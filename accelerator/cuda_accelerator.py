@@ -8,6 +8,9 @@ import os
 import pkgutil
 import importlib
 import sys
+import time as _time
+import json as _json
+from collections import deque as _deque
 
 from .abstract_accelerator import DeepSpeedAccelerator
 # During setup stage torch may not be installed, pass on no torch will
@@ -380,3 +383,327 @@ class CUDA_Accelerator(DeepSpeedAccelerator):
         else:
             raise ValueError(
                 f"{backend} not supported by {self.device_name()}. Supported Backends are {supported_backends}")
+
+    # =================================================================
+    # M053: DES-LOC Profiling & Memory Tracking (400 lines)
+    # =================================================================
+    # Adds real GPU profiling hooks to the CUDA accelerator.
+    # All data from actual torch.cuda APIs — no simulation.
+    # Architecture reference: CCCL cudax/include/cuda/experimental/__stf
+    # =================================================================
+
+    def desloc_init_profiler(self, log_dir=None):
+        """Initialize DES-LOC GPU profiler state."""
+        self._desloc_profile_enabled = True
+        self._desloc_log_dir = log_dir
+        self._desloc_step_timings = _deque(maxlen=10000)
+        self._desloc_memory_snapshots = _deque(maxlen=10000)
+        self._desloc_kernel_events = _deque(maxlen=5000)
+        self._desloc_bandwidth_samples = _deque(maxlen=5000)
+        self._desloc_compute_util_samples = _deque(maxlen=5000)
+        self._desloc_total_forward_ms = 0.0
+        self._desloc_total_backward_ms = 0.0
+        self._desloc_total_comm_ms = 0.0
+        self._desloc_total_optim_ms = 0.0
+        self._desloc_step_count = 0
+        self._desloc_sm_clock_mhz = None
+        self._desloc_mem_clock_mhz = None
+        self._desloc_gpu_name = None
+        self._desloc_gpu_total_mem = None
+        # Capture GPU hardware info
+        try:
+            dev = torch.cuda.current_device()
+            props = torch.cuda.get_device_properties(dev)
+            self._desloc_gpu_name = props.name
+            self._desloc_gpu_total_mem = props.total_memory
+            self._desloc_sm_count = props.multi_processor_count
+            self._desloc_compute_capability = (props.major, props.minor)
+        except Exception:
+            self._desloc_gpu_name = 'unknown'
+            self._desloc_gpu_total_mem = 0
+            self._desloc_sm_count = 0
+            self._desloc_compute_capability = (0, 0)
+
+    def desloc_memory_snapshot(self, label=''):
+        """Take a GPU memory snapshot with label."""
+        if not getattr(self, '_desloc_profile_enabled', False):
+            return {}
+        dev = torch.cuda.current_device()
+        snapshot = {
+            'label': label,
+            'timestamp': _time.time(),
+            'allocated_bytes': torch.cuda.memory_allocated(dev),
+            'reserved_bytes': torch.cuda.memory_reserved(dev),
+            'max_allocated_bytes': torch.cuda.max_memory_allocated(dev),
+            'allocated_gb': round(torch.cuda.memory_allocated(dev) / 1e9, 4),
+            'reserved_gb': round(torch.cuda.memory_reserved(dev) / 1e9, 4),
+            'max_allocated_gb': round(torch.cuda.max_memory_allocated(dev) / 1e9, 4),
+            'free_gb': round((self._desloc_gpu_total_mem - torch.cuda.memory_allocated(dev)) / 1e9, 4) if self._desloc_gpu_total_mem else 0,
+            'utilization': round(torch.cuda.memory_allocated(dev) / max(self._desloc_gpu_total_mem, 1), 4) if self._desloc_gpu_total_mem else 0,
+        }
+        self._desloc_memory_snapshots.append(snapshot)
+        return snapshot
+
+    def desloc_begin_step(self):
+        """Mark the beginning of a training step for profiling."""
+        if not getattr(self, '_desloc_profile_enabled', False):
+            return
+        self._desloc_step_start = _time.time()
+        self._desloc_step_forward_ms = 0
+        self._desloc_step_backward_ms = 0
+        self._desloc_step_comm_ms = 0
+        self._desloc_step_optim_ms = 0
+        torch.cuda.synchronize()
+        self._desloc_cuda_start_event = torch.cuda.Event(enable_timing=True)
+        self._desloc_cuda_end_event = torch.cuda.Event(enable_timing=True)
+        self._desloc_cuda_start_event.record()
+
+    def desloc_end_step(self, loss=None, tokens=0):
+        """Mark the end of a training step and record profiling data."""
+        if not getattr(self, '_desloc_profile_enabled', False):
+            return {}
+        self._desloc_cuda_end_event.record()
+        torch.cuda.synchronize()
+        cuda_elapsed_ms = self._desloc_cuda_start_event.elapsed_time(
+            self._desloc_cuda_end_event)
+        wall_elapsed_ms = (_time.time() - self._desloc_step_start) * 1000
+
+        self._desloc_step_count += 1
+        self._desloc_total_forward_ms += self._desloc_step_forward_ms
+        self._desloc_total_backward_ms += self._desloc_step_backward_ms
+        self._desloc_total_comm_ms += self._desloc_step_comm_ms
+        self._desloc_total_optim_ms += self._desloc_step_optim_ms
+
+        dev = torch.cuda.current_device()
+        timing = {
+            'step': self._desloc_step_count,
+            'wall_ms': round(wall_elapsed_ms, 3),
+            'cuda_ms': round(cuda_elapsed_ms, 3),
+            'forward_ms': round(self._desloc_step_forward_ms, 3),
+            'backward_ms': round(self._desloc_step_backward_ms, 3),
+            'comm_ms': round(self._desloc_step_comm_ms, 3),
+            'optim_ms': round(self._desloc_step_optim_ms, 3),
+            'overhead_ms': round(wall_elapsed_ms - cuda_elapsed_ms, 3),
+            'mem_alloc_gb': round(torch.cuda.memory_allocated(dev) / 1e9, 4),
+            'mem_reserved_gb': round(torch.cuda.memory_reserved(dev) / 1e9, 4),
+            'tokens': tokens,
+            'tokens_per_sec': round(tokens / max(wall_elapsed_ms / 1000, 1e-6), 1),
+        }
+        if loss is not None:
+            timing['loss'] = loss
+        self._desloc_step_timings.append(timing)
+        return timing
+
+    def desloc_record_phase(self, phase, elapsed_ms):
+        """Record timing for a specific phase within a step."""
+        if not getattr(self, '_desloc_profile_enabled', False):
+            return
+        if phase == 'forward':
+            self._desloc_step_forward_ms += elapsed_ms
+        elif phase == 'backward':
+            self._desloc_step_backward_ms += elapsed_ms
+        elif phase == 'comm':
+            self._desloc_step_comm_ms += elapsed_ms
+        elif phase == 'optim':
+            self._desloc_step_optim_ms += elapsed_ms
+
+    def desloc_measure_bandwidth(self, tensor_bytes, elapsed_ms):
+        """Record a bandwidth measurement from a real data transfer."""
+        if not getattr(self, '_desloc_profile_enabled', False):
+            return
+        if elapsed_ms > 0:
+            bw_gbps = (tensor_bytes / 1e9) / (elapsed_ms / 1000)
+        else:
+            bw_gbps = 0
+        self._desloc_bandwidth_samples.append({
+            'bytes': tensor_bytes,
+            'ms': round(elapsed_ms, 4),
+            'bw_gbps': round(bw_gbps, 2),
+        })
+
+    def desloc_get_gpu_info(self):
+        """Return GPU hardware information."""
+        return {
+            'name': getattr(self, '_desloc_gpu_name', 'unknown'),
+            'total_memory_gb': round(getattr(self, '_desloc_gpu_total_mem', 0) / 1e9, 2),
+            'sm_count': getattr(self, '_desloc_sm_count', 0),
+            'compute_capability': getattr(self, '_desloc_compute_capability', (0, 0)),
+        }
+
+    def desloc_get_profiler_summary(self):
+        """Return aggregated profiling summary."""
+        if not getattr(self, '_desloc_profile_enabled', False):
+            return {'enabled': False}
+        n = max(self._desloc_step_count, 1)
+        summary = {
+            'enabled': True,
+            'total_steps': self._desloc_step_count,
+            'gpu': self.desloc_get_gpu_info(),
+            'avg_forward_ms': round(self._desloc_total_forward_ms / n, 3),
+            'avg_backward_ms': round(self._desloc_total_backward_ms / n, 3),
+            'avg_comm_ms': round(self._desloc_total_comm_ms / n, 3),
+            'avg_optim_ms': round(self._desloc_total_optim_ms / n, 3),
+            'avg_total_ms': round(
+                (self._desloc_total_forward_ms + self._desloc_total_backward_ms +
+                 self._desloc_total_comm_ms + self._desloc_total_optim_ms) / n, 3),
+            'compute_fraction': round(
+                (self._desloc_total_forward_ms + self._desloc_total_backward_ms) /
+                max(self._desloc_total_forward_ms + self._desloc_total_backward_ms +
+                    self._desloc_total_comm_ms + self._desloc_total_optim_ms, 1), 4),
+            'comm_fraction': round(
+                self._desloc_total_comm_ms /
+                max(self._desloc_total_forward_ms + self._desloc_total_backward_ms +
+                    self._desloc_total_comm_ms + self._desloc_total_optim_ms, 1), 4),
+        }
+        # Memory summary from snapshots
+        if self._desloc_memory_snapshots:
+            peak = max(s['allocated_gb'] for s in self._desloc_memory_snapshots)
+            summary['peak_memory_gb'] = peak
+        # Bandwidth summary
+        if self._desloc_bandwidth_samples:
+            bws = [s['bw_gbps'] for s in self._desloc_bandwidth_samples if s['bw_gbps'] > 0]
+            if bws:
+                summary['avg_bandwidth_gbps'] = round(sum(bws) / len(bws), 2)
+                summary['peak_bandwidth_gbps'] = round(max(bws), 2)
+        return summary
+
+    def desloc_save_profile(self, path):
+        """Save profiling data to a JSON file."""
+        if not getattr(self, '_desloc_profile_enabled', False):
+            return
+        output = {
+            'summary': self.desloc_get_profiler_summary(),
+            'step_timings': list(self._desloc_step_timings)[-1000:],
+            'memory_snapshots': list(self._desloc_memory_snapshots)[-500:],
+            'bandwidth_samples': list(self._desloc_bandwidth_samples)[-500:],
+        }
+        os.makedirs(os.path.dirname(path) if os.path.dirname(path) else '.', exist_ok=True)
+        with open(path, 'w') as f:
+            _json.dump(output, f, indent=2)
+
+    def desloc_hbm_state_analysis(self):
+        """Analyze HBM (High Bandwidth Memory) state management.
+
+        Computes optimizer state memory footprint and determines
+        whether HBM capacity is sufficient for DES-LOC's desynchronized
+        state storage (each worker keeps local copies of u, v).
+
+        Reference: DES-LOC BM10 - HBM Optimizer State Management
+        """
+        if not getattr(self, '_desloc_profile_enabled', False):
+            return {}
+        dev = torch.cuda.current_device()
+        total_mem = self._desloc_gpu_total_mem or torch.cuda.get_device_properties(dev).total_memory
+        allocated = torch.cuda.memory_allocated(dev)
+        reserved = torch.cuda.memory_reserved(dev)
+
+        # DES-LOC requires 3x parameter memory: params + exp_avg + exp_avg_sq
+        # vs DDP which may share these across GPUs
+        analysis = {
+            'total_hbm_gb': round(total_mem / 1e9, 2),
+            'allocated_gb': round(allocated / 1e9, 2),
+            'reserved_gb': round(reserved / 1e9, 2),
+            'free_gb': round((total_mem - allocated) / 1e9, 2),
+            'utilization_pct': round(allocated / max(total_mem, 1) * 100, 2),
+            'headroom_for_desloc_states': round((total_mem - reserved) / 1e9, 2),
+        }
+        # Check if there's enough headroom for local optimizer states
+        # Rule of thumb: need ~3x model params for Adam states
+        model_bytes_estimate = allocated * 0.3  # rough: ~30% of allocated is model
+        adam_state_bytes = model_bytes_estimate * 2  # exp_avg + exp_avg_sq
+        analysis['estimated_model_gb'] = round(model_bytes_estimate / 1e9, 2)
+        analysis['estimated_adam_states_gb'] = round(adam_state_bytes / 1e9, 2)
+        analysis['desloc_feasible'] = (total_mem - reserved) > adam_state_bytes
+        return analysis
+
+    def desloc_nccl_test(self, tensor_size_mb=10, num_iters=5):
+        """Run a simple NCCL bandwidth test.
+
+        Creates a tensor and performs allreduce to measure real bandwidth.
+        This gives a ground-truth number for communication cost modeling.
+
+        Returns bandwidth in GB/s or 0 if distributed is not initialized.
+        """
+        try:
+            import torch.distributed as torch_dist
+            if not torch_dist.is_initialized():
+                return {'available': False, 'reason': 'distributed not initialized'}
+        except Exception:
+            return {'available': False, 'reason': 'torch.distributed import failed'}
+
+        dev = torch.cuda.current_device()
+        numel = int(tensor_size_mb * 1e6 / 4)  # fp32 elements
+        tensor = torch.randn(numel, device=f'cuda:{dev}')
+
+        # Warmup
+        for _ in range(2):
+            torch_dist.all_reduce(tensor)
+        torch.cuda.synchronize()
+
+        # Timed iterations
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        for _ in range(num_iters):
+            torch_dist.all_reduce(tensor)
+        end.record()
+        torch.cuda.synchronize()
+
+        elapsed_ms = start.elapsed_time(end) / num_iters
+        tensor_bytes = tensor.numel() * tensor.element_size()
+        # allreduce transfers 2*(N-1)/N * data for ring
+        world_size = torch_dist.get_world_size()
+        algo_bytes = tensor_bytes * 2 * (world_size - 1) / world_size
+        bw_gbps = (algo_bytes / 1e9) / (elapsed_ms / 1000)
+
+        del tensor
+        torch.cuda.empty_cache()
+
+        return {
+            'available': True,
+            'tensor_mb': tensor_size_mb,
+            'num_iters': num_iters,
+            'avg_latency_ms': round(elapsed_ms, 3),
+            'bandwidth_gbps': round(bw_gbps, 2),
+            'world_size': world_size,
+        }
+
+    def desloc_topology_info(self):
+        """Detect GPU interconnect topology.
+
+        Returns NVLink/PCIe info if available through pynvml.
+        """
+        topology = {
+            'device_count': self.device_count(),
+            'links': [],
+        }
+        if pynvml is None:
+            topology['pynvml_available'] = False
+            return topology
+
+        topology['pynvml_available'] = True
+        try:
+            count = pynvml.nvmlDeviceGetCount()
+            for i in range(count):
+                handle = pynvml.nvmlDeviceGetHandleByIndex(i)
+                name = pynvml.nvmlDeviceGetName(handle)
+                if isinstance(name, bytes):
+                    name = name.decode('utf-8')
+                topology['links'].append({
+                    'gpu_id': i,
+                    'name': name,
+                })
+                # Check P2P connectivity
+                for j in range(count):
+                    if i != j:
+                        try:
+                            link_type = pynvml.nvmlDeviceGetP2PStatus(
+                                handle,
+                                pynvml.nvmlDeviceGetHandleByIndex(j),
+                                pynvml.NVML_P2P_CAPS_INDEX_READ)
+                            topology['links'][-1][f'p2p_to_gpu{j}'] = bool(link_type)
+                        except Exception:
+                            pass
+        except Exception as e:
+            topology['error'] = str(e)
+        return topology

@@ -985,3 +985,266 @@ def adamw(
         found_inf=found_inf,
         has_complex=has_complex,
     )
+
+
+# =====================================================================
+# M059: DES-LOC ZenFlow Integration (400 lines)
+# =====================================================================
+# Extends ZenFlow's selective update with DES-LOC's desynchronized
+# communication schedule. ZenFlow updates only "hot" parameters each
+# step; DES-LOC adds independent sync periods for the states.
+#
+# This combines two orthogonal optimizations:
+# - ZenFlow: reduce compute by selective parameter updates
+# - DES-LOC: reduce communication by independent state sync
+#
+# Reference: des_loc_reconstructed.tex Algorithm 1
+# Architecture: follows ZenFlowSelectiveAdamW pattern
+# =====================================================================
+
+import math as _math
+import time as _time
+from collections import deque as _deque
+
+
+class DESLOCZenFlowAdamW(torch.optim.AdamW):
+    """
+    DES-LOC + ZenFlow AdamW.
+
+    Combines ZenFlow's selective parameter updates with DES-LOC's
+    desynchronized communication schedule.
+
+    ZenFlow contribution: only update "selected" parameters each step
+    DES-LOC contribution: sync x, u, v at independent Kx, Ku, Kv periods
+
+    Args:
+        params: model parameters
+        lr: learning rate (default: 1e-3)
+        betas: Adam betas (default: (0.9, 0.999))
+        eps: numerical stability (default: 1e-8)
+        weight_decay: decoupled weight decay (default: 0.01)
+        Kx: parameter sync period (default: 32)
+        Ku: first moment sync period (default: 96)
+        Kv: second moment sync period (default: 192)
+        clip_radius: per-coordinate clipping (default: 1.0)
+        offload: use CPU offload (default: False)
+    """
+
+    def __init__(self, params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8,
+                 weight_decay=0.01, Kx=32, Ku=96, Kv=192,
+                 clip_radius=1.0, offload=False, **kwargs):
+        if not _ZENFLOW_AVAILABLE:
+            raise RuntimeError(
+                "DESLOCZenFlowAdamW requires PyTorch 2.1+")
+        super().__init__(params, lr=lr, betas=betas, eps=eps,
+                         weight_decay=weight_decay, **kwargs)
+        self._Kx = Kx
+        self._Ku = Ku
+        self._Kv = Kv
+        self._clip_radius = clip_radius
+        self._offload = offload
+        self.global_step = 0
+        self.zenflow_state = 0
+
+        # DES-LOC tracking
+        self._sync_x_count = 0
+        self._sync_u_count = 0
+        self._sync_v_count = 0
+        self._total_comm_bytes = 0
+        self._clip_count = 0
+        self._selective_update_count = 0
+        self._full_update_count = 0
+        self._comm_times_ms = _deque(maxlen=500)
+
+    def _clip_coordinate_wise(self, grad, rho):
+        """Per-coordinate clipping: clip(g, rho)_i = sign(g_i)*min(|g_i|, rho)."""
+        mask = grad.abs() > rho
+        if mask.any():
+            self._clip_count += 1
+            grad.clamp_(-rho, rho)
+        return grad
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        """Combined DES-LOC + ZenFlow step.
+
+        1. Per-coordinate clip gradients (DES-LOC Algorithm 1 line 168)
+        2. Selective or full Adam update (ZenFlow)
+        3. Communication handled by sync_if_needed()
+        """
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        self.global_step += 1
+
+        for group in self.param_groups:
+            beta1, beta2 = group['betas']
+            lr = group['lr']
+            eps = group['eps']
+            wd = group['weight_decay']
+            rho = self._clip_radius
+
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+
+                grad = p.grad.data
+
+                # DES-LOC per-coordinate clipping
+                if rho > 0:
+                    grad = self._clip_coordinate_wise(grad, rho)
+
+                state = self.state[p]
+                if len(state) == 0:
+                    state['step'] = 0
+                    state['exp_avg'] = torch.zeros_like(p.data)
+                    state['exp_avg_sq'] = torch.zeros_like(p.data)
+
+                state['step'] += 1
+                step_t = state['step']
+
+                exp_avg = state['exp_avg']
+                exp_avg_sq = state['exp_avg_sq']
+
+                # ZenFlow selective update check
+                is_selective = hasattr(p, 'selected_indices') and p.selected_indices is not None
+                if is_selective:
+                    self._selective_update_count += 1
+                    # Only update selected indices
+                    if len(p.shape) > 1:
+                        sel_grad = grad[:, p.selected_indices]
+                        sel_avg = exp_avg[:, p.selected_indices]
+                        sel_avg_sq = exp_avg_sq[:, p.selected_indices]
+                        sel_p = p.data[:, p.selected_indices]
+                    else:
+                        sel_grad = grad
+                        sel_avg = exp_avg
+                        sel_avg_sq = exp_avg_sq
+                        sel_p = p.data
+
+                    # Decoupled weight decay
+                    if wd != 0:
+                        sel_p.mul_(1 - lr * wd)
+
+                    # Adam moment updates (selective)
+                    sel_avg.mul_(beta1).add_(sel_grad, alpha=1 - beta1)
+                    sel_avg_sq.mul_(beta2).addcmul_(
+                        sel_grad, sel_grad, value=1 - beta2)
+
+                    # Bias-corrected update
+                    bc1 = 1 - beta1 ** step_t
+                    bc2 = 1 - beta2 ** step_t
+                    step_size = lr / bc1
+                    denom = (sel_avg_sq.sqrt() / _math.sqrt(bc2)).add_(eps)
+                    sel_p.addcdiv_(sel_avg, denom, value=-step_size)
+
+                    # Write back
+                    if len(p.shape) > 1:
+                        p.data[:, p.selected_indices] = sel_p
+                        exp_avg[:, p.selected_indices] = sel_avg
+                        exp_avg_sq[:, p.selected_indices] = sel_avg_sq
+                else:
+                    self._full_update_count += 1
+                    # Full Adam update
+                    if wd != 0:
+                        p.data.mul_(1 - lr * wd)
+
+                    exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
+                    exp_avg_sq.mul_(beta2).addcmul_(
+                        grad, grad, value=1 - beta2)
+
+                    bc1 = 1 - beta1 ** step_t
+                    bc2 = 1 - beta2 ** step_t
+                    step_size = lr / bc1
+                    denom = (exp_avg_sq.sqrt() / _math.sqrt(bc2)).add_(eps)
+                    p.data.addcdiv_(exp_avg, denom, value=-step_size)
+
+        return loss
+
+    def sync_if_needed(self, world_size):
+        """Sync optimizer states based on DES-LOC schedule."""
+        if world_size <= 1:
+            return {'sync_x': False, 'sync_u': False, 'sync_v': False}
+
+        sync_x = (self.global_step % self._Kx == 0)
+        sync_u = (self.global_step % self._Ku == 0)
+        sync_v = (self.global_step % self._Kv == 0)
+
+        if not sync_x and not sync_u and not sync_v:
+            return {'sync_x': False, 'sync_u': False, 'sync_v': False}
+
+        try:
+            import torch.distributed as td
+            if not td.is_initialized():
+                return {'sync_x': sync_x, 'sync_u': sync_u, 'sync_v': sync_v}
+        except ImportError:
+            return {'sync_x': sync_x, 'sync_u': sync_u, 'sync_v': sync_v}
+
+        t0 = _time.time()
+
+        for group in self.param_groups:
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+                state = self.state[p]
+                elem_sz = p.data.element_size()
+                numel = p.data.numel()
+
+                if sync_x:
+                    td.all_reduce(p.data, op=td.ReduceOp.AVG)
+                    self._total_comm_bytes += numel * elem_sz * 2
+
+                if sync_u and 'exp_avg' in state:
+                    td.all_reduce(state['exp_avg'], op=td.ReduceOp.AVG)
+                    self._total_comm_bytes += numel * elem_sz * 2
+
+                if sync_v and 'exp_avg_sq' in state:
+                    td.all_reduce(state['exp_avg_sq'], op=td.ReduceOp.AVG)
+                    self._total_comm_bytes += numel * elem_sz * 2
+
+        elapsed_ms = (_time.time() - t0) * 1000
+        self._comm_times_ms.append(elapsed_ms)
+
+        if sync_x:
+            self._sync_x_count += 1
+        if sync_u:
+            self._sync_u_count += 1
+        if sync_v:
+            self._sync_v_count += 1
+
+        return {'sync_x': sync_x, 'sync_u': sync_u, 'sync_v': sync_v}
+
+    def _sync_selective_optimizer_lr(self):
+        """Compatibility with ZenFlow engine integration."""
+        pass
+
+    def get_desloc_stats(self):
+        """Return combined DES-LOC + ZenFlow statistics."""
+        n = max(self.global_step, 1)
+        total_updates = self._selective_update_count + self._full_update_count
+        return {
+            'optimizer': 'DESLOCZenFlowAdamW',
+            'global_step': self.global_step,
+            'Kx': self._Kx,
+            'Ku': self._Ku,
+            'Kv': self._Kv,
+            'clip_radius': self._clip_radius,
+            'sync_x_count': self._sync_x_count,
+            'sync_u_count': self._sync_u_count,
+            'sync_v_count': self._sync_v_count,
+            'total_comm_bytes': self._total_comm_bytes,
+            'total_comm_gb': round(self._total_comm_bytes / 1e9, 4),
+            'clip_events': self._clip_count,
+            'selective_updates': self._selective_update_count,
+            'full_updates': self._full_update_count,
+            'selective_ratio': round(
+                self._selective_update_count / max(total_updates, 1), 4),
+            'avg_comm_ms': round(
+                sum(self._comm_times_ms) / len(self._comm_times_ms), 3
+            ) if self._comm_times_ms else 0,
+            'comm_reduction_vs_ddp': round(
+                (n * 3) / max(self._sync_x_count + self._sync_u_count +
+                              self._sync_v_count, 1), 2),
+        }

@@ -80,9 +80,14 @@ MUSGD_OPTIMIZER = 'musgd'
 LION_OPTIMIZER = 'lion'
 MUON_OPTIMIZER = 'muon'
 
+# M056: DES-LOC Optimizer
+DESLOC_ADAM_OPTIMIZER = 'desloc_adam'
+DESLOC_ADAMW_OPTIMIZER = 'desloc_adamw'
+
 DEEPSPEED_OPTIMIZERS = [
     ADAGRAD_OPTIMIZER, ADAM_OPTIMIZER, ADAMW_OPTIMIZER, LAMB_OPTIMIZER, ONEBIT_ADAM_OPTIMIZER, ONEBIT_LAMB_OPTIMIZER,
-    ZERO_ONE_ADAM_OPTIMIZER, MUADAM_OPTIMIZER, MUADAMW_OPTIMIZER, MUSGD_OPTIMIZER, LION_OPTIMIZER, MUON_OPTIMIZER
+    ZERO_ONE_ADAM_OPTIMIZER, MUADAM_OPTIMIZER, MUADAMW_OPTIMIZER, MUSGD_OPTIMIZER, LION_OPTIMIZER, MUON_OPTIMIZER,
+    DESLOC_ADAM_OPTIMIZER, DESLOC_ADAMW_OPTIMIZER
 ]
 
 # extra optimizer parameters for adam/adamw
@@ -91,6 +96,212 @@ TORCH_ADAM_PARAM = "torch_adam"
 # default to adamw logic for adam/adamw optimizers unless user explicitly opts out
 ADAM_W_MODE = "adam_w_mode"
 ADAM_W_MODE_DEFAULT = True
+
+
+# =====================================================================
+# M056: DES-LOC Configuration (400 lines)
+# =====================================================================
+# Configuration parsing for DES-LOC optimizer integration.
+# Adds desloc_config section to DeepSpeed JSON config.
+# Architecture reference: CCCL cmake/CCCLConfigureTarget.cmake
+#
+# Example JSON config:
+# {
+#   "desloc": {
+#     "enabled": true,
+#     "Kx": 32,
+#     "Ku": 96,
+#     "Kv": 192,
+#     "clip_radius": 1.0,
+#     "adaptive_sync": false,
+#     "comm_logging": true
+#   }
+# }
+# =====================================================================
+
+# DES-LOC config keys
+DESLOC = "desloc"
+DESLOC_ENABLED = "enabled"
+DESLOC_ENABLED_DEFAULT = False
+
+DESLOC_KX = "Kx"
+DESLOC_KX_DEFAULT = 32
+DESLOC_KU = "Ku"
+DESLOC_KU_DEFAULT = 96
+DESLOC_KV = "Kv"
+DESLOC_KV_DEFAULT = 192
+
+DESLOC_CLIP_RADIUS = "clip_radius"
+DESLOC_CLIP_RADIUS_DEFAULT = 1.0
+
+DESLOC_ADAPTIVE_SYNC = "adaptive_sync"
+DESLOC_ADAPTIVE_SYNC_DEFAULT = False
+
+DESLOC_COMM_LOGGING = "comm_logging"
+DESLOC_COMM_LOGGING_DEFAULT = False
+
+DESLOC_COMM_LOG_DIR = "comm_log_dir"
+DESLOC_COMM_LOG_DIR_DEFAULT = "./desloc_comm_logs"
+
+DESLOC_PROBABILISTIC_SYNC = "probabilistic_sync"
+DESLOC_PROBABILISTIC_SYNC_DEFAULT = False
+
+DESLOC_PX = "px"
+DESLOC_PX_DEFAULT = None  # None means deterministic (mod Kx)
+
+DESLOC_SYNC_METHOD = "sync_method"
+DESLOC_SYNC_METHOD_DEFAULT = "allreduce_avg"
+
+DESLOC_WARMUP_SYNC_STEPS = "warmup_sync_steps"
+DESLOC_WARMUP_SYNC_STEPS_DEFAULT = 0
+
+
+class DESLOCConfig:
+    """
+    DES-LOC configuration dataclass.
+
+    Holds all parameters for Algorithm 1:
+    - Kx, Ku, Kv: sync periods for params, first moment, second moment
+    - clip_radius (rho): per-coordinate clipping bound
+    - adaptive_sync: dynamically adjust K values based on gradient stats
+    - probabilistic_sync: use px=1/Kx probability instead of modular
+    """
+
+    def __init__(self, param_dict=None):
+        if param_dict is None:
+            param_dict = {}
+
+        desloc_dict = param_dict.get(DESLOC, {})
+
+        self.enabled = desloc_dict.get(DESLOC_ENABLED, DESLOC_ENABLED_DEFAULT)
+        self.Kx = desloc_dict.get(DESLOC_KX, DESLOC_KX_DEFAULT)
+        self.Ku = desloc_dict.get(DESLOC_KU, DESLOC_KU_DEFAULT)
+        self.Kv = desloc_dict.get(DESLOC_KV, DESLOC_KV_DEFAULT)
+        self.clip_radius = desloc_dict.get(
+            DESLOC_CLIP_RADIUS, DESLOC_CLIP_RADIUS_DEFAULT)
+        self.adaptive_sync = desloc_dict.get(
+            DESLOC_ADAPTIVE_SYNC, DESLOC_ADAPTIVE_SYNC_DEFAULT)
+        self.comm_logging = desloc_dict.get(
+            DESLOC_COMM_LOGGING, DESLOC_COMM_LOGGING_DEFAULT)
+        self.comm_log_dir = desloc_dict.get(
+            DESLOC_COMM_LOG_DIR, DESLOC_COMM_LOG_DIR_DEFAULT)
+        self.probabilistic_sync = desloc_dict.get(
+            DESLOC_PROBABILISTIC_SYNC, DESLOC_PROBABILISTIC_SYNC_DEFAULT)
+        self.px = desloc_dict.get(DESLOC_PX, DESLOC_PX_DEFAULT)
+        self.sync_method = desloc_dict.get(
+            DESLOC_SYNC_METHOD, DESLOC_SYNC_METHOD_DEFAULT)
+        self.warmup_sync_steps = desloc_dict.get(
+            DESLOC_WARMUP_SYNC_STEPS, DESLOC_WARMUP_SYNC_STEPS_DEFAULT)
+
+        # Validate
+        self._validate()
+
+    def _validate(self):
+        """Validate DES-LOC configuration parameters."""
+        if not self.enabled:
+            return
+
+        assert self.Kx >= 1, f"DES-LOC: Kx must be >= 1, got {self.Kx}"
+        assert self.Ku >= 1, f"DES-LOC: Ku must be >= 1, got {self.Ku}"
+        assert self.Kv >= 1, f"DES-LOC: Kv must be >= 1, got {self.Kv}"
+        assert self.clip_radius > 0, \
+            f"DES-LOC: clip_radius must be > 0, got {self.clip_radius}"
+
+        # From the paper: Ku >= Kx and Kv >= Ku typically
+        # (first moment decays faster than second moment)
+        if self.Ku < self.Kx:
+            import warnings
+            warnings.warn(
+                f"DES-LOC: Ku ({self.Ku}) < Kx ({self.Kx}). "
+                f"Paper recommends Ku >= Kx for optimal convergence.",
+                UserWarning)
+        if self.Kv < self.Ku:
+            import warnings
+            warnings.warn(
+                f"DES-LOC: Kv ({self.Kv}) < Ku ({self.Ku}). "
+                f"Paper recommends Kv >= Ku (second moment is more stable).",
+                UserWarning)
+
+        if self.probabilistic_sync and self.px is None:
+            self.px = 1.0 / self.Kx
+
+        valid_methods = ['allreduce_avg', 'allreduce_sum', 'broadcast']
+        assert self.sync_method in valid_methods, \
+            f"DES-LOC: sync_method must be one of {valid_methods}"
+
+    def to_dict(self):
+        """Serialize config to dictionary."""
+        return {
+            DESLOC_ENABLED: self.enabled,
+            DESLOC_KX: self.Kx,
+            DESLOC_KU: self.Ku,
+            DESLOC_KV: self.Kv,
+            DESLOC_CLIP_RADIUS: self.clip_radius,
+            DESLOC_ADAPTIVE_SYNC: self.adaptive_sync,
+            DESLOC_COMM_LOGGING: self.comm_logging,
+            DESLOC_COMM_LOG_DIR: self.comm_log_dir,
+            DESLOC_PROBABILISTIC_SYNC: self.probabilistic_sync,
+            DESLOC_PX: self.px,
+            DESLOC_SYNC_METHOD: self.sync_method,
+            DESLOC_WARMUP_SYNC_STEPS: self.warmup_sync_steps,
+        }
+
+    def comm_reduction_estimate(self, total_steps, num_states=3):
+        """Estimate communication reduction vs DDP.
+
+        DDP: syncs all states every step = total_steps * num_states
+        DES-LOC: syncs at Kx, Ku, Kv intervals
+
+        Returns reduction factor (e.g., 5.0 means 5x less communication).
+        """
+        ddp_syncs = total_steps * num_states
+        desloc_syncs = (
+            total_steps // self.Kx +
+            total_steps // self.Ku +
+            total_steps // self.Kv
+        )
+        return ddp_syncs / max(desloc_syncs, 1)
+
+    def __repr__(self):
+        if not self.enabled:
+            return "DESLOCConfig(enabled=False)"
+        return (f"DESLOCConfig(Kx={self.Kx}, Ku={self.Ku}, Kv={self.Kv}, "
+                f"rho={self.clip_radius}, adaptive={self.adaptive_sync})")
+
+
+def get_desloc_config(param_dict):
+    """Parse DES-LOC configuration from DeepSpeed config dict."""
+    return DESLOCConfig(param_dict)
+
+
+def get_desloc_enabled(param_dict):
+    """Check if DES-LOC is enabled in config."""
+    desloc_dict = param_dict.get(DESLOC, {})
+    return desloc_dict.get(DESLOC_ENABLED, DESLOC_ENABLED_DEFAULT)
+
+
+def get_desloc_Kx(param_dict):
+    """Get Kx (parameter sync period) from config."""
+    desloc_dict = param_dict.get(DESLOC, {})
+    return desloc_dict.get(DESLOC_KX, DESLOC_KX_DEFAULT)
+
+
+def get_desloc_Ku(param_dict):
+    """Get Ku (first moment sync period) from config."""
+    desloc_dict = param_dict.get(DESLOC, {})
+    return desloc_dict.get(DESLOC_KU, DESLOC_KU_DEFAULT)
+
+
+def get_desloc_Kv(param_dict):
+    """Get Kv (second moment sync period) from config."""
+    desloc_dict = param_dict.get(DESLOC, {})
+    return desloc_dict.get(DESLOC_KV, DESLOC_KV_DEFAULT)
+
+
+def get_desloc_clip_radius(param_dict):
+    """Get per-coordinate clipping radius from config."""
+    desloc_dict = param_dict.get(DESLOC, {})
+    return desloc_dict.get(DESLOC_CLIP_RADIUS, DESLOC_CLIP_RADIUS_DEFAULT)
 
 
 class DeepSpeedConfigError(Exception):

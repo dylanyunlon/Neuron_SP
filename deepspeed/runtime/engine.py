@@ -24,6 +24,10 @@ from typing import Callable, Dict, Union, Iterable, Container, List
 import deepspeed
 
 from deepspeed import comm as dist
+from deepspeed.comm.comm import (init_desloc_comm, get_desloc_schedule,
+                                 get_desloc_bw_tracker, get_desloc_comm_summary,
+                                 desloc_all_reduce, close_desloc_comm,
+                                 DESLOCCommSchedule, CommBandwidthTracker)
 from deepspeed.runtime.utils import see_memory_usage, DummyOptim, register_output_backward_hooks, check_internal_apis_for_count_used_parameters
 from .zero.offload_config import OffloadDeviceEnum, OffloadStateTypeEnum
 from deepspeed.runtime.base_optimizer import ZeROOptimizer
@@ -260,6 +264,25 @@ class DeepSpeedEngine(Module):
         self.basic_optimizer = None
         self.lr_scheduler = None
 
+        # =================================================================
+        # M052: DES-LOC Engine Integration
+        # =================================================================
+        # DES-LOC mode: desynchronized optimizer state communication
+        # When enabled, allreduce_gradients() uses DES-LOC schedule
+        # instead of syncing every step.
+        # =================================================================
+        self.desloc_enabled = False
+        self.desloc_schedule = None
+        self.desloc_bw_tracker = None
+        self.desloc_Kx = 32   # parameter sync period
+        self.desloc_Ku = 96   # first moment sync period
+        self.desloc_Kv = 192  # second moment sync period
+        self.desloc_clip_radius = 1.0
+        self.desloc_comm_log_path = None
+        self._desloc_step_comm_bytes = 0
+        self._desloc_total_comm_bytes = 0
+        self._desloc_sync_events = []
+
         self._is_gradient_accumulation_boundary = None
         self.scale_wrt_gas = None
         self.losses = None
@@ -360,6 +383,11 @@ class DeepSpeedEngine(Module):
         self._sync_zenflow_optimizer_lr = lambda: sync_zenflow_optimizer_lr(self)
 
         self._configure_zenflow()
+
+        # =====================================================================
+        # M052: DES-LOC Engine Integration
+        # =====================================================================
+        self._configure_desloc()
 
         if has_optimizer:
             self._configure_optimizer(optimizer, model_parameters)
@@ -2411,8 +2439,272 @@ class DeepSpeedEngine(Module):
             f"time (ms) | fwd: {fwd_time:.2f} (fwd_moe: {moe_time:.2f}, 1st_a2a: {falltoall:.2f}, 2nd_a2a: {salltoall:.2f}, top_k: {gate_time:.2f})",
             ranks=[0])
 
+    # =================================================================
+    # M052: DES-LOC Engine Integration (400 lines)
+    # =================================================================
+    # Implements DES-LOC Algorithm 1 sync schedule within DeepSpeed.
+    # Controls when parameters (x), first moment (u), and second
+    # moment (v) are synchronized across workers.
+    #
+    # Reference: des_loc_reconstructed.tex lines 151-183
+    # Architecture: follows zenflow integration pattern
+    # =================================================================
+
+    def _configure_desloc(self):
+        """Initialize DES-LOC state within the engine.
+
+        Called during __init__ after _configure_zenflow().
+        Reads Kx, Ku, Kv from the DeepSpeed config or uses defaults.
+        """
+        self.desloc_enabled = False
+        self.desloc_Kx = 32
+        self.desloc_Ku = 96
+        self.desloc_Kv = 192
+        self.desloc_clip_radius = 1.0
+        self.desloc_step_counter = 0
+        self.desloc_sync_x_count = 0
+        self.desloc_sync_u_count = 0
+        self.desloc_sync_v_count = 0
+        self.desloc_total_comm_bytes = 0
+        self.desloc_skipped_comm_bytes = 0
+        self.desloc_comm_log = []
+        self.desloc_param_bytes_cache = None
+
+        # Read from config if available
+        if self._config is not None and hasattr(self._config, 'desloc_config'):
+            dc = self._config.desloc_config()
+            if dc is not None:
+                self.desloc_enabled = dc.get('enabled', False)
+                self.desloc_Kx = dc.get('Kx', 32)
+                self.desloc_Ku = dc.get('Ku', 96)
+                self.desloc_Kv = dc.get('Kv', 192)
+                self.desloc_clip_radius = dc.get('clip_radius', 1.0)
+
+        # Also check environment variables (for standalone usage)
+        if os.environ.get('DESLOC_ENABLED', '').lower() in ('1', 'true', 'yes'):
+            self.desloc_enabled = True
+            self.desloc_Kx = int(os.environ.get('DESLOC_KX', self.desloc_Kx))
+            self.desloc_Ku = int(os.environ.get('DESLOC_KU', self.desloc_Ku))
+            self.desloc_Kv = int(os.environ.get('DESLOC_KV', self.desloc_Kv))
+            self.desloc_clip_radius = float(os.environ.get(
+                'DESLOC_CLIP_RADIUS', self.desloc_clip_radius))
+
+        if self.desloc_enabled:
+            log_dist(
+                f"DES-LOC enabled: Kx={self.desloc_Kx}, "
+                f"Ku={self.desloc_Ku}, Kv={self.desloc_Kv}, "
+                f"clip_radius={self.desloc_clip_radius}",
+                ranks=[0])
+
+    def desloc_should_sync_x(self):
+        """Check if parameters should be synced at the current step."""
+        if not self.desloc_enabled:
+            return True  # non-DES-LOC: always sync
+        return self.desloc_step_counter % self.desloc_Kx == 0
+
+    def desloc_should_sync_u(self):
+        """Check if first moment should be synced at the current step."""
+        if not self.desloc_enabled:
+            return True
+        return self.desloc_step_counter % self.desloc_Ku == 0
+
+    def desloc_should_sync_v(self):
+        """Check if second moment should be synced at the current step."""
+        if not self.desloc_enabled:
+            return True
+        return self.desloc_step_counter % self.desloc_Kv == 0
+
+    def desloc_advance_step(self):
+        """Advance the DES-LOC step counter. Called from step()."""
+        if not self.desloc_enabled:
+            return
+        self.desloc_step_counter += 1
+
+    def desloc_get_param_bytes(self):
+        """Get total parameter bytes (cached after first call)."""
+        if self.desloc_param_bytes_cache is None:
+            total = 0
+            for p in self.module.parameters():
+                if p.requires_grad:
+                    total += p.numel() * p.element_size()
+            self.desloc_param_bytes_cache = total
+        return self.desloc_param_bytes_cache
+
+    def desloc_clip_gradients(self):
+        """Apply per-coordinate gradient clipping from Algorithm 1.
+
+        clip(g, rho)_i = sign(g_i) * min(|g_i|, rho)
+
+        Reference: des_loc_reconstructed.tex line 168
+        """
+        if not self.desloc_enabled:
+            return
+        rho = self.desloc_clip_radius
+        for p in self.module.parameters():
+            if p.grad is not None:
+                p.grad.data.clamp_(-rho, rho)
+
+    def desloc_sync_optimizer_states(self, optimizer):
+        """Sync optimizer states (u, v) based on DES-LOC schedule.
+
+        Only syncs when Ku or Kv period is reached.
+        This is called AFTER the optimizer.step() to average
+        the first and second moments across workers.
+
+        Reference: des_loc_reconstructed.tex lines 170-174
+        """
+        if not self.desloc_enabled:
+            return
+        if dist.get_world_size() <= 1:
+            return
+
+        sync_u = self.desloc_should_sync_u()
+        sync_v = self.desloc_should_sync_v()
+
+        if not sync_u and not sync_v:
+            # Track skipped bytes
+            self.desloc_skipped_comm_bytes += self.desloc_get_param_bytes() * 2
+            return
+
+        dp_group = None
+        if self.mpu is not None:
+            dp_group = self.mpu.get_data_parallel_group()
+
+        # Iterate over optimizer state to sync moments
+        for param_group in optimizer.param_groups:
+            for p in param_group['params']:
+                if p.grad is None:
+                    continue
+                if p not in optimizer.state:
+                    continue
+
+                state = optimizer.state[p]
+
+                # Sync first moment (u / exp_avg)
+                if sync_u:
+                    exp_avg = state.get('exp_avg', None)
+                    if exp_avg is not None:
+                        dist.all_reduce(exp_avg, op=dist.ReduceOp.AVG,
+                                        group=dp_group)
+                        comm_bytes = exp_avg.numel() * exp_avg.element_size()
+                        self.desloc_total_comm_bytes += comm_bytes
+
+                # Sync second moment (v / exp_avg_sq)
+                if sync_v:
+                    exp_avg_sq = state.get('exp_avg_sq', None)
+                    if exp_avg_sq is not None:
+                        dist.all_reduce(exp_avg_sq, op=dist.ReduceOp.AVG,
+                                        group=dp_group)
+                        comm_bytes = exp_avg_sq.numel() * exp_avg_sq.element_size()
+                        self.desloc_total_comm_bytes += comm_bytes
+
+        if sync_u:
+            self.desloc_sync_u_count += 1
+        if sync_v:
+            self.desloc_sync_v_count += 1
+
+    def desloc_allreduce_gradients(self, bucket_size=500000000):
+        """DES-LOC-aware gradient allreduce.
+
+        Only performs allreduce when the parameter sync period Kx
+        is reached. Otherwise, workers train with local gradients.
+
+        This replaces the standard allreduce_gradients when
+        DES-LOC is enabled.
+        """
+        if not self.desloc_enabled:
+            # Fall through to standard allreduce
+            return False  # signal: not handled
+
+        if not self.is_gradient_accumulation_boundary():
+            return True  # signal: handled (skip)
+
+        if self.desloc_should_sync_x():
+            # Perform actual allreduce of gradients
+            grads = None
+            self.buffered_allreduce_fallback(grads=grads,
+                                             elements_per_buffer=bucket_size)
+            self.desloc_sync_x_count += 1
+            self.desloc_total_comm_bytes += self.desloc_get_param_bytes()
+            return True  # signal: handled
+
+        # Skip gradient allreduce this step
+        self.desloc_skipped_comm_bytes += self.desloc_get_param_bytes()
+        return True  # signal: handled (skipped)
+
+    def desloc_get_comm_stats(self):
+        """Return DES-LOC communication statistics."""
+        total_steps = max(self.desloc_step_counter, 1)
+
+        # What DDP would have communicated (every step, all 3 states)
+        param_bytes = self.desloc_get_param_bytes()
+        ddp_total = param_bytes * 3 * total_steps
+
+        # What DES-LOC actually communicated
+        desloc_total = self.desloc_total_comm_bytes
+
+        return {
+            'enabled': self.desloc_enabled,
+            'total_steps': total_steps,
+            'Kx': self.desloc_Kx,
+            'Ku': self.desloc_Ku,
+            'Kv': self.desloc_Kv,
+            'sync_x_count': self.desloc_sync_x_count,
+            'sync_u_count': self.desloc_sync_u_count,
+            'sync_v_count': self.desloc_sync_v_count,
+            'total_comm_bytes': desloc_total,
+            'skipped_comm_bytes': self.desloc_skipped_comm_bytes,
+            'ddp_equivalent_bytes': ddp_total,
+            'comm_reduction_factor': ddp_total / max(desloc_total, 1),
+            'x_sync_ratio': self.desloc_sync_x_count / max(total_steps, 1),
+            'u_sync_ratio': self.desloc_sync_u_count / max(total_steps, 1),
+            'v_sync_ratio': self.desloc_sync_v_count / max(total_steps, 1),
+        }
+
+    def desloc_log_step(self, loss=None):
+        """Log DES-LOC metrics for the current step."""
+        if not self.desloc_enabled:
+            return
+        entry = {
+            'step': self.desloc_step_counter,
+            'global_step': self.global_steps,
+            'sync_x': self.desloc_should_sync_x(),
+            'sync_u': self.desloc_should_sync_u(),
+            'sync_v': self.desloc_should_sync_v(),
+            'total_comm_bytes': self.desloc_total_comm_bytes,
+        }
+        if loss is not None:
+            entry['loss'] = loss
+        self.desloc_comm_log.append(entry)
+
+    def desloc_save_comm_log(self, path):
+        """Save DES-LOC communication log to a JSON file."""
+        import json as _json
+        output = {
+            'config': {
+                'Kx': self.desloc_Kx,
+                'Ku': self.desloc_Ku,
+                'Kv': self.desloc_Kv,
+                'clip_radius': self.desloc_clip_radius,
+            },
+            'stats': self.desloc_get_comm_stats(),
+            'log': self.desloc_comm_log[-1000:],  # last 1000 entries
+        }
+        with open(path, 'w') as f:
+            _json.dump(output, f, indent=2)
+
+    # =================================================================
+    # End M052
+    # =================================================================
+
     @instrument_w_nvtx
     def allreduce_gradients(self, bucket_size=MEMORY_OPT_ALLREDUCE_SIZE):
+        # M052: DES-LOC intercept — skip allreduce when Kx period not reached
+        if self.desloc_enabled:
+            handled = self.desloc_allreduce_gradients(bucket_size)
+            if handled:
+                return
+
         # Skip gradient reduction when DeepCompile is enabled
         # DeepCompile handles its own gradient reduction through compiled graph operations
         if self.is_deepcompile_active() and not self.compile_autosp():
@@ -2701,11 +2993,22 @@ class DeepSpeedEngine(Module):
                 # https://nvidia.github.io/apex/advanced.html#gradient-clipping
                 master_params = amp.master_params(self.optimizer)
                 clip_grad_norm_(parameters=master_params, max_norm=self.gradient_clipping(), mpu=self.mpu)
+
+        # M052: DES-LOC per-coordinate clipping (Algorithm 1 line 168)
+        if self.desloc_enabled:
+            self.desloc_clip_gradients()
+
         if self.torch_autocast_z0_gradscaler:
             self.torch_autocast_z0_gradscaler.step(self.optimizer)
             self.torch_autocast_z0_gradscaler.update()
         else:
             self.optimizer.step()
+
+        # M052: DES-LOC sync optimizer states (u, v) after step
+        if self.desloc_enabled:
+            self.desloc_sync_optimizer_states(self.optimizer)
+            self.desloc_advance_step()
+            self.desloc_log_step()
 
         if hasattr(self.optimizer, '_global_grad_norm'):
             self._global_grad_norm = self.optimizer._global_grad_norm

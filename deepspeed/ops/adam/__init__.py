@@ -7,3 +7,7 @@ from .cpu_adam import DeepSpeedCPUAdam
 from .fused_adam import FusedAdam
 from .zenflow_cpu_adam import ZenFlowCPUAdam
 from .zenflow_torch_adam import ZenFlowSelectiveAdamW, ZenFlowSelectiveAdamW_stage3
+
+# M058: DES-LOC optimizers
+from .fused_adam import DESLOCFusedAdam
+from .cpu_adam import DESLOCCPUAdam
