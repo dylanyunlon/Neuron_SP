@@ -435,6 +435,13 @@ class PipelineModule(nn.Module):
                         except AttributeError:
                             pass
                     print(f'    {idx+start:2d}: {name}')
+            # DES-LOC: per-stage comm cost estimate
+            if method == 'parameters':
+                param_counts = self._count_layer_params()
+                for stage in range(num_stages):
+                    stage_params = sum(param_counts[self.parts[stage]:self.parts[stage + 1]])
+                    print(f'  stage={stage} params={stage_params:,} '
+                          f'desloc_allreduce_bytes/sync={stage_params * 4 * 2:,}')
             if self.loss_fn:
                 try:
                     print(f'  loss: {self.loss_fn.__name__}')
