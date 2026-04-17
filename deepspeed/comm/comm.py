@@ -1283,3 +1283,400 @@ def patch_aws_sm_env_for_torch_nccl_backend(verbose=True):
             "Discovered AWS SageMaker settings of world_rank={}, local_rank={}, world_size={}, master_addr={}, master_port={}"
             .format(os.environ['RANK'], os.environ['LOCAL_RANK'], os.environ['WORLD_SIZE'], os.environ['MASTER_ADDR'],
                     os.environ['MASTER_PORT']))
+
+
+# =================================================================
+# M064: Probabilistic Sync + Comm Reduction Tracker (400 lines)
+# =================================================================
+# Implements Section 3 probabilistic synchronization equivalence
+# (px = 1/Kx) and comprehensive communication reduction tracking
+# for generating RQ3/RQ4 figures.
+#
+# Reference: template_extraction_section3.txt CXXIII
+# Reference: Algorithm 1 line 14: "if t mod Kj = 0 then sync"
+# =================================================================
+
+import math as _math
+import hashlib as _hashlib
+
+
+class DESLOCProbabilisticSync:
+    """Probabilistic sync scheduler per Section 3.
+
+    Instead of deterministic "t mod Kx == 0", syncs with
+    probability px = 1/Kx each step. The paper proves these
+    are statistically equivalent for convergence analysis.
+
+    Uses a deterministic hash-based approach to ensure
+    reproducibility across workers without numpy.random.
+
+    Reference: Section 3: "we average with probability
+    px = 1/Kx, two approaches are statistically equivalent"
+    """
+
+    def __init__(self, Kx=32, Ku=96, Kv=192, seed=42,
+                 probabilistic=False):
+        self.Kx = Kx
+        self.Ku = Ku
+        self.Kv = Kv
+        self.px = 1.0 / max(Kx, 1)
+        self.pu = 1.0 / max(Ku, 1)
+        self.pv = 1.0 / max(Kv, 1)
+        self.seed = seed
+        self.probabilistic = probabilistic
+        self.step = 0
+        self.sync_x_count = 0
+        self.sync_u_count = 0
+        self.sync_v_count = 0
+
+    def _hash_decision(self, step, state_key):
+        """Deterministic pseudo-random decision using SHA256.
+
+        Ensures all workers make the same sync decision without
+        requiring a shared RNG state or numpy.random.
+        """
+        raw = f"{self.seed}:{step}:{state_key}"
+        h = _hashlib.sha256(raw.encode()).hexdigest()
+        # Convert first 8 hex chars to float in [0, 1)
+        val = int(h[:8], 16) / 0xFFFFFFFF
+        return val
+
+    def should_sync_x(self, step=None):
+        """Decide whether to sync parameters at this step."""
+        if step is None:
+            step = self.step
+        if not self.probabilistic:
+            return step % self.Kx == 0
+        return self._hash_decision(step, 'x') < self.px
+
+    def should_sync_u(self, step=None):
+        """Decide whether to sync first moment at this step."""
+        if step is None:
+            step = self.step
+        if not self.probabilistic:
+            return step % self.Ku == 0
+        return self._hash_decision(step, 'u') < self.pu
+
+    def should_sync_v(self, step=None):
+        """Decide whether to sync second moment at this step."""
+        if step is None:
+            step = self.step
+        if not self.probabilistic:
+            return step % self.Kv == 0
+        return self._hash_decision(step, 'v') < self.pv
+
+    def advance(self):
+        """Advance step and record sync counts."""
+        if self.should_sync_x():
+            self.sync_x_count += 1
+        if self.should_sync_u():
+            self.sync_u_count += 1
+        if self.should_sync_v():
+            self.sync_v_count += 1
+        self.step += 1
+
+    def get_empirical_rates(self):
+        """Get empirical sync rates."""
+        s = max(self.step, 1)
+        return {
+            'x_rate': self.sync_x_count / s,
+            'u_rate': self.sync_u_count / s,
+            'v_rate': self.sync_v_count / s,
+            'expected_x_rate': self.px,
+            'expected_u_rate': self.pu,
+            'expected_v_rate': self.pv,
+        }
+
+
+class DESLOCCommReductionTracker:
+    """Track communication reduction across training.
+
+    Records exact bytes communicated per step, per state type,
+    for generating the throughput and comm reduction figures
+    required by RQ3 and RQ4.
+
+    Data format follows NKI-FA commit da964f3 draw_plot.py:
+    precise numeric values from actual training, not synthetic.
+    """
+
+    def __init__(self, param_bytes=0, world_size=1):
+        self.param_bytes = param_bytes
+        self.world_size = world_size
+        self.step = 0
+        self.x_comm_bytes = 0
+        self.u_comm_bytes = 0
+        self.v_comm_bytes = 0
+        self.x_comm_count = 0
+        self.u_comm_count = 0
+        self.v_comm_count = 0
+        self.step_log = []
+        self.wallclock_start = None
+        self.step_times = []
+
+    def record_sync(self, state_type, num_bytes, elapsed_ms=0.0):
+        """Record a synchronization event.
+
+        Args:
+            state_type: 'x' (params), 'u' (first moment), 'v' (second)
+            num_bytes: bytes communicated in this allreduce
+            elapsed_ms: time taken for this communication
+        """
+        if state_type == 'x':
+            self.x_comm_bytes += num_bytes
+            self.x_comm_count += 1
+        elif state_type == 'u':
+            self.u_comm_bytes += num_bytes
+            self.u_comm_count += 1
+        elif state_type == 'v':
+            self.v_comm_bytes += num_bytes
+            self.v_comm_count += 1
+
+    def record_step(self, loss=None, lr=None, grad_norm=None):
+        """Record per-step metrics for the experiment log."""
+        total_bytes = (self.x_comm_bytes + self.u_comm_bytes +
+                       self.v_comm_bytes)
+        entry = {
+            'step': self.step,
+            'total_comm_bytes': total_bytes,
+            'x_comm_bytes': self.x_comm_bytes,
+            'u_comm_bytes': self.u_comm_bytes,
+            'v_comm_bytes': self.v_comm_bytes,
+            'x_comm_count': self.x_comm_count,
+            'u_comm_count': self.u_comm_count,
+            'v_comm_count': self.v_comm_count,
+        }
+        if loss is not None:
+            entry['loss'] = loss
+        if lr is not None:
+            entry['lr'] = lr
+        if grad_norm is not None:
+            entry['grad_norm'] = grad_norm
+        self.step_log.append(entry)
+        self.step += 1
+
+    def get_reduction_vs_ddp(self):
+        """Calculate comm reduction factor vs DDP.
+
+        DDP communicates all 3 states every step.
+        Factor = DDP_bytes / DES-LOC_bytes.
+        """
+        ddp_bytes = self.param_bytes * 3 * max(self.step, 1)
+        desloc_bytes = (self.x_comm_bytes + self.u_comm_bytes +
+                        self.v_comm_bytes)
+        if desloc_bytes == 0:
+            return float('inf')
+        return ddp_bytes / desloc_bytes
+
+    def get_reduction_vs_local_adam(self):
+        """Calculate comm reduction factor vs Local Adam.
+
+        Local Adam syncs all 3 states at the same frequency.
+        """
+        local_adam_bytes = self.param_bytes * 3 * self.x_comm_count
+        desloc_bytes = (self.x_comm_bytes + self.u_comm_bytes +
+                        self.v_comm_bytes)
+        if desloc_bytes == 0:
+            return float('inf')
+        return local_adam_bytes / desloc_bytes
+
+    def get_throughput_samples_per_sec(self, batch_size, elapsed_sec):
+        """Compute training throughput."""
+        if elapsed_sec <= 0:
+            return 0.0
+        return (self.step * batch_size) / elapsed_sec
+
+    def format_log_entry(self, step_idx):
+        """Format a log entry in the NKI-FA draw_plot.py style.
+
+        Example output:
+        ### step=100, Kx=32, loss=2.847, comm_bytes=15728640 ###
+        DES-LOC x_sync: 3, u_sync: 1, v_sync: 0
+        Reduction vs DDP: 5.33x, vs Local Adam: 2.00x
+        """
+        if step_idx >= len(self.step_log):
+            return ""
+        e = self.step_log[step_idx]
+        lines = []
+        header = f"### step={e['step']}"
+        if 'loss' in e:
+            header += f", loss={e['loss']:.4f}"
+        header += f", comm_bytes={e['total_comm_bytes']} ###"
+        lines.append(header)
+        lines.append(
+            f"DES-LOC x_sync: {e['x_comm_count']}, "
+            f"u_sync: {e['u_comm_count']}, "
+            f"v_sync: {e['v_comm_count']}")
+        return "\n".join(lines)
+
+    def export_for_plotting(self):
+        """Export data in format ready for matplotlib/seaborn.
+
+        Returns dict of lists suitable for pd.DataFrame construction,
+        following NKI-FA draw_plot.py convention.
+        """
+        steps = []
+        losses = []
+        comm_bytes_list = []
+        x_counts = []
+        u_counts = []
+        v_counts = []
+
+        for entry in self.step_log:
+            steps.append(entry['step'])
+            losses.append(entry.get('loss', None))
+            comm_bytes_list.append(entry['total_comm_bytes'])
+            x_counts.append(entry['x_comm_count'])
+            u_counts.append(entry['u_comm_count'])
+            v_counts.append(entry['v_comm_count'])
+
+        return {
+            'step': steps,
+            'loss': losses,
+            'total_comm_bytes': comm_bytes_list,
+            'x_sync_count': x_counts,
+            'u_sync_count': u_counts,
+            'v_sync_count': v_counts,
+            'reduction_vs_ddp': self.get_reduction_vs_ddp(),
+            'reduction_vs_local_adam': self.get_reduction_vs_local_adam(),
+        }
+
+
+class DESLOCThroughputMeter:
+    """Measure DES-LOC throughput vs DDP baseline.
+
+    Section 5.3: "This yields a 1.24× speedup over DDP and
+    2.01× over Local Adam at Kx=32"
+
+    Records wallclock times for compute vs communication to
+    calculate the overlap efficiency.
+    """
+
+    def __init__(self):
+        self.compute_times_ms = []
+        self.comm_times_ms = []
+        self.total_step_times_ms = []
+        self.step = 0
+
+    def record_compute(self, elapsed_ms):
+        """Record time spent on forward/backward pass."""
+        self.compute_times_ms.append(elapsed_ms)
+
+    def record_comm(self, elapsed_ms):
+        """Record time spent on communication."""
+        self.comm_times_ms.append(elapsed_ms)
+
+    def record_total_step(self, elapsed_ms):
+        """Record total step time (compute + comm + overhead)."""
+        self.total_step_times_ms.append(elapsed_ms)
+        self.step += 1
+
+    def get_avg_compute_ms(self):
+        if not self.compute_times_ms:
+            return 0.0
+        return sum(self.compute_times_ms) / len(self.compute_times_ms)
+
+    def get_avg_comm_ms(self):
+        if not self.comm_times_ms:
+            return 0.0
+        return sum(self.comm_times_ms) / len(self.comm_times_ms)
+
+    def get_avg_step_ms(self):
+        if not self.total_step_times_ms:
+            return 0.0
+        return (sum(self.total_step_times_ms) /
+                len(self.total_step_times_ms))
+
+    def get_comm_compute_ratio(self):
+        """Ratio of comm time to compute time."""
+        avg_comp = self.get_avg_compute_ms()
+        avg_comm = self.get_avg_comm_ms()
+        if avg_comp == 0:
+            return float('inf')
+        return avg_comm / avg_comp
+
+    def estimate_speedup_vs_ddp(self, ddp_comm_fraction=0.3):
+        """Estimate speedup based on communication reduction.
+
+        Args:
+            ddp_comm_fraction: fraction of DDP step time spent on comm
+        """
+        if not self.total_step_times_ms:
+            return 1.0
+        avg_step = self.get_avg_step_ms()
+        avg_comm = self.get_avg_comm_ms()
+        # DDP step time = compute + ddp_comm
+        # DES-LOC step time = compute + desloc_comm
+        compute_ms = avg_step - avg_comm
+        ddp_comm_ms = compute_ms * ddp_comm_fraction / (
+            1.0 - ddp_comm_fraction)
+        ddp_step_ms = compute_ms + ddp_comm_ms
+        if avg_step <= 0:
+            return 1.0
+        return ddp_step_ms / avg_step
+
+    def format_summary(self):
+        """Format throughput summary for experiment log.
+
+        Output follows NKI-FA structured log format.
+        """
+        lines = [
+            f"### Throughput Summary (steps={self.step}) ###",
+            f"Avg compute: {self.get_avg_compute_ms():.3f}ms",
+            f"Avg comm: {self.get_avg_comm_ms():.3f}ms",
+            f"Avg step: {self.get_avg_step_ms():.3f}ms",
+            f"Comm/Compute ratio: {self.get_comm_compute_ratio():.4f}",
+            f"Est. speedup vs DDP: "
+            f"{self.estimate_speedup_vs_ddp():.2f}x",
+        ]
+        return "\n".join(lines)
+
+
+# Global instances for convenience
+_desloc_prob_sync = None
+_desloc_comm_tracker = None
+_desloc_throughput_meter = None
+
+
+def init_desloc_probabilistic_sync(Kx=32, Ku=96, Kv=192,
+                                    seed=42, probabilistic=False):
+    """Initialize the global probabilistic sync scheduler."""
+    global _desloc_prob_sync
+    _desloc_prob_sync = DESLOCProbabilisticSync(
+        Kx=Kx, Ku=Ku, Kv=Kv, seed=seed,
+        probabilistic=probabilistic)
+    return _desloc_prob_sync
+
+
+def get_desloc_prob_sync():
+    """Get the global probabilistic sync scheduler."""
+    return _desloc_prob_sync
+
+
+def init_desloc_comm_tracker(param_bytes=0, world_size=1):
+    """Initialize the global communication reduction tracker."""
+    global _desloc_comm_tracker
+    _desloc_comm_tracker = DESLOCCommReductionTracker(
+        param_bytes=param_bytes, world_size=world_size)
+    return _desloc_comm_tracker
+
+
+def get_desloc_comm_tracker():
+    """Get the global communication tracker."""
+    return _desloc_comm_tracker
+
+
+def init_desloc_throughput_meter():
+    """Initialize the global throughput meter."""
+    global _desloc_throughput_meter
+    _desloc_throughput_meter = DESLOCThroughputMeter()
+    return _desloc_throughput_meter
+
+
+def get_desloc_throughput_meter():
+    """Get the global throughput meter."""
+    return _desloc_throughput_meter
+
+
+# =================================================================
+# End M064
+# =================================================================

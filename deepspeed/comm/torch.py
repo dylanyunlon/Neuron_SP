@@ -711,3 +711,415 @@ def get_desloc_torch_stats():
     if _global_desloc_torch_ar is not None:
         return _global_desloc_torch_ar.get_stats()
     return {'initialized': False}
+
+
+# =================================================================
+# M065: Ring-AllReduce Instrumented Ops + Nesterov Outer (400 lines)
+# =================================================================
+# Extends torch comm layer with:
+# 1. Bandwidth-optimal Ring-AllReduce timing hooks
+# 2. Nesterov outer optimizer integration (Section 5.5)
+# 3. Per-state allreduce routing for DES-LOC schedule
+#
+# Reference: Section 4.1 "bandwidth-optimal Ring-AllReduce"
+# Reference: template_extraction_from_latex.txt Ⅱ=Ring-AllReduce
+# =================================================================
+
+import time as _time
+import math as _math
+
+
+class DESLOCRingAllReduceProfiler:
+    """Profile Ring-AllReduce operations for DES-LOC.
+
+    Section 4.1: "bandwidth-optimal Ring-AllReduce"
+    Measures actual bandwidth utilization per sync event to
+    generate wallclock comparison figures.
+    """
+
+    def __init__(self, world_size=1):
+        self.world_size = world_size
+        self.op_log = []
+        self.total_bytes_sent = 0
+        self.total_time_ms = 0.0
+        self.op_count = 0
+
+    def start_op(self):
+        """Mark the start of an allreduce operation."""
+        return _time.monotonic()
+
+    def end_op(self, start_time, num_bytes, state_type='x',
+               op_type='allreduce'):
+        """Record completion of an allreduce operation.
+
+        Args:
+            start_time: from start_op()
+            num_bytes: bytes communicated
+            state_type: 'x', 'u', or 'v'
+            op_type: 'allreduce', 'broadcast', 'reduce_scatter'
+        """
+        elapsed = (_time.monotonic() - start_time) * 1000.0
+        self.total_bytes_sent += num_bytes
+        self.total_time_ms += elapsed
+        self.op_count += 1
+
+        # Ring-AllReduce: effective bandwidth = data_size * 2(N-1)/N / time
+        if self.world_size > 1 and elapsed > 0:
+            ring_factor = 2.0 * (self.world_size - 1) / self.world_size
+            effective_bw_gbps = (
+                num_bytes * ring_factor / (elapsed / 1000.0) / 1e9)
+        else:
+            effective_bw_gbps = 0.0
+
+        entry = {
+            'op_index': self.op_count,
+            'state_type': state_type,
+            'op_type': op_type,
+            'num_bytes': num_bytes,
+            'elapsed_ms': round(elapsed, 4),
+            'effective_bw_gbps': round(effective_bw_gbps, 2),
+        }
+        self.op_log.append(entry)
+        return entry
+
+    def get_avg_bandwidth_gbps(self):
+        """Get average effective bandwidth across all ops."""
+        if not self.op_log:
+            return 0.0
+        total_bw = sum(e['effective_bw_gbps'] for e in self.op_log)
+        return total_bw / len(self.op_log)
+
+    def get_bandwidth_by_state(self):
+        """Get bandwidth breakdown by state type."""
+        result = {}
+        for state in ('x', 'u', 'v'):
+            ops = [e for e in self.op_log
+                   if e['state_type'] == state]
+            if ops:
+                result[state] = {
+                    'count': len(ops),
+                    'total_bytes': sum(e['num_bytes'] for e in ops),
+                    'total_ms': sum(e['elapsed_ms'] for e in ops),
+                    'avg_bw_gbps': (
+                        sum(e['effective_bw_gbps'] for e in ops) /
+                        len(ops)),
+                }
+        return result
+
+    def format_log(self):
+        """Format profiler log in NKI-FA structured format."""
+        lines = [
+            f"### Ring-AllReduce Profile "
+            f"(world_size={self.world_size}, "
+            f"ops={self.op_count}) ###"
+        ]
+        by_state = self.get_bandwidth_by_state()
+        for state, stats in by_state.items():
+            lines.append(
+                f"State {state}: {stats['count']} ops, "
+                f"{stats['total_bytes']/1e6:.1f}MB, "
+                f"{stats['total_ms']:.1f}ms, "
+                f"avg {stats['avg_bw_gbps']:.1f} Gbps")
+        lines.append(
+            f"Overall avg bandwidth: "
+            f"{self.get_avg_bandwidth_gbps():.1f} Gbps")
+        return "\n".join(lines)
+
+
+class DESLOCNesterovOuterOptimizer:
+    """Nesterov momentum outer optimizer for DES-LOC.
+
+    Section 5.5: "using Nesterov as the outer optimizer improves
+    performance over averaging by ≈ 0.3%"
+
+    Applied at parameter sync points (when t mod Kx == 0).
+    Replaces simple E_m[x] averaging with Nesterov momentum.
+
+    Reference: template_extraction_section5.txt CXLV = Nesterov
+    """
+
+    def __init__(self, momentum=0.9, outer_lr=1.0):
+        self.momentum = momentum
+        self.outer_lr = outer_lr
+        self.velocity_buffers = {}
+        self.sync_count = 0
+
+    def apply(self, params, dp_group=None):
+        """Apply Nesterov outer step after parameter averaging.
+
+        For each parameter p:
+          1. Compute averaged params: p_avg = E_m[p]
+          2. v_{t+1} = momentum * v_t + (p_avg - p_local_before_avg)
+          3. p = p_avg + momentum * v_{t+1} (Nesterov lookahead)
+
+        But since dist.all_reduce(AVG) modifies p in-place,
+        we need to save pre-avg values.
+        """
+        import torch.distributed as _dist
+
+        pre_avg_snapshots = {}
+        for p in params:
+            if p.requires_grad:
+                pre_avg_snapshots[id(p)] = p.data.clone()
+
+        # Step 1: AllReduce average
+        for p in params:
+            if p.requires_grad:
+                _dist.all_reduce(p.data, op=_dist.ReduceOp.AVG,
+                                 group=dp_group)
+
+        # Step 2-3: Nesterov momentum update
+        for p in params:
+            if not p.requires_grad:
+                continue
+            pid = id(p)
+            if pid not in self.velocity_buffers:
+                self.velocity_buffers[pid] = p.data.new_zeros(
+                    p.data.shape)
+
+            v = self.velocity_buffers[pid]
+            delta = p.data - pre_avg_snapshots[pid]
+
+            # v = momentum * v + delta
+            v.mul_(self.momentum).add_(delta)
+
+            # Nesterov lookahead: p += momentum * v * outer_lr
+            p.data.add_(v, alpha=self.momentum * self.outer_lr)
+
+        self.sync_count += 1
+
+    def reset(self):
+        """Reset velocity buffers (e.g., after checkpoint load)."""
+        self.velocity_buffers.clear()
+        self.sync_count = 0
+
+    def get_stats(self):
+        """Get outer optimizer statistics."""
+        total_v_norm = 0.0
+        count = 0
+        for v in self.velocity_buffers.values():
+            total_v_norm += v.norm().item()
+            count += 1
+        return {
+            'sync_count': self.sync_count,
+            'momentum': self.momentum,
+            'outer_lr': self.outer_lr,
+            'num_params_tracked': count,
+            'avg_velocity_norm': (
+                total_v_norm / max(count, 1)),
+        }
+
+
+class DESLOCStateRouter:
+    """Route optimizer states to correct sync handler.
+
+    For Adam/ADOPT: routes x, u (exp_avg), v (exp_avg_sq)
+    For Muon: routes x and momentum_buffer only
+    For SGDM: routes x and momentum_buffer only
+
+    Section 5.6: "the relevant synchronization periods reduce
+    to parameters (Kx) and momentum (Ku)" for Muon
+    """
+
+    def __init__(self, optimizer_type='adam', Kx=32, Ku=96,
+                 Kv=192, profiler=None):
+        self.optimizer_type = optimizer_type
+        self.Kx = Kx
+        self.Ku = Ku
+        self.Kv = Kv
+        self.profiler = profiler
+        self.step = 0
+
+    def get_states_to_sync(self, step=None):
+        """Determine which states need syncing at this step.
+
+        Returns list of (state_key, state_type) tuples.
+        """
+        if step is None:
+            step = self.step
+        states = []
+
+        if step % self.Kx == 0:
+            states.append(('params', 'x'))
+
+        if self.optimizer_type in ('adam', 'adopt'):
+            if step % self.Ku == 0:
+                states.append(('exp_avg', 'u'))
+            if step % self.Kv == 0:
+                states.append(('exp_avg_sq', 'v'))
+        elif self.optimizer_type in ('muon', 'sgdm'):
+            if step % self.Ku == 0:
+                states.append(('momentum_buffer', 'u'))
+                # Also check exp_avg for Muon variants
+                states.append(('exp_avg', 'u'))
+
+        return states
+
+    def sync_optimizer_states(self, optimizer, dp_group=None):
+        """Execute state synchronization for current step.
+
+        Performs allreduce only for states that need syncing
+        according to DES-LOC schedule.
+        """
+        import torch.distributed as _dist
+
+        states_to_sync = self.get_states_to_sync()
+        if not states_to_sync:
+            self.step += 1
+            return {'synced': [], 'bytes': 0}
+
+        synced = []
+        total_bytes = 0
+
+        for pg in optimizer.param_groups:
+            for p in pg['params']:
+                if p.grad is None or p not in optimizer.state:
+                    continue
+                state = optimizer.state[p]
+
+                for state_key, state_type in states_to_sync:
+                    if state_key == 'params':
+                        continue  # params handled separately
+                    if state_key not in state:
+                        continue
+
+                    tensor = state[state_key]
+                    start = None
+                    if self.profiler is not None:
+                        start = self.profiler.start_op()
+
+                    _dist.all_reduce(tensor, op=_dist.ReduceOp.AVG,
+                                     group=dp_group)
+                    num_bytes = tensor.numel() * tensor.element_size()
+                    total_bytes += num_bytes
+
+                    if self.profiler is not None and start is not None:
+                        self.profiler.end_op(
+                            start, num_bytes, state_type)
+
+        synced_types = [s[1] for s in states_to_sync]
+        self.step += 1
+        return {'synced': synced_types, 'bytes': total_bytes}
+
+    def get_sync_summary(self):
+        """Get summary of sync decisions made."""
+        total_steps = max(self.step, 1)
+        x_syncs = total_steps // max(self.Kx, 1)
+        u_syncs = total_steps // max(self.Ku, 1)
+        summary = {
+            'optimizer_type': self.optimizer_type,
+            'total_steps': total_steps,
+            'x_syncs': x_syncs,
+            'u_syncs': u_syncs,
+        }
+        if self.optimizer_type in ('adam', 'adopt'):
+            v_syncs = total_steps // max(self.Kv, 1)
+            summary['v_syncs'] = v_syncs
+            summary['total_syncs'] = x_syncs + u_syncs + v_syncs
+            ddp_syncs = total_steps * 3
+        else:
+            summary['total_syncs'] = x_syncs + u_syncs
+            ddp_syncs = total_steps * 2
+        summary['ddp_equivalent_syncs'] = ddp_syncs
+        summary['reduction_factor'] = (
+            ddp_syncs / max(summary['total_syncs'], 1))
+        return summary
+
+
+class DESLOCGradientClipper:
+    """Per-coordinate gradient clipping from Algorithm 1.
+
+    Section 2: "clip(g, ρ)_i = sign(g_i) * min(|g_i|, ρ)"
+
+    Records clipping statistics for experiment logs.
+    """
+
+    def __init__(self, clip_radius=1.0):
+        self.clip_radius = clip_radius
+        self.total_elements = 0
+        self.clipped_elements = 0
+        self.clip_count = 0
+
+    def clip(self, parameters):
+        """Apply per-coordinate clipping to all parameter gradients.
+
+        Returns:
+            dict with clipping statistics
+        """
+        total = 0
+        clipped = 0
+        for p in parameters:
+            if p.grad is None:
+                continue
+            grad = p.grad.data
+            total += grad.numel()
+            mask = grad.abs() > self.clip_radius
+            clipped += mask.sum().item()
+            grad.clamp_(-self.clip_radius, self.clip_radius)
+
+        self.total_elements += total
+        self.clipped_elements += clipped
+        self.clip_count += 1
+
+        clip_ratio = clipped / max(total, 1)
+        return {
+            'clip_radius': self.clip_radius,
+            'total_elements': total,
+            'clipped_elements': clipped,
+            'clip_ratio': clip_ratio,
+        }
+
+    def get_cumulative_stats(self):
+        """Get cumulative clipping statistics."""
+        return {
+            'clip_radius': self.clip_radius,
+            'total_clips': self.clip_count,
+            'cumulative_elements': self.total_elements,
+            'cumulative_clipped': self.clipped_elements,
+            'cumulative_clip_ratio': (
+                self.clipped_elements /
+                max(self.total_elements, 1)),
+        }
+
+
+# Global profiler and router instances
+_desloc_ring_profiler = None
+_desloc_nesterov_outer = None
+_desloc_state_router = None
+_desloc_grad_clipper = None
+
+
+def init_desloc_ring_profiler(world_size=1):
+    """Initialize global Ring-AllReduce profiler."""
+    global _desloc_ring_profiler
+    _desloc_ring_profiler = DESLOCRingAllReduceProfiler(world_size)
+    return _desloc_ring_profiler
+
+
+def init_desloc_nesterov_outer(momentum=0.9, outer_lr=1.0):
+    """Initialize global Nesterov outer optimizer."""
+    global _desloc_nesterov_outer
+    _desloc_nesterov_outer = DESLOCNesterovOuterOptimizer(
+        momentum, outer_lr)
+    return _desloc_nesterov_outer
+
+
+def init_desloc_state_router(optimizer_type='adam', Kx=32,
+                              Ku=96, Kv=192):
+    """Initialize global state router."""
+    global _desloc_state_router
+    _desloc_state_router = DESLOCStateRouter(
+        optimizer_type, Kx, Ku, Kv, _desloc_ring_profiler)
+    return _desloc_state_router
+
+
+def init_desloc_grad_clipper(clip_radius=1.0):
+    """Initialize global gradient clipper."""
+    global _desloc_grad_clipper
+    _desloc_grad_clipper = DESLOCGradientClipper(clip_radius)
+    return _desloc_grad_clipper
+
+
+# =================================================================
+# End M065
+# =================================================================

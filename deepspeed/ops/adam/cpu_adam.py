@@ -561,3 +561,287 @@ class DESLOCCPUAdam(torch.optim.Optimizer):
                 (n * 3) / max(self._sync_x_count + self._sync_u_count +
                               self._sync_v_count, 1), 2),
         }
+
+
+# =================================================================
+# M068: DES-LOC CPUAdam ZeRO-Offload State Sync (400 lines)
+# =================================================================
+# Extends DESLOCCPUAdam with ZeRO-Offload-aware state sync.
+# When optimizer states are on CPU (ZeRO Stage 2/3 offload),
+# DES-LOC must coordinate GPU↔CPU transfers with sync schedule.
+#
+# Reference: Section 4.1 "Ring-AllReduce"
+# Reference: DeepSpeed ZeRO-Offload architecture
+# =================================================================
+
+import time as _time
+import math as _math
+
+
+class DESLOCCPUOffloadSync:
+    """Manage DES-LOC state sync with CPU-offloaded states.
+
+    When ZeRO-Offload moves optimizer states to CPU:
+    1. States live on CPU memory
+    2. Allreduce requires GPU-side communication
+    3. DES-LOC must schedule CPU→GPU→allreduce→CPU transfers
+
+    This class batches transfers to minimize PCIe overhead.
+    """
+
+    def __init__(self, Kx=32, Ku=96, Kv=192, pin_memory=True):
+        self.Kx = Kx
+        self.Ku = Ku
+        self.Kv = Kv
+        self.pin_memory = pin_memory
+        self.step = 0
+        self.transfer_log = []
+        self.total_cpu_to_gpu_bytes = 0
+        self.total_gpu_to_cpu_bytes = 0
+        self.total_transfer_time_ms = 0.0
+
+    def should_sync(self, state_type):
+        """Check if sync needed for state at current step."""
+        if state_type == 'x':
+            return self.step % self.Kx == 0
+        elif state_type == 'u':
+            return self.step % self.Ku == 0
+        elif state_type == 'v':
+            return self.step % self.Kv == 0
+        return False
+
+    def sync_cpu_state(self, cpu_tensor, device, state_type,
+                       dp_group=None):
+        """Sync a CPU-resident optimizer state via GPU allreduce.
+
+        Steps:
+        1. Copy CPU tensor → GPU (pinned → device)
+        2. AllReduce on GPU
+        3. Copy GPU tensor → CPU (device → pinned)
+        """
+        import torch
+        import torch.distributed as dist
+
+        if not self.should_sync(state_type):
+            return 0
+
+        start = _time.monotonic()
+
+        # Step 1: CPU → GPU
+        if self.pin_memory and not cpu_tensor.is_pinned():
+            gpu_tensor = cpu_tensor.to(device, non_blocking=True)
+        else:
+            gpu_tensor = cpu_tensor.to(device, non_blocking=True)
+
+        torch.cuda.synchronize(device)
+        num_bytes = cpu_tensor.numel() * cpu_tensor.element_size()
+        self.total_cpu_to_gpu_bytes += num_bytes
+
+        # Step 2: AllReduce on GPU
+        if dist.is_initialized() and dist.get_world_size() > 1:
+            dist.all_reduce(gpu_tensor, op=dist.ReduceOp.AVG,
+                            group=dp_group)
+
+        # Step 3: GPU → CPU
+        cpu_tensor.copy_(gpu_tensor, non_blocking=True)
+        torch.cuda.synchronize(device)
+        self.total_gpu_to_cpu_bytes += num_bytes
+
+        elapsed_ms = (_time.monotonic() - start) * 1000.0
+        self.total_transfer_time_ms += elapsed_ms
+
+        self.transfer_log.append({
+            'step': self.step,
+            'state_type': state_type,
+            'bytes': num_bytes,
+            'time_ms': round(elapsed_ms, 4),
+        })
+
+        return num_bytes
+
+    def sync_all_states(self, optimizer, device, dp_group=None):
+        """Sync all optimizer states that need syncing.
+
+        Iterates over optimizer state dict and syncs CPU tensors
+        that are due according to DES-LOC schedule.
+        """
+        total_bytes = 0
+        for pg in optimizer.param_groups:
+            for p in pg['params']:
+                if p not in optimizer.state:
+                    continue
+                state = optimizer.state[p]
+
+                # First moment (u / exp_avg)
+                if 'exp_avg' in state and state['exp_avg'].is_cpu:
+                    total_bytes += self.sync_cpu_state(
+                        state['exp_avg'], device, 'u', dp_group)
+
+                # Second moment (v / exp_avg_sq)
+                if 'exp_avg_sq' in state and state['exp_avg_sq'].is_cpu:
+                    total_bytes += self.sync_cpu_state(
+                        state['exp_avg_sq'], device, 'v', dp_group)
+
+        self.step += 1
+        return total_bytes
+
+    def get_stats(self):
+        """Get offload sync statistics."""
+        return {
+            'total_steps': self.step,
+            'Kx': self.Kx, 'Ku': self.Ku, 'Kv': self.Kv,
+            'cpu_to_gpu_bytes': self.total_cpu_to_gpu_bytes,
+            'gpu_to_cpu_bytes': self.total_gpu_to_cpu_bytes,
+            'total_transfer_time_ms': round(
+                self.total_transfer_time_ms, 2),
+            'num_transfers': len(self.transfer_log),
+        }
+
+    def format_log(self):
+        """Format offload sync log."""
+        s = self.get_stats()
+        lines = [
+            f"### CPU Offload Sync "
+            f"(Kx={s['Kx']}, Ku={s['Ku']}, Kv={s['Kv']}) ###",
+            f"Steps: {s['total_steps']}",
+            f"CPU→GPU: {s['cpu_to_gpu_bytes']/1e6:.1f}MB",
+            f"GPU→CPU: {s['gpu_to_cpu_bytes']/1e6:.1f}MB",
+            f"Transfer time: {s['total_transfer_time_ms']:.1f}ms",
+            f"Transfers: {s['num_transfers']}",
+        ]
+        return "\n".join(lines)
+
+
+class DESLOCGradientVarianceTracker:
+    """Track gradient variance per parameter for Theorem 1.
+
+    Assumption 2: E[‖g^m - ∇f_m(x)‖²] ≤ σ²
+
+    Estimates σ² empirically to validate convergence bound
+    and generate RQ1 supplementary data.
+    """
+
+    def __init__(self, window_size=100):
+        self.window_size = window_size
+        self.grad_sq_sums = {}
+        self.grad_sums = {}
+        self.counts = {}
+        self.variance_history = []
+
+    def record_gradient(self, param_id, grad_tensor):
+        """Record gradient for variance estimation."""
+        grad_flat = grad_tensor.flatten()
+        grad_norm_sq = grad_flat.dot(grad_flat).item()
+        grad_sum = grad_flat.sum().item()
+        n = grad_flat.numel()
+
+        if param_id not in self.grad_sq_sums:
+            self.grad_sq_sums[param_id] = 0.0
+            self.grad_sums[param_id] = 0.0
+            self.counts[param_id] = 0
+
+        self.grad_sq_sums[param_id] += grad_norm_sq / n
+        self.grad_sums[param_id] += grad_sum / n
+        self.counts[param_id] += 1
+
+    def estimate_variance(self, param_id):
+        """Estimate gradient variance for a parameter.
+
+        Var(g) = E[g²] - (E[g])²
+        """
+        if param_id not in self.counts or self.counts[param_id] < 2:
+            return 0.0
+        n = self.counts[param_id]
+        mean_sq = self.grad_sq_sums[param_id] / n
+        mean = self.grad_sums[param_id] / n
+        return max(mean_sq - mean * mean, 0.0)
+
+    def get_global_variance_estimate(self):
+        """Get σ² estimate across all parameters."""
+        if not self.counts:
+            return 0.0
+        total_var = 0.0
+        count = 0
+        for pid in self.counts:
+            total_var += self.estimate_variance(pid)
+            count += 1
+        if count == 0:
+            return 0.0
+        avg_var = total_var / count
+        self.variance_history.append(avg_var)
+        return avg_var
+
+    def get_summary(self):
+        """Get variance tracking summary."""
+        return {
+            'num_params_tracked': len(self.counts),
+            'total_samples': sum(self.counts.values()),
+            'global_variance': self.get_global_variance_estimate(),
+            'variance_history_len': len(self.variance_history),
+            'recent_variance': (
+                self.variance_history[-1]
+                if self.variance_history else 0.0),
+        }
+
+
+class DESLOCParameterPartitioner:
+    """Partition parameters for efficient DES-LOC sync.
+
+    Groups parameters by size and type to batch allreduce
+    operations, reducing kernel launch overhead.
+    """
+
+    def __init__(self, bucket_size_mb=25):
+        self.bucket_size_bytes = bucket_size_mb * 1024 * 1024
+        self.buckets = {'x': [], 'u': [], 'v': []}
+        self.bucket_sizes = {'x': 0, 'u': 0, 'v': 0}
+
+    def add_parameter(self, param, state_type='x'):
+        """Add parameter to appropriate bucket."""
+        size = param.numel() * param.element_size()
+        self.buckets[state_type].append(param)
+        self.bucket_sizes[state_type] += size
+
+    def get_buckets(self, state_type):
+        """Get parameter buckets ready for batched allreduce."""
+        params = self.buckets.get(state_type, [])
+        if not params:
+            return []
+
+        # Group into buckets of bucket_size_bytes
+        groups = []
+        current_group = []
+        current_size = 0
+
+        for p in params:
+            p_size = p.numel() * p.element_size()
+            if current_size + p_size > self.bucket_size_bytes and current_group:
+                groups.append(current_group)
+                current_group = []
+                current_size = 0
+            current_group.append(p)
+            current_size += p_size
+
+        if current_group:
+            groups.append(current_group)
+        return groups
+
+    def get_stats(self):
+        """Get partitioning statistics."""
+        return {
+            'bucket_size_mb': self.bucket_size_bytes / (1024 * 1024),
+            'x_params': len(self.buckets['x']),
+            'u_params': len(self.buckets['u']),
+            'v_params': len(self.buckets['v']),
+            'x_bytes': self.bucket_sizes['x'],
+            'u_bytes': self.bucket_sizes['u'],
+            'v_bytes': self.bucket_sizes['v'],
+            'x_buckets': len(self.get_buckets('x')),
+            'u_buckets': len(self.get_buckets('u')),
+            'v_buckets': len(self.get_buckets('v')),
+        }
+
+
+# =================================================================
+# End M068
+# =================================================================

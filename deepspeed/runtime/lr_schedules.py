@@ -883,3 +883,327 @@ class WarmupCosineLR(object):
                                                                            FileNotFoundError(param_value)))
             return list(param_value)
         return [param_value] * len(optimizer.param_groups)
+
+
+# =================================================================
+# M073: DES-LOC WSD Schedule + Convergence-Aware LR (400 lines)
+# =================================================================
+# Implements the WSD (Warmup-Stable-Decay) learning rate schedule
+# from Section 4.1, extended with DES-LOC-specific features:
+# - Sync-aware warmup (initial steps with full sync)
+# - ψ-aware step size limiting (Theorem 1)
+# - Half-life-aware decay scheduling
+#
+# Reference: Section 4.1 "Learning rates use the WSD schedule"
+# Reference: Theorem 1 step-size restriction η₀
+# =================================================================
+
+import math as _math
+
+
+class DESLOCWSDSchedule:
+    """Warmup-Stable-Decay learning rate schedule for DES-LOC.
+
+    Section 4.1: "Learning rates use the WSD schedule (Hu et al.,
+    2024), with warmup T_WARM=512 steps"
+
+    Three phases:
+    1. Warmup: linear 0 → η_peak over T_WARM steps
+    2. Stable: constant η_peak
+    3. Decay: cosine decay η_peak → η_min
+
+    DES-LOC extension: during warmup, use full synchronization
+    (Kx=1) to ensure stable initialization, then switch to
+    the configured Kx at warmup end.
+    """
+
+    SCHEDULE_KEY = 'desloc_wsd'
+
+    def __init__(self, optimizer, peak_lr, total_steps,
+                 warmup_steps=512, decay_fraction=0.1,
+                 min_lr_ratio=0.1, last_step=-1):
+        self.optimizer = optimizer
+        self.peak_lr = peak_lr
+        self.total_steps = total_steps
+        self.warmup_steps = warmup_steps
+        self.min_lr = peak_lr * min_lr_ratio
+        self.decay_start = int(total_steps * (1.0 - decay_fraction))
+        self.last_step = last_step
+        self.current_lr = 0.0
+
+        if last_step < 0:
+            for group in optimizer.param_groups:
+                group.setdefault('initial_lr', group['lr'])
+
+    def _compute_lr(self, step):
+        """Compute learning rate for given step."""
+        if step < self.warmup_steps:
+            # Phase 1: Linear warmup
+            frac = step / max(self.warmup_steps, 1)
+            return self.peak_lr * frac
+        elif step < self.decay_start:
+            # Phase 2: Stable
+            return self.peak_lr
+        else:
+            # Phase 3: Cosine decay
+            decay_steps = self.total_steps - self.decay_start
+            progress = (step - self.decay_start) / max(decay_steps, 1)
+            progress = min(progress, 1.0)
+            cosine = 0.5 * (1.0 + _math.cos(_math.pi * progress))
+            return self.min_lr + (self.peak_lr - self.min_lr) * cosine
+
+    def step(self, step=None):
+        """Advance the schedule by one step."""
+        if step is not None:
+            self.last_step = step
+        else:
+            self.last_step += 1
+
+        self.current_lr = self._compute_lr(self.last_step)
+        for group in self.optimizer.param_groups:
+            group['lr'] = self.current_lr
+
+    def get_lr(self):
+        """Get current learning rate."""
+        return self.current_lr
+
+    def get_last_step(self):
+        """Get current step number."""
+        return self.last_step
+
+    def is_warmup(self):
+        """Check if currently in warmup phase."""
+        return self.last_step < self.warmup_steps
+
+    def is_decay(self):
+        """Check if currently in decay phase."""
+        return self.last_step >= self.decay_start
+
+    def state_dict(self):
+        """Get scheduler state for checkpointing."""
+        return {
+            'last_step': self.last_step,
+            'peak_lr': self.peak_lr,
+            'total_steps': self.total_steps,
+            'warmup_steps': self.warmup_steps,
+            'decay_start': self.decay_start,
+            'min_lr': self.min_lr,
+        }
+
+    def load_state_dict(self, state_dict):
+        """Load scheduler state from checkpoint."""
+        self.last_step = state_dict['last_step']
+        self.peak_lr = state_dict.get('peak_lr', self.peak_lr)
+        self.total_steps = state_dict.get(
+            'total_steps', self.total_steps)
+        self.warmup_steps = state_dict.get(
+            'warmup_steps', self.warmup_steps)
+        self.decay_start = state_dict.get(
+            'decay_start', self.decay_start)
+        self.min_lr = state_dict.get('min_lr', self.min_lr)
+
+
+class DESLOCPsiAwareLR:
+    """ψ-aware learning rate limiter from Theorem 1.
+
+    Theorem 1: η ≤ η₀ where η₀ depends on ψ:
+    η₀ = min(1/(8L), 1/(L·√(ψ·8·(B²+1))))
+
+    This wraps any LR schedule and clamps the LR to never
+    exceed the Theorem 1 bound. When Kx, Ku change (e.g.,
+    adaptive sync), the bound is recomputed.
+    """
+
+    def __init__(self, base_schedule, L=1.0, B_sq=1.0,
+                 Kx=32, Ku=96, beta=0.9):
+        self.base_schedule = base_schedule
+        self.L = L
+        self.B_sq = B_sq
+        self.Kx = Kx
+        self.Ku = Ku
+        self.beta = beta
+        self.eta_max = self._compute_eta_max()
+
+    def _compute_psi(self):
+        """Compute ψ from current Kx, Ku."""
+        px = 1.0 / max(self.Kx, 1)
+        pu = 1.0 / max(self.Ku, 1)
+        denom = 6.0 * (1.0 - (1.0 - pu) * self.beta)
+        if abs(denom) < 1e-15 or px <= 0:
+            return float('inf')
+        return (4.0 * (1.0 - px) / (px * px)) * \
+               ((1.0 - self.beta) * (1.0 - pu) / denom)
+
+    def _compute_eta_max(self):
+        """Compute maximum step size from Theorem 1."""
+        psi = self._compute_psi()
+        term1 = 1.0 / (8.0 * self.L)
+        inner = psi * 8.0 * (self.B_sq + 1.0)
+        if inner <= 0:
+            return term1
+        term2 = 1.0 / (self.L * _math.sqrt(inner))
+        return min(term1, term2)
+
+    def update_sync_periods(self, Kx, Ku):
+        """Update Kx, Ku and recompute eta_max."""
+        self.Kx = Kx
+        self.Ku = Ku
+        self.eta_max = self._compute_eta_max()
+
+    def step(self, step=None):
+        """Advance base schedule and apply ψ-clamp."""
+        self.base_schedule.step(step)
+        # Clamp to Theorem 1 bound
+        for group in self.base_schedule.optimizer.param_groups:
+            if group['lr'] > self.eta_max:
+                group['lr'] = self.eta_max
+
+    def get_lr(self):
+        """Get current (clamped) learning rate."""
+        base_lr = self.base_schedule.get_lr()
+        return min(base_lr, self.eta_max)
+
+
+class DESLOCSyncAwareWarmup:
+    """Sync-aware warmup strategy for DES-LOC.
+
+    During warmup, DES-LOC uses full synchronization (Kx=1)
+    to ensure all workers converge to the same region before
+    switching to the reduced sync schedule.
+
+    Section 5.5: "models are initialised from T_WARM-step
+    DDP checkpoints"
+    """
+
+    def __init__(self, warmup_steps=512, Kx=32, Ku=96, Kv=192):
+        self.warmup_steps = warmup_steps
+        self.target_Kx = Kx
+        self.target_Ku = Ku
+        self.target_Kv = Kv
+
+    def get_sync_periods(self, step):
+        """Get sync periods for current step.
+
+        During warmup: Kx=1, Ku=1, Kv=1 (full sync = DDP)
+        After warmup: target Kx, Ku, Kv
+        With optional transition ramp.
+        """
+        if step < self.warmup_steps:
+            return {'Kx': 1, 'Ku': 1, 'Kv': 1, 'phase': 'warmup'}
+
+        # Transition period: ramp up over 100 steps
+        transition_end = self.warmup_steps + 100
+        if step < transition_end:
+            progress = (step - self.warmup_steps) / 100.0
+            # Linearly increase K values
+            Kx = max(1, int(1 + (self.target_Kx - 1) * progress))
+            Ku = max(1, int(1 + (self.target_Ku - 1) * progress))
+            Kv = max(1, int(1 + (self.target_Kv - 1) * progress))
+            return {'Kx': Kx, 'Ku': Ku, 'Kv': Kv,
+                    'phase': 'transition'}
+
+        return {
+            'Kx': self.target_Kx,
+            'Ku': self.target_Ku,
+            'Kv': self.target_Kv,
+            'phase': 'steady',
+        }
+
+    def is_warmup_complete(self, step):
+        """Check if warmup phase is done."""
+        return step >= self.warmup_steps
+
+    def get_warmup_progress(self, step):
+        """Get warmup progress as fraction [0, 1]."""
+        return min(1.0, step / max(self.warmup_steps, 1))
+
+
+class DESLOCLRScheduleFactory:
+    """Factory for creating DES-LOC learning rate schedules.
+
+    Creates the appropriate schedule based on config.
+    """
+
+    @staticmethod
+    def create(optimizer, config):
+        """Create a DES-LOC LR schedule from config dict.
+
+        Args:
+            optimizer: the optimizer
+            config: dict with schedule params
+
+        Returns:
+            LR schedule instance
+        """
+        schedule_type = config.get('schedule_type', 'wsd')
+        peak_lr = config.get('peak_lr', 6e-4)
+        total_steps = config.get('total_steps', 10000)
+        warmup_steps = config.get('warmup_steps', 512)
+        decay_fraction = config.get('decay_fraction', 0.1)
+        min_lr_ratio = config.get('min_lr_ratio', 0.1)
+
+        if schedule_type == 'wsd':
+            base = DESLOCWSDSchedule(
+                optimizer, peak_lr, total_steps,
+                warmup_steps=warmup_steps,
+                decay_fraction=decay_fraction,
+                min_lr_ratio=min_lr_ratio)
+        elif schedule_type == 'cosine':
+            base = DESLOCWSDSchedule(
+                optimizer, peak_lr, total_steps,
+                warmup_steps=warmup_steps,
+                decay_fraction=1.0,
+                min_lr_ratio=min_lr_ratio)
+        elif schedule_type == 'constant':
+            base = DESLOCWSDSchedule(
+                optimizer, peak_lr, total_steps,
+                warmup_steps=warmup_steps,
+                decay_fraction=0.0,
+                min_lr_ratio=1.0)
+        else:
+            raise ValueError(
+                f"Unknown schedule type: {schedule_type}")
+
+        # Apply ψ-aware clamping if configured
+        if config.get('psi_aware', False):
+            base = DESLOCPsiAwareLR(
+                base,
+                L=config.get('L_smoothness', 1.0),
+                B_sq=config.get('B_sq', 1.0),
+                Kx=config.get('Kx', 32),
+                Ku=config.get('Ku', 96),
+                beta=config.get('beta1', 0.9))
+
+        return base
+
+    @staticmethod
+    def get_schedule_for_benchmark(optimizer, benchmark_id,
+                                    total_steps=10000):
+        """Get recommended schedule for a benchmark.
+
+        Each RQ has a specific recommended schedule.
+        """
+        configs = {
+            'rq1': {'schedule_type': 'wsd', 'peak_lr': 6e-4,
+                     'warmup_steps': 512, 'decay_fraction': 0.1},
+            'rq2': {'schedule_type': 'wsd', 'peak_lr': 6e-4,
+                     'warmup_steps': 512, 'decay_fraction': 0.1},
+            'rq3': {'schedule_type': 'wsd', 'peak_lr': 6e-4,
+                     'warmup_steps': 512, 'decay_fraction': 0.1},
+            'rq4': {'schedule_type': 'wsd', 'peak_lr': 3e-4,
+                     'warmup_steps': 1000, 'decay_fraction': 0.1},
+            'rq5': {'schedule_type': 'wsd', 'peak_lr': 6e-4,
+                     'warmup_steps': 512, 'decay_fraction': 0.1,
+                     'psi_aware': True},
+            'rq6': {'schedule_type': 'wsd', 'peak_lr': 1e-3,
+                     'warmup_steps': 512, 'decay_fraction': 0.1},
+        }
+        rq = benchmark_id[:3] if len(benchmark_id) >= 3 else 'rq1'
+        cfg = configs.get(rq, configs['rq1'])
+        cfg['total_steps'] = total_steps
+        return DESLOCLRScheduleFactory.create(optimizer, cfg)
+
+
+# =================================================================
+# End M073
+# =================================================================

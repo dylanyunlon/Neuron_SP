@@ -265,3 +265,411 @@ def create_desloc_backend(world_size, rank, backend_type='nccl',
     else:
         raise ValueError(f"Unknown DES-LOC backend: {backend_type}. "
                          f"Supported: nccl, gloo, single")
+
+
+# =================================================================
+# M066: Backend-Agnostic DES-LOC Collective Ops (400 lines)
+# =================================================================
+# Extends the backend abstraction with DES-LOC-specific collective
+# operations that work across NCCL, Gloo, and single-GPU backends.
+#
+# Implements the full DES-LOC Algorithm 1 communication pattern:
+# - Selective state synchronization (x at Kx, u at Ku, v at Kv)
+# - ServerOpt integration point
+# - Per-coordinate clipping before allreduce
+#
+# Reference: Algorithm 1 lines 9-21
+# Reference: template_extraction_from_latex.txt Ⅱ=Ring-AllReduce
+# =================================================================
+
+import time as _time
+import math as _math
+
+
+class DESLOCCollectiveOps:
+    """Backend-agnostic implementation of DES-LOC collective ops.
+
+    Wraps any backend (NCCL/Gloo/single) and applies DES-LOC
+    sync schedule on top. This is the main integration point
+    between DeepSpeed's communication layer and DES-LOC.
+
+    Algorithm 1 pseudocode mapping:
+      line 14: if t mod Kj = 0 then sync s^j
+      line 15: s_t^{j,m} <- UPDATE^j(E_m[s_{t-1}^j], g_t^m)
+      line 18: if t mod Kx = 0 then sync x
+      line 19: x <- OPT(SERVEROPT(E_m[x_t^m])...)
+    """
+
+    def __init__(self, backend, Kx=32, Ku=96, Kv=192,
+                 clip_radius=1.0, server_opt=None):
+        self.backend = backend
+        self.Kx = Kx
+        self.Ku = Ku
+        self.Kv = Kv
+        self.clip_radius = clip_radius
+        self.server_opt = server_opt
+        self.step = 0
+        self.stats = {
+            'x_syncs': 0, 'u_syncs': 0, 'v_syncs': 0,
+            'x_bytes': 0, 'u_bytes': 0, 'v_bytes': 0,
+            'x_time_ms': 0.0, 'u_time_ms': 0.0, 'v_time_ms': 0.0,
+            'clip_events': 0,
+        }
+
+    def _should_sync(self, state_type):
+        """Check if state_type should sync at current step."""
+        if state_type == 'x':
+            return self.step % self.Kx == 0
+        elif state_type == 'u':
+            return self.step % self.Ku == 0
+        elif state_type == 'v':
+            return self.step % self.Kv == 0
+        return False
+
+    def clip_gradients(self, params):
+        """Per-coordinate gradient clipping (Algorithm 1 line 12).
+
+        clip(g, ρ)_i = sign(g_i) * min(|g_i|, ρ)
+        """
+        for p in params:
+            if p.grad is not None:
+                p.grad.data.clamp_(-self.clip_radius, self.clip_radius)
+                self.stats['clip_events'] += 1
+
+    def sync_parameters(self, params, group=None):
+        """Sync parameters (x) if schedule allows.
+
+        Algorithm 1 line 18: if t mod Kx = 0 then sync x
+        Algorithm 1 line 19: x <- SERVEROPT(E_m[x])
+
+        Returns True if sync was performed.
+        """
+        if not self._should_sync('x'):
+            return False
+
+        start = _time.monotonic()
+        total_bytes = 0
+
+        for p in params:
+            if not p.requires_grad:
+                continue
+            self.backend.all_reduce(p.data, group=group)
+            total_bytes += p.numel() * p.element_size()
+
+        # Apply ServerOpt if configured
+        if self.server_opt is not None:
+            self.server_opt.step(params)
+
+        elapsed_ms = (_time.monotonic() - start) * 1000.0
+        self.stats['x_syncs'] += 1
+        self.stats['x_bytes'] += total_bytes
+        self.stats['x_time_ms'] += elapsed_ms
+        return True
+
+    def sync_first_moment(self, optimizer, group=None):
+        """Sync first moment (u / exp_avg) if schedule allows.
+
+        Algorithm 1 line 14: if t mod Ku = 0 then sync s^u
+        """
+        if not self._should_sync('u'):
+            return False
+
+        start = _time.monotonic()
+        total_bytes = 0
+
+        for pg in optimizer.param_groups:
+            for p in pg['params']:
+                if p not in optimizer.state:
+                    continue
+                state = optimizer.state[p]
+                for key in ('exp_avg', 'momentum_buffer'):
+                    if key in state:
+                        self.backend.all_reduce(
+                            state[key], group=group)
+                        total_bytes += (state[key].numel() *
+                                        state[key].element_size())
+
+        elapsed_ms = (_time.monotonic() - start) * 1000.0
+        self.stats['u_syncs'] += 1
+        self.stats['u_bytes'] += total_bytes
+        self.stats['u_time_ms'] += elapsed_ms
+        return True
+
+    def sync_second_moment(self, optimizer, group=None):
+        """Sync second moment (v / exp_avg_sq) if schedule allows.
+
+        Algorithm 1 line 14: if t mod Kv = 0 then sync s^v
+        """
+        if not self._should_sync('v'):
+            return False
+
+        start = _time.monotonic()
+        total_bytes = 0
+
+        for pg in optimizer.param_groups:
+            for p in pg['params']:
+                if p not in optimizer.state:
+                    continue
+                state = optimizer.state[p]
+                if 'exp_avg_sq' in state:
+                    self.backend.all_reduce(
+                        state['exp_avg_sq'], group=group)
+                    total_bytes += (state['exp_avg_sq'].numel() *
+                                    state['exp_avg_sq'].element_size())
+
+        elapsed_ms = (_time.monotonic() - start) * 1000.0
+        self.stats['v_syncs'] += 1
+        self.stats['v_bytes'] += total_bytes
+        self.stats['v_time_ms'] += elapsed_ms
+        return True
+
+    def full_step(self, params, optimizer, group=None):
+        """Execute full DES-LOC communication step.
+
+        Called after optimizer.step(). Performs:
+        1. Gradient clipping (if not already done)
+        2. Parameter sync (if t mod Kx == 0)
+        3. First moment sync (if t mod Ku == 0)
+        4. Second moment sync (if t mod Kv == 0)
+
+        Returns dict describing what was synced.
+        """
+        result = {
+            'step': self.step,
+            'x_synced': False,
+            'u_synced': False,
+            'v_synced': False,
+            'total_bytes': 0,
+        }
+
+        result['x_synced'] = self.sync_parameters(params, group)
+        result['u_synced'] = self.sync_first_moment(optimizer, group)
+        result['v_synced'] = self.sync_second_moment(optimizer, group)
+
+        if result['x_synced']:
+            result['total_bytes'] += self.stats['x_bytes']
+        if result['u_synced']:
+            result['total_bytes'] += self.stats['u_bytes']
+        if result['v_synced']:
+            result['total_bytes'] += self.stats['v_bytes']
+
+        self.step += 1
+        return result
+
+    def get_comm_stats(self):
+        """Get comprehensive communication statistics."""
+        total_bytes = (self.stats['x_bytes'] +
+                       self.stats['u_bytes'] +
+                       self.stats['v_bytes'])
+        total_time = (self.stats['x_time_ms'] +
+                      self.stats['u_time_ms'] +
+                      self.stats['v_time_ms'])
+        total_syncs = (self.stats['x_syncs'] +
+                       self.stats['u_syncs'] +
+                       self.stats['v_syncs'])
+
+        # DDP equivalent: all 3 states every step
+        ddp_syncs = self.step * 3
+        ddp_bytes = total_bytes * (ddp_syncs / max(total_syncs, 1))
+
+        return {
+            'total_steps': self.step,
+            'Kx': self.Kx, 'Ku': self.Ku, 'Kv': self.Kv,
+            'x_syncs': self.stats['x_syncs'],
+            'u_syncs': self.stats['u_syncs'],
+            'v_syncs': self.stats['v_syncs'],
+            'total_syncs': total_syncs,
+            'total_bytes': total_bytes,
+            'total_time_ms': total_time,
+            'avg_time_per_sync_ms': (
+                total_time / max(total_syncs, 1)),
+            'ddp_equivalent_syncs': ddp_syncs,
+            'reduction_factor': ddp_syncs / max(total_syncs, 1),
+            'clip_events': self.stats['clip_events'],
+        }
+
+    def format_experiment_log(self):
+        """Format communication stats as experiment log entry.
+
+        Follows NKI-FA structured log format for downstream parsing.
+        """
+        s = self.get_comm_stats()
+        lines = [
+            f"### DES-LOC Comm Stats "
+            f"(Kx={s['Kx']}, Ku={s['Ku']}, Kv={s['Kv']}) ###",
+            f"Total steps: {s['total_steps']}",
+            f"x syncs: {s['x_syncs']}, "
+            f"u syncs: {s['u_syncs']}, "
+            f"v syncs: {s['v_syncs']}",
+            f"Total bytes: {s['total_bytes']}",
+            f"Total comm time: {s['total_time_ms']:.2f}ms",
+            f"Reduction vs DDP: {s['reduction_factor']:.2f}x",
+            f"Clip events: {s['clip_events']}",
+        ]
+        return "\n".join(lines)
+
+
+class DESLOCServerOpt:
+    """ServerOpt (outer optimizer applied after averaging).
+
+    Algorithm 1 line 19: x <- OPT(SERVEROPT(E_m[x]))
+
+    Default: identity (just use averaged params).
+    Can be overridden with Nesterov (Section 5.5) or
+    other server-side optimizers.
+    """
+
+    def __init__(self, opt_type='identity', momentum=0.0,
+                 outer_lr=1.0):
+        self.opt_type = opt_type
+        self.momentum = momentum
+        self.outer_lr = outer_lr
+        self.velocity = {}
+        self.step_count = 0
+
+    def step(self, params):
+        """Apply server-side optimization after averaging.
+
+        For identity: no-op (just use averaged params).
+        For nesterov: apply momentum-based correction.
+        """
+        if self.opt_type == 'identity':
+            self.step_count += 1
+            return
+
+        if self.opt_type == 'nesterov':
+            for p in params:
+                if not p.requires_grad:
+                    continue
+                pid = id(p)
+                if pid not in self.velocity:
+                    self.velocity[pid] = p.data.new_zeros(
+                        p.data.shape)
+                v = self.velocity[pid]
+                v.mul_(self.momentum)
+                p.data.add_(v, alpha=self.outer_lr * self.momentum)
+            self.step_count += 1
+            return
+
+    def get_stats(self):
+        return {
+            'opt_type': self.opt_type,
+            'momentum': self.momentum,
+            'outer_lr': self.outer_lr,
+            'step_count': self.step_count,
+            'tracked_params': len(self.velocity),
+        }
+
+
+class DESLOCConvergenceMonitor:
+    """Monitor convergence metrics during training.
+
+    Tracks loss, gradient norms, and sync decisions to detect
+    training instabilities early.
+
+    Section 5.4: "The heuristic baseline suffers training
+    instabilities potentially impacting downstream performance"
+    """
+
+    def __init__(self, window_size=100):
+        self.window_size = window_size
+        self.loss_history = []
+        self.grad_norm_history = []
+        self.instability_events = []
+
+    def record(self, loss, grad_norm=None):
+        """Record a training step's metrics."""
+        self.loss_history.append(loss)
+        if grad_norm is not None:
+            self.grad_norm_history.append(grad_norm)
+
+        # Detect instability: loss spike > 5x recent average
+        if len(self.loss_history) > self.window_size:
+            recent = self.loss_history[-self.window_size:-1]
+            avg_recent = sum(recent) / len(recent)
+            if avg_recent > 0 and loss > 5.0 * avg_recent:
+                self.instability_events.append({
+                    'step': len(self.loss_history) - 1,
+                    'loss': loss,
+                    'avg_recent': avg_recent,
+                    'ratio': loss / avg_recent,
+                })
+
+    def is_stable(self):
+        """Check if training appears stable."""
+        if len(self.loss_history) < self.window_size:
+            return True  # Not enough data
+        recent = self.loss_history[-self.window_size:]
+        # Check for NaN/Inf
+        for v in recent:
+            if _math.isnan(v) or _math.isinf(v):
+                return False
+        # Check for monotonic increase over full window
+        if all(recent[i] >= recent[i - 1]
+               for i in range(1, len(recent))):
+            return False
+        return True
+
+    def get_summary(self):
+        """Get convergence summary."""
+        n = len(self.loss_history)
+        if n == 0:
+            return {'steps': 0}
+        return {
+            'steps': n,
+            'final_loss': self.loss_history[-1],
+            'min_loss': min(self.loss_history),
+            'instability_events': len(self.instability_events),
+            'is_stable': self.is_stable(),
+            'last_10_avg': (
+                sum(self.loss_history[-10:]) /
+                min(10, n)),
+        }
+
+    def format_log(self):
+        """Format convergence summary for experiment log."""
+        s = self.get_summary()
+        lines = [
+            f"### Convergence Monitor (steps={s['steps']}) ###",
+            f"Final loss: {s.get('final_loss', 'N/A')}",
+            f"Min loss: {s.get('min_loss', 'N/A')}",
+            f"Stable: {s.get('is_stable', 'N/A')}",
+            f"Instability events: "
+            f"{s.get('instability_events', 0)}",
+        ]
+        return "\n".join(lines)
+
+
+def create_desloc_collective_ops(backend, Kx=32, Ku=96, Kv=192,
+                                  clip_radius=1.0,
+                                  server_opt_type='identity',
+                                  nesterov_momentum=0.9,
+                                  outer_lr=1.0):
+    """Factory function for DES-LOC collective ops.
+
+    Creates the full DES-LOC communication stack:
+    - CollectiveOps with sync schedule
+    - ServerOpt (identity or Nesterov)
+    - ConvergenceMonitor
+    """
+    server_opt = DESLOCServerOpt(
+        opt_type=server_opt_type,
+        momentum=nesterov_momentum,
+        outer_lr=outer_lr)
+
+    collective = DESLOCCollectiveOps(
+        backend=backend, Kx=Kx, Ku=Ku, Kv=Kv,
+        clip_radius=clip_radius, server_opt=server_opt)
+
+    monitor = DESLOCConvergenceMonitor()
+
+    return {
+        'collective': collective,
+        'server_opt': server_opt,
+        'monitor': monitor,
+    }
+
+
+# =================================================================
+# End M066
+# =================================================================

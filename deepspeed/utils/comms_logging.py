@@ -376,3 +376,370 @@ class CommsLogger:
 
         # Return the dictionary if requested
         return result_dict if return_dict else None
+
+
+# =================================================================
+# M071: DES-LOC Structured Experiment Logger (400 lines)
+# =================================================================
+# Produces structured logs parseable by the plotting pipeline.
+# Follows NKI-FA commit da964f3 draw_plot.py format:
+# - Header with config
+# - Parseable data lines with key=value format
+# - Summary section with aggregate metrics
+#
+# Reference: NKI-FA exp_utils/draw_plot.py
+# =================================================================
+
+import os as _os
+import json as _json
+import time as _time
+import math as _math
+
+
+class DESLOCStructuredLogger:
+    """Structured logger for DES-LOC experiments.
+
+    Produces log files formatted for direct parsing by
+    the figure generation pipeline. Every numeric value
+    is written with full precision and labeled explicitly.
+
+    Log format:
+    ```
+    ### DESLOC_EXPERIMENT_START ###
+    # config: model=125M Kx=32 Ku=96 Kv=192 ...
+    # benchmark: rq3_comm_reduction_125M
+    # timestamp: 2026-04-17T06:53:49
+    step=0 loss=10.8234 lr=6.0000e-04 grad_norm=12.345 ...
+    step=10 loss=8.1234 lr=5.8800e-04 ...
+    ### DESLOC_EXPERIMENT_END ###
+    ### DESLOC_SUMMARY_START ###
+    final_loss=3.2145
+    min_loss=3.1892
+    ...
+    ### DESLOC_SUMMARY_END ###
+    ```
+    """
+
+    def __init__(self, benchmark_id, config, log_dir=None):
+        self.benchmark_id = benchmark_id
+        self.config = config
+        self.log_dir = log_dir or './desloc_experiment_logs'
+        self.entries = []
+        self.start_time = _time.time()
+        self.metadata = {}
+
+    def set_metadata(self, key, value):
+        """Set experiment metadata."""
+        self.metadata[key] = value
+
+    def log_step(self, step, loss, lr=None, grad_norm=None,
+                 sync_x=False, sync_u=False, sync_v=False,
+                 comm_bytes=0, compute_ms=None, comm_ms=None,
+                 exp_avg_norm=None, exp_avg_sq_norm=None,
+                 param_norm=None, tokens_per_sec=None):
+        """Log a single training step."""
+        entry = {'step': step, 'loss': loss}
+        if lr is not None:
+            entry['lr'] = lr
+        if grad_norm is not None:
+            entry['grad_norm'] = grad_norm
+        entry['sync_x'] = int(sync_x)
+        entry['sync_u'] = int(sync_u)
+        entry['sync_v'] = int(sync_v)
+        entry['comm_bytes'] = comm_bytes
+        if compute_ms is not None:
+            entry['compute_ms'] = compute_ms
+        if comm_ms is not None:
+            entry['comm_ms'] = comm_ms
+        if exp_avg_norm is not None:
+            entry['exp_avg_norm'] = exp_avg_norm
+        if exp_avg_sq_norm is not None:
+            entry['exp_avg_sq_norm'] = exp_avg_sq_norm
+        if param_norm is not None:
+            entry['param_norm'] = param_norm
+        if tokens_per_sec is not None:
+            entry['tokens_per_sec'] = tokens_per_sec
+        self.entries.append(entry)
+
+    def _format_value(self, key, value):
+        """Format a value for log output."""
+        if isinstance(value, float):
+            if abs(value) < 0.001 and value != 0:
+                return f"{key}={value:.6e}"
+            elif abs(value) > 10000:
+                return f"{key}={value:.2f}"
+            else:
+                return f"{key}={value:.6f}"
+        elif isinstance(value, int):
+            return f"{key}={value}"
+        elif isinstance(value, bool):
+            return f"{key}={int(value)}"
+        return f"{key}={value}"
+
+    def format_header(self):
+        """Format the log file header."""
+        lines = ["### DESLOC_EXPERIMENT_START ###"]
+        cfg_parts = []
+        for k, v in self.config.items():
+            if isinstance(v, (str, int, float, bool)):
+                cfg_parts.append(f"{k}={v}")
+        lines.append(f"# config: {' '.join(cfg_parts)}")
+        lines.append(f"# benchmark: {self.benchmark_id}")
+        import datetime
+        ts = datetime.datetime.now().isoformat(timespec='seconds')
+        lines.append(f"# timestamp: {ts}")
+        for k, v in self.metadata.items():
+            lines.append(f"# {k}: {v}")
+        return "\n".join(lines)
+
+    def format_entries(self):
+        """Format all log entries."""
+        lines = []
+        for entry in self.entries:
+            parts = [self._format_value(k, v)
+                      for k, v in entry.items()]
+            lines.append(" ".join(parts))
+        return "\n".join(lines)
+
+    def compute_summary(self):
+        """Compute experiment summary metrics."""
+        if not self.entries:
+            return {}
+
+        losses = [e['loss'] for e in self.entries
+                  if not _math.isnan(e['loss'])]
+        total_comm = sum(e.get('comm_bytes', 0)
+                         for e in self.entries)
+        x_syncs = sum(e.get('sync_x', 0) for e in self.entries)
+        u_syncs = sum(e.get('sync_u', 0) for e in self.entries)
+        v_syncs = sum(e.get('sync_v', 0) for e in self.entries)
+        total_steps = len(self.entries)
+        elapsed = _time.time() - self.start_time
+
+        summary = {
+            'final_loss': losses[-1] if losses else 0.0,
+            'min_loss': min(losses) if losses else 0.0,
+            'total_steps': total_steps,
+            'total_comm_bytes': total_comm,
+            'x_syncs': x_syncs,
+            'u_syncs': u_syncs,
+            'v_syncs': v_syncs,
+            'elapsed_seconds': round(elapsed, 2),
+            'steps_per_second': round(
+                total_steps / max(elapsed, 0.01), 2),
+        }
+
+        # Convergence rate: avg loss over last 10%
+        tail = max(1, total_steps // 10)
+        tail_losses = losses[-tail:] if losses else [0.0]
+        summary['tail_avg_loss'] = round(
+            sum(tail_losses) / len(tail_losses), 6)
+
+        # Communication reduction vs DDP
+        if total_steps > 0:
+            ddp_syncs = total_steps * 3  # all 3 states every step
+            desloc_syncs = x_syncs + u_syncs + v_syncs
+            summary['reduction_vs_ddp'] = round(
+                ddp_syncs / max(desloc_syncs, 1), 2)
+
+        # Throughput
+        compute_times = [e.get('compute_ms', 0)
+                         for e in self.entries
+                         if 'compute_ms' in e]
+        if compute_times:
+            summary['avg_compute_ms'] = round(
+                sum(compute_times) / len(compute_times), 3)
+        comm_times = [e.get('comm_ms', 0)
+                      for e in self.entries if 'comm_ms' in e]
+        if comm_times:
+            summary['avg_comm_ms'] = round(
+                sum(comm_times) / len(comm_times), 3)
+
+        return summary
+
+    def format_summary(self):
+        """Format the summary section."""
+        summary = self.compute_summary()
+        lines = ["### DESLOC_SUMMARY_START ###"]
+        for k, v in summary.items():
+            lines.append(self._format_value(k, v))
+        lines.append("### DESLOC_SUMMARY_END ###")
+        return "\n".join(lines)
+
+    def save(self, filename=None):
+        """Save complete log to file."""
+        _os.makedirs(self.log_dir, exist_ok=True)
+        if filename is None:
+            cfg = self.config
+            parts = [self.benchmark_id]
+            if 'model_size' in cfg:
+                parts.append(cfg['model_size'])
+            if 'Kx' in cfg:
+                parts.append(f"Kx{cfg['Kx']}")
+            if 'seed' in cfg:
+                parts.append(f"s{cfg['seed']}")
+            filename = "_".join(parts) + ".log"
+
+        path = _os.path.join(self.log_dir, filename)
+        with open(path, 'w') as f:
+            f.write(self.format_header() + "\n")
+            f.write(self.format_entries() + "\n")
+            f.write("### DESLOC_EXPERIMENT_END ###\n")
+            f.write(self.format_summary() + "\n")
+        return path
+
+    def save_json(self, filename=None):
+        """Save as JSON for programmatic access."""
+        _os.makedirs(self.log_dir, exist_ok=True)
+        if filename is None:
+            filename = f"{self.benchmark_id}.json"
+        path = _os.path.join(self.log_dir, filename)
+        output = {
+            'benchmark_id': self.benchmark_id,
+            'config': self.config,
+            'metadata': self.metadata,
+            'summary': self.compute_summary(),
+            'entries': self.entries,
+        }
+        with open(path, 'w') as f:
+            _json.dump(output, f, indent=2)
+        return path
+
+
+class DESLOCLogParser:
+    """Parse DES-LOC structured log files for plotting.
+
+    Reads logs produced by DESLOCStructuredLogger and extracts
+    data suitable for matplotlib/seaborn visualization.
+
+    Follows NKI-FA draw_plot.py parsing convention.
+    """
+
+    def __init__(self):
+        self.experiments = []
+
+    def parse_file(self, path):
+        """Parse a single log file."""
+        config = {}
+        entries = []
+        summary = {}
+        section = 'header'
+
+        with open(path, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+
+                if line == '### DESLOC_EXPERIMENT_START ###':
+                    section = 'data'
+                    continue
+                elif line == '### DESLOC_EXPERIMENT_END ###':
+                    section = 'between'
+                    continue
+                elif line == '### DESLOC_SUMMARY_START ###':
+                    section = 'summary'
+                    continue
+                elif line == '### DESLOC_SUMMARY_END ###':
+                    section = 'done'
+                    continue
+
+                if line.startswith('# config:'):
+                    cfg_str = line[len('# config:'):].strip()
+                    for part in cfg_str.split():
+                        if '=' in part:
+                            k, v = part.split('=', 1)
+                            config[k] = self._parse_val(v)
+                    continue
+
+                if line.startswith('# benchmark:'):
+                    config['benchmark_id'] = line.split(':', 1)[1].strip()
+                    continue
+
+                if line.startswith('#'):
+                    continue
+
+                if section == 'data':
+                    entry = {}
+                    for part in line.split():
+                        if '=' in part:
+                            k, v = part.split('=', 1)
+                            entry[k] = self._parse_val(v)
+                    if entry:
+                        entries.append(entry)
+
+                elif section == 'summary':
+                    if '=' in line:
+                        k, v = line.split('=', 1)
+                        summary[k] = self._parse_val(v)
+
+        result = {
+            'config': config,
+            'entries': entries,
+            'summary': summary,
+            'path': path,
+        }
+        self.experiments.append(result)
+        return result
+
+    def _parse_val(self, s):
+        """Parse a string value to appropriate type."""
+        try:
+            if '.' in s or 'e' in s.lower():
+                return float(s)
+            return int(s)
+        except ValueError:
+            return s
+
+    def parse_directory(self, log_dir):
+        """Parse all .log files in a directory."""
+        results = []
+        for fn in sorted(_os.listdir(log_dir)):
+            if fn.endswith('.log'):
+                path = _os.path.join(log_dir, fn)
+                results.append(self.parse_file(path))
+        return results
+
+    def extract_loss_curves(self, benchmark_filter=None):
+        """Extract loss curves for plotting.
+
+        Returns dict suitable for pd.DataFrame:
+        {
+          'step': [...],
+          'loss': [...],
+          'config_label': [...],
+        }
+        """
+        data = {'step': [], 'loss': [], 'config_label': []}
+        for exp in self.experiments:
+            bid = exp['config'].get('benchmark_id', '')
+            if benchmark_filter and benchmark_filter not in bid:
+                continue
+            cfg = exp['config']
+            label = f"{cfg.get('method', 'desloc')}_Kx{cfg.get('Kx', '?')}"
+            for entry in exp['entries']:
+                if 'step' in entry and 'loss' in entry:
+                    data['step'].append(entry['step'])
+                    data['loss'].append(entry['loss'])
+                    data['config_label'].append(label)
+        return data
+
+    def extract_comm_reduction(self):
+        """Extract communication reduction data."""
+        data = {'method': [], 'reduction_vs_ddp': [],
+                'final_loss': []}
+        for exp in self.experiments:
+            s = exp.get('summary', {})
+            cfg = exp.get('config', {})
+            data['method'].append(
+                cfg.get('method', 'desloc'))
+            data['reduction_vs_ddp'].append(
+                s.get('reduction_vs_ddp', 1.0))
+            data['final_loss'].append(
+                s.get('final_loss', 0.0))
+        return data
+
+
+# =================================================================
+# End M071
+# =================================================================

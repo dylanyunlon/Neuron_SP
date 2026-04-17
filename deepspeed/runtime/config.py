@@ -1221,3 +1221,447 @@ class DeepSpeedConfig(object):
                         "DeepSpeedConfig: In FP32 mode, DeepSpeed does not permit MAX_GRAD_NORM ({}) > 0, setting to zero"
                         .format(self.optimizer_params[MAX_GRAD_NORM]))
                 self.optimizer_params[MAX_GRAD_NORM] = 0.0
+
+
+# =================================================================
+# M063: DES-LOC Experiment Config Schema + Validation (400 lines)
+# =================================================================
+# Extends DESLOCConfig with experiment-level settings for the
+# 12-benchmark suite covering RQ1-RQ6.
+#
+# Reference: template_extraction_section5.txt (RQ1-RQ6)
+# Reference: NKI-FA commit da964f3 draw_plot.py rigor standard
+# =================================================================
+
+# --- Experiment-level constants ---
+
+DESLOC_EXPERIMENT = "desloc_experiment"
+
+DESLOC_EXP_BENCHMARK_SUITE = "benchmark_suite"
+DESLOC_EXP_BENCHMARK_SUITE_DEFAULT = "full"
+
+DESLOC_EXP_MODEL_SIZES = "model_sizes"
+DESLOC_EXP_MODEL_SIZES_DEFAULT = ["125M", "350M", "1.3B"]
+
+DESLOC_EXP_KX_SWEEP = "Kx_sweep"
+DESLOC_EXP_KX_SWEEP_DEFAULT = [1, 2, 4, 8, 16, 32, 64, 128]
+
+DESLOC_EXP_KU_MULTIPLIERS = "Ku_multipliers"
+DESLOC_EXP_KU_MULTIPLIERS_DEFAULT = [1, 2, 3, 4, 6, 8]
+
+DESLOC_EXP_KV_MULTIPLIERS = "Kv_multipliers"
+DESLOC_EXP_KV_MULTIPLIERS_DEFAULT = [1, 2, 4, 6, 8, 12]
+
+DESLOC_EXP_BETA2_SWEEP = "beta2_sweep"
+DESLOC_EXP_BETA2_SWEEP_DEFAULT = [0.95, 0.98, 0.99, 0.995, 0.999]
+
+DESLOC_EXP_OUTER_OPTIMIZERS = "outer_optimizers"
+DESLOC_EXP_OUTER_OPTIMIZERS_DEFAULT = ["averaging", "nesterov"]
+
+DESLOC_EXP_INNER_OPTIMIZERS = "inner_optimizers"
+DESLOC_EXP_INNER_OPTIMIZERS_DEFAULT = ["adam", "adopt", "muon"]
+
+DESLOC_EXP_NESTEROV_MOMENTUM = "nesterov_momentum"
+DESLOC_EXP_NESTEROV_MOMENTUM_DEFAULT = 0.9
+
+DESLOC_EXP_NESTEROV_LR = "nesterov_outer_lr"
+DESLOC_EXP_NESTEROV_LR_DEFAULT = 1.0
+
+DESLOC_EXP_TOTAL_STEPS = "total_steps"
+DESLOC_EXP_TOTAL_STEPS_DEFAULT = 10000
+
+DESLOC_EXP_WARMUP_STEPS = "warmup_steps"
+DESLOC_EXP_WARMUP_STEPS_DEFAULT = 512
+
+DESLOC_EXP_LOG_DIR = "experiment_log_dir"
+DESLOC_EXP_LOG_DIR_DEFAULT = "./desloc_experiment_logs"
+
+DESLOC_EXP_FIGURE_DIR = "figure_output_dir"
+DESLOC_EXP_FIGURE_DIR_DEFAULT = "./desloc_figures"
+
+DESLOC_EXP_SEEDS = "seeds"
+DESLOC_EXP_SEEDS_DEFAULT = [42, 137, 256]
+
+DESLOC_EXP_GPU_IDS = "gpu_ids"
+DESLOC_EXP_GPU_IDS_DEFAULT = None  # auto-detect
+
+DESLOC_EXP_DTYPE = "dtype"
+DESLOC_EXP_DTYPE_DEFAULT = "bf16"
+
+DESLOC_EXP_GRADIENT_CHECKPOINTING = "gradient_checkpointing"
+DESLOC_EXP_GRADIENT_CHECKPOINTING_DEFAULT = False
+
+
+class DESLOCExperimentConfig:
+    """Configuration for the 12-benchmark DES-LOC experiment suite.
+
+    Covers all six Research Questions from Section 5:
+      RQ1: Empirical rate of change (Section 5.1)
+      RQ2: Sync frequency ablation (Section 5.2)
+      RQ3: Communication reduction (Section 5.3)
+      RQ4: Large-scale training (Section 5.4)
+      RQ5: Nesterov outer optimizer (Section 5.5)
+      RQ6: Muon inner optimizer (Section 5.6)
+
+    Each RQ maps to 2+ benchmark configurations, totaling 12+.
+    """
+
+    # Benchmark registry: maps benchmark ID to RQ and description
+    BENCHMARK_REGISTRY = {
+        'rq1_rate_of_change_adam': {
+            'rq': 'RQ1', 'desc': 'Rate of change: Adam β₂ sweep',
+            'section': '5.1', 'figure': 'Figure 3',
+        },
+        'rq1_rate_of_change_adopt': {
+            'rq': 'RQ1', 'desc': 'Rate of change: ADOPT β₂ sweep',
+            'section': '5.1', 'figure': 'Figure 3',
+        },
+        'rq2_sync_freq_Kx': {
+            'rq': 'RQ2', 'desc': 'Sync frequency: varying Kx',
+            'section': '5.2', 'figure': 'Figure 4',
+        },
+        'rq2_sync_freq_Ku_Kv': {
+            'rq': 'RQ2', 'desc': 'Sync frequency: varying Ku, Kv',
+            'section': '5.2', 'figure': 'Figure 4',
+        },
+        'rq3_comm_reduction_125M': {
+            'rq': 'RQ3', 'desc': 'Comm reduction: 125M model',
+            'section': '5.3', 'figure': 'Figure 5',
+        },
+        'rq3_comm_reduction_350M': {
+            'rq': 'RQ3', 'desc': 'Comm reduction: 350M model',
+            'section': '5.3', 'figure': 'Figure 5',
+        },
+        'rq4_billion_scale': {
+            'rq': 'RQ4', 'desc': 'Billion-scale: 1.3B model',
+            'section': '5.4', 'figure': 'Table 2',
+        },
+        'rq4_icl_evaluation': {
+            'rq': 'RQ4', 'desc': 'ICL task evaluation',
+            'section': '5.4', 'figure': 'Table 2',
+        },
+        'rq5_nesterov_outer': {
+            'rq': 'RQ5', 'desc': 'Nesterov outer optimizer',
+            'section': '5.5', 'figure': 'Figure 6',
+        },
+        'rq5_nesterov_vs_avg': {
+            'rq': 'RQ5', 'desc': 'Nesterov vs averaging ablation',
+            'section': '5.5', 'figure': 'Figure 6',
+        },
+        'rq6_muon_125M': {
+            'rq': 'RQ6', 'desc': 'Muon inner optimizer: 125M',
+            'section': '5.6', 'figure': 'Figure 7',
+        },
+        'rq6_muon_350M': {
+            'rq': 'RQ6', 'desc': 'Muon inner optimizer: 350M',
+            'section': '5.6', 'figure': 'Figure 7',
+        },
+    }
+
+    def __init__(self, param_dict=None):
+        if param_dict is None:
+            param_dict = {}
+
+        exp_dict = param_dict.get(DESLOC_EXPERIMENT, {})
+
+        self.benchmark_suite = exp_dict.get(
+            DESLOC_EXP_BENCHMARK_SUITE,
+            DESLOC_EXP_BENCHMARK_SUITE_DEFAULT)
+        self.model_sizes = exp_dict.get(
+            DESLOC_EXP_MODEL_SIZES,
+            DESLOC_EXP_MODEL_SIZES_DEFAULT)
+        self.Kx_sweep = exp_dict.get(
+            DESLOC_EXP_KX_SWEEP,
+            DESLOC_EXP_KX_SWEEP_DEFAULT)
+        self.Ku_multipliers = exp_dict.get(
+            DESLOC_EXP_KU_MULTIPLIERS,
+            DESLOC_EXP_KU_MULTIPLIERS_DEFAULT)
+        self.Kv_multipliers = exp_dict.get(
+            DESLOC_EXP_KV_MULTIPLIERS,
+            DESLOC_EXP_KV_MULTIPLIERS_DEFAULT)
+        self.beta2_sweep = exp_dict.get(
+            DESLOC_EXP_BETA2_SWEEP,
+            DESLOC_EXP_BETA2_SWEEP_DEFAULT)
+        self.outer_optimizers = exp_dict.get(
+            DESLOC_EXP_OUTER_OPTIMIZERS,
+            DESLOC_EXP_OUTER_OPTIMIZERS_DEFAULT)
+        self.inner_optimizers = exp_dict.get(
+            DESLOC_EXP_INNER_OPTIMIZERS,
+            DESLOC_EXP_INNER_OPTIMIZERS_DEFAULT)
+        self.nesterov_momentum = exp_dict.get(
+            DESLOC_EXP_NESTEROV_MOMENTUM,
+            DESLOC_EXP_NESTEROV_MOMENTUM_DEFAULT)
+        self.nesterov_outer_lr = exp_dict.get(
+            DESLOC_EXP_NESTEROV_LR,
+            DESLOC_EXP_NESTEROV_LR_DEFAULT)
+        self.total_steps = exp_dict.get(
+            DESLOC_EXP_TOTAL_STEPS,
+            DESLOC_EXP_TOTAL_STEPS_DEFAULT)
+        self.warmup_steps = exp_dict.get(
+            DESLOC_EXP_WARMUP_STEPS,
+            DESLOC_EXP_WARMUP_STEPS_DEFAULT)
+        self.log_dir = exp_dict.get(
+            DESLOC_EXP_LOG_DIR,
+            DESLOC_EXP_LOG_DIR_DEFAULT)
+        self.figure_dir = exp_dict.get(
+            DESLOC_EXP_FIGURE_DIR,
+            DESLOC_EXP_FIGURE_DIR_DEFAULT)
+        self.seeds = exp_dict.get(
+            DESLOC_EXP_SEEDS,
+            DESLOC_EXP_SEEDS_DEFAULT)
+        self.gpu_ids = exp_dict.get(
+            DESLOC_EXP_GPU_IDS,
+            DESLOC_EXP_GPU_IDS_DEFAULT)
+        self.dtype = exp_dict.get(
+            DESLOC_EXP_DTYPE,
+            DESLOC_EXP_DTYPE_DEFAULT)
+        self.gradient_checkpointing = exp_dict.get(
+            DESLOC_EXP_GRADIENT_CHECKPOINTING,
+            DESLOC_EXP_GRADIENT_CHECKPOINTING_DEFAULT)
+
+        self._validate()
+
+    def _validate(self):
+        """Validate experiment configuration."""
+        valid_suites = ['full', 'rq1', 'rq2', 'rq3', 'rq4',
+                        'rq5', 'rq6', 'quick', 'comm_only']
+        assert self.benchmark_suite in valid_suites, \
+            f"benchmark_suite must be one of {valid_suites}"
+
+        for ms in self.model_sizes:
+            assert ms in ["125M", "350M", "700M", "1.3B", "2.7B"], \
+                f"Unknown model size: {ms}"
+
+        for Kx in self.Kx_sweep:
+            assert isinstance(Kx, int) and Kx >= 1, \
+                f"Kx sweep values must be int >= 1, got {Kx}"
+
+        for b2 in self.beta2_sweep:
+            assert 0 < b2 < 1, f"beta2 must be in (0,1), got {b2}"
+
+        valid_dtypes = ['fp32', 'fp16', 'bf16']
+        assert self.dtype in valid_dtypes, \
+            f"dtype must be one of {valid_dtypes}"
+
+        assert self.total_steps >= 100, \
+            f"total_steps must be >= 100 for meaningful results"
+        assert self.warmup_steps < self.total_steps, \
+            f"warmup_steps must be < total_steps"
+
+    def get_active_benchmarks(self):
+        """Get list of benchmarks to run based on suite selection."""
+        if self.benchmark_suite == 'full':
+            return list(self.BENCHMARK_REGISTRY.keys())
+        elif self.benchmark_suite == 'quick':
+            return ['rq1_rate_of_change_adam',
+                    'rq3_comm_reduction_125M',
+                    'rq6_muon_125M']
+        elif self.benchmark_suite == 'comm_only':
+            return ['rq3_comm_reduction_125M',
+                    'rq3_comm_reduction_350M']
+        else:
+            # Filter by RQ prefix
+            rq_upper = self.benchmark_suite.upper()
+            return [k for k, v in self.BENCHMARK_REGISTRY.items()
+                    if v['rq'] == rq_upper]
+
+    def generate_ablation_grid(self, benchmark_id):
+        """Generate all configurations for a specific benchmark.
+
+        Returns a list of dicts, each representing one experiment run.
+        Each config produces one data point in the corresponding figure.
+        """
+        if benchmark_id not in self.BENCHMARK_REGISTRY:
+            raise ValueError(f"Unknown benchmark: {benchmark_id}")
+
+        configs = []
+        rq = self.BENCHMARK_REGISTRY[benchmark_id]['rq']
+
+        if rq == 'RQ1':
+            # Sweep β₂ to measure rate of change
+            for b2 in self.beta2_sweep:
+                for seed in self.seeds:
+                    configs.append({
+                        'benchmark_id': benchmark_id,
+                        'model_size': '125M',
+                        'beta1': 0.9,
+                        'beta2': b2,
+                        'Kx': 32, 'Ku': 96, 'Kv': 192,
+                        'seed': seed,
+                        'total_steps': self.total_steps,
+                        'warmup_steps': self.warmup_steps,
+                        'inner_optimizer': (
+                            'adopt' if 'adopt' in benchmark_id
+                            else 'adam'),
+                        'track_rate_of_change': True,
+                    })
+
+        elif rq == 'RQ2':
+            # Sweep Kx, Ku, Kv independently
+            base_Kx = 32
+            if 'Kx' in benchmark_id:
+                for Kx in self.Kx_sweep:
+                    for seed in self.seeds:
+                        configs.append({
+                            'benchmark_id': benchmark_id,
+                            'model_size': '125M',
+                            'Kx': Kx, 'Ku': Kx * 3, 'Kv': Kx * 6,
+                            'seed': seed,
+                            'total_steps': self.total_steps,
+                            'warmup_steps': self.warmup_steps,
+                        })
+            else:
+                for ku_m in self.Ku_multipliers:
+                    for kv_m in self.Kv_multipliers:
+                        for seed in self.seeds:
+                            configs.append({
+                                'benchmark_id': benchmark_id,
+                                'model_size': '125M',
+                                'Kx': base_Kx,
+                                'Ku': base_Kx * ku_m,
+                                'Kv': base_Kx * kv_m,
+                                'seed': seed,
+                                'total_steps': self.total_steps,
+                                'warmup_steps': self.warmup_steps,
+                            })
+
+        elif rq == 'RQ3':
+            # DDP baseline vs Local Adam vs DES-LOC
+            model = ('125M' if '125M' in benchmark_id else '350M')
+            methods = ['ddp', 'local_adam', 'desloc']
+            for method in methods:
+                for seed in self.seeds:
+                    cfg = {
+                        'benchmark_id': benchmark_id,
+                        'model_size': model,
+                        'method': method,
+                        'seed': seed,
+                        'total_steps': self.total_steps,
+                        'warmup_steps': self.warmup_steps,
+                    }
+                    if method == 'desloc':
+                        cfg['Kx'] = 32
+                        cfg['Ku'] = 96
+                        cfg['Kv'] = 192
+                    elif method == 'local_adam':
+                        cfg['Kx'] = 32
+                        cfg['Ku'] = 32
+                        cfg['Kv'] = 32
+                    else:
+                        cfg['Kx'] = 1
+                        cfg['Ku'] = 1
+                        cfg['Kv'] = 1
+                    configs.append(cfg)
+
+        elif rq == 'RQ4':
+            for seed in self.seeds:
+                configs.append({
+                    'benchmark_id': benchmark_id,
+                    'model_size': '1.3B',
+                    'Kx': 32, 'Ku': 96, 'Kv': 192,
+                    'seed': seed,
+                    'total_steps': self.total_steps,
+                    'warmup_steps': self.warmup_steps,
+                })
+
+        elif rq == 'RQ5':
+            for outer_opt in self.outer_optimizers:
+                for Kx in [8, 32, 128]:
+                    for seed in self.seeds:
+                        configs.append({
+                            'benchmark_id': benchmark_id,
+                            'model_size': '125M',
+                            'outer_optimizer': outer_opt,
+                            'nesterov_momentum': self.nesterov_momentum,
+                            'nesterov_outer_lr': self.nesterov_outer_lr,
+                            'Kx': Kx, 'Ku': Kx * 3, 'Kv': Kx * 6,
+                            'seed': seed,
+                            'total_steps': self.total_steps,
+                            'warmup_steps': self.warmup_steps,
+                        })
+
+        elif rq == 'RQ6':
+            model = ('125M' if '125M' in benchmark_id else '350M')
+            methods = ['local_muon', 'desloc_muon']
+            for method in methods:
+                for seed in self.seeds:
+                    cfg = {
+                        'benchmark_id': benchmark_id,
+                        'model_size': model,
+                        'inner_optimizer': 'muon',
+                        'method': method,
+                        'seed': seed,
+                        'total_steps': self.total_steps,
+                        'warmup_steps': self.warmup_steps,
+                        'Kx': 32,
+                        'Ku': 96,
+                    }
+                    if method == 'local_muon':
+                        cfg['Ku'] = cfg['Kx']
+                    configs.append(cfg)
+
+        return configs
+
+    def count_total_runs(self):
+        """Count total number of experiment runs across all benchmarks."""
+        total = 0
+        for bid in self.get_active_benchmarks():
+            total += len(self.generate_ablation_grid(bid))
+        return total
+
+    def generate_experiment_manifest(self):
+        """Generate a manifest of all experiments to run.
+
+        Returns a list of (benchmark_id, config_dict, run_index) tuples.
+        Used by the shell launcher to schedule GPU jobs.
+        """
+        manifest = []
+        run_idx = 0
+        for bid in self.get_active_benchmarks():
+            grid = self.generate_ablation_grid(bid)
+            for cfg in grid:
+                cfg['run_index'] = run_idx
+                cfg['dtype'] = self.dtype
+                cfg['gpu_ids'] = self.gpu_ids
+                cfg['log_dir'] = self.log_dir
+                cfg['figure_dir'] = self.figure_dir
+                cfg['gradient_checkpointing'] = (
+                    self.gradient_checkpointing)
+                manifest.append((bid, cfg, run_idx))
+                run_idx += 1
+        return manifest
+
+    def to_dict(self):
+        """Serialize experiment config."""
+        return {
+            DESLOC_EXP_BENCHMARK_SUITE: self.benchmark_suite,
+            DESLOC_EXP_MODEL_SIZES: self.model_sizes,
+            DESLOC_EXP_KX_SWEEP: self.Kx_sweep,
+            DESLOC_EXP_KU_MULTIPLIERS: self.Ku_multipliers,
+            DESLOC_EXP_KV_MULTIPLIERS: self.Kv_multipliers,
+            DESLOC_EXP_BETA2_SWEEP: self.beta2_sweep,
+            DESLOC_EXP_OUTER_OPTIMIZERS: self.outer_optimizers,
+            DESLOC_EXP_INNER_OPTIMIZERS: self.inner_optimizers,
+            DESLOC_EXP_TOTAL_STEPS: self.total_steps,
+            DESLOC_EXP_WARMUP_STEPS: self.warmup_steps,
+            DESLOC_EXP_LOG_DIR: self.log_dir,
+            DESLOC_EXP_FIGURE_DIR: self.figure_dir,
+            DESLOC_EXP_SEEDS: self.seeds,
+            DESLOC_EXP_DTYPE: self.dtype,
+        }
+
+    def __repr__(self):
+        active = self.get_active_benchmarks()
+        total = self.count_total_runs()
+        return (f"DESLOCExperimentConfig(suite={self.benchmark_suite}, "
+                f"benchmarks={len(active)}, total_runs={total})")
+
+
+def get_desloc_experiment_config(param_dict):
+    """Parse DES-LOC experiment configuration."""
+    return DESLOCExperimentConfig(param_dict)
+
+
+# =================================================================
+# End M063
+# =================================================================
