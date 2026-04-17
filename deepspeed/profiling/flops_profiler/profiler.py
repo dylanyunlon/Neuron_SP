@@ -340,6 +340,14 @@ class FlopsProfiler(object):
             print(line_fmt.format('batch size per GPU: ', self.ds_engine.train_micro_batch_size_per_gpu()))
             if self.ds_engine.has_moe_layers:
                 print(line_fmt.format('expert tensor parallelism enabled: ', expert_tensor_parallelism > 1))
+            # DES-LOC: report communication reduction if enabled
+            if getattr(self.ds_engine, 'desloc_enabled', False):
+                _kx = self.ds_engine.desloc_Kx
+                _ku = self.ds_engine.desloc_Ku
+                _kv = self.ds_engine.desloc_Kv
+                _red = 3.0 / (1.0/_kx + 1.0/_ku + 1.0/_kv)
+                print(line_fmt.format('DES-LOC sync (Kx/Ku/Kv): ', f'{_kx}/{_ku}/{_kv}'))
+                print(line_fmt.format('DES-LOC comm reduction vs DDP: ', f'{_red:.1f}x'))
 
         print(line_fmt.format('params per GPU: ', params_to_string(total_params)))
         if total_model_expert_params > 0:
