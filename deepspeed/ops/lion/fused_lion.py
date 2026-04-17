@@ -33,11 +33,17 @@ class FusedLion(torch.optim.Optimizer):
         https://doi.org/10.48550/arXiv.2302.06675
     """
 
-    def __init__(self, params, lr=1e-3, betas=(0.9, 0.999), weight_decay=0., set_grad_none=True):
+    def __init__(self, params, lr=1e-3, betas=(0.9, 0.999), weight_decay=0., set_grad_none=True,
+                 desloc_kx=0, desloc_ku_ratio=3):
 
         defaults = dict(lr=lr, betas=betas, weight_decay=weight_decay)
         super(FusedLion, self).__init__(params, defaults)
         self.set_grad_none = set_grad_none
+        # M108: DES-LOC single-momentum path (Lion has only exp_avg, no exp_avg_sq)
+        self.desloc_kx = desloc_kx
+        self.desloc_ku = desloc_kx * desloc_ku_ratio if desloc_kx > 0 else 0
+        self.desloc_enabled = desloc_kx > 0
+        self._desloc_step = 0
 
         fused_lion_cuda = FusedLionBuilder().load()
         # Skip buffer
@@ -97,6 +103,8 @@ class FusedLion(torch.optim.Optimizer):
                     state['step'] = group.get('step', 0)
                     # Exponential moving average of gradient values
                     state['exp_avg'] = torch.zeros_like(p.data)
+                    # M108: DES-LOC sync flag for single-momentum
+                    state['desloc_mom_sync_due'] = False
 
                 if p.dtype == torch.float16:
                     g_16.append(p.grad.data)
@@ -128,4 +136,7 @@ class FusedLion(torch.optim.Optimizer):
                 multi_tensor_applier(self.multi_tensor_lion, self._dummy_overflow_buf, [g_32, p_32, m_32], group['lr'],
                                      beta1, beta2, state['step'], group['weight_decay'])
 
+        # M108: advance DES-LOC step
+        if self.desloc_enabled:
+            self._desloc_step += 1
         return loss

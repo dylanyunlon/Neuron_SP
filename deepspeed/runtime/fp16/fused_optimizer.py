@@ -117,6 +117,9 @@ class FP16_Optimizer(DeepSpeedOptimizer):
 
         self.overflow = False
         self.overflow_checker = CheckOverflow(self.fp16_groups, mpu=self.mpu, deepspeed=deepspeed)
+        # M111: DES-LOC overflow-per-sync-window tracking
+        self._desloc_overflow_in_window = 0
+        self._desloc_total_overflows = 0
         self.initialize_optimizer_states()
 
     def initialize_optimizer_states(self):
@@ -169,6 +172,9 @@ class FP16_Optimizer(DeepSpeedOptimizer):
                 if self.verbose:
                     logger.info("[deepspeed] fp16 dynamic loss scale overflow! Skipping step. Attempted loss "
                                 "scale: {}, reducing to {}".format(prev_scale, self.loss_scale_config.cur_scale))
+                # M111: Record overflow for DES-LOC sync window
+                self._desloc_overflow_in_window += 1
+                self._desloc_total_overflows += 1
                 return self.overflow
 
         scaled_grad_norm = get_global_norm(norm_list=norm_groups)
@@ -274,6 +280,9 @@ class FP16_Optimizer(DeepSpeedOptimizer):
                         p.grad = None
                 if self.timers:
                     self.timers.log(OVERFLOW_TIMERS)
+                # M111: Record overflow for DES-LOC sync window
+                self._desloc_overflow_in_window += 1
+                self._desloc_total_overflows += 1
                 return self.overflow
 
         grads_groups_flat = []

@@ -1007,6 +1007,8 @@ class FPDT_Attention(torch.nn.Module):
 
         self.reture_bias = return_bias
         self.dropout = config.attention_dropout
+        # M114: DES-LOC FPDT AllToAll byte tracking
+        self._desloc_a2a_bytes = 0
 
         self.chunk_size = chunk_size
         self.double_buffer = enable_offloading

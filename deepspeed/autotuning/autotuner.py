@@ -1,4 +1,5 @@
 # Copyright (c) Microsoft Corporation.
+# M120: DES-LOC sync period parameters added to autotuning search space
 # SPDX-License-Identifier: Apache-2.0
 
 # DeepSpeed Team
@@ -325,6 +326,9 @@ class Autotuner:
 
         # each zero stage uses a different template configuration file
         config_zero = tuning_space.get(ZERO_OPTIMIZATION, {})
+        # M120: DES-LOC sync period search parameters
+        desloc_config = tuning_space.get("desloc", {})
+        desloc_kx_values = desloc_config.get("kx", [0])  # 0=disabled
         stage = config_zero.get(ZERO_OPTIMIZATION_STAGE, ZERO_OPTIMIZATION_STAGE_DEFAULT)
         template_config = {}
         if stage == 0:
@@ -522,6 +526,9 @@ class Autotuner:
 
     def tune_space(self, tuning_space, prev_max_mbs=0, prev_best_mbs=0, prev_best_metric_val=0):
         config_zero = tuning_space.get(ZERO_OPTIMIZATION, {})
+        # M120: DES-LOC sync period search parameters
+        desloc_config = tuning_space.get("desloc", {})
+        desloc_kx_values = desloc_config.get("kx", [0])  # 0=disabled
         stage = config_zero.get(ZERO_OPTIMIZATION_STAGE, None)
         tuning_space_name = TUNING_MICRO_BATCH_SIZE_PREFIX + str(stage)
         tuning_micro_batch_sizes = []

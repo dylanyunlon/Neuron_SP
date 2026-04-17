@@ -66,4 +66,9 @@ class ZenFlowConfig(DeepSpeedConfigModel):
         if not isinstance(self.pt_reserved_cores_perc, float):
             raise ValueError('pt_reserved_cores_perc must be a float')
 
+        # M117: DES-LOC configuration for ZenFlow
+        if not hasattr(self, 'desloc_kx'):
+            self.desloc_kx = 0
+            self.desloc_ku_ratio = 3
+            self.desloc_kv_ratio = 6
         return self
