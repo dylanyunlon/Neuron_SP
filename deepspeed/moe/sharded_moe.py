@@ -215,6 +215,8 @@ def top1gating(logits: Tensor,
     if not drop_tokens:
         new_capacity = torch.max(exp_counts).to(logits.device)
         # Communicate across expert processes to pick the maximum capacity.
+        # NOTE(DES-LOC): This all_reduce is MoE load balancing, NOT gradient sync.
+        # Must execute every step regardless of Kx. Do not add desloc skip.
         if ep_group is not None:
             dist.all_reduce(new_capacity, op=dist.ReduceOp.MAX, group=ep_group)
         if groups._get_expert_model_parallel_world_size() == 1:
