@@ -188,6 +188,4 @@ def start_optimizer_process(zf_optimizer):
     msg = zf_optimizer.parent_conn.recv()
     assert msg["type"] == "ready", "Optimizer process did not initialize correctly."
 
-    # M118: DES-LOC sync marker for ZenFlow process communication
-    zf_optimizer._desloc_process_synced = True
     zf_optimizer.process_optimizer_established = True

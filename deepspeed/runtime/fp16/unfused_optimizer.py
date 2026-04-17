@@ -102,8 +102,6 @@ class FP16_UnfusedOptimizer(DeepSpeedOptimizer):
 
         self.overflow = False
         self.overflow_checker = CheckOverflow(self.fp16_groups, mpu=self.mpu, deepspeed=deepspeed)
-        # M113: DES-LOC overflow tracking for unfused path
-        self._desloc_overflow_in_window = 0
 
         self.initialize_optimizer_states()
 

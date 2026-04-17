@@ -101,8 +101,6 @@ def zenflow_step(engine: "DeepSpeedEngine", lr_kwargs):
         engine (DeepSpeedEngine): The engine managing training state.
         lr_kwargs (dict): Optional kwargs passed to the LR scheduler step.
     """
-    # M115: DES-LOC sync aligns with ZenFlow update boundaries
-    _desloc_sync_due = getattr(engine, '_desloc_sync_due', False)
     if engine.is_gradient_accumulation_boundary():
         if engine.micro_steps + 1 >= engine.full_warm_up_rounds:
             _take_selective_parameter_step(engine)

@@ -576,8 +576,6 @@ class ZenFlowZeroOptimizer(DeepSpeedZeroOptimizer):
         self.exit_backward()
 
     def log_selective_optimizer_timers(self):
-        # M116: DES-LOC step tracking for ZenFlow
-        self._desloc_zenflow_steps = getattr(self, '_desloc_zenflow_steps', 0) + 1
         self.timers.log(SELECTIVE_OPTIMIZER_TIMERS)
 
     def _sync_selective_optimizer_lr(self):
@@ -596,8 +594,6 @@ class ZenFlowZeroOptimizer(DeepSpeedZeroOptimizer):
             self._selective_optimizer_step(i)
             self.timers(SELECTIVE_OPTIMIZER_STEP_TIMER).stop()
 
-        # M116: DES-LOC step tracking for ZenFlow
-        self._desloc_zenflow_steps = getattr(self, '_desloc_zenflow_steps', 0) + 1
         self.timers.log(SELECTIVE_OPTIMIZER_TIMERS)
 
 

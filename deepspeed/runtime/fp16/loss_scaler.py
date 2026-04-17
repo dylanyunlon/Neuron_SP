@@ -230,9 +230,6 @@ class DynamicLossScaler(LossScalerBase):
         self.consecutive_hysteresis = consecutive_hysteresis
         self.raise_error_at_min_scale = raise_error_at_min_scale
         self.dynamic = True
-        # M112: DES-LOC loss scale consensus state
-        self._desloc_pre_update_scale = init_scale
-        self._desloc_scale_adjustments = 0
         self.dtype = dtype
 
     # `params` is a list / generator of torch.Variable

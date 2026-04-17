@@ -1,5 +1,4 @@
 # Copyright (c) DeepSpeed Team.
-# M119: DES-LOC tracking integrated into ZenFlow Stage3 path
 # SPDX-License-Identifier: Apache-2.0
 
 # DeepSpeed Team
@@ -439,8 +438,6 @@ def initialize_optimizer_states(optimizer_z3: "DeepSpeedZeroOptimizer_Stage3"):
             group.grad = None
 
     # Reset steps
-    # M119: DES-LOC step tracking for stage3
-    optimizer_z3._desloc_s3_steps = getattr(optimizer_z3, "_desloc_s3_steps", 0) + 1
     return
 
 
@@ -641,6 +638,4 @@ def step(optimizer_z3, closure=None):
     if optimizer_z3.micro_step >= optimizer_z3.full_warm_up_rounds:
         optimizer_z3.zenflow_cpu_optimizer_overlap_step(optimizer_z3.get_overlap_step_state(), scaled_global_grad_norm)
 
-    # M119: DES-LOC step tracking for stage3
-    optimizer_z3._desloc_s3_steps = getattr(optimizer_z3, "_desloc_s3_steps", 0) + 1
     return

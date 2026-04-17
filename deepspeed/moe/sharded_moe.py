@@ -491,9 +491,6 @@ class TopKGate(Module):
         self.noisy_gate_policy = noisy_gate_policy
         self.timers = SynchronizedWallClockTimer()
         self.wall_clock_breakdown = False
-        # M109: DES-LOC AllToAll byte tracking for bandwidth coordination
-        self._desloc_a2a_bytes = 0
-        self._desloc_step = 0
         self.gate_time = 0.0
         self.drop_tokens = drop_tokens
         self.use_rts = use_rts
@@ -574,9 +571,6 @@ class MOELayer(Base):
         self.time_moe = 0.0
         self.timers = SynchronizedWallClockTimer()
         self.wall_clock_breakdown = False
-        # M109: DES-LOC AllToAll byte tracking for bandwidth coordination
-        self._desloc_a2a_bytes = 0
-        self._desloc_step = 0
 
         self.use_tutel = use_tutel and TUTEL_INSTALLED and gate.k == 1
 
@@ -666,9 +660,6 @@ class MOELayer(Base):
         if self.wall_clock_breakdown:
             self.timers(SECOND_ALLTOALL_TIMER).stop()
             self.time_salltoall = self.timers(SECOND_ALLTOALL_TIMER).elapsed(reset=False)
-        # M109: Record AllToAll bytes for DES-LOC bandwidth planning
-        self._desloc_a2a_bytes += expert_output.nelement() * expert_output.element_size()
-        self._desloc_step += 1
 
         if tensor_model_world_size > 1:
             # the dropped duplicate tokens need to be gathered on each
