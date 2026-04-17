@@ -1873,3 +1873,345 @@ class DESLOCExperimentAggregator:
 # =================================================================
 # End M070
 # =================================================================
+
+# =================================================================
+# M079: Experiment Log Parser + Statistical Aggregator
+# Claude-5 (M077-M091)
+# Data pipeline: stdout/log → regex parse → DataFrame-compatible dict
+# =================================================================
+
+import re
+import json
+import csv
+import math
+import os
+from collections import defaultdict
+
+
+class ExperimentLogParser:
+    """Parse training logs into structured data.
+
+    Handles two formats:
+    1. DES-LOC native CSV/JSON (from DeslocExperimentLogger)
+    2. Raw stdout logs with "step=N loss=X.XXXX lr=Y.YY throughput=Z"
+    """
+
+    # Regex patterns for raw log parsing
+    _STEP_PATTERN = re.compile(
+        r"step[=:\s]+(\d+)"
+    )
+    _LOSS_PATTERN = re.compile(
+        r"loss[=:\s]+([\d.]+(?:e[+-]?\d+)?)"
+    )
+    _LR_PATTERN = re.compile(
+        r"(?:lr|learning_rate)[=:\s]+([\d.]+(?:e[+-]?\d+)?)"
+    )
+    _THROUGHPUT_PATTERN = re.compile(
+        r"(?:throughput|tokens/s|tps)[=:\s]+([\d.]+(?:e[+-]?\d+)?)"
+    )
+    _TFLOPS_PATTERN = re.compile(
+        r"([\d.]+)\s*TFLOPS"
+    )
+    _COMM_BYTES_PATTERN = re.compile(
+        r"comm[_\s]?bytes[=:\s]+(\d+)"
+    )
+    _GRAD_NORM_PATTERN = re.compile(
+        r"grad[_\s]?norm[=:\s]+([\d.]+(?:e[+-]?\d+)?)"
+    )
+    _MEMORY_PATTERN = re.compile(
+        r"mem[_\s]?(?:alloc|used)[=:\s]+([\d.]+)\s*(?:MB|GB)"
+    )
+    _NKI_BLOCK_PATTERN = re.compile(
+        r"###\s*(.*?)\s*###"
+    )
+    _NKI_METRIC_PATTERN = re.compile(
+        r"(\w[\w\d]*)\s+(\w+):\s+([\d.]+)ms,\s+([\d.]+)\s+TFLOPS"
+    )
+
+    def __init__(self):
+        self._entries = []
+
+    def parse_csv(self, path):
+        """Parse DES-LOC native CSV log."""
+        entries = []
+        with open(path, "r") as fh:
+            reader = csv.DictReader(fh)
+            for row in reader:
+                entry = {}
+                for k, v in row.items():
+                    try:
+                        entry[k] = float(v)
+                    except (ValueError, TypeError):
+                        entry[k] = v
+                if "step" in entry:
+                    entry["step"] = int(entry["step"])
+                entries.append(entry)
+        self._entries = entries
+        return entries
+
+    def parse_json(self, path):
+        """Parse DES-LOC native JSON log."""
+        with open(path, "r") as fh:
+            data = json.load(fh)
+        self._entries = data.get("entries", [])
+        return self._entries
+
+    def parse_stdout(self, text):
+        """Parse raw training stdout line by line."""
+        entries = []
+        for line in text.strip().split("\n"):
+            line = line.strip()
+            if not line:
+                continue
+            step_m = self._STEP_PATTERN.search(line)
+            if not step_m:
+                continue
+            entry = {"step": int(step_m.group(1))}
+            loss_m = self._LOSS_PATTERN.search(line)
+            if loss_m:
+                entry["loss"] = float(loss_m.group(1))
+            lr_m = self._LR_PATTERN.search(line)
+            if lr_m:
+                entry["lr"] = float(lr_m.group(1))
+            tp_m = self._THROUGHPUT_PATTERN.search(line)
+            if tp_m:
+                entry["throughput_tps"] = float(tp_m.group(1))
+            tf_m = self._TFLOPS_PATTERN.search(line)
+            if tf_m:
+                entry["tflops"] = float(tf_m.group(1))
+            cb_m = self._COMM_BYTES_PATTERN.search(line)
+            if cb_m:
+                entry["comm_bytes"] = int(cb_m.group(1))
+            gn_m = self._GRAD_NORM_PATTERN.search(line)
+            if gn_m:
+                entry["grad_norm"] = float(gn_m.group(1))
+            mem_m = self._MEMORY_PATTERN.search(line)
+            if mem_m:
+                entry["memory_mb"] = float(mem_m.group(1))
+            entries.append(entry)
+        self._entries = entries
+        return entries
+
+    def parse_nki_format(self, text):
+        """Parse NKI-FA style benchmark output.
+
+        Format: "### headdim=128, causal=False, seqlen=16384 ###"
+        followed by "Fav3 bwd: 18.034ms, 609.7 TFLOPS"
+        """
+        entries = []
+        current_config = {}
+        for line in text.strip().split("\n"):
+            line = line.strip()
+            block_m = self._NKI_BLOCK_PATTERN.match(line)
+            if block_m:
+                config_str = block_m.group(1)
+                current_config = {}
+                for part in config_str.split(","):
+                    part = part.strip()
+                    if "=" in part:
+                        k, v = part.split("=", 1)
+                        k = k.strip()
+                        v = v.strip()
+                        try:
+                            current_config[k] = int(v)
+                        except ValueError:
+                            try:
+                                current_config[k] = float(v)
+                            except ValueError:
+                                current_config[k] = v
+                continue
+            metric_m = self._NKI_METRIC_PATTERN.match(line)
+            if metric_m:
+                entry = dict(current_config)
+                entry["method"] = metric_m.group(1)
+                entry["direction"] = metric_m.group(2)
+                entry["time_ms"] = float(metric_m.group(3))
+                entry["tflops"] = float(metric_m.group(4))
+                entries.append(entry)
+        self._entries = entries
+        return entries
+
+    def get_entries(self):
+        return list(self._entries)
+
+    def filter_by(self, **kwargs):
+        """Filter entries by key-value pairs."""
+        result = self._entries
+        for k, v in kwargs.items():
+            result = [e for e in result if e.get(k) == v]
+        return result
+
+
+class StatisticalAggregator:
+    """Compute mean±std over multiple seeds for NeurIPS-quality plots.
+
+    Nick Joseph: "损失函数其实很有效。理想的评估应关注实际关心的目标"
+    """
+
+    @staticmethod
+    def aggregate_by_step(runs_data, metric="loss"):
+        """Given list of [{step, metric}] from multiple seeds,
+        compute per-step mean and std."""
+        by_step = defaultdict(list)
+        for run in runs_data:
+            for entry in run:
+                step = entry.get("step")
+                val = entry.get(metric)
+                if step is not None and val is not None:
+                    if not math.isnan(val):
+                        by_step[step].append(val)
+        result = []
+        for step in sorted(by_step.keys()):
+            vals = by_step[step]
+            n = len(vals)
+            mean = sum(vals) / n
+            if n > 1:
+                var = sum((v - mean) ** 2 for v in vals) / (n - 1)
+                std = math.sqrt(var)
+            else:
+                std = 0.0
+            result.append({
+                "step": step, "mean": mean, "std": std,
+                "min": min(vals), "max": max(vals), "n": n,
+            })
+        return result
+
+    @staticmethod
+    def compute_final_metrics(runs_data, metric="loss",
+                              last_n=100):
+        """Compute summary stats over last N steps of each run."""
+        finals = []
+        for run in runs_data:
+            vals = [e.get(metric, float("nan")) for e in run
+                    if not math.isnan(e.get(metric, float("nan")))]
+            if len(vals) >= last_n:
+                finals.append(sum(vals[-last_n:]) / last_n)
+            elif vals:
+                finals.append(sum(vals) / len(vals))
+        if not finals:
+            return {"mean": float("nan"), "std": 0.0, "n": 0}
+        n = len(finals)
+        mean = sum(finals) / n
+        if n > 1:
+            var = sum((v - mean) ** 2 for v in finals) / (n - 1)
+            std = math.sqrt(var)
+        else:
+            std = 0.0
+        return {"mean": mean, "std": std, "n": n,
+                "min": min(finals), "max": max(finals)}
+
+    @staticmethod
+    def communication_reduction(desloc_bytes, baseline_bytes):
+        """Compute communication reduction factor."""
+        if baseline_bytes <= 0:
+            return 0.0
+        return baseline_bytes / desloc_bytes if desloc_bytes > 0 else float("inf")
+
+
+class BenchmarkComparator:
+    """Compare DES-LOC results against DDP/LocalAdam baselines."""
+
+    def __init__(self):
+        self._baselines = {}
+        self._methods = {}
+
+    def register_baseline(self, name, data):
+        self._baselines[name] = data
+
+    def register_method(self, name, data):
+        self._methods[name] = data
+
+    def compare_loss(self, method_name, baseline_name="ddp",
+                     last_n=100):
+        """Compare final loss: method vs baseline."""
+        base_data = self._baselines.get(baseline_name, [])
+        method_data = self._methods.get(method_name, [])
+        base_stats = StatisticalAggregator.compute_final_metrics(
+            [base_data], last_n=last_n)
+        method_stats = StatisticalAggregator.compute_final_metrics(
+            [method_data], last_n=last_n)
+        gap = method_stats["mean"] - base_stats["mean"]
+        rel_gap = gap / base_stats["mean"] if base_stats["mean"] != 0 else 0
+        return {
+            "baseline": baseline_name,
+            "method": method_name,
+            "baseline_loss": base_stats["mean"],
+            "method_loss": method_stats["mean"],
+            "absolute_gap": gap,
+            "relative_gap_pct": rel_gap * 100,
+        }
+
+    def compare_communication(self, method_name,
+                              baseline_name="local_adam"):
+        """Compare total communication bytes."""
+        base = self._baselines.get(baseline_name, [])
+        method = self._methods.get(method_name, [])
+        base_bytes = sum(e.get("comm_bytes", 0) for e in base)
+        method_bytes = sum(e.get("comm_bytes", 0) for e in method)
+        reduction = StatisticalAggregator.communication_reduction(
+            method_bytes, base_bytes)
+        return {
+            "baseline": baseline_name,
+            "method": method_name,
+            "baseline_bytes": base_bytes,
+            "method_bytes": method_bytes,
+            "reduction_factor": reduction,
+        }
+
+    def summary_table(self):
+        """Generate comparison table for all registered methods."""
+        rows = []
+        for name in self._methods:
+            for bname in self._baselines:
+                loss_cmp = self.compare_loss(name, bname)
+                comm_cmp = self.compare_communication(name, bname)
+                rows.append({**loss_cmp, **comm_cmp})
+        return rows
+
+
+class ResultsExporter:
+    """Export results to CSV/JSON for plotting pipeline."""
+
+    @staticmethod
+    def to_csv(data, path, fieldnames=None):
+        if not data:
+            return
+        if fieldnames is None:
+            fieldnames = list(data[0].keys())
+        with open(path, "w", newline="") as fh:
+            writer = csv.DictWriter(fh, fieldnames=fieldnames)
+            writer.writeheader()
+            for row in data:
+                writer.writerow({k: row.get(k, "") for k in fieldnames})
+
+    @staticmethod
+    def to_json(data, path):
+        with open(path, "w") as fh:
+            json.dump(data, fh, indent=2, default=str)
+
+    @staticmethod
+    def aggregate_and_export(log_dir, output_dir):
+        """Walk log_dir, parse all CSVs, aggregate, and export."""
+        os.makedirs(output_dir, exist_ok=True)
+        parser = ExperimentLogParser()
+        all_results = {}
+        if not os.path.isdir(log_dir):
+            return all_results
+        for root, dirs, files in os.walk(log_dir):
+            for fname in files:
+                if fname.endswith(".csv"):
+                    path = os.path.join(root, fname)
+                    entries = parser.parse_csv(path)
+                    exp_id = os.path.splitext(fname)[0]
+                    all_results[exp_id] = entries
+        summary_path = os.path.join(output_dir, "aggregated_results.json")
+        ResultsExporter.to_json(
+            {k: len(v) for k, v in all_results.items()},
+            summary_path,
+        )
+        return all_results
+
+
+# =================================================================
+# End M079  (LogParser + Aggregator + Comparator + Exporter)
+# =================================================================

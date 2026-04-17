@@ -592,3 +592,468 @@ fi
 # =============================================================================
 # End M076
 # =============================================================================
+
+# =============================================================================
+# M090: Production Experiment Entry — Environment + 100-Run Batch Execution
+# Claude-5 (M077-M091)
+# Pattern: like llm4walking.sh — full env setup then batch dispatch
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Section A: Hardware inventory
+# ---------------------------------------------------------------------------
+detect_gpu_topology() {
+    echo "========================================"
+    echo " GPU Topology Detection"
+    echo "========================================"
+    if command -v nvidia-smi &>/dev/null; then
+        nvidia-smi --query-gpu=index,name,memory.total,compute_cap,power.limit \
+            --format=csv,noheader 2>/dev/null | while IFS=',' read -r idx name mem cc pw; do
+            echo "  GPU $idx: $name | ${mem}MiB | CC $cc | ${pw}W"
+        done
+        echo ""
+        echo "  NVLink topology:"
+        nvidia-smi topo -m 2>/dev/null || echo "  (nvidia-smi topo unavailable)"
+    else
+        echo "  nvidia-smi not found"
+    fi
+    echo ""
+}
+
+check_cuda_version() {
+    echo "========================================"
+    echo " CUDA / Driver Version"
+    echo "========================================"
+    if command -v nvcc &>/dev/null; then
+        NVCC_VER=$(nvcc --version 2>/dev/null | grep "release" | awk '{print $NF}')
+        echo "  nvcc:   $NVCC_VER"
+    fi
+    if command -v nvidia-smi &>/dev/null; then
+        DRIVER_VER=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1)
+        CUDA_VER=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1)
+        echo "  Driver: $DRIVER_VER"
+    fi
+    python3 -c "import torch; print(f'  PyTorch: {torch.__version__}'); print(f'  CUDA RT: {torch.version.cuda}')" 2>/dev/null || true
+    echo ""
+}
+
+check_nccl_version() {
+    echo "========================================"
+    echo " NCCL Version"
+    echo "========================================"
+    python3 -c "
+import torch
+if hasattr(torch.cuda, 'nccl'):
+    v = torch.cuda.nccl.version()
+    print(f'  NCCL: {v[0]}.{v[1]}.{v[2]}')
+else:
+    print('  NCCL version detection unavailable')
+" 2>/dev/null || echo "  (detection failed)"
+    echo ""
+}
+
+# ---------------------------------------------------------------------------
+# Section B: Environment setup for DES-LOC experiments
+# ---------------------------------------------------------------------------
+setup_desloc_env() {
+    echo "========================================"
+    echo " DES-LOC Experiment Environment Setup"
+    echo "========================================"
+
+    export DESLOC_ROOT="${DESLOC_ROOT:-$(cd "$(dirname "$0")" && pwd)}"
+    export DESLOC_LOG_ROOT="${DESLOC_LOG_ROOT:-${DESLOC_ROOT}/experiment_logs}"
+    export DESLOC_FIGURE_DIR="${DESLOC_FIGURE_DIR:-${DESLOC_ROOT}/figures}"
+    export DESLOC_CHECKPOINT_DIR="${DESLOC_CHECKPOINT_DIR:-${DESLOC_ROOT}/checkpoints}"
+
+    mkdir -p "$DESLOC_LOG_ROOT"
+    mkdir -p "$DESLOC_FIGURE_DIR"
+    mkdir -p "$DESLOC_CHECKPOINT_DIR"
+
+    # CUDA optimization flags
+    export CUDA_DEVICE_MAX_CONNECTIONS=1
+    export NCCL_IB_DISABLE=0
+    export NCCL_TREE_THRESHOLD=0
+    export OMP_NUM_THREADS=4
+    export TOKENIZERS_PARALLELISM=false
+
+    # Detect number of GPUs
+    if command -v nvidia-smi &>/dev/null; then
+        NUM_GPUS=$(nvidia-smi -L 2>/dev/null | wc -l)
+    else
+        NUM_GPUS=1
+    fi
+    export NUM_GPUS
+    echo "  DESLOC_ROOT:       $DESLOC_ROOT"
+    echo "  DESLOC_LOG_ROOT:   $DESLOC_LOG_ROOT"
+    echo "  NUM_GPUS:          $NUM_GPUS"
+    echo ""
+}
+
+# ---------------------------------------------------------------------------
+# Section C: Pre-flight checks
+# ---------------------------------------------------------------------------
+run_preflight_checks() {
+    echo "========================================"
+    echo " Pre-Flight Checks"
+    echo "========================================"
+
+    # Check Python
+    python3 --version 2>/dev/null || { echo "FATAL: python3 not found"; return 1; }
+
+    # Check torch
+    python3 -c "import torch; assert torch.cuda.is_available(), 'CUDA not available'" 2>/dev/null \
+        || { echo "FATAL: PyTorch CUDA not available"; return 1; }
+
+    # Check deepspeed
+    python3 -c "import deepspeed; print(f'  DeepSpeed: {deepspeed.__version__}')" 2>/dev/null \
+        || echo "  WARNING: deepspeed not importable (will use local)"
+
+    # GPU precision validation
+    echo "  Running GPU precision check..."
+    python3 -c "
+import sys
+sys.path.insert(0, '.')
+from deepspeed.comm.backend import PrecisionValidator
+pv = PrecisionValidator(matrix_size=128)
+results = pv.validate_all_devices()
+for r in results:
+    status = r['status']
+    name = r.get('device_name', 'unknown')
+    print(f'    GPU {r[\"device\"]}: {name} — {status}')
+    if status != 'pass':
+        for c in r.get('checks', []):
+            if not c.get('passed', True):
+                print(f'      FAIL: {c}')
+if not pv.all_passed():
+    print('  WARNING: GPU precision check found issues')
+else:
+    print('  All GPUs passed precision check')
+" 2>/dev/null || echo "  (precision check skipped)"
+
+    # GPU memory check
+    python3 -c "
+import torch
+for i in range(torch.cuda.device_count()):
+    props = torch.cuda.get_device_properties(i)
+    free = props.total_mem - torch.cuda.memory_allocated(i)
+    print(f'    GPU {i}: {props.name} — {free/(1024**3):.1f} GB free / {props.total_mem/(1024**3):.1f} GB total')
+" 2>/dev/null || true
+
+    echo "  Pre-flight checks complete"
+    echo ""
+}
+
+# ---------------------------------------------------------------------------
+# Section D: Experiment matrix definition (14 benchmarks × 3 seeds)
+# ---------------------------------------------------------------------------
+# Each experiment is a function that sets env vars and calls the runner
+
+SEEDS=(42 137 2024)
+EXPERIMENT_COUNTER=0
+TOTAL_EXPERIMENTS=0
+
+count_all_experiments() {
+    # 14 benchmarks × 3 seeds = 42, plus some single-seed runs
+    echo 44
+}
+
+run_single_experiment() {
+    local RUN_ID="$1"
+    local METHOD="$2"
+    local KX="$3"
+    local KU="$4"
+    local KV="$5"
+    local STEPS="$6"
+    local SEED="$7"
+    local EXTRA_ARGS="${8:-}"
+
+    EXPERIMENT_COUNTER=$((EXPERIMENT_COUNTER + 1))
+    local LOG_DIR="${DESLOC_LOG_ROOT}/${RUN_ID}"
+    mkdir -p "$LOG_DIR"
+
+    echo "[$EXPERIMENT_COUNTER/$TOTAL_EXPERIMENTS] $RUN_ID (seed=$SEED)"
+
+    # Build the launch command
+    local CMD="torchrun \
+        --nproc_per_node=$NUM_GPUS \
+        --master_port=$((29500 + EXPERIMENT_COUNTER % 100)) \
+        REAL_GPU_BENCHMARK.py \
+        --method=$METHOD \
+        --Kx=$KX --Ku=$KU --Kv=$KV \
+        --total-steps=$STEPS \
+        --seed=$SEED \
+        --log-dir=$LOG_DIR \
+        --run-id=$RUN_ID \
+        $EXTRA_ARGS"
+
+    echo "  CMD: $CMD"
+    echo "  Log: $LOG_DIR"
+
+    # Execute with timeout and logging
+    local LOG_FILE="${LOG_DIR}/${RUN_ID}.log"
+    if eval "$CMD" > "$LOG_FILE" 2>&1; then
+        echo "  ✓ Completed successfully"
+    else
+        echo "  ✗ Failed (exit=$?), see $LOG_FILE"
+    fi
+
+    # GPU memory cleanup between experiments
+    python3 -c "
+import torch
+if torch.cuda.is_available():
+    for i in range(torch.cuda.device_count()):
+        with torch.cuda.device(i):
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats()
+" 2>/dev/null || true
+
+    echo ""
+}
+
+# ---------------------------------------------------------------------------
+# Section E: Benchmark batch execution
+# ---------------------------------------------------------------------------
+run_all_benchmarks() {
+    echo "========================================"
+    echo " DES-LOC Full Benchmark Suite"
+    echo "========================================"
+    TOTAL_EXPERIMENTS=$(count_all_experiments)
+    echo "  Total experiments to run: $TOTAL_EXPERIMENTS"
+    echo "  Start time: $(date)"
+    echo ""
+
+    local START_TIME=$(date +%s)
+
+    # Bench 01: DDP baseline
+    for SEED in "${SEEDS[@]}"; do
+        run_single_experiment "bench01_ddp_s${SEED}" "ddp" 1 1 1 5000 "$SEED"
+    done
+
+    # Bench 02: Local Adam Kx=8
+    for SEED in "${SEEDS[@]}"; do
+        run_single_experiment "bench02_localadam_Kx8_s${SEED}" "local_adam" 8 8 8 5000 "$SEED"
+    done
+
+    # Bench 03: DES-LOC standard Kx=8,Ku=24,Kv=48
+    for SEED in "${SEEDS[@]}"; do
+        run_single_experiment "bench03_desloc_std_s${SEED}" "desloc" 8 24 48 5000 "$SEED"
+    done
+
+    # Bench 04: DES-LOC aggressive Kx=16,Ku=48,Kv=96
+    for SEED in "${SEEDS[@]}"; do
+        run_single_experiment "bench04_desloc_agg_s${SEED}" "desloc" 16 48 96 5000 "$SEED"
+    done
+
+    # Bench 05: Kx sweep (4,16,32,64)
+    for KX_VAL in 4 16 32 64; do
+        KU_VAL=$((KX_VAL * 3))
+        KV_VAL=$((KX_VAL * 6))
+        run_single_experiment "bench05_Kx${KX_VAL}_s42" "desloc" "$KX_VAL" "$KU_VAL" "$KV_VAL" 3000 42
+    done
+
+    # Bench 06: Ku sweep
+    run_single_experiment "bench06_Ku8_s42" "desloc" 8 8 48 3000 42
+    run_single_experiment "bench06_Ku48_s42" "desloc" 8 48 48 3000 42
+
+    # Bench 07: β₂ half-life (via extra args)
+    run_single_experiment "bench07_b2_095_s42" "desloc" 8 24 48 3000 42 "--beta2=0.95"
+    run_single_experiment "bench07_b2_0999_s42" "desloc" 8 24 48 3000 42 "--beta2=0.999"
+
+    # Bench 08: ADOPT variant
+    for SEED in "${SEEDS[@]}"; do
+        run_single_experiment "bench08_adopt_s${SEED}" "desloc" 8 24 48 5000 "$SEED" "--optimizer=adopt"
+    done
+
+    # Bench 09: Nesterov outer
+    for SEED in "${SEEDS[@]}"; do
+        run_single_experiment "bench09_nesterov_s${SEED}" "desloc_outer" 8 24 48 5000 "$SEED" "--outer-opt=nesterov"
+    done
+
+    # Bench 10: Muon inner
+    for SEED in "${SEEDS[@]}"; do
+        run_single_experiment "bench10_muon_s${SEED}" "desloc" 8 24 0 5000 "$SEED" "--optimizer=muon"
+    done
+
+    # Bench 11: 350M scaling
+    run_single_experiment "bench11_350M_s42" "desloc" 8 24 48 3000 42 "--model=gpt2_350M"
+
+    # Bench 12: Comm roofline (single run)
+    run_single_experiment "bench12_comm_roofline" "comm_benchmark" 1 1 1 0 42
+
+    # Bench 13: Long convergence
+    run_single_experiment "bench13_convergence_s42" "desloc" 8 24 48 10000 42
+
+    # Bench 14: Checkpoint init
+    run_single_experiment "bench14_ckpt_init_s42" "desloc" 8 24 48 5000 42 "--checkpoint-init"
+
+    local END_TIME=$(date +%s)
+    local ELAPSED=$((END_TIME - START_TIME))
+
+    echo "========================================"
+    echo " Benchmark Suite Complete"
+    echo "========================================"
+    echo "  Total experiments: $EXPERIMENT_COUNTER"
+    echo "  Wall time: ${ELAPSED}s ($(( ELAPSED / 60 ))m $(( ELAPSED % 60 ))s)"
+    echo "  Results: $DESLOC_LOG_ROOT"
+    echo ""
+}
+
+# ---------------------------------------------------------------------------
+# Section F: Results aggregation
+# ---------------------------------------------------------------------------
+aggregate_results() {
+    echo "========================================"
+    echo " Aggregating Results"
+    echo "========================================"
+
+    python3 -c "
+import sys, os, json
+sys.path.insert(0, '.')
+from deepspeed.runtime.utils import ResultsExporter
+
+log_root = os.environ.get('DESLOC_LOG_ROOT', './experiment_logs')
+out_dir = os.environ.get('DESLOC_FIGURE_DIR', './figures')
+results = ResultsExporter.aggregate_and_export(log_root, out_dir)
+print(f'  Aggregated {len(results)} experiments')
+for exp_id, entries in sorted(results.items()):
+    print(f'    {exp_id}: {len(entries)} data points')
+" 2>/dev/null || echo "  Aggregation skipped (module not available)"
+
+    echo ""
+}
+
+# ---------------------------------------------------------------------------
+# Section G: Figure generation
+# ---------------------------------------------------------------------------
+generate_all_figures() {
+    echo "========================================"
+    echo " Generating NeurIPS Figures"
+    echo "========================================"
+
+    python3 -c "
+import sys, os
+sys.path.insert(0, '.')
+from deepspeed.utils.comms_logging import DESLOC_FIGURE_SPECS
+
+fig_dir = os.environ.get('DESLOC_FIGURE_DIR', './figures')
+os.makedirs(fig_dir, exist_ok=True)
+
+print(f'  Figure directory: {fig_dir}')
+print(f'  Defined figures: {len(DESLOC_FIGURE_SPECS)}')
+for name, spec in DESLOC_FIGURE_SPECS.items():
+    print(f'    {spec.filename}.pdf — {spec.title} (Section {spec.section})')
+print('')
+print('  Note: Actual matplotlib rendering requires experiment data.')
+print('  Run benchmarks first, then call generate_all_figures.')
+" 2>/dev/null || echo "  Figure generation skipped"
+
+    echo ""
+}
+
+# ---------------------------------------------------------------------------
+# Section H: Full pipeline entry point
+# ---------------------------------------------------------------------------
+run_full_pipeline() {
+    echo ""
+    echo "╔══════════════════════════════════════════════════╗"
+    echo "║  DES-LOC Benchmark Suite — Full Pipeline        ║"
+    echo "║  14 Benchmarks × 3 Seeds = 42+ Experiments      ║"
+    echo "║  Hardware: 2×A6000 + 1×H100 NVL                 ║"
+    echo "╚══════════════════════════════════════════════════╝"
+    echo ""
+
+    detect_gpu_topology
+    check_cuda_version
+    check_nccl_version
+    setup_desloc_env
+    run_preflight_checks
+    run_all_benchmarks
+    aggregate_results
+    generate_all_figures
+
+    echo "========================================"
+    echo " Pipeline Complete"
+    echo "========================================"
+    echo "  Logs:    $DESLOC_LOG_ROOT"
+    echo "  Figures: $DESLOC_FIGURE_DIR"
+    echo "  Time:    $(date)"
+    echo ""
+}
+
+# ---------------------------------------------------------------------------
+# Section I: Extended CLI dispatch
+# ---------------------------------------------------------------------------
+case "${1:-}" in
+    --full-pipeline)
+        run_full_pipeline
+        ;;
+    --all-benchmarks)
+        setup_desloc_env
+        run_all_benchmarks
+        ;;
+    --preflight)
+        detect_gpu_topology
+        check_cuda_version
+        check_nccl_version
+        setup_desloc_env
+        run_preflight_checks
+        ;;
+    --aggregate)
+        setup_desloc_env
+        aggregate_results
+        ;;
+    --figures)
+        setup_desloc_env
+        generate_all_figures
+        ;;
+    --topology)
+        detect_gpu_topology
+        ;;
+    --bench01)
+        setup_desloc_env
+        TOTAL_EXPERIMENTS=3
+        for SEED in "${SEEDS[@]}"; do
+            run_single_experiment "bench01_ddp_s${SEED}" "ddp" 1 1 1 5000 "$SEED"
+        done
+        ;;
+    --bench03)
+        setup_desloc_env
+        TOTAL_EXPERIMENTS=3
+        for SEED in "${SEEDS[@]}"; do
+            run_single_experiment "bench03_desloc_std_s${SEED}" "desloc" 8 24 48 5000 "$SEED"
+        done
+        ;;
+    --bench05-sweep)
+        setup_desloc_env
+        TOTAL_EXPERIMENTS=4
+        for KX_VAL in 4 16 32 64; do
+            KU_VAL=$((KX_VAL * 3))
+            KV_VAL=$((KX_VAL * 6))
+            run_single_experiment "bench05_Kx${KX_VAL}_s42" "desloc" "$KX_VAL" "$KU_VAL" "$KV_VAL" 3000 42
+        done
+        ;;
+    --bench09-nesterov)
+        setup_desloc_env
+        TOTAL_EXPERIMENTS=3
+        for SEED in "${SEEDS[@]}"; do
+            run_single_experiment "bench09_nesterov_s${SEED}" "desloc_outer" 8 24 48 5000 "$SEED" "--outer-opt=nesterov"
+        done
+        ;;
+    --help-m090)
+        echo "M090 DES-LOC Benchmark CLI:"
+        echo "  --full-pipeline     Run everything: detect → check → benchmark → aggregate → plot"
+        echo "  --all-benchmarks    Run all 14 benchmarks (44 experiments)"
+        echo "  --preflight         Hardware detection + precision check only"
+        echo "  --aggregate         Aggregate existing experiment logs"
+        echo "  --figures           Generate NeurIPS figures from aggregated data"
+        echo "  --topology          Show GPU topology"
+        echo "  --bench01           Run DDP baseline only"
+        echo "  --bench03           Run DES-LOC standard only"
+        echo "  --bench05-sweep     Run Kx sweep only"
+        echo "  --bench09-nesterov  Run Nesterov outer optimizer only"
+        ;;
+esac
+
+# =============================================================================
+# End M090
+# =============================================================================

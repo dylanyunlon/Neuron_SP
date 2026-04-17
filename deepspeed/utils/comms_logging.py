@@ -743,3 +743,276 @@ class DESLOCLogParser:
 # =================================================================
 # End M071
 # =================================================================
+
+# =================================================================
+# M087: NeurIPS Visualization — Matplotlib Figure Generator
+# Claude-5 (M077-M091)
+# Standard: NKI-FA commit da964f3 draw_plot.py rigor
+# =================================================================
+
+import os
+import json
+import csv
+import math
+import logging
+
+_m087_logger = logging.getLogger("DeepSpeed")
+
+
+class NeurIPSFigureSpec:
+    """Specification for a NeurIPS-quality figure.
+
+    Standards enforced:
+    - Font size: 10pt for axes, 12pt for title
+    - Figure width: 3.25in (single column) or 6.75in (double)
+    - DPI: 300 for print
+    - Color palette: colorblind-safe
+    - Error bars: mean ± std (3 seeds minimum)
+    - Axis labels: descriptive, with units
+    - No "1, 11, 0.9" style irregular data
+    """
+
+    SINGLE_COL_WIDTH = 3.25
+    DOUBLE_COL_WIDTH = 6.75
+    HEIGHT_RATIO = 0.75
+    DPI = 300
+    FONT_SIZE_AXIS = 10
+    FONT_SIZE_TITLE = 12
+    FONT_SIZE_LEGEND = 9
+
+    # Colorblind-safe palette (Okabe-Ito)
+    COLORS = [
+        "#0072B2",  # blue
+        "#D55E00",  # vermillion
+        "#009E73",  # green
+        "#CC79A7",  # pink
+        "#F0E442",  # yellow
+        "#56B4E9",  # sky blue
+        "#E69F00",  # orange
+        "#000000",  # black
+    ]
+
+    LINE_STYLES = ["-", "--", "-.", ":", "-", "--", "-.", ":"]
+    MARKERS = ["o", "s", "^", "D", "v", "P", "*", "X"]
+
+    def __init__(self, title, xlabel, ylabel,
+                 width="single", filename=None, section=None):
+        self.title = title
+        self.xlabel = xlabel
+        self.ylabel = ylabel
+        self.width = (self.SINGLE_COL_WIDTH if width == "single"
+                      else self.DOUBLE_COL_WIDTH)
+        self.height = self.width * self.HEIGHT_RATIO
+        self.filename = filename or title.lower().replace(" ", "_")
+        self.section = section
+
+
+# All 14 benchmark figure specifications
+DESLOC_FIGURE_SPECS = {
+    "fig_5_1_halflife": NeurIPSFigureSpec(
+        "Relative Change Rates of Momentum States",
+        "Training Step", "Relative Change Rate",
+        section="5.1", filename="fig_5_1_halflife"),
+    "fig_5_2_sync_freq": NeurIPSFigureSpec(
+        "Effect of Independent Sync Frequencies",
+        "Synchronization Period (K)", "Final Validation Loss (nats)",
+        section="5.2", filename="fig_5_2_sync_freq"),
+    "fig_5_3_comm_reduction": NeurIPSFigureSpec(
+        "Communication Reduction: DES-LOC vs Baselines",
+        "Training Step", "Validation Loss (nats)",
+        width="double", section="5.3",
+        filename="fig_5_3_comm_reduction"),
+    "fig_5_4_scaling": NeurIPSFigureSpec(
+        "Scaling to 350M Parameters",
+        "Training Step", "Validation Loss (nats)",
+        section="5.4", filename="fig_5_4_scaling"),
+    "fig_5_5_nesterov": NeurIPSFigureSpec(
+        "Nesterov Outer Optimizer vs Averaging",
+        "Training Step", "Validation Loss (nats)",
+        section="5.5", filename="fig_5_5_nesterov"),
+    "fig_5_6_muon": NeurIPSFigureSpec(
+        "DES-LOC with Muon Inner Optimizer",
+        "Training Step", "Validation Loss (nats)",
+        section="5.6", filename="fig_5_6_muon"),
+    "fig_comm_roofline": NeurIPSFigureSpec(
+        "Communication Roofline Analysis",
+        "Message Size (bytes)", "Bandwidth (GB/s)",
+        section="appendix", filename="fig_comm_roofline"),
+    "fig_convergence_rate": NeurIPSFigureSpec(
+        "Convergence Rate Verification",
+        "Training Steps (T)", "||∇f||² (log scale)",
+        section="3", filename="fig_convergence_rate"),
+    "fig_comm_savings_bar": NeurIPSFigureSpec(
+        "Communication Bytes: DDP vs Local Adam vs DES-LOC",
+        "Method", "Total Communication (GB)",
+        section="5.3", filename="fig_comm_savings_bar"),
+    "fig_throughput": NeurIPSFigureSpec(
+        "Training Throughput Comparison",
+        "Method", "Throughput (tokens/sec)",
+        section="5.3", filename="fig_throughput"),
+    "fig_mfu_comparison": NeurIPSFigureSpec(
+        "Model FLOPS Utilization",
+        "Method", "MFU (%)",
+        section="5.3", filename="fig_mfu_comparison"),
+}
+
+
+class FigureDataValidator:
+    """Validate data before plotting to catch NeurIPS-review killers.
+
+    Rules:
+    1. No irregular axis values ("1, 11, 0.9")
+    2. All data must have provenance (experiment_id)
+    3. Error bars required for multi-seed experiments
+    4. Axis ranges must be sensible
+    """
+
+    @staticmethod
+    def validate_axis_values(values, axis_name="x"):
+        """Check values form regular pattern (powers of 2, linear, etc)."""
+        issues = []
+        if len(values) < 2:
+            return issues
+        values = sorted(values)
+        # Check for suspicious patterns
+        diffs = [values[i+1] - values[i]
+                 for i in range(len(values)-1)]
+        if len(set(diffs)) > 1:
+            # Not linear — check if powers of 2
+            is_pow2 = all(v > 0 and (v & (v-1)) == 0
+                          for v in values if isinstance(v, int) and v > 0)
+            if not is_pow2:
+                ratios = [values[i+1] / values[i]
+                          for i in range(len(values)-1)
+                          if values[i] != 0]
+                is_geometric = (len(set(round(r, 2) for r in ratios)) <= 1
+                                if ratios else False)
+                if not is_geometric:
+                    issues.append(
+                        f"{axis_name}-axis values {values} are neither "
+                        f"linear, power-of-2, nor geometric — reviewer "
+                        f"will question this")
+        return issues
+
+    @staticmethod
+    def validate_data_provenance(data_entries):
+        """Ensure each data point has an experiment_id."""
+        missing = [i for i, e in enumerate(data_entries)
+                   if "experiment_id" not in e and "run_id" not in e]
+        if missing:
+            return [f"{len(missing)} data points lack experiment provenance"]
+        return []
+
+    @staticmethod
+    def validate_error_bars(aggregated_data):
+        """Check all aggregated data has std values."""
+        missing = [d for d in aggregated_data
+                   if "std" not in d or d.get("n", 0) < 2]
+        if missing:
+            return [f"{len(missing)} points lack error bars (need n>=2)"]
+        return []
+
+    @staticmethod
+    def validate_loss_range(loss_values):
+        """Check loss values are in reasonable range."""
+        issues = []
+        for v in loss_values:
+            if math.isnan(v) or math.isinf(v):
+                issues.append("Loss contains NaN/Inf")
+                break
+            if v < 0:
+                issues.append(f"Negative loss value: {v}")
+            if v > 100:
+                issues.append(f"Suspiciously high loss: {v}")
+        return issues
+
+
+class PlotDataPreparer:
+    """Prepare data for matplotlib plotting from experiment logs.
+
+    Reads experiment CSV/JSON, aggregates over seeds,
+    outputs plotting-ready data structures.
+    """
+
+    @staticmethod
+    def prepare_loss_curves(experiment_results, methods,
+                            step_interval=10):
+        """Prepare loss curve data for multi-method comparison.
+
+        Returns dict: method_name → [(step, mean, std), ...]
+        """
+        curves = {}
+        for method in methods:
+            runs = experiment_results.get(method, [])
+            if not runs:
+                continue
+            # Group by step
+            by_step = {}
+            for run in runs:
+                for entry in run:
+                    step = entry.get("step", 0)
+                    loss = entry.get("loss", float("nan"))
+                    if step % step_interval == 0 and not math.isnan(loss):
+                        if step not in by_step:
+                            by_step[step] = []
+                        by_step[step].append(loss)
+            # Compute mean ± std
+            curve = []
+            for step in sorted(by_step.keys()):
+                vals = by_step[step]
+                mean = sum(vals) / len(vals)
+                if len(vals) > 1:
+                    var = sum((v - mean)**2 for v in vals) / (len(vals)-1)
+                    std = math.sqrt(var)
+                else:
+                    std = 0.0
+                curve.append({"step": step, "mean": mean, "std": std,
+                              "n": len(vals)})
+            curves[method] = curve
+        return curves
+
+    @staticmethod
+    def prepare_bar_chart(method_values):
+        """Prepare data for bar chart comparison.
+
+        method_values: dict of method_name → {"mean": x, "std": y}
+        """
+        return [{"method": k, **v} for k, v in method_values.items()]
+
+    @staticmethod
+    def prepare_ablation_sweep(sweep_param, sweep_values,
+                               loss_values):
+        """Prepare data for single-variable ablation plot.
+
+        sweep_values: list of parameter values tested
+        loss_values: dict of value → [loss_seed1, loss_seed2, ...]
+        """
+        points = []
+        for val in sorted(sweep_values):
+            losses = loss_values.get(val, [])
+            if not losses:
+                continue
+            mean = sum(losses) / len(losses)
+            if len(losses) > 1:
+                var = sum((v - mean)**2 for v in losses) / (len(losses)-1)
+                std = math.sqrt(var)
+            else:
+                std = 0.0
+            points.append({
+                sweep_param: val,
+                "mean_loss": mean,
+                "std_loss": std,
+                "n": len(losses),
+            })
+        return points
+
+    @staticmethod
+    def export_plot_data(data, path):
+        """Export plotting data to JSON for reproducibility."""
+        with open(path, "w") as fh:
+            json.dump(data, fh, indent=2, default=str)
+
+
+# =================================================================
+# End M087  (NeurIPS Figure Specs + Validator + Data Preparer)
+# =================================================================

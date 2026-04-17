@@ -3337,3 +3337,295 @@ class DESLOCZeROMemoryEstimator:
 # =================================================================
 # End M074
 # =================================================================
+
+# =================================================================
+# M086: DES-LOC × ZeRO Integration — Partitioned Independent Sync
+# Claude-5 (M077-M091)
+# Nick Joseph: "我们主要是把分布式框架调到极致"
+# =================================================================
+
+import math
+import time
+import logging
+
+_m086_logger = logging.getLogger("DeepSpeed")
+
+
+class DeslocZeroSyncManager:
+    """Manage DES-LOC independent synchronization within ZeRO Stage 1/2.
+
+    ZeRO partitions optimizer states across data-parallel workers.
+    DES-LOC adds independent sync periods on top:
+      - Parameters: AllReduce every Kx steps
+      - First momentum (u): AllReduce every Ku steps
+      - Second momentum (v): AllReduce every Kv steps
+
+    Key insight: When Kx>1, we can skip AllGather on intermediate
+    steps, saving communication.  Momentum states being offloaded
+    to CPU (ZeRO-Offload) naturally benefit from DES-LOC since
+    less-frequent sync means less H2D/D2H traffic.
+    """
+
+    def __init__(self, Kx=8, Ku=24, Kv=48, world_size=1,
+                 zero_stage=1, overlap_comm=True):
+        self.Kx = max(1, Kx)
+        self.Ku = max(1, Ku)
+        self.Kv = max(1, Kv)
+        self.world_size = world_size
+        self.zero_stage = zero_stage
+        self.overlap_comm = overlap_comm
+        self._step = 0
+        self._param_bytes_synced = 0
+        self._momentum_bytes_synced = 0
+        self._param_bytes_skipped = 0
+        self._momentum_bytes_skipped = 0
+        self._comm_events = []
+
+    def step(self):
+        self._step += 1
+        return {
+            "step": self._step,
+            "sync_params": self.should_sync_params(),
+            "sync_u": self.should_sync_u(),
+            "sync_v": self.should_sync_v(),
+        }
+
+    def should_sync_params(self):
+        return self._step % self.Kx == 0
+
+    def should_sync_u(self):
+        return self._step % self.Ku == 0
+
+    def should_sync_v(self):
+        return self._step % self.Kv == 0
+
+    def record_sync(self, state_type, num_bytes, time_ms=0.0):
+        """Record a synchronization event."""
+        if state_type == "params":
+            self._param_bytes_synced += num_bytes
+        else:
+            self._momentum_bytes_synced += num_bytes
+        self._comm_events.append({
+            "step": self._step,
+            "type": state_type,
+            "bytes": num_bytes,
+            "time_ms": time_ms,
+        })
+
+    def record_skip(self, state_type, num_bytes):
+        if state_type == "params":
+            self._param_bytes_skipped += num_bytes
+        else:
+            self._momentum_bytes_skipped += num_bytes
+
+    def communication_summary(self):
+        """Compute communication statistics."""
+        total_synced = (self._param_bytes_synced
+                        + self._momentum_bytes_synced)
+        total_skipped = (self._param_bytes_skipped
+                         + self._momentum_bytes_skipped)
+        total_possible = total_synced + total_skipped
+
+        reduction_factor = 1.0
+        if total_synced > 0 and total_possible > 0:
+            reduction_factor = total_possible / total_synced
+
+        return {
+            "total_steps": self._step,
+            "Kx": self.Kx, "Ku": self.Ku, "Kv": self.Kv,
+            "zero_stage": self.zero_stage,
+            "param_bytes_synced": self._param_bytes_synced,
+            "momentum_bytes_synced": self._momentum_bytes_synced,
+            "param_bytes_skipped": self._param_bytes_skipped,
+            "momentum_bytes_skipped": self._momentum_bytes_skipped,
+            "reduction_factor": round(reduction_factor, 1),
+            "param_sync_count": self._step // self.Kx,
+            "u_sync_count": self._step // self.Ku,
+            "v_sync_count": self._step // self.Kv,
+        }
+
+
+class PartitionedMomentumSync:
+    """Synchronize partitioned momentum states (ZeRO Stage 2).
+
+    In ZeRO-2, optimizer states are partitioned across workers.
+    DES-LOC syncs these partitions independently:
+
+    For parameters: AllReduce full parameters at Kx
+    For momentum u: AllReduce only the u partition at Ku
+    For momentum v: AllReduce only the v partition at Kv
+
+    This means at Ku steps, we communicate param_size/world_size
+    bytes for u, not param_size bytes.
+    """
+
+    def __init__(self, num_partitions, partition_id,
+                 Kx=8, Ku=24, Kv=48):
+        self.num_partitions = num_partitions
+        self.partition_id = partition_id
+        self.Kx = max(1, Kx)
+        self.Ku = max(1, Ku)
+        self.Kv = max(1, Kv)
+        self._step = 0
+
+    def get_partition_comm_bytes(self, total_param_bytes):
+        """Bytes communicated for this partition at current step."""
+        per_partition = total_param_bytes // max(1, self.num_partitions)
+        self._step += 1
+        bytes_this_step = 0
+
+        if self._step % self.Kx == 0:
+            bytes_this_step += total_param_bytes  # Full param sync
+        if self._step % self.Ku == 0:
+            bytes_this_step += per_partition  # Only u partition
+        if self._step % self.Kv == 0:
+            bytes_this_step += per_partition  # Only v partition
+        return bytes_this_step
+
+    def ddp_comm_bytes(self, total_param_bytes):
+        """DDP equivalent: gradient AllReduce every step."""
+        return total_param_bytes
+
+    def local_adam_comm_bytes(self, total_param_bytes):
+        """Local Adam: sync all states (x,u,v) at Kx."""
+        per_partition = total_param_bytes // max(1, self.num_partitions)
+        if self._step % self.Kx == 0:
+            return total_param_bytes + 2 * per_partition
+        return 0
+
+    def reduction_summary(self, total_param_bytes, total_steps):
+        """Project total communication over training run."""
+        full_sync = total_param_bytes
+        partition = total_param_bytes // max(1, self.num_partitions)
+
+        desloc_total = (
+            (total_steps // self.Kx) * full_sync
+            + (total_steps // self.Ku) * partition
+            + (total_steps // self.Kv) * partition
+        )
+        ddp_total = total_steps * full_sync
+        local_adam_total = (
+            (total_steps // self.Kx) * (full_sync + 2 * partition)
+        )
+
+        return {
+            "desloc_bytes": desloc_total,
+            "ddp_bytes": ddp_total,
+            "local_adam_bytes": local_adam_total,
+            "reduction_vs_ddp": round(
+                ddp_total / max(1, desloc_total), 1),
+            "reduction_vs_local_adam": round(
+                local_adam_total / max(1, desloc_total), 1),
+        }
+
+
+class CommunicationCounter:
+    """Precise communication accounting for DES-LOC experiments.
+
+    Tracks every AllReduce/ReduceScatter call with byte counts
+    for accurate reporting in NeurIPS paper tables.
+    """
+
+    def __init__(self):
+        self._ops = []
+        self._total_bytes = 0
+        self._total_calls = 0
+        self._by_type = {}
+
+    def record(self, op_type, num_bytes, step,
+               time_ms=0.0, skipped=False):
+        entry = {
+            "op": op_type,
+            "bytes": num_bytes,
+            "step": step,
+            "time_ms": time_ms,
+            "skipped": skipped,
+        }
+        self._ops.append(entry)
+        if not skipped:
+            self._total_bytes += num_bytes
+            self._total_calls += 1
+            self._by_type[op_type] = (
+                self._by_type.get(op_type, 0) + num_bytes)
+
+    def get_total_bytes(self):
+        return self._total_bytes
+
+    def get_total_gb(self):
+        return self._total_bytes / 1e9
+
+    def get_breakdown(self):
+        return dict(self._by_type)
+
+    def get_bytes_at_step(self, step):
+        return sum(e["bytes"] for e in self._ops
+                   if e["step"] == step and not e["skipped"])
+
+    def get_skipped_bytes(self):
+        return sum(e["bytes"] for e in self._ops if e["skipped"])
+
+    def summary(self):
+        return {
+            "total_bytes": self._total_bytes,
+            "total_gb": round(self.get_total_gb(), 3),
+            "total_calls": self._total_calls,
+            "skipped_bytes": self.get_skipped_bytes(),
+            "breakdown": self.get_breakdown(),
+        }
+
+
+class GradientAccumulationCompat:
+    """Ensure DES-LOC sync periods align with gradient accumulation.
+
+    When using gradient_accumulation_steps=G, the effective step
+    for DES-LOC sync should be the optimization step (step // G),
+    not the micro-batch step.
+    """
+
+    def __init__(self, grad_accum_steps=1, Kx=8, Ku=24, Kv=48):
+        self.gas = max(1, grad_accum_steps)
+        self.Kx = max(1, Kx)
+        self.Ku = max(1, Ku)
+        self.Kv = max(1, Kv)
+        self._micro_step = 0
+
+    def micro_step(self):
+        self._micro_step += 1
+
+    def is_accumulation_boundary(self):
+        return self._micro_step % self.gas == 0
+
+    def optimization_step(self):
+        return self._micro_step // self.gas
+
+    def should_sync_params(self):
+        if not self.is_accumulation_boundary():
+            return False
+        opt_step = self.optimization_step()
+        return opt_step > 0 and opt_step % self.Kx == 0
+
+    def should_sync_u(self):
+        if not self.is_accumulation_boundary():
+            return False
+        opt_step = self.optimization_step()
+        return opt_step > 0 and opt_step % self.Ku == 0
+
+    def should_sync_v(self):
+        if not self.is_accumulation_boundary():
+            return False
+        opt_step = self.optimization_step()
+        return opt_step > 0 and opt_step % self.Kv == 0
+
+    def get_state(self):
+        return {
+            "micro_step": self._micro_step,
+            "optimization_step": self.optimization_step(),
+            "gas": self.gas,
+            "Kx": self.Kx, "Ku": self.Ku, "Kv": self.Kv,
+            "at_boundary": self.is_accumulation_boundary(),
+        }
+
+
+# =================================================================
+# End M086  (ZeRO Sync Manager + Partitioned Momentum + CommCounter)
+# =================================================================

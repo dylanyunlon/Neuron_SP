@@ -1680,3 +1680,349 @@ def get_desloc_throughput_meter():
 # =================================================================
 # End M064
 # =================================================================
+
+# =================================================================
+# M080: DES-LOC Communication Bandwidth Benchmark Suite
+# Claude-5 (M077-M091)
+# Nick Joseph: "训练要跨大量GPU并行进行...分布式有多种模式"
+# =================================================================
+
+import time
+import math
+import json
+import os
+
+
+class CommBandwidthProfiler:
+    """Measure AllReduce/ReduceScatter latency and bandwidth.
+
+    Records per-operation timing using CUDA events for accuracy.
+    Separates warmup iterations from measured iterations.
+    """
+
+    def __init__(self, warmup_iters=5, measure_iters=20,
+                 msg_sizes_bytes=None):
+        self.warmup_iters = warmup_iters
+        self.measure_iters = measure_iters
+        self.msg_sizes = msg_sizes_bytes or [
+            1024,           # 1 KB
+            8192,           # 8 KB
+            65536,          # 64 KB
+            524288,         # 512 KB
+            1048576,        # 1 MB
+            4194304,        # 4 MB
+            16777216,       # 16 MB
+            67108864,       # 64 MB
+            268435456,      # 256 MB
+        ]
+        self._results = []
+
+    def benchmark_allreduce(self, group=None):
+        """Run AllReduce benchmark across message sizes."""
+        try:
+            import torch
+            import deepspeed.comm as dist
+        except ImportError:
+            return []
+
+        if not dist.is_initialized():
+            return []
+
+        device = torch.cuda.current_device()
+        results = []
+        world_size = dist.get_world_size(group)
+
+        for size_bytes in self.msg_sizes:
+            num_elements = size_bytes // 4  # float32
+            if num_elements < 1:
+                num_elements = 1
+            tensor = torch.zeros(num_elements, dtype=torch.float32,
+                                 device=device)
+
+            # Warmup
+            for _ in range(self.warmup_iters):
+                dist.all_reduce(tensor, group=group)
+            torch.cuda.synchronize()
+
+            # Measure
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
+            torch.cuda.synchronize()
+            start_event.record()
+            for _ in range(self.measure_iters):
+                dist.all_reduce(tensor, group=group)
+            end_event.record()
+            torch.cuda.synchronize()
+
+            elapsed_ms = start_event.elapsed_time(end_event)
+            avg_ms = elapsed_ms / self.measure_iters
+            # AllReduce transfers 2*(N-1)/N * msg_size (ring algo)
+            algo_bw_factor = 2.0 * (world_size - 1) / world_size
+            if avg_ms > 0:
+                bw_gbps = (size_bytes * algo_bw_factor
+                           / (avg_ms / 1000.0) / 1e9)
+            else:
+                bw_gbps = 0.0
+
+            result = {
+                "op": "all_reduce",
+                "msg_size_bytes": size_bytes,
+                "world_size": world_size,
+                "latency_ms": round(avg_ms, 4),
+                "bandwidth_gbps": round(bw_gbps, 2),
+                "algo_bw_factor": algo_bw_factor,
+                "iters": self.measure_iters,
+            }
+            results.append(result)
+            del tensor
+
+        self._results.extend(results)
+        return results
+
+    def benchmark_reduce_scatter(self, group=None):
+        """Run ReduceScatter benchmark across message sizes."""
+        try:
+            import torch
+            import deepspeed.comm as dist
+        except ImportError:
+            return []
+
+        if not dist.is_initialized():
+            return []
+
+        device = torch.cuda.current_device()
+        results = []
+        world_size = dist.get_world_size(group)
+
+        for size_bytes in self.msg_sizes:
+            num_elements = size_bytes // 4
+            if num_elements < world_size:
+                num_elements = world_size
+            # Ensure divisible
+            num_elements = (num_elements // world_size) * world_size
+            tensor = torch.zeros(num_elements, dtype=torch.float32,
+                                 device=device)
+            output = torch.zeros(num_elements // world_size,
+                                 dtype=torch.float32, device=device)
+
+            for _ in range(self.warmup_iters):
+                dist.reduce_scatter(output, tensor, group=group)
+            torch.cuda.synchronize()
+
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
+            torch.cuda.synchronize()
+            start_event.record()
+            for _ in range(self.measure_iters):
+                dist.reduce_scatter(output, tensor, group=group)
+            end_event.record()
+            torch.cuda.synchronize()
+
+            elapsed_ms = start_event.elapsed_time(end_event)
+            avg_ms = elapsed_ms / self.measure_iters
+            algo_bw_factor = (world_size - 1.0) / world_size
+            if avg_ms > 0:
+                bw_gbps = (size_bytes * algo_bw_factor
+                           / (avg_ms / 1000.0) / 1e9)
+            else:
+                bw_gbps = 0.0
+
+            result = {
+                "op": "reduce_scatter",
+                "msg_size_bytes": size_bytes,
+                "world_size": world_size,
+                "latency_ms": round(avg_ms, 4),
+                "bandwidth_gbps": round(bw_gbps, 2),
+                "algo_bw_factor": algo_bw_factor,
+                "iters": self.measure_iters,
+            }
+            results.append(result)
+            del tensor, output
+
+        self._results.extend(results)
+        return results
+
+    def get_results(self):
+        return list(self._results)
+
+    def export_json(self, path):
+        with open(path, "w") as fh:
+            json.dump(self._results, fh, indent=2)
+
+    def export_csv(self, path):
+        if not self._results:
+            return
+        import csv as csv_mod
+        fields = list(self._results[0].keys())
+        with open(path, "w", newline="") as fh:
+            writer = csv_mod.DictWriter(fh, fieldnames=fields)
+            writer.writeheader()
+            writer.writerows(self._results)
+
+
+class TopologyDetector:
+    """Detect GPU interconnect topology (NVLink, PCIe, InfiniBand).
+
+    Nick Joseph: "同事甚至跑了聚类算法来推测芯片分布在哪些机房"
+    """
+
+    def __init__(self):
+        self._topology = {}
+        self._detected = False
+
+    def detect(self):
+        """Probe GPU topology using nvidia-smi and torch."""
+        info = {"num_gpus": 0, "gpu_names": [], "interconnects": [],
+                "nvlink_pairs": [], "pcie_bandwidth": []}
+        try:
+            import torch
+            if torch.cuda.is_available():
+                info["num_gpus"] = torch.cuda.device_count()
+                for i in range(info["num_gpus"]):
+                    props = torch.cuda.get_device_properties(i)
+                    info["gpu_names"].append(props.name)
+        except Exception:
+            pass
+
+        # Detect NVLink via P2P access check
+        try:
+            import torch
+            for i in range(info["num_gpus"]):
+                for j in range(i + 1, info["num_gpus"]):
+                    can_access = torch.cuda.can_device_access_peer(i, j)
+                    link_type = "nvlink" if can_access else "pcie"
+                    info["interconnects"].append({
+                        "gpu_a": i, "gpu_b": j, "type": link_type,
+                    })
+                    if can_access:
+                        info["nvlink_pairs"].append((i, j))
+        except Exception:
+            pass
+
+        self._topology = info
+        self._detected = True
+        return info
+
+    def get_topology(self):
+        if not self._detected:
+            self.detect()
+        return self._topology
+
+    def is_heterogeneous(self):
+        topo = self.get_topology()
+        names = set(topo.get("gpu_names", []))
+        return len(names) > 1
+
+    def has_nvlink(self):
+        topo = self.get_topology()
+        return len(topo.get("nvlink_pairs", [])) > 0
+
+    def recommended_comm_strategy(self):
+        """Recommend DES-LOC communication strategy based on topology."""
+        topo = self.get_topology()
+        if self.has_nvlink():
+            return {
+                "strategy": "nvlink_ring",
+                "description": "Use ring AllReduce over NVLink",
+                "expected_bw_gbps": 600,
+            }
+        elif topo["num_gpus"] > 1:
+            return {
+                "strategy": "pcie_tree",
+                "description": "Use tree AllReduce over PCIe",
+                "expected_bw_gbps": 32,
+            }
+        else:
+            return {
+                "strategy": "single_gpu",
+                "description": "No communication needed",
+                "expected_bw_gbps": 0,
+            }
+
+
+class DeslocCommTracker:
+    """Track per-step communication volume for DES-LOC experiments.
+
+    Counts bytes saved by skipping AllReduce when step % Kx != 0.
+    """
+
+    def __init__(self, Kx=8, Ku=24, Kv=48, param_bytes=0):
+        self.Kx = max(1, Kx)
+        self.Ku = max(1, Ku)
+        self.Kv = max(1, Kv)
+        self.param_bytes = param_bytes
+        self._step = 0
+        self._total_sent = 0
+        self._total_saved = 0
+        self._log = []
+
+    def step(self):
+        """Record one training step and return comm decision."""
+        self._step += 1
+        sent = 0
+        saved = 0
+
+        # Parameter sync
+        if self._step % self.Kx == 0:
+            sent += self.param_bytes
+        else:
+            saved += self.param_bytes
+
+        # First momentum sync
+        if self._step % self.Ku == 0:
+            sent += self.param_bytes
+        else:
+            saved += self.param_bytes
+
+        # Second momentum sync
+        if self._step % self.Kv == 0:
+            sent += self.param_bytes
+        else:
+            saved += self.param_bytes
+
+        self._total_sent += sent
+        self._total_saved += saved
+
+        entry = {
+            "step": self._step,
+            "bytes_sent": sent,
+            "bytes_saved": saved,
+            "sync_x": self._step % self.Kx == 0,
+            "sync_u": self._step % self.Ku == 0,
+            "sync_v": self._step % self.Kv == 0,
+        }
+        self._log.append(entry)
+        return entry
+
+    def get_reduction_factor(self):
+        """Communication reduction vs DDP (sync every step)."""
+        ddp_total = self._step * self.param_bytes * 3
+        if ddp_total <= 0:
+            return 1.0
+        return ddp_total / max(1, self._total_sent)
+
+    def get_reduction_vs_local_adam(self):
+        """Reduction vs Local Adam (syncs all states at Kx)."""
+        local_adam_sent = (self._step // self.Kx) * self.param_bytes * 3
+        if local_adam_sent <= 0:
+            return 1.0
+        return local_adam_sent / max(1, self._total_sent)
+
+    def summary(self):
+        return {
+            "total_steps": self._step,
+            "Kx": self.Kx, "Ku": self.Ku, "Kv": self.Kv,
+            "total_bytes_sent": self._total_sent,
+            "total_bytes_saved": self._total_saved,
+            "reduction_vs_ddp": round(self.get_reduction_factor(), 1),
+            "reduction_vs_local_adam": round(
+                self.get_reduction_vs_local_adam(), 1),
+        }
+
+    def get_log(self):
+        return list(self._log)
+
+
+# =================================================================
+# End M080  (CommBandwidthProfiler + TopologyDetector + CommTracker)
+# =================================================================

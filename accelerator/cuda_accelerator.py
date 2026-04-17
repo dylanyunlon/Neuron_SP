@@ -707,3 +707,410 @@ class CUDA_Accelerator(DeepSpeedAccelerator):
         except Exception as e:
             topology['error'] = str(e)
         return topology
+
+# =================================================================
+# M091: CUDA/Trainium2 Dual-Backend Accelerator + Hardware-Aware Opt
+# Claude-5 (M077-M091)
+# Nick Joseph: "拥有多种芯片在某些方面很有优势...但你可能需要
+# 为每种芯片重复编写代码"
+# =================================================================
+
+import os
+import math
+import time
+import logging
+
+_m091_logger = logging.getLogger("DeepSpeed")
+
+
+class AcceleratorCapabilityProbe:
+    """Probe hardware capabilities for DES-LOC optimization decisions.
+
+    Queries GPU properties at runtime to auto-configure:
+    - Batch size (based on memory)
+    - Communication strategy (based on interconnect)
+    - Precision (BF16 native vs emulated)
+    - Sync periods (based on bandwidth)
+    """
+
+    def __init__(self):
+        self._capabilities = {}
+        self._probed = False
+
+    def probe(self):
+        """Probe all available accelerator capabilities."""
+        caps = {
+            "backend": "unknown",
+            "device_count": 0,
+            "devices": [],
+            "bf16_native": False,
+            "fp16_native": False,
+            "nvlink_available": False,
+            "total_memory_gb": 0.0,
+        }
+
+        # Try CUDA first
+        try:
+            import torch
+            if torch.cuda.is_available():
+                caps["backend"] = "cuda"
+                caps["device_count"] = torch.cuda.device_count()
+                caps["bf16_native"] = (
+                    torch.cuda.is_bf16_supported()
+                    if hasattr(torch.cuda, "is_bf16_supported")
+                    else False
+                )
+                caps["fp16_native"] = True
+
+                for i in range(caps["device_count"]):
+                    props = torch.cuda.get_device_properties(i)
+                    dev = {
+                        "id": i,
+                        "name": props.name,
+                        "total_memory_gb": round(
+                            props.total_mem / (1024 ** 3), 1),
+                        "compute_capability": (
+                            props.major, props.minor),
+                        "sm_count": props.multi_processor_count,
+                    }
+                    # Detect BF16 support by compute capability
+                    if props.major >= 8:
+                        dev["bf16_supported"] = True
+                        dev["tf32_supported"] = True
+                    else:
+                        dev["bf16_supported"] = False
+                        dev["tf32_supported"] = False
+
+                    # Detect GPU family
+                    name_lower = props.name.lower()
+                    if "h100" in name_lower:
+                        dev["family"] = "hopper"
+                        dev["peak_tflops_bf16"] = 1979.0
+                        dev["hbm_bw_gbps"] = 3350
+                    elif "a100" in name_lower:
+                        dev["family"] = "ampere"
+                        dev["peak_tflops_bf16"] = 312.0
+                        dev["hbm_bw_gbps"] = 2039
+                    elif "a6000" in name_lower:
+                        dev["family"] = "ampere"
+                        dev["peak_tflops_bf16"] = 155.0
+                        dev["hbm_bw_gbps"] = 768
+                    elif "4090" in name_lower:
+                        dev["family"] = "ada"
+                        dev["peak_tflops_bf16"] = 330.0
+                        dev["hbm_bw_gbps"] = 1008
+                    else:
+                        dev["family"] = "unknown"
+                        dev["peak_tflops_bf16"] = 50.0
+                        dev["hbm_bw_gbps"] = 500
+
+                    caps["devices"].append(dev)
+
+                caps["total_memory_gb"] = sum(
+                    d["total_memory_gb"] for d in caps["devices"])
+
+                # Check NVLink via P2P access
+                if caps["device_count"] > 1:
+                    try:
+                        caps["nvlink_available"] = (
+                            torch.cuda.can_device_access_peer(0, 1))
+                    except Exception:
+                        caps["nvlink_available"] = False
+        except ImportError:
+            pass
+
+        # Try Neuron (Trainium2) if CUDA not available
+        if caps["backend"] == "unknown":
+            try:
+                import torch_neuronx
+                caps["backend"] = "neuron"
+                caps["bf16_native"] = True  # Trainium2 has native BF16
+                _m091_logger.info("Detected AWS Neuron (Trainium2) backend")
+            except ImportError:
+                pass
+
+        # Check for XLA (TPU or Neuron)
+        if caps["backend"] == "unknown":
+            try:
+                import torch_xla
+                caps["backend"] = "xla"
+                _m091_logger.info("Detected XLA backend")
+            except ImportError:
+                pass
+
+        if caps["backend"] == "unknown":
+            caps["backend"] = "cpu"
+            _m091_logger.info("No GPU/accelerator detected, using CPU")
+
+        self._capabilities = caps
+        self._probed = True
+        return caps
+
+    def get_capabilities(self):
+        if not self._probed:
+            self.probe()
+        return self._capabilities
+
+    def is_cuda(self):
+        return self.get_capabilities()["backend"] == "cuda"
+
+    def is_neuron(self):
+        return self.get_capabilities()["backend"] == "neuron"
+
+    def is_heterogeneous(self):
+        caps = self.get_capabilities()
+        families = set(d.get("family", "?") for d in caps["devices"])
+        return len(families) > 1
+
+    def weakest_gpu_memory_gb(self):
+        caps = self.get_capabilities()
+        mems = [d["total_memory_gb"] for d in caps["devices"]]
+        return min(mems) if mems else 0
+
+
+class DeslocHardwareOptimizer:
+    """Auto-tune DES-LOC hyperparameters based on hardware.
+
+    Given GPU configuration, recommend:
+    - batch_size: fit in weakest GPU memory
+    - Kx: based on interconnect bandwidth (faster → lower Kx)
+    - dtype: BF16 if supported, else FP16
+    - comm_overlap: if NVLink available
+    """
+
+    # Model memory estimates (params + optimizer states + activations)
+    MODEL_MEMORY_GB = {
+        "117M": {"params": 0.5, "optim": 1.5, "act_per_batch": 0.1},
+        "350M": {"params": 1.4, "optim": 4.2, "act_per_batch": 0.3},
+        "1.3B": {"params": 5.2, "optim": 15.6, "act_per_batch": 1.0},
+        "2.7B": {"params": 10.8, "optim": 32.4, "act_per_batch": 2.0},
+        "6.7B": {"params": 26.8, "optim": 80.4, "act_per_batch": 5.0},
+    }
+
+    def __init__(self, probe=None):
+        self.probe = probe or AcceleratorCapabilityProbe()
+        self._caps = self.probe.get_capabilities()
+
+    def recommend_batch_size(self, model_size="117M", seq_len=1024):
+        """Recommend batch size based on available memory."""
+        mem_info = self.MODEL_MEMORY_GB.get(
+            model_size, self.MODEL_MEMORY_GB["117M"])
+        available_gb = self.probe.weakest_gpu_memory_gb()
+        if available_gb <= 0:
+            return 1
+
+        # Reserve 20% for PyTorch overhead
+        usable_gb = available_gb * 0.8
+        fixed_gb = mem_info["params"] + mem_info["optim"]
+        remaining_gb = usable_gb - fixed_gb
+        if remaining_gb <= 0:
+            return 1
+
+        batch_size = int(remaining_gb / mem_info["act_per_batch"])
+        # Round down to power of 2
+        if batch_size >= 2:
+            batch_size = 2 ** int(math.log2(batch_size))
+        return max(1, min(batch_size, 256))
+
+    def recommend_dtype(self):
+        """Recommend precision based on hardware."""
+        if self._caps.get("bf16_native", False):
+            return "bf16"
+        elif self._caps.get("fp16_native", False):
+            return "fp16"
+        return "fp32"
+
+    def recommend_sync_periods(self, model_size="117M",
+                               beta1=0.9, beta2=0.999):
+        """Recommend DES-LOC sync periods based on hardware."""
+        has_nvlink = self._caps.get("nvlink_available", False)
+
+        # Half-life based recommendation
+        hl1 = -1.0 / math.log2(beta1) if 0 < beta1 < 1 else 10
+        hl2 = -1.0 / math.log2(beta2) if 0 < beta2 < 1 else 1000
+
+        if has_nvlink:
+            # NVLink: high bandwidth → can sync more frequently
+            Kx = 8
+        else:
+            # PCIe: limited bandwidth → sync less frequently
+            Kx = 16
+
+        # Ku proportional to Kx, bounded by half-life
+        Ku = max(Kx, min(int(Kx * 3), int(hl1)))
+        Kv = max(Ku, min(int(Kx * 6), int(hl2 / 2)))
+
+        return {
+            "Kx": Kx, "Ku": Ku, "Kv": Kv,
+            "reason": f"{'NVLink' if has_nvlink else 'PCIe'} detected",
+            "half_life_beta1": round(hl1, 1),
+            "half_life_beta2": round(hl2, 1),
+        }
+
+    def recommend_comm_strategy(self):
+        """Recommend communication overlap strategy."""
+        has_nvlink = self._caps.get("nvlink_available", False)
+        n_gpus = self._caps.get("device_count", 1)
+
+        if n_gpus <= 1:
+            return {"overlap": False, "algorithm": "none",
+                    "reason": "single GPU"}
+        elif has_nvlink:
+            return {"overlap": True, "algorithm": "ring",
+                    "reason": "NVLink ring AllReduce optimal"}
+        else:
+            return {"overlap": True, "algorithm": "tree",
+                    "reason": "PCIe tree AllReduce for bandwidth"}
+
+    def full_recommendation(self, model_size="117M",
+                            beta1=0.9, beta2=0.999):
+        """Generate complete DES-LOC configuration recommendation."""
+        return {
+            "hardware": {
+                "backend": self._caps.get("backend", "unknown"),
+                "num_gpus": self._caps.get("device_count", 0),
+                "total_memory_gb": self._caps.get("total_memory_gb", 0),
+                "nvlink": self._caps.get("nvlink_available", False),
+                "heterogeneous": self.probe.is_heterogeneous(),
+            },
+            "model_size": model_size,
+            "batch_size": self.recommend_batch_size(model_size),
+            "dtype": self.recommend_dtype(),
+            "sync_periods": self.recommend_sync_periods(
+                model_size, beta1, beta2),
+            "comm_strategy": self.recommend_comm_strategy(),
+        }
+
+
+class NeuronAcceleratorBridge:
+    """Bridge between NVIDIA CUDA and AWS Neuron (Trainium2) APIs.
+
+    Provides unified interface for DES-LOC operations:
+    - Memory management
+    - Synchronization barriers
+    - Performance counters
+    - Device selection
+
+    Falls back gracefully when Neuron is not available.
+    """
+
+    def __init__(self):
+        self._backend = None
+        self._detected = False
+
+    def detect_backend(self):
+        if self._detected:
+            return self._backend
+        try:
+            import torch
+            if torch.cuda.is_available():
+                self._backend = "cuda"
+                self._detected = True
+                return "cuda"
+        except ImportError:
+            pass
+        try:
+            import torch_neuronx
+            self._backend = "neuron"
+            self._detected = True
+            return "neuron"
+        except ImportError:
+            pass
+        try:
+            import torch_xla
+            self._backend = "xla"
+            self._detected = True
+            return "xla"
+        except ImportError:
+            pass
+        self._backend = "cpu"
+        self._detected = True
+        return "cpu"
+
+    def synchronize(self):
+        """Backend-agnostic synchronize."""
+        backend = self.detect_backend()
+        if backend == "cuda":
+            import torch
+            torch.cuda.synchronize()
+        elif backend in ("neuron", "xla"):
+            try:
+                import torch_xla.core.xla_model as xm
+                xm.mark_step()
+            except ImportError:
+                pass
+
+    def empty_cache(self):
+        """Backend-agnostic cache clearing."""
+        backend = self.detect_backend()
+        if backend == "cuda":
+            import torch
+            torch.cuda.empty_cache()
+
+    def memory_allocated(self, device=0):
+        """Return allocated memory in bytes."""
+        backend = self.detect_backend()
+        if backend == "cuda":
+            import torch
+            return torch.cuda.memory_allocated(device)
+        return 0
+
+    def memory_reserved(self, device=0):
+        backend = self.detect_backend()
+        if backend == "cuda":
+            import torch
+            return torch.cuda.memory_reserved(device)
+        return 0
+
+    def device_name(self, device=0):
+        backend = self.detect_backend()
+        if backend == "cuda":
+            import torch
+            return torch.cuda.get_device_name(device)
+        elif backend == "neuron":
+            return "AWS Trainium2"
+        elif backend == "xla":
+            return "XLA Device"
+        return "CPU"
+
+    def device_count(self):
+        backend = self.detect_backend()
+        if backend == "cuda":
+            import torch
+            return torch.cuda.device_count()
+        elif backend == "neuron":
+            cores = os.environ.get("NEURON_RT_VISIBLE_CORES", "")
+            if cores:
+                return len(cores.split(","))
+            return 1
+        return 1
+
+    def set_device(self, device_id):
+        backend = self.detect_backend()
+        if backend == "cuda":
+            import torch
+            torch.cuda.set_device(device_id)
+        elif backend in ("neuron", "xla"):
+            os.environ["NEURON_RT_VISIBLE_CORES"] = str(device_id)
+
+    def get_performance_summary(self):
+        """Collect performance counters from current backend."""
+        summary = {"backend": self.detect_backend()}
+        if summary["backend"] == "cuda":
+            import torch
+            for i in range(torch.cuda.device_count()):
+                summary[f"gpu_{i}"] = {
+                    "name": torch.cuda.get_device_name(i),
+                    "memory_allocated_mb": round(
+                        torch.cuda.memory_allocated(i) / (1024**2), 1),
+                    "memory_reserved_mb": round(
+                        torch.cuda.memory_reserved(i) / (1024**2), 1),
+                    "max_memory_allocated_mb": round(
+                        torch.cuda.max_memory_allocated(i) / (1024**2), 1),
+                }
+        return summary
+
+
+# =================================================================
+# End M091  (CapabilityProbe + HardwareOptimizer + NeuronBridge)
+# =================================================================
