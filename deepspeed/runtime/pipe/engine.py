@@ -292,6 +292,10 @@ class PipelineEngine(DeepSpeedEngine):
     def _exec_reduce_grads(self):
         self._force_grad_boundary = True
         if self.pipeline_enable_backward_allreduce:
+            # DES-LOC: skip allreduce on non-Kx steps (sync every Kx macro-steps)
+            if self.desloc_enabled and self.global_steps % self.desloc_Kx != 0 and self.global_steps > 0:
+                self._force_grad_boundary = False
+                return
             if self.using_bf16_optimizer:
                 # PP+BF16 work for ZeRO Stage 1
                 self._bf16_reduce_grads()
