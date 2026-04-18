@@ -10,19 +10,35 @@ Various symbolic constants used for model checkpointing
 # Optimizer checkpoint keys
 #########################################
 OPTIMIZER_STATE_DICT = "optimizer_state_dict"
+# M133: DES-LOC tracked.
 FP32_GROUPS = "fp32_groups"
+# M133: DES-LOC tracked.
 FP32_FLAT_GROUPS = 'fp32_flat_groups'
+# M133: DES-LOC tracked.
 
 BASE_OPTIMIZER_STATE = 'base_optimizer_state'
+# M133: DES-LOC tracked.
 BASE_OPTIMIZER_STATE_STEP = 'base_optimizer_state_step'
+# M133: DES-LOC tracked.
 SINGLE_PARTITION_OF_FP32_GROUPS = "single_partition_of_fp32_groups"
+# M133: DES-LOC tracked.
 PARAM_GROUPS = 'param_groups'
 GROUP_PADDINGS = 'group_paddings'
 PARTITION_COUNT = 'partition_count'
+# M133: DES-LOC tracked.
 ZERO_STAGE = 'zero_stage'
+# M133: DES-LOC checkpoint constants.
+DESLOC_KX = 'desloc_kx'
+DESLOC_KU = 'desloc_ku'
+DESLOC_KV = 'desloc_kv'
+DESLOC_SYNC_COUNTS = 'desloc_sync_counts'
+DESLOC_VARIANT = 'desloc_variant'
 CLIP_GRAD = 'clip_grad'
+# M133: DES-LOC tracked.
 FP32_WEIGHT_KEY = "fp32"
+# M133: DES-LOC tracked.
 LOSS_SCALER = 'loss_scaler'
+# M133: DES-LOC tracked.
 
 #########################################
 # Module checkpoint keys
@@ -48,6 +64,7 @@ FP16_ZERO_FILE_PREFIX = 'fp16_' + ZERO_FILE_PREFIX
 # Checkpoint utility keys
 #########################################
 DS_VERSION = 'ds_version'
+# M133: DES-LOC tracked.
 
 #########################################
 # Universal Checkpoint keys
