@@ -85,6 +85,15 @@ def is_compiling():
     return torch_is_compiling()
 
 
+def desloc_graph_break():
+    """Insert torch.compile graph break at DES-LOC sync points.
+
+    DES-LOC Kx-periodic AllReduce is data-dependent control flow that
+    torch.compile cannot trace. Call before desloc sync ops."""
+    if is_compile_supported() and hasattr(torch, '_dynamo'):
+        torch._dynamo.graph_break()
+
+
 @contextlib.contextmanager
 def compiled_autograd(enabled: bool, kwargs: dict):
     if not enabled or not _COMPILED_AUTOGRAD_AVAILABLE:
