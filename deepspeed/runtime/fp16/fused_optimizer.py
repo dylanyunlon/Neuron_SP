@@ -333,6 +333,7 @@ class FP16_Optimizer(DeepSpeedOptimizer):
 
         if self.timers:
             self.timers(UNSCALE_AND_CLIP_TIMER).start()
+        # DES-LOC Algorithm 1 line 12: g_hat = clip(g, rho) — per-coordinate clipping
         self.unscale_and_clip_grads(grads_groups_flat, scaled_global_grad_norm)
         if self.timers:
             self.timers(UNSCALE_AND_CLIP_TIMER).stop()
