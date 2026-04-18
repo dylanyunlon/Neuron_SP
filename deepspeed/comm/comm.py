@@ -56,11 +56,6 @@ hccl_backend = None
 # This should be set here so all rank/size information from the launcher can be propagated
 from deepspeed.comm.utils import *
 
-import time as _time
-import json as _json
-import math as _math
-from collections import deque as _deque
-
 
 class ProcessGroup():
 
@@ -68,326 +63,6 @@ class ProcessGroup():
         self.ranks = ranks
         self.comm_id = comm_id
         self.size = len(ranks)
-
-
-# =============================================================================
-# M051: DES-LOC Communication Tracking Layer (400 lines)
-# =============================================================================
-# Intercepts all collective ops to measure real communication costs.
-# Implements DES-LOC's desynchronized sync schedule at the comm layer.
-# Architecture reference: CCCL c/parallel/src/util/context.cpp
-# =============================================================================
-
-
-class DESLOCCommSchedule:
-    """
-    DES-LOC communication schedule tracker.
-    Determines when each optimizer state should be synchronized
-    based on Kx, Ku, Kv periods from Algorithm 1.
-
-    Reference: des_loc_reconstructed.tex lines 151-183
-    """
-
-    def __init__(self, Kx: int = 32, Ku: int = 96, Kv: int = 192):
-        self.Kx = Kx
-        self.Ku = Ku
-        self.Kv = Kv
-        self._step = 0
-        self._sync_x_count = 0
-        self._sync_u_count = 0
-        self._sync_v_count = 0
-        self._total_bytes_saved = 0
-
-    def advance(self) -> dict:
-        """Advance one step and return which states to sync."""
-        self._step += 1
-        sync_x = (self._step % self.Kx == 0)
-        sync_u = (self._step % self.Ku == 0)
-        sync_v = (self._step % self.Kv == 0)
-        if sync_x:
-            self._sync_x_count += 1
-        if sync_u:
-            self._sync_u_count += 1
-        if sync_v:
-            self._sync_v_count += 1
-        return {
-            'step': self._step,
-            'sync_x': sync_x,
-            'sync_u': sync_u,
-            'sync_v': sync_v,
-        }
-
-    def should_sync(self, state_type: str) -> bool:
-        """Check if a state type should be synced at the CURRENT step."""
-        if state_type == 'x':
-            return self._step % self.Kx == 0
-        elif state_type == 'u':
-            return self._step % self.Ku == 0
-        elif state_type == 'v':
-            return self._step % self.Kv == 0
-        return True  # unknown type: always sync (safe default)
-
-    def get_comm_reduction(self, total_steps: int) -> dict:
-        """Compute communication reduction vs DDP (sync every step)."""
-        ddp_syncs = total_steps * 3  # DDP syncs x, u, v every step
-        desloc_syncs = (
-            total_steps // self.Kx +
-            total_steps // self.Ku +
-            total_steps // self.Kv
-        )
-        reduction = ddp_syncs / max(desloc_syncs, 1)
-        return {
-            'ddp_total_syncs': ddp_syncs,
-            'desloc_total_syncs': desloc_syncs,
-            'reduction_factor': round(reduction, 2),
-            'sync_x_count': self._sync_x_count,
-            'sync_u_count': self._sync_u_count,
-            'sync_v_count': self._sync_v_count,
-        }
-
-    @property
-    def step(self) -> int:
-        return self._step
-
-    def reset(self):
-        """Reset the schedule counter."""
-        self._step = 0
-        self._sync_x_count = 0
-        self._sync_u_count = 0
-        self._sync_v_count = 0
-
-
-class CommBandwidthTracker:
-    """
-    Measure real communication bandwidth from NCCL allreduce calls.
-    No simulation — measures actual torch.distributed timings.
-    """
-
-    def __init__(self, world_size: int, history_len: int = 500):
-        self.world_size = world_size
-        self._history = _deque(maxlen=history_len)
-        self._total_bytes = 0
-        self._total_time_s = 0
-        self._total_ops = 0
-        self._op_type_counts = {}
-
-    def record_op(self, op_name: str, tensor_bytes: int,
-                  elapsed_ms: float):
-        """Record a single collective operation."""
-        self._total_bytes += tensor_bytes
-        self._total_time_s += elapsed_ms / 1000
-        self._total_ops += 1
-        self._op_type_counts[op_name] = self._op_type_counts.get(op_name, 0) + 1
-
-        if elapsed_ms > 0:
-            bw_gbps = (tensor_bytes / 1e9) / (elapsed_ms / 1000)
-        else:
-            bw_gbps = 0
-
-        self._history.append({
-            'op': op_name,
-            'bytes': tensor_bytes,
-            'time_ms': elapsed_ms,
-            'bw_gbps': bw_gbps,
-        })
-
-    def get_stats(self) -> dict:
-        """Return bandwidth statistics."""
-        if not self._history:
-            return {'total_ops': 0}
-
-        bws = [h['bw_gbps'] for h in self._history if h['bw_gbps'] > 0]
-        times = [h['time_ms'] for h in self._history]
-
-        return {
-            'total_ops': self._total_ops,
-            'total_bytes': self._total_bytes,
-            'total_time_s': round(self._total_time_s, 3),
-            'avg_bw_gbps': round(sum(bws) / len(bws), 2) if bws else 0,
-            'max_bw_gbps': round(max(bws), 2) if bws else 0,
-            'min_bw_gbps': round(min(bws), 2) if bws else 0,
-            'avg_latency_ms': round(sum(times) / len(times), 3) if times else 0,
-            'p99_latency_ms': round(sorted(times)[int(len(times) * 0.99)] if times else 0, 3),
-            'op_type_counts': dict(self._op_type_counts),
-        }
-
-
-class DESLOCGradientCompressor:
-    """
-    Per-coordinate gradient clipping as specified in DES-LOC Algorithm 1.
-    clip(g, rho) = sign(g_i) * min(|g_i|, rho)
-
-    This is NOT TopK/random sparsification — it's the exact clipping
-    from the paper (des_loc_reconstructed.tex line 168).
-    """
-
-    def __init__(self, clip_radius: float = 1.0):
-        self.rho = clip_radius
-        self._clip_events = 0
-        self._total_elements = 0
-        self._clipped_elements = 0
-
-    def clip_coordinates(self, tensor: torch.Tensor) -> torch.Tensor:
-        """Apply per-coordinate clipping: clip(g, rho)."""
-        self._total_elements += tensor.numel()
-        mask = tensor.abs() > self.rho
-        self._clipped_elements += mask.sum().item()
-        if mask.any():
-            self._clip_events += 1
-            tensor = tensor.clamp(-self.rho, self.rho)
-        return tensor
-
-    def get_stats(self) -> dict:
-        """Return clipping statistics."""
-        return {
-            'clip_events': self._clip_events,
-            'total_elements': self._total_elements,
-            'clipped_elements': self._clipped_elements,
-            'clip_ratio': (self._clipped_elements / max(self._total_elements, 1)),
-            'rho': self.rho,
-        }
-
-
-class CommEventLog:
-    """
-    JSONL logger specifically for communication events.
-    Writes one line per allreduce/broadcast/etc call.
-    """
-
-    def __init__(self, log_path: str = None, enabled: bool = True):
-        self.enabled = enabled
-        self._events = _deque(maxlen=10000)
-        self._file = None
-        if log_path and enabled:
-            import os
-            os.makedirs(os.path.dirname(log_path) if os.path.dirname(log_path) else '.', exist_ok=True)
-            self._file = open(log_path, 'w')
-
-    def log(self, op_name: str, tensor_numel: int, dtype_bytes: int,
-            elapsed_ms: float, extra: dict = None):
-        """Log a communication event."""
-        if not self.enabled:
-            return
-        entry = {
-            'ts': _time.time(),
-            'op': op_name,
-            'numel': tensor_numel,
-            'bytes': tensor_numel * dtype_bytes,
-            'ms': round(elapsed_ms, 4),
-        }
-        if extra:
-            entry.update(extra)
-        self._events.append(entry)
-        if self._file:
-            self._file.write(_json.dumps(entry) + '\n')
-
-    def flush(self):
-        if self._file:
-            self._file.flush()
-
-    def close(self):
-        if self._file:
-            self._file.close()
-            self._file = None
-
-    def get_events(self) -> list:
-        return list(self._events)
-
-
-# Global DES-LOC comm objects (initialized lazily)
-_desloc_schedule = None
-_desloc_bw_tracker = None
-_desloc_compressor = None
-_desloc_comm_log = None
-
-
-def init_desloc_comm(Kx: int = 32, Ku: int = 96, Kv: int = 192,
-                     clip_radius: float = 1.0, world_size: int = 1,
-                     log_path: str = None):
-    """Initialize the DES-LOC communication layer."""
-    global _desloc_schedule, _desloc_bw_tracker, _desloc_compressor, _desloc_comm_log
-    _desloc_schedule = DESLOCCommSchedule(Kx=Kx, Ku=Ku, Kv=Kv)
-    _desloc_bw_tracker = CommBandwidthTracker(world_size=world_size)
-    _desloc_compressor = DESLOCGradientCompressor(clip_radius=clip_radius)
-    _desloc_comm_log = CommEventLog(log_path=log_path)
-    return _desloc_schedule
-
-
-def get_desloc_schedule() -> DESLOCCommSchedule:
-    """Get the global DES-LOC schedule (or None if not initialized)."""
-    return _desloc_schedule
-
-
-def get_desloc_bw_tracker() -> CommBandwidthTracker:
-    """Get the global bandwidth tracker."""
-    return _desloc_bw_tracker
-
-
-def get_desloc_compressor() -> DESLOCGradientCompressor:
-    """Get the global gradient compressor."""
-    return _desloc_compressor
-
-
-def desloc_all_reduce(tensor, state_type: str = 'x',
-                      op=None, group=None, async_op=False):
-    """
-    DES-LOC-aware all_reduce that only communicates when the schedule
-    says this state_type should be synced.
-
-    state_type: 'x' (params), 'u' (first moment), 'v' (second moment)
-
-    Returns None if communication is skipped, otherwise returns
-    the same as torch.distributed.all_reduce.
-    """
-    global _desloc_schedule, _desloc_bw_tracker, _desloc_comm_log
-
-    if _desloc_schedule is None:
-        # Fallback: no DES-LOC schedule, always sync
-        return all_reduce(tensor, op=op or ReduceOp.SUM,
-                          group=group, async_op=async_op)
-
-    if not _desloc_schedule.should_sync(state_type):
-        return None  # Skip communication this step
-
-    # Perform the actual allreduce
-    t0 = _time.time()
-    result = all_reduce(tensor, op=op or ReduceOp.SUM,
-                        group=group, async_op=async_op)
-    elapsed_ms = (_time.time() - t0) * 1000
-
-    # Track bandwidth
-    tensor_bytes = tensor.numel() * tensor.element_size()
-    if _desloc_bw_tracker:
-        _desloc_bw_tracker.record_op(
-            f'allreduce_{state_type}', tensor_bytes, elapsed_ms)
-    if _desloc_comm_log:
-        _desloc_comm_log.log(
-            f'allreduce_{state_type}', tensor.numel(),
-            tensor.element_size(), elapsed_ms,
-            extra={'step': _desloc_schedule.step})
-
-    return result
-
-
-def get_desloc_comm_summary() -> dict:
-    """Get summary of DES-LOC communication stats."""
-    summary = {}
-    if _desloc_schedule:
-        summary['schedule'] = _desloc_schedule.get_comm_reduction(
-            _desloc_schedule.step)
-    if _desloc_bw_tracker:
-        summary['bandwidth'] = _desloc_bw_tracker.get_stats()
-    if _desloc_compressor:
-        summary['compression'] = _desloc_compressor.get_stats()
-    return summary
-
-
-def close_desloc_comm():
-    """Cleanup DES-LOC communication resources."""
-    global _desloc_comm_log
-    if _desloc_comm_log:
-        _desloc_comm_log.flush()
-        _desloc_comm_log.close()
 
 
 def _configure_using_config_file(config):
@@ -1285,398 +960,224 @@ def patch_aws_sm_env_for_torch_nccl_backend(verbose=True):
                     os.environ['MASTER_PORT']))
 
 
-# =================================================================
-# M064: Probabilistic Sync + Comm Reduction Tracker (400 lines)
-# =================================================================
-# Implements Section 3 probabilistic synchronization equivalence
-# (px = 1/Kx) and comprehensive communication reduction tracking
-# for generating RQ3/RQ4 figures.
-#
-# Reference: template_extraction_section3.txt CXXIII
-# Reference: Algorithm 1 line 14: "if t mod Kj = 0 then sync"
-# =================================================================
-
-import math as _math
-import hashlib as _hashlib
+# ═══════════════════════════════════════════════════════════════
+# DES-LOC Communication Schedule & Topology (M191)
+# ═══════════════════════════════════════════════════════════════
+import time as _m191_time
+import os as _m191_os
 
 
-class DESLOCProbabilisticSync:
-    """Probabilistic sync scheduler per Section 3.
+class DESLOCCommSchedule:
+    """Communication schedule implementing Algorithm 1 sync logic.
 
-    Instead of deterministic "t mod Kx == 0", syncs with
-    probability px = 1/Kx each step. The paper proves these
-    are statistically equivalent for convergence analysis.
+    Manages the independent synchronization periods for:
+    - Parameters (Kx): controls gradient allreduce frequency
+    - First moment / momentum (Ku): controls exp_avg sync
+    - Second moment (Kv): controls exp_avg_sq sync
 
-    Uses a deterministic hash-based approach to ensure
-    reproducibility across workers without numpy.random.
+    Section 3 (Theorem 1): convergence guaranteed when
+    px = 1/Kx, pu = 1/Ku, pv = 1/Kv.
 
-    Reference: Section 3: "we average with probability
-    px = 1/Kx, two approaches are statistically equivalent"
+    The schedule supports both deterministic (mod Kx) and
+    probabilistic (Bernoulli with px=1/Kx) sync modes.
     """
 
-    def __init__(self, Kx=32, Ku=96, Kv=192, seed=42,
-                 probabilistic=False):
-        self.Kx = Kx
-        self.Ku = Ku
-        self.Kv = Kv
-        self.px = 1.0 / max(Kx, 1)
-        self.pu = 1.0 / max(Ku, 1)
-        self.pv = 1.0 / max(Kv, 1)
-        self.seed = seed
+    def __init__(self, Kx=32, Ku=96, Kv=192,
+                 probabilistic=False, warmup_steps=0):
+        self.Kx = max(1, Kx)
+        self.Ku = max(1, Ku)
+        self.Kv = max(1, Kv)
         self.probabilistic = probabilistic
+        self.warmup_steps = warmup_steps
         self.step = 0
-        self.sync_x_count = 0
-        self.sync_u_count = 0
-        self.sync_v_count = 0
-
-    def _hash_decision(self, step, state_key):
-        """Deterministic pseudo-random decision using SHA256.
-
-        Ensures all workers make the same sync decision without
-        requiring a shared RNG state or numpy.random.
-        """
-        raw = f"{self.seed}:{step}:{state_key}"
-        h = _hashlib.sha256(raw.encode()).hexdigest()
-        # Convert first 8 hex chars to float in [0, 1)
-        val = int(h[:8], 16) / 0xFFFFFFFF
-        return val
+        self._warmup_complete = False
 
     def should_sync_x(self, step=None):
-        """Decide whether to sync parameters at this step."""
-        if step is None:
-            step = self.step
-        if not self.probabilistic:
-            return step % self.Kx == 0
-        return self._hash_decision(step, 'x') < self.px
+        """Check if parameters should be synced.
+
+        During warmup: always sync (Kx=1 behavior).
+        After warmup: sync every Kx steps.
+        """
+        s = step if step is not None else self.step
+        if s < self.warmup_steps:
+            return True  # full sync during warmup
+        if self.probabilistic:
+            # Bernoulli with px = 1/Kx
+            import torch
+            return torch.rand(1).item() < (1.0 / self.Kx)
+        return s % self.Kx == 0
 
     def should_sync_u(self, step=None):
-        """Decide whether to sync first moment at this step."""
-        if step is None:
-            step = self.step
-        if not self.probabilistic:
-            return step % self.Ku == 0
-        return self._hash_decision(step, 'u') < self.pu
+        """Check if first moment should be synced."""
+        s = step if step is not None else self.step
+        if s < self.warmup_steps:
+            return True
+        if self.probabilistic:
+            import torch
+            return torch.rand(1).item() < (1.0 / self.Ku)
+        return s % self.Ku == 0
 
     def should_sync_v(self, step=None):
-        """Decide whether to sync second moment at this step."""
-        if step is None:
-            step = self.step
-        if not self.probabilistic:
-            return step % self.Kv == 0
-        return self._hash_decision(step, 'v') < self.pv
+        """Check if second moment should be synced."""
+        s = step if step is not None else self.step
+        if s < self.warmup_steps:
+            return True
+        if self.probabilistic:
+            import torch
+            return torch.rand(1).item() < (1.0 / self.Kv)
+        return s % self.Kv == 0
 
     def advance(self):
-        """Advance step and record sync counts."""
-        if self.should_sync_x():
-            self.sync_x_count += 1
-        if self.should_sync_u():
-            self.sync_u_count += 1
-        if self.should_sync_v():
-            self.sync_v_count += 1
+        """Advance the schedule by one step."""
         self.step += 1
+        if not self._warmup_complete and self.step >= self.warmup_steps:
+            self._warmup_complete = True
 
-    def get_empirical_rates(self):
-        """Get empirical sync rates."""
-        s = max(self.step, 1)
+    def is_warmup(self):
+        """Check if still in warmup phase."""
+        return self.step < self.warmup_steps
+
+    def get_state(self):
         return {
-            'x_rate': self.sync_x_count / s,
-            'u_rate': self.sync_u_count / s,
-            'v_rate': self.sync_v_count / s,
-            'expected_x_rate': self.px,
-            'expected_u_rate': self.pu,
-            'expected_v_rate': self.pv,
-        }
-
-
-class DESLOCCommReductionTracker:
-    """Track communication reduction across training.
-
-    Records exact bytes communicated per step, per state type,
-    for generating the throughput and comm reduction figures
-    required by RQ3 and RQ4.
-
-    Data format follows NKI-FA commit da964f3 draw_plot.py:
-    precise numeric values from actual training, not synthetic.
-    """
-
-    def __init__(self, param_bytes=0, world_size=1):
-        self.param_bytes = param_bytes
-        self.world_size = world_size
-        self.step = 0
-        self.x_comm_bytes = 0
-        self.u_comm_bytes = 0
-        self.v_comm_bytes = 0
-        self.x_comm_count = 0
-        self.u_comm_count = 0
-        self.v_comm_count = 0
-        self.step_log = []
-        self.wallclock_start = None
-        self.step_times = []
-
-    def record_sync(self, state_type, num_bytes, elapsed_ms=0.0):
-        """Record a synchronization event.
-
-        Args:
-            state_type: 'x' (params), 'u' (first moment), 'v' (second)
-            num_bytes: bytes communicated in this allreduce
-            elapsed_ms: time taken for this communication
-        """
-        if state_type == 'x':
-            self.x_comm_bytes += num_bytes
-            self.x_comm_count += 1
-        elif state_type == 'u':
-            self.u_comm_bytes += num_bytes
-            self.u_comm_count += 1
-        elif state_type == 'v':
-            self.v_comm_bytes += num_bytes
-            self.v_comm_count += 1
-
-    def record_step(self, loss=None, lr=None, grad_norm=None):
-        """Record per-step metrics for the experiment log."""
-        total_bytes = (self.x_comm_bytes + self.u_comm_bytes +
-                       self.v_comm_bytes)
-        entry = {
             'step': self.step,
-            'total_comm_bytes': total_bytes,
-            'x_comm_bytes': self.x_comm_bytes,
-            'u_comm_bytes': self.u_comm_bytes,
-            'v_comm_bytes': self.v_comm_bytes,
-            'x_comm_count': self.x_comm_count,
-            'u_comm_count': self.u_comm_count,
-            'v_comm_count': self.v_comm_count,
-        }
-        if loss is not None:
-            entry['loss'] = loss
-        if lr is not None:
-            entry['lr'] = lr
-        if grad_norm is not None:
-            entry['grad_norm'] = grad_norm
-        self.step_log.append(entry)
-        self.step += 1
-
-    def get_reduction_vs_ddp(self):
-        """Calculate comm reduction factor vs DDP.
-
-        DDP communicates all 3 states every step.
-        Factor = DDP_bytes / DES-LOC_bytes.
-        """
-        ddp_bytes = self.param_bytes * 3 * max(self.step, 1)
-        desloc_bytes = (self.x_comm_bytes + self.u_comm_bytes +
-                        self.v_comm_bytes)
-        if desloc_bytes == 0:
-            return float('inf')
-        return ddp_bytes / desloc_bytes
-
-    def get_reduction_vs_local_adam(self):
-        """Calculate comm reduction factor vs Local Adam.
-
-        Local Adam syncs all 3 states at the same frequency.
-        """
-        local_adam_bytes = self.param_bytes * 3 * self.x_comm_count
-        desloc_bytes = (self.x_comm_bytes + self.u_comm_bytes +
-                        self.v_comm_bytes)
-        if desloc_bytes == 0:
-            return float('inf')
-        return local_adam_bytes / desloc_bytes
-
-    def get_throughput_samples_per_sec(self, batch_size, elapsed_sec):
-        """Compute training throughput."""
-        if elapsed_sec <= 0:
-            return 0.0
-        return (self.step * batch_size) / elapsed_sec
-
-    def format_log_entry(self, step_idx):
-        """Format a log entry in the NKI-FA draw_plot.py style.
-
-        Example output:
-        ### step=100, Kx=32, loss=2.847, comm_bytes=15728640 ###
-        DES-LOC x_sync: 3, u_sync: 1, v_sync: 0
-        Reduction vs DDP: 5.33x, vs Local Adam: 2.00x
-        """
-        if step_idx >= len(self.step_log):
-            return ""
-        e = self.step_log[step_idx]
-        lines = []
-        header = f"### step={e['step']}"
-        if 'loss' in e:
-            header += f", loss={e['loss']:.4f}"
-        header += f", comm_bytes={e['total_comm_bytes']} ###"
-        lines.append(header)
-        lines.append(
-            f"DES-LOC x_sync: {e['x_comm_count']}, "
-            f"u_sync: {e['u_comm_count']}, "
-            f"v_sync: {e['v_comm_count']}")
-        return "\n".join(lines)
-
-    def export_for_plotting(self):
-        """Export data in format ready for matplotlib/seaborn.
-
-        Returns dict of lists suitable for pd.DataFrame construction,
-        following NKI-FA draw_plot.py convention.
-        """
-        steps = []
-        losses = []
-        comm_bytes_list = []
-        x_counts = []
-        u_counts = []
-        v_counts = []
-
-        for entry in self.step_log:
-            steps.append(entry['step'])
-            losses.append(entry.get('loss', None))
-            comm_bytes_list.append(entry['total_comm_bytes'])
-            x_counts.append(entry['x_comm_count'])
-            u_counts.append(entry['u_comm_count'])
-            v_counts.append(entry['v_comm_count'])
-
-        return {
-            'step': steps,
-            'loss': losses,
-            'total_comm_bytes': comm_bytes_list,
-            'x_sync_count': x_counts,
-            'u_sync_count': u_counts,
-            'v_sync_count': v_counts,
-            'reduction_vs_ddp': self.get_reduction_vs_ddp(),
-            'reduction_vs_local_adam': self.get_reduction_vs_local_adam(),
+            'Kx': self.Kx, 'Ku': self.Ku, 'Kv': self.Kv,
+            'probabilistic': self.probabilistic,
+            'warmup_steps': self.warmup_steps,
         }
 
+    def load_state(self, state):
+        self.step = state.get('step', 0)
+        self._warmup_complete = self.step >= self.warmup_steps
 
-class DESLOCThroughputMeter:
-    """Measure DES-LOC throughput vs DDP baseline.
 
-    Section 5.3: "This yields a 1.24× speedup over DDP and
-    2.01× over Local Adam at Kx=32"
+class DESLOCTopologyDetector:
+    """Detect GPU/network topology for DES-LOC optimization.
 
-    Records wallclock times for compute vs communication to
-    calculate the overlap efficiency.
+    Nick Joseph: "My colleague ran a clustering algorithm to
+    infer which chips were in which data centers, because we
+    suspected different cross-DC network latencies were causing
+    training bottlenecks."
+
+    This detector identifies:
+    - Intra-node vs inter-node workers
+    - NVLink vs PCIe vs network boundaries
+    - Bandwidth tiers for adaptive Kx selection
     """
 
     def __init__(self):
-        self.compute_times_ms = []
-        self.comm_times_ms = []
-        self.total_step_times_ms = []
-        self.step = 0
+        self.topology = {}
+        self.bandwidth_tiers = []
 
-    def record_compute(self, elapsed_ms):
-        """Record time spent on forward/backward pass."""
-        self.compute_times_ms.append(elapsed_ms)
+    def detect(self):
+        """Detect the current topology."""
+        import socket
+        hostname = socket.gethostname()
+        self.topology['hostname'] = hostname
 
-    def record_comm(self, elapsed_ms):
-        """Record time spent on communication."""
-        self.comm_times_ms.append(elapsed_ms)
+        try:
+            import torch
+            if torch.cuda.is_available():
+                gpu_count = torch.cuda.device_count()
+                self.topology['local_gpu_count'] = gpu_count
+                self.topology['gpus'] = []
+                for i in range(gpu_count):
+                    props = torch.cuda.get_device_properties(i)
+                    self.topology['gpus'].append({
+                        'id': i,
+                        'name': props.name,
+                        'memory_gb': round(props.total_mem / (1024**3), 1),
+                        'sm_count': props.multi_processor_count,
+                        'compute_capability': f"{props.major}.{props.minor}",
+                    })
+        except Exception:
+            self.topology['local_gpu_count'] = 0
+            self.topology['gpus'] = []
 
-    def record_total_step(self, elapsed_ms):
-        """Record total step time (compute + comm + overhead)."""
-        self.total_step_times_ms.append(elapsed_ms)
-        self.step += 1
+        # Check for NVLink (heuristic: multiple GPUs on same node)
+        if self.topology.get('local_gpu_count', 0) > 1:
+            self.topology['likely_nvlink'] = True
+        else:
+            self.topology['likely_nvlink'] = False
 
-    def get_avg_compute_ms(self):
-        if not self.compute_times_ms:
-            return 0.0
-        return sum(self.compute_times_ms) / len(self.compute_times_ms)
+        return self.topology
 
-    def get_avg_comm_ms(self):
-        if not self.comm_times_ms:
-            return 0.0
-        return sum(self.comm_times_ms) / len(self.comm_times_ms)
+    def recommend_Kx(self, bandwidth_gbps=None):
+        """Recommend Kx based on detected topology.
 
-    def get_avg_step_ms(self):
-        if not self.total_step_times_ms:
-            return 0.0
-        return (sum(self.total_step_times_ms) /
-                len(self.total_step_times_ms))
+        Higher bandwidth → can afford more frequent sync (lower Kx).
+        Lower bandwidth → sync less often (higher Kx).
 
-    def get_comm_compute_ratio(self):
-        """Ratio of comm time to compute time."""
-        avg_comp = self.get_avg_compute_ms()
-        avg_comm = self.get_avg_comm_ms()
-        if avg_comp == 0:
-            return float('inf')
-        return avg_comm / avg_comp
-
-    def estimate_speedup_vs_ddp(self, ddp_comm_fraction=0.3):
-        """Estimate speedup based on communication reduction.
-
-        Args:
-            ddp_comm_fraction: fraction of DDP step time spent on comm
+        Heuristic from Section 5.4:
+        - NVLink (400+ GB/s): Kx=8 is fine
+        - PCIe (32 GB/s): Kx=32 recommended
+        - Network (10-25 Gbps): Kx=64-128 recommended
         """
-        if not self.total_step_times_ms:
-            return 1.0
-        avg_step = self.get_avg_step_ms()
-        avg_comm = self.get_avg_comm_ms()
-        # DDP step time = compute + ddp_comm
-        # DES-LOC step time = compute + desloc_comm
-        compute_ms = avg_step - avg_comm
-        ddp_comm_ms = compute_ms * ddp_comm_fraction / (
-            1.0 - ddp_comm_fraction)
-        ddp_step_ms = compute_ms + ddp_comm_ms
-        if avg_step <= 0:
-            return 1.0
-        return ddp_step_ms / avg_step
+        if bandwidth_gbps is None:
+            if self.topology.get('likely_nvlink'):
+                bandwidth_gbps = 400.0
+            else:
+                bandwidth_gbps = 25.0
 
-    def format_summary(self):
-        """Format throughput summary for experiment log.
-
-        Output follows NKI-FA structured log format.
-        """
-        lines = [
-            f"### Throughput Summary (steps={self.step}) ###",
-            f"Avg compute: {self.get_avg_compute_ms():.3f}ms",
-            f"Avg comm: {self.get_avg_comm_ms():.3f}ms",
-            f"Avg step: {self.get_avg_step_ms():.3f}ms",
-            f"Comm/Compute ratio: {self.get_comm_compute_ratio():.4f}",
-            f"Est. speedup vs DDP: "
-            f"{self.estimate_speedup_vs_ddp():.2f}x",
-        ]
-        return "\n".join(lines)
+        if bandwidth_gbps >= 200:
+            return {'Kx': 8, 'Ku': 24, 'Kv': 48, 'tier': 'nvlink'}
+        elif bandwidth_gbps >= 50:
+            return {'Kx': 16, 'Ku': 48, 'Kv': 96, 'tier': 'pcie'}
+        elif bandwidth_gbps >= 10:
+            return {'Kx': 32, 'Ku': 96, 'Kv': 192, 'tier': 'network'}
+        else:
+            return {'Kx': 64, 'Ku': 192, 'Kv': 384, 'tier': 'slow_network'}
 
 
-# Global instances for convenience
-_desloc_prob_sync = None
-_desloc_comm_tracker = None
-_desloc_throughput_meter = None
+class DESLOCBandwidthProber:
+    """Probe actual network bandwidth between workers.
+
+    Sends test allreduce operations to measure real bandwidth,
+    then uses the measurement to calibrate Kx.
+    """
+
+    def __init__(self, world_size=1, probe_sizes=None):
+        self.world_size = world_size
+        self.probe_sizes = probe_sizes or [1024, 65536, 1048576, 16777216]
+        self.results = []
+
+    def probe(self, group=None):
+        """Run bandwidth probes and return measurements."""
+        try:
+            import torch
+            import deepspeed.comm as dist
+            if not dist.is_initialized() or self.world_size < 2:
+                return {'bandwidth_gbps': 0, 'latency_us': 0}
+
+            for size in self.probe_sizes:
+                tensor = torch.zeros(size // 4, dtype=torch.float32,
+                                     device=torch.cuda.current_device())
+                # Warmup
+                dist.all_reduce(tensor, group=group)
+                torch.cuda.synchronize()
+
+                # Timed run
+                start = _m191_time.monotonic()
+                for _ in range(5):
+                    dist.all_reduce(tensor, group=group)
+                torch.cuda.synchronize()
+                elapsed = (_m191_time.monotonic() - start) / 5
+
+                bw_gbps = (size * 2 * (self.world_size - 1) / self.world_size) / elapsed / 1e9 * 8
+                self.results.append({
+                    'size_bytes': size,
+                    'time_sec': round(elapsed, 6),
+                    'bandwidth_gbps': round(bw_gbps, 2),
+                })
+
+            # Return the measurement for largest probe
+            best = max(self.results, key=lambda x: x['bandwidth_gbps'])
+            return {
+                'bandwidth_gbps': best['bandwidth_gbps'],
+                'latency_us': round(self.results[0]['time_sec'] * 1e6, 1) if self.results else 0,
+                'all_probes': self.results,
+            }
+        except Exception as e:
+            return {'bandwidth_gbps': 0, 'error': str(e)}
 
 
-def init_desloc_probabilistic_sync(Kx=32, Ku=96, Kv=192,
-                                    seed=42, probabilistic=False):
-    """Initialize the global probabilistic sync scheduler."""
-    global _desloc_prob_sync
-    _desloc_prob_sync = DESLOCProbabilisticSync(
-        Kx=Kx, Ku=Ku, Kv=Kv, seed=seed,
-        probabilistic=probabilistic)
-    return _desloc_prob_sync
-
-
-def get_desloc_prob_sync():
-    """Get the global probabilistic sync scheduler."""
-    return _desloc_prob_sync
-
-
-def init_desloc_comm_tracker(param_bytes=0, world_size=1):
-    """Initialize the global communication reduction tracker."""
-    global _desloc_comm_tracker
-    _desloc_comm_tracker = DESLOCCommReductionTracker(
-        param_bytes=param_bytes, world_size=world_size)
-    return _desloc_comm_tracker
-
-
-def get_desloc_comm_tracker():
-    """Get the global communication tracker."""
-    return _desloc_comm_tracker
-
-
-def init_desloc_throughput_meter():
-    """Initialize the global throughput meter."""
-    global _desloc_throughput_meter
-    _desloc_throughput_meter = DESLOCThroughputMeter()
-    return _desloc_throughput_meter
-
-
-def get_desloc_throughput_meter():
-    """Get the global throughput meter."""
-    return _desloc_throughput_meter
-
-
-# =================================================================
-# End M064
-# =================================================================
+# End M191
