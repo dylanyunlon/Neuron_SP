@@ -636,3 +636,42 @@ def _get_padded_tensor(src_tensor, size):
                 if p.grad is not None:
                     p.grad.data.clamp_(-rho, rho)
 
+
+    # --- DES-LOC BF16 (M143) ---
+    def _desloc_bf16_should_sync(self,tier='x'):
+        e=getattr(self,'deepspeed_engine',None) or getattr(self,'ds_engine',None)
+        if e is None or not getattr(e,'desloc_enabled',False): return True
+        return {'x':e.desloc_is_param_sync_step,'u':e.desloc_is_momentum_sync_step,'v':e.desloc_is_variance_sync_step}.get(tier,e.desloc_is_param_sync_step)()
+    def _desloc_bf16_clip(self):
+        e=getattr(self,'deepspeed_engine',None) or getattr(self,'ds_engine',None)
+        if e is None or not getattr(e,'desloc_enabled',False): return
+        rho=e.desloc_clip_rho
+        if rho<=0: return
+        for gp in self.fp32_groups_gradient_flat_partition:
+            if gp is not None: gp.clamp_(-rho,rho)
+    def _desloc_bf16_sync_states(self):
+        e=getattr(self,'deepspeed_engine',None) or getattr(self,'ds_engine',None)
+        if e is None or not getattr(e,'desloc_enabled',False): return
+        su=e.desloc_is_momentum_sync_step();sv=e.desloc_is_variance_sync_step()
+        if not su and not sv: return
+        for i,g in enumerate(self.optimizer.param_groups):
+            for p in g['params']:
+                if p not in self.optimizer.state: continue
+                st=self.optimizer.state[p]; dp=self.real_dp_process_group[min(i,len(self.real_dp_process_group)-1)]
+                if su and 'exp_avg' in st and dist.get_world_size(group=dp)>1: dist.all_reduce(st['exp_avg'],op=dist.ReduceOp.AVG,group=dp)
+                if sv and 'exp_avg_sq' in st and dist.get_world_size(group=dp)>1: dist.all_reduce(st['exp_avg_sq'],op=dist.ReduceOp.AVG,group=dp)
+    def _desloc_bf16_nesterov(self,mu=0.9):
+        e=getattr(self,'deepspeed_engine',None) or getattr(self,'ds_engine',None)
+        if e is None or not getattr(e,'desloc_enabled',False) or not self._desloc_bf16_should_sync('x'): return
+        if not hasattr(self,'_dbv'): self._dbv,self._dbp={},{}
+        for i,flat in enumerate(self.bf16_groups_flat):
+            pid=id(flat)
+            if pid not in self._dbv: self._dbv[pid]=flat.data.new_zeros(flat.data.shape);self._dbp[pid]=flat.data.clone();continue
+            d=flat.data.float()-self._dbp[pid].float();v=self._dbv[pid];v.mul_(mu).add_(d)
+            flat.data.add_(v.to(flat.dtype),alpha=mu);self._dbp[pid].copy_(flat.data)
+    def _desloc_bf16_comm_stats(self):
+        e=getattr(self,'deepspeed_engine',None) or getattr(self,'ds_engine',None)
+        if e is None: return {'reduction':1.0}
+        tp=sum(f.numel() for f in self.bf16_groups_flat);pb=tp*2
+        dl=pb/e.desloc_Kx+pb/e.desloc_Ku+pb/e.desloc_Kv
+        return {'params':tp,'reduction':round(pb/max(dl,1),1)}
