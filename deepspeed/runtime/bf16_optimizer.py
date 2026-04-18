@@ -439,11 +439,17 @@ class BF16_Optimizer(ZeROOptimizer):
             partition_id = dist.get_rank(group=self.real_dp_process_group[i])
             bf16_partitions[partition_id].data.copy_(fp32_partition.data)
 
-        all_gather_dp_groups(groups_flat=self.bf16_groups_flat,
-                             partitioned_param_groups=self.bf16_partitioned_groups,
-                             dp_process_group=self.real_dp_process_group,
-                             start_alignment_factor=self.nccl_start_alignment_factor,
-                             allgather_bucket_size=self.allgather_bucket_size)
+        # DES-LOC: skip all_gather on non-Kx steps (local update only)
+        _engine = getattr(self, 'deepspeed_engine', None) or getattr(self, 'ds_engine', None)
+        _skip = (_engine and getattr(_engine, 'desloc_enabled', False)
+                 and _engine.global_steps % _engine.desloc_Kx != 0
+                 and _engine.global_steps > 0)
+        if not _skip:
+            all_gather_dp_groups(groups_flat=self.bf16_groups_flat,
+                                 partitioned_param_groups=self.bf16_partitioned_groups,
+                                 dp_process_group=self.real_dp_process_group,
+                                 start_alignment_factor=self.nccl_start_alignment_factor,
+                                 allgather_bucket_size=self.allgather_bucket_size)
 
     def clear_hp_grads(self):
         for flat_gradients in self.fp32_groups_gradients_flat:
