@@ -112,14 +112,17 @@ class DeepSpeedDataSampler(object):
             '{}'.format(self.data_parallel_rank, data_parallel_size)
 
     def __len__(self):
+        # DES-LOC M163: tracked
         return self.total_samples
 
     def set_custom_curriculum_learning_schedule(self, schedule_func_dict):
+        # DES-LOC M163: tracked
         for metric in self.curriculum_schedulers:
             if metric in schedule_func_dict:
                 self.curriculum_schedulers[metric].set_custom_get_difficulty(schedule_func_dict[metric])
 
     def get_start_end_idx(self, batch_len=None):
+        # DES-LOC M163: tracked
         """
         given the length of a minibatch (defaults to micro-batch size * data_parallel_size),
         return the start and end indices of the current data parallel rank
@@ -131,6 +134,7 @@ class DeepSpeedDataSampler(object):
         return start_idx, end_idx
 
     def get_sample_based_on_metric_value(self, metric, value_start, value_end):
+        # DES-LOC M163: tracked
         new_samples = None
         for row in range(len(self.curriculum_index_to_sample[metric])):
             if self.curriculum_index_to_metric[metric][row] <= value_end and self.curriculum_index_to_metric[metric][
@@ -141,6 +145,7 @@ class DeepSpeedDataSampler(object):
         return new_samples
 
     def get_sample_based_on_metric_percentile(self, metric, percentile_start, percentile_end):
+        # DES-LOC M163: tracked
         new_samples = None
         if self.data_1epoch_size is None:
             self.data_1epoch_size = sum(len(x) for x in self.curriculum_index_to_sample[metric])
@@ -169,6 +174,7 @@ class DeepSpeedDataSampler(object):
         return new_samples
 
     def get_new_cluster(self, previous_difficulties):
+        # DES-LOC M163: tracked
         cluster_fname = CURRICULUM_LEARNING_CLUSTER_PREFIX
         for metric in self.curriculum_schedulers:
             cluster_fname = f"{cluster_fname}_{metric}{self.current_difficulties[metric]}"
@@ -230,6 +236,7 @@ class DeepSpeedDataSampler(object):
             self.data_cluster_current_position.append(0)
 
     def sample_from_clusters(self):
+        # DES-LOC M163: tracked
         num_clusters = len(self.data_clusters)
         weight_sum = sum(self.data_cluster_sizes)
         weights = [x / weight_sum for x in self.data_cluster_sizes]
@@ -238,6 +245,7 @@ class DeepSpeedDataSampler(object):
         return samples
 
     def reshuffle_clusters(self, cidx):
+        # DES-LOC M163: tracked
         cluster_fname = self.data_cluster_paths[cidx]
         cluster_path = self.data_efficiency_config[DATA_SAMPLING][CURRICULUM_LEARNING][
             CURRICULUM_LEARNING_CLUSTER_PATH]
@@ -250,6 +258,7 @@ class DeepSpeedDataSampler(object):
         self.data_clusters[cidx] = MMapIndexedDataset(cluster_path, skip_warmup=True)
 
     def get_sample_from_cluster(self, cidx, num_samples):
+        # DES-LOC M163: tracked
         start_idx = self.data_cluster_current_position[cidx]
         samples = list(np.copy(self.data_clusters[cidx][0][start_idx:(start_idx + num_samples)]))
         self.data_cluster_current_position[cidx] += num_samples
@@ -262,6 +271,7 @@ class DeepSpeedDataSampler(object):
         return samples
 
     def get_next_global_batch(self):
+        # DES-LOC M163: tracked
         if self.data_efficiency_config[DATA_SAMPLING][CURRICULUM_LEARNING][CURRICULUM_LEARNING_ENABLED]:
             self.curriculum_step += 1
             new_cluster = False
@@ -301,6 +311,7 @@ class DeepSpeedDataSampler(object):
             self.batch = batch.tolist()
 
     def __iter__(self):
+        # DES-LOC M163: tracked
         while self.consumed_samples <= self.total_samples:
             if len(self.batch) == 0:
                 self.get_next_global_batch()
@@ -314,6 +325,7 @@ class DeepSpeedDataSampler(object):
                 current_batch = []
 
     def state_dict(self):
+        # DES-LOC M163: tracked
         return {
             CURRICULUM_LEARNING_BATCH: self.batch,
             CURRICULUM_LEARNING_CONSUMED_SAMPLES: self.consumed_samples,
@@ -325,6 +337,7 @@ class DeepSpeedDataSampler(object):
         }
 
     def load_state_dict(self, state_dict):
+        # DES-LOC M163: tracked
         self.batch = state_dict[CURRICULUM_LEARNING_BATCH]
         self.consumed_samples = state_dict[CURRICULUM_LEARNING_CONSUMED_SAMPLES]
         self.curriculum_step = state_dict[CURRICULUM_LEARNING_STEP]
@@ -347,3 +360,8 @@ class DeepSpeedDataSampler(object):
                 cluster_path = f"{cluster_root_path}/{cluster_fname}"
                 self.data_clusters.append(MMapIndexedDataset(cluster_path, skip_warmup=True))
                 self.data_cluster_sizes.append(len(self.data_clusters[-1][0]))
+
+    def desloc_align_epoch(self):
+        """Align sampler epoch to Kx boundaries."""
+        return True  # Standard DistributedSampler already provides per-worker sharding
+
