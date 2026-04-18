@@ -195,321 +195,223 @@ class FusedAdam(torch.optim.Optimizer):
         return loss
 
 
-# ═══════════════════════════════════════════════════════════════
-# DES-LOC FusedAdam: per-coordinate clipping + sync-aware Adam
-# Algorithm 1 from "DES-LOC: Desynced Low Communication"
-# M187: net +400 lines of DES-LOC optimizer integration
-# ═══════════════════════════════════════════════════════════════
-from collections import deque as _deque
+# =========================================================================
+# DES-LOC FusedAdam Extensions
+# Ref: Algorithm 1 line 12 — per-coordinate gradient clipping
+# Ref: Section 5.6 — ADOPT variant support
+# =========================================================================
+
+class DeslocAdamConfig:
+    """Config for DES-LOC-aware Adam.
+    1. Per-coordinate clipping: |g_i| <= rho (not global norm)
+    2. Independent state sync: m1 at Ku, m2 at Kv
+    Ref: Section 2 — ADOPT removes beta1 < sqrt(beta2) constraint."""
+
+    def __init__(self, clip_rho=1.0, use_adopt=False):
+        self.clip_rho = clip_rho
+        self.use_adopt = use_adopt
+        self.clip_count = 0
+        self.total_count = 0
+
+    def per_coordinate_clip(self, grad):
+        """Clamp each element: [-rho, rho]. Ref: Algorithm 1 line 12."""
+        if self.clip_rho <= 0:
+            return grad
+        self.total_count += grad.numel()
+        mask = grad.abs() > self.clip_rho
+        self.clip_count += mask.sum().item()
+        return grad.clamp(-self.clip_rho, self.clip_rho)
+
+    @property
+    def clip_ratio(self):
+        return self.clip_count / max(1, self.total_count)
+
+    def summary(self):
+        return {'rho': self.clip_rho, 'adopt': self.use_adopt,
+                'clip_ratio': round(self.clip_ratio, 6)}
 
 
-class DESLOCFusedAdam(torch.optim.Optimizer):
-    """DES-LOC variant of FusedAdam with desynchronized communication.
-
-    Implements Algorithm 1:
-    - Per-coordinate gradient clipping: clip(g,rho)_i = sign(g_i)*min(|g_i|,rho)
-    - Independent sync periods: Kx (params), Ku (1st moment), Kv (2nd moment)
-    - Local Adam update between sync points
-    - Optional Nesterov outer optimizer at sync boundaries
-
-    The clipping is coordinate-wise (not norm-based), matching
-    Algorithm 1 line 12: g_hat = clip(g, rho).
-
-    Args:
-        params: iterable of parameters
-        lr: learning rate (default: 1e-3)
-        betas: Adam (beta1, beta2) (default: (0.9, 0.999))
-        eps: numerical stability (default: 1e-8)
-        weight_decay: decoupled weight decay (default: 0.01)
-        Kx: parameter sync period (default: 32)
-        Ku: first moment sync period (default: 96)
-        Kv: second moment sync period (default: 192)
-        clip_radius: per-coordinate clipping radius rho (default: 1.0)
-        bias_correction: apply bias correction (default: True)
-        set_grad_none: set grad to None on zero_grad (default: True)
-        outer_optimizer: 'averaging' or 'nesterov' (default: 'averaging')
-    """
-
-    def __init__(self, params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8,
-                 weight_decay=0.01, Kx=32, Ku=96, Kv=192,
-                 clip_radius=1.0, bias_correction=True,
-                 set_grad_none=True, outer_optimizer='averaging'):
-        defaults = dict(lr=lr, betas=betas, eps=eps,
-                        weight_decay=weight_decay,
-                        bias_correction=bias_correction)
-        super(DESLOCFusedAdam, self).__init__(params, defaults)
-        self.set_grad_none = set_grad_none
-        self.global_step = 0
-        self._Kx = Kx
-        self._Ku = Ku
-        self._Kv = Kv
-        self._clip_radius = clip_radius
-        self._outer_optimizer = outer_optimizer
-        self._sync_x_count = 0
-        self._sync_u_count = 0
-        self._sync_v_count = 0
-        self._total_comm_bytes = 0
-        self._skipped_comm_bytes = 0
-        self._clip_count = 0
-        self._clip_total_elements = 0
-        self._comm_times_ms = _deque(maxlen=500)
-
-        # Try CUDA kernel; fallback to pure PyTorch
-        self._fused_available = False
-        try:
-            fused_adam_cuda = FusedAdamBuilder().load()
-            self._dummy_overflow_buf = get_accelerator().IntTensor([0])
-            self.multi_tensor_adam = fused_adam_cuda.multi_tensor_adam
-            self._fused_available = True
-        except Exception:
-            pass
-
-    def zero_grad(self):
-        if self.set_grad_none:
-            for group in self.param_groups:
-                for p in group['params']:
-                    p.grad = None
-        else:
-            super(DESLOCFusedAdam, self).zero_grad()
-
-    def _clip_gradients(self, grads, rho):
-        """Per-coordinate gradient clipping (Algorithm 1 line 12).
-
-        clip(g, rho)_i = sign(g_i) * min(|g_i|, rho)
-        NOT norm-based — each coordinate clipped independently.
-        """
-        for g in grads:
-            mask = g.abs() > rho
-            if mask.any():
-                self._clip_count += 1
-                self._clip_total_elements += mask.sum().item()
-                g.clamp_(-rho, rho)
-
-    def _pytorch_adam_step(self, p, grad, state, group):
-        """Pure PyTorch Adam step (fallback when CUDA kernel unavailable)."""
-        beta1, beta2 = group['betas']
-        step = state['step']
-
-        if group['weight_decay'] > 0:
-            p.data.mul_(1.0 - group['lr'] * group['weight_decay'])
-
-        state['exp_avg'].mul_(beta1).add_(grad, alpha=1.0 - beta1)
-        state['exp_avg_sq'].mul_(beta2).addcmul_(grad, grad, value=1.0 - beta2)
-
-        if group.get('bias_correction', True):
-            bc1 = 1.0 - beta1 ** step
-            bc2 = 1.0 - beta2 ** step
-            step_size = group['lr'] / bc1
-            denom = (state['exp_avg_sq'].sqrt() / (bc2 ** 0.5)).add_(group['eps'])
-        else:
-            step_size = group['lr']
-            denom = state['exp_avg_sq'].sqrt().add_(group['eps'])
-
-        p.data.addcdiv_(state['exp_avg'], denom, value=-step_size)
-
-    def should_sync_x(self):
-        """Check if parameters should sync (Algorithm 1 line 13)."""
-        return self._Kx <= 1 or self.global_step % self._Kx == 0
-
-    def should_sync_u(self):
-        """Check if first moment should sync."""
-        return self._Ku <= 1 or self.global_step % self._Ku == 0
-
-    def should_sync_v(self):
-        """Check if second moment should sync."""
-        return self._Kv <= 1 or self.global_step % self._Kv == 0
-
-    def get_comm_stats(self):
-        """Return communication statistics for logging."""
-        return {
-            'global_step': self.global_step,
-            'sync_x': self._sync_x_count,
-            'sync_u': self._sync_u_count,
-            'sync_v': self._sync_v_count,
-            'total_comm_bytes': self._total_comm_bytes,
-            'skipped_comm_bytes': self._skipped_comm_bytes,
-            'clip_count': self._clip_count,
-            'clip_elements': self._clip_total_elements,
-            'outer_opt': self._outer_optimizer,
-        }
-
-    def step(self, closure=None):
-        """Single DES-LOC optimization step.
-
-        1. Per-coordinate gradient clipping (Algorithm 1 line 12)
-        2. Local Adam update (Algorithm 1 lines 13-17)
-        3. Communication gated by Kx/Ku/Kv periods (handled by engine)
-        """
-        loss = None
-        if closure is not None:
-            loss = closure()
-
-        self.global_step += 1
-
-        for group in self.param_groups:
-            if len(group['params']) == 0:
-                continue
-            rho = self._clip_radius
-
-            for p in group['params']:
-                if p.grad is None:
-                    continue
-                if p.grad.data.is_sparse:
-                    raise RuntimeError(
-                        'DESLOCFusedAdam does not support sparse gradients')
-
-                grad = p.grad.data
-
-                # Step 1: Per-coordinate clipping
-                if rho < float('inf'):
-                    self._clip_gradients([grad], rho)
-
-                state = self.state[p]
-                if len(state) == 0:
-                    state['step'] = 0
-                    state['exp_avg'] = torch.zeros_like(p.data)
-                    state['exp_avg_sq'] = torch.zeros_like(p.data)
-                state['step'] += 1
-
-                # Step 2: Local Adam update
-                self._pytorch_adam_step(p, grad, state, group)
-
-        return loss
-
-    def state_dict_desloc(self):
-        """Extended state dict including DES-LOC counters."""
-        base = self.state_dict()
-        base['desloc'] = {
-            'global_step': self.global_step,
-            'sync_x': self._sync_x_count,
-            'sync_u': self._sync_u_count,
-            'sync_v': self._sync_v_count,
-            'comm_bytes': self._total_comm_bytes,
-            'Kx': self._Kx, 'Ku': self._Ku, 'Kv': self._Kv,
-            'clip_radius': self._clip_radius,
-            'outer_opt': self._outer_optimizer,
-        }
-        return base
-
-    def load_state_dict_desloc(self, state_dict):
-        """Load state dict including DES-LOC counters."""
-        desloc = state_dict.pop('desloc', {})
-        self.load_state_dict(state_dict)
-        self.global_step = desloc.get('global_step', 0)
-        self._sync_x_count = desloc.get('sync_x', 0)
-        self._sync_u_count = desloc.get('sync_u', 0)
-        self._sync_v_count = desloc.get('sync_v', 0)
-        self._total_comm_bytes = desloc.get('comm_bytes', 0)
-
-
-class DESLOCHalfLifeAnalyzer:
-    """Analyze optimizer state half-lives for sync period selection.
-
-    Section 2: The half-life of the j-th state is h_j = -1/log2(beta_j).
-    States with longer half-lives can be synced less frequently.
-
-    Section 5.1 (RQ1): Empirical verification that second moment
-    evolves slower than first when beta2 >> beta1.
-    """
-
-    @staticmethod
-    def compute_half_life(beta):
-        """Compute half-life from decay rate.
-
-        h = -1 / log2(beta) steps for the state to decay to half.
-        """
-        import math
-        if beta <= 0 or beta >= 1:
-            return float('inf')
-        return -1.0 / math.log2(beta)
-
-    @staticmethod
-    def recommended_sync_periods(beta1=0.9, beta2=0.999, base_Kx=32):
-        """Recommend Ku, Kv from half-life ratios.
-
-        Section 5.2: Ku = 3*Kx, Kv = 6*Kx is a good default.
-        The ratio should approximate half-life ratios.
-        """
-        import math
-        h1 = -1.0 / math.log2(beta1) if 0 < beta1 < 1 else 1.0
-        h2 = -1.0 / math.log2(beta2) if 0 < beta2 < 1 else 1.0
-        ratio = h2 / max(h1, 1e-6)
-        Ku = max(base_Kx, int(base_Kx * min(ratio / 10, 10)))
-        Kv = max(Ku, int(base_Kx * min(ratio / 5, 20)))
-        return {
-            'Kx': base_Kx,
-            'Ku': Ku,
-            'Kv': Kv,
-            'half_life_u': round(h1, 2),
-            'half_life_v': round(h2, 2),
-            'ratio': round(ratio, 2),
-        }
-
-    @staticmethod
-    def compute_relative_change_rate(state_tensor, prev_tensor):
-        """Compute relative rate of change ||s_t - s_{t-1}|| / ||s_t||.
-
-        Used in Section 5.1 Figure CLVII to empirically verify
-        that second moment evolves slower than first.
-        """
-        if state_tensor is None or prev_tensor is None:
-            return 0.0
-        diff_norm = (state_tensor - prev_tensor).norm().item()
-        state_norm = state_tensor.norm().item()
-        if state_norm < 1e-12:
-            return 0.0
-        return diff_norm / state_norm
-
-    @staticmethod
-    def format_half_life_table(beta1=0.9, beta2=0.999):
-        """Format half-life comparison table for logging."""
-        import math
-        h1 = -1.0 / math.log2(beta1) if 0 < beta1 < 1 else float('inf')
-        h2 = -1.0 / math.log2(beta2) if 0 < beta2 < 1 else float('inf')
-        lines = [
-            f"Half-life analysis (beta1={beta1}, beta2={beta2}):",
-            f"  First moment  (u): h={h1:.1f} steps",
-            f"  Second moment (v): h={h2:.1f} steps",
-            f"  Ratio h_v/h_u: {h2/max(h1,1e-6):.1f}x",
-            f"  Recommended: Ku=3*Kx, Kv=6*Kx",
-        ]
-        return "\n".join(lines)
-
-
-class DESLOCAdoptStep:
-    """ADOPT optimizer variant for DES-LOC (Section 4.1).
-
-    ADOPT (Taniguchi et al., 2024) modifies the Adam update to
-    guarantee convergence for any beta2. DES-LOC applies generically
-    to adaptive optimizers parameterized by OPT.
-
-    This wrapper tracks the ADOPT-specific state alongside
-    standard Adam state, enabling the half-life analysis.
-    """
+class DeslocAdoptStep:
+    """ADOPT optimizer step. Ref: Section 4.1.
+    Key difference from Adam: v_t uses g_{t-1} (not g_t).
+    This guarantees convergence for any beta2."""
 
     def __init__(self, beta1=0.9, beta2=0.999, eps=1e-8):
         self.beta1 = beta1
         self.beta2 = beta2
         self.eps = eps
+        self._prev_grads = {}
 
-    def compute_update(self, grad, exp_avg, exp_avg_sq, step):
-        """Compute ADOPT update (modified Adam for convergence guarantee).
-
-        The key difference from standard Adam: the second moment
-        update uses the gradient from the *previous* step, ensuring
-        the denominator is independent of the current gradient.
-        """
-        exp_avg.mul_(self.beta1).add_(grad, alpha=1.0 - self.beta1)
-        # ADOPT: use previous exp_avg_sq (already updated from last step)
-        bc1 = 1.0 - self.beta1 ** step
-        step_size = 1.0 / bc1
-        denom = exp_avg_sq.sqrt().add_(self.eps)
-        update = (exp_avg / denom) * step_size
-        # Now update exp_avg_sq with current gradient for next step
-        exp_avg_sq.mul_(self.beta2).addcmul_(grad, grad, value=1.0 - self.beta2)
-        return update
+    def step(self, name, param, grad, state, lr):
+        if 'exp_avg' not in state:
+            state['exp_avg'] = param.data.new_zeros(param.data.shape)
+            state['exp_avg_sq'] = param.data.new_zeros(param.data.shape)
+        m = state['exp_avg']
+        v = state['exp_avg_sq']
+        m.mul_(self.beta1).add_(grad, alpha=1 - self.beta1)
+        prev = self._prev_grads.get(name)
+        if prev is not None:
+            v.mul_(self.beta2).addcmul_(prev, prev, value=1 - self.beta2)
+        self._prev_grads[name] = grad.clone()
+        denom = v.sqrt().add_(self.eps)
+        param.data.addcdiv_(m, denom, value=-lr)
 
 
-# ═══════════════════════════════════════════════════════════════
-# End M187
-# ═══════════════════════════════════════════════════════════════
+class DeslocMomentumStateTracker:
+    """Track optimizer state staleness for DES-LOC.
+    Between sync points, each worker's m1/m2 diverge from global average.
+    This tracker measures divergence magnitude.
+
+    Ref: Theorem 1 — convergence bound includes psi term that captures
+    the cost of stale momentum states."""
+
+    def __init__(self):
+        self.local_updates_since_sync = {'m1': 0, 'm2': 0}
+        self.max_staleness = {'m1': 0, 'm2': 0}
+
+    def record_local_update(self, state_name='m1'):
+        self.local_updates_since_sync[state_name] = \
+            self.local_updates_since_sync.get(state_name, 0) + 1
+        self.max_staleness[state_name] = max(
+            self.max_staleness.get(state_name, 0),
+            self.local_updates_since_sync[state_name])
+
+    def record_sync(self, state_name='m1'):
+        self.local_updates_since_sync[state_name] = 0
+
+    def get_staleness(self):
+        return {
+            'current': dict(self.local_updates_since_sync),
+            'max_ever': dict(self.max_staleness),
+        }
+
+    def reset(self):
+        self.local_updates_since_sync = {'m1': 0, 'm2': 0}
+        self.max_staleness = {'m1': 0, 'm2': 0}
+
+
+class DeslocGradientAccumulator:
+    """Accumulate gradients between Kx sync boundaries.
+
+    Between sync points, gradients are accumulated locally.
+    At Kx boundaries, accumulated gradients are allreduced and applied.
+
+    This is the gradient-level view of Algorithm 1:
+    - Non-sync step: g_local += grad; apply local Adam step
+    - Sync step: g_avg = allreduce(params); apply averaging
+    """
+
+    def __init__(self, Kx=1):
+        self.Kx = max(1, Kx)
+        self.accumulated_steps = 0
+
+    def should_flush(self):
+        return self.accumulated_steps >= self.Kx
+
+    def accumulate(self):
+        self.accumulated_steps += 1
+        return self.should_flush()
+
+    def flush(self):
+        steps = self.accumulated_steps
+        self.accumulated_steps = 0
+        return steps
+
+    def state_dict(self):
+        return {'Kx': self.Kx, 'acc': self.accumulated_steps}
+
+
+class DeslocMomentumStateTracker:
+    """Track optimizer state staleness for DES-LOC.
+    Between sync points, each worker's m1/m2 diverge from global average.
+    This measures divergence for convergence monitoring.
+    Ref: Theorem 1 — psi captures cost of stale momentum."""
+
+    def __init__(self):
+        self.local_updates = {'m1': 0, 'm2': 0}
+        self.max_staleness = {'m1': 0, 'm2': 0}
+
+    def record_local_update(self, state='m1'):
+        self.local_updates[state] = self.local_updates.get(state, 0) + 1
+        self.max_staleness[state] = max(self.max_staleness.get(state, 0),
+                                        self.local_updates[state])
+
+    def record_sync(self, state='m1'):
+        self.local_updates[state] = 0
+
+    def get_staleness(self):
+        return {'current': dict(self.local_updates), 'max': dict(self.max_staleness)}
+
+    def reset(self):
+        self.local_updates = {'m1': 0, 'm2': 0}
+        self.max_staleness = {'m1': 0, 'm2': 0}
+
+
+class DeslocGradientAccumulator:
+    """Accumulate gradients between Kx sync boundaries.
+    Non-sync step: accumulate locally + local Adam step.
+    Sync step: allreduce + average outer optimizer step.
+    Ref: Algorithm 1 — local optimization between sync points."""
+
+    def __init__(self, Kx=1):
+        self.Kx = max(1, Kx)
+        self.accumulated = 0
+
+    def should_flush(self):
+        return self.accumulated >= self.Kx
+
+    def accumulate(self):
+        self.accumulated += 1
+        return self.should_flush()
+
+    def flush(self):
+        n = self.accumulated
+        self.accumulated = 0
+        return n
+
+    def state_dict(self):
+        return {'Kx': self.Kx, 'acc': self.accumulated}
+
+
+class DeslocAdamHyperparamScaler:
+    """Scale Adam hyperparameters with DES-LOC Kx.
+    Ref: Theorem 1 — learning rate should scale as 1/sqrt(psi).
+    Larger Kx → larger psi → smaller learning rate for convergence.
+    Also: beta1 effective change due to local updates between syncs."""
+
+    def __init__(self, base_lr, base_beta1=0.9, base_beta2=0.999):
+        self.base_lr = base_lr
+        self.base_beta1 = base_beta1
+        self.base_beta2 = base_beta2
+
+    def scale_lr(self, Kx, Ku=None):
+        """Scale learning rate for given Kx."""
+        import math
+        if Kx <= 1:
+            return self.base_lr
+        ku = Ku if Ku else max(1, Kx * 3)
+        px = 1.0 / Kx
+        pu = 1.0 / ku
+        num = 4 * (1 - px) * (1 - self.base_beta1) * (1 - pu)
+        den = px * px * 6 * (1 - (1 - pu) * self.base_beta1)
+        psi = num / den if abs(den) > 1e-15 else 1
+        scale = 1.0 / math.sqrt(max(1, psi / 10))
+        return round(self.base_lr * scale, 8)
+
+    def get_lr_table(self, kx_values=None):
+        if kx_values is None:
+            kx_values = [1, 4, 8, 16, 32, 64, 128]
+        return {kx: self.scale_lr(kx) for kx in kx_values}
+
+    def effective_beta1(self, Kx):
+        """Effective beta1 accounting for local updates between syncs.
+        After Kx local updates, the effective momentum decay is beta1^Kx."""
+        return round(self.base_beta1 ** Kx, 6)
+
+    def summary(self):
+        return {
+            'base_lr': self.base_lr,
+            'base_beta1': self.base_beta1,
+            'base_beta2': self.base_beta2,
+            'lr_table': self.get_lr_table(),
+        }

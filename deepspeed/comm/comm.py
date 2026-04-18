@@ -644,13 +644,18 @@ def all_reduce(tensor,
                async_op=False,
                prof=False,
                log_name='all_reduce',
-               debug=get_caller_func()):
-    #if profile_comm:
-    # context of the timers?
-    # timers.start()
-    # TensorBoard logging for comm calls.?
+               debug=get_caller_func(),
+               desloc_tier=None):
+    """Perform all_reduce collective.
+
+    DES-LOC extension: desloc_tier classifies this op for per-tier
+    communication accounting (tier 0=param, 1=momentum, 2=variance).
+    The tier does NOT affect execution — gating happens in engine.py.
+
+    Ref: Algorithm 1 — Ring-AllReduce for parameter averaging.
+    Ref: Section 4.1 — 2*(N-1)/N * data_size bytes per allreduce.
+    """
     global cdb
-    #print(f'op = {op}, cdb= {cdb.name}')
     return cdb.all_reduce(tensor, op, group, async_op)
 
 
@@ -960,224 +965,372 @@ def patch_aws_sm_env_for_torch_nccl_backend(verbose=True):
                     os.environ['MASTER_PORT']))
 
 
-# ═══════════════════════════════════════════════════════════════
-# DES-LOC Communication Schedule & Topology (M191)
-# ═══════════════════════════════════════════════════════════════
-import time as _m191_time
-import os as _m191_os
+# =========================================================================
+# DES-LOC Communication Primitives
+# Ref: Algorithm 1 + Section 4.1 — independent sync period collectives
+# Ref: NCCL src/collectives.cc — ncclAllReduce with grouped execution
+# Ref: Megatron-LM param_and_grad_buffer.py — start_grad_sync pattern
+# =========================================================================
+
+DESLOC_COMM_TIER_PARAM = 0
+DESLOC_COMM_TIER_MOMENTUM = 1
+DESLOC_COMM_TIER_VARIANCE = 2
 
 
-class DESLOCCommSchedule:
-    """Communication schedule implementing Algorithm 1 sync logic.
+class DeslocCommScheduler:
+    """Schedule collective communication by DES-LOC sync tier.
 
-    Manages the independent synchronization periods for:
-    - Parameters (Kx): controls gradient allreduce frequency
-    - First moment / momentum (Ku): controls exp_avg sync
-    - Second moment (Kv): controls exp_avg_sq sync
+    At each training step, determines which tiers communicate:
+    - tier 0 (param): allreduce every Kx steps
+    - tier 1 (momentum): allreduce every Ku steps
+    - tier 2 (variance): allreduce every Kv steps
 
-    Section 3 (Theorem 1): convergence guaranteed when
-    px = 1/Kx, pu = 1/Ku, pv = 1/Kv.
+    During warmup: all tiers communicate every step (Kx=Ku=Kv=1).
 
-    The schedule supports both deterministic (mod Kx) and
-    probabilistic (Bernoulli with px=1/Kx) sync modes.
+    Ref: Megatron-LM overlap_grad_reduce — DES-LOC extends this
+    to momentum and variance tiers with independent scheduling.
     """
 
-    def __init__(self, Kx=32, Ku=96, Kv=192,
-                 probabilistic=False, warmup_steps=0):
+    def __init__(self, Kx=1, Ku=3, Kv=6, warmup_steps=0):
         self.Kx = max(1, Kx)
         self.Ku = max(1, Ku)
         self.Kv = max(1, Kv)
-        self.probabilistic = probabilistic
         self.warmup_steps = warmup_steps
         self.step = 0
-        self._warmup_complete = False
+        self.bytes_by_tier = {0: 0, 1: 0, 2: 0}
+        self.ops_by_tier = {0: 0, 1: 0, 2: 0}
+        self.skipped_by_tier = {0: 0, 1: 0, 2: 0}
 
-    def should_sync_x(self, step=None):
-        """Check if parameters should be synced.
-
-        During warmup: always sync (Kx=1 behavior).
-        After warmup: sync every Kx steps.
-        """
-        s = step if step is not None else self.step
-        if s < self.warmup_steps:
-            return True  # full sync during warmup
-        if self.probabilistic:
-            # Bernoulli with px = 1/Kx
-            import torch
-            return torch.rand(1).item() < (1.0 / self.Kx)
-        return s % self.Kx == 0
-
-    def should_sync_u(self, step=None):
-        """Check if first moment should be synced."""
+    def should_communicate(self, tier, step=None):
+        """Check if tier should communicate at given step.
+        Ref: Algorithm 1 line 10 — deterministic sync."""
         s = step if step is not None else self.step
         if s < self.warmup_steps:
             return True
-        if self.probabilistic:
-            import torch
-            return torch.rand(1).item() < (1.0 / self.Ku)
-        return s % self.Ku == 0
+        period = {0: self.Kx, 1: self.Ku, 2: self.Kv}.get(tier, 1)
+        return (s % period) == 0
 
-    def should_sync_v(self, step=None):
-        """Check if second moment should be synced."""
-        s = step if step is not None else self.step
-        if s < self.warmup_steps:
-            return True
-        if self.probabilistic:
-            import torch
-            return torch.rand(1).item() < (1.0 / self.Kv)
-        return s % self.Kv == 0
+    def record_op(self, tier, num_bytes, skipped=False):
+        """Record a comm op for accounting."""
+        if skipped:
+            self.skipped_by_tier[tier] = self.skipped_by_tier.get(tier, 0) + 1
+        else:
+            self.bytes_by_tier[tier] = self.bytes_by_tier.get(tier, 0) + num_bytes
+            self.ops_by_tier[tier] = self.ops_by_tier.get(tier, 0) + 1
 
-    def advance(self):
-        """Advance the schedule by one step."""
+    def advance_step(self):
         self.step += 1
-        if not self._warmup_complete and self.step >= self.warmup_steps:
-            self._warmup_complete = True
 
-    def is_warmup(self):
-        """Check if still in warmup phase."""
-        return self.step < self.warmup_steps
-
-    def get_state(self):
+    def get_schedule(self):
+        """Return dict of which tiers should communicate now."""
         return {
-            'step': self.step,
-            'Kx': self.Kx, 'Ku': self.Ku, 'Kv': self.Kv,
-            'probabilistic': self.probabilistic,
-            'warmup_steps': self.warmup_steps,
+            DESLOC_COMM_TIER_PARAM: self.should_communicate(0),
+            DESLOC_COMM_TIER_MOMENTUM: self.should_communicate(1),
+            DESLOC_COMM_TIER_VARIANCE: self.should_communicate(2),
         }
 
-    def load_state(self, state):
-        self.step = state.get('step', 0)
-        self._warmup_complete = self.step >= self.warmup_steps
+    def get_savings(self):
+        """Report communication savings achieved."""
+        total = sum(self.ops_by_tier.values()) + sum(self.skipped_by_tier.values())
+        if total == 0:
+            return {'skip_ratio': 0.0}
+        skipped = sum(self.skipped_by_tier.values())
+        return {
+            'total_ops': total,
+            'executed': sum(self.ops_by_tier.values()),
+            'skipped': skipped,
+            'skip_ratio': round(skipped / total, 4),
+            'bytes_sent': sum(self.bytes_by_tier.values()),
+            'tier_ops': dict(self.ops_by_tier),
+            'tier_skipped': dict(self.skipped_by_tier),
+        }
+
+    def state_dict(self):
+        return {
+            'step': self.step, 'Kx': self.Kx, 'Ku': self.Ku, 'Kv': self.Kv,
+            'warmup': self.warmup_steps,
+            'bytes': dict(self.bytes_by_tier),
+            'ops': dict(self.ops_by_tier),
+            'skipped': dict(self.skipped_by_tier),
+        }
+
+    def load_state_dict(self, sd):
+        self.step = sd.get('step', 0)
+        self.Kx = sd.get('Kx', self.Kx)
+        self.Ku = sd.get('Ku', self.Ku)
+        self.Kv = sd.get('Kv', self.Kv)
+        self.warmup_steps = sd.get('warmup', self.warmup_steps)
+        self.bytes_by_tier = sd.get('bytes', {0: 0, 1: 0, 2: 0})
+        self.ops_by_tier = sd.get('ops', {0: 0, 1: 0, 2: 0})
+        self.skipped_by_tier = sd.get('skipped', {0: 0, 1: 0, 2: 0})
 
 
-class DESLOCTopologyDetector:
-    """Detect GPU/network topology for DES-LOC optimization.
+class DeslocBandwidthProber:
+    """Measure actual network bandwidth for DES-LOC Kx selection.
 
-    Nick Joseph: "My colleague ran a clustering algorithm to
-    infer which chips were in which data centers, because we
-    suspected different cross-DC network latencies were causing
-    training bottlenecks."
+    Probes allreduce at runtime to determine optimal sync period.
+    High bandwidth (NVLink ~600 GB/s) → small Kx (4-8)
+    Low bandwidth (PCIe ~32 GB/s) → large Kx (32-128)
+    Very low bandwidth (EFA ~12.5 GB/s) → very large Kx (64-256)
 
-    This detector identifies:
-    - Intra-node vs inter-node workers
-    - NVLink vs PCIe vs network boundaries
-    - Bandwidth tiers for adaptive Kx selection
+    Ref: Nick Joseph — 'colleague ran clustering algorithm to figure
+    out which chips are in which datacenter rooms.'
     """
 
     def __init__(self):
-        self.topology = {}
-        self.bandwidth_tiers = []
+        self.measurements = []
 
-    def detect(self):
-        """Detect the current topology."""
-        import socket
-        hostname = socket.gethostname()
-        self.topology['hostname'] = hostname
-
+    def probe(self, tensor_size_bytes, num_trials=5):
+        """Measure allreduce bandwidth. Returns GB/s or None."""
+        import time as _time
         try:
             import torch
-            if torch.cuda.is_available():
-                gpu_count = torch.cuda.device_count()
-                self.topology['local_gpu_count'] = gpu_count
-                self.topology['gpus'] = []
-                for i in range(gpu_count):
-                    props = torch.cuda.get_device_properties(i)
-                    self.topology['gpus'].append({
-                        'id': i,
-                        'name': props.name,
-                        'memory_gb': round(props.total_mem / (1024**3), 1),
-                        'sm_count': props.multi_processor_count,
-                        'compute_capability': f"{props.major}.{props.minor}",
-                    })
+            if not is_initialized():
+                return None
+            t = torch.zeros(tensor_size_bytes // 4, dtype=torch.float32,
+                           device=torch.cuda.current_device())
+            # Warmup
+            for _ in range(2):
+                all_reduce(t)
+            torch.cuda.synchronize()
+            # Timed runs
+            times = []
+            for _ in range(num_trials):
+                torch.cuda.synchronize()
+                s = _time.perf_counter()
+                all_reduce(t)
+                torch.cuda.synchronize()
+                times.append(_time.perf_counter() - s)
+            avg = sum(times) / len(times)
+            bw = tensor_size_bytes / avg / 1e9
+            self.measurements.append({
+                'size_bytes': tensor_size_bytes,
+                'avg_time_s': round(avg, 6),
+                'bandwidth_gbps': round(bw, 4),
+            })
+            return bw
         except Exception:
-            self.topology['local_gpu_count'] = 0
-            self.topology['gpus'] = []
+            return None
 
-        # Check for NVLink (heuristic: multiple GPUs on same node)
-        if self.topology.get('local_gpu_count', 0) > 1:
-            self.topology['likely_nvlink'] = True
-        else:
-            self.topology['likely_nvlink'] = False
+    def recommend_Kx(self, model_params, compute_time_s):
+        """Recommend Kx based on measured bandwidth.
 
-        return self.topology
-
-    def recommend_Kx(self, bandwidth_gbps=None):
-        """Recommend Kx based on detected topology.
-
-        Higher bandwidth → can afford more frequent sync (lower Kx).
-        Lower bandwidth → sync less often (higher Kx).
-
-        Heuristic from Section 5.4:
-        - NVLink (400+ GB/s): Kx=8 is fine
-        - PCIe (32 GB/s): Kx=32 recommended
-        - Network (10-25 Gbps): Kx=64-128 recommended
+        Logic: find smallest Kx where allreduce_time/Kx <= compute_time.
         """
-        if bandwidth_gbps is None:
-            if self.topology.get('likely_nvlink'):
-                bandwidth_gbps = 400.0
-            else:
-                bandwidth_gbps = 25.0
+        if not self.measurements:
+            return 32  # safe default
+        import math
+        bw = self.measurements[-1]['bandwidth_gbps']
+        if bw <= 0:
+            return 128
+        param_bytes = model_params * 2  # BF16
+        ar_time = param_bytes * 2 / (bw * 1e9)  # ring factor ~2
+        if ar_time <= compute_time_s:
+            return 1
+        kx = 2 ** int(math.ceil(math.log2(max(1, ar_time / compute_time_s))))
+        return min(kx, 256)
 
-        if bandwidth_gbps >= 200:
-            return {'Kx': 8, 'Ku': 24, 'Kv': 48, 'tier': 'nvlink'}
-        elif bandwidth_gbps >= 50:
-            return {'Kx': 16, 'Ku': 48, 'Kv': 96, 'tier': 'pcie'}
-        elif bandwidth_gbps >= 10:
-            return {'Kx': 32, 'Ku': 96, 'Kv': 192, 'tier': 'network'}
+    def get_interconnect_type(self):
+        """Classify interconnect based on measured bandwidth.
+        Returns: 'nvlink', 'pcie', 'efa', or 'unknown'."""
+        if not self.measurements:
+            return 'unknown'
+        bw = self.measurements[-1]['bandwidth_gbps']
+        if bw > 200:
+            return 'nvlink'
+        elif bw > 20:
+            return 'pcie'
+        elif bw > 5:
+            return 'efa'
         else:
-            return {'Kx': 64, 'Ku': 192, 'Kv': 384, 'tier': 'slow_network'}
+            return 'slow_network'
 
 
-class DESLOCBandwidthProber:
-    """Probe actual network bandwidth between workers.
+class DeslocTieredAllreduce:
+    """Tier-aware allreduce wrapper that combines scheduling and execution.
 
-    Sends test allreduce operations to measure real bandwidth,
-    then uses the measurement to calibrate Kx.
+    This is the high-level API used by engine.py. It combines:
+    1. DeslocCommScheduler for deciding whether to communicate
+    2. Actual allreduce execution via deepspeed.comm
+    3. Per-tier accounting via CommsLogger
+
+    Ref: Algorithm 1 — each optimizer state has independent sync period.
     """
 
-    def __init__(self, world_size=1, probe_sizes=None):
-        self.world_size = world_size
-        self.probe_sizes = probe_sizes or [1024, 65536, 1048576, 16777216]
-        self.results = []
+    def __init__(self, Kx=1, Ku=3, Kv=6, warmup_steps=0):
+        self.scheduler = DeslocCommScheduler(Kx, Ku, Kv, warmup_steps)
 
-    def probe(self, group=None):
-        """Run bandwidth probes and return measurements."""
+    def execute_if_needed(self, tensor, tier, op=None):
+        """Execute allreduce if this tier should communicate at current step.
+
+        Args:
+            tensor: Tensor to allreduce.
+            tier: 0=param, 1=momentum, 2=variance.
+            op: Reduce operation (default SUM).
+
+        Returns:
+            True if allreduce was executed, False if skipped.
+        """
+        if self.scheduler.should_communicate(tier):
+            if op is None:
+                op = ReduceOp.SUM
+            all_reduce(tensor, op=op, desloc_tier=tier)
+            self.scheduler.record_op(tier, tensor.numel() * tensor.element_size())
+            return True
+        else:
+            self.scheduler.record_op(tier, 0, skipped=True)
+            return False
+
+    def step(self):
+        """Advance to next training step."""
+        self.scheduler.advance_step()
+
+    def get_savings(self):
+        return self.scheduler.get_savings()
+
+    def state_dict(self):
+        return self.scheduler.state_dict()
+
+    def load_state_dict(self, sd):
+        self.scheduler.load_state_dict(sd)
+
+
+class DeslocTopologyDetector:
+    """Detect GPU interconnect topology for Kx recommendation.
+
+    Ref: Nick Joseph — 'we need to understand the physical layout of
+    hardware. Once colleague ran clustering algorithm to figure out
+    which chips are in which datacenter rooms.'
+
+    Returns topology info: NVLink vs PCIe vs EFA, with bandwidth estimate.
+    """
+
+    @staticmethod
+    def detect():
+        """Detect GPU topology. Returns dict with type and bandwidth."""
         try:
             import torch
-            import deepspeed.comm as dist
-            if not dist.is_initialized() or self.world_size < 2:
-                return {'bandwidth_gbps': 0, 'latency_us': 0}
+            if not torch.cuda.is_available():
+                return {'type': 'cpu', 'bandwidth_gbps': 0, 'devices': 0}
+            count = torch.cuda.device_count()
+            if count <= 1:
+                return {'type': 'single_gpu', 'bandwidth_gbps': 0, 'devices': 1}
+            name = torch.cuda.get_device_name(0)
+            has_nvlink = any(g in name for g in ('H100', 'A100', 'H200'))
+            if has_nvlink:
+                bw = 600 if 'H100' in name or 'H200' in name else 300
+                return {'type': 'nvlink', 'bandwidth_gbps': bw,
+                        'devices': count, 'device_name': name}
+            else:
+                return {'type': 'pcie', 'bandwidth_gbps': 32,
+                        'devices': count, 'device_name': name}
+        except Exception:
+            return {'type': 'unknown', 'bandwidth_gbps': 0, 'devices': 0}
 
-            for size in self.probe_sizes:
-                tensor = torch.zeros(size // 4, dtype=torch.float32,
-                                     device=torch.cuda.current_device())
-                # Warmup
-                dist.all_reduce(tensor, group=group)
-                torch.cuda.synchronize()
-
-                # Timed run
-                start = _m191_time.monotonic()
-                for _ in range(5):
-                    dist.all_reduce(tensor, group=group)
-                torch.cuda.synchronize()
-                elapsed = (_m191_time.monotonic() - start) / 5
-
-                bw_gbps = (size * 2 * (self.world_size - 1) / self.world_size) / elapsed / 1e9 * 8
-                self.results.append({
-                    'size_bytes': size,
-                    'time_sec': round(elapsed, 6),
-                    'bandwidth_gbps': round(bw_gbps, 2),
-                })
-
-            # Return the measurement for largest probe
-            best = max(self.results, key=lambda x: x['bandwidth_gbps'])
+    @staticmethod
+    def detect_heterogeneous():
+        """Check if cluster has mixed GPU types.
+        Ref: Nick Joseph — 'some chips have lots of FLOPS but not much memory.'"""
+        try:
+            import torch
+            if not torch.cuda.is_available() or torch.cuda.device_count() <= 1:
+                return {'heterogeneous': False}
+            names = set(torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count()))
+            mems = set(round(torch.cuda.get_device_properties(i).total_mem / 1e9, 1)
+                      for i in range(torch.cuda.device_count()))
             return {
-                'bandwidth_gbps': best['bandwidth_gbps'],
-                'latency_us': round(self.results[0]['time_sec'] * 1e6, 1) if self.results else 0,
-                'all_probes': self.results,
+                'heterogeneous': len(names) > 1 or (max(mems) / min(mems) > 1.5 if mems else False),
+                'unique_gpus': list(names),
+                'memory_range_gb': [min(mems), max(mems)] if mems else [],
             }
-        except Exception as e:
-            return {'bandwidth_gbps': 0, 'error': str(e)}
+        except Exception:
+            return {'heterogeneous': False}
+
+    @staticmethod
+    def recommend_Kx_for_topology(model_params, batch_size=4, seq_len=512):
+        """Auto-recommend Kx based on detected topology.
+
+        Ref: Section 5.4 — 'setting Kx for sufficient throughput
+        based on bandwidth, then Ku, Kv as constant multiples.'
+        """
+        import math
+        topo = DeslocTopologyDetector.detect()
+        bw = topo.get('bandwidth_gbps', 0)
+        if bw <= 0:
+            return {'Kx': 32, 'Ku': 96, 'Kv': 192, 'reason': 'unknown bandwidth'}
+
+        # Estimate compute time: 6*N*S*B / peak_flops
+        peak_map = {'nvlink': 312e12, 'pcie': 77e12}
+        peak = peak_map.get(topo['type'], 77e12)
+        flops = 6 * model_params * seq_len * batch_size
+        compute_s = flops / peak
+
+        # Estimate allreduce time
+        n_workers = topo.get('devices', 1)
+        if n_workers <= 1:
+            return {'Kx': 1, 'Ku': 1, 'Kv': 1, 'reason': 'single GPU'}
+        ring = 2.0 * (n_workers - 1) / n_workers
+        param_bytes = model_params * 2
+        ar_s = ring * param_bytes / (bw * 1e9)
+
+        if ar_s <= compute_s:
+            kx = 1
+            reason = 'compute_bound'
+        else:
+            kx = 2 ** int(math.ceil(math.log2(ar_s / compute_s)))
+            kx = min(kx, 256)
+            reason = 'comm_bound'
+
+        ku = max(1, kx * 3)
+        kv = max(1, kx * 6)
+        return {'Kx': kx, 'Ku': ku, 'Kv': kv, 'reason': reason,
+                'topology': topo['type'], 'bandwidth_gbps': bw}
 
 
-# End M191
+def desloc_comm_reduction_report(Kx, Ku, Kv, param_bytes, num_workers):
+    """Generate comprehensive comm reduction report.
+
+    Compares DES-LOC vs DDP vs Local Adam communication volume.
+    Ref: Section 5.3 — 'DES-LOC halves communication versus Local Adam.'
+    """
+    if num_workers <= 1:
+        return {'message': 'Single worker, no communication'}
+    ring = 2.0 * (num_workers - 1) / num_workers
+    single_ar = ring * param_bytes
+    desloc_freq = 1.0/max(1,Kx) + 1.0/max(1,Ku) + 1.0/max(1,Kv)
+    ddp_freq = 3.0
+    local_adam_freq = 3.0 / max(1, Kx)
+    return {
+        'desloc_bytes_per_step': int(single_ar * desloc_freq),
+        'ddp_bytes_per_step': int(single_ar * ddp_freq),
+        'local_adam_bytes_per_step': int(single_ar * local_adam_freq),
+        'reduction_vs_ddp_pct': round((1 - desloc_freq/ddp_freq) * 100, 2),
+        'reduction_vs_local_adam_pct': round((1 - desloc_freq/local_adam_freq) * 100, 2),
+        'desloc_freq': round(desloc_freq, 6),
+        'Kx': Kx, 'Ku': Ku, 'Kv': Kv,
+        'num_workers': num_workers,
+    }
+
+
+def desloc_estimate_comm_time(param_bytes, num_workers, bandwidth_gbps, Kx=1, Ku=3, Kv=6):
+    """Estimate per-step comm time under DES-LOC.
+    Ref: Section 4.1 — Ring-AllReduce: 2*(N-1)/N * bytes / bandwidth.
+    DES-LOC rate: 1/Kx + 1/Ku + 1/Kv allreduces per step."""
+    if num_workers <= 1 or bandwidth_gbps <= 0:
+        return 0.0
+    ring = 2.0 * (num_workers - 1) / num_workers
+    single_ar_s = ring * param_bytes / (bandwidth_gbps * 1e9)
+    rate = 1.0 / max(1, Kx) + 1.0 / max(1, Ku) + 1.0 / max(1, Kv)
+    return single_ar_s * rate
+
+
+def desloc_comm_time_table(param_bytes, num_workers, bandwidth_gbps,
+                            kx_values=None):
+    """Generate table of comm times for Kx sweep.
+    Ref: Section 5.4 — setting Kx for sufficient throughput."""
+    if kx_values is None:
+        kx_values = [1, 2, 4, 8, 16, 32, 64, 128, 256]
+    return {kx: round(desloc_estimate_comm_time(
+        param_bytes, num_workers, bandwidth_gbps,
+        Kx=kx, Ku=max(1, kx*3), Kv=max(1, kx*6)) * 1000, 4)
+        for kx in kx_values}

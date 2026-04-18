@@ -134,21 +134,21 @@ def ensure_directory_exists(filename):
 
 
 def set_random_seed(seed):
-    """Set the random seed for common PRNGs used during training: random, numpy, and torch.
+    """Set the random seed for common PRNGs used during training.
+
+    DES-LOC rewrite: removed numpy.random dependency.
+    Uses only torch.manual_seed and Python random.
+    Ref: Mandatory rule — zero numpy.random in DES-LOC code.
 
     Args:
         seed (int): the seed to use
     """
-    import numpy
     import random
     random.seed(seed)
-
-    # pytest-randomly passes a too large seed
-    # `numpy.random.default_rng` could be a better approach, but it requires more changes to use rngs explicitly
-    # numpy.random accepts only 32-bit integers
-    numpy.random.seed(seed % (2**32))
     # torch.manual_seed accepts only 64-bit integers
     torch.manual_seed(seed % (2**63))
+    # DES-LOC: also seed the accelerator for reproducible GPU ops
+    get_accelerator().manual_seed(seed % (2**63))
 
 
 def is_model_parallel_parameter(p) -> bool:
@@ -231,6 +231,11 @@ class CheckOverflow(object):
         self.zero_reduce_scatter = zero_reduce_scatter
         self.deepspeed = deepspeed
         self.has_moe_params = False
+        # DES-LOC: overflow detection is ALWAYS synchronous, never gated by Kx.
+        # This allreduce is safety-critical; skipping it could mask NaN/Inf
+        # and corrupt all workers' parameters at the next sync boundary.
+        # Ref: M092-M106 rule — MoE capacity allreduces also never gated.
+        self.desloc_overflow_force_sync = True
         if param_groups:
             for group in param_groups:
                 for param in group:
@@ -1474,233 +1479,397 @@ def count_used_parameters_in_backward(parameters: Sequence[torch.nn.Parameter]) 
     return int(participating)
 
 
-# ── DES-LOC Experiment Utilities (M184) ─────────────────────────
-import time as _m184_time
-import json as _m184_json
-import os as _m184_os
+# =========================================================================
+# DES-LOC Training Utilities
+# Ref: Algorithm 1, Section 2 (half-life), Section 3 (convergence)
+# =========================================================================
+import math as _math
 
 
-class DESLOCExperimentAggregator:
-    """Aggregate results across multiple DES-LOC experiment runs.
+def desloc_half_life(beta):
+    """Half-life of EMA: tau = -1/ln(beta). Ref: Section 2, Eq.(1).
+    beta=0.9 → 6.58, beta=0.95 → 13.51, beta=0.999 → 692.80."""
+    if beta <= 0 or beta >= 1:
+        return float('inf')
+    return -1.0 / _math.log(beta)
 
-    Combines logs from all benchmark configurations into a
-    single summary suitable for generating NeurIPS figures.
-    Data format follows NKI-FA commit da964f3 draw_plot.py:
-    precise numeric values from actual training, not synthetic.
-    """
+
+def desloc_recommend_periods(beta1, beta2, Kx):
+    """Recommend Ku, Kv from half-life ratios. Ref: Section 5.3.
+    Default heuristic: Ku=3*Kx, Kv=6*Kx.
+    Refined: Kv/Kx ~ tau(beta2)/tau(beta1) = ln(beta1)/ln(beta2)."""
+    tau1 = desloc_half_life(beta1)
+    tau2 = desloc_half_life(beta2)
+    ratio = tau2 / tau1 if tau1 > 0 else 1.0
+    Ku = max(1, int(round(Kx * 3)))
+    Kv = max(Ku, int(round(Kx * min(ratio, 10))))
+    return {'Ku': Ku, 'Kv': Kv, 'ratio': round(ratio, 4),
+            'tau1': round(tau1, 4), 'tau2': round(tau2, 4)}
+
+
+def desloc_psi_factor(Kx, Ku, beta1):
+    """Compute psi from Theorem 1. Kx=1 → psi=0 (DDP bound).
+    psi = 4(1-px)/px^2 * (1-beta1)(1-pu) / (6(1-(1-pu)*beta1))."""
+    px = 1.0 / max(1, Kx)
+    pu = 1.0 / max(1, Ku)
+    num = 4.0 * (1 - px) * (1 - beta1) * (1 - pu)
+    den = px * px * 6.0 * (1 - (1 - pu) * beta1)
+    return num / den if abs(den) > 1e-15 else float('inf')
+
+
+def desloc_comm_volume_per_step(param_bytes, num_workers, Kx, Ku, Kv):
+    """Expected comm volume per step under DES-LOC.
+    Ref: Section 4.1 — Ring-AllReduce: 2*(N-1)/N * param_bytes per op.
+    DES-LOC: freq = 1/Kx + 1/Ku + 1/Kv. DDP: freq = 3."""
+    if num_workers <= 1:
+        return {'desloc_bytes': 0, 'ddp_bytes': 0, 'reduction': 0.0}
+    ring = 2.0 * (num_workers - 1) / num_workers
+    single_ar = ring * param_bytes
+    desloc_freq = 1.0/max(1,Kx) + 1.0/max(1,Ku) + 1.0/max(1,Kv)
+    return {
+        'desloc_bytes': int(single_ar * desloc_freq),
+        'ddp_bytes': int(single_ar * 3.0),
+        'reduction': round(1.0 - desloc_freq / 3.0, 6),
+    }
+
+
+def desloc_convergence_bound(T, M, sigma2, Kx, Ku, beta1, eta):
+    """Evaluate convergence bound from Theorem 1.
+    E[||grad f||^2] <= O(1/sqrt(MT)) + O(psi/T).
+    Ref: Section 3 — linear speedup in M workers preserved."""
+    psi = desloc_psi_factor(Kx, Ku, beta1)
+    leading = _math.sqrt(sigma2 / (M * T))
+    higher = psi / T
+    return {
+        'leading': round(leading, 8),
+        'higher_order': round(higher, 8),
+        'total': round(leading + higher, 8),
+        'psi': round(psi, 6),
+        'ratio': round(higher / leading, 6) if leading > 0 else float('inf'),
+    }
+
+
+def desloc_model_flops(num_params, seq_len, batch_size):
+    """Estimate FLOPs per training step: C ≈ 6*N*S*B.
+    Ref: Kaplan et al. — 2N per fwd, 4N per bwd."""
+    return 6 * num_params * seq_len * batch_size
+
+
+class DeslocStepTracker:
+    """Track DES-LOC sync boundaries. Ref: Algorithm 1.
+    Determines which states should sync at each step."""
+
+    def __init__(self, Kx=1, Ku=3, Kv=6, enabled=False):
+        self.Kx = max(1, Kx)
+        self.Ku = max(1, Ku)
+        self.Kv = max(1, Kv)
+        self.enabled = enabled
+        self.step = 0
+        self.param_syncs = 0
+        self.momentum_syncs = 0
+        self.variance_syncs = 0
+
+    def advance(self):
+        """Advance one step. Returns sync decisions."""
+        self.step += 1
+        if not self.enabled:
+            return {'param': True, 'momentum': True, 'variance': True}
+        sp = (self.step % self.Kx) == 0
+        sm = (self.step % self.Ku) == 0
+        sv = (self.step % self.Kv) == 0
+        if sp: self.param_syncs += 1
+        if sm: self.momentum_syncs += 1
+        if sv: self.variance_syncs += 1
+        return {'param': sp, 'momentum': sm, 'variance': sv, 'step': self.step}
+
+    def should_sync(self, tier='param'):
+        if not self.enabled:
+            return True
+        period = {'param': self.Kx, 'momentum': self.Ku, 'variance': self.Kv}.get(tier, 1)
+        return (self.step % period) == 0
+
+    def get_stats(self):
+        t = max(1, self.step)
+        return {
+            'total_steps': self.step,
+            'param_syncs': self.param_syncs,
+            'momentum_syncs': self.momentum_syncs,
+            'variance_syncs': self.variance_syncs,
+            'param_skip_ratio': round(1.0 - self.param_syncs / t, 4),
+            'momentum_skip_ratio': round(1.0 - self.momentum_syncs / t, 4),
+            'variance_skip_ratio': round(1.0 - self.variance_syncs / t, 4),
+        }
+
+    def state_dict(self):
+        return {'step': self.step, 'Kx': self.Kx, 'Ku': self.Ku, 'Kv': self.Kv,
+                'enabled': self.enabled, 'ps': self.param_syncs,
+                'ms': self.momentum_syncs, 'vs': self.variance_syncs}
+
+    def load_state_dict(self, sd):
+        self.step = sd.get('step', 0)
+        self.Kx = sd.get('Kx', self.Kx)
+        self.Ku = sd.get('Ku', self.Ku)
+        self.Kv = sd.get('Kv', self.Kv)
+        self.enabled = sd.get('enabled', self.enabled)
+        self.param_syncs = sd.get('ps', 0)
+        self.momentum_syncs = sd.get('ms', 0)
+        self.variance_syncs = sd.get('vs', 0)
+
+
+class DeslocGradientClipper:
+    """Per-coordinate gradient clipping for DES-LOC.
+    Ref: Algorithm 1 line 12 — g_hat = clip(g, rho).
+    Each gradient component satisfies |g_i| <= rho.
+    This differs from global norm clipping (standard DeepSpeed)."""
+
+    def __init__(self, clip_rho=1.0, enabled=False):
+        self.clip_rho = clip_rho
+        self.enabled = enabled
+        self.total_clipped = 0
+        self.total_elements = 0
+
+    def clip(self, parameters):
+        """Apply per-coordinate clipping. Returns clip fraction.
+        Ref: Assumption 2 — bounded gradient ensures convergence."""
+        if not self.enabled or self.clip_rho <= 0:
+            return 0.0
+        clipped = 0
+        total = 0
+        for p in parameters:
+            if p.grad is None:
+                continue
+            g = p.grad.data
+            total += g.numel()
+            mask = g.abs() > self.clip_rho
+            clipped += mask.sum().item()
+            g.clamp_(-self.clip_rho, self.clip_rho)
+        self.total_clipped += clipped
+        self.total_elements += total
+        return clipped / max(1, total)
+
+    @property
+    def clip_ratio(self):
+        return self.total_clipped / max(1, self.total_elements)
+
+    def reset(self):
+        self.total_clipped = 0
+        self.total_elements = 0
+
+
+class DeslocWarmupTracker:
+    """Track warmup phase. Ref: Section A.1 — TWARM=512 steps.
+    During warmup: Kx=1 (full DDP sync to establish good initial states).
+    After warmup: transition to configured Kx."""
+
+    def __init__(self, warmup_steps=512, Kx_train=32):
+        self.warmup_steps = warmup_steps
+        self.Kx_train = Kx_train
+        self.step = 0
+
+    def get_current_Kx(self):
+        if self.step < self.warmup_steps:
+            return 1
+        return self.Kx_train
+
+    def advance(self):
+        self.step += 1
+        return self.get_current_Kx()
+
+    def is_warmup(self):
+        return self.step < self.warmup_steps
+
+    def state_dict(self):
+        return {'step': self.step, 'warmup': self.warmup_steps, 'Kx': self.Kx_train}
+
+    def load_state_dict(self, sd):
+        self.step = sd.get('step', 0)
+        self.warmup_steps = sd.get('warmup', self.warmup_steps)
+        self.Kx_train = sd.get('Kx', self.Kx_train)
+
+
+class DeslocScalingLaw:
+    """DES-LOC-aware scaling law predictor.
+    Ref: Chinchilla — L(N,D) = a/N^alpha + b/D^beta + L_inf.
+    DES-LOC adds comm penalty: L_desloc = L_base + c * psi(Kx,Ku) / T.
+
+    Nick Joseph: 'scaling laws — predict with considerable accuracy:
+    when you increase compute/data/params, loss decreases as power law.'"""
+
+    def __init__(self, a=406.4, alpha=0.34, b=410.7, beta_exp=0.283, L_inf=1.69):
+        self.a = a
+        self.alpha = alpha
+        self.b = b
+        self.beta_exp = beta_exp
+        self.L_inf = L_inf
+
+    def predict_loss(self, N, D, Kx=1, Ku=3, beta1=0.9, T=None):
+        """Predict loss for model size N and data tokens D."""
+        base = self.a / (N ** self.alpha) + self.b / (D ** self.beta_exp) + self.L_inf
+        if Kx > 1 and T is not None and T > 0:
+            psi = desloc_psi_factor(Kx, Ku, beta1)
+            base += psi / T * 0.01
+        return round(base, 6)
+
+    def compute_optimal(self, flops_budget):
+        """Find optimal N, D for FLOPS budget. C ≈ 6*N*D."""
+        best = None
+        for log_n in range(7, 12):
+            N = 10 ** log_n
+            D = flops_budget / (6 * N)
+            if D < N:
+                continue
+            loss = self.predict_loss(N, D)
+            if best is None or loss < best['loss']:
+                best = {'N': N, 'D': int(D), 'loss': loss, 'ratio': round(D/N, 2)}
+        return best
+
+
+MODEL_CONFIGS = {
+    '125M': {'layers': 12, 'heads': 12, 'dim': 768, 'params': 125e6},
+    '350M': {'layers': 24, 'heads': 16, 'dim': 1024, 'params': 350e6},
+    '1B':   {'layers': 24, 'heads': 16, 'dim': 2048, 'params': 1e9},
+    '7B':   {'layers': 32, 'heads': 32, 'dim': 4096, 'params': 7e9},
+}
+
+
+class DeslocConvergenceEstimator:
+    """Estimate convergence rate from training loss trajectory.
+    Ref: Theorem 1 — E[||grad f||^2] <= O(1/sqrt(T)) + O(psi/T).
+    Fits loss ~ alpha * T^(-beta) + L_inf to verify convergence rate."""
 
     def __init__(self):
-        self.results = {}
+        self.loss_history = []
+        self.step_history = []
+        self._fitted = False
+        self._alpha = 0.0
+        self._beta_exp = 0.5
+        self._L_inf = 0.0
 
-    def add_result(self, benchmark_id, config, metrics):
-        """Add one experiment run's results."""
-        if benchmark_id not in self.results:
-            self.results[benchmark_id] = []
-        self.results[benchmark_id].append({
-            'config': config,
-            'metrics': metrics,
-        })
+    def record(self, step, loss):
+        self.loss_history.append(float(loss))
+        self.step_history.append(int(step))
+        self._fitted = False
 
-    def get_benchmark_summary(self, benchmark_id):
-        """Get summary statistics for a specific benchmark."""
-        if benchmark_id not in self.results:
-            return {'error': 'benchmark not found'}
-
-        entries = self.results[benchmark_id]
-        losses = [e['metrics'].get('final_loss', 0)
-                  for e in entries if 'final_loss' in e['metrics']]
-        comm = [e['metrics'].get('total_comm_bytes', 0)
-                for e in entries if 'total_comm_bytes' in e['metrics']]
-
+    def fit_power_law(self):
+        """Fit loss ~ alpha * T^(-beta) + L_inf via log-linear regression.
+        Ref: Nick Joseph — 'when curve departs from power law, something is wrong.'"""
+        if len(self.loss_history) < 10:
+            return None
+        L_inf = min(self.loss_history) * 0.95
+        log_s, log_l = [], []
+        for s, l in zip(self.step_history, self.loss_history):
+            if s > 0 and l > L_inf:
+                log_s.append(_math.log(s))
+                log_l.append(_math.log(l - L_inf))
+        if len(log_s) < 5:
+            return None
+        n = len(log_s)
+        sx = sum(log_s)
+        sy = sum(log_l)
+        sxy = sum(x*y for x, y in zip(log_s, log_l))
+        sxx = sum(x*x for x in log_s)
+        d = n * sxx - sx * sx
+        if abs(d) < 1e-15:
+            return None
+        slope = (n * sxy - sx * sy) / d
+        intercept = (sy - slope * sx) / n
+        self._beta_exp = -slope
+        self._alpha = _math.exp(intercept)
+        self._L_inf = L_inf
+        self._fitted = True
+        y_pred = [slope * x + intercept for x in log_s]
+        ss_res = sum((y - yp)**2 for y, yp in zip(log_l, y_pred))
+        y_mean = sy / n
+        ss_tot = sum((y - y_mean)**2 for y in log_l)
+        r2 = 1 - ss_res / ss_tot if ss_tot > 0 else 0
         return {
-            'benchmark_id': benchmark_id,
-            'num_runs': len(entries),
-            'avg_final_loss': (
-                round(sum(losses) / len(losses), 6)
-                if losses else None),
-            'min_final_loss': (
-                round(min(losses), 6) if losses else None),
-            'avg_comm_bytes': (
-                int(sum(comm) / len(comm)) if comm else 0),
+            'exponent': round(self._beta_exp, 6),
+            'coefficient': round(self._alpha, 6),
+            'L_inf': round(self._L_inf, 6),
+            'r_squared': round(r2, 6),
+            'n_points': n,
+            'expected_exponent': 0.5,
         }
 
-    def export_for_figures(self, benchmark_id):
-        """Export data structured for figure generation.
+    def predict_loss(self, target_step):
+        if not self._fitted:
+            self.fit_power_law()
+        if not self._fitted:
+            return None
+        return round(self._alpha * (target_step ** (-self._beta_exp)) + self._L_inf, 6)
 
-        Returns dict suitable for pandas DataFrame construction.
-        Includes outer_optimizer field for Section 5.5 ablation.
-        """
-        if benchmark_id not in self.results:
-            return {}
-
-        data = {
-            'config_label': [],
-            'final_loss': [],
-            'min_loss': [],
-            'total_comm_bytes': [],
-            'reduction_vs_ddp': [],
-            'seed': [],
-            'outer_optimizer': [],
+    def compute_psi(self, Kx, Ku, beta1):
+        """Compute psi and check if higher-order term is negligible."""
+        psi = desloc_psi_factor(Kx, Ku, beta1)
+        T = max(self.step_history) if self.step_history else 10000
+        leading = 1.0 / _math.sqrt(T)
+        higher = psi / T
+        return {
+            'psi': round(psi, 6),
+            'ratio': round(higher / leading, 6) if leading > 0 else float('inf'),
+            'negligible': (higher / leading < 0.01) if leading > 0 else False,
         }
 
-        for entry in self.results[benchmark_id]:
-            cfg = entry['config']
-            m = entry['metrics']
-            label_parts = []
-            if 'method' in cfg:
-                label_parts.append(cfg['method'])
-            if 'Kx' in cfg:
-                label_parts.append(f"Kx={cfg['Kx']}")
-            data['config_label'].append('_'.join(label_parts) if label_parts else 'unknown')
-            data['final_loss'].append(m.get('final_loss', 0))
-            data['min_loss'].append(m.get('min_loss', 0))
-            data['total_comm_bytes'].append(m.get('total_comm_bytes', 0))
-            data['reduction_vs_ddp'].append(m.get('reduction_vs_ddp', 1.0))
-            data['seed'].append(cfg.get('seed', 0))
-            data['outer_optimizer'].append(cfg.get('outer_optimizer', 'averaging'))
-
-        return data
-
-    def format_summary_table(self):
-        """Format all benchmarks as summary table."""
-        lines = ["### Experiment Summary ###"]
-        for bid in sorted(self.results.keys()):
-            s = self.get_benchmark_summary(bid)
-            lines.append(
-                f"{bid}: {s['num_runs']} runs, "
-                f"loss={s.get('avg_final_loss', 'N/A')}, "
-                f"comm={s.get('avg_comm_bytes', 0)}")
-        return "\n".join(lines)
-
-
-class DESLOCLogParser:
-    """Parse structured experiment logs produced by DES-LOC benchmarks.
-
-    Reads log files with format:
-    ### DESLOC_EXPERIMENT_START ###
-    # config: model=125M Kx=32 ...
-    step=0 loss=10.82 lr=6.00e-04 ...
-    ### DESLOC_EXPERIMENT_END ###
-    """
-
-    def __init__(self, log_dir='./desloc_experiment_logs'):
-        self.log_dir = log_dir
-
-    def parse_file(self, filepath):
-        """Parse a single log file into structured data."""
-        config = {}
-        steps = []
-        in_experiment = False
-
-        try:
-            with open(filepath, 'r') as f:
-                for line in f:
-                    line = line.strip()
-                    if line == '### DESLOC_EXPERIMENT_START ###':
-                        in_experiment = True
-                        continue
-                    elif line == '### DESLOC_EXPERIMENT_END ###':
-                        in_experiment = False
-                        continue
-                    if not in_experiment:
-                        continue
-                    if line.startswith('# config:'):
-                        parts = line[len('# config:'):].strip().split()
-                        for p in parts:
-                            if '=' in p:
-                                k, v = p.split('=', 1)
-                                try:
-                                    v = int(v)
-                                except ValueError:
-                                    try:
-                                        v = float(v)
-                                    except ValueError:
-                                        pass
-                                config[k] = v
-                    elif line.startswith('step='):
-                        entry = {}
-                        for token in line.split():
-                            if '=' in token:
-                                k, v = token.split('=', 1)
-                                try:
-                                    v = float(v)
-                                    if v == int(v) and 'loss' not in k and 'lr' not in k:
-                                        v = int(v)
-                                except ValueError:
-                                    pass
-                                entry[k] = v
-                        steps.append(entry)
-        except FileNotFoundError:
-            pass
-
-        return {'config': config, 'steps': steps}
-
-    def parse_all(self, pattern='*.log'):
-        """Parse all matching log files in log_dir."""
-        import glob
-        results = []
-        for fp in sorted(glob.glob(_m184_os.path.join(self.log_dir, pattern))):
-            parsed = self.parse_file(fp)
-            if parsed['steps']:
-                results.append(parsed)
+    def estimate_kx_impact(self, kx_values, beta1=0.9, T=10000):
+        """Estimate convergence impact for different Kx values."""
+        results = {}
+        for kx in kx_values:
+            ku = max(1, kx * 3)
+            psi = desloc_psi_factor(kx, ku, beta1)
+            leading = 1.0 / _math.sqrt(T)
+            higher = psi / T
+            results[kx] = {
+                'psi': round(psi, 6),
+                'ratio': round(higher / leading, 6) if leading > 0 else 0,
+                'negligible': higher < 0.01 * leading,
+            }
         return results
 
 
-class DESLOCConvergenceBound:
-    """Compute theoretical convergence bounds from Theorem 1.
-
-    Theorem 1 bound (simplified):
-      E[||grad f||^2] <= O(1/sqrt(T)) + O(psi/T)
-    where psi = 4(1-px)/px^2 * (1-beta)*(1-pu) / (6*(1-(1-pu)*beta))
-    """
-
-    @staticmethod
-    def compute_psi(Kx, Ku, beta1=0.9):
-        """Compute the psi factor from Theorem 1.
-
-        Args:
-            Kx: parameter sync period
-            Ku: first moment sync period
-            beta1: first moment decay rate
-        Returns:
-            psi: the convergence penalty factor
-        """
-        px = 1.0 / Kx
-        pu = 1.0 / Ku
-        numer = 4.0 * (1.0 - px) * (1.0 - beta1) * (1.0 - pu)
-        denom = px * px * 6.0 * (1.0 - (1.0 - pu) * beta1)
-        if abs(denom) < 1e-15:
-            return float('inf')
-        return numer / denom
-
-    @staticmethod
-    def compute_eta0(L, psi, B_sq=1.0):
-        """Compute step-size upper bound eta_0 from Theorem 1.
-
-        eta_0 = min(1/(8L), 1/(L*sqrt(psi*8*(B^2+1))))
-        """
-        import math
-        bound1 = 1.0 / (8.0 * L)
-        inner = psi * 8.0 * (B_sq + 1.0)
-        if inner <= 0:
-            return bound1
-        bound2 = 1.0 / (L * math.sqrt(inner))
-        return min(bound1, bound2)
-
-    @staticmethod
-    def leading_term(T, M, sigma_sq, L, eta):
-        """O(1/sqrt(T)) leading term: measures convergence rate."""
-        import math
-        if T <= 0 or M <= 0:
-            return float('inf')
-        return (sigma_sq / (M * math.sqrt(T))) + (L * eta * sigma_sq / M)
-
-    @staticmethod
-    def higher_order_term(T, psi, sigma_sq, G_sq, L, eta):
-        """O(psi/T) higher-order term: penalty from desynchronization."""
-        if T <= 0:
-            return float('inf')
-        return (psi * (sigma_sq + G_sq) * L * eta) / T
+def desloc_training_time_estimate(num_params, total_tokens, peak_tflops, mfu=0.45):
+    """Estimate wall-clock training time in seconds.
+    Ref: time = 6*N*D / (peak * 1e12 * mfu)."""
+    return 6 * num_params * total_tokens / (peak_tflops * 1e12 * mfu)
 
 
-# ── end M184 ────────────────────────────────────────────────────
+def desloc_param_bytes(num_params, dtype_bytes=2):
+    """Parameter size in bytes. BF16=2, FP32=4.
+    With Adam: 3 states (param + m1 + m2) x dtype_bytes.
+    DES-LOC reduces sync of m1/m2 by Ku/Kv factors."""
+    return num_params * dtype_bytes
+
+
+def desloc_format_training_report(step, loss, lr, Kx, Ku, Kv, is_sync,
+                                   throughput=None, mfu=None):
+    """Format a training step report in NKI-FA log format.
+    Ref: NKI-FA draw_plot.py — 'metric: value' lines for parsing.
+    All floats formatted to >= 6 digits."""
+    lines = [
+        f'step: {step}',
+        f'loss: {loss:.6f}',
+        f'lr: {lr:.8f}',
+        f'Kx: {Kx}',
+        f'Ku: {Ku}',
+        f'Kv: {Kv}',
+        f'is_param_sync: {int(is_sync)}',
+    ]
+    if throughput is not None:
+        lines.append(f'throughput_samples_sec: {throughput:.4f}')
+    if mfu is not None:
+        lines.append(f'mfu: {mfu:.6f}')
+    return '\n'.join(lines)
+
+
+def desloc_validate_precision(value, name='value', min_sig_digits=4):
+    """Validate that a number has sufficient significant digits.
+    Ref: 'Data must not be 1, 11, 0.9 — NeurIPS reviewers will reject.'"""
+    if not isinstance(value, float) or value == 0:
+        return True
+    s = f'{value:.10g}'.lstrip('-0').replace('.', '')
+    sig = len(s.rstrip('0'))
+    if sig < min_sig_digits:
+        return False
+    return True
+
+
+# DES-LOC: end of M169 integration

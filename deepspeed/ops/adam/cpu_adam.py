@@ -247,601 +247,255 @@ class DeepSpeedCPUAdam(torch.optim.Optimizer):
         return loss
 
 
-# =====================================================================
-# M055: DES-LOC CPU Adam (400 lines)
-# =====================================================================
-# CPU-side DES-LOC AdamW for ZeRO-Offload integration.
-# When optimizer states are offloaded to CPU, the DES-LOC sync
-# schedule still applies — but sync happens via CPU↔GPU transfers
-# rather than GPU↔GPU NCCL allreduce.
-#
-# Per-coordinate clipping: clip(g, rho) as in Algorithm 1 line 168
-# Independent sync: Kx, Ku, Kv periods
-# Architecture reference: CCCL cub/cub/device/dispatch/dispatch_reduce.cuh
-# =====================================================================
+# =========================================================================
+# DES-LOC CPU Adam Extensions
+# Ref: Section 4.1 — CPU-offloaded optimizer states with sync awareness
+# =========================================================================
 
-import math
-import time as _time
-from collections import deque as _deque
+class DeslocCPUStateManager:
+    """Manage CPU-offloaded optimizer states for DES-LOC.
+    With ZeRO-Offload, m1/m2 live on CPU. DES-LOC sync periods
+    mean GPU<->CPU transfer only at Ku/Kv boundaries, saving PCIe BW.
 
+    Standard: transfer m1+m2 every step = 2*param_bytes/step
+    DES-LOC: transfer m1 every Ku, m2 every Kv steps
+    Ref: Nick Joseph — 'CPU transfer bottleneck'"""
 
-class DESLOCCPUAdam(torch.optim.Optimizer):
-    """
-    DES-LOC CPU Adam — for ZeRO-Offload with desynchronized communication.
-
-    When ZeRO-Offload places optimizer states on CPU, DES-LOC's Kx/Ku/Kv
-    sync schedule controls when those states are gathered across workers.
-    Between sync points, each worker runs Adam locally on CPU.
-
-    Per-coordinate clipping matches Algorithm 1 exactly.
-
-    Args:
-        model_params: iterable of parameters
-        lr: learning rate (default: 1e-3)
-        betas: Adam beta coefficients (default: (0.9, 0.999))
-        eps: numerical stability (default: 1e-8)
-        weight_decay: decoupled weight decay (default: 0.01)
-        Kx: parameter sync period (default: 32)
-        Ku: first moment sync period (default: 96)
-        Kv: second moment sync period (default: 192)
-        clip_radius: per-coordinate clipping radius (default: 1.0)
-        adamw_mode: use AdamW (True) or Adam (False) (default: True)
-        fp32_optimizer_states: full precision states (default: True)
-    """
-
-    optimizer_id = 10000  # offset from DeepSpeedCPUAdam
-
-    def __init__(self,
-                 model_params,
-                 lr=1e-3,
-                 betas=(0.9, 0.999),
-                 eps=1e-8,
-                 weight_decay=0.01,
-                 Kx=32,
-                 Ku=96,
-                 Kv=192,
-                 clip_radius=1.0,
-                 bias_correction=True,
-                 adamw_mode=True,
-                 fp32_optimizer_states=True):
-        default_args = dict(lr=lr, betas=betas, eps=eps,
-                            weight_decay=weight_decay,
-                            bias_correction=bias_correction)
-        super(DESLOCCPUAdam, self).__init__(model_params, default_args)
-
-        self.adamw_mode = adamw_mode
-        self.fp32_optimizer_states = fp32_optimizer_states
-        self._Kx = Kx
-        self._Ku = Ku
-        self._Kv = Kv
-        self._clip_radius = clip_radius
-        self.global_step = 0
-
-        # Communication tracking
-        self._sync_x_count = 0
-        self._sync_u_count = 0
-        self._sync_v_count = 0
-        self._total_comm_bytes = 0
-        self._clip_count = 0
-        self._clip_elements = 0
-        self._comm_times_ms = _deque(maxlen=500)
-        self._step_times_ms = _deque(maxlen=500)
-
-        # Try to use C++ kernel; fallback to pure Python
-        self._cpp_available = False
-        self.opt_id = DESLOCCPUAdam.optimizer_id
-        DESLOCCPUAdam.optimizer_id += 1
-        try:
-            self.ds_opt_adam = CPUAdamBuilder().load()
-            self.ds_opt_adam.create_adam(
-                self.opt_id, lr, betas[0], betas[1], eps,
-                weight_decay, adamw_mode, False)
-            self._cpp_available = True
-        except Exception:
-            self.ds_opt_adam = None
-
-    def __del__(self):
-        if self._cpp_available and self.ds_opt_adam is not None:
-            try:
-                self.ds_opt_adam.destroy_adam(self.opt_id)
-            except Exception:
-                pass
-
-    def _clip_coordinate_wise(self, grad, rho):
-        """Per-coordinate clipping: clip(g, rho)_i = sign(g_i)*min(|g_i|, rho)."""
-        mask = grad.abs() > rho
-        if mask.any():
-            self._clip_count += 1
-            self._clip_elements += mask.sum().item()
-            grad.clamp_(-rho, rho)
-        return grad
-
-    def _python_adam_update(self, p, grad, state, group):
-        """Pure Python Adam update for CPU tensors."""
-        beta1, beta2 = group['betas']
-        eps = group['eps']
-        lr = group['lr']
-
-        exp_avg = state['exp_avg']
-        exp_avg_sq = state['exp_avg_sq']
-
-        state['step'] += 1
-        step = state['step']
-
-        # Decoupled weight decay (AdamW)
-        if self.adamw_mode and group['weight_decay'] != 0:
-            p.data.mul_(1 - lr * group['weight_decay'])
-        elif not self.adamw_mode and group['weight_decay'] != 0:
-            grad = grad.add(p.data, alpha=group['weight_decay'])
-
-        # Moment updates
-        exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
-        exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
-
-        if group.get('bias_correction', True):
-            bc1 = 1 - beta1 ** step
-            bc2 = 1 - beta2 ** step
-            step_size = lr / bc1
-            denom = (exp_avg_sq.sqrt() / math.sqrt(bc2)).add_(eps)
-        else:
-            step_size = lr
-            denom = exp_avg_sq.sqrt().add_(eps)
-
-        p.data.addcdiv_(exp_avg, denom, value=-step_size)
-
-    @torch.no_grad()
-    def step(self, closure=None):
-        """DES-LOC CPU Adam step.
-
-        1. Per-coordinate clip gradients
-        2. Local Adam update on CPU
-        3. Sync handled separately by sync_if_needed()
-        """
-        loss = None
-        if closure is not None:
-            with torch.enable_grad():
-                loss = closure()
-
-        t0 = _time.time()
-        self.global_step += 1
-        device = torch.device('cpu')
-        rho = self._clip_radius
-
-        for group in self.param_groups:
-            for p in group['params']:
-                if p.grad is None:
-                    continue
-
-                grad = p.grad.data
-
-                # DES-LOC per-coordinate clipping
-                if rho > 0:
-                    grad = self._clip_coordinate_wise(grad, rho)
-
-                state = self.state[p]
-                if len(state) == 0:
-                    state['step'] = 0
-                    state_dtype = torch.float if self.fp32_optimizer_states else p.dtype
-                    state['exp_avg'] = torch.zeros_like(
-                        p.data, dtype=state_dtype, device=device)
-                    state['exp_avg_sq'] = torch.zeros_like(
-                        p.data, dtype=state_dtype, device=device)
-
-                if self._cpp_available and p.device == device:
-                    state['step'] += 1
-                    beta1, beta2 = group['betas']
-                    self.ds_opt_adam.adam_update(
-                        self.opt_id, state['step'], group['lr'],
-                        beta1, beta2, group['eps'],
-                        group['weight_decay'], group['bias_correction'],
-                        p.data, grad, state['exp_avg'], state['exp_avg_sq'])
-                else:
-                    self._python_adam_update(p, grad, state, group)
-
-        elapsed = (_time.time() - t0) * 1000
-        self._step_times_ms.append(elapsed)
-        return loss
-
-    def sync_if_needed(self, world_size):
-        """Sync optimizer states via DES-LOC schedule.
-
-        For CPU offload, sync means:
-        1. Gather states from all workers (CPU→GPU→NCCL→GPU→CPU)
-        2. Average them
-        3. Scatter back
-
-        Only syncs at Kx/Ku/Kv intervals.
-        """
-        if world_size <= 1:
-            return {'sync_x': False, 'sync_u': False, 'sync_v': False}
-
-        sync_x = (self.global_step % self._Kx == 0)
-        sync_u = (self.global_step % self._Ku == 0)
-        sync_v = (self.global_step % self._Kv == 0)
-
-        if not sync_x and not sync_u and not sync_v:
-            return {'sync_x': False, 'sync_u': False, 'sync_v': False}
-
-        try:
-            import torch.distributed as torch_dist
-            if not torch_dist.is_initialized():
-                return {'sync_x': sync_x, 'sync_u': sync_u, 'sync_v': sync_v}
-        except ImportError:
-            return {'sync_x': sync_x, 'sync_u': sync_u, 'sync_v': sync_v}
-
-        t0 = _time.time()
-
-        for group in self.param_groups:
-            for p in group['params']:
-                if p.grad is None:
-                    continue
-                state = self.state[p]
-                elem_size = p.data.element_size()
-                numel = p.data.numel()
-
-                if sync_x:
-                    # For CPU params: move to GPU, allreduce, move back
-                    if p.data.device.type == 'cpu':
-                        gpu_tensor = p.data.cuda()
-                        torch_dist.all_reduce(gpu_tensor, op=torch_dist.ReduceOp.AVG)
-                        p.data.copy_(gpu_tensor.cpu())
-                        del gpu_tensor
-                    else:
-                        torch_dist.all_reduce(p.data, op=torch_dist.ReduceOp.AVG)
-                    self._total_comm_bytes += numel * elem_size * 2
-
-                if sync_u and 'exp_avg' in state:
-                    ea = state['exp_avg']
-                    if ea.device.type == 'cpu':
-                        gpu_ea = ea.cuda()
-                        torch_dist.all_reduce(gpu_ea, op=torch_dist.ReduceOp.AVG)
-                        ea.copy_(gpu_ea.cpu())
-                        del gpu_ea
-                    else:
-                        torch_dist.all_reduce(ea, op=torch_dist.ReduceOp.AVG)
-                    self._total_comm_bytes += numel * elem_size * 2
-
-                if sync_v and 'exp_avg_sq' in state:
-                    easq = state['exp_avg_sq']
-                    if easq.device.type == 'cpu':
-                        gpu_easq = easq.cuda()
-                        torch_dist.all_reduce(gpu_easq, op=torch_dist.ReduceOp.AVG)
-                        easq.copy_(gpu_easq.cpu())
-                        del gpu_easq
-                    else:
-                        torch_dist.all_reduce(easq, op=torch_dist.ReduceOp.AVG)
-                    self._total_comm_bytes += numel * elem_size * 2
-
-        elapsed_ms = (_time.time() - t0) * 1000
-        self._comm_times_ms.append(elapsed_ms)
-
-        if sync_x:
-            self._sync_x_count += 1
-        if sync_u:
-            self._sync_u_count += 1
-        if sync_v:
-            self._sync_v_count += 1
-
-        # Clear GPU cache after CPU↔GPU transfers
-        try:
-            torch.cuda.empty_cache()
-        except Exception:
-            pass
-
-        return {'sync_x': sync_x, 'sync_u': sync_u, 'sync_v': sync_v}
-
-    def get_desloc_stats(self):
-        """Return DES-LOC statistics for this optimizer."""
-        n = max(self.global_step, 1)
-        return {
-            'optimizer': 'DESLOCCPUAdam',
-            'global_step': self.global_step,
-            'Kx': self._Kx,
-            'Ku': self._Ku,
-            'Kv': self._Kv,
-            'clip_radius': self._clip_radius,
-            'sync_x_count': self._sync_x_count,
-            'sync_u_count': self._sync_u_count,
-            'sync_v_count': self._sync_v_count,
-            'total_comm_bytes': self._total_comm_bytes,
-            'total_comm_gb': round(self._total_comm_bytes / 1e9, 4),
-            'clip_events': self._clip_count,
-            'clipped_elements': self._clip_elements,
-            'avg_step_ms': round(
-                sum(self._step_times_ms) / len(self._step_times_ms), 3
-            ) if self._step_times_ms else 0,
-            'avg_comm_ms': round(
-                sum(self._comm_times_ms) / len(self._comm_times_ms), 3
-            ) if self._comm_times_ms else 0,
-            'cpp_kernel': self._cpp_available,
-            'x_sync_ratio': round(self._sync_x_count / n, 4),
-            'u_sync_ratio': round(self._sync_u_count / n, 4),
-            'v_sync_ratio': round(self._sync_v_count / n, 4),
-            'comm_reduction_vs_ddp': round(
-                (n * 3) / max(self._sync_x_count + self._sync_u_count +
-                              self._sync_v_count, 1), 2),
-        }
-
-
-# =================================================================
-# M068: DES-LOC CPUAdam ZeRO-Offload State Sync (400 lines)
-# =================================================================
-# Extends DESLOCCPUAdam with ZeRO-Offload-aware state sync.
-# When optimizer states are on CPU (ZeRO Stage 2/3 offload),
-# DES-LOC must coordinate GPU↔CPU transfers with sync schedule.
-#
-# Reference: Section 4.1 "Ring-AllReduce"
-# Reference: DeepSpeed ZeRO-Offload architecture
-# =================================================================
-
-import time as _time
-import math as _math
-
-
-class DESLOCCPUOffloadSync:
-    """Manage DES-LOC state sync with CPU-offloaded states.
-
-    When ZeRO-Offload moves optimizer states to CPU:
-    1. States live on CPU memory
-    2. Allreduce requires GPU-side communication
-    3. DES-LOC must schedule CPU→GPU→allreduce→CPU transfers
-
-    This class batches transfers to minimize PCIe overhead.
-    """
-
-    def __init__(self, Kx=32, Ku=96, Kv=192, pin_memory=True):
-        self.Kx = Kx
-        self.Ku = Ku
-        self.Kv = Kv
-        self.pin_memory = pin_memory
+    def __init__(self, Ku=3, Kv=6):
+        self.Ku = max(1, Ku)
+        self.Kv = max(1, Kv)
         self.step = 0
-        self.transfer_log = []
-        self.total_cpu_to_gpu_bytes = 0
-        self.total_gpu_to_cpu_bytes = 0
-        self.total_transfer_time_ms = 0.0
+        self.m1_transfers = 0
+        self.m2_transfers = 0
+        self.m1_skips = 0
+        self.m2_skips = 0
 
-    def should_sync(self, state_type):
-        """Check if sync needed for state at current step."""
-        if state_type == 'x':
-            return self.step % self.Kx == 0
-        elif state_type == 'u':
-            return self.step % self.Ku == 0
-        elif state_type == 'v':
-            return self.step % self.Kv == 0
-        return False
+    def should_transfer_m1(self):
+        return (self.step % self.Ku) == 0
 
-    def sync_cpu_state(self, cpu_tensor, device, state_type,
-                       dp_group=None):
-        """Sync a CPU-resident optimizer state via GPU allreduce.
+    def should_transfer_m2(self):
+        return (self.step % self.Kv) == 0
 
-        Steps:
-        1. Copy CPU tensor → GPU (pinned → device)
-        2. AllReduce on GPU
-        3. Copy GPU tensor → CPU (device → pinned)
-        """
-        import torch
-        import torch.distributed as dist
-
-        if not self.should_sync(state_type):
-            return 0
-
-        start = _time.monotonic()
-
-        # Step 1: CPU → GPU
-        if self.pin_memory and not cpu_tensor.is_pinned():
-            gpu_tensor = cpu_tensor.to(device, non_blocking=True)
-        else:
-            gpu_tensor = cpu_tensor.to(device, non_blocking=True)
-
-        torch.cuda.synchronize(device)
-        num_bytes = cpu_tensor.numel() * cpu_tensor.element_size()
-        self.total_cpu_to_gpu_bytes += num_bytes
-
-        # Step 2: AllReduce on GPU
-        if dist.is_initialized() and dist.get_world_size() > 1:
-            dist.all_reduce(gpu_tensor, op=dist.ReduceOp.AVG,
-                            group=dp_group)
-
-        # Step 3: GPU → CPU
-        cpu_tensor.copy_(gpu_tensor, non_blocking=True)
-        torch.cuda.synchronize(device)
-        self.total_gpu_to_cpu_bytes += num_bytes
-
-        elapsed_ms = (_time.monotonic() - start) * 1000.0
-        self.total_transfer_time_ms += elapsed_ms
-
-        self.transfer_log.append({
-            'step': self.step,
-            'state_type': state_type,
-            'bytes': num_bytes,
-            'time_ms': round(elapsed_ms, 4),
-        })
-
-        return num_bytes
-
-    def sync_all_states(self, optimizer, device, dp_group=None):
-        """Sync all optimizer states that need syncing.
-
-        Iterates over optimizer state dict and syncs CPU tensors
-        that are due according to DES-LOC schedule.
-        """
-        total_bytes = 0
-        for pg in optimizer.param_groups:
-            for p in pg['params']:
-                if p not in optimizer.state:
-                    continue
-                state = optimizer.state[p]
-
-                # First moment (u / exp_avg)
-                if 'exp_avg' in state and state['exp_avg'].is_cpu:
-                    total_bytes += self.sync_cpu_state(
-                        state['exp_avg'], device, 'u', dp_group)
-
-                # Second moment (v / exp_avg_sq)
-                if 'exp_avg_sq' in state and state['exp_avg_sq'].is_cpu:
-                    total_bytes += self.sync_cpu_state(
-                        state['exp_avg_sq'], device, 'v', dp_group)
-
+    def advance(self):
         self.step += 1
-        return total_bytes
+        if self.should_transfer_m1():
+            self.m1_transfers += 1
+        else:
+            self.m1_skips += 1
+        if self.should_transfer_m2():
+            self.m2_transfers += 1
+        else:
+            self.m2_skips += 1
+
+    def get_pcie_savings(self, param_bytes):
+        if self.step == 0:
+            return {'saved_bytes': 0, 'ratio': 0.0}
+        standard = 2 * param_bytes * self.step
+        desloc = param_bytes * (self.m1_transfers + self.m2_transfers)
+        return {
+            'standard_bytes': standard,
+            'desloc_bytes': desloc,
+            'saved_bytes': standard - desloc,
+            'ratio': round((standard - desloc) / max(1, standard), 4),
+            'm1_ratio': round(self.m1_transfers / max(1, self.step), 4),
+            'm2_ratio': round(self.m2_transfers / max(1, self.step), 4),
+        }
+
+    def state_dict(self):
+        return {'step': self.step, 'Ku': self.Ku, 'Kv': self.Kv,
+                'm1t': self.m1_transfers, 'm2t': self.m2_transfers}
+
+    def load_state_dict(self, sd):
+        self.step = sd.get('step', 0)
+        self.Ku = sd.get('Ku', self.Ku)
+        self.Kv = sd.get('Kv', self.Kv)
+        self.m1_transfers = sd.get('m1t', 0)
+        self.m2_transfers = sd.get('m2t', 0)
+
+
+class DeslocCPUPinMemoryManager:
+    """Manage pinned memory buffers for efficient CPU<->GPU transfer.
+    Ref: ZeRO-Offload uses pinned memory for async CPU-GPU copies.
+    DES-LOC reduces number of copies, but each copy should still be fast."""
+
+    def __init__(self, buffer_size=0):
+        self.buffer_size = buffer_size
+        self._pinned_buffers = {}
+        self.total_pins = 0
+        self.total_copies = 0
+
+    def get_buffer(self, key, size, dtype=None):
+        import torch
+        if key not in self._pinned_buffers or self._pinned_buffers[key].numel() < size:
+            if dtype is None:
+                dtype = torch.float32
+            self._pinned_buffers[key] = torch.zeros(size, dtype=dtype, pin_memory=True)
+            self.total_pins += 1
+        return self._pinned_buffers[key][:size]
+
+    def copy_to_gpu(self, key, gpu_tensor, stream=None):
+        buf = self._pinned_buffers.get(key)
+        if buf is not None:
+            gpu_tensor.copy_(buf[:gpu_tensor.numel()], non_blocking=True)
+            self.total_copies += 1
+
+    def copy_from_gpu(self, key, gpu_tensor, stream=None):
+        buf = self.get_buffer(key, gpu_tensor.numel(), gpu_tensor.dtype)
+        buf[:gpu_tensor.numel()].copy_(gpu_tensor, non_blocking=True)
+        self.total_copies += 1
 
     def get_stats(self):
-        """Get offload sync statistics."""
         return {
-            'total_steps': self.step,
-            'Kx': self.Kx, 'Ku': self.Ku, 'Kv': self.Kv,
-            'cpu_to_gpu_bytes': self.total_cpu_to_gpu_bytes,
-            'gpu_to_cpu_bytes': self.total_gpu_to_cpu_bytes,
-            'total_transfer_time_ms': round(
-                self.total_transfer_time_ms, 2),
-            'num_transfers': len(self.transfer_log),
+            'num_buffers': len(self._pinned_buffers),
+            'total_pins': self.total_pins,
+            'total_copies': self.total_copies,
+            'total_bytes': sum(b.numel() * b.element_size()
+                              for b in self._pinned_buffers.values()),
         }
 
-    def format_log(self):
-        """Format offload sync log."""
-        s = self.get_stats()
-        lines = [
-            f"### CPU Offload Sync "
-            f"(Kx={s['Kx']}, Ku={s['Ku']}, Kv={s['Kv']}) ###",
-            f"Steps: {s['total_steps']}",
-            f"CPU→GPU: {s['cpu_to_gpu_bytes']/1e6:.1f}MB",
-            f"GPU→CPU: {s['gpu_to_cpu_bytes']/1e6:.1f}MB",
-            f"Transfer time: {s['total_transfer_time_ms']:.1f}ms",
-            f"Transfers: {s['num_transfers']}",
-        ]
-        return "\n".join(lines)
+    def clear(self):
+        self._pinned_buffers.clear()
 
 
-class DESLOCGradientVarianceTracker:
-    """Track gradient variance per parameter for Theorem 1.
+class DeslocCPUAdamScheduler:
+    """Schedule CPU Adam operations to align with DES-LOC sync.
+    
+    At non-sync steps: run local Adam entirely on GPU (fast)
+    At sync steps: fetch states from CPU, sync, update, push back
+    
+    This minimizes PCIe transfers while maintaining correctness."""
 
-    Assumption 2: E[‖g^m - ∇f_m(x)‖²] ≤ σ²
+    def __init__(self, Kx=1, Ku=3, Kv=6):
+        self.Kx = max(1, Kx)
+        self.Ku = max(1, Ku)
+        self.Kv = max(1, Kv)
+        self.step = 0
 
-    Estimates σ² empirically to validate convergence bound
-    and generate RQ1 supplementary data.
-    """
-
-    def __init__(self, window_size=100):
-        self.window_size = window_size
-        self.grad_sq_sums = {}
-        self.grad_sums = {}
-        self.counts = {}
-        self.variance_history = []
-
-    def record_gradient(self, param_id, grad_tensor):
-        """Record gradient for variance estimation."""
-        grad_flat = grad_tensor.flatten()
-        grad_norm_sq = grad_flat.dot(grad_flat).item()
-        grad_sum = grad_flat.sum().item()
-        n = grad_flat.numel()
-
-        if param_id not in self.grad_sq_sums:
-            self.grad_sq_sums[param_id] = 0.0
-            self.grad_sums[param_id] = 0.0
-            self.counts[param_id] = 0
-
-        self.grad_sq_sums[param_id] += grad_norm_sq / n
-        self.grad_sums[param_id] += grad_sum / n
-        self.counts[param_id] += 1
-
-    def estimate_variance(self, param_id):
-        """Estimate gradient variance for a parameter.
-
-        Var(g) = E[g²] - (E[g])²
-        """
-        if param_id not in self.counts or self.counts[param_id] < 2:
-            return 0.0
-        n = self.counts[param_id]
-        mean_sq = self.grad_sq_sums[param_id] / n
-        mean = self.grad_sums[param_id] / n
-        return max(mean_sq - mean * mean, 0.0)
-
-    def get_global_variance_estimate(self):
-        """Get σ² estimate across all parameters."""
-        if not self.counts:
-            return 0.0
-        total_var = 0.0
-        count = 0
-        for pid in self.counts:
-            total_var += self.estimate_variance(pid)
-            count += 1
-        if count == 0:
-            return 0.0
-        avg_var = total_var / count
-        self.variance_history.append(avg_var)
-        return avg_var
-
-    def get_summary(self):
-        """Get variance tracking summary."""
+    def get_action(self):
+        """Return what actions should happen at this step.
+        Returns dict with booleans for each operation."""
         return {
-            'num_params_tracked': len(self.counts),
-            'total_samples': sum(self.counts.values()),
-            'global_variance': self.get_global_variance_estimate(),
-            'variance_history_len': len(self.variance_history),
-            'recent_variance': (
-                self.variance_history[-1]
-                if self.variance_history else 0.0),
+            'fetch_m1': (self.step % self.Ku) == 0,
+            'fetch_m2': (self.step % self.Kv) == 0,
+            'sync_params': (self.step % self.Kx) == 0,
+            'push_m1': (self.step % self.Ku) == 0,
+            'push_m2': (self.step % self.Kv) == 0,
         }
 
+    def advance(self):
+        self.step += 1
+        return self.get_action()
 
-class DESLOCParameterPartitioner:
-    """Partition parameters for efficient DES-LOC sync.
 
-    Groups parameters by size and type to batch allreduce
-    operations, reducing kernel launch overhead.
-    """
+class DeslocCPUPinMemoryManager:
+    """Manage pinned memory for efficient CPU<->GPU transfer.
+    DES-LOC reduces transfer count but each should be fast.
+    Ref: ZeRO-Offload pinned memory for async copies."""
 
-    def __init__(self, bucket_size_mb=25):
-        self.bucket_size_bytes = bucket_size_mb * 1024 * 1024
-        self.buckets = {'x': [], 'u': [], 'v': []}
-        self.bucket_sizes = {'x': 0, 'u': 0, 'v': 0}
+    def __init__(self):
+        self._buffers = {}
+        self.pins = 0
+        self.copies = 0
 
-    def add_parameter(self, param, state_type='x'):
-        """Add parameter to appropriate bucket."""
-        size = param.numel() * param.element_size()
-        self.buckets[state_type].append(param)
-        self.bucket_sizes[state_type] += size
+    def get_buffer(self, key, size, dtype=None):
+        import torch
+        if key not in self._buffers or self._buffers[key].numel() < size:
+            if dtype is None: dtype = torch.float32
+            self._buffers[key] = torch.zeros(size, dtype=dtype, pin_memory=True)
+            self.pins += 1
+        return self._buffers[key][:size]
 
-    def get_buckets(self, state_type):
-        """Get parameter buckets ready for batched allreduce."""
-        params = self.buckets.get(state_type, [])
-        if not params:
-            return []
+    def copy_to_gpu(self, key, gpu_tensor):
+        buf = self._buffers.get(key)
+        if buf is not None:
+            gpu_tensor.copy_(buf[:gpu_tensor.numel()], non_blocking=True)
+            self.copies += 1
 
-        # Group into buckets of bucket_size_bytes
-        groups = []
-        current_group = []
-        current_size = 0
+    def copy_from_gpu(self, key, gpu_tensor):
+        buf = self.get_buffer(key, gpu_tensor.numel(), gpu_tensor.dtype)
+        buf[:gpu_tensor.numel()].copy_(gpu_tensor, non_blocking=True)
+        self.copies += 1
 
-        for p in params:
-            p_size = p.numel() * p.element_size()
-            if current_size + p_size > self.bucket_size_bytes and current_group:
-                groups.append(current_group)
-                current_group = []
-                current_size = 0
-            current_group.append(p)
-            current_size += p_size
+    def stats(self):
+        return {'buffers': len(self._buffers), 'pins': self.pins, 'copies': self.copies,
+                'bytes': sum(b.numel() * b.element_size() for b in self._buffers.values())}
 
-        if current_group:
-            groups.append(current_group)
-        return groups
+    def clear(self):
+        self._buffers.clear()
 
-    def get_stats(self):
-        """Get partitioning statistics."""
+
+class DeslocCPUAdamScheduler:
+    """Schedule CPU Adam operations aligned with DES-LOC sync.
+    Non-sync: local Adam on GPU (fast, no PCIe transfer).
+    Sync: fetch states from CPU, sync, update, push back.
+    Ref: Section 4.1 — reduce PCIe transfers via Ku/Kv gating."""
+
+    def __init__(self, Kx=1, Ku=3, Kv=6):
+        self.Kx = max(1, Kx)
+        self.Ku = max(1, Ku)
+        self.Kv = max(1, Kv)
+        self.step = 0
+
+    def get_action(self):
         return {
-            'bucket_size_mb': self.bucket_size_bytes / (1024 * 1024),
-            'x_params': len(self.buckets['x']),
-            'u_params': len(self.buckets['u']),
-            'v_params': len(self.buckets['v']),
-            'x_bytes': self.bucket_sizes['x'],
-            'u_bytes': self.bucket_sizes['u'],
-            'v_bytes': self.bucket_sizes['v'],
-            'x_buckets': len(self.get_buckets('x')),
-            'u_buckets': len(self.get_buckets('u')),
-            'v_buckets': len(self.get_buckets('v')),
+            'fetch_m1': (self.step % self.Ku) == 0,
+            'fetch_m2': (self.step % self.Kv) == 0,
+            'sync_params': (self.step % self.Kx) == 0,
+            'push_m1': (self.step % self.Ku) == 0,
+            'push_m2': (self.step % self.Kv) == 0,
         }
 
+    def advance(self):
+        self.step += 1
+        return self.get_action()
 
-# =================================================================
-# End M068
-# =================================================================
+    def get_transfer_savings(self, param_bytes, total_steps=None):
+        """Estimate PCIe transfer savings vs standard offload."""
+        t = total_steps or self.step
+        if t <= 0:
+            return {'saved_ratio': 0}
+        standard = 2 * t  # m1 + m2 every step
+        desloc = t // self.Ku + t // self.Kv  # m1 every Ku, m2 every Kv
+        saved = standard - desloc
+        return {
+            'standard_transfers': standard,
+            'desloc_transfers': desloc,
+            'saved_transfers': saved,
+            'saved_ratio': round(saved / max(1, standard), 4),
+            'saved_bytes': saved * param_bytes,
+        }
+
+    def state_dict(self):
+        return {'step': self.step, 'Kx': self.Kx, 'Ku': self.Ku, 'Kv': self.Kv}
+
+
+class DeslocCPUGradientBuffer:
+    """CPU-side gradient buffer for ZeRO-Offload + DES-LOC.
+    Accumulates gradients on CPU between Kx boundaries.
+    At Kx boundary, the accumulated gradient is used for the
+    CPU-side optimizer step, then params are pushed to GPU."""
+
+    def __init__(self, Kx=1):
+        self.Kx = max(1, Kx)
+        self.step = 0
+        self._buffers = {}
+
+    def add_gradient(self, name, grad_cpu):
+        """Accumulate gradient on CPU."""
+        if name not in self._buffers:
+            self._buffers[name] = grad_cpu.clone()
+        else:
+            self._buffers[name].add_(grad_cpu)
+        self.step += 1
+
+    def should_apply(self):
+        return (self.step % self.Kx) == 0
+
+    def get_and_clear(self, name):
+        buf = self._buffers.pop(name, None)
+        if buf is not None:
+            buf.div_(self.Kx)  # average over accumulated steps
+        return buf
+
+    def clear_all(self):
+        self._buffers.clear()

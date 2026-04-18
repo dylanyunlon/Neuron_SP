@@ -2989,351 +2989,250 @@ def estimate_zero2_model_states_mem_needs_all_cold(total_params,
         print(f" {cpu_mem/2**30:7.2f}GB | {gpu_mem/2**30:6.2f}GB | {options_str}")
 
 
-# =================================================================
-# M074: DES-LOC Integration with ZeRO Stage 1/2 (400 lines)
-# =================================================================
-# Integrates DES-LOC's independent sync schedule with ZeRO
-# Stage 1 (optimizer state partitioning) and Stage 2 (gradient
-# partitioning). Key challenge: ZeRO already reduces comm by
-# partitioning; DES-LOC further reduces by skipping sync rounds.
-#
-# Reference: Algorithm 1 with ZeRO partitioned states
-# Reference: Section 4.1 integration with existing systems
-# =================================================================
+# =========================================================================
+# DES-LOC ZeRO Stage 1/2 Extensions
+# Ref: Algorithm 1 — gradient allreduce gated by Kx
+# Ref: M092-M106 — MoE capacity allreduces NEVER gated
+# =========================================================================
 
-import time as _time
-import math as _math
+class DeslocZeroSyncManager:
+    """Manage DES-LOC sync within ZeRO gradient partitioning.
+    ZeRO-1: partitions optimizer states. ZeRO-2: partitions gradients.
+    DES-LOC gates the reduce_scatter at Kx boundaries.
+    MoE capacity allreduces always execute (never gated)."""
 
-
-class DESLOCZeROIntegration:
-    """Integrate DES-LOC sync schedule with ZeRO Stage 1/2.
-
-    ZeRO Stage 1: partitions optimizer states across workers
-    ZeRO Stage 2: partitions gradients across workers
-
-    DES-LOC extends this by:
-    1. Only gathering/scattering optimizer states at Ku/Kv intervals
-    2. Only allreducing gradients at Kx intervals
-    3. Using local gradients between sync points
-
-    The combination achieves multiplicative communication reduction:
-    ZeRO_reduction × DES-LOC_reduction.
-    """
-
-    def __init__(self, zero_optimizer, Kx=32, Ku=96, Kv=192,
-                 clip_radius=1.0):
-        self.zero_optimizer = zero_optimizer
-        self.Kx = Kx
-        self.Ku = Ku
-        self.Kv = Kv
-        self.clip_radius = clip_radius
+    def __init__(self, Kx=1, enabled=False):
+        self.Kx = max(1, Kx)
+        self.enabled = enabled
         self.step = 0
-        self.stats = {
-            'grad_allreduce_count': 0,
-            'grad_skip_count': 0,
-            'state_sync_count': 0,
-            'state_skip_count': 0,
-            'total_comm_bytes': 0,
-            'skipped_comm_bytes': 0,
-        }
+        self.executed = 0
+        self.skipped = 0
 
-    def should_allreduce_gradients(self):
-        """Check if gradients should be allreduced this step.
-
-        In DES-LOC, gradient allreduce only happens at Kx intervals.
-        Between sync points, workers use their local gradients.
-        """
-        return self.step % self.Kx == 0
-
-    def should_sync_optimizer_states(self):
-        """Check if optimizer states need syncing.
-
-        Returns tuple (sync_u, sync_v).
-        """
-        sync_u = self.step % self.Ku == 0
-        sync_v = self.step % self.Kv == 0
-        return sync_u, sync_v
-
-    def pre_gradient_allreduce(self, grads_partition):
-        """Hook called before ZeRO's gradient allreduce.
-
-        If DES-LOC says to skip this round, return True to
-        signal the caller to skip the allreduce.
-
-        Also applies per-coordinate clipping (Algorithm 1 line 12).
-        """
-        # Apply clipping before potential allreduce
-        if grads_partition is not None:
-            for grad in grads_partition:
-                if grad is not None:
-                    grad.clamp_(-self.clip_radius, self.clip_radius)
-
-        if not self.should_allreduce_gradients():
-            self.stats['grad_skip_count'] += 1
-            return True  # Skip allreduce
-        self.stats['grad_allreduce_count'] += 1
-        return False  # Proceed with allreduce
-
-    def post_optimizer_step(self, optimizer, dp_group=None):
-        """Hook called after optimizer.step().
-
-        Syncs optimizer states according to DES-LOC schedule.
-        For ZeRO Stage 1, states are already partitioned,
-        so we only sync the local partition's states.
-        """
-        import torch.distributed as dist
-
-        sync_u, sync_v = self.should_sync_optimizer_states()
-
-        if not sync_u and not sync_v:
-            self.stats['state_skip_count'] += 1
-            self.step += 1
-            return
-
-        self.stats['state_sync_count'] += 1
-
-        for pg in optimizer.param_groups:
-            for p in pg['params']:
-                if p not in optimizer.state:
-                    continue
-                state = optimizer.state[p]
-
-                if sync_u and 'exp_avg' in state:
-                    t = state['exp_avg']
-                    if not t.is_cpu:
-                        dist.all_reduce(t, op=dist.ReduceOp.AVG,
-                                        group=dp_group)
-                        self.stats['total_comm_bytes'] += (
-                            t.numel() * t.element_size())
-
-                if sync_v and 'exp_avg_sq' in state:
-                    t = state['exp_avg_sq']
-                    if not t.is_cpu:
-                        dist.all_reduce(t, op=dist.ReduceOp.AVG,
-                                        group=dp_group)
-                        self.stats['total_comm_bytes'] += (
-                            t.numel() * t.element_size())
-
-        self.step += 1
-
-    def get_combined_reduction(self, zero_reduction=None):
-        """Calculate combined ZeRO + DES-LOC reduction.
-
-        ZeRO Stage 1: reduces optimizer state comm by 1/N
-        DES-LOC: reduces state comm by Kx/(Kx + Ku/Ku_eff + Kv/Kv_eff)
-
-        Combined: multiplicative.
-        """
-        total_steps = max(self.step, 1)
-        desloc_syncs = (
-            self.stats['grad_allreduce_count'] +
-            self.stats['state_sync_count'])
-        ddp_syncs = total_steps * 3
-        desloc_reduction = ddp_syncs / max(desloc_syncs, 1)
-
-        if zero_reduction is None:
-            zero_reduction = 1.0
-
-        return {
-            'desloc_reduction': round(desloc_reduction, 2),
-            'zero_reduction': round(zero_reduction, 2),
-            'combined_reduction': round(
-                desloc_reduction * zero_reduction, 2),
-            'grad_allreduce_count': self.stats['grad_allreduce_count'],
-            'grad_skip_count': self.stats['grad_skip_count'],
-            'state_sync_count': self.stats['state_sync_count'],
-            'state_skip_count': self.stats['state_skip_count'],
-        }
-
-    def format_log(self):
-        """Format integration stats for experiment log."""
-        r = self.get_combined_reduction()
-        lines = [
-            f"### ZeRO + DES-LOC Integration "
-            f"(Kx={self.Kx}, Ku={self.Ku}, Kv={self.Kv}) ###",
-            f"Steps: {self.step}",
-            f"Grad allreduce: {r['grad_allreduce_count']} "
-            f"(skipped {r['grad_skip_count']})",
-            f"State sync: {r['state_sync_count']} "
-            f"(skipped {r['state_skip_count']})",
-            f"DES-LOC reduction: {r['desloc_reduction']}x",
-            f"Combined: {r['combined_reduction']}x",
-        ]
-        return "\n".join(lines)
-
-
-class DESLOCZeROGradientBucket:
-    """DES-LOC-aware gradient bucketing for ZeRO Stage 2.
-
-    ZeRO Stage 2 uses gradient bucketing for efficient allreduce.
-    With DES-LOC, we skip entire buckets when Kx doesn't trigger.
-
-    This avoids the overhead of iterating over parameters
-    just to skip the allreduce.
-    """
-
-    def __init__(self, bucket_size_bytes=500_000_000, Kx=32):
-        self.bucket_size_bytes = bucket_size_bytes
-        self.Kx = Kx
-        self.step = 0
-        self.buckets_processed = 0
-        self.buckets_skipped = 0
-
-    def should_process_bucket(self):
-        """Check if gradient buckets should be allreduced."""
-        return self.step % self.Kx == 0
-
-    def process_or_skip(self, grads, allreduce_fn, group=None):
-        """Process gradient bucket or skip based on schedule.
-
-        Args:
-            grads: list of gradient tensors
-            allreduce_fn: function to call for allreduce
-            group: process group
-
-        Returns:
-            True if allreduce was performed, False if skipped
-        """
-        if self.should_process_bucket():
-            allreduce_fn(grads, group=group)
-            self.buckets_processed += 1
+    def should_reduce(self, is_moe_capacity=False):
+        if is_moe_capacity:
+            return True  # NEVER skip MoE
+        if not self.enabled or self.Kx <= 1:
             return True
-        self.buckets_skipped += 1
-        return False
+        return (self.step % self.Kx) == 0
 
-    def advance_step(self):
-        """Advance the step counter."""
+    def record(self, executed):
+        if executed:
+            self.executed += 1
+        else:
+            self.skipped += 1
+
+    def advance(self):
         self.step += 1
 
     def get_stats(self):
+        t = self.executed + self.skipped
         return {
-            'buckets_processed': self.buckets_processed,
-            'buckets_skipped': self.buckets_skipped,
-            'skip_ratio': (
-                self.buckets_skipped /
-                max(self.buckets_processed +
-                    self.buckets_skipped, 1)),
+            'executed': self.executed, 'skipped': self.skipped,
+            'ratio': round(self.skipped / max(1, t), 4),
+            'Kx': self.Kx, 'step': self.step,
+        }
+
+    def state_dict(self):
+        return {'step': self.step, 'Kx': self.Kx, 'enabled': self.enabled,
+                'ex': self.executed, 'sk': self.skipped}
+
+    def load_state_dict(self, sd):
+        self.step = sd.get('step', 0)
+        self.Kx = sd.get('Kx', self.Kx)
+        self.enabled = sd.get('enabled', self.enabled)
+        self.executed = sd.get('ex', 0)
+        self.skipped = sd.get('sk', 0)
+
+
+class DeslocPartitionedMomentumSync:
+    """Handle momentum sync with ZeRO partitioning.
+    In ZeRO, optimizer states are partitioned. At Ku/Kv boundaries,
+    we allreduce momentum partitions — only the partitions, not full state.
+    Ref: Section 4.1 — 'syncing states less frequently, proportional to half-lives.'"""
+
+    def __init__(self, Ku=3, Kv=6):
+        self.Ku = max(1, Ku)
+        self.Kv = max(1, Kv)
+        self.step = 0
+        self.m1_syncs = 0
+        self.m2_syncs = 0
+
+    def should_sync_m1(self):
+        return (self.step % self.Ku) == 0
+
+    def should_sync_m2(self):
+        return (self.step % self.Kv) == 0
+
+    def advance(self):
+        self.step += 1
+        if self.should_sync_m1():
+            self.m1_syncs += 1
+        if self.should_sync_m2():
+            self.m2_syncs += 1
+
+    def get_stats(self):
+        return {
+            'm1_syncs': self.m1_syncs, 'm2_syncs': self.m2_syncs,
+            'm1_ratio': round(self.m1_syncs / max(1, self.step), 4),
+            'm2_ratio': round(self.m2_syncs / max(1, self.step), 4),
         }
 
 
-class DESLOCZeROCheckpointHelper:
-    """Helper for checkpointing DES-LOC + ZeRO state.
+class DeslocZeroGradientBuffer:
+    """Buffer for gradient accumulation between Kx sync points.
+    In ZeRO-2, gradients are partitioned and reduced. DES-LOC
+    accumulates local gradients between Kx boundaries.
+    At Kx boundaries, the accumulated gradient is reduce_scattered.
 
-    Saves/loads DES-LOC sync counters alongside ZeRO state.
-    Ensures correct resume behavior when restarting from
-    a DDP checkpoint (Section 5.5 initialization protocol).
-    """
+    This differs from gradient_accumulation_steps (which is for
+    micro-batching). DES-LOC accumulation is for comm reduction."""
 
-    @staticmethod
-    def save_desloc_state(integration, path):
-        """Save DES-LOC integration state for checkpoint."""
-        import json
-        state = {
-            'step': integration.step,
-            'Kx': integration.Kx,
-            'Ku': integration.Ku,
-            'Kv': integration.Kv,
-            'clip_radius': integration.clip_radius,
-            'stats': integration.stats,
+    def __init__(self, Kx=1):
+        self.Kx = max(1, Kx)
+        self.accumulated_steps = 0
+        self.total_flushes = 0
+
+    def accumulate(self):
+        self.accumulated_steps += 1
+        if self.accumulated_steps >= self.Kx:
+            self.accumulated_steps = 0
+            self.total_flushes += 1
+            return True  # flush: do the reduce_scatter
+        return False  # keep accumulating
+
+    def should_flush(self):
+        return self.accumulated_steps == 0 or self.accumulated_steps >= self.Kx
+
+    def state_dict(self):
+        return {'Kx': self.Kx, 'acc': self.accumulated_steps, 'flushes': self.total_flushes}
+
+
+class DeslocZeroGradientBuffer:
+    """Gradient buffer for ZeRO + DES-LOC accumulation.
+    ZeRO-2 partitions and reduces gradients. DES-LOC adds another
+    level: accumulate reduced gradients across Kx steps.
+    At Kx boundary, the accumulated partitioned gradient is used."""
+
+    def __init__(self, Kx=1):
+        self.Kx = max(1, Kx)
+        self.accumulated = 0
+        self.total_flushes = 0
+
+    def accumulate(self):
+        self.accumulated += 1
+        if self.accumulated >= self.Kx:
+            self.accumulated = 0
+            self.total_flushes += 1
+            return True
+        return False
+
+    def should_flush(self):
+        return self.accumulated == 0 or self.accumulated >= self.Kx
+
+    def state_dict(self):
+        return {'Kx': self.Kx, 'acc': self.accumulated, 'flushes': self.total_flushes}
+
+
+class DeslocZeroPartitionTracker:
+    """Track which ZeRO partitions have been synced.
+    In ZeRO-1, optimizer states are partitioned across workers.
+    DES-LOC means different partitions may be at different sync states.
+    This tracker ensures consistency at checkpoint boundaries."""
+
+    def __init__(self, num_partitions=1, Kx=1, Ku=3, Kv=6):
+        self.num_partitions = num_partitions
+        self.Kx = Kx
+        self.Ku = Ku
+        self.Kv = Kv
+        self.partition_sync_step = {
+            'param': [0] * num_partitions,
+            'momentum': [0] * num_partitions,
+            'variance': [0] * num_partitions,
         }
-        with open(path, 'w') as f:
-            json.dump(state, f, indent=2)
+
+    def record_sync(self, partition_id, tier='param', step=0):
+        if tier in self.partition_sync_step:
+            if partition_id < len(self.partition_sync_step[tier]):
+                self.partition_sync_step[tier][partition_id] = step
+
+    def get_staleness(self, partition_id, tier='param', current_step=0):
+        if tier in self.partition_sync_step:
+            if partition_id < len(self.partition_sync_step[tier]):
+                return current_step - self.partition_sync_step[tier][partition_id]
+        return 0
+
+    def all_synced_at(self, step, tier='param'):
+        """Check if all partitions are synced at given step."""
+        if tier not in self.partition_sync_step:
+            return True
+        return all(s >= step for s in self.partition_sync_step[tier])
+
+    def state_dict(self):
+        return {'n': self.num_partitions, 'sync': dict(self.partition_sync_step),
+                'Kx': self.Kx, 'Ku': self.Ku, 'Kv': self.Kv}
+
+    def load_state_dict(self, sd):
+        self.num_partitions = sd.get('n', self.num_partitions)
+        self.partition_sync_step = sd.get('sync', self.partition_sync_step)
+
+
+class DeslocZeroOverflowGuard:
+    """Guard against overflow during DES-LOC non-sync steps.
+    Overflow detection (NaN/Inf in gradients) must ALWAYS be synchronous.
+    Even when DES-LOC skips allreduce, overflow checks must run.
+
+    Ref: M092-M106 rule — 'MoE capacity allreduces must NOT be gated.'
+    Same principle: safety-critical ops are never skipped."""
+
+    def __init__(self):
+        self.overflow_at_non_sync = 0
+        self.overflow_at_sync = 0
+        self.total_checks = 0
+
+    def check(self, has_overflow, is_sync_step):
+        self.total_checks += 1
+        if has_overflow:
+            if is_sync_step:
+                self.overflow_at_sync += 1
+            else:
+                self.overflow_at_non_sync += 1
+        return has_overflow
+
+    def should_force_sync(self):
+        """If overflow detected at non-sync step, force sync next step."""
+        return self.overflow_at_non_sync > 0
+
+    def get_stats(self):
+        return {
+            'total_checks': self.total_checks,
+            'overflow_at_sync': self.overflow_at_sync,
+            'overflow_at_non_sync': self.overflow_at_non_sync,
+            'needs_force_sync': self.should_force_sync(),
+        }
+
+    def reset_non_sync_overflow(self):
+        self.overflow_at_non_sync = 0
+
+
+class DeslocZeroMoEGuard:
+    """Ensure MoE capacity allreduces are never gated by DES-LOC.
+    MoE expert capacity factor allreduces are required for load balancing.
+    Skipping them would cause experts to receive wrong number of tokens.
+
+    Ref: M094 rule — 'annotate capacity allreduce as DES-LOC-incompatible.'"""
 
     @staticmethod
-    def load_desloc_state(integration, path):
-        """Load DES-LOC integration state from checkpoint."""
-        import json
-        import os
-        if not os.path.exists(path):
+    def is_moe_capacity_op(op_name):
+        """Check if an operation is a MoE capacity allreduce."""
+        if not isinstance(op_name, str):
             return False
-        with open(path, 'r') as f:
-            state = json.load(f)
-        integration.step = state.get('step', 0)
-        integration.Kx = state.get('Kx', integration.Kx)
-        integration.Ku = state.get('Ku', integration.Ku)
-        integration.Kv = state.get('Kv', integration.Kv)
-        integration.clip_radius = state.get(
-            'clip_radius', integration.clip_radius)
-        integration.stats = state.get('stats', integration.stats)
-        return True
+        lower = op_name.lower()
+        return any(k in lower for k in ('capacity', 'expert_count', 'moe_gate',
+                                        'load_balance', 'aux_loss'))
 
     @staticmethod
-    def validate_checkpoint_compatibility(ckpt_config,
-                                           current_config):
-        """Check if checkpoint is compatible with current config.
-
-        Warns if Kx/Ku/Kv changed between checkpoint and current run.
-        """
-        warnings_list = []
-        for key in ('Kx', 'Ku', 'Kv'):
-            old = ckpt_config.get(key)
-            new = current_config.get(key)
-            if old is not None and new is not None and old != new:
-                warnings_list.append(
-                    f"DES-LOC {key} changed: checkpoint={old}, "
-                    f"current={new}")
-        return {
-            'compatible': len(warnings_list) == 0,
-            'warnings': warnings_list,
-        }
-
-
-class DESLOCZeROMemoryEstimator:
-    """Estimate memory savings from DES-LOC + ZeRO.
-
-    ZeRO reduces memory per GPU by partitioning states.
-    DES-LOC doesn't directly reduce memory, but by reducing
-    communication frequency, it allows larger batch sizes
-    (and thus better GPU utilization).
-    """
-
-    @staticmethod
-    def estimate(model_params_bytes, num_workers, zero_stage,
-                 dtype_bytes=4):
-        """Estimate memory per GPU.
-
-        ZeRO Stage 0: model + optimizer (3x) = 4× param memory
-        ZeRO Stage 1: model + optimizer/N = (1 + 3/N)× param memory
-        ZeRO Stage 2: model + (optimizer+gradients)/N
-        """
-        P = model_params_bytes
-        N = max(num_workers, 1)
-
-        if zero_stage == 0:
-            per_gpu = P * 4  # params + 3× optimizer states
-        elif zero_stage == 1:
-            per_gpu = P + (P * 3) / N  # params + partitioned opt
-        elif zero_stage == 2:
-            per_gpu = P + (P * 3 + P) / N  # + partitioned grads
-        else:
-            per_gpu = P / N + (P * 3 + P) / N  # Stage 3
-
-        return {
-            'per_gpu_bytes': int(per_gpu),
-            'per_gpu_gb': round(per_gpu / 1e9, 2),
-            'total_bytes': int(per_gpu * N),
-            'total_gb': round(per_gpu * N / 1e9, 2),
-            'zero_stage': zero_stage,
-            'num_workers': N,
-            'model_params_bytes': P,
-        }
-
-    @staticmethod
-    def max_batch_size(gpu_memory_bytes, model_params_bytes,
-                       seq_len, num_workers, zero_stage,
-                       activation_factor=2.0):
-        """Estimate max batch size given memory constraints."""
-        mem_est = DESLOCZeROMemoryEstimator.estimate(
-            model_params_bytes, num_workers, zero_stage)
-        available = gpu_memory_bytes - mem_est['per_gpu_bytes']
-        # Activation memory ≈ factor × params × seq_len / model_dim
-        # Simplified: activation_per_sample ≈ params * activation_factor
-        act_per_sample = model_params_bytes * activation_factor / 1024
-        if act_per_sample <= 0:
-            return 0
-        return max(1, int(available / act_per_sample))
-
-
-# =================================================================
-# End M074
-# =================================================================
+    def should_execute(op_name, is_sync_step):
+        """Always execute MoE ops regardless of DES-LOC sync state."""
+        if DeslocZeroMoEGuard.is_moe_capacity_op(op_name):
+            return True
+        return is_sync_step

@@ -47,629 +47,296 @@ class Backend(object):
         self.initialized = True
 
 
-# =====================================================================
-# M060: DES-LOC Communication Backend Abstraction (400 lines)
-# =====================================================================
-# Provides a backend-agnostic interface for DES-LOC communication.
-# Supports NCCL (GPU), Gloo (CPU), and future Trainium/NeuronCore
-# backends. Each backend implements the same sync schedule but
-# with hardware-specific collective operations.
-#
-# Reference: des_loc_reconstructed.tex Algorithm 1
-# Architecture: follows CCCL thrust/system/ backend pattern
-# =====================================================================
+# =========================================================================
+# DES-LOC Backend Extensions
+# Ref: Algorithm 1 — per-tier communication primitives
+# =========================================================================
 
-import time as _time
-from collections import deque as _deque
+class DeslocBackendMixin:
+    """Mixin for DES-LOC tier awareness in any comm backend.
 
-
-class DESLOCBackend:
-    """
-    Abstract DES-LOC communication backend.
-
-    Provides the interface for desynchronized allreduce operations
-    across different hardware backends (NCCL, Gloo, custom).
-
-    Subclasses implement:
-    - allreduce_avg(): average tensors across workers
-    - barrier(): synchronize all workers
-    - get_bandwidth(): measure communication bandwidth
+    Any backend (Torch, NCCL, Gloo) can use this to get:
+    - Per-tier byte accounting
+    - Sync period gating
+    - Communication reduction tracking
     """
 
-    def __init__(self, world_size, rank, Kx=32, Ku=96, Kv=192,
-                 clip_radius=1.0):
-        self.world_size = world_size
-        self.rank = rank
-        self._Kx = Kx
-        self._Ku = Ku
-        self._Kv = Kv
-        self._clip_radius = clip_radius
-        self._step = 0
+    def init_desloc(self, Kx=1, Ku=3, Kv=6):
+        self._desloc_Kx = Kx
+        self._desloc_Ku = Ku
+        self._desloc_Kv = Kv
+        self._desloc_step = 0
+        self._desloc_bytes = {0: 0, 1: 0, 2: 0}
+        self._desloc_skipped = {0: 0, 1: 0, 2: 0}
 
-        # Statistics
-        self._allreduce_count = 0
-        self._allreduce_bytes = 0
-        self._allreduce_skip_count = 0
-        self._allreduce_times_ms = _deque(maxlen=1000)
-        self._sync_x_count = 0
-        self._sync_u_count = 0
-        self._sync_v_count = 0
+    def desloc_should_comm(self, tier):
+        period = {0: self._desloc_Kx, 1: self._desloc_Ku,
+                  2: self._desloc_Kv}.get(tier, 1)
+        return (self._desloc_step % max(1, period)) == 0
 
-    def advance_step(self):
-        """Advance the global step counter."""
-        self._step += 1
+    def desloc_record(self, tier, num_bytes):
+        self._desloc_bytes[tier] = self._desloc_bytes.get(tier, 0) + num_bytes
 
-    @property
-    def step(self):
-        return self._step
+    def desloc_record_skip(self, tier):
+        self._desloc_skipped[tier] = self._desloc_skipped.get(tier, 0) + 1
 
-    def should_sync(self, state_type):
-        """Determine if state_type should be synced at current step."""
-        if state_type == 'x':
-            return self._step % self._Kx == 0
-        elif state_type == 'u':
-            return self._step % self._Ku == 0
-        elif state_type == 'v':
-            return self._step % self._Kv == 0
-        return True
+    def desloc_advance(self):
+        self._desloc_step += 1
 
-    def allreduce_avg(self, tensor, group=None, async_op=False):
-        """Perform allreduce with averaging. Must be overridden."""
-        raise NotImplementedError
-
-    def barrier(self, group=None):
-        """Synchronize all workers. Must be overridden."""
-        raise NotImplementedError
-
-    def conditional_allreduce(self, tensor, state_type='x',
-                               group=None, async_op=False):
-        """Allreduce only if DES-LOC schedule permits."""
-        if self.world_size <= 1:
-            return False
-
-        if not self.should_sync(state_type):
-            self._allreduce_skip_count += 1
-            return False
-
-        t0 = _time.time()
-        self.allreduce_avg(tensor, group=group, async_op=async_op)
-        elapsed_ms = (_time.time() - t0) * 1000
-
-        tensor_bytes = tensor.numel() * tensor.element_size()
-        self._allreduce_count += 1
-        self._allreduce_bytes += tensor_bytes
-        self._allreduce_times_ms.append(elapsed_ms)
-
-        if state_type == 'x':
-            self._sync_x_count += 1
-        elif state_type == 'u':
-            self._sync_u_count += 1
-        elif state_type == 'v':
-            self._sync_v_count += 1
-
-        return True
-
-    def clip_and_sync(self, tensor, state_type='x', group=None):
-        """Apply per-coordinate clipping then conditional allreduce."""
-        if self._clip_radius > 0:
-            tensor.clamp_(-self._clip_radius, self._clip_radius)
-        return self.conditional_allreduce(tensor, state_type, group)
-
-    def get_stats(self):
-        """Return communication statistics."""
-        n = max(self._step, 1)
-        total_syncs = self._sync_x_count + self._sync_u_count + self._sync_v_count
-        ddp_equivalent = n * 3  # DDP syncs all 3 states every step
-        times = list(self._allreduce_times_ms)
+    def desloc_report(self):
         return {
-            'backend': self.__class__.__name__,
-            'world_size': self.world_size,
-            'rank': self.rank,
-            'step': self._step,
-            'Kx': self._Kx,
-            'Ku': self._Ku,
-            'Kv': self._Kv,
-            'clip_radius': self._clip_radius,
-            'allreduce_count': self._allreduce_count,
-            'allreduce_bytes': self._allreduce_bytes,
-            'allreduce_gb': round(self._allreduce_bytes / 1e9, 4),
-            'allreduce_skip_count': self._allreduce_skip_count,
-            'sync_x_count': self._sync_x_count,
-            'sync_u_count': self._sync_u_count,
-            'sync_v_count': self._sync_v_count,
-            'comm_reduction': round(ddp_equivalent / max(total_syncs, 1), 2),
-            'avg_latency_ms': round(sum(times) / len(times), 3) if times else 0,
-            'p99_latency_ms': round(
-                sorted(times)[int(len(times) * 0.99)], 3) if times else 0,
+            'step': self._desloc_step,
+            'bytes': dict(self._desloc_bytes),
+            'skipped': dict(self._desloc_skipped),
+            'Kx': self._desloc_Kx, 'Ku': self._desloc_Ku, 'Kv': self._desloc_Kv,
         }
 
 
-class DESLOCNCCLBackend(DESLOCBackend):
-    """DES-LOC backend using NCCL via torch.distributed."""
+class DeslocTopologyDetector:
+    """Detect GPU interconnect for Kx recommendation.
+    Ref: Nick Joseph — 'ran clustering algorithm for chip locations.'"""
 
-    def __init__(self, world_size, rank, **kwargs):
-        super().__init__(world_size, rank, **kwargs)
-        self._name = 'desloc_nccl'
+    @staticmethod
+    def detect():
+        try:
+            import torch
+            if not torch.cuda.is_available():
+                return {'type': 'cpu', 'bw': 0}
+            count = torch.cuda.device_count()
+            if count <= 1:
+                return {'type': 'single', 'bw': 0, 'n': 1}
+            name = torch.cuda.get_device_name(0)
+            nvl = any(g in name for g in ('H100', 'A100', 'H200'))
+            bw = (600 if 'H100' in name else 300) if nvl else 32
+            return {'type': 'nvlink' if nvl else 'pcie', 'bw': bw, 'n': count, 'gpu': name}
+        except Exception:
+            return {'type': 'unknown', 'bw': 0}
 
-    def allreduce_avg(self, tensor, group=None, async_op=False):
-        """NCCL allreduce with averaging."""
-        import torch.distributed as td
-        return td.all_reduce(tensor, op=td.ReduceOp.AVG,
-                              group=group, async_op=async_op)
-
-    def barrier(self, group=None):
-        """NCCL barrier."""
-        import torch.distributed as td
-        td.barrier(group=group)
-
-
-class DESLOCGlooBackend(DESLOCBackend):
-    """DES-LOC backend using Gloo (CPU-based communication)."""
-
-    def __init__(self, world_size, rank, **kwargs):
-        super().__init__(world_size, rank, **kwargs)
-        self._name = 'desloc_gloo'
-
-    def allreduce_avg(self, tensor, group=None, async_op=False):
-        """Gloo allreduce with manual averaging."""
-        import torch.distributed as td
-        td.all_reduce(tensor, op=td.ReduceOp.SUM,
-                       group=group, async_op=async_op)
-        tensor.div_(self.world_size)
-
-    def barrier(self, group=None):
-        import torch.distributed as td
-        td.barrier(group=group)
+    @staticmethod
+    def detect_heterogeneous():
+        try:
+            import torch
+            if not torch.cuda.is_available() or torch.cuda.device_count() <= 1:
+                return {'hetero': False}
+            names = set(torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count()))
+            return {'hetero': len(names) > 1, 'gpus': list(names)}
+        except Exception:
+            return {'hetero': False}
 
 
-class DESLOCSingleGPUBackend(DESLOCBackend):
-    """DES-LOC backend for single GPU (no-op communication)."""
+class DeslocInterconnectProfiler:
+    """Profile interconnect at runtime for dynamic Kx adjustment.
 
-    def __init__(self, **kwargs):
-        super().__init__(world_size=1, rank=0, **kwargs)
-        self._name = 'desloc_single'
+    Periodically measures allreduce bandwidth and adjusts Kx.
+    This handles cases where network conditions change during training
+    (e.g. shared cluster with varying load).
 
-    def allreduce_avg(self, tensor, group=None, async_op=False):
-        """No-op: single GPU, no communication needed."""
-        return None
-
-    def barrier(self, group=None):
-        """No-op barrier."""
-        pass
-
-    def conditional_allreduce(self, tensor, state_type='x',
-                               group=None, async_op=False):
-        """No-op: always returns False (no communication)."""
-        return False
-
-
-def create_desloc_backend(world_size, rank, backend_type='nccl',
-                           **kwargs):
-    """Factory function to create the appropriate DES-LOC backend.
-
-    Args:
-        world_size: number of workers
-        rank: current worker rank
-        backend_type: 'nccl', 'gloo', or 'single'
-        **kwargs: Kx, Ku, Kv, clip_radius
-
-    Returns:
-        DESLOCBackend instance
-    """
-    if world_size <= 1 or backend_type == 'single':
-        return DESLOCSingleGPUBackend(**kwargs)
-    elif backend_type == 'nccl':
-        return DESLOCNCCLBackend(world_size, rank, **kwargs)
-    elif backend_type == 'gloo':
-        return DESLOCGlooBackend(world_size, rank, **kwargs)
-    else:
-        raise ValueError(f"Unknown DES-LOC backend: {backend_type}. "
-                         f"Supported: nccl, gloo, single")
-
-
-# =================================================================
-# M066: Backend-Agnostic DES-LOC Collective Ops (400 lines)
-# =================================================================
-# Extends the backend abstraction with DES-LOC-specific collective
-# operations that work across NCCL, Gloo, and single-GPU backends.
-#
-# Implements the full DES-LOC Algorithm 1 communication pattern:
-# - Selective state synchronization (x at Kx, u at Ku, v at Kv)
-# - ServerOpt integration point
-# - Per-coordinate clipping before allreduce
-#
-# Reference: Algorithm 1 lines 9-21
-# Reference: template_extraction_from_latex.txt Ⅱ=Ring-AllReduce
-# =================================================================
-
-import time as _time
-import math as _math
-
-
-class DESLOCCollectiveOps:
-    """Backend-agnostic implementation of DES-LOC collective ops.
-
-    Wraps any backend (NCCL/Gloo/single) and applies DES-LOC
-    sync schedule on top. This is the main integration point
-    between DeepSpeed's communication layer and DES-LOC.
-
-    Algorithm 1 pseudocode mapping:
-      line 14: if t mod Kj = 0 then sync s^j
-      line 15: s_t^{j,m} <- UPDATE^j(E_m[s_{t-1}^j], g_t^m)
-      line 18: if t mod Kx = 0 then sync x
-      line 19: x <- OPT(SERVEROPT(E_m[x_t^m])...)
+    Ref: Nick Joseph — 'latency differed based on datacenter room.'
     """
 
-    def __init__(self, backend, Kx=32, Ku=96, Kv=192,
-                 clip_radius=1.0, server_opt=None):
-        self.backend = backend
-        self.Kx = Kx
-        self.Ku = Ku
-        self.Kv = Kv
-        self.clip_radius = clip_radius
-        self.server_opt = server_opt
+    def __init__(self, profile_interval=1000, min_Kx=1, max_Kx=256):
+        self.profile_interval = profile_interval
+        self.min_Kx = min_Kx
+        self.max_Kx = max_Kx
         self.step = 0
-        self.stats = {
-            'x_syncs': 0, 'u_syncs': 0, 'v_syncs': 0,
-            'x_bytes': 0, 'u_bytes': 0, 'v_bytes': 0,
-            'x_time_ms': 0.0, 'u_time_ms': 0.0, 'v_time_ms': 0.0,
-            'clip_events': 0,
-        }
+        self.bandwidth_history = []
+        self.current_Kx = 32
 
-    def _should_sync(self, state_type):
-        """Check if state_type should sync at current step."""
-        if state_type == 'x':
-            return self.step % self.Kx == 0
-        elif state_type == 'u':
-            return self.step % self.Ku == 0
-        elif state_type == 'v':
-            return self.step % self.Kv == 0
-        return False
+    def should_profile(self):
+        return self.step % self.profile_interval == 0
 
-    def clip_gradients(self, params):
-        """Per-coordinate gradient clipping (Algorithm 1 line 12).
+    def update_bandwidth(self, bw_gbps):
+        self.bandwidth_history.append(bw_gbps)
+        if len(self.bandwidth_history) > 10:
+            self.bandwidth_history = self.bandwidth_history[-10:]
 
-        clip(g, ρ)_i = sign(g_i) * min(|g_i|, ρ)
-        """
-        for p in params:
-            if p.grad is not None:
-                p.grad.data.clamp_(-self.clip_radius, self.clip_radius)
-                self.stats['clip_events'] += 1
+    def get_recommended_Kx(self, model_params, compute_time_s):
+        if not self.bandwidth_history:
+            return self.current_Kx
+        import math
+        avg_bw = sum(self.bandwidth_history) / len(self.bandwidth_history)
+        if avg_bw <= 0:
+            return self.max_Kx
+        ar_time = model_params * 2 * 2 / (avg_bw * 1e9)
+        if ar_time <= compute_time_s:
+            kx = self.min_Kx
+        else:
+            kx = 2 ** int(math.ceil(math.log2(ar_time / compute_time_s)))
+        return max(self.min_Kx, min(self.max_Kx, kx))
 
-    def sync_parameters(self, params, group=None):
-        """Sync parameters (x) if schedule allows.
-
-        Algorithm 1 line 18: if t mod Kx = 0 then sync x
-        Algorithm 1 line 19: x <- SERVEROPT(E_m[x])
-
-        Returns True if sync was performed.
-        """
-        if not self._should_sync('x'):
-            return False
-
-        start = _time.monotonic()
-        total_bytes = 0
-
-        for p in params:
-            if not p.requires_grad:
-                continue
-            self.backend.all_reduce(p.data, group=group)
-            total_bytes += p.numel() * p.element_size()
-
-        # Apply ServerOpt if configured
-        if self.server_opt is not None:
-            self.server_opt.step(params)
-
-        elapsed_ms = (_time.monotonic() - start) * 1000.0
-        self.stats['x_syncs'] += 1
-        self.stats['x_bytes'] += total_bytes
-        self.stats['x_time_ms'] += elapsed_ms
-        return True
-
-    def sync_first_moment(self, optimizer, group=None):
-        """Sync first moment (u / exp_avg) if schedule allows.
-
-        Algorithm 1 line 14: if t mod Ku = 0 then sync s^u
-        """
-        if not self._should_sync('u'):
-            return False
-
-        start = _time.monotonic()
-        total_bytes = 0
-
-        for pg in optimizer.param_groups:
-            for p in pg['params']:
-                if p not in optimizer.state:
-                    continue
-                state = optimizer.state[p]
-                for key in ('exp_avg', 'momentum_buffer'):
-                    if key in state:
-                        self.backend.all_reduce(
-                            state[key], group=group)
-                        total_bytes += (state[key].numel() *
-                                        state[key].element_size())
-
-        elapsed_ms = (_time.monotonic() - start) * 1000.0
-        self.stats['u_syncs'] += 1
-        self.stats['u_bytes'] += total_bytes
-        self.stats['u_time_ms'] += elapsed_ms
-        return True
-
-    def sync_second_moment(self, optimizer, group=None):
-        """Sync second moment (v / exp_avg_sq) if schedule allows.
-
-        Algorithm 1 line 14: if t mod Kv = 0 then sync s^v
-        """
-        if not self._should_sync('v'):
-            return False
-
-        start = _time.monotonic()
-        total_bytes = 0
-
-        for pg in optimizer.param_groups:
-            for p in pg['params']:
-                if p not in optimizer.state:
-                    continue
-                state = optimizer.state[p]
-                if 'exp_avg_sq' in state:
-                    self.backend.all_reduce(
-                        state['exp_avg_sq'], group=group)
-                    total_bytes += (state['exp_avg_sq'].numel() *
-                                    state['exp_avg_sq'].element_size())
-
-        elapsed_ms = (_time.monotonic() - start) * 1000.0
-        self.stats['v_syncs'] += 1
-        self.stats['v_bytes'] += total_bytes
-        self.stats['v_time_ms'] += elapsed_ms
-        return True
-
-    def full_step(self, params, optimizer, group=None):
-        """Execute full DES-LOC communication step.
-
-        Called after optimizer.step(). Performs:
-        1. Gradient clipping (if not already done)
-        2. Parameter sync (if t mod Kx == 0)
-        3. First moment sync (if t mod Ku == 0)
-        4. Second moment sync (if t mod Kv == 0)
-
-        Returns dict describing what was synced.
-        """
-        result = {
-            'step': self.step,
-            'x_synced': False,
-            'u_synced': False,
-            'v_synced': False,
-            'total_bytes': 0,
-        }
-
-        result['x_synced'] = self.sync_parameters(params, group)
-        result['u_synced'] = self.sync_first_moment(optimizer, group)
-        result['v_synced'] = self.sync_second_moment(optimizer, group)
-
-        if result['x_synced']:
-            result['total_bytes'] += self.stats['x_bytes']
-        if result['u_synced']:
-            result['total_bytes'] += self.stats['u_bytes']
-        if result['v_synced']:
-            result['total_bytes'] += self.stats['v_bytes']
-
+    def advance(self):
         self.step += 1
-        return result
 
-    def get_comm_stats(self):
-        """Get comprehensive communication statistics."""
-        total_bytes = (self.stats['x_bytes'] +
-                       self.stats['u_bytes'] +
-                       self.stats['v_bytes'])
-        total_time = (self.stats['x_time_ms'] +
-                      self.stats['u_time_ms'] +
-                      self.stats['v_time_ms'])
-        total_syncs = (self.stats['x_syncs'] +
-                       self.stats['u_syncs'] +
-                       self.stats['v_syncs'])
-
-        # DDP equivalent: all 3 states every step
-        ddp_syncs = self.step * 3
-        ddp_bytes = total_bytes * (ddp_syncs / max(total_syncs, 1))
-
+    def state_dict(self):
         return {
-            'total_steps': self.step,
-            'Kx': self.Kx, 'Ku': self.Ku, 'Kv': self.Kv,
-            'x_syncs': self.stats['x_syncs'],
-            'u_syncs': self.stats['u_syncs'],
-            'v_syncs': self.stats['v_syncs'],
-            'total_syncs': total_syncs,
-            'total_bytes': total_bytes,
-            'total_time_ms': total_time,
-            'avg_time_per_sync_ms': (
-                total_time / max(total_syncs, 1)),
-            'ddp_equivalent_syncs': ddp_syncs,
-            'reduction_factor': ddp_syncs / max(total_syncs, 1),
-            'clip_events': self.stats['clip_events'],
+            'step': self.step, 'kx': self.current_Kx,
+            'bw_history': list(self.bandwidth_history),
         }
 
-    def format_experiment_log(self):
-        """Format communication stats as experiment log entry.
-
-        Follows NKI-FA structured log format for downstream parsing.
-        """
-        s = self.get_comm_stats()
-        lines = [
-            f"### DES-LOC Comm Stats "
-            f"(Kx={s['Kx']}, Ku={s['Ku']}, Kv={s['Kv']}) ###",
-            f"Total steps: {s['total_steps']}",
-            f"x syncs: {s['x_syncs']}, "
-            f"u syncs: {s['u_syncs']}, "
-            f"v syncs: {s['v_syncs']}",
-            f"Total bytes: {s['total_bytes']}",
-            f"Total comm time: {s['total_time_ms']:.2f}ms",
-            f"Reduction vs DDP: {s['reduction_factor']:.2f}x",
-            f"Clip events: {s['clip_events']}",
-        ]
-        return "\n".join(lines)
+    def load_state_dict(self, sd):
+        self.step = sd.get('step', 0)
+        self.current_Kx = sd.get('kx', 32)
+        self.bandwidth_history = sd.get('bw_history', [])
 
 
-class DESLOCServerOpt:
-    """ServerOpt (outer optimizer applied after averaging).
+# =========================================================================
+# DES-LOC Backend Extensions — Interconnect Profiling + Dynamic Kx
+# Ref: Nick Joseph — 'understand physical layout of hardware'
+# =========================================================================
 
-    Algorithm 1 line 19: x <- OPT(SERVEROPT(E_m[x]))
+class DeslocInterconnectProfiler:
+    """Profile interconnect at runtime for dynamic Kx adjustment.
+    Periodically measures bandwidth and adjusts Kx.
+    Handles varying network load in shared clusters."""
 
-    Default: identity (just use averaged params).
-    Can be overridden with Nesterov (Section 5.5) or
-    other server-side optimizers.
-    """
+    def __init__(self, profile_interval=1000, min_Kx=1, max_Kx=256):
+        self.profile_interval = profile_interval
+        self.min_Kx = min_Kx
+        self.max_Kx = max_Kx
+        self.step = 0
+        self.bw_history = []
+        self.current_Kx = 32
 
-    def __init__(self, opt_type='identity', momentum=0.0,
-                 outer_lr=1.0):
-        self.opt_type = opt_type
-        self.momentum = momentum
-        self.outer_lr = outer_lr
-        self.velocity = {}
-        self.step_count = 0
+    def should_profile(self):
+        return self.step % self.profile_interval == 0
 
-    def step(self, params):
-        """Apply server-side optimization after averaging.
+    def update_bandwidth(self, bw_gbps):
+        self.bw_history.append(bw_gbps)
+        if len(self.bw_history) > 20:
+            self.bw_history = self.bw_history[-20:]
 
-        For identity: no-op (just use averaged params).
-        For nesterov: apply momentum-based correction.
-        """
-        if self.opt_type == 'identity':
-            self.step_count += 1
-            return
+    def get_recommended_Kx(self, model_params, compute_s):
+        if not self.bw_history:
+            return self.current_Kx
+        import math
+        avg_bw = sum(self.bw_history) / len(self.bw_history)
+        if avg_bw <= 0:
+            return self.max_Kx
+        ar_s = model_params * 2 * 2 / (avg_bw * 1e9)
+        if ar_s <= compute_s:
+            return self.min_Kx
+        kx = 2 ** int(math.ceil(math.log2(ar_s / compute_s)))
+        return max(self.min_Kx, min(self.max_Kx, kx))
 
-        if self.opt_type == 'nesterov':
-            for p in params:
-                if not p.requires_grad:
-                    continue
-                pid = id(p)
-                if pid not in self.velocity:
-                    self.velocity[pid] = p.data.new_zeros(
-                        p.data.shape)
-                v = self.velocity[pid]
-                v.mul_(self.momentum)
-                p.data.add_(v, alpha=self.outer_lr * self.momentum)
-            self.step_count += 1
-            return
+    def advance(self):
+        self.step += 1
 
-    def get_stats(self):
-        return {
-            'opt_type': self.opt_type,
-            'momentum': self.momentum,
-            'outer_lr': self.outer_lr,
-            'step_count': self.step_count,
-            'tracked_params': len(self.velocity),
-        }
+    def state_dict(self):
+        return {'step': self.step, 'kx': self.current_Kx, 'bw': list(self.bw_history)}
+
+    def load_state_dict(self, sd):
+        self.step = sd.get('step', 0)
+        self.current_Kx = sd.get('kx', 32)
+        self.bw_history = sd.get('bw', [])
 
 
-class DESLOCConvergenceMonitor:
-    """Monitor convergence metrics during training.
+class DeslocBackendStats:
+    """Aggregate communication statistics across all backends.
+    Provides unified view of DES-LOC comm efficiency."""
 
-    Tracks loss, gradient norms, and sync decisions to detect
-    training instabilities early.
+    def __init__(self):
+        self.total_bytes = 0
+        self.total_ops = 0
+        self.skipped_ops = 0
+        self.tier_stats = {0: {'bytes': 0, 'ops': 0, 'lat_ms': 0},
+                          1: {'bytes': 0, 'ops': 0, 'lat_ms': 0},
+                          2: {'bytes': 0, 'ops': 0, 'lat_ms': 0}}
 
-    Section 5.4: "The heuristic baseline suffers training
-    instabilities potentially impacting downstream performance"
-    """
+    def record(self, tier, num_bytes, latency_ms=0):
+        self.total_bytes += num_bytes
+        self.total_ops += 1
+        if tier in self.tier_stats:
+            self.tier_stats[tier]['bytes'] += num_bytes
+            self.tier_stats[tier]['ops'] += 1
+            self.tier_stats[tier]['lat_ms'] += latency_ms
 
-    def __init__(self, window_size=100):
-        self.window_size = window_size
-        self.loss_history = []
-        self.grad_norm_history = []
-        self.instability_events = []
-
-    def record(self, loss, grad_norm=None):
-        """Record a training step's metrics."""
-        self.loss_history.append(loss)
-        if grad_norm is not None:
-            self.grad_norm_history.append(grad_norm)
-
-        # Detect instability: loss spike > 5x recent average
-        if len(self.loss_history) > self.window_size:
-            recent = self.loss_history[-self.window_size:-1]
-            avg_recent = sum(recent) / len(recent)
-            if avg_recent > 0 and loss > 5.0 * avg_recent:
-                self.instability_events.append({
-                    'step': len(self.loss_history) - 1,
-                    'loss': loss,
-                    'avg_recent': avg_recent,
-                    'ratio': loss / avg_recent,
-                })
-
-    def is_stable(self):
-        """Check if training appears stable."""
-        if len(self.loss_history) < self.window_size:
-            return True  # Not enough data
-        recent = self.loss_history[-self.window_size:]
-        # Check for NaN/Inf
-        for v in recent:
-            if _math.isnan(v) or _math.isinf(v):
-                return False
-        # Check for monotonic increase over full window
-        if all(recent[i] >= recent[i - 1]
-               for i in range(1, len(recent))):
-            return False
-        return True
+    def record_skip(self):
+        self.skipped_ops += 1
 
     def get_summary(self):
-        """Get convergence summary."""
-        n = len(self.loss_history)
-        if n == 0:
-            return {'steps': 0}
+        total = self.total_ops + self.skipped_ops
         return {
-            'steps': n,
-            'final_loss': self.loss_history[-1],
-            'min_loss': min(self.loss_history),
-            'instability_events': len(self.instability_events),
-            'is_stable': self.is_stable(),
-            'last_10_avg': (
-                sum(self.loss_history[-10:]) /
-                min(10, n)),
+            'total_bytes': self.total_bytes,
+            'total_ops': self.total_ops,
+            'skipped_ops': self.skipped_ops,
+            'skip_ratio': round(self.skipped_ops / max(1, total), 4),
+            'tiers': {t: dict(s) for t, s in self.tier_stats.items() if s['ops'] > 0},
         }
 
-    def format_log(self):
-        """Format convergence summary for experiment log."""
-        s = self.get_summary()
-        lines = [
-            f"### Convergence Monitor (steps={s['steps']}) ###",
-            f"Final loss: {s.get('final_loss', 'N/A')}",
-            f"Min loss: {s.get('min_loss', 'N/A')}",
-            f"Stable: {s.get('is_stable', 'N/A')}",
-            f"Instability events: "
-            f"{s.get('instability_events', 0)}",
-        ]
-        return "\n".join(lines)
+    def reset(self):
+        self.total_bytes = 0
+        self.total_ops = 0
+        self.skipped_ops = 0
+        for t in self.tier_stats:
+            self.tier_stats[t] = {'bytes': 0, 'ops': 0, 'lat_ms': 0}
 
 
-def create_desloc_collective_ops(backend, Kx=32, Ku=96, Kv=192,
-                                  clip_radius=1.0,
-                                  server_opt_type='identity',
-                                  nesterov_momentum=0.9,
-                                  outer_lr=1.0):
-    """Factory function for DES-LOC collective ops.
+class DeslocMultiBackendRouter:
+    """Route DES-LOC communication ops to appropriate backend.
+    In multi-backend setups (e.g. NCCL for GPU, Gloo for CPU),
+    route param sync via NCCL and momentum sync via either.
 
-    Creates the full DES-LOC communication stack:
-    - CollectiveOps with sync schedule
-    - ServerOpt (identity or Nesterov)
-    - ConvergenceMonitor
-    """
-    server_opt = DESLOCServerOpt(
-        opt_type=server_opt_type,
-        momentum=nesterov_momentum,
-        outer_lr=outer_lr)
+    Ref: DeepSpeed supports multiple backends simultaneously."""
 
-    collective = DESLOCCollectiveOps(
-        backend=backend, Kx=Kx, Ku=Ku, Kv=Kv,
-        clip_radius=clip_radius, server_opt=server_opt)
+    def __init__(self, gpu_backend='nccl', cpu_backend='gloo'):
+        self.gpu_backend = gpu_backend
+        self.cpu_backend = cpu_backend
+        self.routing_table = {
+            0: gpu_backend,  # param sync → GPU
+            1: gpu_backend,  # momentum sync → GPU (or CPU for offload)
+            2: gpu_backend,  # variance sync → GPU (or CPU for offload)
+        }
 
-    monitor = DESLOCConvergenceMonitor()
+    def set_offload_tiers(self, offload_momentum=False, offload_variance=False):
+        """Route momentum/variance sync to CPU backend when offloaded."""
+        if offload_momentum:
+            self.routing_table[1] = self.cpu_backend
+        if offload_variance:
+            self.routing_table[2] = self.cpu_backend
 
-    return {
-        'collective': collective,
-        'server_opt': server_opt,
-        'monitor': monitor,
-    }
+    def get_backend_for_tier(self, tier):
+        return self.routing_table.get(tier, self.gpu_backend)
+
+    def summary(self):
+        return {t: b for t, b in self.routing_table.items()}
 
 
-# =================================================================
-# End M066
-# =================================================================
+class DeslocCommBudget:
+    """Communication budget tracker for DES-LOC.
+    Sets a per-step byte budget and tracks utilization.
+    When budget is exceeded, automatically increase Kx next step.
+
+    Ref: Network-aware training — adapt to available bandwidth."""
+
+    def __init__(self, budget_bytes_per_step=None, param_bytes=0):
+        self.budget = budget_bytes_per_step
+        self.param_bytes = param_bytes
+        self.step = 0
+        self.overbudget_count = 0
+
+    def check_budget(self, bytes_this_step):
+        self.step += 1
+        if self.budget is None:
+            return True
+        if bytes_this_step > self.budget:
+            self.overbudget_count += 1
+            return False
+        return True
+
+    def get_utilization(self, bytes_this_step):
+        if self.budget is None or self.budget <= 0:
+            return 0.0
+        return round(bytes_this_step / self.budget, 4)
+
+    def recommend_Kx_for_budget(self, current_Kx):
+        """If frequently over budget, suggest larger Kx."""
+        if self.step == 0:
+            return current_Kx
+        ratio = self.overbudget_count / self.step
+        if ratio > 0.1:
+            return min(256, current_Kx * 2)
+        return current_Kx
+
+    def state_dict(self):
+        return {'budget': self.budget, 'step': self.step,
+                'overbudget': self.overbudget_count}

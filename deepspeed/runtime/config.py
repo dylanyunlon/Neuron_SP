@@ -14,6 +14,25 @@ import copy
 import base64
 
 from .constants import *
+
+# DES-LOC configuration keys — Algorithm 1 sync periods
+DESLOC = 'desloc'
+DESLOC_ENABLED = 'enabled'
+DESLOC_ENABLED_DEFAULT = False
+DESLOC_KX = 'Kx'
+DESLOC_KX_DEFAULT = 1           # Kx=1 = standard DDP (every step sync)
+DESLOC_KU = 'Ku'
+DESLOC_KU_DEFAULT = 3           # First momentum sync period
+DESLOC_KV = 'Kv'
+DESLOC_KV_DEFAULT = 6           # Second momentum sync period
+DESLOC_CLIP_RHO = 'clip_rho'
+DESLOC_CLIP_RHO_DEFAULT = 1.0   # Per-coordinate clipping bound
+DESLOC_OUTER_OPT = 'outer_optimizer'
+DESLOC_OUTER_OPT_DEFAULT = 'average'  # 'average' or 'nesterov'
+DESLOC_INNER_OPT = 'inner_optimizer'
+DESLOC_INNER_OPT_DEFAULT = 'adam'     # 'adam', 'adopt', 'muon'
+DESLOC_WARMUP = 'warmup_steps'
+DESLOC_WARMUP_DEFAULT = 512     # Ref: Section A.1 — TWARM=512
 from .config_utils import (
     get_scalar_param,
     dict_raise_error_on_duplicate_keys,
@@ -778,6 +797,18 @@ class DeepSpeedConfig(object):
         self.comms_config = DeepSpeedCommsConfig(param_dict)
         self.monitor_config = get_monitor_config(param_dict)
 
+        # DES-LOC: parse independent sync period configuration
+        # Ref: Algorithm 1 line 7 — Kx for params, Ku for m1, Kv for m2
+        desloc_dict = param_dict.get(DESLOC, {})
+        self.desloc_enabled = desloc_dict.get(DESLOC_ENABLED, DESLOC_ENABLED_DEFAULT)
+        self.desloc_Kx = desloc_dict.get(DESLOC_KX, DESLOC_KX_DEFAULT)
+        self.desloc_Ku = desloc_dict.get(DESLOC_KU, DESLOC_KU_DEFAULT)
+        self.desloc_Kv = desloc_dict.get(DESLOC_KV, DESLOC_KV_DEFAULT)
+        self.desloc_clip_rho = desloc_dict.get(DESLOC_CLIP_RHO, DESLOC_CLIP_RHO_DEFAULT)
+        self.desloc_outer_opt = desloc_dict.get(DESLOC_OUTER_OPT, DESLOC_OUTER_OPT_DEFAULT)
+        self.desloc_inner_opt = desloc_dict.get(DESLOC_INNER_OPT, DESLOC_INNER_OPT_DEFAULT)
+        self.desloc_warmup = desloc_dict.get(DESLOC_WARMUP, DESLOC_WARMUP_DEFAULT)
+
         self.gradient_clipping = get_gradient_clipping(param_dict)
         self.float16_config = get_float16_config(param_dict)
         self.bfloat16_config = get_bfloat16_config(param_dict)
@@ -870,41 +901,6 @@ class DeepSpeedConfig(object):
 
         self.timers_config = get_timers_config(param_dict)
         self.tensor_parallel_config = get_tensor_parallel_config(param_dict)
-
-        # ── DES-LOC configuration (M183) ────────────────────────────
-        self._desloc_raw = param_dict.get('desloc', {})
-        self.desloc_enabled = self._desloc_raw.get('enabled', False)
-        self.desloc_Kx = self._desloc_raw.get('Kx', 32)
-        self.desloc_Ku = self._desloc_raw.get('Ku', 96)
-        self.desloc_Kv = self._desloc_raw.get('Kv', 192)
-        self.desloc_clip_radius = self._desloc_raw.get('clip_radius', 1.0)
-        self.desloc_outer_optimizer = self._desloc_raw.get('outer_optimizer', 'averaging')
-        self.desloc_nesterov_momentum = self._desloc_raw.get('nesterov_momentum', 0.9)
-        self.desloc_nesterov_lr = self._desloc_raw.get('nesterov_lr', 1.0)
-        self.desloc_muon_compat = self._desloc_raw.get('muon_compat', False)
-        self.desloc_warmup_sync_steps = self._desloc_raw.get('warmup_sync_steps', 0)
-        self.desloc_comm_logging = self._desloc_raw.get('comm_logging', False)
-        # ── end DES-LOC config (M183) ───────────────────────────────
-
-    # ── DES-LOC config accessor (M183) ───────────────────────────
-    def desloc_config(self):
-        """Return DES-LOC configuration dict for engine consumption."""
-        if not self.desloc_enabled:
-            return None
-        return {
-            'enabled': self.desloc_enabled,
-            'Kx': self.desloc_Kx,
-            'Ku': self.desloc_Ku,
-            'Kv': self.desloc_Kv,
-            'clip_radius': self.desloc_clip_radius,
-            'outer_optimizer': self.desloc_outer_optimizer,
-            'nesterov_momentum': self.desloc_nesterov_momentum,
-            'nesterov_lr': self.desloc_nesterov_lr,
-            'muon_compat': self.desloc_muon_compat,
-            'warmup_sync_steps': self.desloc_warmup_sync_steps,
-            'comm_logging': self.desloc_comm_logging,
-        }
-    # ── end DES-LOC accessor (M183) ─────────────────────────────
 
     def _batch_assertion(self):
 
@@ -1045,3 +1041,364 @@ class DeepSpeedConfig(object):
                         "DeepSpeedConfig: In FP32 mode, DeepSpeed does not permit MAX_GRAD_NORM ({}) > 0, setting to zero"
                         .format(self.optimizer_params[MAX_GRAD_NORM]))
                 self.optimizer_params[MAX_GRAD_NORM] = 0.0
+
+
+# =========================================================================
+# DES-LOC Configuration Class
+# Ref: Algorithm 1 + Section 4.1 + Theorem 1
+# =========================================================================
+
+class DeslocConfig:
+    """DES-LOC configuration with validation and diagnostics.
+
+    Parameters:
+        Kx: Parameter sync period (must be >= 1). Kx=1 = DDP baseline.
+        Ku: First momentum sync period (should be >= Kx).
+        Kv: Second momentum sync period (should be >= Ku).
+        clip_rho: Per-coordinate gradient clipping bound (> 0).
+        outer_optimizer: 'average' or 'nesterov' (Section 5.5).
+        inner_optimizer: 'adam', 'adopt', or 'muon' (Section 5.6).
+        warmup_steps: Steps with Kx=1 before DES-LOC activates.
+
+    Ref: Section 5.3 — Ku=3*Kx, Kv=6*Kx as default heuristic.
+    """
+
+    VALID_OUTER = ('average', 'nesterov')
+    VALID_INNER = ('adam', 'adopt', 'muon', 'sgdm')
+
+    def __init__(self, enabled=False, Kx=1, Ku=3, Kv=6, clip_rho=1.0,
+                 outer_optimizer='average', inner_optimizer='adam',
+                 warmup_steps=512, beta1=0.9, beta2=0.999):
+        self.enabled = enabled
+        self.Kx = max(1, int(Kx))
+        self.Ku = max(1, int(Ku))
+        self.Kv = max(1, int(Kv))
+        self.clip_rho = float(clip_rho)
+        self.outer_optimizer = outer_optimizer
+        self.inner_optimizer = inner_optimizer
+        self.warmup_steps = max(0, int(warmup_steps))
+        self.beta1 = beta1
+        self.beta2 = beta2
+
+    def validate(self):
+        """Validate configuration. Returns list of issue strings."""
+        import math
+        issues = []
+        if self.Kx < 1:
+            issues.append(f'ERROR: Kx={self.Kx} must be >= 1')
+        if self.Ku < self.Kx:
+            issues.append(f'WARNING: Ku={self.Ku} < Kx={self.Kx}')
+        if self.Kv < self.Ku:
+            issues.append(f'WARNING: Kv={self.Kv} < Ku={self.Ku}')
+        if self.clip_rho <= 0:
+            issues.append(f'ERROR: clip_rho={self.clip_rho} must be > 0')
+        if self.outer_optimizer not in self.VALID_OUTER:
+            issues.append(f'ERROR: outer_optimizer={self.outer_optimizer}')
+        if self.inner_optimizer not in self.VALID_INNER:
+            issues.append(f'ERROR: inner_optimizer={self.inner_optimizer}')
+        # Half-life alignment check
+        if 0 < self.beta1 < 1 and 0 < self.beta2 < 1:
+            tau1 = -1.0 / math.log(self.beta1)
+            tau2 = -1.0 / math.log(self.beta2)
+            ratio = tau2 / tau1
+            if self.Kv / max(1, self.Kx) < ratio * 0.5:
+                issues.append(
+                    f'WARNING: Kv/Kx={self.Kv/self.Kx:.1f} << '
+                    f'tau2/tau1={ratio:.1f}; consider Kv={int(self.Kx*ratio)}')
+        if self.warmup_steps > 0 and self.warmup_steps % self.Kx != 0:
+            issues.append(f'WARNING: warmup_steps={self.warmup_steps} '
+                         f'not multiple of Kx={self.Kx}')
+        return issues
+
+    def to_dict(self):
+        return {
+            DESLOC_ENABLED: self.enabled,
+            DESLOC_KX: self.Kx, DESLOC_KU: self.Ku, DESLOC_KV: self.Kv,
+            DESLOC_CLIP_RHO: self.clip_rho,
+            DESLOC_OUTER_OPT: self.outer_optimizer,
+            DESLOC_INNER_OPT: self.inner_optimizer,
+            DESLOC_WARMUP: self.warmup_steps,
+        }
+
+    @classmethod
+    def from_dict(cls, d):
+        return cls(
+            enabled=d.get(DESLOC_ENABLED, False),
+            Kx=d.get(DESLOC_KX, 1), Ku=d.get(DESLOC_KU, 3), Kv=d.get(DESLOC_KV, 6),
+            clip_rho=d.get(DESLOC_CLIP_RHO, 1.0),
+            outer_optimizer=d.get(DESLOC_OUTER_OPT, 'average'),
+            inner_optimizer=d.get(DESLOC_INNER_OPT, 'adam'),
+            warmup_steps=d.get(DESLOC_WARMUP, 512),
+        )
+
+    def summary(self):
+        import math
+        if not self.enabled:
+            return 'DES-LOC: disabled (standard DDP)'
+        tau1 = -1.0/math.log(self.beta1) if 0<self.beta1<1 else 0
+        tau2 = -1.0/math.log(self.beta2) if 0<self.beta2<1 else 0
+        return (f'DES-LOC: Kx={self.Kx} Ku={self.Ku} Kv={self.Kv} '
+                f'rho={self.clip_rho} outer={self.outer_optimizer} '
+                f'inner={self.inner_optimizer} warmup={self.warmup_steps} '
+                f'tau1={tau1:.1f} tau2={tau2:.1f}')
+
+
+# Experiment matrix for NeurIPS ablation
+DESLOC_ABLATION = {
+    'kx_sweep': [1, 2, 4, 8, 16, 32, 64, 128],
+    'beta2_sweep': [0.9, 0.95, 0.99, 0.999],
+    'model_sweep': ['125M', '350M', '1B'],
+    'outer_sweep': ['average', 'nesterov'],
+    'inner_sweep': ['adam', 'adopt'],
+}
+
+
+def desloc_generate_ablation(seeds=(42, 137, 2024)):
+    """Generate complete experiment list. Ref: Section 5 RQ1-RQ6.
+    Total: 7 Kx x 3 beta2 x 2 models x 3 seeds = 126 base.
+    Plus: 2 outer x 3 seeds + 2 inner x 3 seeds = 12.
+    Grand total: 138 experiments."""
+    exps = []
+    for kx in [1, 4, 8, 16, 32, 64, 128]:
+        for b2 in [0.95, 0.99, 0.999]:
+            for model in ['125M', '350M']:
+                for seed in seeds:
+                    ku, kv = max(1, kx*3), max(1, kx*6)
+                    exps.append({'Kx': kx, 'Ku': ku, 'Kv': kv,
+                                'beta2': b2, 'model': model, 'seed': seed,
+                                'rq': 'RQ1-4'})
+    for outer in ['average', 'nesterov']:
+        for seed in seeds:
+            exps.append({'Kx': 32, 'Ku': 96, 'Kv': 192,
+                        'outer': outer, 'model': '125M', 'seed': seed, 'rq': 'RQ5'})
+    for inner in ['adam', 'adopt']:
+        for seed in seeds:
+            exps.append({'Kx': 32, 'Ku': 96, 'Kv': 192,
+                        'inner': inner, 'model': '125M', 'seed': seed, 'rq': 'RQ6'})
+    return exps
+
+
+def desloc_validate_precision(results):
+    """Check all numeric values have >= 4 significant digits.
+    Ref: NeurIPS standard — reviewers reject 1, 11, 0.9."""
+    violations = []
+    def walk(d, p=''):
+        if isinstance(d, dict):
+            for k, v in d.items():
+                walk(v, f'{p}.{k}' if p else k)
+        elif isinstance(d, (list, tuple)):
+            for i, v in enumerate(d):
+                walk(v, f'{p}[{i}]')
+        elif isinstance(d, float) and d != 0:
+            s = f'{d:.10g}'.lstrip('-0').replace('.', '')
+            if len(s.rstrip('0')) < 4:
+                violations.append(p)
+    walk(results)
+    return violations
+
+
+DESLOC_FIGURE_SPECS = {
+    'fig1': {'title': 'RQ1: Half-Life Validation', 'x': 'beta2', 'y': 'change_rate_ratio'},
+    'fig2': {'title': 'RQ2: Independent Sync Periods', 'x': 'Kx', 'y': 'final_loss'},
+    'fig3': {'title': 'RQ3: Comm Reduction', 'x': 'method', 'y': 'comm_bytes'},
+    'fig4': {'title': 'RQ4: Large-Scale Loss Curves', 'x': 'step', 'y': 'loss'},
+    'fig5': {'title': 'RQ5: Nesterov Outer Optimizer', 'x': 'step', 'y': 'loss'},
+    'fig6': {'title': 'RQ6: Muon Compatibility', 'x': 'model', 'y': 'final_loss'},
+}
+
+
+class DeslocOuterOptimizerConfig:
+    """Configuration for the DES-LOC outer optimizer.
+    Ref: Section 5.5 — Nesterov outer optimizer improves over averaging.
+
+    At each Kx boundary, workers average parameters. The outer optimizer
+    controls HOW: simple averaging or Nesterov momentum on the delta.
+
+    Nesterov update at sync boundary:
+      v_{t+1} = beta_outer * v_t + (x_avg - x_local)
+      x_{t+1} = x_avg + beta_outer * v_{t+1}
+
+    This reduces noise from local optimization between sync points.
+    """
+
+    def __init__(self, mode='average', beta_outer=0.9, outer_lr=1.0):
+        self.mode = mode
+        self.beta_outer = beta_outer
+        self.outer_lr = outer_lr
+
+    def validate(self):
+        issues = []
+        if self.mode not in ('average', 'nesterov'):
+            issues.append(f'ERROR: mode={self.mode} not in (average, nesterov)')
+        if not (0 < self.beta_outer < 1):
+            issues.append(f'ERROR: beta_outer={self.beta_outer} not in (0,1)')
+        if self.outer_lr <= 0:
+            issues.append(f'ERROR: outer_lr={self.outer_lr} must be > 0')
+        return issues
+
+    def to_dict(self):
+        return {'mode': self.mode, 'beta_outer': self.beta_outer,
+                'outer_lr': self.outer_lr}
+
+    @classmethod
+    def from_dict(cls, d):
+        return cls(mode=d.get('mode', 'average'),
+                   beta_outer=d.get('beta_outer', 0.9),
+                   outer_lr=d.get('outer_lr', 1.0))
+
+
+class DeslocInnerOptimizerConfig:
+    """Configuration for DES-LOC inner optimizer.
+    Ref: Section 5.6 — ADOPT modifies Adam update to guarantee
+    convergence for any beta2, removing beta1 < sqrt(beta2) constraint.
+
+    ADOPT update: v_t uses g_{t-1} instead of g_t.
+    Muon: uses Nesterov SGD on steepest-descent directions."""
+
+    def __init__(self, optimizer_type='adam', beta1=0.9, beta2=0.999,
+                 eps=1e-8, weight_decay=0.0):
+        self.optimizer_type = optimizer_type
+        self.beta1 = beta1
+        self.beta2 = beta2
+        self.eps = eps
+        self.weight_decay = weight_decay
+
+    def validate(self):
+        issues = []
+        if self.optimizer_type not in ('adam', 'adopt', 'muon', 'sgdm'):
+            issues.append(f'ERROR: type={self.optimizer_type}')
+        if not (0 <= self.beta1 < 1):
+            issues.append(f'ERROR: beta1={self.beta1}')
+        if not (0 <= self.beta2 < 1):
+            issues.append(f'ERROR: beta2={self.beta2}')
+        # ADOPT removes this constraint, but standard Adam needs it
+        if self.optimizer_type == 'adam' and self.beta1 >= self.beta2 ** 0.5:
+            issues.append(f'WARNING: beta1={self.beta1} >= sqrt(beta2)='
+                         f'{self.beta2**0.5:.4f}; consider ADOPT')
+        return issues
+
+    def to_dict(self):
+        return {'type': self.optimizer_type, 'beta1': self.beta1,
+                'beta2': self.beta2, 'eps': self.eps, 'wd': self.weight_decay}
+
+    @classmethod
+    def from_dict(cls, d):
+        return cls(optimizer_type=d.get('type', 'adam'),
+                   beta1=d.get('beta1', 0.9), beta2=d.get('beta2', 0.999),
+                   eps=d.get('eps', 1e-8), weight_decay=d.get('wd', 0.0))
+
+
+def desloc_format_table(results, metrics, group_key='Kx'):
+    """Format results as comparison table for logging.
+    Ref: Section 5 tables — NeurIPS comparison format."""
+    import math
+    groups = {}
+    for r in results:
+        g = r.get(group_key, r.get('config', {}).get(group_key))
+        groups.setdefault(g, []).append(r)
+    header = [group_key] + metrics
+    rows = [header]
+    for gval in sorted(groups.keys()):
+        row = [str(gval)]
+        for mk in metrics:
+            vals = [e.get(mk) or e.get('metrics', {}).get(mk) for e in groups[gval]]
+            vals = [v for v in vals if v is not None]
+            if vals:
+                m = sum(vals) / len(vals)
+                if len(vals) > 1:
+                    s = math.sqrt(sum((x-m)**2 for x in vals) / (len(vals)-1))
+                    row.append(f'{m:.4f}+/-{s:.4f}')
+                else:
+                    row.append(f'{m:.4f}')
+            else:
+                row.append('-')
+        rows.append(row)
+    return rows
+
+
+def desloc_compute_optimal_config(model_params, num_workers,
+                                   peak_tflops, net_bw_gbps,
+                                   beta1=0.9, beta2=0.999):
+    """Compute optimal DES-LOC config for given hardware setup.
+    Finds smallest Kx where training becomes compute-bound.
+
+    Returns DeslocConfig instance with recommended parameters.
+    Ref: Section 5.4 — 'setting Kx for sufficient throughput
+    based on bandwidth, then Ku, Kv as constant multiples.'"""
+    import math
+    param_bytes = model_params * 2  # BF16
+    # Estimate compute time: 6*N*512*4 / (peak * 1e12)
+    flops = 6 * model_params * 512 * 4
+    compute_s = flops / (peak_tflops * 1e12) if peak_tflops > 0 else 1
+    # Allreduce time
+    if num_workers > 1 and net_bw_gbps > 0:
+        ring = 2.0 * (num_workers - 1) / num_workers
+        ar_s = ring * param_bytes / (net_bw_gbps * 1e9)
+    else:
+        ar_s = 0
+    # Find smallest Kx where ar/Kx < compute
+    if ar_s <= compute_s:
+        Kx = 1
+    else:
+        Kx = 2 ** int(math.ceil(math.log2(ar_s / compute_s)))
+    Kx = min(Kx, 256)
+    # Recommend Ku, Kv from half-life
+    tau1 = -1.0 / math.log(beta1) if 0 < beta1 < 1 else 1
+    tau2 = -1.0 / math.log(beta2) if 0 < beta2 < 1 else 1
+    ratio = min(10, tau2 / tau1) if tau1 > 0 else 3
+    Ku = max(1, int(round(Kx * 3)))
+    Kv = max(Ku, int(round(Kx * ratio)))
+    return DeslocConfig(enabled=True, Kx=Kx, Ku=Ku, Kv=Kv,
+                        beta1=beta1, beta2=beta2)
+
+
+def desloc_config_from_json(json_path):
+    """Load DES-LOC config from standalone JSON file.
+    Format: {"desloc": {"enabled": true, "Kx": 32, ...}}"""
+    import json
+    with open(json_path) as f:
+        data = json.load(f)
+    desloc_dict = data.get('desloc', data)
+    return DeslocConfig.from_dict(desloc_dict)
+
+
+def desloc_config_to_deepspeed_json(desloc_config, base_config=None):
+    """Merge DES-LOC config into a DeepSpeed JSON config dict.
+    If base_config is None, creates minimal config."""
+    if base_config is None:
+        base_config = {
+            'train_batch_size': 32,
+            'fp16': {'enabled': True},
+        }
+    base_config[DESLOC] = desloc_config.to_dict()
+    return base_config
+
+
+def desloc_print_config_summary(config):
+    """Print DES-LOC configuration summary to console.
+    Includes validation warnings."""
+    if isinstance(config, DeslocConfig):
+        print(config.summary())
+        issues = config.validate()
+        for iss in issues:
+            print(f'  {iss}')
+    elif hasattr(config, 'desloc_enabled'):
+        # DeepSpeedConfig object
+        print(f'DES-LOC: enabled={config.desloc_enabled} '
+              f'Kx={config.desloc_Kx} Ku={config.desloc_Ku} Kv={config.desloc_Kv}')
+
+
+DESLOC_DEFAULT_CONFIGS = {
+    'ddp_baseline': DeslocConfig(enabled=False),
+    'conservative': DeslocConfig(enabled=True, Kx=4, Ku=12, Kv=24),
+    'moderate': DeslocConfig(enabled=True, Kx=32, Ku=96, Kv=192),
+    'aggressive': DeslocConfig(enabled=True, Kx=128, Ku=384, Kv=768),
+}
+
+
+def desloc_config_summary_string(cfg):
+    """One-line DES-LOC config summary for logging."""
+    if not cfg.get('enabled', False):
+        return 'DES-LOC: disabled'
+    return (f"DES-LOC: Kx={cfg.get('Kx',1)} Ku={cfg.get('Ku',3)} "
+            f"Kv={cfg.get('Kv',6)} rho={cfg.get('clip_rho',1.0)}")

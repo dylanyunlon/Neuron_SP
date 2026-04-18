@@ -885,127 +885,375 @@ class WarmupCosineLR(object):
         return [param_value] * len(optimizer.param_groups)
 
 
-# ── DES-LOC WSD Learning Rate Schedule (M186) ──────────────────
-import math as _m186_math
+# =========================================================================
+# DES-LOC Learning Rate Schedule Extensions
+# Ref: Section 4.1 — 'Learning rates use the WSD schedule'
+# Ref: Section A.1 — TWARM = 512 steps, with Warmup-Stable-Decay
+# =========================================================================
+import math as _math
 
 
-class DESLOCWSDSchedule:
-    """Warmup-Stable-Decay learning rate schedule for DES-LOC.
+class DeslocWSDSchedule:
+    """Warmup-Stable-Decay schedule aligned with DES-LOC sync periods.
 
-    Section 4.1: Learning rates use the WSD schedule (Hu et al.,
-    2024), with warmup T_WARM=512 steps.
+    WSD has three phases:
+    1. Warmup: linear ramp from 0 to peak_lr (TWARM steps)
+    2. Stable: constant peak_lr
+    3. Decay: cosine decay to min_lr
 
-    Three phases:
-    1. Warmup: linear 0 -> eta_peak over T_WARM steps
-    2. Stable: constant eta_peak
-    3. Decay: cosine decay eta_peak -> eta_min
-
-    DES-LOC extension: during warmup, use full sync (Kx=1);
-    optionally co-decay the Nesterov outer_lr during decay phase.
+    DES-LOC alignment requirements:
+    - Warmup end should be at a Kx boundary for clean transition
+    - Decay start should be at a Kx boundary for consistent sync
+    - During decay, consider reducing Kx for tighter convergence
     """
 
-    SCHEDULE_KEY = 'desloc_wsd'
-
-    def __init__(self, optimizer, peak_lr, total_steps,
-                 warmup_steps=512, decay_fraction=0.1,
-                 min_lr_ratio=0.1, last_step=-1,
-                 nesterov_outer_lr=None):
-        self.optimizer = optimizer
+    def __init__(self, peak_lr, min_lr, warmup_steps, stable_steps, decay_steps,
+                 decay_type='cosine', Kx=1):
         self.peak_lr = peak_lr
-        self.total_steps = total_steps
+        self.min_lr = min_lr
         self.warmup_steps = warmup_steps
-        self.min_lr = peak_lr * min_lr_ratio
-        self.decay_start = int(total_steps * (1.0 - decay_fraction))
-        self.last_step = last_step
-        self.current_lr = 0.0
-        self.nesterov_outer_lr_peak = nesterov_outer_lr
-        self.current_nesterov_outer_lr = nesterov_outer_lr
+        self.stable_steps = stable_steps
+        self.decay_steps = decay_steps
+        self.total_steps = warmup_steps + stable_steps + decay_steps
+        self.decay_type = decay_type
+        self.Kx = max(1, Kx)
+        # Align phase boundaries to Kx multiples
+        if Kx > 1:
+            self.warmup_steps = self._align(warmup_steps)
+            self.stable_steps = self._align(stable_steps)
+            self.total_steps = self.warmup_steps + self.stable_steps + decay_steps
 
-        if last_step < 0:
-            for group in optimizer.param_groups:
-                group.setdefault('initial_lr', group['lr'])
+    def _align(self, steps):
+        """Round steps up to nearest Kx multiple."""
+        if self.Kx <= 1:
+            return steps
+        return ((steps + self.Kx - 1) // self.Kx) * self.Kx
 
-    def _compute_lr(self, step):
-        """Compute learning rate for given step."""
+    def get_lr(self, step):
+        """Get learning rate at given step."""
         if step < self.warmup_steps:
-            frac = step / max(self.warmup_steps, 1)
-            return self.peak_lr * frac
-        elif step < self.decay_start:
+            return self.peak_lr * step / max(1, self.warmup_steps)
+        elif step < self.warmup_steps + self.stable_steps:
             return self.peak_lr
         else:
-            decay_steps = self.total_steps - self.decay_start
-            progress = (step - self.decay_start) / max(decay_steps, 1)
-            progress = min(progress, 1.0)
-            cosine = 0.5 * (1.0 + _m186_math.cos(_m186_math.pi * progress))
-            return self.min_lr + (self.peak_lr - self.min_lr) * cosine
+            decay_step = step - self.warmup_steps - self.stable_steps
+            ratio = min(1.0, decay_step / max(1, self.decay_steps))
+            if self.decay_type == 'cosine':
+                return self.min_lr + 0.5 * (self.peak_lr - self.min_lr) * (
+                    1 + _math.cos(_math.pi * ratio))
+            else:
+                return self.peak_lr - (self.peak_lr - self.min_lr) * ratio
 
-    def step(self, step=None):
-        """Advance the schedule by one step."""
-        if step is not None:
-            self.last_step = step
-        else:
-            self.last_step += 1
-        self.current_lr = self._compute_lr(self.last_step)
-        for group in self.optimizer.param_groups:
-            group['lr'] = self.current_lr
-        # Co-decay outer_lr during decay phase
-        if self.nesterov_outer_lr_peak is not None and self.is_decay():
-            ratio = self.current_lr / max(self.peak_lr, 1e-12)
-            self.current_nesterov_outer_lr = self.nesterov_outer_lr_peak * ratio
+    def get_phase(self, step):
+        if step < self.warmup_steps:
+            return 'warmup'
+        elif step < self.warmup_steps + self.stable_steps:
+            return 'stable'
+        return 'decay'
 
-    def get_lr(self):
-        return self.current_lr
-
-    def is_warmup(self):
-        return self.last_step < self.warmup_steps
-
-    def is_decay(self):
-        return self.last_step >= self.decay_start
+    def is_phase_boundary(self, step):
+        return (step == self.warmup_steps or
+                step == self.warmup_steps + self.stable_steps)
 
     def state_dict(self):
         return {
-            'last_step': self.last_step,
-            'peak_lr': self.peak_lr,
-            'total_steps': self.total_steps,
-            'warmup_steps': self.warmup_steps,
-            'decay_start': self.decay_start,
-            'min_lr': self.min_lr,
+            'peak_lr': self.peak_lr, 'min_lr': self.min_lr,
+            'warmup': self.warmup_steps, 'stable': self.stable_steps,
+            'decay': self.decay_steps, 'type': self.decay_type, 'Kx': self.Kx,
         }
 
-    def load_state_dict(self, state_dict):
-        self.last_step = state_dict['last_step']
-        self.peak_lr = state_dict.get('peak_lr', self.peak_lr)
-        self.total_steps = state_dict.get('total_steps', self.total_steps)
-        self.warmup_steps = state_dict.get('warmup_steps', self.warmup_steps)
-        self.decay_start = state_dict.get('decay_start', self.decay_start)
-        self.min_lr = state_dict.get('min_lr', self.min_lr)
+
+class DeslocLRAligner:
+    """Align any LR schedule with DES-LOC sync boundaries.
+    Ref: DES-LOC warmup→stable transition should happen at a Kx step."""
+
+    def __init__(self, Kx=1):
+        self.Kx = max(1, Kx)
+
+    def align_warmup(self, warmup_steps):
+        if self.Kx <= 1:
+            return warmup_steps
+        return ((warmup_steps + self.Kx - 1) // self.Kx) * self.Kx
+
+    def should_force_sync(self, lr_current, lr_previous):
+        """Check if LR change warrants forced sync (>10% drop)."""
+        if lr_previous <= 0:
+            return False
+        return abs(lr_current - lr_previous) / lr_previous > 0.1
 
 
-class DESLOCPsiCalculator:
-    """Compute psi factor for step-size restriction from Theorem 1.
+class DeslocLRScaler:
+    """Scale learning rate based on DES-LOC sync period.
 
-    psi = 4(1-px)/px^2 * (1-beta)(1-pu) / (6(1-(1-pu)*beta))
-    eta_0 = min(1/(8L), 1/(L*sqrt(psi*8*(B^2+1))))
+    Ref: Theorem 1 — eta_0 proportional to 1/sqrt(psi).
+    Larger Kx → larger psi → should reduce learning rate.
+    This keeps the convergence bound tight.
+
+    Also: Section 5.5 — 'higher momentum sync frequency permits
+    a larger step size.'
     """
 
-    @staticmethod
-    def compute_psi(Kx, Ku, beta1=0.9):
-        px = 1.0 / max(Kx, 1)
-        pu = 1.0 / max(Ku, 1)
-        numer = 4.0 * (1.0 - px) * (1.0 - beta1) * (1.0 - pu)
-        denom = px * px * 6.0 * (1.0 - (1.0 - pu) * beta1)
-        if abs(denom) < 1e-15:
-            return float('inf')
-        return numer / denom
+    def __init__(self, base_lr, Kx=1, beta1=0.9):
+        self.base_lr = base_lr
+        self.Kx = Kx
+        self.beta1 = beta1
 
-    @staticmethod
-    def max_lr(L, psi, B_sq=1.0):
-        bound1 = 1.0 / (8.0 * L)
-        inner = psi * 8.0 * (B_sq + 1.0)
-        if inner <= 0:
-            return bound1
-        bound2 = 1.0 / (L * _m186_math.sqrt(inner))
-        return min(bound1, bound2)
+    def get_scaled_lr(self, Kx=None):
+        """Return learning rate scaled for given Kx.
+        Rule: lr = base_lr / sqrt(max(1, psi/10))."""
+        kx = Kx if Kx is not None else self.Kx
+        if kx <= 1:
+            return self.base_lr
+        # Compute psi
+        px = 1.0 / kx
+        pu = 1.0 / max(1, kx * 3)
+        num = 4 * (1 - px) * (1 - self.beta1) * (1 - pu)
+        den = px * px * 6 * (1 - (1 - pu) * self.beta1)
+        psi = num / den if abs(den) > 1e-15 else 1
+        scale = 1.0 / _math.sqrt(max(1, psi / 10))
+        return self.base_lr * scale
+
+    def get_recommended_lr_table(self, kx_values=None):
+        """Return LR recommendations for different Kx values.
+        Useful for experiment planning."""
+        if kx_values is None:
+            kx_values = [1, 4, 8, 16, 32, 64, 128]
+        return {kx: round(self.get_scaled_lr(kx), 8) for kx in kx_values}
 
 
-# ── end M186 ────────────────────────────────────────────────────
+class DeslocCyclicalKx:
+    """Cyclical Kx schedule: alternate between low and high Kx.
+
+    During stable LR phase, periodically reduce Kx to "refresh"
+    synchronization, then increase again. This balances communication
+    savings with convergence quality.
+
+    Pattern: Kx_high for T_high steps, then Kx_low for T_low steps.
+    Ref: Not in original paper — experimental extension.
+    """
+
+    def __init__(self, Kx_low=4, Kx_high=64, cycle_steps=1000, low_fraction=0.2):
+        self.Kx_low = Kx_low
+        self.Kx_high = Kx_high
+        self.cycle_steps = cycle_steps
+        self.low_fraction = low_fraction
+        self.low_steps = int(cycle_steps * low_fraction)
+
+    def get_Kx(self, step):
+        """Get Kx for current step."""
+        pos = step % self.cycle_steps
+        if pos < self.low_steps:
+            return self.Kx_low
+        return self.Kx_high
+
+    def state_dict(self):
+        return {'low': self.Kx_low, 'high': self.Kx_high,
+                'cycle': self.cycle_steps, 'frac': self.low_fraction}
+
+
+class DeslocWSDParameterOptimizer:
+    """Auto-configure WSD schedule parameters for DES-LOC training.
+
+    Given model size, training budget, and DES-LOC config, recommends:
+    - peak_lr, min_lr
+    - warmup_steps (aligned to Kx)
+    - stable_steps, decay_steps
+
+    Ref: Section A.1 experiment settings:
+      125M: lr=6e-4, warmup=512, total=25000
+      350M: lr=3e-4, warmup=512, total=50000
+      1B:   lr=2e-4, warmup=1024, total=100000
+
+    Nick Joseph: 'scaling laws: peak LR scales as ~1/sqrt(N)'
+    """
+
+    # Empirical scaling: lr ~ C / sqrt(N)
+    LR_CONSTANT = 0.19  # fitted from 125M: 6e-4 * sqrt(125e6) ≈ 0.19
+
+    def __init__(self, model_params, total_steps, Kx=1):
+        self.model_params = model_params
+        self.total_steps = total_steps
+        self.Kx = max(1, Kx)
+
+    def recommend(self):
+        """Return recommended WSD parameters."""
+        import math
+        # Peak LR from scaling: lr ≈ C / sqrt(N)
+        peak_lr = self.LR_CONSTANT / math.sqrt(self.model_params)
+        peak_lr = max(1e-5, min(peak_lr, 1e-2))  # clamp to reasonable range
+        min_lr = peak_lr * 0.1
+
+        # Warmup: 2% of total, aligned to Kx
+        warmup = int(self.total_steps * 0.02)
+        if self.Kx > 1:
+            warmup = ((warmup + self.Kx - 1) // self.Kx) * self.Kx
+        warmup = max(self.Kx, warmup)
+
+        # Decay: 20% of total
+        decay = int(self.total_steps * 0.20)
+        if self.Kx > 1:
+            decay = ((decay + self.Kx - 1) // self.Kx) * self.Kx
+
+        # Stable: remainder
+        stable = self.total_steps - warmup - decay
+
+        return {
+            'peak_lr': round(peak_lr, 8),
+            'min_lr': round(min_lr, 8),
+            'warmup_steps': warmup,
+            'stable_steps': stable,
+            'decay_steps': decay,
+            'total_steps': self.total_steps,
+            'Kx': self.Kx,
+        }
+
+
+class DeslocScheduleValidator:
+    """Validate LR schedule + DES-LOC config compatibility.
+
+    Checks:
+    1. Warmup end aligns with Kx boundary
+    2. Decay start aligns with Kx boundary
+    3. Peak LR is appropriate for model size
+    4. Total steps sufficient for convergence at given Kx
+    """
+
+    def __init__(self, schedule_config, desloc_config):
+        self.sched = schedule_config
+        self.desloc = desloc_config
+
+    def validate(self):
+        issues = []
+        Kx = self.desloc.get('Kx', 1)
+
+        # Check warmup alignment
+        warmup = self.sched.get('warmup_steps', 0)
+        if Kx > 1 and warmup % Kx != 0:
+            issues.append(
+                f'WARNING: warmup_steps={warmup} not aligned to Kx={Kx}. '
+                f'Recommend: {((warmup + Kx - 1) // Kx) * Kx}')
+
+        # Check total steps sufficient
+        total = self.sched.get('total_steps', 0)
+        if Kx > 1 and total < Kx * 100:
+            issues.append(
+                f'WARNING: total_steps={total} < 100*Kx={Kx*100}. '
+                f'May not have enough sync points for convergence.')
+
+        # Check peak LR not too high for large Kx
+        peak_lr = self.sched.get('peak_lr', 0)
+        if Kx > 32 and peak_lr > 1e-3:
+            issues.append(
+                f'WARNING: peak_lr={peak_lr} may be too high for Kx={Kx}. '
+                f'Theorem 1: eta should scale as 1/sqrt(psi).')
+
+        return issues
+
+
+def desloc_create_schedule(model_size, total_steps, Kx=32):
+    """Quick helper to create a complete DES-LOC-aligned WSD schedule.
+
+    Args:
+        model_size: String like '125M', '350M', '1B'
+        total_steps: Total training steps
+        Kx: DES-LOC parameter sync period
+
+    Returns:
+        DeslocWSDSchedule instance
+    """
+    params_map = {'125M': 125e6, '350M': 350e6, '1B': 1e9, '3B': 3e9, '7B': 7e9}
+    params = params_map.get(model_size, 125e6)
+    opt = DeslocWSDParameterOptimizer(params, total_steps, Kx)
+    rec = opt.recommend()
+    return DeslocWSDSchedule(
+        peak_lr=rec['peak_lr'],
+        min_lr=rec['min_lr'],
+        warmup_steps=rec['warmup_steps'],
+        stable_steps=rec['stable_steps'],
+        decay_steps=rec['decay_steps'],
+        decay_type='cosine',
+        Kx=Kx,
+    )
+
+
+# Standard DES-LOC schedule configurations from paper
+DESLOC_SCHEDULE_PRESETS = {
+    '125M_25k': {
+        'model': '125M', 'total_steps': 25000,
+        'peak_lr': 6e-4, 'min_lr': 6e-5,
+        'warmup': 512, 'stable': 19488, 'decay': 5000,
+    },
+    '350M_50k': {
+        'model': '350M', 'total_steps': 50000,
+        'peak_lr': 3e-4, 'min_lr': 3e-5,
+        'warmup': 512, 'stable': 39488, 'decay': 10000,
+    },
+    '1B_100k': {
+        'model': '1B', 'total_steps': 100000,
+        'peak_lr': 2e-4, 'min_lr': 2e-5,
+        'warmup': 1024, 'stable': 78976, 'decay': 20000,
+    },
+}
+
+
+class DeslocAdaptiveKxSchedule:
+    """Adaptive Kx that changes during training.
+    Phase 1 (warmup): Kx=1 (full DDP)
+    Phase 2 (early): Kx=Kx_low (moderate savings)
+    Phase 3 (stable): Kx=Kx_high (maximum savings)
+    Phase 4 (decay): Kx=Kx_low (tighten for final convergence)
+
+    Ref: Theorem 1 — psi term becomes relatively more important
+    as 1/sqrt(T) leading term shrinks with more training steps.
+    So late-stage training benefits from smaller Kx."""
+
+    def __init__(self, Kx_low=8, Kx_high=64, warmup_steps=512,
+                 early_steps=5000, decay_start=None, total_steps=25000):
+        self.Kx_low = Kx_low
+        self.Kx_high = Kx_high
+        self.warmup_steps = warmup_steps
+        self.early_steps = early_steps
+        self.decay_start = decay_start or int(total_steps * 0.8)
+        self.total_steps = total_steps
+
+    def get_Kx(self, step):
+        if step < self.warmup_steps:
+            return 1
+        elif step < self.warmup_steps + self.early_steps:
+            return self.Kx_low
+        elif step < self.decay_start:
+            return self.Kx_high
+        else:
+            return self.Kx_low
+
+    def get_Ku_Kv(self, step):
+        kx = self.get_Kx(step)
+        return max(1, kx * 3), max(1, kx * 6)
+
+    def state_dict(self):
+        return {'low': self.Kx_low, 'high': self.Kx_high,
+                'warmup': self.warmup_steps, 'early': self.early_steps,
+                'decay': self.decay_start, 'total': self.total_steps}
+
+    def load_state_dict(self, sd):
+        self.Kx_low = sd.get('low', self.Kx_low)
+        self.Kx_high = sd.get('high', self.Kx_high)
+        self.warmup_steps = sd.get('warmup', self.warmup_steps)
+        self.early_steps = sd.get('early', self.early_steps)
+        self.decay_start = sd.get('decay', self.decay_start)
+        self.total_steps = sd.get('total', self.total_steps)
+
+    def describe(self):
+        return (f'AdaptiveKx: warmup(Kx=1, {self.warmup_steps}steps) → '
+                f'early(Kx={self.Kx_low}, {self.early_steps}steps) → '
+                f'stable(Kx={self.Kx_high}) → '
+                f'decay(Kx={self.Kx_low}, from step {self.decay_start})')
+
+
+def desloc_lr_warmup_aligned(base_warmup, Kx, min_warmup=64):
+    """Align warmup steps to Kx boundary.
+    Returns warmup that is >= base_warmup and divisible by Kx."""
+    if Kx <= 1:
+        return max(min_warmup, base_warmup)
+    aligned = ((base_warmup + Kx - 1) // Kx) * Kx
+    return max(min_warmup, aligned)

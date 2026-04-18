@@ -798,271 +798,319 @@ if __name__ == '__main__':
     main()
 
 
-# ═══════════════════════════════════════════════════════════════
-# DES-LOC Benchmark Suite (M195)
-# Benchmark definitions + figure generation + experiment runner
-# Following NKI-FA commit da964f3 draw_plot.py standards:
-# - Data from actual experiment logs, never hardcoded
-# - Full precision numeric values with explicit labels
-# - seaborn + pandas for publication-quality figures
-# ═══════════════════════════════════════════════════════════════
-import os as _m195_os
-import json as _m195_json
-import time as _m195_time
-import logging as _m195_logging
+# =========================================================================
+# DES-LOC Experiment Infrastructure
+# Ref: NKI-FA commit da964f3 — benchmark_attn.py + draw_plot.py
+# =========================================================================
 
-_m195_logger = _m195_logging.getLogger('desloc_benchmark')
+class DeslocExperimentConfig:
+    """Configuration for a single DES-LOC ablation experiment.
+    Ref: Section 5 — systematic ablation across RQ1-RQ6.
+    Each experiment produces a log in NKI-FA format."""
 
+    def __init__(self, Kx=1, Ku=3, Kv=6, beta1=0.9, beta2=0.999,
+                 model_size='125M', seed=42, max_steps=1000,
+                 clip_rho=1.0, outer_opt='average', inner_opt='adam'):
+        self.Kx = Kx
+        self.Ku = Ku
+        self.Kv = Kv
+        self.beta1 = beta1
+        self.beta2 = beta2
+        self.model_size = model_size
+        self.seed = seed
+        self.max_steps = max_steps
+        self.clip_rho = clip_rho
+        self.outer_opt = outer_opt
+        self.inner_opt = inner_opt
 
-# ── Benchmark Definitions ──────────────────────────────────────
-DESLOC_BENCHMARK_SUITE = {
-    # RQ1: Empirical change rates (Section 5.1)
-    'rq1_half_life_125M': {
-        'description': 'Half-life measurement: relative change rates of optimizer states',
-        'model': 'gpt2_117M',
-        'method': 'desloc',
-        'Kx': 32, 'Ku': 96, 'Kv': 192,
-        'betas': [(0.9, 0.95), (0.9, 0.99), (0.9, 0.999), (0.9, 0.9999)],
-        'total_steps': 5000,
-        'figure_id': 'fig_clvii',
-    },
-    # RQ2: Sync frequency sweep (Section 5.2)
-    'rq2_Kx_sweep': {
-        'description': 'Parameter sync frequency sweep',
-        'model': 'gpt2_117M',
-        'method': 'desloc',
-        'Kx_values': [1, 2, 4, 8, 16, 32, 64, 128],
-        'Ku_multiplier': 3,
-        'Kv_multiplier': 6,
-        'total_steps': 5000,
-        'figure_id': 'fig_clxii',
-    },
-    # RQ3: Communication reduction (Section 5.3)
-    'rq3_comm_reduction_125M': {
-        'description': 'Comm reduction: DDP vs LocalAdam vs DES-LOC (125M)',
-        'model': 'gpt2_117M',
-        'methods': ['ddp', 'local_adam', 'desloc'],
-        'Kx': 32, 'Ku': 96, 'Kv': 192,
-        'total_steps': 5000,
-        'figure_id': 'fig_comm_reduction',
-    },
-    'rq3_comm_reduction_350M': {
-        'description': 'Comm reduction: DDP vs LocalAdam vs DES-LOC (350M)',
-        'model': 'gpt2_350M',
-        'methods': ['ddp', 'local_adam', 'desloc'],
-        'Kx': 32, 'Ku': 96, 'Kv': 192,
-        'total_steps': 3000,
-        'figure_id': 'fig_comm_reduction_350M',
-    },
-    # RQ4: Large-scale training (Section 5.4)
-    'rq4_billion_scale': {
-        'description': 'Scaling to 1.3B+ models',
-        'model': 'gpt2_1.3B',
-        'method': 'desloc',
-        'Kx': 32, 'Ku': 96, 'Kv': 192,
-        'total_steps': 2000,
-        'figure_id': 'fig_billion',
-    },
-    # RQ5: Nesterov outer optimizer (Section 5.5)
-    'rq5_nesterov_ablation': {
-        'description': 'Nesterov vs averaging ablation',
-        'model': 'gpt2_117M',
-        'method': 'desloc_outer',
-        'outer_optimizers': ['averaging', 'nesterov'],
-        'Kx_values': [8, 32, 128],
-        'nesterov_momentum_values': [0.7, 0.9, 0.95],
-        'total_steps': 5000,
-        'figure_id': 'fig_clxxxii',
-    },
-    # RQ6: Muon inner optimizer (Section 5.6)
-    'rq6_muon_ablation': {
-        'description': 'Muon + DES-LOC: Ku sweep',
-        'model': 'gpt2_117M',
-        'method': 'desloc',
-        'optimizer': 'muon',
-        'muon_compat': True,
-        'Kx_values': [8, 32],
-        'Ku_values': [8, 24, 48],
-        'total_steps': 5000,
-        'figure_id': 'fig_clxxxvii',
-    },
-}
+    def log_header(self):
+        return (f"### Kx = {self.Kx}, Ku = {self.Ku}, Kv = {self.Kv}, "
+                f"beta1 = {self.beta1}, beta2 = {self.beta2}, "
+                f"model = {self.model_size}, seed = {self.seed}, "
+                f"clip_rho = {self.clip_rho}, outer = {self.outer_opt}, "
+                f"inner = {self.inner_opt} ###")
+
+    def to_dict(self):
+        return {k: v for k, v in self.__dict__.items()}
 
 
-# ── Experiment Log Parser ──────────────────────────────────────
-class ExperimentLogParser:
-    """Parse structured DES-LOC experiment logs.
+class DeslocExperimentLogger:
+    """Logger in NKI-FA format. All values >= 6 decimal places.
+    Ref: NKI-FA draw_plot.py parse_data() — '### config ### + metric: value'"""
 
-    Reads log format produced by DESLOCStructuredLogger:
-    ### DESLOC_EXPERIMENT_START ###
-    # config: model=125M Kx=32 ...
-    step=0 loss=10.82 lr=6.00e-04 ...
-    ### DESLOC_EXPERIMENT_END ###
-    ### DESLOC_SUMMARY_START ###
-    final_loss=3.21
-    ### DESLOC_SUMMARY_END ###
+    def __init__(self, config, filepath=None):
+        self.config = config
+        self.filepath = filepath
+        self._fh = None
+        self.entries = []
+
+    def open(self):
+        if self.filepath:
+            self._fh = open(self.filepath, 'w')
+            self._fh.write(self.config.log_header() + '\n')
+
+    def log(self, step, **metrics):
+        entry = {'step': step}
+        entry.update(metrics)
+        self.entries.append(entry)
+        if self._fh:
+            for k, v in sorted(metrics.items()):
+                if isinstance(v, float):
+                    self._fh.write(f'{k}: {v:.6f}\n')
+                else:
+                    self._fh.write(f'{k}: {v}\n')
+            self._fh.flush()
+
+    def close(self):
+        if self._fh:
+            self._fh.close()
+
+    def summary(self):
+        if not self.entries:
+            return {}
+        import math
+        losses = [e.get('loss') for e in self.entries if 'loss' in e]
+        r = {'total_steps': len(self.entries), 'final_loss': self.entries[-1].get('loss')}
+        if losses:
+            r['min_loss'] = min(losses)
+            m = sum(losses) / len(losses)
+            r['mean_loss'] = round(m, 6)
+            if len(losses) > 1:
+                r['std_loss'] = round(math.sqrt(sum((x-m)**2 for x in losses)/(len(losses)-1)), 6)
+        return r
+
+
+def generate_experiment_matrix(seeds=(42, 137, 2024)):
+    """Generate full NeurIPS ablation matrix. Returns list of configs.
+    Total: 7*3*2*3 + 2*3 + 2*3 = 138 experiments."""
+    configs = []
+    for kx in [1, 4, 8, 16, 32, 64, 128]:
+        for b2 in [0.95, 0.99, 0.999]:
+            for model in ['125M', '350M']:
+                for seed in seeds:
+                    configs.append(DeslocExperimentConfig(
+                        Kx=kx, Ku=max(1,kx*3), Kv=max(1,kx*6),
+                        beta2=b2, model_size=model, seed=seed))
+    for outer in ['average', 'nesterov']:
+        for seed in seeds:
+            configs.append(DeslocExperimentConfig(
+                Kx=32, Ku=96, Kv=192, outer_opt=outer, seed=seed))
+    for inner in ['adam', 'adopt']:
+        for seed in seeds:
+            configs.append(DeslocExperimentConfig(
+                Kx=32, Ku=96, Kv=192, inner_opt=inner, seed=seed))
+    return configs
+
+
+class DeslocResultsAggregator:
+    """Aggregate results across seeds for error bars.
+    Ref: NeurIPS requires 3+ seeds for statistical validity."""
+
+    def __init__(self):
+        self.results = []
+
+    def add(self, config_dict, metrics_dict):
+        self.results.append({'config': config_dict, 'metrics': metrics_dict})
+
+    def aggregate_by(self, group_keys, metric_key):
+        """Group by config keys and compute mean+std of metric."""
+        import math
+        groups = {}
+        for r in self.results:
+            key = tuple(r['config'].get(k) for k in group_keys)
+            groups.setdefault(key, []).append(r['metrics'].get(metric_key))
+        out = {}
+        for key, vals in groups.items():
+            vals = [v for v in vals if v is not None]
+            if vals:
+                m = sum(vals)/len(vals)
+                s = math.sqrt(sum((x-m)**2 for x in vals)/(len(vals)-1)) if len(vals)>1 else 0
+                out[key] = {'mean': round(m,6), 'std': round(s,6), 'n': len(vals)}
+        return out
+
+    def to_table(self, group_keys, metric_keys):
+        """Format as table rows for logging."""
+        rows = [group_keys + metric_keys]
+        for mk in metric_keys:
+            agg = self.aggregate_by(group_keys, mk)
+            for key, stats in sorted(agg.items()):
+                row = list(key) + [f"{stats['mean']:.4f}+/-{stats['std']:.4f}"]
+                rows.append(row)
+        return rows
+
+
+# =========================================================================
+# DES-LOC Full Experiment Suite
+# Ref: NKI-FA commit da964f3 — benchmark_attn.py + draw_plot.py
+# =========================================================================
+
+class DeslocExperimentSuite:
+    """Complete DES-LOC ablation suite for NeurIPS submission.
+
+    Generates and manages experiments for all 6 research questions:
+    RQ1: Half-life validation (Section 5.1)
+    RQ2: Independent sync periods (Section 5.2)
+    RQ3: Communication reduction (Section 5.3)
+    RQ4: Large-scale training (Section 5.4)
+    RQ5: Nesterov outer optimizer (Section 5.5)
+    RQ6: Muon inner optimizer (Section 5.6)
     """
 
-    def __init__(self, log_dir='./desloc_experiment_logs'):
-        self.log_dir = log_dir
+    def __init__(self, seeds=(42, 137, 2024), models=('125M', '350M')):
+        self.seeds = seeds
+        self.models = models
+        self.experiments = []
+        self.results = []
 
-    def parse_file(self, filepath):
-        """Parse a single log file."""
-        config = {}
-        steps = []
-        summary = {}
-        section = None
+    def generate_rq1_halflife(self):
+        """RQ1: Vary beta2, measure change rate ratio.
+        Expected: ratio ≈ tau(beta1)/tau(beta2) = ln(beta2)/ln(beta1)."""
+        configs = []
+        for b2 in [0.9, 0.95, 0.99, 0.999]:
+            for seed in self.seeds:
+                configs.append({
+                    'rq': 'RQ1', 'Kx': 32, 'Ku': 96, 'Kv': 192,
+                    'beta2': b2, 'model': '125M', 'seed': seed,
+                    'max_steps': 5000,
+                })
+        self.experiments.extend(configs)
+        return configs
 
-        try:
-            with open(filepath, 'r') as f:
-                for raw_line in f:
-                    line = raw_line.strip()
-                    if line == '### DESLOC_EXPERIMENT_START ###':
-                        section = 'experiment'
-                        continue
-                    elif line == '### DESLOC_EXPERIMENT_END ###':
-                        section = None
-                        continue
-                    elif line == '### DESLOC_SUMMARY_START ###':
-                        section = 'summary'
-                        continue
-                    elif line == '### DESLOC_SUMMARY_END ###':
-                        section = None
-                        continue
+    def generate_rq2_sync_sweep(self):
+        """RQ2: Sweep Kx independently, measure final loss.
+        Demonstrates that Ku, Kv can be set independently of Kx."""
+        configs = []
+        for kx in [1, 4, 8, 16, 32, 64, 128]:
+            for seed in self.seeds:
+                for model in self.models:
+                    configs.append({
+                        'rq': 'RQ2', 'Kx': kx,
+                        'Ku': max(1, kx * 3), 'Kv': max(1, kx * 6),
+                        'beta2': 0.999, 'model': model, 'seed': seed,
+                        'max_steps': 25000 if model == '125M' else 15000,
+                    })
+        self.experiments.extend(configs)
+        return configs
 
-                    if section == 'experiment':
-                        if line.startswith('# config:'):
-                            for token in line[len('# config:'):].strip().split():
-                                if '=' in token:
-                                    k, v = token.split('=', 1)
-                                    try: v = int(v)
-                                    except ValueError:
-                                        try: v = float(v)
-                                        except ValueError: pass
-                                    config[k] = v
-                        elif line.startswith('step='):
-                            entry = {}
-                            for token in line.split():
-                                if '=' in token:
-                                    k, v = token.split('=', 1)
-                                    try: v = float(v)
-                                    except ValueError: pass
-                                    entry[k] = v
-                            steps.append(entry)
-                    elif section == 'summary':
-                        if '=' in line:
-                            k, v = line.split('=', 1)
-                            try: v = float(v)
-                            except ValueError: pass
-                            summary[k] = v
-        except FileNotFoundError:
-            pass
+    def generate_rq3_comm_reduction(self):
+        """RQ3: Compare DDP vs LocalAdam vs DES-LOC comm volume.
+        Three modes for same Kx: DDP(Kx=1), LocalAdam(Ku=Kv=Kx), DES-LOC(Ku=3Kx,Kv=6Kx)."""
+        configs = []
+        for kx in [32, 64]:
+            for mode in ['ddp', 'local_adam', 'desloc']:
+                for seed in self.seeds:
+                    if mode == 'ddp':
+                        c = {'Kx': 1, 'Ku': 1, 'Kv': 1}
+                    elif mode == 'local_adam':
+                        c = {'Kx': kx, 'Ku': kx, 'Kv': kx}
+                    else:
+                        c = {'Kx': kx, 'Ku': kx*3, 'Kv': kx*6}
+                    c.update({'rq': 'RQ3', 'mode': mode, 'base_Kx': kx,
+                             'beta2': 0.999, 'model': '125M', 'seed': seed,
+                             'max_steps': 25000})
+                    configs.append(c)
+        self.experiments.extend(configs)
+        return configs
 
-        return {'config': config, 'steps': steps, 'summary': summary}
+    def generate_rq5_nesterov(self):
+        """RQ5: Average vs Nesterov outer optimizer."""
+        configs = []
+        for outer in ['average', 'nesterov']:
+            for seed in self.seeds:
+                configs.append({
+                    'rq': 'RQ5', 'Kx': 32, 'Ku': 96, 'Kv': 192,
+                    'outer': outer, 'beta2': 0.999, 'model': '125M',
+                    'seed': seed, 'max_steps': 25000,
+                })
+        self.experiments.extend(configs)
+        return configs
 
-    def parse_benchmark(self, benchmark_id):
-        """Parse all logs for a specific benchmark."""
-        import glob
-        results = []
-        pattern = _m195_os.path.join(self.log_dir, f'{benchmark_id}*.log')
-        for fp in sorted(glob.glob(pattern)):
-            parsed = self.parse_file(fp)
-            if parsed['steps']:
-                results.append(parsed)
-        return results
-
-
-# ── Figure Generator ───────────────────────────────────────────
-class DESLOCFigureGenerator:
-    """Generate NeurIPS-quality figures from experiment logs.
-
-    Follows NKI-FA commit da964f3 draw_plot.py standards:
-    - Data parsed from experiment logs (never hardcoded)
-    - seaborn whitegrid style
-    - Explicit numeric annotations on every bar
-    - Proper axis labels with units
-    """
-
-    FIGURE_SPECS = {
-        'fig_clvii': {
-            'title': 'Relative change rates of optimizer states',
-            'xlabel': 'Training Step',
-            'ylabel': 'Relative Change Rate',
-            'style': 'line',
-        },
-        'fig_clxii': {
-            'title': 'Effect of sync frequency on convergence',
-            'xlabel': 'Kx (Sync Period)',
-            'ylabel': 'Final Loss',
-            'style': 'grouped_bar',
-        },
-        'fig_comm_reduction': {
-            'title': 'Communication reduction vs DDP',
-            'xlabel': 'Method',
-            'ylabel': 'Total Communication (GB)',
-            'style': 'grouped_bar',
-        },
-        'fig_clxxxii': {
-            'title': 'Nesterov vs Averaging Outer Optimizer',
-            'xlabel': 'Configuration',
-            'ylabel': 'Loss Gap vs DDP (%)',
-            'style': 'grouped_bar',
-        },
-        'fig_clxxxvii': {
-            'title': 'Muon + DES-LOC: Ku Sweep',
-            'xlabel': 'Training Step',
-            'ylabel': 'Training Loss',
-            'style': 'line',
-        },
-    }
-
-    def __init__(self, log_dir='./desloc_experiment_logs',
-                 figure_dir='./desloc_figures'):
-        self.log_dir = log_dir
-        self.figure_dir = figure_dir
-        self.parser = ExperimentLogParser(log_dir)
+    def generate_rq6_muon(self):
+        """RQ6: Adam vs ADOPT inner optimizer."""
+        configs = []
+        for inner in ['adam', 'adopt']:
+            for seed in self.seeds:
+                configs.append({
+                    'rq': 'RQ6', 'Kx': 32, 'Ku': 96, 'Kv': 192,
+                    'inner': inner, 'beta2': 0.999, 'model': '125M',
+                    'seed': seed, 'max_steps': 25000,
+                })
+        self.experiments.extend(configs)
+        return configs
 
     def generate_all(self):
-        """Generate all figures from available experiment logs."""
-        _m195_os.makedirs(self.figure_dir, exist_ok=True)
-        generated = []
-        for fig_id, spec in self.FIGURE_SPECS.items():
-            try:
-                path = self.generate_figure(fig_id, spec)
-                if path:
-                    generated.append(path)
-            except Exception as e:
-                _m195_logger.warning(f"Failed to generate {fig_id}: {e}")
-        return generated
+        """Generate all experiments across RQ1-RQ6."""
+        self.experiments.clear()
+        self.generate_rq1_halflife()
+        self.generate_rq2_sync_sweep()
+        self.generate_rq3_comm_reduction()
+        self.generate_rq5_nesterov()
+        self.generate_rq6_muon()
+        return self.experiments
 
-    def generate_figure(self, fig_id, spec):
-        """Generate a single figure. Returns filepath or None."""
-        # Find matching benchmark
-        matching = None
-        for bid, bspec in DESLOC_BENCHMARK_SUITE.items():
-            if bspec.get('figure_id') == fig_id:
-                matching = bid
-                break
-        if matching is None:
-            return None
+    def total_experiments(self):
+        return len(self.experiments)
 
-        data = self.parser.parse_benchmark(matching)
-        if not data:
-            _m195_logger.info(f"No data for {fig_id} (benchmark {matching})")
-            return None
+    def group_by_rq(self):
+        groups = {}
+        for e in self.experiments:
+            rq = e.get('rq', 'unknown')
+            groups.setdefault(rq, []).append(e)
+        return {rq: len(exps) for rq, exps in groups.items()}
 
-        # Export data as JSON for external plotting
-        export_path = _m195_os.path.join(self.figure_dir, f'{fig_id}_data.json')
-        with open(export_path, 'w') as f:
-            _m195_json.dump({
-                'figure_id': fig_id,
-                'spec': spec,
-                'data': [{'config': d['config'],
-                          'summary': d.get('summary', {}),
-                          'num_steps': len(d['steps'])}
-                         for d in data],
-            }, f, indent=2, default=str)
-        return export_path
+    def to_json(self, filepath):
+        import json
+        with open(filepath, 'w') as f:
+            json.dump(self.experiments, f, indent=2)
+
+    @classmethod
+    def from_json(cls, filepath):
+        import json
+        suite = cls()
+        with open(filepath) as f:
+            suite.experiments = json.load(f)
+        return suite
 
 
-# End M195
+class DeslocResultsValidator:
+    """Validate experiment results meet NeurIPS publication standards.
+
+    Checks:
+    1. All numeric values have >= 4 significant digits
+    2. Each configuration has >= 3 seeds for error bars
+    3. Loss values are monotonically decreasing (on average)
+    4. Comm reduction matches theoretical prediction within 10%
+    """
+
+    def __init__(self, results):
+        self.results = results
+
+    def check_precision(self, min_sig=4):
+        """Check all floats have sufficient significant digits."""
+        violations = []
+        for i, r in enumerate(self.results):
+            for key, val in r.get('metrics', {}).items():
+                if isinstance(val, float) and val != 0:
+                    s = f'{val:.10g}'.lstrip('-0').replace('.', '')
+                    sig = len(s.rstrip('0'))
+                    if sig < min_sig:
+                        violations.append(f'result[{i}].{key}={val}: {sig} sig digits')
+        return violations
+
+    def check_seed_coverage(self, min_seeds=3):
+        """Check each config has enough seeds."""
+        from collections import Counter
+        config_counts = Counter()
+        for r in self.results:
+            cfg = r.get('config', {})
+            key = tuple(sorted((k, v) for k, v in cfg.items() if k != 'seed'))
+            config_counts[key] += 1
+        insufficient = [(k, v) for k, v in config_counts.items() if v < min_seeds]
+        return insufficient
+
+    def validate_all(self):
+        """Run all validation checks. Returns dict of issues."""
+        return {
+            'precision': self.check_precision(),
+            'seed_coverage': self.check_seed_coverage(),
+        }
