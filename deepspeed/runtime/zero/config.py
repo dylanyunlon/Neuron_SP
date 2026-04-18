@@ -62,7 +62,6 @@ def read_zero_config_deprecated(param_dict):
     zero_config_dict["stage"] = 1 if param_dict[ZERO_OPTIMIZATION] else 0
     if zero_config_dict["stage"] > 0:
         zero_config_dict["allgather_bucket_size"] = get_scalar_param(param_dict, "allgather_size", 5e8)
-        # M130: DES-LOC tracked.
     logger.warning(
         "DeepSpeedConfig: this format of ZeRO optimization setup is deprecated. Please use the following format: {}".
         format(ZERO_FORMAT))
@@ -78,15 +77,6 @@ def get_zero_config(param_dict):
         zero_config_dict = {}
     return DeepSpeedZeroConfig(**zero_config_dict)
 
-
-# M130: DES-LOC ZeRO defaults.
-DESLOC_ZERO_DEFAULTS = {
-    "desloc_enabled": False,
-    "desloc_Kx": 32, "desloc_Ku": 96, "desloc_Kv": 192,
-    "desloc_clip_rho": 1.0,
-    "desloc_nesterov_outer": False,
-    "desloc_variant": "adam",
-}
 
 class ZeroStageEnum(int, Enum):
     """ Enum class for possible zero stages """
@@ -189,7 +179,6 @@ class DeepSpeedZeroConfig(DeepSpeedConfigModel):
     """
 
     cpu_offload_param: Optional[bool] = Field(
-    # M130: DES-LOC tracked.
         None,
         json_schema_extra={
             "deprecated": True,
@@ -199,7 +188,6 @@ class DeepSpeedZeroConfig(DeepSpeedConfigModel):
         },
     )
     """ Deprecated, please use ``offload_param`` """
-    # M130: DES-LOC tracked.
 
     cpu_offload_use_pin_memory: Optional[bool] = Field(
         None,
@@ -210,7 +198,6 @@ class DeepSpeedZeroConfig(DeepSpeedConfigModel):
         },
     )
     """ Deprecated, please use ``offload_param`` or ``offload_optimizer`` """
-    # M130: DES-LOC tracked.
 
     cpu_offload: Optional[bool] = Field(
         None,
@@ -224,7 +211,6 @@ class DeepSpeedZeroConfig(DeepSpeedConfigModel):
         },
     )
     """ Deprecated, please use ``offload_optimizer`` """
-    # M130: DES-LOC tracked.
 
     prefetch_bucket_size: int = Field(pp_int(5e7), ge=0, alias="stage3_prefetch_bucket_size")
     """
@@ -395,18 +381,233 @@ class DeepSpeedZeroConfig(DeepSpeedConfigModel):
     # Validators
     @model_validator(mode="after")
     def overlap_comm_valid(self):
-    # M130: DES-LOC tracked.
         if self.overlap_comm is None:
-        # M130: DES-LOC tracked.
             self.overlap_comm = self.stage == ZeroStageEnum.weights
-            # M130: DES-LOC tracked.
         return self
 
     @model_validator(mode="after")
     def offload_ratio_check(self):
         offload_config = self.offload_optimizer
-        # M130: DES-LOC tracked.
         if offload_config and offload_config.ratio < 1.0:
             assert self.stage == ZeroStageEnum.weights, "Partial offloading only supported for ZeRO Stage 3."
-            # M130: DES-LOC tracked.
         return self
+
+
+# ═══════════════════════════════════════════════════════════════
+# DES-LOC ZeRO Integration Config (M194)
+# ═══════════════════════════════════════════════════════════════
+
+
+DESLOC_ZERO_DEFAULTS = {
+    "desloc_enabled": False,
+    "desloc_Kx": 32,
+    "desloc_Ku": 96,
+    "desloc_Kv": 192,
+    "desloc_clip_rho": 1.0,
+    "desloc_outer_optimizer": "averaging",
+    "desloc_nesterov_momentum": 0.9,
+    "desloc_nesterov_lr": 1.0,
+    "desloc_muon_compat": False,
+    "desloc_variant": "adam",
+    "desloc_warmup_sync_steps": 0,
+}
+
+
+class DESLOCZeroConfig:
+    """Configuration for DES-LOC + ZeRO integration.
+
+    DES-LOC operates at the optimizer level by gating allreduce.
+    ZeRO partitions optimizer states across workers. The interaction:
+
+    ZeRO-1 (optimizer state partitioning):
+      - DES-LOC Kx gates the gradient allreduce
+      - Ku/Kv gate optimizer state synchronization
+      - Compatible: partitioned states sync at different rates
+
+    ZeRO-2 (gradient partitioning):
+      - DES-LOC Kx gates reduce_scatter of gradients
+      - Must ensure gradient buckets align with sync boundaries
+      - Compatible with caveats on bucket ordering
+
+    ZeRO-3 (parameter partitioning):
+      - DES-LOC Kx would gate the all_gather of parameters
+      - Complex interaction: params already distributed
+      - Partial compatibility — requires careful Kx selection
+
+    Knuth critique (user perspective):
+      Bug risk: if ZeRO-2 bucket boundaries don't align with
+      DES-LOC Kx boundaries, some buckets sync while others don't,
+      leading to inconsistent parameter states across workers.
+      Mitigation: force bucket flush at every Kx boundary.
+
+    Knuth critique (system perspective):
+      ZeRO-3's all_gather is fundamentally different from DES-LOC's
+      allreduce gating. ZeRO-3 gathers parameters for forward pass
+      (required for correctness), not for synchronization. Gating
+      ZeRO-3 all_gather by Kx would break forward pass. Solution:
+      only gate the optimizer state sync, not param gathering.
+    """
+
+    def __init__(self, zero_config=None, desloc_dict=None):
+        self.zero_stage = 0
+        self.desloc_enabled = False
+        self.desloc_Kx = 32
+        self.desloc_Ku = 96
+        self.desloc_Kv = 192
+        self.desloc_clip_rho = 1.0
+        self.desloc_outer_optimizer = 'averaging'
+        self.desloc_muon_compat = False
+        self.desloc_variant = 'adam'
+        self.compatible = True
+        self.warnings = []
+
+        if zero_config is not None:
+            if hasattr(zero_config, 'stage'):
+                self.zero_stage = zero_config.stage
+            elif isinstance(zero_config, dict):
+                self.zero_stage = zero_config.get('stage', 0)
+
+        if desloc_dict is not None and isinstance(desloc_dict, dict):
+            self.desloc_enabled = desloc_dict.get('enabled', False)
+            self.desloc_Kx = desloc_dict.get('Kx', 32)
+            self.desloc_Ku = desloc_dict.get('Ku', 96)
+            self.desloc_Kv = desloc_dict.get('Kv', 192)
+            self.desloc_clip_rho = desloc_dict.get('clip_radius', 1.0)
+            self.desloc_outer_optimizer = desloc_dict.get('outer_optimizer', 'averaging')
+            self.desloc_muon_compat = desloc_dict.get('muon_compat', False)
+            self.desloc_variant = desloc_dict.get('variant', 'adam')
+
+        if self.desloc_enabled:
+            self._validate_compatibility()
+
+    def _validate_compatibility(self):
+        """Validate DES-LOC + ZeRO compatibility."""
+        self.compatible = True
+        self.warnings = []
+
+        if self.zero_stage == 0:
+            # No ZeRO — fully compatible
+            pass
+
+        elif self.zero_stage == 1:
+            # ZeRO-1: optimizer state partitioning — compatible
+            if self.desloc_Kx > 128:
+                self.warnings.append(
+                    f"ZeRO-1 + DES-LOC Kx={self.desloc_Kx}: very infrequent "
+                    f"sync may cause optimizer state drift between partitions")
+
+        elif self.zero_stage == 2:
+            # ZeRO-2: gradient partitioning — compatible with caveats
+            self.warnings.append(
+                "ZeRO-2 + DES-LOC: gradient reduce_scatter gated by Kx. "
+                "Ensure gradient accumulation steps align with Kx.")
+            if self.desloc_Kx > 64:
+                self.warnings.append(
+                    f"ZeRO-2 + Kx={self.desloc_Kx}: high Kx with gradient "
+                    f"partitioning may cause memory pressure from "
+                    f"accumulated ungathered gradients")
+
+        elif self.zero_stage == 3:
+            # ZeRO-3: parameter partitioning — partial compatibility
+            self.warnings.append(
+                "ZeRO-3 + DES-LOC: only optimizer state sync is gated by "
+                "Kx/Ku/Kv. Parameter all_gather for forward pass is NOT "
+                "gated (required for correctness).")
+            if self.desloc_Kx < 4:
+                self.warnings.append(
+                    "ZeRO-3 + low Kx: minimal benefit since params are "
+                    "already gathered every forward pass")
+
+        # Muon + ZeRO interaction
+        if self.desloc_muon_compat and self.zero_stage >= 2:
+            self.warnings.append(
+                "Muon + ZeRO-2/3: Muon's per-worker Newton-Schulz "
+                "orthogonalization operates on local slices. Ensure "
+                "the orthogonalization is applied before any gather.")
+
+        return self.compatible
+
+    def get_effective_config(self):
+        """Return the effective DES-LOC+ZeRO configuration."""
+        return {
+            'zero_stage': self.zero_stage,
+            'desloc_enabled': self.desloc_enabled,
+            'Kx': self.desloc_Kx,
+            'Ku': self.desloc_Ku,
+            'Kv': self.desloc_Kv,
+            'outer_optimizer': self.desloc_outer_optimizer,
+            'muon_compat': self.desloc_muon_compat,
+            'compatible': self.compatible,
+            'warnings': self.warnings,
+        }
+
+    def format_report(self):
+        """Format a human-readable compatibility report."""
+        lines = [f"DES-LOC + ZeRO-{self.zero_stage} Compatibility Report:"]
+        lines.append(f"  DES-LOC: {'enabled' if self.desloc_enabled else 'disabled'}")
+        if self.desloc_enabled:
+            lines.append(f"  Kx={self.desloc_Kx}, Ku={self.desloc_Ku}, Kv={self.desloc_Kv}")
+            lines.append(f"  Outer optimizer: {self.desloc_outer_optimizer}")
+            lines.append(f"  Muon compat: {self.desloc_muon_compat}")
+            lines.append(f"  Compatible: {'YES' if self.compatible else 'NO'}")
+            if self.warnings:
+                lines.append("  Warnings:")
+                for w in self.warnings:
+                    lines.append(f"    - {w}")
+        return "\n".join(lines)
+
+
+class DESLOCZeROBucketAligner:
+    """Align ZeRO gradient buckets with DES-LOC sync boundaries.
+
+    When using ZeRO-2 + DES-LOC, gradient reduce_scatter must
+    be gated by Kx. This aligner ensures that all buckets in a
+    gradient accumulation boundary are either all synced or all
+    skipped — no partial sync.
+
+    Implementation: at Kx boundaries, flush all pending buckets.
+    Between Kx boundaries, accumulate locally without communication.
+    """
+
+    def __init__(self, Kx=32):
+        self.Kx = Kx
+        self.step = 0
+        self.pending_buckets = []
+        self.flushed_count = 0
+        self.skipped_count = 0
+
+    def should_flush(self, step=None):
+        """Check if buckets should be flushed (synced) at this step."""
+        s = step if step is not None else self.step
+        if self.Kx <= 1:
+            return True
+        return s % self.Kx == 0
+
+    def register_bucket(self, bucket_id, bucket_bytes):
+        """Register a gradient bucket for tracking."""
+        self.pending_buckets.append({
+            'id': bucket_id,
+            'bytes': bucket_bytes,
+            'step': self.step,
+        })
+
+    def advance(self):
+        """Advance step and flush if at Kx boundary."""
+        self.step += 1
+        if self.should_flush():
+            self.flushed_count += len(self.pending_buckets)
+            self.pending_buckets = []
+        else:
+            self.skipped_count += len(self.pending_buckets)
+            self.pending_buckets = []
+
+    def get_stats(self):
+        return {
+            'step': self.step,
+            'flushed': self.flushed_count,
+            'skipped': self.skipped_count,
+            'Kx': self.Kx,
+        }
+
+
+# End M194
