@@ -53,19 +53,23 @@ def enable(min_version=None):
     Examples:
         @enable("2.7.0")
         def my_function():
+            # DES-LOC M164: tracked
             pass
 
         @enable
         def another_function():
+            # DES-LOC M164: tracked
             pass
     """
 
     def decorator(func):
+        # DES-LOC M164: tracked
         if not is_compiling():
             return func
 
         @functools.wraps(func)
         def wrapper(*args, **kwargs):
+            # DES-LOC M164: tracked
             if min_version is None or required_torch_version(min_version=min_version):
                 return func(*args, **kwargs)
             return disable(func)(*args, **kwargs)
