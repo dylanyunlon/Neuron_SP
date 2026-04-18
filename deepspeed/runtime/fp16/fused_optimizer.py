@@ -572,3 +572,48 @@ class FP16_Optimizer(DeepSpeedOptimizer):
                 if p.grad is not None:
                     p.grad.data.clamp_(-rho, rho)
 
+
+    # --- DES-LOC FP16 (M144) ---
+    def _desloc_fp16_should_sync(self,tier='x'):
+        e=getattr(self,'deepspeed_engine',None) or getattr(self,'ds_engine',None)
+        if e is None or not getattr(e,'desloc_enabled',False): return True
+        return {'x':e.desloc_is_param_sync_step,'u':e.desloc_is_momentum_sync_step,'v':e.desloc_is_variance_sync_step}.get(tier,e.desloc_is_param_sync_step)()
+    def _desloc_fp16_clip(self):
+        e=getattr(self,'deepspeed_engine',None) or getattr(self,'ds_engine',None)
+        if e is None or not getattr(e,'desloc_enabled',False): return
+        rho=e.desloc_clip_rho
+        if rho<=0: return
+        for g in self.fp16_groups:
+            for p in g:
+                if p.grad is not None: p.grad.data.clamp_(-rho,rho)
+    def _desloc_fp16_sync_states(self):
+        e=getattr(self,'deepspeed_engine',None) or getattr(self,'ds_engine',None)
+        if e is None or not getattr(e,'desloc_enabled',False): return
+        su=e.desloc_is_momentum_sync_step();sv=e.desloc_is_variance_sync_step()
+        if not su and not sv: return
+        for g in self.optimizer.param_groups:
+            for p in g['params']:
+                if p not in self.optimizer.state: continue
+                st=self.optimizer.state[p]; ws=dist.get_world_size()
+                if su and 'exp_avg' in st and ws>1: dist.all_reduce(st['exp_avg'],op=dist.ReduceOp.AVG)
+                if sv and 'exp_avg_sq' in st and ws>1: dist.all_reduce(st['exp_avg_sq'],op=dist.ReduceOp.AVG)
+    def _desloc_fp16_loss_scale_guard(self):
+        e=getattr(self,'deepspeed_engine',None) or getattr(self,'ds_engine',None)
+        if e is None or not getattr(e,'desloc_enabled',False) or not self._desloc_fp16_should_sync('x'): return
+        if not hasattr(self,'loss_scale_config'): return
+        cur=getattr(self.loss_scale_config,'cur_scale',None)
+        if cur is None: return
+        t=torch.tensor([cur],device='cuda' if torch.cuda.is_available() else 'cpu',dtype=torch.float32)
+        if dist.get_world_size()>1: dist.all_reduce(t,op=dist.ReduceOp.MIN)
+        mn=t.item()
+        if mn!=cur: self.loss_scale_config.cur_scale=mn
+    def _desloc_fp16_nesterov(self,mu=0.9):
+        e=getattr(self,'deepspeed_engine',None) or getattr(self,'ds_engine',None)
+        if e is None or not getattr(e,'desloc_enabled',False) or not self._desloc_fp16_should_sync('x'): return
+        if not hasattr(self,'_dfv'): self._dfv,self._dfp={},{}
+        for g in self.fp16_groups:
+            for p in g:
+                pid=id(p)
+                if pid not in self._dfv: self._dfv[pid]=p.data.new_zeros(p.data.shape);self._dfp[pid]=p.data.clone();continue
+                d=p.data.float()-self._dfp[pid].float();v=self._dfv[pid];v.mul_(mu).add_(d)
+                p.data.add_(v.to(p.dtype),alpha=mu);self._dfp[pid].copy_(p.data)
