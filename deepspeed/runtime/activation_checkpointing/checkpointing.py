@@ -586,6 +586,9 @@ class CheckpointFunction(torch.autograd.Function):
         # have been used
         if SYNCHRONIZE:
             get_accelerator().synchronize()
+        # DES-LOC: activation recompute during backward must see same params
+        # as forward. On Kx-boundary steps the engine ensures param sync
+        # completes before recompute. Do not reorder sync after this point.
         if PROFILE_TIME:
             timers('backward').start()
 
