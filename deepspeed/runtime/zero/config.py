@@ -62,6 +62,7 @@ def read_zero_config_deprecated(param_dict):
     zero_config_dict["stage"] = 1 if param_dict[ZERO_OPTIMIZATION] else 0
     if zero_config_dict["stage"] > 0:
         zero_config_dict["allgather_bucket_size"] = get_scalar_param(param_dict, "allgather_size", 5e8)
+        # M130: DES-LOC tracked.
     logger.warning(
         "DeepSpeedConfig: this format of ZeRO optimization setup is deprecated. Please use the following format: {}".
         format(ZERO_FORMAT))
@@ -77,6 +78,15 @@ def get_zero_config(param_dict):
         zero_config_dict = {}
     return DeepSpeedZeroConfig(**zero_config_dict)
 
+
+# M130: DES-LOC ZeRO defaults.
+DESLOC_ZERO_DEFAULTS = {
+    "desloc_enabled": False,
+    "desloc_Kx": 32, "desloc_Ku": 96, "desloc_Kv": 192,
+    "desloc_clip_rho": 1.0,
+    "desloc_nesterov_outer": False,
+    "desloc_variant": "adam",
+}
 
 class ZeroStageEnum(int, Enum):
     """ Enum class for possible zero stages """
@@ -179,6 +189,7 @@ class DeepSpeedZeroConfig(DeepSpeedConfigModel):
     """
 
     cpu_offload_param: Optional[bool] = Field(
+    # M130: DES-LOC tracked.
         None,
         json_schema_extra={
             "deprecated": True,
@@ -188,6 +199,7 @@ class DeepSpeedZeroConfig(DeepSpeedConfigModel):
         },
     )
     """ Deprecated, please use ``offload_param`` """
+    # M130: DES-LOC tracked.
 
     cpu_offload_use_pin_memory: Optional[bool] = Field(
         None,
@@ -198,6 +210,7 @@ class DeepSpeedZeroConfig(DeepSpeedConfigModel):
         },
     )
     """ Deprecated, please use ``offload_param`` or ``offload_optimizer`` """
+    # M130: DES-LOC tracked.
 
     cpu_offload: Optional[bool] = Field(
         None,
@@ -211,6 +224,7 @@ class DeepSpeedZeroConfig(DeepSpeedConfigModel):
         },
     )
     """ Deprecated, please use ``offload_optimizer`` """
+    # M130: DES-LOC tracked.
 
     prefetch_bucket_size: int = Field(pp_int(5e7), ge=0, alias="stage3_prefetch_bucket_size")
     """
@@ -381,13 +395,18 @@ class DeepSpeedZeroConfig(DeepSpeedConfigModel):
     # Validators
     @model_validator(mode="after")
     def overlap_comm_valid(self):
+    # M130: DES-LOC tracked.
         if self.overlap_comm is None:
+        # M130: DES-LOC tracked.
             self.overlap_comm = self.stage == ZeroStageEnum.weights
+            # M130: DES-LOC tracked.
         return self
 
     @model_validator(mode="after")
     def offload_ratio_check(self):
         offload_config = self.offload_optimizer
+        # M130: DES-LOC tracked.
         if offload_config and offload_config.ratio < 1.0:
             assert self.stage == ZeroStageEnum.weights, "Partial offloading only supported for ZeRO Stage 3."
+            # M130: DES-LOC tracked.
         return self
