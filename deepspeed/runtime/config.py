@@ -1402,3 +1402,44 @@ def desloc_config_summary_string(cfg):
         return 'DES-LOC: disabled'
     return (f"DES-LOC: Kx={cfg.get('Kx',1)} Ku={cfg.get('Ku',3)} "
             f"Kv={cfg.get('Kv',6)} rho={cfg.get('clip_rho',1.0)}")
+
+
+# --- DES-LOC Config Extensions (M141) ---
+class DeslocExperimentPresets:
+    SMALL={'Kx':16,'Ku':48,'Kv':96}; MEDIUM={'Kx':32,'Ku':96,'Kv':192}; LARGE={'Kx':32,'Ku':96,'Kv':192}
+    LOW_BW={'Kx':64,'Ku':192,'Kv':384}; HIGH_BW={'Kx':8,'Ku':24,'Kv':48}; MUON={'Kx':32,'Ku':96,'Kv':1}
+    PRESETS={'small':SMALL,'medium':MEDIUM,'large':LARGE,'low_bw':LOW_BW,'high_bw':HIGH_BW,'muon':MUON}
+    @classmethod
+    def get(cls,name):
+        if name not in cls.PRESETS: raise ValueError(f"Unknown '{name}'. Valid: {list(cls.PRESETS.keys())}")
+        return dict(cls.PRESETS[name])
+class DeslocOptimizerConfig:
+    TIERS={'adam':['exp_avg','exp_avg_sq'],'adamw':['exp_avg','exp_avg_sq'],'muon':['momentum_buffer'],'sgdm':['momentum_buffer']}
+    def __init__(self, opt='adam', b1=0.9, b2=0.999): self.opt=opt.lower(); self.b1,self.b2=b1,b2; self._st=self.TIERS.get(self.opt,self.TIERS['adam'])
+    @property
+    def has_v(self): return 'exp_avg_sq' in self._st
+    def halflife(self,beta):
+        import math; return -1.0/math.log2(beta) if 0<beta<1 else float('inf')
+    def recommend(self,Kx=32):
+        tu=self.halflife(self.b1); tv=self.halflife(self.b2) if self.has_v else 1.0
+        Ku=max(Kx,int(Kx*min(3,tu/max(Kx,1)))); Kv=max(Ku,int(Kx*min(6,tv/max(tu,1e-8)))) if self.has_v else 1
+        return {'Kx':Kx,'Ku':Ku,'Kv':Kv}
+class DeslocScalingConfig:
+    @staticmethod
+    def for_model(np, nw=8, bw=10.0):
+        pb=np*2; ar=pb/(bw*1e9)*1000*2; cm=max(100,np/1e9*500)
+        Kx=max(8,min(256,1<<max(0,int(ar/(0.1*cm))-1).bit_length())); return {'Kx':Kx,'Ku':3*Kx,'Kv':6*Kx}
+    @staticmethod
+    def for_hw(ic='infiniband',ng=8):
+        bw={'nvlink':600,'pcie':32,'infiniband':25,'ethernet':10}.get(ic,10)
+        base=16 if bw>100 else 32 if bw>20 else 64
+        if ng>64: base*=2
+        return {'Kx':base,'Ku':3*base,'Kv':6*base}
+def validate_desloc_config(cfg):
+    e,w=[],[];d=cfg.get('desloc',{})
+    if not d.get('enabled',False): return {'valid':True,'errors':[],'warnings':[]}
+    Kx,Ku,Kv=d.get('Kx',32),d.get('Ku',96),d.get('Kv',192)
+    if Kx<1: e.append(f'Kx={Kx}<1')
+    if Ku<Kx: w.append(f'Ku<Kx')
+    if Kv<Ku: w.append(f'Kv<Ku')
+    return {'valid':len(e)==0,'errors':e,'warnings':w}
