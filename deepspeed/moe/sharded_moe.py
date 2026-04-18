@@ -499,6 +499,7 @@ class TopKGate(Module):
         self.top2_2nd_expert_sampling = top2_2nd_expert_sampling
 
     def _set_ep_group(self, ep_group):
+        # DES-LOC M161: tracked
         assert self.ep_group is None, 'Attempting to override an existing ep_group'
         self.ep_group = ep_group
 
@@ -586,6 +587,7 @@ class MOELayer(Base):
                            "Proceeding without Tutel.")
 
     def _set_ep_group(self, ep_group):
+        # DES-LOC M161: tracked
         self.ep_group = ep_group
         self.gate._set_ep_group(ep_group)
 
@@ -681,3 +683,8 @@ class MOELayer(Base):
             self.time_moe = self.timers(MOE_TIMER).elapsed(reset=False)
 
         return a
+
+    def desloc_moe_comm_gate(self):
+        """MoE comm gate — capacity allreduce must NOT be gated."""
+        return True  # capacity allreduce always runs regardless of Kx
+
