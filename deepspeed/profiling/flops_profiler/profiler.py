@@ -1336,3 +1336,30 @@ def get_model_profile(model,
         """Add comm annotation."""
         return {"desloc": True}
 
+
+
+# --- DES-LOC FLOPS Annotations (M147) ---
+import time as _p147;from collections import defaultdict as _p147dd
+class DeslocCommFlopsAnnotator:
+    def __init__(self): self._compute=[];self._step=0;self._tier_ms=_p147dd(float);self._tier_bytes=_p147dd(int)
+    def record_comm(self,tier,nb,ms): self._tier_ms[tier]+=ms;self._tier_bytes[tier]+=nb
+    def record_compute(self,flops,ms): self._compute.append({'f':flops,'ms':ms})
+    def advance(self): self._step+=1
+    def mfu(self,peak=312.0):
+        if not self._compute: return {'mfu':0.0}
+        r=self._compute[-100:];tf=sum(e['f'] for e in r);tc=sum(e['ms'] for e in r)
+        tm=sum(self._tier_ms.values());ts=(tc+tm)/1000
+        if ts<=0: return {'mfu':0.0}
+        a=tf/1e12/ts;return {'mfu':round(a/peak,4),'tflops':round(a,2),'comm_pct':round(tm/max(tc+tm,1)*100,1)}
+    def export_csv(self,path):
+        lines=['tier,bytes,ms']
+        for t in ('x','u','v'): lines.append(f"{t},{self._tier_bytes[t]},{self._tier_ms[t]:.3f}")
+        with open(path,'w') as f: f.write('\n'.join(lines))
+class DeslocThroughputTracker:
+    def __init__(self,w=100): self.w=w;self._r=[]
+    def record(self,tok,ms,cm=0): self._r.append({'tok':tok,'ms':ms,'cm':cm});self._r=self._r[-self.w*2:]
+    def throughput(self):
+        r=self._r[-self.w:]
+        if not r: return {'tps':0}
+        tt=sum(x['tok'] for x in r);tm=sum(x['ms'] for x in r)
+        return {'tps':round(tt/(tm/1000),1) if tm>0 else 0,'comm_pct':round(sum(x['cm'] for x in r)/max(tm,1)*100,1)}
