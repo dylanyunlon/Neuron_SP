@@ -503,7 +503,7 @@ USE_DATA_BEFORE_EXPERT_PARALLEL = "use_data_before_expert_parallelism"
 USE_DATA_BEFORE_EXPERT_PARALLEL_DEFAULT = False
 
 #########################################
-# DES-LOC: Desynced Low Communication
+# DES-LOC: Desynced Low Communication (M193)
 #########################################
 DESLOC = "desloc"
 DESLOC_ENABLED = "enabled"
@@ -518,3 +518,43 @@ DESLOC_CLIP_RADIUS = "clip_radius"
 DESLOC_CLIP_RADIUS_DEFAULT = 1.0
 DESLOC_OUTER_OPT = "outer_optimizer"
 DESLOC_OUTER_OPT_DEFAULT = "averaging"
+DESLOC_OUTER_OPT_NESTEROV = "nesterov"
+DESLOC_NESTEROV_MOMENTUM = "nesterov_momentum"
+DESLOC_NESTEROV_MOMENTUM_DEFAULT = 0.9
+DESLOC_NESTEROV_LR = "nesterov_lr"
+DESLOC_NESTEROV_LR_DEFAULT = 1.0
+DESLOC_MUON_COMPAT = "muon_compat"
+DESLOC_MUON_COMPAT_DEFAULT = False
+DESLOC_WARMUP_SYNC_STEPS = "warmup_sync_steps"
+DESLOC_WARMUP_SYNC_STEPS_DEFAULT = 0
+DESLOC_COMM_LOGGING = "comm_logging"
+DESLOC_COMM_LOGGING_DEFAULT = False
+
+
+#########################################
+# DES-LOC: Desynced Low Communication (M193)
+#########################################
+DESLOC = "desloc"
+DESLOC_ENABLED = "enabled"
+DESLOC_ENABLED_DEFAULT = False
+DESLOC_KX = "Kx"
+DESLOC_KX_DEFAULT = 32
+DESLOC_KU = "Ku"
+DESLOC_KU_DEFAULT = 96
+DESLOC_KV = "Kv"
+DESLOC_KV_DEFAULT = 192
+DESLOC_CLIP_RADIUS = "clip_radius"
+DESLOC_CLIP_RADIUS_DEFAULT = 1.0
+DESLOC_OUTER_OPT = "outer_optimizer"
+DESLOC_OUTER_OPT_DEFAULT = "averaging"
+DESLOC_OUTER_OPT_NESTEROV = "nesterov"
+DESLOC_NESTEROV_MOMENTUM = "nesterov_momentum"
+DESLOC_NESTEROV_MOMENTUM_DEFAULT = 0.9
+DESLOC_NESTEROV_LR = "nesterov_lr"
+DESLOC_NESTEROV_LR_DEFAULT = 1.0
+DESLOC_MUON_COMPAT = "muon_compat"
+DESLOC_MUON_COMPAT_DEFAULT = False
+DESLOC_WARMUP_SYNC_STEPS = "warmup_sync_steps"
+DESLOC_WARMUP_SYNC_STEPS_DEFAULT = 0
+DESLOC_COMM_LOGGING = "comm_logging"
+DESLOC_COMM_LOGGING_DEFAULT = False
