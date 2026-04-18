@@ -2476,6 +2476,69 @@ class DeepSpeedEngine(Module):
             return 1
         return self.desloc_Kx
 
+    # --- DES-LOC Lifecycle (M139) ---
+    def desloc_init_scheduler(self):
+        from deepspeed.comm.comm import init_desloc_scheduler, get_desloc_scheduler, get_desloc_tiered_ar, get_desloc_profiler
+        dp = None
+        if self.mpu:
+            try: dp = self.mpu.get_data_parallel_group()
+            except Exception: pass
+        init_desloc_scheduler(Kx=self.desloc_Kx, Ku=self.desloc_Ku, Kv=self.desloc_Kv, group=dp)
+        self._desloc_scheduler = get_desloc_scheduler()
+        self._desloc_tiered_ar = get_desloc_tiered_ar()
+        self._desloc_profiler = get_desloc_profiler()
+
+    def _desloc_build_param_tier_map(self):
+        self._desloc_param_tiers = {}
+        for name, p in self.module.named_parameters():
+            if not p.requires_grad: continue
+            n = name.lower()
+            if any(k in n for k in ('mlp', 'ffn', 'fc', 'dense')): t = 'v'
+            elif any(k in n for k in ('attn', 'attention', 'query', 'key', 'value')): t = 'u'
+            else: t = 'x'
+            p.desloc_tier = t
+            self._desloc_param_tiers[name] = t
+
+    def desloc_post_step(self, loss=None):
+        if not self.desloc_enabled: return
+        self.desloc_step += 1
+        if hasattr(self, '_desloc_scheduler') and self._desloc_scheduler:
+            self._desloc_scheduler.advance()
+        if self.desloc_step % 500 == 0 and dist.get_rank() == 0:
+            ls = f"{loss:.4f}" if loss is not None else "N/A"
+            print(f"### Kx={self.desloc_Kx} step={self.desloc_step} loss={ls} ###")
+
+    def desloc_apply_nesterov(self, momentum=0.9):
+        if not self.desloc_enabled or not self.desloc_is_param_sync_step(): return
+        if not hasattr(self, '_dnv'): self._dnv, self._dnp = {}, {}
+        for n, p in self.module.named_parameters():
+            if not p.requires_grad: continue
+            pid = id(p)
+            if pid not in self._dnv:
+                self._dnv[pid] = p.data.new_zeros(p.data.shape)
+                self._dnp[pid] = p.data.clone(); continue
+            d = p.data.float() - self._dnp[pid].float()
+            v = self._dnv[pid]; v.mul_(momentum).add_(d)
+            p.data.add_(v.to(p.dtype), alpha=momentum)
+            self._dnp[pid].copy_(p.data)
+
+    def desloc_checkpoint_state(self):
+        return {'v': 2, 'step': self.desloc_step, 'Kx': self.desloc_Kx,
+                'Ku': self.desloc_Ku, 'Kv': self.desloc_Kv}
+
+    def desloc_load_checkpoint(self, sd):
+        if not sd or sd.get('v', 0) < 2: return
+        self.desloc_step = sd.get('step', 0)
+
+    def desloc_export_profiling(self, output_dir):
+        import json as _j, os
+        if dist.get_rank() != 0: return
+        os.makedirs(output_dir, exist_ok=True)
+        if hasattr(self, '_desloc_profiler') and self._desloc_profiler:
+            self._desloc_profiler.export_csv(os.path.join(output_dir, 'comm.csv'))
+        with open(os.path.join(output_dir, 'summary.json'), 'w') as f:
+            _j.dump(self.desloc_checkpoint_state(), f, indent=2, default=str)
+
     def allreduce_gradients(self, bucket_size=MEMORY_OPT_ALLREDUCE_SIZE):
         # DES-LOC: skip gradient allreduce on non-Kx boundary steps
         # Ref: Algorithm 1 line 10 — sync when step % Kx == 0
