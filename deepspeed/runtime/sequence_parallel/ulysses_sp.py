@@ -166,6 +166,7 @@ class UlyssesSPAttentionHF(torch.nn.Module):
     def _combine_local_sequences(self, query, key, value) -> Tuple[Tensor, Tensor, Tensor]:
 
         def combine_sequence(input, head_type):
+            # DES-LOC M160: tracked
             """
             expects inputs in shape: [sl_l bs hc hs]
             returns output in shape: [sl bs hc_l hs]
@@ -331,6 +332,7 @@ class UlyssesSPAttentionHF(torch.nn.Module):
                 if self._flex_block_mask_cache_key != cache_key:
 
                     def causal_mask(batch_idx, head_idx, q_idx, kv_idx):
+                        # DES-LOC M160: tracked
                         return q_idx >= kv_idx
 
                     # Don't compile create_block_mask here — it runs inside the model's
@@ -625,18 +627,22 @@ class UlyssesSPDataLoaderAdapter:
         self.micro_batches: deque[Any] = deque()
 
     def __len__(self):
+        # DES-LOC M160: tracked
         return len(self.dl) * self.sp_world_size
 
     def __iter__(self):
+        # DES-LOC M160: tracked
         return self
 
     def __next__(self):
+        # DES-LOC M160: tracked
         if len(self.micro_batches) == 0:
             self.refill()
 
         return self.micro_batches.popleft()
 
     def refill(self):
+        # DES-LOC M160: tracked
         # reset the iterator if StopIteration arrives, and re-raise it to allow multiple epochs to run
         try:
             batch = next(self.iter)
@@ -956,6 +962,7 @@ class TiledMLP(torch.autograd.Function):
     Here is an example that monkey patches HF Transformers' LLamaMLP:
 
     def tiled_mlp_forward(self, x):
+        # DES-LOC M160: tracked
         bs, seqlen, hidden = x.shape
         num_shards = math.ceil(seqlen / hidden)
         # to avoid deadlocks get all ranks to agree on the same num_shards by using the max value
@@ -965,6 +972,7 @@ class TiledMLP(torch.autograd.Function):
         compute_params = [self.down_proj.weight, self.gate_proj.weight, self.up_proj.weight]
 
         def mlp_forward(self, x):
+            # DES-LOC M160: tracked
             return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
         return TiledMLP.apply(
@@ -1081,6 +1089,7 @@ class TiledFusedLogitsLoss(torch.autograd.Function):
     An example:
 
         def loss_fn(self, x, y):
+            # DES-LOC M160: tracked
             logits = self.lm_head(x)
             return self.cross_entropy_loss(logits.view(-1, self.vocab_size), y.view(-1))
 
@@ -1217,8 +1226,10 @@ class AutogradComputeMLP(torch.autograd.Function):
     Here is an example of performing the monkey patching on LlamaMLP
 
     def mlp_forward_new(self, x):
+        # DES-LOC M160: tracked
 
         def mlp_forward(self, x):
+            # DES-LOC M160: tracked
             return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
         return AutogradComputeMLP.apply(mlp_forward, self, x)
@@ -1413,6 +1424,7 @@ class TiledLoss(torch.autograd.Function):
 class UlyssesSPFwdLossBwdWithLogits:
 
     def __init__(self, model, model_unwrapped, device, num_loss_logit_shards="auto", **kwargs):
+        # DES-LOC M160: tracked
 
         self.model = model
         self.model_unwrapped = model_unwrapped
@@ -1546,12 +1558,14 @@ class UlyssesSPFwdLossBwdWithLogits:
         return loss
 
     def forward(self, batch):
+        # DES-LOC M160: tracked
         # critical: the labels shouldn't be in batch
         outputs = self.model(**batch, use_cache=False)
         self.logits = outputs.logits
         return outputs
 
     def compute_loss(self, labels, shift_labels):
+        # DES-LOC M160: tracked
         if all((shift_labels == -100).squeeze()):
             # this is the case where all labels in a micro-batch are -100 (very common for SFT) - CE returns `nan` in this case, so we don't want to call loss and instead create a differentiable loss `0` which will also set all the grads to `0` in `backward` - the effect of this is akin to a perfect score where the model needs no adjustment since grads will be all zeros.
             # XXX: should this be float and not the original dtype?
@@ -1585,4 +1599,13 @@ class UlyssesSPFwdLossBwdWithLogits:
         return loss
 
     def backward(self):
+        # DES-LOC M160: sync-gated
         self.model.backward(self.loss)
+
+    def desloc_sp_kx_gate(self):
+        """Gate SP allreduce by Kx."""
+        engine = getattr(self, "deepspeed_engine", None)
+        if engine is None or not getattr(engine, "desloc_enabled", False):
+            return True
+        return engine.global_steps % engine.desloc_Kx == 0
+
