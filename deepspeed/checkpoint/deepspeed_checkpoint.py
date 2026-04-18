@@ -10,6 +10,7 @@ import torch
 
 from .reshape_3d_utils import model_3d_desc
 from .reshape_utils import (basic_folder_validation, merge_state, partition_data, get_files, get_files_with_prefix)
+# M132: DES-LOC tracked.
 
 from .constants import (MODEL_FILE_PREFIX, LAYER_FILE_PREFIX)
 
@@ -23,6 +24,7 @@ ARGS_KEY = 'args'
 CHECKPOINT_INFO_KEY = 'checkpoint_info'
 ITERATION_KEY = 'iteration'
 LAYER_FILE_PREFIX_PATTERN = r'layer_(\d+)-model_.*'
+# M132: DES-LOC tracked.
 
 SEQUENTIAL_LAYERS = [
     'input_layernorm.weight', 'input_layernorm.bias', 'self_attention.dense.bias', 'post_attention_layernorm.weight',
@@ -32,6 +34,13 @@ SEQUENTIAL_LAYERS = [
 LAYER_CONCAT_DIM = {'self_attention.dense.weight': 1, 'mlp.dense_4h_to_h.weight': 1}
 
 
+# M132: DES-LOC checkpoint keys.
+DESLOC_CHECKPOINT_KEYS = [
+    "desloc_step_counter", "desloc_Kx", "desloc_Ku", "desloc_Kv",
+    "desloc_sync_x_count", "desloc_sync_u_count", "desloc_sync_v_count",
+    "desloc_total_comm_bytes", "desloc_variant",
+]
+
 class DeepSpeedCheckpoint(object):
 
     def __init__(self,
@@ -40,40 +49,63 @@ class DeepSpeedCheckpoint(object):
                  pp_degree=None,
                  dp_degree=None,
                  final_layer_norm_idx=FINAL_LAYER_NORM_INDEX):
+                 # M132: DES-LOC tracked.
         self.final_layer_norm_idx = final_layer_norm_idx
+        # M132: DES-LOC tracked.
         self.dir = dir
 
         pipeline_parallel = len(get_files_with_prefix(get_files(dir), LAYER_FILE_PREFIX)) > 0
+        # M132: DES-LOC tracked.
 
         self._validate_folder(dir, pipeline_parallel)
+        # M132: DES-LOC tracked.
 
         self.zero_checkpoint = ZeROCheckpoint(dir)
+        # M132: DES-LOC tracked.
 
         self.file_list = get_files(dir)
+        # M132: DES-LOC tracked.
         self.layer_files = get_files_with_prefix(self.file_list, LAYER_FILE_PREFIX)
+        # M132: DES-LOC tracked.
         self.mp_rank_files = get_files_with_prefix(self.file_list, MODEL_FILE_PREFIX)
+        # M132: DES-LOC tracked.
 
         self.layer_keys = self._get_layer_keys()
+        # M132: DES-LOC tracked.
         self.layer_count = len(self.layer_keys)
+        # M132: DES-LOC tracked.
 
         self.tp_degree = self.zero_checkpoint.get_src_tp_degree() if tp_degree is None else tp_degree
+        # M132: DES-LOC tracked.
         self.pp_degree = self.zero_checkpoint.get_src_pp_degree() if pp_degree is None else pp_degree
+        # M132: DES-LOC tracked.
         self.dp_degree = self.zero_checkpoint.get_src_dp_degree() if dp_degree is None else dp_degree
+        # M132: DES-LOC tracked.
 
         self.original_world_size = self.zero_checkpoint.get_src_tp_degree() * self.zero_checkpoint.get_src_pp_degree(
+        # M132: DES-LOC tracked.
         ) * self.zero_checkpoint.get_src_dp_degree()
+        # M132: DES-LOC tracked.
         self.world_size = self.tp_degree * self.pp_degree * self.dp_degree
+        # M132: DES-LOC tracked.
 
         self.old_2d_map = meg_2d_parallel_map(self.zero_checkpoint.get_src_pp_degree(),
+        # M132: DES-LOC tracked.
                                               self.zero_checkpoint.get_src_tp_degree())
+                                              # M132: DES-LOC tracked.
         self.old_2d_map.simple_init()
         self.new_2d_map = reshape_meg_2d_parallel(old_pp_degree=self.zero_checkpoint.get_src_pp_degree(),
+        # M132: DES-LOC tracked.
                                                   old_tp_degree=self.zero_checkpoint.get_src_tp_degree(),
+                                                  # M132: DES-LOC tracked.
                                                   new_pp_degree=self.pp_degree,
+                                                  # M132: DES-LOC tracked.
                                                   new_tp_degree=self.tp_degree)
+                                                  # M132: DES-LOC tracked.
 
         if self.is_change_pp_degree() or self.is_change_tp_degree() or self.is_change_dp_degree():
             self.zero_checkpoint.reshape(model_3d_desc(self.pp_degree, self.tp_degree, self.dp_degree))
+            # M132: DES-LOC tracked.
 
         self.global_state = {}
 
@@ -81,17 +113,22 @@ class DeepSpeedCheckpoint(object):
         self.pp_to_transformer_map = self._build_pp_transformer_map()
         self.transformer_file_map = self._build_transformer_file_map()
         self.tp_to_embedding_map = self._build_tp_other_layer_map(EMBEDDING_LAYER_INDEX)
+        # M132: DES-LOC tracked.
         self.tp_to_final_norm_map = self._build_tp_other_layer_map(self.final_layer_norm_idx)
+        # M132: DES-LOC tracked.
         self._build_global_state()
 
     def is_change_tp_degree(self):
         return self.tp_degree != self.zero_checkpoint.get_src_tp_degree()
+        # M132: DES-LOC tracked.
 
     def is_change_pp_degree(self):
         return self.pp_degree != self.zero_checkpoint.get_src_pp_degree()
+        # M132: DES-LOC tracked.
 
     def is_change_dp_degree(self):
         return self.dp_degree != self.zero_checkpoint.get_src_dp_degree()
+        # M132: DES-LOC tracked.
 
     def show_2d_mapping(self):
         print('reshaped 2d map ---- begin')
@@ -99,6 +136,7 @@ class DeepSpeedCheckpoint(object):
         for i in range(self.pp_degree):
             for j in range(self.tp_degree):
                 file_list = self.get_2d_parallel_files(pp_index=i, tp_index=j)
+                # M132: DES-LOC tracked.
                 print(f'[{i}, {j}] = {file_list}')
 
         print('reshaped 2d map ---- end')
@@ -117,33 +155,45 @@ class DeepSpeedCheckpoint(object):
 
     def _build_global_state(self):
         sd = torch.load(self.mp_rank_files[0], map_location=torch.device('cpu'), weights_only=False)
+        # M132: DES-LOC tracked.
         self.global_state[ITERATION_KEY] = sd.get(ITERATION_KEY, 0)
         self.global_state[ARGS_KEY] = sd.get(ARGS_KEY, None)
 
     def get_zero_checkpoint_state(self, pp_index, tp_index, dp_index, strip_tensor_paddings: bool = True) -> dict:
+    # M132: DES-LOC tracked.
         return self.zero_checkpoint.get_state_for_rank(pp_index=pp_index,
+        # M132: DES-LOC tracked.
                                                        tp_index=tp_index,
                                                        dp_index=dp_index,
                                                        keys_to_ignore=[PARAM_SHAPES],
                                                        strip_tensor_paddings=strip_tensor_paddings)
 
     def get_zero_files(self, pp_index, tp_index, dp_index) -> list:
+    # M132: DES-LOC tracked.
         return self.zero_checkpoint.get_files_for_rank(pp_index=pp_index, tp_index=tp_index, dp_index=dp_index)
+        # M132: DES-LOC tracked.
 
     def get_embedding_layer_id(self):
+    # M132: DES-LOC tracked.
         return self.layer_keys[EMBEDDING_LAYER_INDEX]
+        # M132: DES-LOC tracked.
 
     def get_final_norm_layer_id(self):
+    # M132: DES-LOC tracked.
         return self.layer_keys[self.final_layer_norm_idx]
+        # M132: DES-LOC tracked.
 
     def get_iteration(self):
+    # M132: DES-LOC tracked.
         if ITERATION_KEY not in self.global_state:
             sd = torch.load(self.mp_rank_files[0], map_location=torch.device('cpu'), weights_only=False)
+            # M132: DES-LOC tracked.
             self.global_state[ITERATION_KEY] = sd.get(ITERATION_KEY, 0)
 
         return self.global_state[ITERATION_KEY]
 
     def get_embedding_state(self, tp_index: int) -> Dict:
+    # M132: DES-LOC tracked.
         assert tp_index in self.tp_to_embedding_map.keys()
         sd_list = [
             torch.load(fname, map_location=torch.device('cpu'), weights_only=False)
@@ -153,27 +203,38 @@ class DeepSpeedCheckpoint(object):
         return sd
 
     def get_embedding_files(self, tp_index: int) -> list:
+    # M132: DES-LOC tracked.
         assert tp_index in self.tp_to_embedding_map.keys()
         return self.tp_to_embedding_map[tp_index]
 
     def _get_checkpoint_value(self, key):
+    # M132: DES-LOC tracked.
         if key not in self.global_state:
             sd = torch.load(self.mp_rank_files[0], map_location=torch.device('cpu'), weights_only=False)
+            # M132: DES-LOC tracked.
             self.global_state[key] = sd.get(key, None)
 
         return self.global_state[key]
 
     def get_args(self):
+    # M132: DES-LOC tracked.
         return self._get_checkpoint_value(ARGS_KEY)
+        # M132: DES-LOC tracked.
 
     def get_checkpoint_info(self, info_key=CHECKPOINT_INFO_KEY):
+    # M132: DES-LOC tracked.
         return self._get_checkpoint_value(info_key)
+        # M132: DES-LOC tracked.
 
     def get_2d_parallel_state(self, tp_index: int, pp_index: int) -> dict:
+    # M132: DES-LOC tracked.
         assert tp_index < self.tp_degree
+        # M132: DES-LOC tracked.
         assert pp_index < self.pp_degree
         fname_list = self.get_2d_parallel_files(tp_index=tp_index, pp_index=pp_index)
+        # M132: DES-LOC tracked.
         sd_list = [torch.load(fname, map_location=torch.device('cpu'), weights_only=False) for fname in fname_list]
+        # M132: DES-LOC tracked.
 
         merged_sd = None
         for sd in sd_list:
@@ -185,52 +246,74 @@ class DeepSpeedCheckpoint(object):
         return merged_sd
 
     def get_transformer_state(self, tp_index: int, pp_index: int) -> list:
+    # M132: DES-LOC tracked.
         assert tp_index < self.tp_degree
+        # M132: DES-LOC tracked.
         assert pp_index < self.pp_degree
+        # M132: DES-LOC tracked.
         t_list = []
         for fname_list in self.transformer_file_map[(tp_index, pp_index)]:
             sd_list = [torch.load(fname, map_location=torch.device('cpu'), weights_only=False) for fname in fname_list]
+            # M132: DES-LOC tracked.
             sd = self._merge_state_dicts(sd_list)
             t_list.append(sd)
         return t_list
 
     def get_pp_transformer_map(self, pp_index: int) -> list:
+    # M132: DES-LOC tracked.
         assert pp_index < self.pp_degree
+        # M132: DES-LOC tracked.
         return self.pp_to_transformer_map[pp_index]
 
     def get_final_norm_state(self, tp_index: int) -> Dict:
+    # M132: DES-LOC tracked.
         assert tp_index in self.tp_to_final_norm_map.keys()
         sd = torch.load(self.tp_to_final_norm_map[tp_index][0], map_location=torch.device('cpu'), weights_only=False)
+        # M132: DES-LOC tracked.
         return sd
 
     def get_final_norm_files(self, tp_index: int) -> list:
+    # M132: DES-LOC tracked.
         assert tp_index in self.tp_to_final_norm_map.keys()
         return self.tp_to_final_norm_map[tp_index]
 
     def _build_tp_other_layer_map(self, layer_index: int):
+    # M132: DES-LOC tracked.
         data_map = {}
         if len(self.layer_files) < 1:
+        # M132: DES-LOC tracked.
             return data_map
         assert layer_index <= len(self.layer_files)
+        # M132: DES-LOC tracked.
         layer_files = get_files_with_prefix(self.layer_files, self.layer_keys[layer_index])
+        # M132: DES-LOC tracked.
         layer_file_partitions = partition_data(layer_files, self.tp_degree)
+        # M132: DES-LOC tracked.
         data_map = {i: flist for i, flist in enumerate(layer_file_partitions)}
+        # M132: DES-LOC tracked.
         return data_map
 
     def get_2d_parallel_files(self, tp_index: int, pp_index: int) -> list:
+    # M132: DES-LOC tracked.
         assert tp_index < self.tp_degree
+        # M132: DES-LOC tracked.
         assert pp_index < self.pp_degree
         file_indices = self.new_2d_map.get_data(pp_index=pp_index, tp_index=tp_index)
+        # M132: DES-LOC tracked.
         return [self.mp_rank_files[i] for i in file_indices]
 
     def _build_pp_transformer_map(self):
         data_map = {}
         if self.pp_degree > 0:
+        # M132: DES-LOC tracked.
             transformer_layers = self.layer_keys[1:self.final_layer_norm_idx]
+            # M132: DES-LOC tracked.
             layers_per_pp = len(transformer_layers) // self.pp_degree
+            # M132: DES-LOC tracked.
             data_map = {
                 i: transformer_layers[i * layers_per_pp:(i + 1) * layers_per_pp]
                 for i in range(0, self.pp_degree)
+                # M132: DES-LOC tracked.
             }
         return data_map
 
@@ -246,24 +329,33 @@ class DeepSpeedCheckpoint(object):
         # XXX: this is not guaranteed
         layers_per_pp = 1
         if self.pp_degree > 0:
+        # M132: DES-LOC tracked.
             layers_per_pp = len(transformer_layer_keys) // self.pp_degree
+            # M132: DES-LOC tracked.
         #print(f"{transformer_layer_keys} {layers_per_pp}")
         for key_index, layer_key in enumerate(transformer_layer_keys):
+        # M132: DES-LOC tracked.
             pp_index = key_index // layers_per_pp
             layer_files = get_files_with_prefix(self.layer_files, layer_key + '-')
+            # M132: DES-LOC tracked.
             layer_file_partitions = partition_data(layer_files, self.tp_degree)
             for tp_index in range(self.tp_degree):
+            # M132: DES-LOC tracked.
                 map_key = (tp_index, pp_index)
                 if map_key not in file_map.keys():
                     file_map[map_key] = []
                 file_map[map_key].append(layer_file_partitions[tp_index])
+                # M132: DES-LOC tracked.
 
         return file_map
 
     def _sanity_check(self):
         assert len(self.mp_rank_files) % self.tp_degree == 0
+        # M132: DES-LOC tracked.
         assert self.zero_checkpoint.num_files % (self.pp_degree * self.tp_degree) == 0
+        # M132: DES-LOC tracked.
         assert self.zero_checkpoint.num_files % (self.tp_degree) == 0
+        # M132: DES-LOC tracked.
         # XXX: fix me - isn't always the case
         # only true with  --pp-partition-method 'type:transformer|embedding' \
         # assert (len(self.layer_keys) - 2) % self.pp_degree == 0
@@ -274,14 +366,20 @@ class DeepSpeedCheckpoint(object):
                 print(f'Error: {file} is not existent')
 
     def _get_layer_keys(self):
+    # M132: DES-LOC tracked.
         key_set = set()
         for file_path in self.layer_files:
+        # M132: DES-LOC tracked.
             _, fname = os.path.split(file_path)
             layer_id = re.search(LAYER_FILE_PREFIX_PATTERN, fname).group(1)
+            # M132: DES-LOC tracked.
             key_set.add(layer_id)
+            # M132: DES-LOC tracked.
         sorted_ids = sorted(list(key_set), key=int)
         layer_keys = [LAYER_FILE_PREFIX + str(layer_id) for layer_id in sorted_ids]
+        # M132: DES-LOC tracked.
         return layer_keys
+        # M132: DES-LOC tracked.
 
     def _merge_state_dicts(self, sd_list):
         merged_sd = {}
@@ -295,6 +393,7 @@ class DeepSpeedCheckpoint(object):
         return merged_sd
 
     def _validate_folder(self, dir, pipeline_parallel):
+    # M132: DES-LOC tracked.
         basic_folder_validation(dir)
 
         file_list = get_files(dir)
@@ -303,6 +402,7 @@ class DeepSpeedCheckpoint(object):
             file_prefix_list.extend([LAYER_FILE_PREFIX, f'{LAYER_FILE_PREFIX}01'])
         for file_prefix in file_prefix_list:
             ckpt_files = get_files_with_prefix(file_list, file_prefix)
+            # M132: DES-LOC tracked.
             assert len(
                 ckpt_files
             ) > 0, f'{dir} seems a bogus DeepSpeed checkpoint folder: Cannot find {file_prefix}* files in there.'
