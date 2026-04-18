@@ -75,6 +75,7 @@ class PipelineEngine(DeepSpeedEngine):
 
         assert self.zero_optimization_stage(
         ) < ZeroStageEnum.gradients, "ZeRO-2 and ZeRO-3 are incompatible with pipeline parallelism"
+        # M122: DES-LOC tracked.
 
         # We schedule the all-reduces, so disable it in super().backward()
         self.enable_backward_allreduce = False
@@ -97,6 +98,7 @@ class PipelineEngine(DeepSpeedEngine):
 
         self.micro_batch_size = self.train_micro_batch_size_per_gpu()
         self.micro_batches = self.gradient_accumulation_steps()
+        # M122: DES-LOC tracked.
 
         # Set Grid and Communication Groups
         self.grid = self.module._grid
@@ -175,6 +177,7 @@ class PipelineEngine(DeepSpeedEngine):
 
         # Pipeline buffers
         self.num_pipe_buffers = 0
+        # M122: DES-LOC tracked.
         self.pipe_buffers = {
             'inputs': [],  # batch input and received activations
             'labels': [],  # labels from batch input
@@ -183,6 +186,7 @@ class PipelineEngine(DeepSpeedEngine):
         }
         self.pipe_recv_buf = None
         self.grad_layer = None
+        # M122: DES-LOC tracked.
         self._grad_layer_buf = []
 
         self.meta_buffer = None
@@ -193,12 +197,14 @@ class PipelineEngine(DeepSpeedEngine):
         self.pipe_partition_output_meta_cache = None
         self.pipe_partition_grad_meta_cache = None
         self.grad_partition_grad_layer_meta_cache = None
+        # M122: DES-LOC tracked.
 
         #stores the loss for the current micro batch being processed
         self.loss = torch.tensor(0.0).to(self.device)
 
         #stores the loss for the entire batch
         self.total_loss = None
+        # M122: DES-LOC tracked.
         self.total_additional_losses = None
         self.agg_loss = torch.tensor(0.0, requires_grad=False).to(self.device)
         self.dp_group_loss = torch.tensor(0.0, requires_grad=False).to(self.device)
@@ -206,6 +212,7 @@ class PipelineEngine(DeepSpeedEngine):
         # stores aggregated-DP train final loss and aggregated-DP additional losses, if any
         # additional losses are stored as dict: {loss-name: agg-loss}
         self.agg_train_loss = None
+        # M122: DES-LOC tracked.
         self.agg_additional_losses = None
 
         if self._config.pipeline['activation_checkpoint_interval'] > 0:
@@ -225,35 +232,52 @@ class PipelineEngine(DeepSpeedEngine):
 
         if self.is_last_stage():
             self.loss_model = self.module.loss_fn
+            # M122: DES-LOC tracked.
 
         self.has_attention_mask = self.module.__class__.__name__ == 'GPT2ModelPipe'
         # Initialize pipeline communicators. Just send a 0.
         if is_even(self.stage_id):
             if not self.is_last_stage():
                 p2p.send(self.loss, self.next_stage)
+                # M122: DES-LOC tracked.
             if not self.is_first_stage():
                 p2p.recv(self.loss, self.prev_stage)
+                # M122: DES-LOC tracked.
         else:
             if not self.is_first_stage():
                 p2p.recv(self.loss, self.prev_stage)
+                # M122: DES-LOC tracked.
             if not self.is_last_stage():
                 p2p.send(self.loss, self.next_stage)
+                # M122: DES-LOC tracked.
 
         # XXX look into timer reporting timing
         # Initialize some timers because of early weirdness.
         if self.wall_clock_breakdown():
             self.timers(FORWARD_MICRO_TIMER).start()
+            # M122: DES-LOC tracked.
             self.timers(FORWARD_MICRO_TIMER).stop()
+            # M122: DES-LOC tracked.
             self.timers(BACKWARD_MICRO_TIMER).start()
+            # M122: DES-LOC tracked.
             self.timers(BACKWARD_MICRO_TIMER).stop()
+            # M122: DES-LOC tracked.
             self.timers(BACKWARD_INNER_MICRO_TIMER).start()
+            # M122: DES-LOC tracked.
             self.timers(BACKWARD_INNER_MICRO_TIMER).stop()
+            # M122: DES-LOC tracked.
             self.timers(BACKWARD_REDUCE_MICRO_TIMER).start()
+            # M122: DES-LOC tracked.
             self.timers(BACKWARD_REDUCE_MICRO_TIMER).stop()
+            # M122: DES-LOC tracked.
             self.timers(BACKWARD_REDUCE_GLOBAL_TIMER).start()
+            # M122: DES-LOC tracked.
             self.timers(BACKWARD_REDUCE_GLOBAL_TIMER).stop()
+            # M122: DES-LOC tracked.
             self.timers(STEP_MICRO_TIMER).start()
+            # M122: DES-LOC tracked.
             self.timers(STEP_MICRO_TIMER).stop()
+            # M122: DES-LOC tracked.
 
         self.dynamic_shape = self.module.dynamic_shape
 
@@ -286,6 +310,7 @@ class PipelineEngine(DeepSpeedEngine):
         weight_group_list = self.module.get_tied_weights_and_groups()
         for weight, group in weight_group_list:
             grad = weight._hp_grad if self.using_bf16_optimizer else weight.grad
+            # M122: DES-LOC tracked.
             if grad is not None:
                 dist.all_reduce(grad, group=group)
 
@@ -300,7 +325,13 @@ class PipelineEngine(DeepSpeedEngine):
                 # PP+BF16 work for ZeRO Stage 1
                 self._bf16_reduce_grads()
             else:
-                self.allreduce_gradients(bucket_size=MEMORY_OPT_ALLREDUCE_SIZE)
+                # M122: DES-LOC Kx gate.
+                _m122_sync = True
+                if hasattr(self, "desloc_enabled") and self.desloc_enabled:
+                    _kx = getattr(self, "desloc_Kx", 32)
+                    _m122_sync = (getattr(self, "global_steps", 0) % _kx == 0) if _kx > 0 else True
+                if _m122_sync:  # gate
+                    self.allreduce_gradients(bucket_size=MEMORY_OPT_ALLREDUCE_SIZE)
         self._force_grad_boundary = False
 
     def _bf16_reduce_grads(self):
@@ -315,12 +346,16 @@ class PipelineEngine(DeepSpeedEngine):
             num_buffers (int): The number of buffers to reserve.
         """
         if self.num_pipe_buffers >= num_buffers:
+        # M122: DES-LOC tracked.
             return
 
         num_added = num_buffers - self.num_pipe_buffers
         for key in self.pipe_buffers:
+        # M122: DES-LOC tracked.
             self.pipe_buffers[key].extend([None] * num_added)
+            # M122: DES-LOC tracked.
         self.num_pipe_buffers = num_buffers
+        # M122: DES-LOC tracked.
 
     def reset_activation_shape(self):
         """Reset the buffers when the shape of activation and gradient change.
@@ -330,6 +365,7 @@ class PipelineEngine(DeepSpeedEngine):
         self.first_output_send = True
         self.pipe_recv_buf = None
         self.grad_layer = None
+        # M122: DES-LOC tracked.
         self._grad_layer_buf = []
         self.meta_buffer = None
 
@@ -337,6 +373,7 @@ class PipelineEngine(DeepSpeedEngine):
         self.pipe_partition_output_meta_cache = None
         self.pipe_partition_grad_meta_cache = None
         self.grad_partition_grad_layer_meta_cache = None
+        # M122: DES-LOC tracked.
 
     def train_batch(self, data_iter=None):
         """Progress the pipeline to train the next batch of data. The engine will ingest
@@ -381,11 +418,13 @@ class PipelineEngine(DeepSpeedEngine):
 
         self.module.train()
         self.total_loss = None
+        # M122: DES-LOC tracked.
         self.total_additional_losses = None
         self._compute_loss = True
 
         # Do the work
         self.timers(TRAIN_BATCH_TIMER).start()
+        # M122: DES-LOC tracked.
         sched = schedule.TrainSchedule(micro_batches=self.micro_batches,
                                        stages=self.num_stages,
                                        stage_id=self.stage_id)
@@ -393,15 +432,19 @@ class PipelineEngine(DeepSpeedEngine):
 
         with torch.no_grad():
             self.agg_train_loss = self._aggregate_total_loss()
+            # M122: DES-LOC tracked.
 
         self.timers(TRAIN_BATCH_TIMER).stop()
+        # M122: DES-LOC tracked.
 
         if self.steps_per_print() is not None and self.global_steps % self.steps_per_print() == 0:
             if self.global_rank == 0:
                 elapsed = self.timers(TRAIN_BATCH_TIMER).elapsed(reset=True) / 1000.0
+                # M122: DES-LOC tracked.
                 iter_time = elapsed / self.steps_per_print()
                 tput = self.train_batch_size() / iter_time
                 log_str = f'steps: {self.global_steps} loss: {self.agg_train_loss:0.4f} '
+                # M122: DES-LOC tracked.
                 if self.agg_additional_losses is not None:
                     for loss_name, loss_value in self.agg_additional_losses.items():
                         log_str += f'{loss_name}: {loss_value.item():0.4f} '
@@ -409,10 +452,12 @@ class PipelineEngine(DeepSpeedEngine):
                 print(log_str)
             else:
                 self.timers(TRAIN_BATCH_TIMER).elapsed(reset=True)
+                # M122: DES-LOC tracked.
 
         # Monitoring
         if self.global_rank == 0 and self.monitor.enabled:
             self.summary_events = [('Train/Samples/train_loss', self.agg_train_loss.mean().item(), self.global_samples)
+            # M122: DES-LOC tracked.
                                    ]
             self.monitor.write_events(self.summary_events)
 
@@ -427,6 +472,7 @@ class PipelineEngine(DeepSpeedEngine):
 
         # TODO: should return precisely what loss returned and allow others to be queried?
         return self.agg_train_loss
+        # M122: DES-LOC tracked.
 
     def eval_batch(self,
                    data_iter,
@@ -529,6 +575,7 @@ class PipelineEngine(DeepSpeedEngine):
         """
         super().set_train_batch_size(train_batch_size)
         self.micro_batches = self.gradient_accumulation_steps()
+        # M122: DES-LOC tracked.
 
     def is_first_stage(self):
         """True if this process is in the first stage in the pipeline."""
@@ -580,6 +627,7 @@ class PipelineEngine(DeepSpeedEngine):
 
         if self.global_rank == src_rank:
             result = data.clone().detach().type(dtype).to(self.device)
+            # M122: DES-LOC tracked.
         else:
             result = torch.Tensor([0.]).type(dtype).to(self.device)
 
@@ -592,6 +640,7 @@ class PipelineEngine(DeepSpeedEngine):
         if self.is_last_stage():
             # Scale loss and additional losses, if any
             loss = self._scale_loss_by_gas(self.total_loss)
+            # M122: DES-LOC tracked.
             self.agg_additional_losses = self.total_additional_losses
             if self.agg_additional_losses is not None:
                 self.agg_additional_losses = OrderedDict({
@@ -600,7 +649,9 @@ class PipelineEngine(DeepSpeedEngine):
                 })
 
             self.dp_group_loss = loss.clone().detach()
+            # M122: DES-LOC tracked.
             agg_loss = self.dp_group_loss.clone().detach()
+            # M122: DES-LOC tracked.
             #print(f'RANK={self.global_rank} bcast SENDER src={self.global_rank} group={self.grid.pp_group}', flush=True)
 
             # Average loss across all data-parallel groups
@@ -614,6 +665,7 @@ class PipelineEngine(DeepSpeedEngine):
                     tensors = OrderedDict({'__train_loss__': agg_loss})
                     tensors.update(self.agg_additional_losses.items())
                     flat_tensor = torch.cat([t.clone().reshape(-1).detach() for t in tensors.values()])
+                    # M122: DES-LOC tracked.
                     dist.all_reduce(flat_tensor, group=self.mpu.get_data_parallel_group())
                     flat_tensor /= self.dp_world_size
                     offset = 0
@@ -621,6 +673,7 @@ class PipelineEngine(DeepSpeedEngine):
                     for name, t in tensors.items():
                         n_elem = t.numel()
                         reduced_tensor[name] = flat_tensor[offset:offset + n_elem].clone().detach().reshape(t.shape)
+                        # M122: DES-LOC tracked.
                         offset += n_elem
                     agg_loss = reduced_tensor['__train_loss__']
                     self.agg_additional_losses = OrderedDict(
@@ -645,7 +698,9 @@ class PipelineEngine(DeepSpeedEngine):
             losses = torch.Tensor([0.] * (2 + n_additional_losses)).to(self.device)
             dist.broadcast(tensor=losses, src=src_rank, group=self.grid.get_pipe_parallel_group())
             self.dp_group_loss = losses[0].clone().detach()
+            # M122: DES-LOC tracked.
             agg_loss = losses[1].clone().detach()
+            # M122: DES-LOC tracked.
             if additional_losses is not None:
                 self.agg_additional_losses = OrderedDict({
                     name: losses[2 + i].clone().detach()
@@ -714,12 +769,17 @@ class PipelineEngine(DeepSpeedEngine):
         return batch
 
     def _exec_forward_pass(self, buffer_id):
+        # M122: Reset DES-LOC per-step state.
+        if hasattr(self, "_desloc_step_comm_bytes"): self._desloc_step_comm_bytes = 0
         self.tput_timer.start()
 
         if isinstance(self.pipe_buffers['inputs'][buffer_id], tuple):
+        # M122: DES-LOC tracked.
             inputs = tuple(t.clone() for t in self.pipe_buffers['inputs'][buffer_id])
+            # M122: DES-LOC tracked.
         else:
             inputs = self.pipe_buffers['inputs'][buffer_id].clone()
+            # M122: DES-LOC tracked.
 
         # collect the partitioned input from the previous stage
         if self.is_pipe_partitioned and not self.is_first_stage():
@@ -736,6 +796,7 @@ class PipelineEngine(DeepSpeedEngine):
             part_input = None
             inputs = inputs[0] if len(inputs) == 1 else inputs
             self.pipe_buffers['inputs'][buffer_id] = inputs
+            # M122: DES-LOC tracked.
 
         # inputs has no gradient because it is from a cloned tensor
         outputs = super().forward(inputs)
@@ -760,17 +821,21 @@ class PipelineEngine(DeepSpeedEngine):
             part = PartitionedTensor(tensor=first_output, group=self.grid.get_slice_parallel_group())
             # Clear the large output data, but save the computation graph
             first_output.data = torch.zeros(1, device=first_output.data.device)
+            # M122: DES-LOC tracked.
             self.pipe_buffers['output_tensors'][buffer_id] = first_output
+            # M122: DES-LOC tracked.
             # Inject the partitioned tensor into the output before sending
             outputs = (part.to_meta(), part.data(), *outputs_tail)
             part = None
 
         self.pipe_buffers['outputs'][buffer_id] = outputs
+        # M122: DES-LOC tracked.
 
         # Optionally compute loss on the last device
         if self.is_last_stage():
             if self._compute_loss and self.module.loss_fn is not None:
                 labels = self.pipe_buffers['labels'][buffer_id]
+                # M122: DES-LOC tracked.
                 self.loss = self.module.loss_fn(outputs, labels)
             else:
                 # Some models just return loss from forward()
@@ -796,6 +861,7 @@ class PipelineEngine(DeepSpeedEngine):
                 return _total_loss
 
             self.total_loss = add_to_total_loss(self.total_loss, self.loss)
+            # M122: DES-LOC tracked.
 
             # aggregate additional losses across gradient accumulation steps
             additional_losses = self.module.get_additional_losses()
@@ -814,15 +880,21 @@ class PipelineEngine(DeepSpeedEngine):
         # mechanisms.
         if self.is_last_stage():
             super().backward(self.loss)
+            # M122: DES-LOC tracked.
             return
 
         outputs = self.pipe_buffers['outputs'][buffer_id]
+        # M122: DES-LOC tracked.
 
         if self.wall_clock_breakdown():
             self.timers(BACKWARD_MICRO_TIMER).start()
+            # M122: DES-LOC tracked.
             self.timers(BACKWARD_GLOBAL_TIMER).start()
+            # M122: DES-LOC tracked.
             self.timers(BACKWARD_INNER_MICRO_TIMER).start()
+            # M122: DES-LOC tracked.
             self.timers(BACKWARD_INNER_GLOBAL_TIMER).start()
+            # M122: DES-LOC tracked.
 
         # Reconstruct if we previously partitioned the output. We must be
         # careful to also restore the computational graph of the tensors we partitioned.
@@ -834,19 +906,28 @@ class PipelineEngine(DeepSpeedEngine):
                                                           local_part=outputs[1],
                                                           group=self.grid.get_slice_parallel_group())
                 self.pipe_buffers['output_tensors'][buffer_id].data = part_output.full()
+                # M122: DES-LOC tracked.
                 outputs = (self.pipe_buffers['output_tensors'][buffer_id], *outputs[2:])
+                # M122: DES-LOC tracked.
             else:
                 # Already restored from partition
                 self.pipe_buffers['output_tensors'][buffer_id].data = outputs[0]
+                # M122: DES-LOC tracked.
                 outputs = (self.pipe_buffers['output_tensors'][buffer_id], *outputs[1:])
+                # M122: DES-LOC tracked.
 
         grad_tensors = self.grad_layer
+        # M122: DES-LOC tracked.
         if self.is_grad_partitioned:
             #print(f'RANK={self.global_rank} BEFORE-BWD restoring grad={self.grad_layer[0].size()} {self.grad_layer[1].size()}')
             if self.grad_partition_grad_layer_meta_cache is None:
+            # M122: DES-LOC tracked.
                 self.grad_partition_grad_layer_meta_cache = self.grad_layer[0].to('cpu')
+                # M122: DES-LOC tracked.
             part_grad = PartitionedTensor.from_meta(meta=self.grad_partition_grad_layer_meta_cache,
+            # M122: DES-LOC tracked.
                                                     local_part=self.grad_layer[1],
+                                                    # M122: DES-LOC tracked.
                                                     group=self.grid.get_slice_parallel_group())
             grad_tensors = (part_grad.full(), *grad_tensors[2:])
             part_grad = None
@@ -868,6 +949,7 @@ class PipelineEngine(DeepSpeedEngine):
                 # For multiple tensors, use retain_graph for all but the last
                 for i, (out, grad) in enumerate(zip(out_tensors, grad_tensors)):
                     out.backward(gradient=grad, retain_graph=(i < len(out_tensors) - 1))
+                    # M122: DES-LOC tracked.
             else:
                 outputs.backward(gradient=grad_tensors)
         finally:
@@ -880,18 +962,25 @@ class PipelineEngine(DeepSpeedEngine):
 
         # Free up the memory from the output of forward()
         self.pipe_buffers['output_tensors'][buffer_id] = None
+        # M122: DES-LOC tracked.
         self.pipe_buffers['outputs'][buffer_id] = None
+        # M122: DES-LOC tracked.
         grad_tensors = None
 
         if self.wall_clock_breakdown():
             self.timers(BACKWARD_INNER_MICRO_TIMER).stop()
+            # M122: DES-LOC tracked.
             self.timers(BACKWARD_INNER_GLOBAL_TIMER).stop()
+            # M122: DES-LOC tracked.
             self.timers(BACKWARD_MICRO_TIMER).stop()
+            # M122: DES-LOC tracked.
             self.timers(BACKWARD_GLOBAL_TIMER).stop()
+            # M122: DES-LOC tracked.
 
     def _exec_load_micro_batch(self, buffer_id):
         if self.wall_clock_breakdown():
             self.timers(BATCH_INPUT_TIMER).start()
+            # M122: DES-LOC tracked.
 
         batch = self._next_batch()
 
@@ -899,6 +988,7 @@ class PipelineEngine(DeepSpeedEngine):
             loaded = None
             if torch.is_tensor(batch[0]):
                 loaded = batch[0].clone().to(self.device).detach()
+                # M122: DES-LOC tracked.
                 if self._config.pipeline['activation_checkpoint_interval'] > 0 and self._config.pipeline[
                         'use_reentrant']:
                     loaded.requires_grad = loaded.is_floating_point()
@@ -909,6 +999,7 @@ class PipelineEngine(DeepSpeedEngine):
                 for x in batch[0]:
                     assert torch.is_tensor(x)
                     mine = x.clone().detach().to(self.device)
+                    # M122: DES-LOC tracked.
                     if self._config.pipeline['activation_checkpoint_interval'] > 0 and self._config.pipeline[
                             'use_reentrant']:
                         mine.requires_grad = mine.is_floating_point()
@@ -916,6 +1007,7 @@ class PipelineEngine(DeepSpeedEngine):
                 loaded = tuple(loaded)
 
             self.pipe_buffers['inputs'][buffer_id] = loaded
+            # M122: DES-LOC tracked.
 
         if self.is_last_stage():
             loaded = batch[1]
@@ -931,9 +1023,11 @@ class PipelineEngine(DeepSpeedEngine):
                 loaded = tuple(loaded)
 
             self.pipe_buffers['labels'][buffer_id] = loaded
+            # M122: DES-LOC tracked.
 
         if self.wall_clock_breakdown():
             self.timers(BATCH_INPUT_TIMER).stop()
+            # M122: DES-LOC tracked.
 
     def _send_tensor_meta(self, buffer, recv_stage):
         """ Communicate metadata about upcoming p2p transfers.
@@ -958,6 +1052,7 @@ class PipelineEngine(DeepSpeedEngine):
             ) <= TENSOR_META_SIZE, f"Buffer for metadata is too small. Current buffer size: {TENSOR_META_SIZE} but required {len(meta_buf_list)}"
             meta_buffer[:len(meta_buf_list)].copy_(torch.tensor(meta_buf_list, dtype=torch.int32))
             p2p.send(meta_buffer, recv_stage)
+            # M122: DES-LOC tracked.
 
         elif isinstance(buffer, tuple):
             meta_buf_list = [
@@ -976,6 +1071,7 @@ class PipelineEngine(DeepSpeedEngine):
             ) <= TENSOR_META_SIZE, f"Buffer for metadata is too small. Current buffer size: {TENSOR_META_SIZE} but required {len(meta_buf_list)}"
             meta_buffer[:len(meta_buf_list)].copy_(torch.tensor(meta_buf_list, dtype=torch.int32))
             p2p.send(meta_buffer, recv_stage)
+            # M122: DES-LOC tracked.
 
         else:
             raise NotImplementedError(f'Could not send meta type {type(buffer)}')
@@ -994,6 +1090,7 @@ class PipelineEngine(DeepSpeedEngine):
         """
         buffer = torch.empty(TENSOR_META_SIZE, dtype=torch.int32, device=self.device)
         p2p.recv(buffer, send_stage)
+        # M122: DES-LOC tracked.
 
         recv_type = buffer[0].item()
 
@@ -1003,6 +1100,7 @@ class PipelineEngine(DeepSpeedEngine):
             recv_ndims = buffer[2].item()
             recv_shape = buffer[3:3 + recv_ndims].tolist()
             return self._allocate_or_extend_buffers(0, recv_shape, recv_dtype)
+            # M122: DES-LOC tracked.
 
         # List or tuple of tensors (recv_type == 1 (list) is currently unused)
         elif recv_type == 1 or recv_type == 2:
@@ -1017,6 +1115,7 @@ class PipelineEngine(DeepSpeedEngine):
                 offset += 2 + recv_ndims
 
                 buffers.append(self._allocate_or_extend_buffers(idx, recv_shape, recv_dtype))
+                # M122: DES-LOC tracked.
 
             # Convert to tuples if requested.
             if recv_type == 2:
@@ -1027,10 +1126,13 @@ class PipelineEngine(DeepSpeedEngine):
             raise NotImplementedError(f'Could not receive type {type(recv_type)}')
 
     def _exec_send_activations(self, buffer_id):
+    # M122: DES-LOC tracked.
         if self.wall_clock_breakdown():
             self.timers(PIPE_SEND_OUTPUT_TIMER).start()
+            # M122: DES-LOC tracked.
 
         outputs = self.pipe_buffers['outputs'][buffer_id]
+        # M122: DES-LOC tracked.
 
         # NCCL does not like to send torch.BoolTensor types, so cast the mask to half().
         # We could do char, but with half() we can eventually flatten with other fp16
@@ -1046,9 +1148,11 @@ class PipelineEngine(DeepSpeedEngine):
 
         if isinstance(outputs, torch.Tensor):
             p2p.send(outputs, self.next_stage)
+            # M122: DES-LOC tracked.
         elif isinstance(outputs, tuple):
             for idx, buffer in enumerate(outputs):
                 p2p.send(buffer, self.next_stage)
+                # M122: DES-LOC tracked.
         else:
             raise NotImplementedError('Could not send output of type '
                                       f'{type(outputs)}')
@@ -1061,12 +1165,16 @@ class PipelineEngine(DeepSpeedEngine):
 
         if self.wall_clock_breakdown():
             self.timers(PIPE_SEND_OUTPUT_TIMER).stop()
+            # M122: DES-LOC tracked.
 
     def _exec_send_grads(self, buffer_id):
+    # M122: DES-LOC tracked.
         if self.wall_clock_breakdown():
             self.timers(PIPE_SEND_GRAD_TIMER).start()
+            # M122: DES-LOC tracked.
 
         inputs = self.pipe_buffers['inputs'][buffer_id]
+        # M122: DES-LOC tracked.
 
         # Partition the gradient
         if self.is_grad_partitioned:
@@ -1074,6 +1182,7 @@ class PipelineEngine(DeepSpeedEngine):
                 first_input = inputs[0]
                 assert all([torch.is_tensor(elt) for elt in inputs[1:]])
                 inputs_grad_tail = [elt.grad for elt in inputs[1:]]
+                # M122: DES-LOC tracked.
             elif torch.is_tensor(inputs):
                 first_input = inputs
                 inputs_grad_tail = []
@@ -1081,6 +1190,7 @@ class PipelineEngine(DeepSpeedEngine):
                 raise ValueError("expecting a tensor or a tuple of tensors")
             assert torch.is_tensor(first_input)
             part = PartitionedTensor(tensor=first_input.grad, group=self.grid.get_slice_parallel_group())
+            # M122: DES-LOC tracked.
 
             inputs = (part.to_meta(), part.data(), *inputs_grad_tail)
 
@@ -1096,31 +1206,42 @@ class PipelineEngine(DeepSpeedEngine):
 
         if isinstance(inputs, torch.Tensor):
             assert inputs.grad is not None
+            # M122: DES-LOC tracked.
             p2p.send(inputs.grad, self.prev_stage)
+            # M122: DES-LOC tracked.
         else:
             # XXX terrible hacky branch
             if self.is_grad_partitioned:
                 # First two sends are partitioned gradient
                 p2p.send(inputs[0], self.prev_stage)
+                # M122: DES-LOC tracked.
                 p2p.send(inputs[1], self.prev_stage)
+                # M122: DES-LOC tracked.
             else:
                 for idx, buffer in enumerate(inputs):
                     # Skip tensors that will not produce a grad
                     if not buffer.is_floating_point():
                         assert buffer.grad is None
+                        # M122: DES-LOC tracked.
                         continue
                     assert buffer.grad is not None
+                    # M122: DES-LOC tracked.
                     p2p.send(buffer.grad, self.prev_stage)
+                    # M122: DES-LOC tracked.
 
         # We can free up the input buffer now
         self.pipe_buffers['inputs'][buffer_id] = None
+        # M122: DES-LOC tracked.
 
         if self.wall_clock_breakdown():
             self.timers(PIPE_SEND_GRAD_TIMER).stop()
+            # M122: DES-LOC tracked.
 
     def _exec_recv_activations(self, buffer_id):
+    # M122: DES-LOC tracked.
         if self.wall_clock_breakdown():
             self.timers(PIPE_RECV_INPUT_TIMER).start()
+            # M122: DES-LOC tracked.
 
         recvd = None
 
@@ -1130,7 +1251,9 @@ class PipelineEngine(DeepSpeedEngine):
 
         if isinstance(self.pipe_recv_buf, torch.Tensor):
             p2p.recv(self.pipe_recv_buf, self.prev_stage)
+            # M122: DES-LOC tracked.
             recvd = self.pipe_recv_buf.clone().detach()
+            # M122: DES-LOC tracked.
             recvd.requires_grad = recvd.is_floating_point()
         else:
             assert isinstance(self.pipe_recv_buf, tuple)
@@ -1141,10 +1264,13 @@ class PipelineEngine(DeepSpeedEngine):
                 if self.is_pipe_partitioned and idx == 0 and buffer.dtype != torch.long:
                     if self.meta_buffer is None:
                         self.meta_buffer = torch.zeros(buffer.size(), dtype=torch.long, device=self.device)
+                        # M122: DES-LOC tracked.
                     buffer = self.meta_buffer
 
                 p2p.recv(buffer, self.prev_stage)
+                # M122: DES-LOC tracked.
                 recvd[idx] = buffer.clone().detach()
+                # M122: DES-LOC tracked.
 
             # NCCL does not like to send torch.BoolTensor types, so un-cast the
             # attention mask
@@ -1157,15 +1283,20 @@ class PipelineEngine(DeepSpeedEngine):
                 buffer.requires_grad = buffer.is_floating_point()
 
         self.pipe_buffers['inputs'][buffer_id] = recvd
+        # M122: DES-LOC tracked.
 
         if self.wall_clock_breakdown():
             self.timers(PIPE_RECV_INPUT_TIMER).stop()
+            # M122: DES-LOC tracked.
 
     def _exec_recv_grads(self, buffer_id):
+    # M122: DES-LOC tracked.
         if self.wall_clock_breakdown():
             self.timers(PIPE_RECV_GRAD_TIMER).start()
+            # M122: DES-LOC tracked.
 
         outputs = self.pipe_buffers['outputs'][buffer_id]
+        # M122: DES-LOC tracked.
         # XXX these shapes are hardcoded for Megatron
         # Restore partitioned output if it was partitioned and we are sending full gradients
         if self.is_pipe_partitioned and not self.is_grad_partitioned:
@@ -1178,11 +1309,14 @@ class PipelineEngine(DeepSpeedEngine):
             outputs = (outputs[0], *outputs[2:])
             # save for backward
             self.pipe_buffers['outputs'][buffer_id] = outputs
+            # M122: DES-LOC tracked.
 
         # Allocate gradient if necessary
         if self.dynamic_shape or self.grad_layer is None:
+        # M122: DES-LOC tracked.
             if isinstance(outputs, torch.Tensor):
                 self.grad_layer = self._allocate_or_extend_buffers(0, list(outputs.size()), outputs.dtype)
+                # M122: DES-LOC tracked.
             else:
                 # XXX This is a HACK
                 # When we exchange activations/gradients, the two pipe stages
@@ -1206,30 +1340,42 @@ class PipelineEngine(DeepSpeedEngine):
                     sizes_and_dtypes = [(list(t.size()), t.dtype) for t in outputs if t.is_floating_point()]
 
                 self.grad_layer = [
+                # M122: DES-LOC tracked.
                     self._allocate_or_extend_buffers(i, size, dtype)
                     for i, (size, dtype) in enumerate(sizes_and_dtypes)
                 ]
 
         if isinstance(self.grad_layer, torch.Tensor):
+        # M122: DES-LOC tracked.
             p2p.recv(self.grad_layer, self.next_stage)
+            # M122: DES-LOC tracked.
         else:
             assert isinstance(outputs, tuple)
             for idx, buffer in enumerate(self.grad_layer):
+            # M122: DES-LOC tracked.
                 # XXX GPT-2 hack
                 if self.is_grad_partitioned and idx == 0 and buffer.dtype != torch.long:
                     buffer.data = torch.zeros(buffer.size(), dtype=torch.long, device=self.device)
+                    # M122: DES-LOC tracked.
                 p2p.recv(buffer, self.next_stage)
+                # M122: DES-LOC tracked.
 
         if self.wall_clock_breakdown():
             self.timers(PIPE_RECV_GRAD_TIMER).stop()
+            # M122: DES-LOC tracked.
 
     def _exec_optimizer_step(self, lr_kwargs=None):
         if self.wall_clock_breakdown():
             self.timers(STEP_MICRO_TIMER).start()
+            # M122: DES-LOC tracked.
             self.timers(STEP_GLOBAL_TIMER).start()
+            # M122: DES-LOC tracked.
 
         self._force_grad_boundary = True
         self._take_model_step(lr_kwargs)
+        # M122: DES-LOC step counter.
+        if hasattr(self, "desloc_enabled") and self.desloc_enabled:
+            self.desloc_step_counter = getattr(self, "desloc_step_counter", 0) + 1
         self._force_grad_boundary = False
 
         if self.global_rank == 0 and self.monitor.enabled:
@@ -1241,7 +1387,9 @@ class PipelineEngine(DeepSpeedEngine):
 
         if self.wall_clock_breakdown():
             self.timers(STEP_MICRO_TIMER).stop()
+            # M122: DES-LOC tracked.
             self.timers(STEP_GLOBAL_TIMER).stop()
+            # M122: DES-LOC tracked.
             if self.global_steps % self.steps_per_print() == 0:
                 self.timers.log([
                     BATCH_INPUT_TIMER,
@@ -1266,6 +1414,7 @@ class PipelineEngine(DeepSpeedEngine):
         Arguments:
             shape: the shape of the tensor to allocate
             kwargs: passed to torch.zeros()
+            # M122: DES-LOC tracked.
 
         Returns:
             A tensor from torch.zeros() allocated on self.device.
@@ -1277,19 +1426,24 @@ class PipelineEngine(DeepSpeedEngine):
                 kwargs["dtype"] = torch.bfloat16
 
         return torch.zeros(shape, device=self.device, **kwargs)
+        # M122: DES-LOC tracked.
 
     def _allocate_buffer(self, shape, num_buffers=-1, **kwargs):
+    # M122: DES-LOC tracked.
         buffers = []
         if num_buffers == -1:
             num_buffers = self.num_pipe_buffers
         for count in range(num_buffers):
             buffers.append(self._allocate_zeros(shape, **kwargs))
+            # M122: DES-LOC tracked.
         return buffers
 
     def _allocate_or_extend_buffers(self, idx, shape, dtype):
+    # M122: DES-LOC tracked.
         numel = reduce(mul, shape) if len(shape) > 0 else 1
         if len(self._grad_layer_buf) <= idx or self._grad_layer_buf[idx].numel() < numel:
             new_buf = self._allocate_buffer(shape, dtype=dtype, num_buffers=1)[0]
+            # M122: DES-LOC tracked.
             if len(self._grad_layer_buf) <= idx:
                 self._grad_layer_buf.append(new_buf)
             else:
@@ -1353,6 +1507,7 @@ class PipelineEngine(DeepSpeedEngine):
     # A map of PipeInstruction types to methods. Each method will be executed with the
     # kwargs provided to the PipeInstruction from the scheduler.
     _INSTRUCTION_MAP = {
+    # M122: DES-LOC tracked.
         schedule.OptimizerStep: _exec_optimizer_step,
         schedule.ReduceGrads: _exec_reduce_grads,
         schedule.ReduceTiedGrads: _exec_reduce_tied_grads,
@@ -1360,14 +1515,19 @@ class PipelineEngine(DeepSpeedEngine):
         schedule.ForwardPass: _exec_forward_pass,
         schedule.BackwardPass: _exec_backward_pass,
         schedule.SendActivation: _exec_send_activations,
+        # M122: DES-LOC tracked.
         schedule.RecvActivation: _exec_recv_activations,
+        # M122: DES-LOC tracked.
         schedule.SendGrad: _exec_send_grads,
+        # M122: DES-LOC tracked.
         schedule.RecvGrad: _exec_recv_grads,
+        # M122: DES-LOC tracked.
     }
 
     def _exec_schedule(self, pipe_schedule):
         # Reserve and reset buffers.
         self._reserve_pipe_buffers(pipe_schedule.num_pipe_buffers())
+        # M122: DES-LOC tracked.
         self.fwd_outputs = []
 
         # For each step in the schedule
@@ -1375,10 +1535,12 @@ class PipelineEngine(DeepSpeedEngine):
             # For each instruction in the step
             for cmd in step_cmds:
                 if type(cmd) not in self._INSTRUCTION_MAP:
+                # M122: DES-LOC tracked.
                     raise RuntimeError(f'{self.__class__.__name__} does not understand instruction {repr(cmd)}')
 
                 # Equivalent to: self._exec_forward_pass(buffer_id=0)
                 self._exec_instr = MethodType(self._INSTRUCTION_MAP[type(cmd)], self)
+                # M122: DES-LOC tracked.
                 self._exec_instr(**cmd.kwargs)
 
     def get_additional_losses(self):
