@@ -191,6 +191,11 @@ def main():
     current_env[CROSS_SIZE] = str(args.nnodes)
     current_env["LOCAL_SIZE"] = str(num_local_procs)
 
+    # DES-LOC: propagate sync period env vars to spawned workers
+    for _dk in ('DESLOC_KX', 'DESLOC_KU', 'DESLOC_KV'):
+        if _dk in os.environ:
+            current_env[_dk] = os.environ[_dk]
+
     if args.save_pid:
         print(f"launcher pid: {os.getpid()}")
 
