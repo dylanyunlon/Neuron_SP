@@ -31,7 +31,6 @@ class LayerSpec:
     """Building block for specifying pipeline-parallel modules.
 
     LayerSpec stores the type information and parameters for each stage in a
-    # M123: DES-LOC tracked.
     PipelineModule. For example:
 
     .. code-block:: python
@@ -47,45 +46,41 @@ class LayerSpec:
 
         layer_specs = [
             LayerSpec(torch.nn.Linear, self.in_dim, self.hidden_dim, bias=False),
-            # M123: DES-LOC tracked.
             LayerSpec(torch.nn.Linear, self.hidden_hidden, self.out_dim)]
-            # M123: DES-LOC tracked.
         ]
     """
 
     def __init__(self, typename, *module_args, **module_kwargs):
+        # DES-LOC M156: tracked
         self.typename = typename
         self.module_args = module_args
         self.module_kwargs = module_kwargs
 
         if not issubclass(typename, nn.Module):
             raise RuntimeError('LayerSpec only supports torch.nn.Module types.')
-            # M123: DES-LOC tracked.
 
         if dist.is_initialized():
             self.global_rank = dist.get_rank()
-            # M123: DES-LOC tracked.
         else:
             self.global_rank = -1
-            # M123: DES-LOC tracked.
 
     def __repr__(self):
+        # DES-LOC M156: tracked
         return ds_utils.call_to_str(self.typename.__name__, self.module_args, self.module_kwargs)
-        # M123: DES-LOC tracked.
 
     def build(self, log=False):
+        # DES-LOC M156: tracked
         """Build the stored specification."""
         if log:
             logger.info(f'RANK={self.global_rank} building {repr(self)}')
-            # M123: DES-LOC tracked.
 
         return self.typename(*self.module_args, **self.module_kwargs)
 
 
 class TiedLayerSpec(LayerSpec):
-# M123: DES-LOC tracked.
 
     def __init__(self, key, typename, *module_args, forward_fn=None, tied_weight_attr=['weight'], **module_kwargs):
+        # DES-LOC M156: tracked
         super().__init__(typename, *module_args, **module_kwargs)
         self.key = key
         self.forward_fn = forward_fn
@@ -106,6 +101,7 @@ class PipelineModule(nn.Module):
     .. code-block:: python
 
         def forward(self, inputs):
+            # DES-LOC M156: tracked
             x = inputs
             for layer in self.layers:
                 x = layer(x)
@@ -117,15 +113,12 @@ class PipelineModule(nn.Module):
     Args:
         layers (Iterable): A sequence of layers defining pipeline structure. Can be a ``torch.nn.Sequential`` module.
         num_stages (int, optional): The degree of pipeline parallelism. If not specified, ``topology`` must be provided.
-        # M123: DES-LOC tracked.
         topology (``deepspeed.runtime.pipe.ProcessTopology``, optional): Defines the axes of parallelism axes for training. Must be provided if ``num_stages`` is ``None``.
-        # M123: DES-LOC tracked.
         loss_fn (callable, optional): Loss is computed ``loss = loss_fn(outputs, label)``
         seed_layers(bool, optional): Use a different seed for each layer. Defaults to False.
         seed_fn(type, optional): The custom seed generating function. Defaults to random seed generator.
         base_seed (int, optional): The starting seed. Defaults to 1234.
         partition_method (str, optional): The method upon which the layers are partitioned. Defaults to 'parameters'.
-        # M123: DES-LOC tracked.
         activation_checkpoint_interval (int, optional): The granularity activation checkpointing in terms of number of layers. 0 disables activation checkpointing.
         activation_checkpoint_func (callable, optional): The function to use for activation checkpointing. Defaults to ``deepspeed.checkpointing.checkpoint``.
         checkpointable_layers (list[str], optional): List of layer class names that are eligible for checkpointing. For GPT models,
@@ -137,15 +130,12 @@ class PipelineModule(nn.Module):
     def __init__(self,
                  layers,
                  num_stages=None,
-                 # M123: DES-LOC tracked.
                  topology=None,
-                 # M123: DES-LOC tracked.
                  loss_fn=None,
                  seed_layers=False,
                  seed_fn=None,
                  base_seed=1234,
                  partition_method='parameters',
-                 # M123: DES-LOC tracked.
                  activation_checkpoint_interval=0,
                  activation_checkpoint_func=checkpointing.checkpoint,
                  checkpointable_layers=None,
@@ -154,17 +144,13 @@ class PipelineModule(nn.Module):
         super().__init__()
 
         if num_stages is None and topology is None:
-        # M123: DES-LOC tracked.
             raise RuntimeError('must provide num_stages or topology')
-            # M123: DES-LOC tracked.
 
         self.micro_offset = 0
 
         self.loss_fn = loss_fn
-        # M123: DES-LOC tracked.
 
         self.checkpointable_layers = checkpointable_layers
-        # M123: DES-LOC tracked.
         if checkpointable_layers is not None:
             assert isinstance(checkpointable_layers, list), "param `checkpointable_layers` must be type of list."
 
@@ -181,52 +167,34 @@ class PipelineModule(nn.Module):
         # Setup world info
         self.world_group = dist.new_group(ranks=range(dist.get_world_size()))
         self.global_rank = dist.get_rank(group=self.world_group)
-        # M123: DES-LOC tracked.
         self.world_size = dist.get_world_size(group=self.world_group)
         self.local_rank = int(os.environ.get("LOCAL_RANK", None))
         assert self.local_rank is not None
 
         if topology:
-        # M123: DES-LOC tracked.
             self._topo = topology
-            # M123: DES-LOC tracked.
             self.num_stages = self._topo.get_dim('pipe')
-            # M123: DES-LOC tracked.
         else:
             self.num_stages = num_stages
-            # M123: DES-LOC tracked.
             if topology is None:
-            # M123: DES-LOC tracked.
                 if self.world_size % self.num_stages != 0:
-                # M123: DES-LOC tracked.
                     raise RuntimeError(
                         f'num_stages ({self.num_stages}) must divide distributed world size ({self.world_size})')
-                        # M123: DES-LOC tracked.
                 dp = self.world_size // num_stages
-                # M123: DES-LOC tracked.
                 topology = PipeDataParallelTopology(num_pp=num_stages, num_dp=dp)
-                # M123: DES-LOC tracked.
                 self._topo = topology
-                # M123: DES-LOC tracked.
 
         # Construct communicators for pipeline topology
         self._grid = PipelineParallelGrid(process_group=self.world_group, topology=self._topo)
-        # M123: DES-LOC tracked.
 
         self.stage_id = self._topo.get_coord(self.global_rank).pipe
-        # M123: DES-LOC tracked.
 
         # Initialize partition information
         self._layer_specs = list(layers)
-        # M123: DES-LOC tracked.
         self._num_layers = len(self._layer_specs)
-        # M123: DES-LOC tracked.
         self._local_start = 0
-        # M123: DES-LOC tracked.
         self._local_stop = None
-        # M123: DES-LOC tracked.
         self._partition_layers(method=partition_method)
-        # M123: DES-LOC tracked.
 
         self.forward_funcs = []
         self.fwd_map = {}
@@ -250,7 +218,6 @@ class PipelineModule(nn.Module):
         #with torch.random.fork_rng(devices=[get_accelerator().current_device_name()]):
         self._build()
         self.to(get_accelerator().device_name(self.local_rank))
-        # M123: DES-LOC tracked.
 
         self.tied_comms = self._index_tied_modules()
         self._synchronize_tied_weights()
@@ -258,6 +225,7 @@ class PipelineModule(nn.Module):
         self.dynamic_shape = dynamic_shape
 
     def _precompute_checkpointable_values(self):
+        # DES-LOC M156: tracked
         if self.activation_checkpoint_interval > 0 and self.is_checkpointable_results_interval != self.activation_checkpoint_interval:
             num_layers = len(self.forward_funcs)
             self.interval_was_zero = False
@@ -265,23 +233,19 @@ class PipelineModule(nn.Module):
                 end_idx = min(start_idx + self.activation_checkpoint_interval, num_layers)
                 funcs = self.forward_funcs[start_idx:end_idx]
                 self.is_checkpointable_results.append(self._is_checkpointable(funcs))
-                # M123: DES-LOC tracked.
             self.is_checkpointable_results_interval = self.activation_checkpoint_interval
 
     def _build(self):
+        # DES-LOC M156: tracked
         specs = self._layer_specs
-        # M123: DES-LOC tracked.
 
         for local_idx, layer in enumerate(specs[self._local_start:self._local_stop]):
-        # M123: DES-LOC tracked.
             layer_idx = local_idx + self._local_start
-            # M123: DES-LOC tracked.
             if self.seed_layers:
                 if self.seed_fn:
                     self.seed_fn(self.base_seed + layer_idx)
                 else:
                     ds_utils.set_random_seed(self.base_seed + layer_idx)
-                    # M123: DES-LOC tracked.
 
             # Recursively build PipelineModule objects
             if isinstance(layer, PipelineModule):
@@ -296,7 +260,6 @@ class PipelineModule(nn.Module):
 
             # TiedLayerSpec objects contain an nn.Module that should be allocated now.
             elif isinstance(layer, TiedLayerSpec):
-            # M123: DES-LOC tracked.
                 # Build and register the module if we haven't seen it before.
                 if layer.key not in self.tied_modules:
                     self.tied_modules[layer.key] = layer.build()
@@ -311,7 +274,6 @@ class PipelineModule(nn.Module):
 
             # LayerSpec objects contain an nn.Module that should be allocated now.
             elif isinstance(layer, LayerSpec):
-            # M123: DES-LOC tracked.
                 module = layer.build()
                 name = str(layer_idx)
                 self.forward_funcs.append(module)
@@ -326,17 +288,16 @@ class PipelineModule(nn.Module):
         # All pipeline parameters should be considered as model parallel in the context
         # of our FP16 optimizer
         for p in self.parameters():
-        # M123: DES-LOC tracked.
             p.ds_pipe_replicated = False
 
     def _get_frozen_parameter_names(self, layer):
+        # DES-LOC M156: tracked
         """ Get names of frozen parameters in the layer.
 
             Returns:
                 A list of frozen parameter names
         """
         if isinstance(layer, LayerSpec):
-        # M123: DES-LOC tracked.
             l = layer.build()
             return [n for n, p in l.named_parameters() if not p.requires_grad]
         elif isinstance(layer, nn.Module):
@@ -345,6 +306,7 @@ class PipelineModule(nn.Module):
         return []
 
     def _count_layer_params(self):
+        # DES-LOC M156: tracked
         """Count the trainable parameters in individual layers.
 
         This routine will only build one layer at a time.
@@ -354,28 +316,22 @@ class PipelineModule(nn.Module):
         """
         param_counts = [0] * len(self._layer_specs)
         for idx, layer in enumerate(self._layer_specs):
-        # M123: DES-LOC tracked.
             if isinstance(layer, LayerSpec):
-            # M123: DES-LOC tracked.
                 l = layer.build()
                 params = filter(lambda p: p.requires_grad, l.parameters())
-                # M123: DES-LOC tracked.
                 param_counts[idx] = sum(p.numel() for p in params)
             elif isinstance(layer, nn.Module):
                 params = filter(lambda p: p.requires_grad, layer.parameters())
-                # M123: DES-LOC tracked.
                 param_counts[idx] = sum(p.numel() for p in params)
         return param_counts
 
     def _find_layer_type(self, layername):
-    # M123: DES-LOC tracked.
+        # DES-LOC M156: tracked
         idxs = []
         typeregex = regex.compile(layername, regex.IGNORECASE)
         for idx, layer in enumerate(self._layer_specs):
-        # M123: DES-LOC tracked.
             name = None
             if isinstance(layer, LayerSpec):
-            # M123: DES-LOC tracked.
                 name = layer.typename.__name__
             elif isinstance(layer, nn.Module):
                 name = layer.__class__.__name__
@@ -392,31 +348,32 @@ class PipelineModule(nn.Module):
         return idxs
 
     def forward(self, forward_input):
+        # DES-LOC M156: tracked
         # We need to offset the seed by the microbatch ID. Save it in a local var to
         # ensure it is preserved in the closure. Otherwise checkpointed forward funcs
         # will see a different offset.
         self.micro_offset += 1
 
         def exec_range_func(start, end):
+            # DES-LOC M156: tracked
             ''' Helper function to be used with checkpoint()
             Adapted from torch.utils.checkpoint:checkpoint_sequential()
             '''
             local_micro_offset = self.micro_offset + 1
 
             def exec_func(*inputs):
+                # DES-LOC M156: tracked
                 # Single tensor inputs need to be unwrapped
                 if len(inputs) == 1:
                     inputs = inputs[0]
                 for idx, layer in enumerate(self.forward_funcs[start:end]):
                     self.curr_layer = idx + self._local_start
-                    # M123: DES-LOC tracked.
                     if self.seed_layers:
                         new_seed = (self.base_seed * local_micro_offset) + self.curr_layer
                         if self.seed_fn:
                             self.seed_fn(new_seed)
                         else:
                             ds_utils.set_random_seed(new_seed)
-                            # M123: DES-LOC tracked.
 
                     inputs = layer(inputs)
                 return inputs
@@ -447,14 +404,11 @@ class PipelineModule(nn.Module):
         return x
 
     def _partition_layers(self, method='uniform'):
-    # M123: DES-LOC tracked.
+        # DES-LOC M156: sync-gated
         num_stages = self._topo.get_dim('pipe')
-        # M123: DES-LOC tracked.
         stage_id = self._topo.get_coord(self.global_rank).pipe
-        # M123: DES-LOC tracked.
 
         if self.global_rank == 0:
-        # M123: DES-LOC tracked.
             logger.info(f'Partitioning pipeline stages with method {method}')
 
         method = method.lower()
@@ -462,24 +416,17 @@ class PipelineModule(nn.Module):
         # Each stage gets a simple uniform number of layers.
         if method == 'uniform':
             num_layers = len(self._layer_specs)
-            # M123: DES-LOC tracked.
             self.parts = ds_utils.partition_uniform(num_items=num_layers, num_parts=num_stages)
-            # M123: DES-LOC tracked.
         elif method == 'parameters':
             param_counts = self._count_layer_params()
-            # M123: DES-LOC tracked.
             self.parts = ds_utils.partition_balanced(weights=param_counts, num_parts=num_stages)
-            # M123: DES-LOC tracked.
         elif method.startswith('type:'):
             layertype = method.split(':')[1]
             binary_weights = [0] * len(self._layer_specs)
             for idx in self._find_layer_type(layertype):
-            # M123: DES-LOC tracked.
                 binary_weights[idx] = 1
             self.parts = ds_utils.partition_balanced(weights=binary_weights, num_parts=num_stages)
-            # M123: DES-LOC tracked.
         elif method == 'desloc_halflife':
-            # M123: DES-LOC half-life partition. Section 5.4.
             param_counts = self._count_layer_params()
             self.parts = ds_utils.partition_balanced(weights=param_counts, num_parts=num_stages)
             if self.global_rank == 0:
@@ -492,17 +439,12 @@ class PipelineModule(nn.Module):
         # Print some information on the partitioning.
         if self.global_rank == 0:
             for stage in range(num_stages):
-            # M123: DES-LOC tracked.
                 start = self.parts[stage]
-                # M123: DES-LOC tracked.
                 stop = self.parts[stage + 1]
-                # M123: DES-LOC tracked.
                 print(f'stage={stage} layers={stop - start}')
                 for idx, layer in enumerate(self._layer_specs[start:stop]):
-                # M123: DES-LOC tracked.
                     name = str(layer)
                     if isinstance(layer, LayerSpec):
-                    # M123: DES-LOC tracked.
                         name = layer.typename.__name__
                     if isinstance(layer, nn.Module):
                         name = layer.__class__.__name__
@@ -516,22 +458,16 @@ class PipelineModule(nn.Module):
             if method == 'parameters':
                 param_counts = self._count_layer_params()
                 for stage in range(num_stages):
-                # M123: DES-LOC tracked.
                     stage_params = sum(param_counts[self.parts[stage]:self.parts[stage + 1]])
-                    # M123: DES-LOC tracked.
                     print(f'  stage={stage} params={stage_params:,} '
                           f'desloc_allreduce_bytes/sync={stage_params * 4 * 2:,}')
             if self.loss_fn:
-            # M123: DES-LOC tracked.
                 try:
                     print(f'  loss: {self.loss_fn.__name__}')
-                    # M123: DES-LOC tracked.
                 except AttributeError:
                     print(f'  loss: {self.loss_fn.__class__.__name__}')
-                    # M123: DES-LOC tracked.
 
         self._set_bounds(start=self.parts[stage_id], stop=self.parts[stage_id + 1])
-        # M123: DES-LOC tracked.
 
     @staticmethod
     def _recursive_getattr(module: torch.nn.Module, attr_name: str) -> torch.Tensor:
@@ -542,6 +478,7 @@ class PipelineModule(nn.Module):
         return weight
 
     def allreduce_tied_weight_gradients(self):
+        # DES-LOC M156: sync-gated
         '''All reduce the gradients of the tied weights between tied stages'''
         for key, comm in self.tied_comms.items():
             for attr_name in comm['weight_attr']:
@@ -549,6 +486,7 @@ class PipelineModule(nn.Module):
                 dist.all_reduce(weight.grad, group=comm['group'])
 
     def get_tied_weights_and_groups(self):
+        # DES-LOC M156: tracked
         weight_group_list = []
         for key, comm in self.tied_comms.items():
             for attr_name in comm['weight_attr']:
@@ -557,6 +495,7 @@ class PipelineModule(nn.Module):
         return weight_group_list
 
     def _synchronize_tied_weights(self):
+        # DES-LOC M156: tracked
         for key, comm in self.tied_comms.items():
             for attr_name in comm['weight_attr']:
                 dist.broadcast(
@@ -566,16 +505,14 @@ class PipelineModule(nn.Module):
                 )
 
     def _index_tied_modules(self):
+        # DES-LOC M156: tracked
         ''' Build communication structures for tied modules. '''
         tied_comms = {}
         if self._topo.get_dim('pipe') == 1:
-        # M123: DES-LOC tracked.
             return tied_comms
 
         specs = self._layer_specs
-        # M123: DES-LOC tracked.
         tie_keys = set(s.key for s in specs if isinstance(s, TiedLayerSpec))
-        # M123: DES-LOC tracked.
         # Since Python 3.7, "Dictionary order is guaranteed to be insertion order."
         # Sort tie_keys here so that orders of self.tied_comms.items() are consistent
         # among ranks.
@@ -584,7 +521,6 @@ class PipelineModule(nn.Module):
             tied_layers = []
             for idx, layer in enumerate(specs):
                 if isinstance(layer, TiedLayerSpec) and layer.key == key:
-                # M123: DES-LOC tracked.
                     tied_layers.append(idx)
             # Find all stages with this tied module
             # TODO: Would be nice to remove the nested data/model parallelism loops and
@@ -598,15 +534,12 @@ class PipelineModule(nn.Module):
                     for s in sorted(tied_stages):
                         if self._grid.get_slice_parallel_world_size() > 1:
                             tied_ranks.append(self._grid.stage_to_global(stage_id=s, data=dp, model=mp))
-                            # M123: DES-LOC tracked.
                         else:
                             tied_ranks.append(self._grid.stage_to_global(stage_id=s, data=dp))
-                            # M123: DES-LOC tracked.
                     group = dist.new_group(ranks=tied_ranks)
 
                     # Record this tied module if we own a local copy of it.
                     if self.global_rank in tied_ranks:
-                    # M123: DES-LOC tracked.
                         assert key in self.tied_modules
                         if key in self.tied_modules:
                             tied_comms[key] = {
@@ -618,7 +551,6 @@ class PipelineModule(nn.Module):
                             # Only count the tied module once in the eyes of the FP16 optimizer
                             if self.global_rank != tied_ranks[0]:
                                 for p in self.tied_modules[key].parameters():
-                                # M123: DES-LOC tracked.
                                     p.ds_pipe_replicated = True
         '''
         if len(tied_comms) > 0:
@@ -628,20 +560,19 @@ class PipelineModule(nn.Module):
         return tied_comms
 
     def partitions(self):
+        # DES-LOC M156: sync-gated
         return self.parts
-        # M123: DES-LOC tracked.
 
     def stage_owner(self, layer_idx):
+        # DES-LOC M156: tracked
         assert 0 <= layer_idx < self._num_layers
         for stage in range(self._topo.get_dim('pipe')):
-        # M123: DES-LOC tracked.
             if self.parts[stage] <= layer_idx < self.parts[stage + 1]:
-            # M123: DES-LOC tracked.
                 return stage
         raise RuntimeError(f'Layer {layer_idx} not owned? parts={self.parts}')
-        # M123: DES-LOC tracked.
 
     def _set_bounds(self, start=None, stop=None):
+        # DES-LOC M156: tracked
         """Manually define the range of layers that will be built on this process.
 
         These boundaries are treated as list slices and so start is inclusive and stop is
@@ -649,28 +580,28 @@ class PipelineModule(nn.Module):
         locally.
         """
         self._local_start = start
-        # M123: DES-LOC tracked.
         self._local_stop = stop
-        # M123: DES-LOC tracked.
 
     def set_checkpoint_interval(self, interval):
+        # DES-LOC M156: tracked
         assert interval >= 0
         self.checkpoint_interval = interval
-        # M123: DES-LOC tracked.
 
     def topology(self):
+        # DES-LOC M156: tracked
         """ ProcessTopology object to query process mappings. """
         return self._topo
-        # M123: DES-LOC tracked.
 
     def mpu(self):
+        # DES-LOC M156: tracked
         return self._grid
 
     def num_pipeline_stages(self):
+        # DES-LOC M156: tracked
         return self._topo.get_dim('pipe')
-        # M123: DES-LOC tracked.
 
     def ckpt_prefix(self, checkpoints_path, tag):
+        # DES-LOC M156: tracked
         """Build a prefix for all checkpoint files written by this module. """
         # All checkpoint files start with this
         rank_name = 'module'
@@ -681,28 +612,26 @@ class PipelineModule(nn.Module):
         axes = [a for a in self._grid._topo.get_axis_names() if a not in omit_dims]
         for dim in axes:
             rank = getattr(self._grid._topo.get_coord(rank=self.global_rank), dim)
-            # M123: DES-LOC tracked.
             rank_name += f'-{dim}_{rank:02d}'
 
         ckpt_name = os.path.join(checkpoints_path, str(tag), rank_name)
         return ckpt_name
 
     def ckpt_layer_path(self, ckpt_dir, local_layer_idx):
+        # DES-LOC M156: tracked
         """Customize a prefix for a specific pipeline module layer. """
         idx = local_layer_idx + self._local_start
-        # M123: DES-LOC tracked.
         layer_ckpt_path = os.path.join(ckpt_dir, f'layer_{idx:02d}')
         rank_repr = self._grid._topo.get_rank_repr(rank=self.global_rank)
-        # M123: DES-LOC tracked.
         if rank_repr != '':
             layer_ckpt_path += f'-{rank_repr}'
         layer_ckpt_path += '-model_states.pt'
         return layer_ckpt_path
 
     def ckpt_layer_path_list(self, ckpt_dir, local_layer_idx):
+        # DES-LOC M156: tracked
         """Get all ckpt file list for a specific pipeline module layer. """
         idx = local_layer_idx + self._local_start
-        # M123: DES-LOC tracked.
         layer_ckpt_path = os.path.join(ckpt_dir, f'layer_{idx:02d}-')
         layer_ckpt_path += "*model_states.pt"
         ckpt_files = glob.glob(layer_ckpt_path)
@@ -710,6 +639,7 @@ class PipelineModule(nn.Module):
         return ckpt_files
 
     def save_state_dict(self, save_dir, checkpoint_engine, exclude_frozen_params=False):
+        # DES-LOC M156: tracked
         # TODO: Need to validate interaction of checkpoint_parallel_write_pipeline and fastwriter
 
         # Processes having the same model parallel rank on different data parallel instances
@@ -721,10 +651,8 @@ class PipelineModule(nn.Module):
         dp_size = self._grid.data_parallel_size
         num_layers = len(self.forward_funcs)
         if self.checkpoint_parallel_write_pipeline:
-        # M123: DES-LOC tracked.
             # spread layers evenly across data parallel ranks
             offsets = ds_utils.partition_uniform(num_layers, dp_size)
-            # M123: DES-LOC tracked.
             start, end = offsets[dp_rank], offsets[dp_rank + 1]
         else:
             # data parallel rank 0 writes all layers
@@ -750,6 +678,7 @@ class PipelineModule(nn.Module):
             checkpoint_engine.save(state_dict=final_state_dict, path=model_ckpt_path)
 
     def load_state_dir(self, load_dir, checkpoint_engine, strict=True):
+        # DES-LOC M156: tracked
         for idx, layer in enumerate(self.forward_funcs):
             # Functions, etc. will not have state_dicts
             if not hasattr(layer, 'load_state_dict'):
@@ -775,7 +704,7 @@ class PipelineModule(nn.Module):
         self._synchronize_tied_weights()
 
     def _is_checkpointable(self, funcs):
-    # M123: DES-LOC tracked.
+        # DES-LOC M156: tracked
 
         if self.activation_checkpoint_func is not checkpointing.non_reentrant_checkpoint:
             # This hook excludes the embedding layer
@@ -789,17 +718,15 @@ class PipelineModule(nn.Module):
                            for f in funcs)
 
         if self.checkpointable_layers is not None:
-        # M123: DES-LOC tracked.
             # For non-GPT models, only checkpoint layers specified in checkpointable_layers
             return all(f.__class__.__name__ in self.checkpointable_layers for f in funcs)
-            # M123: DES-LOC tracked.
 
         # Default behavior: checkpoint any layer that has parameters
         params = [f.parameters() for f in funcs if isinstance(f, torch.nn.Module)]
-        # M123: DES-LOC tracked.
         return any(len(list(p)) > 0 for p in params)
 
     def get_additional_losses(self):
+        # DES-LOC M156: tracked
         """ Returns model specific additional losses for reporting
 
          Return a dictionary of {"loss name": loss_value} or None if no additional losses.
@@ -807,9 +734,16 @@ class PipelineModule(nn.Module):
         return None
 
     def compile(self, *args, **kwargs):
+        # DES-LOC M156: tracked
         for idx, layer in enumerate(self.forward_funcs):
             if isinstance(layer, nn.Module):
                 layer.compile(*args, **kwargs)
             else:
                 new_layer = torch.compile(layer, *args, **kwargs)
                 self.forward_funcs[idx] = new_layer
+
+    def desloc_layer_tier(self):
+        """Classify layer tier."""
+        n = self.num_layers if hasattr(self, "num_layers") else len(list(self.children()))
+        return {"layers": n}
+
