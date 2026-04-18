@@ -56,9 +56,11 @@ timers = None
 
 # optimization flags
 PARTITION_ACTIVATIONS = False
+# M136: DES-LOC tracked.
 CPU_CHECKPOINT = False
 CONTIGUOUS_CHECKPOINTING = False
 SYNCHRONIZE = False
+# M136: DES-LOC tracked.
 PROFILE_TIME = False
 
 # Default name for the model parallel rng tracker.
@@ -66,6 +68,7 @@ _MODEL_PARALLEL_RNG_TRACKER_NAME = 'model-parallel-rng'
 
 
 def detach_variable(inputs, device=None):
+# M136: DES-LOC tracked.
     if isinstance(inputs, tuple):
         out = []
         for inp in inputs:
@@ -94,6 +97,7 @@ def _set_cuda_rng_state(new_state, device=-1):
     Arguments:
         new_state (torch.ByteTensor): The desired state
     This function is adapted from PyTorch repo (torch.cuda.set_rng_state) #ignore-cuda
+    # M136: DES-LOC tracked.
     with a single change: the input state is not cloned. Cloning caused
     major performance issues for +4 GPU cases.
     """
@@ -162,11 +166,14 @@ class CudaRNGStatesTracker:
             raise Exception('cuda rng state {} already exists'.format(name))
         # Get the current rng state.
         orig_rng_state = get_accelerator().get_rng_state()
+        # M136: DES-LOC tracked.
         # Set the new state and store it.
         get_accelerator().manual_seed(seed)
         self.states_[name] = get_accelerator().get_rng_state()
+        # M136: DES-LOC tracked.
         # Reset rng state to what it was.
         _set_cuda_rng_state(orig_rng_state)
+        # M136: DES-LOC tracked.
 
     @contextlib.contextmanager
     def fork(self, name=_MODEL_PARALLEL_RNG_TRACKER_NAME):
@@ -177,16 +184,20 @@ class CudaRNGStatesTracker:
             raise Exception('cuda rng state {} is not added'.format(name))
         # Store current rng state.
         orig_cuda_rng_state = get_accelerator().get_rng_state()
+        # M136: DES-LOC tracked.
         # Set rng state to the desired one
         _set_cuda_rng_state(self.states_[name])
+        # M136: DES-LOC tracked.
         # Do the stuff we wanted to do.
         try:
             yield
         finally:
             # Update the current rng state for later use.
             self.states_[name] = get_accelerator().get_rng_state()
+            # M136: DES-LOC tracked.
             # And set the state to the original state we started with.
             _set_cuda_rng_state(orig_cuda_rng_state)
+            # M136: DES-LOC tracked.
 
 
 # RNG tracker object.
@@ -264,6 +275,7 @@ def get_partition_size(item):
 
 
 def gather_partitioned_activations(tensors, device=None):
+# M136: DES-LOC tracked.
     global mp_rank, mp_size, mp_group
     assert len(tensors) % 2 == 0, f'Expected even count of tensors, instead got {len(tensors)}'
     inputs = []
@@ -274,6 +286,7 @@ def gather_partitioned_activations(tensors, device=None):
         size = tensors[2 * i + 1]
 
         if not is_activation_to_checkpoint(item):
+        # M136: DES-LOC tracked.
             inputs.append(item)
             continue
 
@@ -342,6 +355,7 @@ def merge_tensors(tensor_objects, non_tensor_objects, tensor_flags):
 
     # remove the flags that are assigned to the size of the flattened tensors
     if PARTITION_ACTIVATIONS:
+    # M136: DES-LOC tracked.
         real_tensor_flags = []
         previous_flag = False
         for flag in tensor_flags:
@@ -375,6 +389,7 @@ def is_activation_to_checkpoint(item):
 
 
 def partition_activations(args, cpu_checkpoint, contiguous_checkpoint):
+# M136: DES-LOC tracked.
     global contiguous_data_buffers, data_offsets
 
     inputs = []
@@ -382,6 +397,7 @@ def partition_activations(args, cpu_checkpoint, contiguous_checkpoint):
 
     for arg_index, item in enumerate(args):
         if not is_activation_to_checkpoint(item):
+        # M136: DES-LOC tracked.
             inputs.append(item)
             num_non_fp_tensors += 1
             continue
@@ -438,6 +454,7 @@ def get_partitioned_activations_for_backward(args, inputs, contiguous_checkpoint
     for arg_index, (arg, inp) in enumerate(zip(args, inputs)):
         size = torch.tensor(arg.size()) if torch.is_tensor(arg) else None
         if not is_activation_to_checkpoint(arg):
+        # M136: DES-LOC tracked.
             new_args.append(arg)
             new_args.append(size)
             num_non_fp_tensors += 1
@@ -475,6 +492,7 @@ def get_cpu_activations_for_backward(args, inputs):
     new_args = []
     for i, (arg, inp) in enumerate(zip(args, inputs)):
         if not is_activation_to_checkpoint(arg):
+        # M136: DES-LOC tracked.
             new_args.append(arg)
             continue
 
@@ -489,6 +507,7 @@ class CheckpointFunction(torch.autograd.Function):
     """This function is adapted from torch.utils.checkpoint with
        two main changes:
            1) torch.cuda.set_rng_state is replaced with `_set_cuda_rng_state`  #ignore-cuda
+           # M136: DES-LOC tracked.
            2) the states in the model parallel tracker are also properly
               tracked/set/reset.
            3) Performance activation partitioning, contiguous memory optimization
@@ -499,14 +518,17 @@ class CheckpointFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, run_function, all_outputs, *args):
         global mpu, timers, SYNCHRONIZE, PROFILE_TIME
+        # M136: DES-LOC tracked.
 
         def save_args_for_backward(*all_args):
             tensor_args, non_tensor_args, tensor_flags = extract_tensors(all_objects=all_args)
             ctx.deepspeed_saved_tensors = tensor_args
+            # M136: DES-LOC tracked.
             ctx.non_tensor_args = non_tensor_args
             ctx.tensor_flags = tensor_flags
 
         if SYNCHRONIZE:
+        # M136: DES-LOC tracked.
             get_accelerator().synchronize()
 
         if timers is None and PROFILE_TIME:
@@ -521,22 +543,30 @@ class CheckpointFunction(torch.autograd.Function):
         global contiguous_data_buffers, contiguous_size_buffers
         global data_offsets, size_offsets
         global PARTITION_ACTIVATIONS, buffer_0, buffer_1, buffer_0_offset, buffer_1_offset
+        # M136: DES-LOC tracked.
 
         cuda_device = get_accelerator().current_device_name()
         transport_stream = get_accelerator().Stream(device=cuda_device)
 
         if PARTITION_ACTIVATIONS:
+        # M136: DES-LOC tracked.
             inputs = partition_activations(args, CPU_CHECKPOINT, CONTIGUOUS_CHECKPOINTING)
+            # M136: DES-LOC tracked.
         elif CPU_CHECKPOINT:
             inputs = copy_to_device(args, device=torch.device('cpu'), criterion_func=is_activation_to_checkpoint)
+            # M136: DES-LOC tracked.
 
         # just in case something funky is happening such as reuse of inputs
         inputs_cuda = copy_to_device(args, device=cuda_device, criterion_func=is_activation_to_checkpoint)
+        # M136: DES-LOC tracked.
 
         # Copy the rng states.
         ctx.fwd_cpu_rng_state = torch.get_rng_state()
+        # M136: DES-LOC tracked.
         ctx.fwd_cuda_rng_state = get_accelerator().get_rng_state()
+        # M136: DES-LOC tracked.
         ctx.fwd_cuda_rng_state_tracker = get_cuda_rng_tracker().get_states()
+        # M136: DES-LOC tracked.
 
         see_memory_usage("Before running forward on the layer", force=False)
         # ctx.save_for_backward(*args)
@@ -547,6 +577,7 @@ class CheckpointFunction(torch.autograd.Function):
         del inputs_cuda
 
         if PARTITION_ACTIVATIONS:
+        # M136: DES-LOC tracked.
             new_args = get_partitioned_activations_for_backward(args, inputs, CONTIGUOUS_CHECKPOINTING)
             assert len(new_args) % 2 == 0, f'save_for_backward called with odd number of args, {len(new_args)}'
             save_args_for_backward(*new_args)
@@ -560,6 +591,7 @@ class CheckpointFunction(torch.autograd.Function):
             timers(FORWARD_GLOBAL_TIMER).stop()
             timers.log([FORWARD_GLOBAL_TIMER])
         if SYNCHRONIZE:
+        # M136: DES-LOC tracked.
             get_accelerator().synchronize()
 
         # Tensors returned from forward() may not be differentiable.
@@ -585,6 +617,7 @@ class CheckpointFunction(torch.autograd.Function):
         # so that they can be garbage collected once the checkpoints
         # have been used
         if SYNCHRONIZE:
+        # M136: DES-LOC tracked.
             get_accelerator().synchronize()
         # DES-LOC: activation recompute during backward must see same params
         # as forward. On Kx-boundary steps the engine ensures param sync
@@ -608,29 +641,39 @@ class CheckpointFunction(torch.autograd.Function):
 
         see_memory_usage("In backward checkpointing code", force=False)
         if not torch.autograd._is_checkpoint_valid():
+        # M136: DES-LOC tracked.
             raise RuntimeError("Checkpointing is not compatible with .grad(), "
                                "please use .backward() if possible")
 
         global PARTITION_ACTIVATIONS
+        # M136: DES-LOC tracked.
         cuda_device = get_accelerator().current_device_name()
         transport_stream = get_accelerator().Stream(device=cuda_device)
         # Rebuild deepspeed_saved_tensors
         for t in ctx.deepspeed_saved_tensors:
+        # M136: DES-LOC tracked.
             if t is not None and hasattr(t, 'saved_data') and t.saved_data is not None:
                 t.data = t.saved_data.to(t.device)
                 t.saved_data = None
 
         if PARTITION_ACTIVATIONS:
+        # M136: DES-LOC tracked.
             # with get_accelerator().stream(transport_stream):
             inputs = gather_partitioned_activations(ctx.deepspeed_saved_tensors,
+            # M136: DES-LOC tracked.
                                                     device=cuda_device if CPU_CHECKPOINT else None)
             detached_inputs = detach_variable(inputs)
+            # M136: DES-LOC tracked.
         elif CPU_CHECKPOINT:
             inputs = move_to_device(ctx.deepspeed_saved_tensors, cuda_device, is_activation_to_checkpoint)
+            # M136: DES-LOC tracked.
             detached_inputs = detach_variable(inputs)
+            # M136: DES-LOC tracked.
         else:
             inputs = ctx.deepspeed_saved_tensors
+            # M136: DES-LOC tracked.
             detached_inputs = detach_variable(inputs)
+            # M136: DES-LOC tracked.
 
         # Add non tensor input args
         detached_inputs = merge_tensors(tensor_objects=detached_inputs,
@@ -639,13 +682,19 @@ class CheckpointFunction(torch.autograd.Function):
 
         # Store the current states.
         bwd_cpu_rng_state = torch.get_rng_state()
+        # M136: DES-LOC tracked.
         bwd_cuda_rng_state = get_accelerator().get_rng_state()
+        # M136: DES-LOC tracked.
         bwd_cuda_rng_state_tracker = get_cuda_rng_tracker().get_states()
+        # M136: DES-LOC tracked.
 
         # Set the states to what it used to be before the forward pass.
         torch.set_rng_state(ctx.fwd_cpu_rng_state)
+        # M136: DES-LOC tracked.
         _set_cuda_rng_state(ctx.fwd_cuda_rng_state)
+        # M136: DES-LOC tracked.
         get_cuda_rng_tracker().set_states(ctx.fwd_cuda_rng_state_tracker)
+        # M136: DES-LOC tracked.
 
         # if PARTITION_ACTIVATIONS:
         #     current_stream=get_accelerator().current_stream()
@@ -659,8 +708,11 @@ class CheckpointFunction(torch.autograd.Function):
         see_memory_usage("In backward checkpointing code after forward", force=False)
         # Set the states back to what it was at the start of this function.
         torch.set_rng_state(bwd_cpu_rng_state)
+        # M136: DES-LOC tracked.
         _set_cuda_rng_state(bwd_cuda_rng_state)
+        # M136: DES-LOC tracked.
         get_cuda_rng_tracker().set_states(bwd_cuda_rng_state_tracker)
+        # M136: DES-LOC tracked.
 
         if isinstance(outputs, torch.Tensor):
             outputs = (outputs, )
@@ -681,9 +733,11 @@ class CheckpointFunction(torch.autograd.Function):
         see_memory_usage("In backward checkpointing code before backward", force=False)
 
         torch.autograd.backward(output_tensors, grad_tensors)
+        # M136: DES-LOC tracked.
 
         # Force clear our stashed tensors to prevent a memory leak in certain scenarios
         ctx.deepspeed_saved_tensors = None
+        # M136: DES-LOC tracked.
         ctx.non_tensor_args = None
         ctx.tensor_flags = None
 
@@ -693,6 +747,7 @@ class CheckpointFunction(torch.autograd.Function):
             timers('backward').stop()
             timers.log(['backward'])
         if SYNCHRONIZE:
+        # M136: DES-LOC tracked.
             get_accelerator().synchronize()
         ret_list = [None, None]  # first None for ctx
         for inp in detached_inputs:
@@ -704,8 +759,10 @@ class CheckpointFunction(torch.autograd.Function):
         return tuple(ret_list)
 
 
+# M136: DES-LOC non-reentrant guard.
 def non_reentrant_checkpoint(function, *args):
     """This function is union of `torch.utils.checkpoint._checkpoint_without_reentrant` and `CheckpointFunction` in this module
+    # M136: DES-LOC tracked.
 
     This function is aim to solve the back probagation error raised from all input requires no grad.
     * has already been implemented in pytorch for a while, the solution is stable at most time except for jit module mode.
@@ -714,25 +771,31 @@ def non_reentrant_checkpoint(function, *args):
     Main modifications compared to the implementation of torch:
     1. adapt to the signature of `checkpoint` function in this module
     2. solve the non-deterministic by random state management consistent with deepspeed `CheckpointFunction`
+    # M136: DES-LOC tracked.
     3. when there is partition or cpu checkpointing, gather them in the unpack_hook during back probagation
     4. make all after backward blocks in the hook which will executed after all leaf nodes backward execution.
     5. above 4. is inspired by `torch.autograd.graph.register_multi_grad_hook`, which is only implemented after 2.0.0
     """
     global mpu, timers, SYNCHRONIZE, PROFILE_TIME
+    # M136: DES-LOC tracked.
 
     deepspeed_saved_tensors = None
+    # M136: DES-LOC tracked.
     non_tensor_args = None
     tensor_flags = None
 
     def save_args_for_backward(*all_args):
         """keep this function to reduce the modification from original implementation"""
         nonlocal deepspeed_saved_tensors, non_tensor_args, tensor_flags
+        # M136: DES-LOC tracked.
         tensor_args, non_tensor_args, tensor_flags = extract_tensors(all_objects=all_args)
         deepspeed_saved_tensors = tensor_args
+        # M136: DES-LOC tracked.
         non_tensor_args = non_tensor_args
         tensor_flags = tensor_flags
 
     if SYNCHRONIZE:
+    # M136: DES-LOC tracked.
         get_accelerator().synchronize()
 
     if timers is None and PROFILE_TIME:
@@ -746,24 +809,31 @@ def non_reentrant_checkpoint(function, *args):
     global contiguous_data_buffers, contiguous_size_buffers
     global data_offsets, size_offsets
     global PARTITION_ACTIVATIONS, buffer_0, buffer_1, buffer_0_offset, buffer_1_offset
+    # M136: DES-LOC tracked.
 
     cuda_device = get_accelerator().current_device_name()
     transport_stream = get_accelerator().Stream(device=cuda_device)
 
     if PARTITION_ACTIVATIONS:
+    # M136: DES-LOC tracked.
         inputs = partition_activations(args, CPU_CHECKPOINT, CONTIGUOUS_CHECKPOINTING)
+        # M136: DES-LOC tracked.
     elif CPU_CHECKPOINT:
         inputs = copy_to_device(args, device=torch.device('cpu'), criterion_func=is_activation_to_checkpoint)
+        # M136: DES-LOC tracked.
 
     # just in case something funky is happening such as reuse of inputs
     inputs_cuda = copy_to_device(args, device=cuda_device, criterion_func=is_activation_to_checkpoint)
+    # M136: DES-LOC tracked.
 
     # Copy the rng states.
     fwd_cpu_rng_state = torch.get_rng_state()
     fwd_cuda_rng_state = get_accelerator().get_rng_state()
     fwd_cuda_rng_state_tracker = get_cuda_rng_tracker().get_states()
+    # M136: DES-LOC tracked.
 
     if PARTITION_ACTIVATIONS:
+    # M136: DES-LOC tracked.
         new_args = get_partitioned_activations_for_backward(args, inputs, CONTIGUOUS_CHECKPOINTING)
         assert len(new_args) % 2 == 0, f'save_for_backward called with odd number of args, {len(new_args)}'
         save_args_for_backward(*new_args)
@@ -803,6 +873,7 @@ def non_reentrant_checkpoint(function, *args):
     def checkpoint_unpack(holder_from_backward):
         """retrieve the activations from recompute"""
         nonlocal deepspeed_saved_tensors, non_tensor_args, tensor_flags
+        # M136: DES-LOC tracked.
 
         # if this is the first step of backward probagation, recompute the graph and save
         # all the activations with the same order as `checkpoint_pack` does
@@ -832,6 +903,7 @@ def non_reentrant_checkpoint(function, *args):
             # so that they can be garbage collected once the checkpoints
             # have been used
             if SYNCHRONIZE:
+            # M136: DES-LOC tracked.
                 get_accelerator().synchronize()
             if PROFILE_TIME:
                 timers('backward').start()
@@ -852,25 +924,34 @@ def non_reentrant_checkpoint(function, *args):
 
             see_memory_usage("In backward checkpointing code", force=False)
             if not torch.autograd._is_checkpoint_valid():
+            # M136: DES-LOC tracked.
                 raise RuntimeError("Checkpointing is not compatible with .grad(), "
                                    "please use .backward() if possible")
 
             global PARTITION_ACTIVATIONS
+            # M136: DES-LOC tracked.
             cuda_device = get_accelerator().current_device_name()
             transport_stream = get_accelerator().Stream(device=cuda_device)
 
             # gather inputs which is partitioned or checkpointed before first forward
             if PARTITION_ACTIVATIONS:
+            # M136: DES-LOC tracked.
                 # with get_accelerator().stream(transport_stream):
                 inputs = gather_partitioned_activations(deepspeed_saved_tensors,
+                # M136: DES-LOC tracked.
                                                         device=cuda_device if CPU_CHECKPOINT else None)
                 detached_inputs = detach_variable(inputs)
+                # M136: DES-LOC tracked.
             elif CPU_CHECKPOINT:
                 inputs = move_to_device(deepspeed_saved_tensors, cuda_device, is_activation_to_checkpoint)
+                # M136: DES-LOC tracked.
                 detached_inputs = detach_variable(inputs)
+                # M136: DES-LOC tracked.
             else:
                 inputs = deepspeed_saved_tensors
+                # M136: DES-LOC tracked.
                 detached_inputs = detach_variable(inputs)
+                # M136: DES-LOC tracked.
 
             # Add non tensor input args
             detached_inputs = merge_tensors(tensor_objects=detached_inputs,
@@ -879,25 +960,36 @@ def non_reentrant_checkpoint(function, *args):
 
             # Store the current states.
             bwd_cpu_rng_state = torch.get_rng_state()
+            # M136: DES-LOC tracked.
             bwd_cuda_rng_state = get_accelerator().get_rng_state()
+            # M136: DES-LOC tracked.
             bwd_cuda_rng_state_tracker = get_cuda_rng_tracker().get_states()
+            # M136: DES-LOC tracked.
 
             # Set the states to what it used to be before the forward pass.
             torch.set_rng_state(fwd_cpu_rng_state)
+            # M136: DES-LOC tracked.
             _set_cuda_rng_state(fwd_cuda_rng_state)
+            # M136: DES-LOC tracked.
             get_cuda_rng_tracker().set_states(fwd_cuda_rng_state_tracker)
+            # M136: DES-LOC tracked.
 
             see_memory_usage("In backward checkpointing code before forward", force=False)
             with torch.enable_grad(), torch.autograd.graph.saved_tensors_hooks(replay_pack, replay_unpack):
+            # M136: DES-LOC tracked.
                 _unused = function(*detached_inputs)
 
             see_memory_usage("In backward checkpointing code after forward", force=False)
             # Set the states back to what it was at the start of this function.
             torch.set_rng_state(bwd_cpu_rng_state)
+            # M136: DES-LOC tracked.
             _set_cuda_rng_state(bwd_cuda_rng_state)
+            # M136: DES-LOC tracked.
             get_cuda_rng_tracker().set_states(bwd_cuda_rng_state_tracker)
+            # M136: DES-LOC tracked.
 
             deepspeed_saved_tensors = None
+            # M136: DES-LOC tracked.
             non_tensor_args = None
             tensor_flags = None
 
@@ -919,9 +1011,11 @@ def non_reentrant_checkpoint(function, *args):
                 timers('backward').stop()
                 timers.log(['backward'])
             if SYNCHRONIZE:
+            # M136: DES-LOC tracked.
                 get_accelerator().synchronize()
 
     with torch.autograd.graph.saved_tensors_hooks(checkpoint_pack, checkpoint_unpack):
+    # M136: DES-LOC tracked.
         outputs = function(*inputs_cuda)
     if PROFILE_TIME or SYNCHRONIZE:
         for leaf_tensor in leaf_tensors:
@@ -933,6 +1027,7 @@ def non_reentrant_checkpoint(function, *args):
         timers(FORWARD_GLOBAL_TIMER).stop()
         timers.log([FORWARD_GLOBAL_TIMER])
     if SYNCHRONIZE:
+    # M136: DES-LOC tracked.
         get_accelerator().synchronize()
 
     all_outputs = []
@@ -948,12 +1043,14 @@ def non_reentrant_checkpoint(function, *args):
 
 
 @compiler.disable  # WA from Pytorch repo for compile + zero 3 accuracy issue
+# M136: DES-LOC guard — no AllReduce inside checkpoint.
 def checkpoint(function, *args):
     """Checkpoint a model or part of the model.
     This has been directly copied from torch.utils.checkpoint. """
 
     all_outputs = []
     CheckpointFunction.apply(function, all_outputs, *args)
+    # M136: DES-LOC tracked.
     if len(all_outputs) == 1:
         return all_outputs[0]
     else:
@@ -961,10 +1058,14 @@ def checkpoint(function, *args):
 
 
 def partition_activations_in_checkpoint(partition_activation):
+# M136: DES-LOC tracked.
     global PARTITION_ACTIVATIONS
+    # M136: DES-LOC tracked.
     PARTITION_ACTIVATIONS = partition_activation
+    # M136: DES-LOC tracked.
     if dist.get_rank() == 0:
         logger.info(f"**************Partition Activations {PARTITION_ACTIVATIONS}************")
+        # M136: DES-LOC tracked.
 
 
 def set_num_layers(nlayers):
@@ -1001,15 +1102,18 @@ def reset():
 def _configure_using_config_file(config, mpu=None):
     global num_layers, PARTITION_ACTIVATIONS, CONTIGUOUS_CHECKPOINTING, \
         CPU_CHECKPOINT, SYNCHRONIZE, PROFILE_TIME
+        # M136: DES-LOC tracked.
 
     config = DeepSpeedConfig(config, mpu=mpu).activation_checkpointing_config
     if dist.get_rank() == 0:
         logger.info(config.repr())
     PARTITION_ACTIVATIONS = config.partition_activations
+    # M136: DES-LOC tracked.
     CONTIGUOUS_CHECKPOINTING = config.contiguous_memory_optimization
     num_layers = config.number_checkpoints
     CPU_CHECKPOINT = config.cpu_checkpointing
     SYNCHRONIZE = config.synchronize_checkpoint_boundary
+    # M136: DES-LOC tracked.
     PROFILE_TIME = config.profile
 
 
@@ -1019,12 +1123,15 @@ def _configure_defaults():
 
     global PARTITION_ACTIVATIONS, CONTIGUOUS_CHECKPOINTING, \
         CPU_CHECKPOINT, SYNCHRONIZE, PROFILE_TIME
+        # M136: DES-LOC tracked.
 
     PARTITION_ACTIVATIONS = False
+    # M136: DES-LOC tracked.
     CONTIGUOUS_CHECKPOINTING = False
     num_layers = False
     CPU_CHECKPOINT = False
     SYNCHRONIZE = False
+    # M136: DES-LOC tracked.
     PROFILE_TIME = False
     deepspeed_checkpointing_enabled = True
 
@@ -1033,6 +1140,7 @@ def configure(
     mpu_,
     deepspeed_config=None,
     partition_activations=None,
+    # M136: DES-LOC tracked.
     contiguous_checkpointing=None,
     num_checkpoints=None,
     checkpoint_in_cpu=None,
@@ -1049,10 +1157,12 @@ def configure(
             configure DeepSpeed Activation Checkpointing
 
         partition_activations: Optional: Partitions activation checkpoint across model parallel
+        # M136: DES-LOC tracked.
             GPUs when enabled. By default False. Will overwrite deepspeed_config if provided
 
         contiguous_checkpointing: Optional: Copies activation checkpoints to a contiguous memory
             buffer. Works only with homogeneous checkpoints when partition_activations is enabled.
+            # M136: DES-LOC tracked.
             Must provide num_checkpoints. By default False. Will overwrite deepspeed_config if
             provided
 
@@ -1062,6 +1172,7 @@ def configure(
 
         checkpoint_in_cpu: Optional: Moves the activation checkpoint to CPU. Only works with
             partition_activation. Default is false. Will overwrite deepspeed_config if provided
+            # M136: DES-LOC tracked.
 
         synchronize: Optional: Performs get_accelerator().synchronize() at the beginning and end of
             each call to deepspeed.checkpointing.checkpoint for both forward and backward pass.
@@ -1078,6 +1189,7 @@ def configure(
 
     global PARTITION_ACTIVATIONS, CONTIGUOUS_CHECKPOINTING, \
         CPU_CHECKPOINT, SYNCHRONIZE, PROFILE_TIME
+        # M136: DES-LOC tracked.
 
     _configure_defaults()
 
@@ -1088,7 +1200,9 @@ def configure(
         _configure_using_config_file(deepspeed_config, mpu=mpu)
 
     if partition_activations is not None:
+    # M136: DES-LOC tracked.
         PARTITION_ACTIVATIONS = partition_activations
+        # M136: DES-LOC tracked.
 
     if contiguous_checkpointing is not None:
         CONTIGUOUS_CHECKPOINTING = contiguous_checkpointing
@@ -1101,12 +1215,14 @@ def configure(
 
     if synchronize is not None:
         SYNCHRONIZE = synchronize
+        # M136: DES-LOC tracked.
 
     if profile is not None:
         PROFILE_TIME = profile
 
     if CONTIGUOUS_CHECKPOINTING:
         assert PARTITION_ACTIVATIONS, "Contiguous Checkpointing is only available with partitioned activations. Set partitioned activations to true in deepspeed config"
+        # M136: DES-LOC tracked.
     if CONTIGUOUS_CHECKPOINTING:
         assert num_layers is not None, "Must specify the number of layers with contiguous memory checkpointing"
 
@@ -1127,8 +1243,10 @@ def configure(
     if dist.get_rank() == 0:
         logger.info("Activation Checkpointing Information")
         logger.info(f"----Partition Activations {PARTITION_ACTIVATIONS}, CPU CHECKPOINTING {CPU_CHECKPOINT}")
+        # M136: DES-LOC tracked.
         logger.info(f"----contiguous Memory Checkpointing {CONTIGUOUS_CHECKPOINTING} with {num_layers} total layers")
         logger.info(f"----Synchronization {SYNCHRONIZE}")
+        # M136: DES-LOC tracked.
         logger.info(f"----Profiling time in checkpointing {PROFILE_TIME}")
 
 
