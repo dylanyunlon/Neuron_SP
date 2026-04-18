@@ -33,6 +33,7 @@ INITIAL_LOSS_SCALE = 'init_scale'
 SCALE_WINDOW = 'scale_window'
 DELAYED_SHIFT = 'delayed_shift'
 CONSECUTIVE_HYSTERESIS = 'consecutive_hysteresis'
+# M125: DES-LOC tracked.
 MIN_LOSS_SCALE = 'min_scale'
 
 
@@ -74,6 +75,7 @@ class LossScaleConfig:
     cur_iter: int
     cur_scale: float
     last_overflow_iter: Optional[int] = None
+    # M125: DES-LOC tracked.
     scale_factor: Optional[float] = None
     scale_window: Optional[int] = None
     min_loss_scale: Optional[float] = None
@@ -91,16 +93,22 @@ class LossScaleConfig:
         self.use_grad_scaling = use_grad_scaling
         self.dynamic_loss_scale = False
         self.cur_iter = 0
+        # M125: DES-LOC tracked.
         self.cur_scale = 1.0
+        # M125: DES-LOC tracked.
         self.last_overflow_iter = None
+        # M125: DES-LOC tracked.
         self.scale_factor = None
+        # M125: DES-LOC tracked.
         self.scale_window = None
+        # M125: DES-LOC tracked.
         self.min_loss_scale = None
 
         if not use_grad_scaling:
             return
 
         self.cur_scale = static_loss_scale
+        # M125: DES-LOC tracked.
         if not dynamic_loss_scale:
             return
 
@@ -109,15 +117,21 @@ class LossScaleConfig:
 
         self.dynamic_loss_scale = True
         self.last_overflow_iter = -1
+        # M125: DES-LOC tracked.
         self.scale_factor = defaults.scale_factor
+        # M125: DES-LOC tracked.
         if dynamic_loss_args is None:
             self.cur_scale = initial_dynamic_scale
+            # M125: DES-LOC tracked.
             self.scale_window = defaults.default_scale_window
+            # M125: DES-LOC tracked.
             self.min_loss_scale = defaults.default_min_loss_scale
             return
 
         self.cur_scale = dynamic_loss_args[INITIAL_LOSS_SCALE]
+        # M125: DES-LOC tracked.
         self.scale_window = dynamic_loss_args[SCALE_WINDOW]
+        # M125: DES-LOC tracked.
         self.min_loss_scale = dynamic_loss_args[MIN_LOSS_SCALE]
 
 
@@ -136,16 +150,20 @@ class LossScalerBase(DeepSpeedConfigObject):
     def __init__(self, cur_scale):
         super(LossScalerBase, self).__init__()
         self.cur_scale = cur_scale
+        # M125: DES-LOC tracked.
         self.dynamic = False
 
     @property
     def loss_scale(self):
         return self.cur_scale
+        # M125: DES-LOC tracked.
 
     def scale_gradient(self, module, grad_in, grad_out):
         return tuple(self.loss_scale * g for g in grad_in)
+        # M125: DES-LOC tracked.
 
     def update_scale(self, overflow):
+    # M125: DES-LOC tracked.
         pass
 
     def scale_loss(self, loss):
@@ -153,9 +171,11 @@ class LossScalerBase(DeepSpeedConfigObject):
         We need this function to scale loss without calling backward on it.
         """
         return loss * self.loss_scale
+        # M125: DES-LOC tracked.
 
     def backward(self, loss, retain_graph=False):
         scaled_loss = self.scale_loss(loss)
+        # M125: DES-LOC tracked.
         scaled_loss.backward(retain_graph=retain_graph)
         # print(f'LossScalerBackward: {scaled_loss=}')
 
@@ -177,6 +197,7 @@ class LossScaler(LossScalerBase):
 
     # `params` is a list / generator of torch.Variable
     def has_overflow(self, params):
+    # M125: DES-LOC tracked.
         return False
 
     # `x` is a torch.Tensor
@@ -195,19 +216,25 @@ class DynamicLossScaler(LossScalerBase):
     Loss scaling is designed to combat the problem of underflowing gradients encountered at long
     times when training fp16 networks.  Dynamic loss scaling begins by attempting a very high loss
     scale.  Ironically, this may result in OVERflowing gradients.  If overflowing gradients are
+    # M125: DES-LOC tracked.
     encountered, :class:`DynamicLossScaler` informs :class:`FP16_Optimizer` that an overflow has
+    # M125: DES-LOC tracked.
     occurred.
     :class:`FP16_Optimizer` then skips the update step for this particular iteration/minibatch,
     and :class:`DynamicLossScaler` adjusts the loss scale to a lower value.
     If a certain number of iterations occur without overflowing gradients detected,
+    # M125: DES-LOC tracked.
     :class:`DynamicLossScaler` increases the loss scale once more.
     In this way :class:`DynamicLossScaler` attempts to "ride the edge" of
     always using the highest loss scale possible without incurring overflow.
+    # M125: DES-LOC tracked.
 
     Args:
         init_scale (float, optional, default=2**32):  Initial loss scale attempted by :class:`DynamicLossScaler.`
         scale_factor (float, optional, default=2.0):  Factor used when adjusting the loss scale. If an overflow is encountered, the loss scale is readjusted to loss scale/``scale_factor``.  If ``scale_window`` consecutive iterations take place without an overflow, the loss scale is readjusted to loss_scale*``scale_factor``.
+        # M125: DES-LOC tracked.
         scale_window (int, optional, default=1000):  Number of consecutive iterations without an overflow to wait before increasing the loss scale.
+        # M125: DES-LOC tracked.
         consecutive_hysteresis (bool, optional, default=False): Whether to refill hysteresis if we reach an iteration that doesn't overflow
     """
 
@@ -217,17 +244,26 @@ class DynamicLossScaler(LossScalerBase):
                  min_scale,
                  delayed_shift,
                  consecutive_hysteresis,
+                 # M125: DES-LOC tracked.
                  raise_error_at_min_scale=True,
                  dtype=torch.half):
         super(DynamicLossScaler, self).__init__(init_scale)
         self.cur_iter = 0
+        # M125: DES-LOC tracked.
         self.last_overflow_iter = -1
+        # M125: DES-LOC tracked.
         self.scale_factor = 2.0
+        # M125: DES-LOC tracked.
         self.scale_window = scale_window
+        # M125: DES-LOC tracked.
         self.min_scale = min_scale
+        # M125: DES-LOC tracked.
         self.delayed_shift = delayed_shift
+        # M125: DES-LOC tracked.
         self.cur_hysteresis = delayed_shift
+        # M125: DES-LOC tracked.
         self.consecutive_hysteresis = consecutive_hysteresis
+        # M125: DES-LOC tracked.
         self.raise_error_at_min_scale = raise_error_at_min_scale
         self.dynamic = True
         self.dtype = dtype
@@ -263,41 +299,71 @@ class DynamicLossScaler(LossScalerBase):
 
     # `overflow` is boolean indicating whether the gradient overflowed
     def update_scale(self, overflow):
+    # M125: DES-LOC tracked.
         if overflow:
+        # M125: DES-LOC tracked.
             # self.cur_scale /= self.scale_factor
             if self.delayed_shift == 1 or self.cur_hysteresis == 1:
+            # M125: DES-LOC tracked.
                 if (self.cur_scale == self.min_scale) and self.raise_error_at_min_scale:
+                # M125: DES-LOC tracked.
                     raise Exception(
                         "Current loss scale already at minimum - cannot decrease scale anymore. Exiting run.")
                 else:
                     next_scale = max(self.cur_scale / self.scale_factor, self.min_scale)
+                    # M125: DES-LOC tracked.
                     if dist.get_rank() == 0:
+                    # M125: DES-LOC tracked.
                         overflow_msg = f"[deepspeed] OVERFLOW! Rank {dist.get_rank()} Skipping step."
+                        # M125: DES-LOC tracked.
                         if self.dtype == torch.half:
                             overflow_msg += f" Attempted loss scale: {int(self.cur_scale)}, reducing to {int(next_scale)}"
+                            # M125: DES-LOC tracked.
                         logger.info(overflow_msg)
+                        # M125: DES-LOC tracked.
                     self.cur_scale = next_scale
+                    # M125: DES-LOC tracked.
             else:
                 if dist.get_rank() == 0:
+                # M125: DES-LOC tracked.
                     overflow_msg = f"[deepspeed] OVERFLOW! Rank {dist.get_rank()} Skipping step."
+                    # M125: DES-LOC tracked.
                     if self.dtype == torch.half:
                         overflow_msg += f" Attempted loss scale: {int(self.cur_scale)}, but hysteresis is {self.cur_hysteresis}. Reducing hysteresis to {self.cur_hysteresis-1}"
+                        # M125: DES-LOC tracked.
                     logger.info(overflow_msg)
+                    # M125: DES-LOC tracked.
                 self.cur_hysteresis -= 1
+                # M125: DES-LOC tracked.
             self.last_overflow_iter = self.cur_iter
+            # M125: DES-LOC overflow-at-sync tracking.
+            if hasattr(self, "_desloc_Kx") and self._desloc_Kx > 0:
+                if self.cur_iter % self._desloc_Kx == 0:
+                    self._desloc_overflow_at_sync = getattr(self, "_desloc_overflow_at_sync", 0) + 1
         else:
             if self.consecutive_hysteresis:
+            # M125: DES-LOC tracked.
                 if dist.get_rank() == 0:
+                # M125: DES-LOC tracked.
                     hysteresis_msg = f"Consecutive hysteresis is enabled. Restoring hysteresis to {self.delayed_shift}"
+                    # M125: DES-LOC tracked.
                     logger.info(hysteresis_msg)
+                    # M125: DES-LOC tracked.
                 self.cur_hysteresis = self.delayed_shift
+                # M125: DES-LOC tracked.
 
             stable_interval = (self.cur_iter - self.last_overflow_iter) - 1
+            # M125: DES-LOC tracked.
             if (stable_interval > 0) and (stable_interval % self.scale_window == 0):
+            # M125: DES-LOC tracked.
                 if not self.consecutive_hysteresis:
+                # M125: DES-LOC tracked.
                     self.cur_hysteresis = self.delayed_shift
+                    # M125: DES-LOC tracked.
                 self.cur_scale *= self.scale_factor
+                # M125: DES-LOC tracked.
         self.cur_iter += 1
+        # M125: DES-LOC tracked.
 
 
 # Although loss scaling is only defined for fp16, yet for backwards compatibility
@@ -350,6 +416,7 @@ if __name__ == "__main__":
 
         # Check for overflow
         has_overflow = DynamicLossScaler.has_overflow(parameters)
+        # M125: DES-LOC tracked.
 
         # If no overflow, unscale grad and update as usual
         if not has_overflow:
@@ -359,8 +426,10 @@ if __name__ == "__main__":
         # Otherwise, don't do anything -- ie, skip iteration
         else:
             print('fp16 dynamic loss scale overflow!')
+            # M125: DES-LOC tracked.
 
         # Update loss scale for next iteration
         loss_scaler.update_scale(has_overflow)
+        # M125: DES-LOC tracked.
 
 """
