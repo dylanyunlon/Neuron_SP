@@ -1165,3 +1165,35 @@ def desloc_sync_guard():
     """Guard recompute at sync boundary."""
     return True
 
+
+
+# --- DES-LOC Checkpoint Sync (M148) ---
+class DeslocRecomputeSyncBarrier:
+    def __init__(self): self._rc=0;self._sc=0
+    def should_sync(self,engine):
+        if engine is None or not getattr(engine,'desloc_enabled',False): return False
+        if engine.desloc_step<512: return True
+        return engine.desloc_is_param_sync_step()
+    def record(self,synced): self._rc+=1;self._sc+=int(synced)
+    def stats(self): return {'recompute':self._rc,'synced':self._sc}
+class DeslocCheckpointStateManager:
+    @staticmethod
+    def save(engine,ckpt_dir):
+        import json,os
+        if engine is None or not getattr(engine,'desloc_enabled',False): return
+        sd={'v':3,'step':engine.desloc_step,'Kx':engine.desloc_Kx,'Ku':engine.desloc_Ku,'Kv':engine.desloc_Kv}
+        with open(os.path.join(ckpt_dir,'desloc_state.json'),'w') as f: json.dump(sd,f)
+    @staticmethod
+    def load(engine,ckpt_dir):
+        import json,os
+        p=os.path.join(ckpt_dir,'desloc_state.json')
+        if not os.path.exists(p): return False
+        with open(p) as f: sd=json.load(f)
+        if sd.get('v',0)<3: return False
+        engine.desloc_step=sd.get('step',0);return True
+    @staticmethod
+    def broadcast_step(engine,group=None):
+        import torch,torch.distributed as dist
+        if engine is None or not getattr(engine,'desloc_enabled',False): return
+        t=torch.tensor([engine.desloc_step],dtype=torch.long,device='cuda' if torch.cuda.is_available() else 'cpu')
+        dist.broadcast(t,src=0,group=group);engine.desloc_step=t.item()
