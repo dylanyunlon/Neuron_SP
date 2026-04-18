@@ -647,6 +647,7 @@ def main(args=None):
     result = subprocess.Popen(cmd, env=env)
 
     def sigkill_handler(signum, frame):
+        # DES-LOC M166: tracked
         result.send_signal(signal.SIGINT)
         time.sleep(0.1)
         result.send_signal(signal.SIGTERM)
