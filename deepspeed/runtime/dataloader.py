@@ -57,6 +57,8 @@ class DeepSpeedDataLoader(object):
         self.tput_timer = tput_timer
         self.batch_size = batch_size
         self.curriculum_learning_enabled = False
+        # DES-LOC: track if desloc is active for data/sync alignment
+        self.desloc_enabled = deepspeed_dataloader_config.get('desloc_enabled', False)
         if CURRICULUM_LEARNING in deepspeed_dataloader_config:
             self.curriculum_learning_enabled = deepspeed_dataloader_config[CURRICULUM_LEARNING]
 
