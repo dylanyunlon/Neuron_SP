@@ -501,3 +501,20 @@ GLOBAL_RANK = "global_rank"
 #########################################
 USE_DATA_BEFORE_EXPERT_PARALLEL = "use_data_before_expert_parallelism"
 USE_DATA_BEFORE_EXPERT_PARALLEL_DEFAULT = False
+
+#########################################
+# DES-LOC: Desynced Low Communication
+#########################################
+DESLOC = "desloc"
+DESLOC_ENABLED = "enabled"
+DESLOC_ENABLED_DEFAULT = False
+DESLOC_KX = "Kx"
+DESLOC_KX_DEFAULT = 32
+DESLOC_KU = "Ku"
+DESLOC_KU_DEFAULT = 96
+DESLOC_KV = "Kv"
+DESLOC_KV_DEFAULT = 192
+DESLOC_CLIP_RADIUS = "clip_radius"
+DESLOC_CLIP_RADIUS_DEFAULT = 1.0
+DESLOC_OUTER_OPT = "outer_optimizer"
+DESLOC_OUTER_OPT_DEFAULT = "averaging"
