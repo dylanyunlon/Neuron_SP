@@ -1770,3 +1770,37 @@ class DeslocPipelineCheckpointGuard:
     def _desloc_pipe_log(self):
         if not self.desloc_enabled or dist.get_rank()!=0: return
         print(f"### PP DES-LOC step={self.desloc_step} stage={getattr(self,'stage_id',0)} tier={self._desloc_pipe_stage_tier()} ###")
+
+    # --- DES-LOC Pipeline Extensions (M149) ---
+    def _desloc_pipe_comm_stats(self):
+        sb=sum(p.numel()*p.element_size() for p in self.module.parameters() if p.requires_grad)
+        Kx=self.desloc_Kx if self.desloc_enabled else 1
+        return {'dp':sb,'reduction':round(Kx,1),'tier':self._desloc_pipe_stage_tier()}
+    def _desloc_pipe_warmup_sched(self,W=512):
+        s=self.desloc_step;tKx,tKu,tKv=self.desloc_Kx,self.desloc_Ku,self.desloc_Kv
+        if s<W//4: return {'Kx':1,'Ku':1,'Kv':1,'phase':'full_sync'}
+        elif s<W//2: return {'Kx':max(1,tKx//4),'Ku':1,'Kv':1,'phase':'grad_x'}
+        elif s<W: return {'Kx':max(1,tKx//2),'Ku':max(1,tKu//4),'Kv':1,'phase':'grad_uv'}
+        return {'Kx':tKx,'Ku':tKu,'Kv':tKv,'phase':'full_desloc'}
+    def _desloc_pipe_stability(self):
+        import math
+        gn=sum(p.grad.data.norm(2).item()**2 for p in self.module.parameters() if p.grad is not None)
+        gn=math.sqrt(gn);t=torch.tensor([gn,gn**2],device=self.device)
+        ws=dist.get_world_size()
+        if ws>1: dist.all_reduce(t);t/=ws
+        mn,msq=t[0].item(),t[1].item();cv=math.sqrt(max(0,msq-mn**2))/max(mn,1e-8)
+        return {'stable':cv<0.5,'cv':round(cv,4)}
+    def _desloc_pipe_overlap_est(self):
+        ns=getattr(self,'num_stages',1)
+        if ns<=1: return 1.0
+        sb=sum(p.numel()*p.element_size() for p in self.module.parameters() if p.requires_grad)
+        cm=sb/10e9*1000/max(self.desloc_Kx,1);cp=100.0/ns
+        ol=min(cm,cp*(ns-1));ex=max(0,cm-ol);return round(cp/max(cp+ex,1e-8),3)
+    def _desloc_pipe_ckpt(self):
+        return {'stage':getattr(self,'stage_id',0),'tier':self._desloc_pipe_stage_tier(),'step':self.desloc_step}
+    def _desloc_pipe_init_ddp(self):
+        if not self.desloc_enabled: return
+        self.desloc_step=0
+        if self.grid and hasattr(self.grid,'get_data_parallel_group'):
+            dp=self.grid.get_data_parallel_group()
+            for p in self.module.parameters(): dist.broadcast(p.data,src=0,group=dp)
