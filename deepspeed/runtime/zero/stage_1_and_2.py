@@ -261,6 +261,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
             self.model_parallel_rank = bwc_tensor_model_parallel_rank(mpu)
 
         self.overflow = False
+        self.desloc_engine = None  # set by DeepSpeedEngine._configure_desloc
         self.clip_grad = clip_grad
         self.communication_data_type = communication_data_type
         self.gradient_predivide_factor = gradient_predivide_factor
@@ -858,6 +859,92 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         self.overlapping_partition_gradients_reduce_epilogue()
 
     #########################################################################
+    # --- DES-LOC Tiered Gradient Bucketing (M137) ---
+    def _desloc_build_gradient_buckets(self):
+        self._desloc_grad_buckets = {"x": [], "u": [], "v": []}
+        self._desloc_bucket_sizes = {"x": 0, "u": 0, "v": 0}
+        for i, group in enumerate(self.bit16_groups):
+            bp, bn = [], 0
+            for p in group:
+                if not p.requires_grad: continue
+                bp.append(p); bn += p.ds_numel if hasattr(p, "ds_numel") else p.numel()
+                if bn >= self.reduce_bucket_size:
+                    t = getattr(p, "desloc_tier", "x")
+                    self._desloc_grad_buckets[t].append({"params": bp, "numel": bn, "gid": i, "done": False})
+                    self._desloc_bucket_sizes[t] += bn; bp, bn = [], 0
+            if bp:
+                t = getattr(bp[0], "desloc_tier", "x")
+                self._desloc_grad_buckets[t].append({"params": bp, "numel": bn, "gid": i, "done": False})
+                self._desloc_bucket_sizes[t] += bn
+
+    def _desloc_reduce_tiered_gradients(self):
+        if not hasattr(self, "_desloc_grad_buckets"): self._desloc_build_gradient_buckets()
+        e = self.desloc_engine
+        if e is None: return
+        for tier in ("x","u","v"):
+            ok = (tier=="x" and e.desloc_should_sync_x()) or (tier=="u" and e.desloc_should_sync_u()) or (tier=="v" and e.desloc_should_sync_v())
+            if not ok: continue
+            for b in self._desloc_grad_buckets[tier]:
+                if b["done"]: continue
+                for p in b["params"]:
+                    g = self.get_gradient_for_reduction(p)
+                    if g is not None: self.reduce_ready_partitions_and_remove_grads(p, b["gid"])
+                b["done"] = True
+
+    def _desloc_reset_buckets(self):
+        if hasattr(self, "_desloc_grad_buckets"):
+            for t in self._desloc_grad_buckets:
+                for b in self._desloc_grad_buckets[t]: b["done"] = False
+
+    def _desloc_clip_per_coordinate(self, rho):
+        if rho <= 0: return
+        for group in self.bit16_groups:
+            for p in group:
+                if p.grad is not None: p.grad.clamp_(-rho, rho)
+
+    def _desloc_compute_halflife(self, beta):
+        import math
+        if beta <= 0 or beta >= 1: return float("inf")
+        return -1.0 / math.log2(beta)
+
+    def _desloc_recommend_periods(self, beta1=0.9, beta2=0.999):
+        tu = self._desloc_compute_halflife(beta1); tv = self._desloc_compute_halflife(beta2)
+        e = self.desloc_engine; Kx = e.desloc_Kx if e else 32
+        Ku = max(Kx, int(Kx * min(3, tu / max(Kx, 1))))
+        Kv = max(Ku, int(Kx * min(6, tv / max(tu, 1e-8))))
+        return {"Kx": Kx, "Ku": Ku, "Kv": Kv}
+
+    def _desloc_comm_reduction_stats(self):
+        if not hasattr(self, "_desloc_bucket_sizes"): return {"reduction": 1.0}
+        e = self.desloc_engine
+        if e is None: return {"reduction": 1.0}
+        total, actual = 0, 0
+        for t in ("x","u","v"):
+            tb = self._desloc_bucket_sizes.get(t, 0) * 2; total += tb
+            K = {"x": e.desloc_Kx, "u": e.desloc_Ku, "v": e.desloc_Kv}[t]
+            actual += tb / max(K, 1)
+        return {"reduction": round(total/max(actual,1), 2)}
+
+    def _desloc_nesterov_outer(self, params, momentum=0.9):
+        if not hasattr(self, "_desloc_vel"): self._desloc_vel, self._desloc_prev = {}, {}
+        for p in params:
+            if not p.requires_grad: continue
+            pid = id(p)
+            if pid not in self._desloc_vel:
+                self._desloc_vel[pid] = p.data.new_zeros(p.data.shape); self._desloc_prev[pid] = p.data.clone(); continue
+            d = p.data.float() - self._desloc_prev[pid].float(); v = self._desloc_vel[pid]; v.mul_(momentum).add_(d)
+            p.data.add_(v.to(p.dtype), alpha=momentum); self._desloc_prev[pid].copy_(p.data)
+
+    def _desloc_warmup(self, W=512):
+        e = self.desloc_engine; return e is None or e.desloc_step_counter < W
+
+    def _desloc_log(self):
+        e = self.desloc_engine
+        if e is None or not e.desloc_enabled: return
+        if e.desloc_step_counter % 500 != 0 or dist.get_rank() != 0: return
+        s = self._desloc_comm_reduction_stats()
+        print(f"### Z12 DES-LOC step={e.desloc_step_counter} ### red={s['reduction']:.1f}x")
+
     #########################ZeRO Partition Gradients########################
     #########################################################################
 
@@ -2281,13 +2368,16 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
             self.reset_cpu_buffers()
 
         self.timers(OPTIMIZER_ALLGATHER_TIMER).start()
-        # Gather the updated weights from everyone.
-        # Then all partitions of the model parameters are updated and ready for next round forward.
-        all_gather_dp_groups(groups_flat=self.bit16_groups_flat,
-                             partitioned_param_groups=self.parallel_partitioned_bit16_groups,
-                             dp_process_group=self.real_dp_process_group,
-                             start_alignment_factor=self.nccl_start_alignment_factor,
-                             allgather_bucket_size=self.allgather_bucket_size)
+        # DES-LOC: skip allgather on non-Kx steps
+        _do_ag = True
+        if self.desloc_engine is not None and not self.desloc_engine.desloc_should_sync_x():
+            _do_ag = False
+        if _do_ag:
+            all_gather_dp_groups(groups_flat=self.bit16_groups_flat,
+                                 partitioned_param_groups=self.parallel_partitioned_bit16_groups,
+                                 dp_process_group=self.real_dp_process_group,
+                                 start_alignment_factor=self.nccl_start_alignment_factor,
+                                 allgather_bucket_size=self.allgather_bucket_size)
         self.timers(OPTIMIZER_ALLGATHER_TIMER).stop()
 
         # TODO: we probably don't need this? just to be safe
