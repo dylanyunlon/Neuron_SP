@@ -313,126 +313,98 @@ def trim_mean(data, trim_percent):
     return mean(data[k:n - k])
 
 
-# =================================================================
-# M072: DES-LOC Wallclock Profiler + Throughput Meter (400 lines)
-# =================================================================
-# Fine-grained timing for DES-LOC training phases:
-# - Forward pass timing
-# - Backward pass timing
-# - Gradient clipping timing
-# - AllReduce timing (per state type: x, u, v)
-# - Optimizer step timing
-# - Total step timing with overlap detection
-#
-# Reference: Section 5.3 speedup measurements
-# Reference: Section 5.4 "training speedup over DDP"
-# =================================================================
-
-import time as _time
-import math as _math
+# ═══════════════════════════════════════════════════════════════
+# DES-LOC Timing & Throughput Tracking (M190)
+# ═══════════════════════════════════════════════════════════════
+import time as _m190_time
+import math as _m190_math
 
 
 class DESLOCPhaseTimer:
-    """Timer for individual training phases within a DES-LOC step.
+    """Timer that tracks compute vs communication time per step.
 
-    Tracks each phase separately to identify bottlenecks and
-    compute the comm/compute overlap ratio.
+    Enables the breakdown needed for RQ3 and RQ4 figures:
+    - compute_ms: time in forward+backward+optimizer
+    - comm_ms: time in allreduce/all_gather
+    - idle_ms: time waiting for sync
     """
 
-    PHASES = [
-        'forward', 'backward', 'grad_clip', 'optimizer_step',
-        'allreduce_x', 'allreduce_u', 'allreduce_v',
-        'data_loading', 'logging', 'total_step',
-    ]
-
     def __init__(self):
-        self.phase_times = {p: [] for p in self.PHASES}
-        self._active = {}
+        self._phase = None
+        self._phase_start = 0.0
+        self.compute_ms_total = 0.0
+        self.comm_ms_total = 0.0
+        self.idle_ms_total = 0.0
         self.step_count = 0
+        self._step_compute = 0.0
+        self._step_comm = 0.0
+        self._step_idle = 0.0
+        self.step_log = []
 
-    def start(self, phase):
-        """Start timing a phase."""
-        self._active[phase] = _time.monotonic()
+    def start_phase(self, phase):
+        """Start timing a phase: 'compute', 'comm', or 'idle'."""
+        now = _m190_time.monotonic() * 1000.0
+        if self._phase is not None:
+            elapsed = now - self._phase_start
+            if self._phase == 'compute':
+                self._step_compute += elapsed
+            elif self._phase == 'comm':
+                self._step_comm += elapsed
+            elif self._phase == 'idle':
+                self._step_idle += elapsed
+        self._phase = phase
+        self._phase_start = now
 
-    def stop(self, phase):
-        """Stop timing a phase and record elapsed time."""
-        if phase not in self._active:
-            return 0.0
-        elapsed_ms = (_time.monotonic() - self._active[phase]) * 1000.0
-        if phase not in self.phase_times:
-            self.phase_times[phase] = []
-        self.phase_times[phase].append(elapsed_ms)
-        del self._active[phase]
-        return elapsed_ms
+    def end_step(self):
+        """End current step, flush accumulated timings."""
+        if self._phase is not None:
+            now = _m190_time.monotonic() * 1000.0
+            elapsed = now - self._phase_start
+            if self._phase == 'compute':
+                self._step_compute += elapsed
+            elif self._phase == 'comm':
+                self._step_comm += elapsed
+            elif self._phase == 'idle':
+                self._step_idle += elapsed
 
-    def record_step(self):
-        """Mark end of a training step."""
+        self.compute_ms_total += self._step_compute
+        self.comm_ms_total += self._step_comm
+        self.idle_ms_total += self._step_idle
+
+        self.step_log.append({
+            'step': self.step_count,
+            'compute_ms': round(self._step_compute, 3),
+            'comm_ms': round(self._step_comm, 3),
+            'idle_ms': round(self._step_idle, 3),
+            'total_ms': round(self._step_compute + self._step_comm + self._step_idle, 3),
+        })
+
         self.step_count += 1
+        self._step_compute = 0.0
+        self._step_comm = 0.0
+        self._step_idle = 0.0
+        self._phase = None
 
-    def get_phase_avg(self, phase):
-        """Get average time for a phase in ms."""
-        times = self.phase_times.get(phase, [])
-        if not times:
-            return 0.0
-        return sum(times) / len(times)
+    def get_averages(self):
+        """Get average timings across all steps."""
+        n = max(self.step_count, 1)
+        return {
+            'avg_compute_ms': round(self.compute_ms_total / n, 3),
+            'avg_comm_ms': round(self.comm_ms_total / n, 3),
+            'avg_idle_ms': round(self.idle_ms_total / n, 3),
+            'avg_total_ms': round((self.compute_ms_total + self.comm_ms_total + self.idle_ms_total) / n, 3),
+            'comm_fraction': round(self.comm_ms_total / max(self.compute_ms_total + self.comm_ms_total, 1e-6), 4),
+            'total_steps': self.step_count,
+        }
 
-    def get_compute_time(self):
-        """Total compute time = forward + backward + optimizer."""
-        return (self.get_phase_avg('forward') +
-                self.get_phase_avg('backward') +
-                self.get_phase_avg('optimizer_step'))
-
-    def get_comm_time(self):
-        """Total communication time = allreduce_{x,u,v}."""
-        return (self.get_phase_avg('allreduce_x') +
-                self.get_phase_avg('allreduce_u') +
-                self.get_phase_avg('allreduce_v'))
-
-    def get_overhead_time(self):
-        """Overhead = total - compute - comm."""
-        total = self.get_phase_avg('total_step')
-        return max(0, total - self.get_compute_time() -
-                   self.get_comm_time())
-
-    def get_comm_compute_ratio(self):
-        """Ratio of comm to compute time."""
-        compute = self.get_compute_time()
-        if compute <= 0:
-            return 0.0
-        return self.get_comm_time() / compute
-
-    def get_utilization(self):
-        """GPU compute utilization = compute / total."""
-        total = self.get_phase_avg('total_step')
-        if total <= 0:
-            return 0.0
-        return self.get_compute_time() / total
-
-    def format_summary(self):
-        """Format phase timing summary for experiment log.
-
-        Output follows NKI-FA structured format.
-        """
-        lines = [f"### Phase Timing Summary (steps={self.step_count}) ###"]
-        for phase in self.PHASES:
-            avg = self.get_phase_avg(phase)
-            if avg > 0:
-                times = self.phase_times[phase]
-                lines.append(
-                    f"{phase}: avg={avg:.3f}ms, "
-                    f"min={min(times):.3f}ms, "
-                    f"max={max(times):.3f}ms, "
-                    f"samples={len(times)}")
-        lines.append(f"Compute: {self.get_compute_time():.3f}ms")
-        lines.append(f"Comm: {self.get_comm_time():.3f}ms")
-        lines.append(f"Overhead: {self.get_overhead_time():.3f}ms")
-        lines.append(
-            f"Comm/Compute ratio: "
-            f"{self.get_comm_compute_ratio():.4f}")
-        lines.append(
-            f"GPU utilization: "
-            f"{self.get_utilization():.4f}")
-        return "\n".join(lines)
+    def export_for_figure(self):
+        """Export step-level timing data for figure generation."""
+        return {
+            'steps': [e['step'] for e in self.step_log],
+            'compute_ms': [e['compute_ms'] for e in self.step_log],
+            'comm_ms': [e['comm_ms'] for e in self.step_log],
+            'total_ms': [e['total_ms'] for e in self.step_log],
+        }
 
 
 class DESLOCThroughputTracker:
@@ -442,7 +414,7 @@ class DESLOCThroughputTracker:
     the throughput comparison figures (RQ3, RQ4).
 
     Section 5.4: "DES-LOC's reduced communication costs result
-    in a ≈ 1.24× training speedup over DDP"
+    in a approx 1.24x training speedup over DDP"
     """
 
     def __init__(self, batch_size=4, seq_len=1024,
@@ -452,17 +424,23 @@ class DESLOCThroughputTracker:
         self.model_params = model_params
         self.dtype_bytes = dtype_bytes
         self.step_times_ms = []
+        self.muon_step_times_ms = []
+        self.comm_times_ms = []
         self.tokens_processed = 0
         self.start_time = None
 
     def start_training(self):
         """Mark training start."""
-        self.start_time = _time.monotonic()
+        self.start_time = _m190_time.monotonic()
 
-    def record_step(self, step_time_ms):
+    def record_step(self, step_time_ms, muon_ms=None, comm_ms=None):
         """Record a single step's wallclock time."""
         self.step_times_ms.append(step_time_ms)
         self.tokens_processed += self.batch_size * self.seq_len
+        if muon_ms is not None:
+            self.muon_step_times_ms.append(muon_ms)
+        if comm_ms is not None:
+            self.comm_times_ms.append(comm_ms)
 
     def get_tokens_per_second(self):
         """Get average tokens/sec throughput."""
@@ -486,142 +464,94 @@ class DESLOCThroughputTracker:
     def get_tflops(self):
         """Estimate TFLOPS based on model size.
 
-        Approximate FLOPs per step:
-          Forward: 2 * params * tokens
-          Backward: 4 * params * tokens
-          Total: 6 * params * tokens
+        Approximate FLOPs per step (forward + backward):
+          6 * model_params * tokens_per_step
         """
-        if self.model_params <= 0 or not self.step_times_ms:
+        if not self.step_times_ms or self.model_params == 0:
+            return 0.0
+        avg_ms = sum(self.step_times_ms) / len(self.step_times_ms)
+        if avg_ms <= 0:
             return 0.0
         tokens_per_step = self.batch_size * self.seq_len
         flops_per_step = 6.0 * self.model_params * tokens_per_step
-        avg_sec = (sum(self.step_times_ms) /
-                   len(self.step_times_ms)) / 1000.0
-        if avg_sec <= 0:
-            return 0.0
-        return flops_per_step / avg_sec / 1e12
+        tflops = flops_per_step / (avg_ms / 1000.0) / 1e12
+        return round(tflops, 2)
 
-    def estimate_time_to_completion(self, total_steps):
-        """Estimate remaining training time."""
-        if not self.step_times_ms:
-            return 0.0
-        avg_ms = sum(self.step_times_ms) / len(self.step_times_ms)
-        remaining_steps = total_steps - len(self.step_times_ms)
-        return max(0, remaining_steps * avg_ms / 1000.0)
+    def get_mfu(self, peak_tflops):
+        """Compute Model FLOPS Utilization.
 
-    def estimate_speedup_vs_ddp(self, ddp_step_time_ms):
-        """Compute speedup factor vs DDP baseline.
-
-        Args:
-            ddp_step_time_ms: measured DDP step time
+        MFU = achieved TFLOPS / peak hardware TFLOPS
         """
-        if not self.step_times_ms or ddp_step_time_ms <= 0:
+        achieved = self.get_tflops()
+        if peak_tflops <= 0:
+            return 0.0
+        return round(achieved / peak_tflops, 4)
+
+    def get_speedup_vs_ddp(self, ddp_avg_step_ms):
+        """Compute speedup over DDP baseline."""
+        if not self.step_times_ms:
             return 1.0
         avg_ms = sum(self.step_times_ms) / len(self.step_times_ms)
         if avg_ms <= 0:
             return 1.0
-        return ddp_step_time_ms / avg_ms
+        return round(ddp_avg_step_ms / avg_ms, 3)
 
-    def format_summary(self):
-        """Format throughput summary for experiment log."""
-        lines = [
-            f"### Throughput Summary "
-            f"(steps={len(self.step_times_ms)}) ###",
-        ]
-        if self.step_times_ms:
-            avg = sum(self.step_times_ms) / len(self.step_times_ms)
-            lines.append(f"Avg step time: {avg:.3f}ms")
-            lines.append(
-                f"Tokens/sec: "
-                f"{self.get_tokens_per_second():.1f}")
-            lines.append(
-                f"Samples/sec: "
-                f"{self.get_samples_per_second():.2f}")
-            if self.model_params > 0:
-                lines.append(
-                    f"TFLOPS: {self.get_tflops():.2f}")
-        return "\n".join(lines)
-
-    def export_for_plotting(self):
-        """Export throughput data for figure generation."""
+    def export_summary(self):
+        """Export throughput summary for figure generation."""
         return {
-            'step_times_ms': self.step_times_ms,
-            'tokens_per_sec': self.get_tokens_per_second(),
-            'samples_per_sec': self.get_samples_per_second(),
-            'tflops': self.get_tflops(),
+            'total_steps': len(self.step_times_ms),
             'total_tokens': self.tokens_processed,
-            'num_steps': len(self.step_times_ms),
+            'avg_step_ms': round(sum(self.step_times_ms) / max(len(self.step_times_ms), 1), 3),
+            'tokens_per_sec': round(self.get_tokens_per_second(), 1),
+            'samples_per_sec': round(self.get_samples_per_second(), 2),
+            'tflops': self.get_tflops(),
+            'avg_muon_ms': round(sum(self.muon_step_times_ms) / max(len(self.muon_step_times_ms), 1), 3) if self.muon_step_times_ms else None,
+            'avg_comm_ms': round(sum(self.comm_times_ms) / max(len(self.comm_times_ms), 1), 3) if self.comm_times_ms else None,
         }
 
 
-class DESLOCWallclockComparison:
-    """Compare wallclock times across methods.
+class DESLOCRooflineAnalyzer:
+    """Roofline model for DES-LOC communication analysis.
 
-    Tracks DDP, Local Adam, and DES-LOC step times
-    side-by-side for the speedup comparison figure.
+    Nick Joseph: "you can use pen-and-paper to compute the theoretical
+    maximum efficiency (MFU). The reasons for inefficiency are usually
+    memory bandwidth bottleneck, CPU transfer bottleneck, etc."
 
-    Section 5.3: "This yields a 1.24× speedup over DDP
-    and 2.01× over Local Adam at Kx=32"
+    This analyzer computes the theoretical communication cost
+    and compares with actual measurements.
     """
 
-    def __init__(self):
-        self.methods = {}
+    def __init__(self, param_bytes, bandwidth_gbps, world_size,
+                 Kx=32, Ku=96, Kv=192):
+        self.param_bytes = param_bytes
+        self.bandwidth_bps = bandwidth_gbps * 1e9 / 8  # bytes/sec
+        self.world_size = world_size
+        self.Kx = Kx
+        self.Ku = Ku
+        self.Kv = Kv
 
-    def add_method(self, name, batch_size=4, seq_len=1024,
-                   model_params=0):
-        """Register a training method for comparison."""
-        self.methods[name] = DESLOCThroughputTracker(
-            batch_size=batch_size, seq_len=seq_len,
-            model_params=model_params)
+    def theoretical_comm_time_per_step(self):
+        """Compute theoretical communication time per step.
 
-    def record_step(self, method_name, step_time_ms):
-        """Record a step time for a specific method."""
-        if method_name in self.methods:
-            self.methods[method_name].record_step(step_time_ms)
-
-    def get_speedup_table(self, baseline='ddp'):
-        """Generate speedup comparison table.
-
-        Returns dict with speedup factors relative to baseline.
+        DDP: allreduce all 3 states every step
+        DES-LOC: allreduce at 1/Kx, 1/Ku, 1/Kv rates
         """
-        if baseline not in self.methods:
-            return {}
+        bytes_per_allreduce = self.param_bytes * 2 * (self.world_size - 1) / self.world_size
+        ddp_time = bytes_per_allreduce * 3 / max(self.bandwidth_bps, 1)
+        desloc_time = bytes_per_allreduce * (1.0/self.Kx + 1.0/self.Ku + 1.0/self.Kv) / max(self.bandwidth_bps, 1)
+        return {
+            'ddp_comm_sec': round(ddp_time, 6),
+            'desloc_comm_sec': round(desloc_time, 6),
+            'speedup': round(ddp_time / max(desloc_time, 1e-12), 2),
+            'bytes_per_allreduce': int(bytes_per_allreduce),
+        }
 
-        baseline_tracker = self.methods[baseline]
-        if not baseline_tracker.step_times_ms:
-            return {}
-
-        baseline_avg = (sum(baseline_tracker.step_times_ms) /
-                        len(baseline_tracker.step_times_ms))
-
-        result = {}
-        for name, tracker in self.methods.items():
-            if not tracker.step_times_ms:
-                continue
-            avg = (sum(tracker.step_times_ms) /
-                   len(tracker.step_times_ms))
-            result[name] = {
-                'avg_step_ms': round(avg, 3),
-                'tokens_per_sec': round(
-                    tracker.get_tokens_per_second(), 1),
-                'tflops': round(tracker.get_tflops(), 2),
-                'speedup_vs_baseline': round(
-                    baseline_avg / max(avg, 0.001), 2),
-            }
-        return result
-
-    def format_comparison(self, baseline='ddp'):
-        """Format speedup comparison as log."""
-        table = self.get_speedup_table(baseline)
-        lines = [f"### Wallclock Comparison (baseline={baseline}) ###"]
-        for name, data in table.items():
-            lines.append(
-                f"{name}: {data['avg_step_ms']:.3f}ms/step, "
-                f"{data['tokens_per_sec']:.0f} tok/s, "
-                f"{data['speedup_vs_baseline']:.2f}x vs {baseline}")
-        return "\n".join(lines)
+    def compute_overlap_efficiency(self, compute_ms, comm_ms):
+        """Compute how well communication overlaps with compute."""
+        if compute_ms <= 0:
+            return 0.0
+        overlap = max(0, compute_ms - max(0, comm_ms - compute_ms))
+        return round(overlap / compute_ms, 4)
 
 
-# =================================================================
-# End M072
-# =================================================================
+# End M190
