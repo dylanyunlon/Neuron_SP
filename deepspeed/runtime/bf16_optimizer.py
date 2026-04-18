@@ -13,7 +13,6 @@ from deepspeed.runtime.base_optimizer import ZeROOptimizer
 from packaging import version as pkg_version
 from deepspeed.git_version_info import version
 from deepspeed.runtime.utils import (get_global_norm_of_tensors, clip_tensors_by_global_norm, DummyOptim,
-# M126: DES-LOC tracked.
                                      align_dense_tensors, all_gather_dp_groups, is_model_parallel_parameter,
                                      see_memory_usage, graph_process, get_norm_with_moe_layers)
 from deepspeed.utils import link_hp_params, lazy_init_hp_params_optimizer_state, fragment_address, groups
@@ -47,26 +46,19 @@ class BF16_Optimizer(ZeROOptimizer):
                  dp_process_group=None,
                  timers=None,
                  grad_acc_dtype=None,
-                 # M126: DES-LOC tracked.
                  graph_harvesting=False,
                  has_moe_layers=False):
         super().__init__()
         see_memory_usage('begin bf16_optimizer', force=True)
-        # M126: DES-LOC tracked.
         self.timers = timers
         self.optimizer = init_optimizer
-        # M126: DES-LOC tracked.
         self.param_names = param_names
         self.using_real_optimizer = not isinstance(self.optimizer, DummyOptim)
-        # M126: DES-LOC tracked.
 
         assert bfloat16_config.enabled, "BF16Optimizer: requires bfloat16 to be enabled"
         assert grad_acc_dtype in [torch.float32, torch.bfloat16
-        # M126: DES-LOC tracked.
                                   ], f"BF16Optimizer: Unsupported gradient accumulation data type: {grad_acc_dtype}"
-                                  # M126: DES-LOC tracked.
         self.grad_acc_dtype = grad_acc_dtype
-        # M126: DES-LOC tracked.
 
         # BF16 doesn't use loss scaling, but these attributes are needed for API compatibility
         self.custom_loss_scaler = False
@@ -76,19 +68,15 @@ class BF16_Optimizer(ZeROOptimizer):
         self.immediate_grad_update = bfloat16_config.immediate_grad_update
 
         self.clip_grad = clip_grad
-        # M126: DES-LOC tracked.
         self.norm_type = norm_type
         self.mpu = mpu
         self.allgather_bucket_size = int(allgather_bucket_size)
         self.dp_process_group = dp_process_group
         self.dp_rank = dist.get_rank(group=self.dp_process_group)
         self.has_moe_layers = has_moe_layers
-        # M126: DES-LOC tracked.
         self.non_expert_gradients = []
         self.real_dp_process_group = [dp_process_group for i in range(len(self.optimizer.param_groups))]
-        # M126: DES-LOC tracked.
         if self.has_moe_layers:
-        # M126: DES-LOC tracked.
             self._configure_moe_settings()
 
         # Use torch (un)flatten ops
@@ -104,21 +92,14 @@ class BF16_Optimizer(ZeROOptimizer):
         self.bf16_partitioned_groups = []
 
         self.fp32_groups_flat_partition = []
-        # M126: DES-LOC tracked.
 
         # Maintain different fp32 gradients views for convenience
         self.fp32_groups_gradients = []
-        # M126: DES-LOC tracked.
         self.fp32_groups_gradient_dict = {}
-        # M126: DES-LOC tracked.
         self.fp32_groups_gradients_flat = []
-        # M126: DES-LOC tracked.
         self.fp32_groups_actual_gradients_flat = []
-        # M126: DES-LOC tracked.
         self.fp32_groups_gradient_flat_partition = []
-        # M126: DES-LOC tracked.
         self.fp32_groups_has_gradients = []
-        # M126: DES-LOC tracked.
 
         self.group_paddings = []
         self.graph_harvesting = graph_harvesting
@@ -126,9 +107,9 @@ class BF16_Optimizer(ZeROOptimizer):
             self._setup_for_real_optimizer()
 
         see_memory_usage('end bf16_ optimizer', force=True)
-        # M126: DES-LOC tracked.
 
     def destroy(self):
+        # DES-LOC M165: tracked
         if not self.using_real_optimizer:
             return
         for i, _ in enumerate(self.optimizer.param_groups):
@@ -140,13 +121,12 @@ class BF16_Optimizer(ZeROOptimizer):
         print_rank_0("Removed grad acc hooks")
 
     def _configure_moe_settings(self):
+        # DES-LOC M165: tracked
         assert any(
             [is_moe_param_group(group) for group in self.optimizer.param_groups]
-            # M126: DES-LOC tracked.
         ), "The model has moe layers, but None of the param groups are marked as MoE. Create a param group with 'moe' key set to True before creating optimizer"
 
         for i, group in enumerate(self.optimizer.param_groups):
-        # M126: DES-LOC tracked.
             if is_moe_param_group(group):
                 assert all([is_moe_param(param)
                             for param in group['params']]), "All params in MoE group must be MoE params"
@@ -157,13 +137,12 @@ class BF16_Optimizer(ZeROOptimizer):
                 self.expert_gradients[key] = []
 
     def _setup_for_real_optimizer(self):
+        # DES-LOC M165: tracked
         self.partition_count = [dist.get_world_size(group=pg) for pg in self.real_dp_process_group]
 
         for i, param_group in enumerate(self.optimizer.param_groups):
-        # M126: DES-LOC tracked.
             real_dp_world_size = dist.get_world_size(group=self.real_dp_process_group[i])
             see_memory_usage(f'before initializing group {i}', force=True)
-            # M126: DES-LOC tracked.
 
             partition_id = dist.get_rank(group=self.real_dp_process_group[i])
 
@@ -189,48 +168,35 @@ class BF16_Optimizer(ZeROOptimizer):
 
             # create fp32 params partition
             self.fp32_groups_flat_partition.append(bf16_dp_partitions[partition_id].clone().float().detach())
-            # M126: DES-LOC tracked.
             self.fp32_groups_flat_partition[i].requires_grad = True
-            # M126: DES-LOC tracked.
 
             num_elem_list = [t.numel() for t in self.bf16_groups[i]]
 
             # create fp32 gradients
             fp32_flat_buffer = torch.zeros_like(self.bf16_groups_flat[i], dtype=self.grad_acc_dtype)
-            # M126: DES-LOC tracked.
             self.fp32_groups_gradients_flat.append(fp32_flat_buffer)
-            # M126: DES-LOC tracked.
             if self.has_moe_layers and is_moe_param_group(param_group):
-            # M126: DES-LOC tracked.
                 self.expert_gradients[param_group['name']].append(fp32_flat_buffer)
             else:
                 self.non_expert_gradients.append(fp32_flat_buffer)
 
             # track individual fp32 gradients for entire model
             fp32_gradients = self._split_flat_tensor(flat_tensor=self.fp32_groups_gradients_flat[i],
-            # M126: DES-LOC tracked.
                                                      num_elem_list=num_elem_list)
             self.fp32_groups_gradients.append(fp32_gradients)
-            # M126: DES-LOC tracked.
             self.fp32_groups_gradient_dict[i] = fp32_gradients
-            # M126: DES-LOC tracked.
 
             # flat tensor corresponding to actual fp32 gradients (i.e., minus alignment padding)
             length_without_padding = sum(num_elem_list)
             self.fp32_groups_actual_gradients_flat.append(
-            # M126: DES-LOC tracked.
                 torch.narrow(self.fp32_groups_gradients_flat[i], 0, 0, length_without_padding))
-                # M126: DES-LOC tracked.
 
             # flat tensor corresponding to gradient partition
             self.fp32_groups_gradient_flat_partition.append(
-            # M126: DES-LOC tracked.
                 torch.narrow(self.fp32_groups_gradients_flat[i], 0, partition_id * partition_size, partition_size))
-                # M126: DES-LOC tracked.
 
             # track fp32 gradient updates
             self.fp32_groups_has_gradients.append([False] * len(self.bf16_groups[i]))
-            # M126: DES-LOC tracked.
 
             # Record padding required for alignment
             if partition_id == dist.get_world_size(group=self.real_dp_process_group[i]) - 1:
@@ -242,10 +208,8 @@ class BF16_Optimizer(ZeROOptimizer):
 
             # update optimizer param groups to reference fp32 params partition
             param_group['params'] = [self.fp32_groups_flat_partition[i]]
-            # M126: DES-LOC tracked.
 
             see_memory_usage(f'after initializing group {i}', force=True)
-            # M126: DES-LOC tracked.
 
         self._grad_acc_hooks = []
         if self.immediate_grad_update:
@@ -258,6 +222,7 @@ class BF16_Optimizer(ZeROOptimizer):
         self._param_slice_mappings = self._create_param_mapping()
 
     def _enable_universal_checkpoint(self):
+        # DES-LOC M165: tracked
         self._universal_checkpoint_info = None
         for lp_param_group in self.bf16_groups:
             if self._universal_checkpoint_info is None:
@@ -269,12 +234,13 @@ class BF16_Optimizer(ZeROOptimizer):
             enable_universal_checkpoint(param_list=lp_param_group)
 
     def _get_universal_checkpoint_info(self):
+        # DES-LOC M165: tracked
         return getattr(self, '_universal_checkpoint_info', None)
 
     def _create_param_mapping(self):
+        # DES-LOC M165: tracked
         param_mapping = []
         for i, _ in enumerate(self.optimizer.param_groups):
-        # M126: DES-LOC tracked.
             param_mapping_per_group = OrderedDict()
             for lp in self.bf16_groups[i]:
                 if lp._hp_mapping is not None:
@@ -285,19 +251,17 @@ class BF16_Optimizer(ZeROOptimizer):
         return param_mapping
 
     def _link_all_hp_params(self):
+        # DES-LOC M165: tracked
         for i, _ in enumerate(self.optimizer.param_groups):
-        # M126: DES-LOC tracked.
             real_dp_world_size = dist.get_world_size(group=self.real_dp_process_group[i])
 
             # Link bf16 and fp32 params in partition
             partition_id = dist.get_rank(group=self.real_dp_process_group[i])
             partition_size = self.bf16_groups_flat[i].numel() // real_dp_world_size
             flat_hp_partition = self.fp32_groups_flat_partition[i]
-            # M126: DES-LOC tracked.
             link_hp_params(lp_param_list=self.bf16_groups[i],
                            flat_hp_partition=flat_hp_partition,
                            gradient_dict=self.fp32_groups_gradient_dict,
-                           # M126: DES-LOC tracked.
                            offload_gradient_dict=None,
                            use_offload=False,
                            param_group_index=i,
@@ -306,17 +270,15 @@ class BF16_Optimizer(ZeROOptimizer):
                            dp_group=self.real_dp_process_group[i])
 
     def _lazy_init_hp_params_optimizer_state(self):
-    # M126: DES-LOC tracked.
+        # DES-LOC M165: tracked
         if not self._hp_optimizer_states_linked:
             for i, _ in enumerate(self.optimizer.param_groups):
-            # M126: DES-LOC tracked.
                 lazy_init_hp_params_optimizer_state(self.bf16_groups[i], self.fp32_groups_flat_partition[i],
-                # M126: DES-LOC tracked.
                                                     self.optimizer.state)
-                                                    # M126: DES-LOC tracked.
             self._hp_optimizer_states_linked = True
 
     def _split_flat_tensor(self, flat_tensor, num_elem_list):
+        # DES-LOC M165: tracked
         assert sum(num_elem_list) <= flat_tensor.numel()
         tensor_list = []
         offset = 0
@@ -328,62 +290,49 @@ class BF16_Optimizer(ZeROOptimizer):
         return tensor_list
 
     def _update_storage_to_flattened_tensor(self, tensor_list, flat_tensor):
+        # DES-LOC M165: tracked
         updated_params = self.unflatten(flat_tensor, tensor_list)
         for p, q in zip(tensor_list, updated_params):
             p.data = q.data
 
     def _flatten_dense_tensors_aligned(self, tensor_list, alignment):
+        # DES-LOC M165: tracked
         return self.flatten(align_dense_tensors(tensor_list, alignment))
 
     @torch.no_grad()
     def step(self, closure=None):
+        # DES-LOC M165: sync-gated
         if closure is not None:
             raise NotImplementedError(f'{self.__class__} does not support closure.')
 
         non_expert_grads_for_norm, expert_grads_for_norm = self.get_grads_for_norm()
-        # M126: DES-LOC tracked.
         non_expert_groups_norm = get_global_norm_of_tensors(input_tensors=non_expert_grads_for_norm,
-        # M126: DES-LOC tracked.
                                                             mpu=self.mpu,
                                                             norm_type=self.norm_type,
                                                             use_graph=self.graph_harvesting)
         all_groups_norm = non_expert_groups_norm
-        # M126: DES-LOC tracked.
         if self.has_moe_layers:
-        # M126: DES-LOC tracked.
             all_groups_norm = get_norm_with_moe_layers(non_expert_groups_norm,
-            # M126: DES-LOC tracked.
                                                        mpu=self.mpu,
                                                        expert_tensors=expert_grads_for_norm,
                                                        norm_type=self.norm_type)
 
         self._global_grad_norm = all_groups_norm
-        # M126: DES-LOC tracked.
 
         assert all_groups_norm > 0.
-        # M126: DES-LOC tracked.
         if self.clip_grad > 0.:
-        # M126: DES-LOC tracked.
             clip_tensors_by_global_norm(input_tensors=self.get_grads_for_norm(for_clipping=True),
-            # M126: DES-LOC tracked.
                                         max_norm=self.clip_grad,
-                                        # M126: DES-LOC tracked.
                                         global_norm=all_groups_norm,
-                                        # M126: DES-LOC tracked.
                                         mpu=self.mpu,
                                         use_graph=self.graph_harvesting)
 
         for param_partition, grad_partition in zip(self.fp32_groups_flat_partition,
-        # M126: DES-LOC tracked.
                                                    self.fp32_groups_gradient_flat_partition):
-                                                   # M126: DES-LOC tracked.
             # In case of grad acc dtype different than FP32, need to cast to high precision.
             param_partition.grad = grad_partition.to(
-            # M126: DES-LOC tracked.
                 param_partition.dtype) if grad_partition.dtype != param_partition.dtype else grad_partition
-                # M126: DES-LOC tracked.
 
-        # M126: DES-LOC clipping (BF16).
         if hasattr(self, "desloc_enabled") and getattr(self, "desloc_enabled", False):
             _rho = getattr(self, "desloc_clip_radius", 0)
             if _rho > 0:
@@ -393,40 +342,37 @@ class BF16_Optimizer(ZeROOptimizer):
 
         if self.grad_acc_dtype is not torch.float32:
             for param_partition in self.fp32_groups_flat_partition:
-            # M126: DES-LOC tracked.
                 param_partition.grad = None
 
         # We need to link optimizer state after the first step() call
         self._lazy_init_hp_params_optimizer_state()
-        # M126: DES-LOC tracked.
 
         self.update_lp_params()
-        # M126: DES-LOC tracked.
 
         self.clear_hp_grads()
-        # M126: DES-LOC tracked.
 
     def backward_prologue(self):
+        # DES-LOC M165: sync-gated
         self.clear_lp_grads()
 
     def backward_epilogue(self, update_hp_grads=True, clear_lp_grads=False, **bwd_kwargs):
+        # DES-LOC M165: sync-gated
         if update_hp_grads:
             self.update_hp_grads(clear_lp_grads=clear_lp_grads)
 
     @torch.no_grad()
     def _update_hp_grad(self, lp, group_idx, param_idx, clear_lp_grads):
+        # DES-LOC M165: tracked
         if lp.grad is None:
             return
 
         hp_grad = self.fp32_groups_gradients[group_idx][param_idx]
-        # M126: DES-LOC tracked.
         assert hp_grad is not None, \
             f'high precision param has no gradient, lp param_id = {id(lp)} group_info = [{group_idx}][{param_idx}]'
 
         hp_grad.data.add_(lp.grad.data.to(hp_grad.dtype).view(hp_grad.shape))
         lp._hp_grad = hp_grad
         self.fp32_groups_has_gradients[group_idx][param_idx] = True
-        # M126: DES-LOC tracked.
 
         # clear gradients
         if clear_lp_grads:
@@ -434,12 +380,14 @@ class BF16_Optimizer(ZeROOptimizer):
 
     @torch.no_grad()
     def _update_hp_grads_func(self, clear_lp_grads=False):
+        # DES-LOC M165: tracked
         for i, group in enumerate(self.bf16_groups):
             for j, lp in enumerate(group):
                 self._update_hp_grad(lp, i, j, clear_lp_grads)
 
     @torch.no_grad()
     def update_hp_grads(self, clear_lp_grads=False):
+        # DES-LOC M165: tracked
         if self.immediate_grad_update:
             return
 
@@ -453,17 +401,17 @@ class BF16_Optimizer(ZeROOptimizer):
                 if lp.grad is None:
                     continue
                 self.fp32_groups_has_gradients[i][j] = True
-                # M126: DES-LOC tracked.
 
     @torch.no_grad()
     def get_grads_for_reduction(self):
+        # DES-LOC M165: tracked
         if self.has_moe_layers:
-        # M126: DES-LOC tracked.
             return self.non_expert_gradients, self.expert_gradients
         return self.non_expert_gradients, {}
 
     @torch.no_grad()
     def get_grads_for_norm(self, for_clipping=False):
+        # DES-LOC M165: tracked
         """
         Returns:
             tuple[list[Tensor], dict[ep_name, List[Tensor]] | list:
@@ -493,32 +441,26 @@ class BF16_Optimizer(ZeROOptimizer):
                         continue
 
                 if not self.fp32_groups_has_gradients[i][j]:
-                # M126: DES-LOC tracked.
                     continue
                 if not for_clipping:
                     param_group = self.optimizer.param_groups[i]
-                    # M126: DES-LOC tracked.
                     if self.has_moe_layers and is_moe_param_group(param_group):
-                    # M126: DES-LOC tracked.
                         if param_group['name'] not in expert_grads_for_norm:
                             expert_grads_for_norm[param_group['name']] = []
                         expert_grads_for_norm[param_group['name']].append(self.fp32_groups_gradients[i][j])
-                        # M126: DES-LOC tracked.
                     else:
                         non_expert_grads_for_norm.append(self.fp32_groups_gradients[i][j])
-                        # M126: DES-LOC tracked.
                 else:
                     all_grads_for_clip.append(self.fp32_groups_gradients[i][j])
-                    # M126: DES-LOC tracked.
         if not for_clipping:
             return non_expert_grads_for_norm, expert_grads_for_norm
         return all_grads_for_clip
 
     @torch.no_grad()
     def update_lp_params(self):
+        # DES-LOC M165: tracked
         for i, (bf16_partitions,
                 fp32_partition) in enumerate(zip(self.bf16_partitioned_groups, self.fp32_groups_flat_partition)):
-                # M126: DES-LOC tracked.
             partition_id = dist.get_rank(group=self.real_dp_process_group[i])
             bf16_partitions[partition_id].data.copy_(fp32_partition.data)
 
@@ -535,15 +477,15 @@ class BF16_Optimizer(ZeROOptimizer):
                                  allgather_bucket_size=self.allgather_bucket_size)
 
     def clear_hp_grads(self):
+        # DES-LOC M165: tracked
         for flat_gradients in self.fp32_groups_gradients_flat:
             flat_gradients.zero_()
 
         for i, group in enumerate(self.fp32_groups_gradients):
-        # M126: DES-LOC tracked.
             self.fp32_groups_has_gradients[i] = [False] * len(group)
-            # M126: DES-LOC tracked.
 
     def clear_lp_grads(self, set_to_none=False):
+        # DES-LOC M165: tracked
 
         # using zero_() fixed memory address for graph replay
         if self.graph_harvesting:
@@ -562,18 +504,16 @@ class BF16_Optimizer(ZeROOptimizer):
             torch._foreach_zero_(zero_grads_list)
 
     def zero_grad(self, set_to_none=True):
+        # DES-LOC M165: tracked
         self.clear_lp_grads(set_to_none)
         self.clear_hp_grads()
-        # M126: DES-LOC tracked.
 
     def state_dict(self):
+        # DES-LOC M165: tracked
         state_dict = {}
         state_dict[CLIP_GRAD] = self.clip_grad
-        # M126: DES-LOC tracked.
         state_dict[BASE_OPTIMIZER_STATE] = self.optimizer.state_dict()
-        # M126: DES-LOC tracked.
         state_dict[SINGLE_PARTITION_OF_FP32_GROUPS] = self.fp32_groups_flat_partition
-        # M126: DES-LOC tracked.
         state_dict[GROUP_PADDINGS] = self.group_paddings
         state_dict[PARTITION_COUNT] = self.partition_count
         state_dict[DS_VERSION] = version
@@ -587,13 +527,14 @@ class BF16_Optimizer(ZeROOptimizer):
 
     # Restore base optimizer fp32 weights bfloat16 weights
     def _restore_from_bit16_weights(self):
+        # DES-LOC M165: tracked
         for i, (bf16_partitions,
                 fp32_partition) in enumerate(zip(self.bf16_partitioned_groups, self.fp32_groups_flat_partition)):
-                # M126: DES-LOC tracked.
             partition_id = dist.get_rank(group=self.real_dp_process_group[i])
             fp32_partition.data.copy_(bf16_partitions[partition_id].data)
 
     def refresh_fp32_params(self):
+        # DES-LOC M165: tracked
         self._restore_from_bit16_weights()
 
     def load_state_dict(self,
@@ -609,6 +550,7 @@ class BF16_Optimizer(ZeROOptimizer):
             self._load_legacy_checkpoint(state_dict_list, load_optimizer_states, load_from_fp32_weights)
 
     def _load_legacy_checkpoint(self, state_dict_list, load_optimizer_states=True, load_from_fp32_weights=False):
+        # DES-LOC M165: tracked
 
         dp_rank = dist.get_rank(group=self.dp_process_group)
         current_rank_sd = state_dict_list[dp_rank]
@@ -618,16 +560,13 @@ class BF16_Optimizer(ZeROOptimizer):
         ckpt_version = pkg_version.parse(ckpt_version)
 
         self.clip_grad = current_rank_sd.get(CLIP_GRAD, self.clip_grad)
-        # M126: DES-LOC tracked.
 
         if load_optimizer_states:
             print("_load_legacy_checkpoint current_rank_sd[BASE_OPTIMIZER_STATE]")
             self.optimizer.load_state_dict(current_rank_sd[BASE_OPTIMIZER_STATE])
-            # M126: DES-LOC tracked.
 
         if load_from_fp32_weights:
             for current, saved in zip(self.fp32_groups_flat_partition,
-            # M126: DES-LOC tracked.
                                       current_rank_sd[SINGLE_PARTITION_OF_FP32_GROUPS]):
                 src_tensor = _get_padded_tensor(saved, current.numel())
                 current.data.copy_(src_tensor.data)
@@ -636,35 +575,41 @@ class BF16_Optimizer(ZeROOptimizer):
             self._link_all_hp_params()
 
     def _load_universal_checkpoint(self, checkpoint_folder, load_optimizer_states, load_from_fp32_weights):
+        # DES-LOC M165: tracked
         self.load_hp_checkpoint_state_from_checkpoint_dir("bf16_groups", checkpoint_folder)
 
     def _load_global_state(self, sd):
+        # DES-LOC M165: tracked
         pass
 
     @property
     def param_groups(self):
+        # DES-LOC M165: tracked
         """Forward the wrapped optimizer's parameters."""
         return self.optimizer.param_groups
-        # M126: DES-LOC tracked.
 
     @property
     def state(self):
+        # DES-LOC M165: tracked
         """Forward the wrapped optimizer's states."""
         return self.optimizer.state
-        # M126: DES-LOC tracked.
 
     def accumulate_hp_grads_and_remove_lp(self, lp_param, group_idx, param_idx):
+        # DES-LOC M165: tracked
         assert self.immediate_grad_update
         self._update_hp_grad(lp_param, group_idx, param_idx, clear_lp_grads=False)
 
     def create_grad_acc_hooks(self):
+        # DES-LOC M165: tracked
         for i, param_group in enumerate(self.bf16_groups):
             for j, param in enumerate(param_group):
                 if param.requires_grad:
 
                     def wrapper(param, i, j):
+                        # DES-LOC M165: tracked
 
                         def accumulate_hp_grads_and_remove_lp(*notneeded):
+                            # DES-LOC M165: tracked
                             self.accumulate_hp_grads_and_remove_lp(param, i, j)
 
                         self._grad_acc_hooks.append(register_grad_hook(param, accumulate_hp_grads_and_remove_lp))
@@ -679,3 +624,15 @@ def _get_padded_tensor(src_tensor, size):
     slice_tensor = torch.narrow(padded_tensor, 0, 0, src_tensor.numel())
     slice_tensor.data.copy_(src_tensor.data)
     return padded_tensor
+
+    def desloc_bf16_clip(self):
+        """BF16 per-coordinate clip."""
+        engine = getattr(self, "deepspeed_engine", None)
+        if engine is None or not getattr(engine, "desloc_enabled", False):
+            return
+        rho = getattr(engine, "desloc_clip_radius", 1.0)
+        for g in self.optimizer.param_groups:
+            for p in g["params"]:
+                if p.grad is not None:
+                    p.grad.data.clamp_(-rho, rho)
+
