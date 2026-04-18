@@ -340,3 +340,63 @@ class DeslocCommBudget:
     def state_dict(self):
         return {'budget': self.budget, 'step': self.step,
                 'overbudget': self.overbudget_count}
+
+
+# --- DES-LOC Backend Extensions (M146) ---
+import time as _b146;import math as _b146m;from collections import defaultdict as _b146dd
+class DeslocConvergenceMonitor:
+    def __init__(self,w=100,th=0.5): self.w,self.th=w,th;self._n=[];self._a=0
+    def record(self,norm): self._n.append(norm);self._n=self._n[-self.w*2:]
+    def cv(self):
+        r=self._n[-self.w:]
+        if len(r)<10: return 0.0
+        m=sum(r)/len(r);return _b146m.sqrt(sum((x-m)**2 for x in r)/len(r))/max(m,1e-8)
+    def is_stable(self): c=self.cv();s=c<self.th;self._a+=0 if s else 1;return s
+    def recommend_Kx(self,cur):
+        c=self.cv()
+        if c>self.th*1.5: return max(1,cur//2)
+        if c>self.th: return max(1,int(cur*0.75))
+        if c<self.th*0.3 and cur<256: return min(256,int(cur*1.25))
+        return cur
+    def state_dict(self): return {'a':self._a,'n':self._n[-self.w:]}
+    def load_state_dict(self,sd): self._a=sd.get('a',0);self._n=sd.get('n',[])
+class DeslocCollectiveOps:
+    def __init__(self,Kx=32,Ku=96,Kv=192,clip=1.0):
+        self.Kx,self.Ku,self.Kv,self.clip=Kx,Ku,Kv,clip;self._step=0;self._bytes=_b146dd(int);self._skips=_b146dd(int)
+    def should_sync(self,tier='x'):
+        K={'x':self.Kx,'u':self.Ku,'v':self.Kv}.get(tier,1);return K<=1 or self._step%K==0
+    def advance(self): self._step+=1
+    def all_reduce(self,tensor,tier='x',op=None,group=None,async_op=False):
+        if not self.should_sync(tier): self._skips[tier]+=1;return None,False
+        import torch.distributed as td
+        if op is None:
+            try: op=td.ReduceOp.AVG
+            except: op=td.ReduceOp.SUM
+        nb=tensor.numel()*tensor.element_size();h=td.all_reduce(tensor,op=op,group=group,async_op=async_op);self._bytes[tier]+=nb;return h,True
+    def clip_grads(self,params):
+        if self.clip<=0: return
+        for p in params:
+            if p.grad is not None: p.grad.data.clamp_(-self.clip,self.clip)
+    def state_dict(self): return {'step':self._step,'Kx':self.Kx,'Ku':self.Ku,'Kv':self.Kv}
+class DeslocServerOptimizer:
+    def __init__(self,mu=0.9): self.mu=mu;self._v={};self._p={}
+    def step(self,named_params,synced):
+        if not synced or self.mu<=0: return
+        for n,p in named_params:
+            if not p.requires_grad: continue
+            pid=id(p)
+            if pid not in self._v: self._v[pid]=p.data.new_zeros(p.data.shape);self._p[pid]=p.data.clone();continue
+            d=p.data.float()-self._p[pid].float();v=self._v[pid];v.mul_(self.mu).add_(d)
+            p.data.add_(v.to(p.dtype),alpha=self.mu);self._p[pid].copy_(p.data)
+class DeslocCommProfiler:
+    def __init__(self,interval=100): self.interval=interval;self._r=[];self._step=0
+    def record(self,Kx,synced,nb=0,ms=0):
+        self._r.append({'s':self._step,'Kx':Kx,'sx':'x' in synced,'b':nb,'ms':ms});self._step+=1
+        if self._step%self.interval==0:
+            r=self._r[-self.interval:];print(f"### DES-LOC step={self._step} ### {sum(1 for x in r if x['sx'])}/{len(r)} syncs")
+    def export_csv(self,path):
+        lines=['step,Kx,sx,bytes,ms']
+        for r in self._r: lines.append(f"{r['s']},{r['Kx']},{int(r['sx'])},{r['b']},{r['ms']:.3f}")
+        with open(path,'w') as f: f.write('\n'.join(lines))
+def create_desloc_stack(Kx=32,Ku=96,Kv=192,clip=1.0,mu=0.9):
+    return {'collective':DeslocCollectiveOps(Kx,Ku,Kv,clip),'server_opt':DeslocServerOptimizer(mu),'monitor':DeslocConvergenceMonitor(),'profiler':DeslocCommProfiler()}
