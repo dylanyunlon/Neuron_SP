@@ -747,3 +747,35 @@ class PipelineModule(nn.Module):
         n = self.num_layers if hasattr(self, "num_layers") else len(list(self.children()))
         return {"layers": n}
 
+
+
+# --- DES-LOC Pipe Module (M151) ---
+class DeslocPipeModuleTierMapper:
+    TMAP={'embed':'x','wte':'x','wpe':'x','norm':'x','ln':'x','bias':'x','attn':'u','attention':'u','query':'u','key':'u','value':'u','mlp':'v','ffn':'v','fc':'v','dense':'v','linear':'v'}
+    def __init__(self): self._tiers={};self._stats={'x':0,'u':0,'v':0};self._numel={'x':0,'u':0,'v':0}
+    def classify(self,name,param):
+        n=name.lower();t='x'
+        for kw,tier in self.TMAP.items():
+            if kw in n: t=tier;break
+        self._tiers[name]=t;self._stats[t]+=1;self._numel[t]+=param.numel();param.desloc_tier=t;return t
+    def classify_module(self,module):
+        for n,p in module.named_parameters():
+            if p.requires_grad: self.classify(n,p)
+    def summary(self):
+        total=sum(self._numel.values())
+        return {t:{'count':self._stats[t],'numel':self._numel[t],'frac':round(self._numel[t]/max(total,1),3)} for t in ('x','u','v')}
+    def recommend_K(self,Kx=32):
+        import math
+        tu=-1.0/math.log2(0.9);tv=-1.0/math.log2(0.999)
+        Ku=max(Kx,int(Kx*min(3,tu/max(Kx,1))));Kv=max(Ku,int(Kx*min(6,tv/max(tu,1e-8))))
+        return {'Kx':Kx,'Ku':Ku,'Kv':Kv}
+    def state_dict(self): return {'tiers':self._tiers,'stats':self._stats,'numel':self._numel}
+    def load_state_dict(self,sd): self._tiers=sd.get('tiers',{});self._stats=sd.get('stats',{'x':0,'u':0,'v':0});self._numel=sd.get('numel',{'x':0,'u':0,'v':0})
+class DeslocPipeLayerBalancer:
+    @staticmethod
+    def estimate_stage_time(pc,flops,Kx=32,bw=10.0):
+        cm=flops/1e12;co=pc*2/(bw*1e9)*1000/max(Kx,1);return {'compute_ms':round(cm,2),'comm_ms':round(co,2),'total_ms':round(cm+co,2)}
+    @staticmethod
+    def is_balanced(st,th=0.2):
+        if not st: return True
+        t=[v['total_ms'] for v in st.values()];return max(t)/max(min(t),1e-8)<(1+th)
