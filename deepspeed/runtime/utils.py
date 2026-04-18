@@ -1474,317 +1474,19 @@ def count_used_parameters_in_backward(parameters: Sequence[torch.nn.Parameter]) 
     return int(participating)
 
 
-# =================================================================
-# M070: DES-LOC Convergence Checker + Bound Validator (400 lines)
-# =================================================================
-# Implements Theorem 1 convergence bound verification and
-# Assumption validation from Section 3.
-#
-# Reference: template_extraction_section3.txt
-# Reference: Theorem 1, Assumptions 1-3
-# =================================================================
-
-import math as _math
-import time as _time
-
-
-class DESLOCConvergenceBound:
-    """Compute and validate Theorem 1 convergence bound.
-
-    Theorem 1: Under Assumptions 1-3, DES-LOC-SGDM with step size
-    η ≤ η₀ achieves:
-
-    1/T Σ E[‖∇f(x_t)‖²] ≤ O(1/√T) + O(1/T)
-
-    The leading term O(1/√T) matches mini-batch SGD (asymptotically
-    optimal). The higher-order term O(1/T) depends on ψ, which
-    encodes the sync frequency penalty.
-
-    ψ = 4(1-px)/px² · (1-β)(1-pu) / (6(1-(1-pu)β))
-    """
-
-    def __init__(self, L=1.0, sigma_sq=1.0, G_sq=0.0, B_sq=1.0,
-                 M=1, beta=0.9):
-        self.L = L
-        self.sigma_sq = sigma_sq
-        self.G_sq = G_sq
-        self.B_sq = B_sq
-        self.M = M
-        self.beta = beta
-
-    def compute_psi(self, px, pu):
-        """Compute ψ factor from Theorem 1.
-
-        ψ = 4(1-px)/px² · (1-β)(1-pu) / (6(1-(1-pu)β))
-        """
-        if px <= 0:
-            return float('inf')
-        denom = 6.0 * (1.0 - (1.0 - pu) * self.beta)
-        if abs(denom) < 1e-15:
-            return float('inf')
-        psi = (4.0 * (1.0 - px) / (px * px)) * \
-              ((1.0 - self.beta) * (1.0 - pu) / denom)
-        return psi
-
-    def compute_eta_max(self, px, pu):
-        """Compute maximum step size η₀.
-
-        η₀ = min(1/(8L), 1/(L·√(ψ·8·(B²+1))))
-        """
-        psi = self.compute_psi(px, pu)
-        term1 = 1.0 / (8.0 * self.L)
-        inner = psi * 8.0 * (self.B_sq + 1.0)
-        if inner <= 0:
-            term2 = term1
-        else:
-            term2 = 1.0 / (self.L * _math.sqrt(inner))
-        return min(term1, term2)
-
-    def compute_leading_term(self, T, eta, px, pu):
-        """Compute the leading term O(1/√T).
-
-        Leading term = 2(f(x₀)-f*) / (ηT) + Lη σ²/M
-        """
-        if T <= 0 or eta <= 0:
-            return float('inf')
-        # Approximate f(x₀)-f* ≈ 10.0 (typical for LM)
-        f_gap = 10.0
-        term1 = 2.0 * f_gap / (eta * T)
-        term2 = self.L * eta * self.sigma_sq / self.M
-        return term1 + term2
-
-    def compute_higher_order_term(self, T, eta, px, pu):
-        """Compute the higher-order term O(1/T).
-
-        Contains the ψ-dependent communication penalty.
-        """
-        psi = self.compute_psi(px, pu)
-        if T <= 0 or eta <= 0:
-            return float('inf')
-        # Higher order: proportional to ψ/T
-        return (self.L * eta * eta * psi *
-                self.sigma_sq * (self.B_sq + 1.0)) / T
-
-    def compute_full_bound(self, T, Kx, Ku, eta=None):
-        """Compute the full convergence bound.
-
-        Args:
-            T: total training steps
-            Kx: parameter sync period
-            Ku: first moment sync period
-            eta: step size (auto-computed if None)
-        """
-        px = 1.0 / max(Kx, 1)
-        pu = 1.0 / max(Ku, 1)
-
-        if eta is None:
-            eta = self.compute_eta_max(px, pu)
-
-        psi = self.compute_psi(px, pu)
-        leading = self.compute_leading_term(T, eta, px, pu)
-        higher = self.compute_higher_order_term(T, eta, px, pu)
-
-        return {
-            'Kx': Kx, 'Ku': Ku,
-            'px': px, 'pu': pu,
-            'psi': round(psi, 6),
-            'eta_max': round(self.compute_eta_max(px, pu), 8),
-            'eta_used': round(eta, 8),
-            'leading_term': round(leading, 8),
-            'higher_order_term': round(higher, 8),
-            'total_bound': round(leading + higher, 8),
-            'T': T, 'M': self.M,
-        }
-
-    def compare_configurations(self, T, configs):
-        """Compare convergence bounds across configurations.
-
-        Args:
-            T: total steps
-            configs: list of (Kx, Ku) tuples
-
-        Returns list of bound computations for comparison.
-        """
-        results = []
-        for Kx, Ku in configs:
-            results.append(self.compute_full_bound(T, Kx, Ku))
-        # Sort by total bound
-        results.sort(key=lambda r: r['total_bound'])
-        return results
-
-
-class DESLOCAssumptionValidator:
-    """Validate Assumptions 1-3 during training.
-
-    Assumption 1: L-smoothness + lower bound f*
-    Assumption 2: Unbiased gradients + bounded variance σ²
-    Assumption 3: Bounded heterogeneity G², B²
-    """
-
-    def __init__(self, window_size=200):
-        self.window_size = window_size
-        self.loss_values = []
-        self.grad_norms = []
-        self.grad_variances = []
-        self.param_grad_products = []
-
-    def record_step(self, loss, grad_norm, grad_variance=None):
-        """Record metrics for assumption validation."""
-        self.loss_values.append(loss)
-        self.grad_norms.append(grad_norm)
-        if grad_variance is not None:
-            self.grad_variances.append(grad_variance)
-
-    def validate_smoothness(self):
-        """Check L-smoothness (Assumption 1).
-
-        Estimate L from consecutive gradient norms and loss changes.
-        If ‖∇f(x)-∇f(y)‖ ≤ L‖x-y‖, then L ≈ Δ(grad_norm)/Δ(loss).
-        """
-        if len(self.grad_norms) < 10:
-            return {'valid': True, 'reason': 'insufficient data'}
-
-        L_estimates = []
-        for i in range(1, min(len(self.grad_norms),
-                              self.window_size)):
-            dg = abs(self.grad_norms[i] - self.grad_norms[i - 1])
-            dl = abs(self.loss_values[i] - self.loss_values[i - 1])
-            if dl > 1e-10:
-                L_estimates.append(dg / dl)
-
-        if not L_estimates:
-            return {'valid': True, 'estimated_L': 0.0}
-
-        L_est = sorted(L_estimates)[len(L_estimates) // 2]
-        return {
-            'valid': L_est < 1e6,
-            'estimated_L': round(L_est, 4),
-            'L_95th': round(
-                sorted(L_estimates)[int(0.95 * len(L_estimates))], 4),
-        }
-
-    def validate_bounded_variance(self):
-        """Check bounded stochastic variance (Assumption 2).
-
-        σ² should remain finite and reasonably bounded.
-        """
-        if len(self.grad_variances) < 10:
-            return {'valid': True, 'reason': 'insufficient data'}
-
-        recent = self.grad_variances[-self.window_size:]
-        sigma_sq = sum(recent) / len(recent)
-        max_var = max(recent)
-
-        return {
-            'valid': not _math.isnan(sigma_sq) and sigma_sq < 1e6,
-            'estimated_sigma_sq': round(sigma_sq, 6),
-            'max_variance': round(max_var, 6),
-            'samples': len(recent),
-        }
-
-    def validate_lower_bound(self):
-        """Check loss is bounded below (Assumption 1).
-
-        f* > -∞. In practice, check loss isn't diverging.
-        """
-        if len(self.loss_values) < 10:
-            return {'valid': True, 'reason': 'insufficient data'}
-
-        recent = self.loss_values[-self.window_size:]
-        has_nan = any(_math.isnan(v) for v in recent)
-        has_inf = any(_math.isinf(v) for v in recent)
-        min_loss = min(v for v in recent
-                       if not _math.isnan(v) and not _math.isinf(v))
-
-        return {
-            'valid': not has_nan and not has_inf,
-            'has_nan': has_nan,
-            'has_inf': has_inf,
-            'min_loss': round(min_loss, 6) if not _math.isinf(min_loss) else 'inf',
-            'current_loss': round(recent[-1], 6),
-        }
-
-    def full_validation(self):
-        """Run all assumption validations."""
-        return {
-            'assumption_1_smoothness': self.validate_smoothness(),
-            'assumption_1_lower_bound': self.validate_lower_bound(),
-            'assumption_2_variance': self.validate_bounded_variance(),
-            'all_valid': (
-                self.validate_smoothness()['valid'] and
-                self.validate_lower_bound()['valid'] and
-                self.validate_bounded_variance()['valid']),
-        }
-
-
-class DESLOCLinearSpeedup:
-    """Verify linear speedup property (1/M scaling).
-
-    Theorem 1: The leading term includes 1/M factor, meaning
-    convergence rate improves linearly with number of workers.
-
-    This tracker compares actual convergence across different
-    worker counts to validate the theoretical prediction.
-    """
-
-    def __init__(self):
-        self.runs = {}
-
-    def record_run(self, M, T, final_grad_norm_sq):
-        """Record a training run's final convergence metric.
-
-        Args:
-            M: number of workers
-            T: total steps
-            final_grad_norm_sq: avg ‖∇f‖² over last 100 steps
-        """
-        if M not in self.runs:
-            self.runs[M] = []
-        self.runs[M].append({
-            'T': T,
-            'final_grad_norm_sq': final_grad_norm_sq,
-            'normalized': final_grad_norm_sq * M,
-        })
-
-    def check_linear_speedup(self):
-        """Check if linear speedup holds.
-
-        If linear speedup holds: final_grad_norm_sq(M) ≈ C/M
-        So final_grad_norm_sq(M) * M should be approximately
-        constant across different M values.
-        """
-        if len(self.runs) < 2:
-            return {'enough_data': False}
-
-        normalized_values = {}
-        for M, entries in self.runs.items():
-            avg_normalized = sum(
-                e['normalized'] for e in entries) / len(entries)
-            normalized_values[M] = avg_normalized
-
-        values = list(normalized_values.values())
-        mean_norm = sum(values) / len(values)
-        max_deviation = max(
-            abs(v - mean_norm) / max(mean_norm, 1e-12)
-            for v in values)
-
-        return {
-            'enough_data': True,
-            'num_worker_configs': len(self.runs),
-            'normalized_values': {
-                str(M): round(v, 6)
-                for M, v in normalized_values.items()},
-            'mean_normalized': round(mean_norm, 6),
-            'max_relative_deviation': round(max_deviation, 4),
-            'linear_speedup_holds': max_deviation < 0.3,
-        }
+# ── DES-LOC Experiment Utilities (M184) ─────────────────────────
+import time as _m184_time
+import json as _m184_json
+import os as _m184_os
 
 
 class DESLOCExperimentAggregator:
-    """Aggregate results across multiple experiment runs.
+    """Aggregate results across multiple DES-LOC experiment runs.
 
     Combines logs from all benchmark configurations into a
     single summary suitable for generating NeurIPS figures.
+    Data format follows NKI-FA commit da964f3 draw_plot.py:
+    precise numeric values from actual training, not synthetic.
     """
 
     def __init__(self):
@@ -1800,7 +1502,7 @@ class DESLOCExperimentAggregator:
         })
 
     def get_benchmark_summary(self, benchmark_id):
-        """Get summary for a specific benchmark."""
+        """Get summary statistics for a specific benchmark."""
         if benchmark_id not in self.results:
             return {'error': 'benchmark not found'}
 
@@ -1826,6 +1528,7 @@ class DESLOCExperimentAggregator:
         """Export data structured for figure generation.
 
         Returns dict suitable for pandas DataFrame construction.
+        Includes outer_optimizer field for Section 5.5 ablation.
         """
         if benchmark_id not in self.results:
             return {}
@@ -1837,6 +1540,7 @@ class DESLOCExperimentAggregator:
             'total_comm_bytes': [],
             'reduction_vs_ddp': [],
             'seed': [],
+            'outer_optimizer': [],
         }
 
         for entry in self.results[benchmark_id]:
@@ -1847,14 +1551,13 @@ class DESLOCExperimentAggregator:
                 label_parts.append(cfg['method'])
             if 'Kx' in cfg:
                 label_parts.append(f"Kx={cfg['Kx']}")
-            data['config_label'].append('_'.join(label_parts))
+            data['config_label'].append('_'.join(label_parts) if label_parts else 'unknown')
             data['final_loss'].append(m.get('final_loss', 0))
             data['min_loss'].append(m.get('min_loss', 0))
-            data['total_comm_bytes'].append(
-                m.get('total_comm_bytes', 0))
-            data['reduction_vs_ddp'].append(
-                m.get('reduction_vs_ddp', 1.0))
+            data['total_comm_bytes'].append(m.get('total_comm_bytes', 0))
+            data['reduction_vs_ddp'].append(m.get('reduction_vs_ddp', 1.0))
             data['seed'].append(cfg.get('seed', 0))
+            data['outer_optimizer'].append(cfg.get('outer_optimizer', 'averaging'))
 
         return data
 
@@ -1870,6 +1573,134 @@ class DESLOCExperimentAggregator:
         return "\n".join(lines)
 
 
-# =================================================================
-# End M070
-# =================================================================
+class DESLOCLogParser:
+    """Parse structured experiment logs produced by DES-LOC benchmarks.
+
+    Reads log files with format:
+    ### DESLOC_EXPERIMENT_START ###
+    # config: model=125M Kx=32 ...
+    step=0 loss=10.82 lr=6.00e-04 ...
+    ### DESLOC_EXPERIMENT_END ###
+    """
+
+    def __init__(self, log_dir='./desloc_experiment_logs'):
+        self.log_dir = log_dir
+
+    def parse_file(self, filepath):
+        """Parse a single log file into structured data."""
+        config = {}
+        steps = []
+        in_experiment = False
+
+        try:
+            with open(filepath, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if line == '### DESLOC_EXPERIMENT_START ###':
+                        in_experiment = True
+                        continue
+                    elif line == '### DESLOC_EXPERIMENT_END ###':
+                        in_experiment = False
+                        continue
+                    if not in_experiment:
+                        continue
+                    if line.startswith('# config:'):
+                        parts = line[len('# config:'):].strip().split()
+                        for p in parts:
+                            if '=' in p:
+                                k, v = p.split('=', 1)
+                                try:
+                                    v = int(v)
+                                except ValueError:
+                                    try:
+                                        v = float(v)
+                                    except ValueError:
+                                        pass
+                                config[k] = v
+                    elif line.startswith('step='):
+                        entry = {}
+                        for token in line.split():
+                            if '=' in token:
+                                k, v = token.split('=', 1)
+                                try:
+                                    v = float(v)
+                                    if v == int(v) and 'loss' not in k and 'lr' not in k:
+                                        v = int(v)
+                                except ValueError:
+                                    pass
+                                entry[k] = v
+                        steps.append(entry)
+        except FileNotFoundError:
+            pass
+
+        return {'config': config, 'steps': steps}
+
+    def parse_all(self, pattern='*.log'):
+        """Parse all matching log files in log_dir."""
+        import glob
+        results = []
+        for fp in sorted(glob.glob(_m184_os.path.join(self.log_dir, pattern))):
+            parsed = self.parse_file(fp)
+            if parsed['steps']:
+                results.append(parsed)
+        return results
+
+
+class DESLOCConvergenceBound:
+    """Compute theoretical convergence bounds from Theorem 1.
+
+    Theorem 1 bound (simplified):
+      E[||grad f||^2] <= O(1/sqrt(T)) + O(psi/T)
+    where psi = 4(1-px)/px^2 * (1-beta)*(1-pu) / (6*(1-(1-pu)*beta))
+    """
+
+    @staticmethod
+    def compute_psi(Kx, Ku, beta1=0.9):
+        """Compute the psi factor from Theorem 1.
+
+        Args:
+            Kx: parameter sync period
+            Ku: first moment sync period
+            beta1: first moment decay rate
+        Returns:
+            psi: the convergence penalty factor
+        """
+        px = 1.0 / Kx
+        pu = 1.0 / Ku
+        numer = 4.0 * (1.0 - px) * (1.0 - beta1) * (1.0 - pu)
+        denom = px * px * 6.0 * (1.0 - (1.0 - pu) * beta1)
+        if abs(denom) < 1e-15:
+            return float('inf')
+        return numer / denom
+
+    @staticmethod
+    def compute_eta0(L, psi, B_sq=1.0):
+        """Compute step-size upper bound eta_0 from Theorem 1.
+
+        eta_0 = min(1/(8L), 1/(L*sqrt(psi*8*(B^2+1))))
+        """
+        import math
+        bound1 = 1.0 / (8.0 * L)
+        inner = psi * 8.0 * (B_sq + 1.0)
+        if inner <= 0:
+            return bound1
+        bound2 = 1.0 / (L * math.sqrt(inner))
+        return min(bound1, bound2)
+
+    @staticmethod
+    def leading_term(T, M, sigma_sq, L, eta):
+        """O(1/sqrt(T)) leading term: measures convergence rate."""
+        import math
+        if T <= 0 or M <= 0:
+            return float('inf')
+        return (sigma_sq / (M * math.sqrt(T))) + (L * eta * sigma_sq / M)
+
+    @staticmethod
+    def higher_order_term(T, psi, sigma_sq, G_sq, L, eta):
+        """O(psi/T) higher-order term: penalty from desynchronization."""
+        if T <= 0:
+            return float('inf')
+        return (psi * (sigma_sq + G_sq) * L * eta) / T
+
+
+# ── end M184 ────────────────────────────────────────────────────
