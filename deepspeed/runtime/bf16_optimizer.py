@@ -675,3 +675,36 @@ def _get_padded_tensor(src_tensor, size):
         tp=sum(f.numel() for f in self.bf16_groups_flat);pb=tp*2
         dl=pb/e.desloc_Kx+pb/e.desloc_Ku+pb/e.desloc_Kv
         return {'params':tp,'reduction':round(pb/max(dl,1),1)}
+
+    # --- DES-LOC BF16 Extensions (M150) ---
+    def _desloc_bf16_stability(self):
+        import math
+        gn=sum(gp.norm(2).item()**2 for gp in self.fp32_groups_gradient_flat_partition if gp is not None)
+        gn=math.sqrt(gn);t=torch.tensor([gn,gn**2],device=self.fp32_groups_flat_partition[0].device if self.fp32_groups_flat_partition else 'cpu')
+        ws=dist.get_world_size(group=self.real_dp_process_group[0])
+        if ws>1: dist.all_reduce(t,group=self.real_dp_process_group[0]);t/=ws
+        mn=t[0].item();cv=math.sqrt(max(0,t[1].item()-mn**2))/max(mn,1e-8)
+        return {'stable':cv<0.5,'cv':round(cv,4),'norm':round(mn,4)}
+    def _desloc_bf16_halflife_rec(self):
+        import math
+        for g in self.optimizer.param_groups:
+            b=g.get('betas',(0.9,0.999));break
+        else: return None
+        e=getattr(self,'deepspeed_engine',None) or getattr(self,'ds_engine',None)
+        Kx=e.desloc_Kx if e else 32
+        tu=-1.0/math.log2(b[0]) if 0<b[0]<1 else float('inf');tv=-1.0/math.log2(b[1]) if 0<b[1]<1 else float('inf')
+        Ku=max(Kx,int(Kx*min(3,tu/max(Kx,1))));Kv=max(Ku,int(Kx*min(6,tv/max(tu,1e-8))))
+        return {'Kx':Kx,'Ku':Ku,'Kv':Kv,'tau_u':round(tu,1),'tau_v':round(tv,1)}
+    def _desloc_bf16_auto_tune(self):
+        e=getattr(self,'deepspeed_engine',None) or getattr(self,'ds_engine',None)
+        if e is None or not getattr(e,'desloc_enabled',False): return
+        st=self._desloc_bf16_stability()
+        if not st['stable']:
+            e.desloc_Kx=max(1,e.desloc_Kx//2);e.desloc_Ku=max(1,e.desloc_Ku//2);e.desloc_Kv=max(1,e.desloc_Kv//2)
+            if dist.get_rank()==0: print(f"[DES-LOC BF16] Stability fix: Kx->{e.desloc_Kx}")
+    def _desloc_bf16_log(self):
+        e=getattr(self,'deepspeed_engine',None) or getattr(self,'ds_engine',None)
+        if e is None or not getattr(e,'desloc_enabled',False): return
+        if e.desloc_step%500!=0 or dist.get_rank()!=0: return
+        s=self._desloc_bf16_comm_stats()
+        print(f"### BF16 DES-LOC step={e.desloc_step} ### red={s['reduction']:.1f}x params={s['params']/1e6:.1f}M")
