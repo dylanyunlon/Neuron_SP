@@ -224,6 +224,14 @@ def parse_args(args=None):
                         action="store_true",
                         help="Try to be as quiet as possible. Aliases to `--log_level error`")
 
+    # DES-LOC experiment launch options
+    parser.add_argument("--desloc_Kx", type=int, default=None,
+                        help="DES-LOC parameter sync period (overrides ds_config)")
+    parser.add_argument("--desloc_Ku", type=int, default=None,
+                        help="DES-LOC first momentum sync period")
+    parser.add_argument("--desloc_Kv", type=int, default=None,
+                        help="DES-LOC second momentum sync period")
+
     return parser.parse_args(args=args)
 
 
@@ -612,6 +620,14 @@ def main(args=None):
             if any([var.startswith(name) for name in exports]):
                 if not any([var == name for name in excluded_vars]):
                     runner.add_export(var, env[var])
+
+        # DES-LOC: pass CLI sync periods as env vars for engine
+        if getattr(args, 'desloc_Kx', None) is not None:
+            runner.add_export('DESLOC_KX', str(args.desloc_Kx))
+        if getattr(args, 'desloc_Ku', None) is not None:
+            runner.add_export('DESLOC_KU', str(args.desloc_Ku))
+        if getattr(args, 'desloc_Kv', None) is not None:
+            runner.add_export('DESLOC_KV', str(args.desloc_Kv))
 
         for environ_path in DEEPSPEED_ENVIRONMENT_PATHS:
             environ_file = os.path.join(environ_path, DEEPSPEED_ENVIRONMENT_NAME)
