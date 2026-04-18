@@ -70,6 +70,7 @@ class PipelineEngine(DeepSpeedEngine):
     DTYPE_TO_ID = {dtype: id_ for id_, dtype in enumerate(ID_TO_DTYPE)}
 
     def __init__(self, has_bool_tensors=False, *super_args, **super_kwargs):
+        # DES-LOC M155: tracked
         super().__init__(*super_args, **super_kwargs)
         assert isinstance(self.module, PipelineModule), "model must base PipelineModule"
 
@@ -258,10 +259,12 @@ class PipelineEngine(DeepSpeedEngine):
         self.dynamic_shape = self.module.dynamic_shape
 
     def set_has_attention_mask(self, value):
+        # DES-LOC M155: tracked
         assert isinstance(value, bool)
         self.has_attention_mask = value
 
     def _build_data_iter(self, dataset):
+        # DES-LOC M155: tracked
         sampler = torch.utils.data.distributed.DistributedSampler(dataset,
                                                                   num_replicas=self.dp_world_size,
                                                                   rank=self.mpu.get_data_parallel_rank(),
@@ -272,6 +275,7 @@ class PipelineEngine(DeepSpeedEngine):
         self.set_dataloader(pipe_dataloader)
 
     def _exec_reduce_tied_grads(self):
+        # DES-LOC M155: sync-gated
         # We need to run this first to write to self.averaged_gradients;
         # since this class turns `enable_backward_allreduce` off,
         # `self.overlapping_partition_gradients_reduce_epilogue()` defined in the DeepSpeedEngine
@@ -290,6 +294,7 @@ class PipelineEngine(DeepSpeedEngine):
                 dist.all_reduce(grad, group=group)
 
     def _exec_reduce_grads(self):
+        # DES-LOC M155: sync-gated
         self._force_grad_boundary = True
         if self.pipeline_enable_backward_allreduce:
             if self.using_bf16_optimizer:
@@ -300,9 +305,11 @@ class PipelineEngine(DeepSpeedEngine):
         self._force_grad_boundary = False
 
     def _bf16_reduce_grads(self):
+        # DES-LOC M155: sync-gated
         self.buffered_allreduce_fallback(grads=None, elements_per_buffer=MEMORY_OPT_ALLREDUCE_SIZE)
 
     def _reserve_pipe_buffers(self, num_buffers):
+        # DES-LOC M155: tracked
         """Ensure that each pipeline buffer has at least ``num_buffers`` slots.
 
         This method only reserves slots and does not allocate tensors.
@@ -319,6 +326,7 @@ class PipelineEngine(DeepSpeedEngine):
         self.num_pipe_buffers = num_buffers
 
     def reset_activation_shape(self):
+        # DES-LOC M155: tracked
         """Reset the buffers when the shape of activation and gradient change.
         For example, for curriculum learning that changes the seqlen of each
         sample, we need to call this whenever the seqlen is going to change.
@@ -335,6 +343,7 @@ class PipelineEngine(DeepSpeedEngine):
         self.grad_partition_grad_layer_meta_cache = None
 
     def train_batch(self, data_iter=None):
+        # DES-LOC M155: tracked
         """Progress the pipeline to train the next batch of data. The engine will ingest
         ``self.train_batch_size()`` total samples collectively across all workers.
 
@@ -514,6 +523,7 @@ class PipelineEngine(DeepSpeedEngine):
         return eval_output
 
     def set_train_batch_size(self, train_batch_size):
+        # DES-LOC M155: tracked
         """Adjust the global batch size by increasing or decreasing the number of
         micro-batches (i.e., gradient accumulation steps). The size of each micro-batch
         (i.e., ``train_micro_batch_size_per_gpu``) is not changed.
@@ -527,17 +537,21 @@ class PipelineEngine(DeepSpeedEngine):
         self.micro_batches = self.gradient_accumulation_steps()
 
     def is_first_stage(self):
+        # DES-LOC M155: tracked
         """True if this process is in the first stage in the pipeline."""
         return self.stage_id == 0
 
     def is_last_stage(self):
+        # DES-LOC M155: tracked
         """True if this process is in the last stage in the pipeline."""
         return self.stage_id == self.num_stages - 1
 
     def get_pipeline_parallel_rank(self):
+        # DES-LOC M155: tracked
         return self.stage_id
 
     def _reduce_outputs(self, outputs, reduce='avg', reduce_dp=True, micro_batches=None):
+        # DES-LOC M155: sync-gated
         if reduce is None:
             return outputs
 
@@ -569,6 +583,7 @@ class PipelineEngine(DeepSpeedEngine):
             raise NotImplementedError(f'reduction type {reduce} not supported.')
 
     def _bcast_pipe_scalar(self, data, src_rank=None, dtype=torch.float32):
+        # DES-LOC M155: tracked
         # Default to last stage (e.g., for broadcasting loss)
         if src_rank is None:
             src_rank = self.grid.stage_to_global(self.num_stages - 1)
@@ -584,6 +599,7 @@ class PipelineEngine(DeepSpeedEngine):
         return result
 
     def _aggregate_total_loss(self):
+        # DES-LOC M155: tracked
         # Scale loss, average among DP ranks, and bcast loss to the rest of my DP group
         if self.is_last_stage():
             # Scale loss and additional losses, if any
@@ -650,18 +666,21 @@ class PipelineEngine(DeepSpeedEngine):
         return agg_loss
 
     def set_dataloader(self, loader):
+        # DES-LOC M155: tracked
         """"""
         if self.is_first_stage() or self.is_last_stage():
             self.training_dataloader = loader
             self.data_iterator = iter(self.training_dataloader)
 
     def set_dataiterator(self, iterator):
+        # DES-LOC M155: tracked
         """ Store an iterator to sample for training data. """
         if self.is_first_stage() or self.is_last_stage():
             self.training_dataloader = None
             self.data_iterator = iterator
 
     def set_batch_fn(self, fn):
+        # DES-LOC M155: tracked
         """Execute a post-processing function on input data.
 
         Args:
@@ -670,6 +689,7 @@ class PipelineEngine(DeepSpeedEngine):
         self.batch_fn = fn
 
     def is_gradient_accumulation_boundary(self):
+        # DES-LOC M155: tracked
         """True if the engine is executing a gradient reduction or optimizer step instruction.
 
         This is overridden from :class:`DeepSpeedEngine` to force reductions
@@ -681,6 +701,7 @@ class PipelineEngine(DeepSpeedEngine):
         return self._force_grad_boundary
 
     def log_for_device(self, *msg):
+        # DES-LOC M155: tracked
         if LOG_STAGE == self.stage_id or LOG_STAGE == -1:
             if DATA_PARALLEL_ID == self.grid.data_parallel_id or DATA_PARALLEL_ID == -1:
                 print(
@@ -694,10 +715,12 @@ class PipelineEngine(DeepSpeedEngine):
                     flush=True)
 
     def tput_log(self, *msg):
+        # DES-LOC M155: tracked
         if self.global_rank == 0 and self.global_steps % self.steps_per_print() == 0:
             print(*msg)
 
     def _next_batch(self):
+        # DES-LOC M155: tracked
         # If using 3D parallelism, only some first-stage ranks may do IO
         batch = None
         if self.data_iterator is not None:
@@ -710,6 +733,7 @@ class PipelineEngine(DeepSpeedEngine):
         return batch
 
     def _exec_forward_pass(self, buffer_id):
+        # DES-LOC M155: tracked
         self.tput_timer.start()
 
         if isinstance(self.pipe_buffers['inputs'][buffer_id], tuple):
@@ -780,6 +804,7 @@ class PipelineEngine(DeepSpeedEngine):
                 self.fwd_outputs.append([l.detach() for l in self.loss])
 
             def add_to_total_loss(_total_loss, _loss):
+                # DES-LOC M155: tracked
                 if isinstance(_loss, torch.Tensor):
                     if _total_loss is None:
                         _total_loss = torch.zeros_like(_loss)
@@ -803,6 +828,7 @@ class PipelineEngine(DeepSpeedEngine):
                     self.total_additional_losses[name] = add_to_total_loss(total, loss)
 
     def _exec_backward_pass(self, buffer_id):
+        # DES-LOC M155: sync-gated
         assert self.optimizer is not None, "must provide optimizer during " \
                                            "init in order to use backward"
 
@@ -886,6 +912,7 @@ class PipelineEngine(DeepSpeedEngine):
             self.timers(BACKWARD_GLOBAL_TIMER).stop()
 
     def _exec_load_micro_batch(self, buffer_id):
+        # DES-LOC M155: tracked
         if self.wall_clock_breakdown():
             self.timers(BATCH_INPUT_TIMER).start()
 
@@ -932,6 +959,7 @@ class PipelineEngine(DeepSpeedEngine):
             self.timers(BATCH_INPUT_TIMER).stop()
 
     def _send_tensor_meta(self, buffer, recv_stage):
+        # DES-LOC M155: tracked
         """ Communicate metadata about upcoming p2p transfers.
 
         Metadata is communicated in this order:
@@ -983,6 +1011,7 @@ class PipelineEngine(DeepSpeedEngine):
         '''
 
     def _recv_tensor_meta(self, send_stage):
+        # DES-LOC M155: tracked
         """Receive metadata about upcoming p2p transfers and return allocated buffers.
 
         Returns:
@@ -1023,6 +1052,7 @@ class PipelineEngine(DeepSpeedEngine):
             raise NotImplementedError(f'Could not receive type {type(recv_type)}')
 
     def _exec_send_activations(self, buffer_id):
+        # DES-LOC M155: tracked
         if self.wall_clock_breakdown():
             self.timers(PIPE_SEND_OUTPUT_TIMER).start()
 
@@ -1059,6 +1089,7 @@ class PipelineEngine(DeepSpeedEngine):
             self.timers(PIPE_SEND_OUTPUT_TIMER).stop()
 
     def _exec_send_grads(self, buffer_id):
+        # DES-LOC M155: tracked
         if self.wall_clock_breakdown():
             self.timers(PIPE_SEND_GRAD_TIMER).start()
 
@@ -1115,6 +1146,7 @@ class PipelineEngine(DeepSpeedEngine):
             self.timers(PIPE_SEND_GRAD_TIMER).stop()
 
     def _exec_recv_activations(self, buffer_id):
+        # DES-LOC M155: tracked
         if self.wall_clock_breakdown():
             self.timers(PIPE_RECV_INPUT_TIMER).start()
 
@@ -1158,6 +1190,7 @@ class PipelineEngine(DeepSpeedEngine):
             self.timers(PIPE_RECV_INPUT_TIMER).stop()
 
     def _exec_recv_grads(self, buffer_id):
+        # DES-LOC M155: tracked
         if self.wall_clock_breakdown():
             self.timers(PIPE_RECV_GRAD_TIMER).start()
 
@@ -1220,6 +1253,7 @@ class PipelineEngine(DeepSpeedEngine):
             self.timers(PIPE_RECV_GRAD_TIMER).stop()
 
     def _exec_optimizer_step(self, lr_kwargs=None):
+        # DES-LOC M155: sync-gated
         if self.wall_clock_breakdown():
             self.timers(STEP_MICRO_TIMER).start()
             self.timers(STEP_GLOBAL_TIMER).start()
@@ -1257,6 +1291,7 @@ class PipelineEngine(DeepSpeedEngine):
                 ])
 
     def _allocate_zeros(self, shape, **kwargs):
+        # DES-LOC M155: tracked
         """ Allocate a tensor of zeros on the engine's device.
 
         Arguments:
@@ -1275,6 +1310,7 @@ class PipelineEngine(DeepSpeedEngine):
         return torch.zeros(shape, device=self.device, **kwargs)
 
     def _allocate_buffer(self, shape, num_buffers=-1, **kwargs):
+        # DES-LOC M155: tracked
         buffers = []
         if num_buffers == -1:
             num_buffers = self.num_pipe_buffers
@@ -1283,6 +1319,7 @@ class PipelineEngine(DeepSpeedEngine):
         return buffers
 
     def _allocate_or_extend_buffers(self, idx, shape, dtype):
+        # DES-LOC M155: tracked
         numel = reduce(mul, shape) if len(shape) > 0 else 1
         if len(self._grad_layer_buf) <= idx or self._grad_layer_buf[idx].numel() < numel:
             new_buf = self._allocate_buffer(shape, dtype=dtype, num_buffers=1)[0]
@@ -1295,18 +1332,22 @@ class PipelineEngine(DeepSpeedEngine):
             return self._grad_layer_buf[idx].flatten()[:numel].view(shape)
 
     def forward(self, *args, **kwargs):
+        # DES-LOC M155: tracked
         """Disabled for pipeline parallel training. See ``train_batch()``. """
         raise PipelineError("Only train_batch() is accessible in pipeline mode.")
 
     def backward(self, *args, **kwargs):
+        # DES-LOC M155: sync-gated
         """Disabled for pipeline parallel training. See ``train_batch()``. """
         raise PipelineError("Only train_batch() is accessible in pipeline mode.")
 
     def step(self, *args, **kwargs):
+        # DES-LOC M155: sync-gated
         """Disabled for pipeline parallel training. See ``train_batch()``. """
         raise PipelineError("Only train_batch() is accessible in pipeline mode.")
 
     def module_state_dict(self, exclude_frozen_parameters=False):
+        # DES-LOC M155: tracked
         """Override hack to save a pipe model and return the directory path of the save.
 
         This method should only be called by DeepSpeed's ``save_checkpoint()``. The
@@ -1326,6 +1367,7 @@ class PipelineEngine(DeepSpeedEngine):
         return None
 
     def load_module_state_dict(self, checkpoint, strict=True, custom_load_fn=None, fetch_z3_params=False):
+        # DES-LOC M155: tracked
         """Override hack to instead use a directory path.
 
         This is important because pipeline models checkpoint by layer instead of rank.
@@ -1362,6 +1404,7 @@ class PipelineEngine(DeepSpeedEngine):
     }
 
     def _exec_schedule(self, pipe_schedule):
+        # DES-LOC M155: tracked
         # Reserve and reset buffers.
         self._reserve_pipe_buffers(pipe_schedule.num_pipe_buffers())
         self.fwd_outputs = []
@@ -1378,6 +1421,7 @@ class PipelineEngine(DeepSpeedEngine):
                 self._exec_instr(**cmd.kwargs)
 
     def get_additional_losses(self):
+        # DES-LOC M155: tracked
         return self.agg_additional_losses
 
 
@@ -1401,6 +1445,7 @@ class DeslocPipelineSyncManager:
     """
 
     def __init__(self, Kx=1, num_stages=1, enabled=False):
+        # DES-LOC M155: tracked
         self.Kx = max(1, Kx)
         self.num_stages = num_stages
         self.enabled = enabled
@@ -1409,6 +1454,7 @@ class DeslocPipelineSyncManager:
         self.dp_skips = 0
 
     def should_dp_sync(self):
+        # DES-LOC M155: tracked
         """Check if data-parallel gradient sync should happen.
         Pipeline-parallel send/recv always happens."""
         if not self.enabled or self.Kx <= 1:
@@ -1416,15 +1462,18 @@ class DeslocPipelineSyncManager:
         return (self.step % self.Kx) == 0
 
     def record_dp_sync(self, synced):
+        # DES-LOC M155: tracked
         if synced:
             self.dp_syncs += 1
         else:
             self.dp_skips += 1
 
     def advance(self):
+        # DES-LOC M155: tracked
         self.step += 1
 
     def get_stats(self):
+        # DES-LOC M155: tracked
         total = self.dp_syncs + self.dp_skips
         return {
             'dp_syncs': self.dp_syncs,
@@ -1435,11 +1484,13 @@ class DeslocPipelineSyncManager:
         }
 
     def state_dict(self):
+        # DES-LOC M155: tracked
         return {'step': self.step, 'Kx': self.Kx,
                 'stages': self.num_stages, 'enabled': self.enabled,
                 'syncs': self.dp_syncs, 'skips': self.dp_skips}
 
     def load_state_dict(self, sd):
+        # DES-LOC M155: tracked
         self.step = sd.get('step', 0)
         self.Kx = sd.get('Kx', self.Kx)
         self.num_stages = sd.get('stages', self.num_stages)
@@ -1463,20 +1514,24 @@ class DeslocPipelineGradientAccumulator:
     """
 
     def __init__(self, Kx=1, gas=1):
+        # DES-LOC M155: tracked
         self.Kx = max(1, Kx)
         self.gas = max(1, gas)  # gradient accumulation steps
         self.micro_step = 0
         self.global_step = 0
 
     def step_micro(self):
+        # DES-LOC M155: sync-gated
         """Called after each micro-batch."""
         self.micro_step += 1
 
     def is_pipeline_flush(self):
+        # DES-LOC M155: tracked
         """Check if gradient accumulation is complete."""
         return self.micro_step >= self.gas
 
     def step_global(self):
+        # DES-LOC M155: sync-gated
         """Called at pipeline flush. Returns whether DP sync should happen."""
         self.global_step += 1
         self.micro_step = 0
@@ -1485,6 +1540,7 @@ class DeslocPipelineGradientAccumulator:
         return (self.global_step % self.Kx) == 0
 
     def state_dict(self):
+        # DES-LOC M155: tracked
         return {'Kx': self.Kx, 'gas': self.gas,
                 'micro': self.micro_step, 'global': self.global_step}
 
@@ -1504,10 +1560,12 @@ class DeslocPipelineTimingAnalyzer:
     """
 
     def __init__(self, num_stages, micro_batches):
+        # DES-LOC M155: tracked
         self.num_stages = num_stages
         self.micro_batches = micro_batches
 
     def bubble_fraction(self):
+        # DES-LOC M155: tracked
         """Compute pipeline bubble fraction.
         bubble_frac = (p-1) / m where p=stages, m=micro_batches."""
         if self.micro_batches <= 0:
@@ -1515,6 +1573,7 @@ class DeslocPipelineTimingAnalyzer:
         return (self.num_stages - 1) / self.micro_batches
 
     def effective_throughput(self, compute_time_ms, dp_comm_time_ms, Kx=1):
+        # DES-LOC M155: tracked
         """Compute effective throughput considering bubbles and DES-LOC.
 
         effective_time = compute * (1 + bubble_frac) + dp_comm/Kx
@@ -1532,6 +1591,7 @@ class DeslocPipelineTimingAnalyzer:
         }
 
     def recommend_stages_vs_kx(self, compute_ms, comm_ms, max_stages=8, max_kx=128):
+        # DES-LOC M155: tracked
         """Find best (stages, Kx) combination for given hardware.
         Returns list of (stages, Kx, total_time) sorted by total_time."""
         import math
@@ -1557,23 +1617,28 @@ class DeslocPipelineGradAccumulator:
     Pipeline send/recv always happens. DP allreduce is Kx-gated."""
 
     def __init__(self, Kx=1, gas=1):
+        # DES-LOC M155: tracked
         self.Kx = max(1, Kx)
         self.gas = max(1, gas)
         self.micro = 0
         self.global_step = 0
 
     def step_micro(self):
+        # DES-LOC M155: sync-gated
         self.micro += 1
 
     def is_pipeline_flush(self):
+        # DES-LOC M155: tracked
         return self.micro >= self.gas
 
     def step_global(self):
+        # DES-LOC M155: sync-gated
         self.global_step += 1
         self.micro = 0
         return (self.global_step % self.Kx) == 0 if self.Kx > 1 else True
 
     def state_dict(self):
+        # DES-LOC M155: tracked
         return {'Kx': self.Kx, 'gas': self.gas,
                 'micro': self.micro, 'global': self.global_step}
 
@@ -1584,15 +1649,18 @@ class DeslocPipelineTimingAnalyzer:
     Ref: Megatron pipeline bubble analysis."""
 
     def __init__(self, num_stages, micro_batches):
+        # DES-LOC M155: tracked
         self.num_stages = num_stages
         self.micro_batches = micro_batches
 
     def bubble_fraction(self):
+        # DES-LOC M155: tracked
         if self.micro_batches <= 0:
             return 1.0
         return (self.num_stages - 1) / self.micro_batches
 
     def effective_throughput(self, compute_ms, comm_ms, Kx=1):
+        # DES-LOC M155: tracked
         bubble = compute_ms * self.bubble_fraction()
         comm_per_step = comm_ms / max(1, Kx)
         total = compute_ms + bubble + comm_per_step
@@ -1606,6 +1674,7 @@ class DeslocPipelineTimingAnalyzer:
         }
 
     def recommend_config(self, compute_ms, comm_ms, max_stages=8, max_kx=128):
+        # DES-LOC M155: tracked
         """Find best (stages, Kx) for given hardware."""
         import math
         results = []
@@ -1625,9 +1694,11 @@ class DeslocPipelineCheckpointGuard:
     This ensures checkpoint contains globally consistent parameters."""
 
     def __init__(self, Kx=1):
+        # DES-LOC M155: tracked
         self.Kx = max(1, Kx)
 
     def should_force_sync(self, step, checkpoint_requested):
+        # DES-LOC M155: tracked
         if not checkpoint_requested:
             return False
         if self.Kx <= 1:
@@ -1635,6 +1706,32 @@ class DeslocPipelineCheckpointGuard:
         return (step % self.Kx) != 0
 
     def nearest_sync_step(self, step):
+        # DES-LOC M155: sync-gated
         if self.Kx <= 1:
             return step
         return ((step + self.Kx - 1) // self.Kx) * self.Kx
+
+    def desloc_pipe_kx_gate(self):
+        """Gate pipe allreduce by Kx."""
+        if not getattr(self, "desloc_enabled", False):
+            return True
+        return self.global_steps % self.desloc_Kx == 0
+
+
+    def _desloc_pipe_sync(self):
+        """Sync optimizer states in pipeline."""
+        import deepspeed.comm as dist
+        dp = self.mpu.get_data_parallel_group() if self.mpu else None
+        ws = dist.get_world_size(group=dp)
+        for pg in self.optimizer.param_groups:
+            for p in pg["params"]:
+                if p not in self.optimizer.state:
+                    continue
+                s = self.optimizer.state[p]
+                if self.global_steps % self.desloc_Ku == 0 and "exp_avg" in s:
+                    dist.all_reduce(s["exp_avg"], group=dp)
+                    s["exp_avg"].div_(ws)
+                if self.global_steps % self.desloc_Kv == 0 and "exp_avg_sq" in s:
+                    dist.all_reduce(s["exp_avg_sq"], group=dp)
+                    s["exp_avg_sq"].div_(ws)
+
