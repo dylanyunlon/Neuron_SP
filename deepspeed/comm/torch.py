@@ -763,3 +763,56 @@ class DeslocBucketedAllreduce:
             'pending': {t: len(b) for t, b in self.tier_buckets.items()},
             'pending_bytes': dict(self.tier_bucket_bytes),
         }
+
+
+# --- DES-LOC NCCL Hooks (M145) ---
+import time as _t145
+class DeslocNCCLProfiler:
+    def __init__(self):
+        from collections import defaultdict as dd
+        self._times=dd(list);self._bytes=dd(int);self._counts=dd(int)
+    def record(self,op,nb,el): self._counts[op]+=1;self._bytes[op]+=nb;self._times[op].append(el*1000)
+    def summary(self):
+        s={}
+        for op in self._counts:
+            t=self._times[op];n=self._counts[op];avg=sum(t)/len(t) if t else 0
+            bw=(self._bytes[op]/n)/(avg/1000)/1e9 if avg>0 and n>0 else 0
+            s[op]={'count':n,'avg_ms':round(avg,3),'bw_gbps':round(bw,2)}
+        return s
+    def export_csv(self,path):
+        lines=['op,count,avg_ms,bw_gbps']
+        for op,s in self.summary().items(): lines.append(f"{op},{s['count']},{s['avg_ms']},{s['bw_gbps']}")
+        with open(path,'w') as f: f.write('\n'.join(lines))
+class DeslocNCCLWrapper:
+    def __init__(self,backend,profiler=None):
+        from collections import defaultdict as dd
+        self.backend=backend;self.profiler=profiler or DeslocNCCLProfiler();self._bytes=dd(int);self._skips=dd(int)
+    def all_reduce(self,tensor,tier='x',op=None,group=None,async_op=False):
+        from deepspeed.comm.comm import desloc_should_sync
+        if not desloc_should_sync(tier): self._skips[tier]+=1;return None,False
+        import torch.distributed as td
+        if op is None:
+            try: op=td.ReduceOp.AVG
+            except: op=td.ReduceOp.SUM
+        nb=tensor.numel()*tensor.element_size();t0=_t145.monotonic()
+        h=self.backend.all_reduce(tensor,op=op,group=group,async_op=async_op)
+        self._bytes[tier]+=nb;self.profiler.record(f'ar_{tier}',nb,_t145.monotonic()-t0);return h,True
+    def get_reduction(self):
+        total=sum(self._bytes.values());skip_est=sum(self._skips[t] for t in self._bytes)
+        return round((total+skip_est)/max(total,1),2)
+class DeslocBandwidthEstimator:
+    SIZES=[1024,16384,262144,4194304]
+    @staticmethod
+    def probe(group=None):
+        import torch,torch.distributed as td
+        results=[];dev='cuda' if torch.cuda.is_available() else 'cpu'
+        for sz in DeslocBandwidthEstimator.SIZES:
+            t=torch.zeros(sz//4,dtype=torch.float32,device=dev);td.barrier(group=group)
+            t0=_t145.monotonic()
+            for _ in range(3): td.all_reduce(t,group=group)
+            el=(_t145.monotonic()-t0)/3;bw=sz*2/max(el,1e-9)/1e9;results.append((sz,round(bw,2)));del t
+        return results
+_desloc_nccl_wrap=None
+def init_desloc_nccl(backend,profiler=None):
+    global _desloc_nccl_wrap;_desloc_nccl_wrap=DeslocNCCLWrapper(backend,profiler);return _desloc_nccl_wrap
+def get_desloc_nccl(): return _desloc_nccl_wrap
