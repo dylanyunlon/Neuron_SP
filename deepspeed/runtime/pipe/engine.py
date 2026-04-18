@@ -1735,3 +1735,38 @@ class DeslocPipelineCheckpointGuard:
                     dist.all_reduce(s["exp_avg_sq"], group=dp)
                     s["exp_avg_sq"].div_(ws)
 
+
+    # --- DES-LOC Pipeline (M142) ---
+    def _desloc_pipe_should_reduce(self,mb):
+        if not self.desloc_enabled: return True
+        if not self.is_gradient_accumulation_boundary(): return False
+        return self.desloc_is_param_sync_step()
+    def _desloc_pipe_stage_tier(self):
+        ns=getattr(self,'num_stages',1); sid=getattr(self,'stage_id',0)
+        if ns<=1 or sid==0 or sid==ns-1: return 'x'
+        return 'u' if sid<ns//2 else 'v'
+    def _desloc_pipe_1f1b(self,nmb):
+        ns=getattr(self,'num_stages',1); sid=getattr(self,'stage_id',0); w=min(nmb,ns-1-sid); s=nmb-w; c=w
+        ph=[('fwd',i,False) for i in range(w)]
+        for i in range(s): ph+=[('fwd',w+i,False),('bwd',i,False)]
+        for i in range(c): ph.append(('bwd',s+i,i==c-1 and self.desloc_is_param_sync_step()))
+        return ph
+    def _desloc_pipe_cross_stage_check(self):
+        if not self.desloc_enabled: return True
+        l=torch.tensor([int(self.desloc_is_param_sync_step())],device=self.device,dtype=torch.int32)
+        if self.grid and hasattr(self.grid,'get_pipe_parallel_group'):
+            pp=self.grid.get_pipe_parallel_group()
+            if pp: dist.broadcast(l,src=0,group=pp)
+        return bool(l.item())==self.desloc_is_param_sync_step()
+    def _desloc_pipe_nesterov(self,mu=0.9):
+        if not self.desloc_enabled or not self.desloc_is_param_sync_step(): return
+        if not hasattr(self,'_dpv'): self._dpv,self._dpp={},{}
+        for n,p in self.module.named_parameters():
+            if not p.requires_grad: continue
+            pid=id(p)
+            if pid not in self._dpv: self._dpv[pid]=p.data.new_zeros(p.data.shape);self._dpp[pid]=p.data.clone();continue
+            d=p.data.float()-self._dpp[pid].float();v=self._dpv[pid];v.mul_(mu).add_(d)
+            p.data.add_(v.to(p.dtype),alpha=mu);self._dpp[pid].copy_(p.data)
+    def _desloc_pipe_log(self):
+        if not self.desloc_enabled or dist.get_rank()!=0: return
+        print(f"### PP DES-LOC step={self.desloc_step} stage={getattr(self,'stage_id',0)} tier={self._desloc_pipe_stage_tier()} ###")
