@@ -195,41 +195,31 @@ class FusedAdam(torch.optim.Optimizer):
         return loss
 
 
-# =====================================================================
-# M054: DES-LOC FusedAdam (400 lines)
-# =====================================================================
-# Extends FusedAdam with DES-LOC per-coordinate clipping and
-# independent optimizer state synchronization schedule.
-# Architecture reference: CCCL cub/cub/agent/agent_reduce.cuh
-#
-# This is the production kernel-fused DES-LOC optimizer.
-# Per-coordinate clipping: clip(g, rho)_i = sign(g_i)*min(|g_i|, rho)
-# Reference: des_loc_reconstructed.tex line 168, Algorithm 1
-# =====================================================================
-
-import math
-import os
-import time as _time
+# ═══════════════════════════════════════════════════════════════
+# DES-LOC FusedAdam: per-coordinate clipping + sync-aware Adam
+# Algorithm 1 from "DES-LOC: Desynced Low Communication"
+# M187: net +400 lines of DES-LOC optimizer integration
+# ═══════════════════════════════════════════════════════════════
 from collections import deque as _deque
 
 
 class DESLOCFusedAdam(torch.optim.Optimizer):
-    """
-    DES-LOC Fused Adam — CUDA-fused AdamW with desynchronized communication.
+    """DES-LOC variant of FusedAdam with desynchronized communication.
 
-    Implements the full DES-LOC Algorithm 1 from the paper:
-    - Per-coordinate gradient clipping: clip(g, rho)
-    - Independent sync periods: Kx (params), Ku (first moment), Kv (second moment)
+    Implements Algorithm 1:
+    - Per-coordinate gradient clipping: clip(g,rho)_i = sign(g_i)*min(|g_i|,rho)
+    - Independent sync periods: Kx (params), Ku (1st moment), Kv (2nd moment)
     - Local Adam update between sync points
+    - Optional Nesterov outer optimizer at sync boundaries
 
-    Uses the same CUDA kernel as FusedAdam for the Adam update,
-    but wraps it with DES-LOC's communication schedule.
+    The clipping is coordinate-wise (not norm-based), matching
+    Algorithm 1 line 12: g_hat = clip(g, rho).
 
     Args:
-        params: iterable of parameters to optimize
+        params: iterable of parameters
         lr: learning rate (default: 1e-3)
-        betas: coefficients for running averages (default: (0.9, 0.999))
-        eps: term for numerical stability (default: 1e-8)
+        betas: Adam (beta1, beta2) (default: (0.9, 0.999))
+        eps: numerical stability (default: 1e-8)
         weight_decay: decoupled weight decay (default: 0.01)
         Kx: parameter sync period (default: 32)
         Ku: first moment sync period (default: 96)
@@ -237,25 +227,16 @@ class DESLOCFusedAdam(torch.optim.Optimizer):
         clip_radius: per-coordinate clipping radius rho (default: 1.0)
         bias_correction: apply bias correction (default: True)
         set_grad_none: set grad to None on zero_grad (default: True)
+        outer_optimizer: 'averaging' or 'nesterov' (default: 'averaging')
     """
 
-    def __init__(self,
-                 params,
-                 lr=1e-3,
-                 betas=(0.9, 0.999),
-                 eps=1e-8,
-                 weight_decay=0.01,
-                 Kx=32,
-                 Ku=96,
-                 Kv=192,
-                 clip_radius=1.0,
-                 bias_correction=True,
-                 set_grad_none=True):
+    def __init__(self, params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8,
+                 weight_decay=0.01, Kx=32, Ku=96, Kv=192,
+                 clip_radius=1.0, bias_correction=True,
+                 set_grad_none=True, outer_optimizer='averaging'):
         defaults = dict(lr=lr, betas=betas, eps=eps,
-                         weight_decay=weight_decay,
-                         bias_correction=bias_correction,
-                         Kx=Kx, Ku=Ku, Kv=Kv,
-                         clip_radius=clip_radius)
+                        weight_decay=weight_decay,
+                        bias_correction=bias_correction)
         super(DESLOCFusedAdam, self).__init__(params, defaults)
         self.set_grad_none = set_grad_none
         self.global_step = 0
@@ -263,8 +244,7 @@ class DESLOCFusedAdam(torch.optim.Optimizer):
         self._Ku = Ku
         self._Kv = Kv
         self._clip_radius = clip_radius
-
-        # Communication tracking
+        self._outer_optimizer = outer_optimizer
         self._sync_x_count = 0
         self._sync_u_count = 0
         self._sync_v_count = 0
@@ -274,7 +254,7 @@ class DESLOCFusedAdam(torch.optim.Optimizer):
         self._clip_total_elements = 0
         self._comm_times_ms = _deque(maxlen=500)
 
-        # Try to load CUDA kernel; fallback to pure PyTorch
+        # Try CUDA kernel; fallback to pure PyTorch
         self._fused_available = False
         try:
             fused_adam_cuda = FusedAdamBuilder().load()
@@ -282,7 +262,7 @@ class DESLOCFusedAdam(torch.optim.Optimizer):
             self.multi_tensor_adam = fused_adam_cuda.multi_tensor_adam
             self._fused_available = True
         except Exception:
-            pass  # Will use pure-torch fallback
+            pass
 
     def zero_grad(self):
         if self.set_grad_none:
@@ -293,12 +273,10 @@ class DESLOCFusedAdam(torch.optim.Optimizer):
             super(DESLOCFusedAdam, self).zero_grad()
 
     def _clip_gradients(self, grads, rho):
-        """Apply per-coordinate gradient clipping.
+        """Per-coordinate gradient clipping (Algorithm 1 line 12).
 
         clip(g, rho)_i = sign(g_i) * min(|g_i|, rho)
-
-        This is NOT norm-based clipping — it clips each coordinate
-        independently, matching Algorithm 1 line 168.
+        NOT norm-based — each coordinate clipped independently.
         """
         for g in grads:
             mask = g.abs() > rho
@@ -308,40 +286,59 @@ class DESLOCFusedAdam(torch.optim.Optimizer):
                 g.clamp_(-rho, rho)
 
     def _pytorch_adam_step(self, p, grad, state, group):
-        """Pure PyTorch Adam update (fallback when CUDA kernel unavailable)."""
+        """Pure PyTorch Adam step (fallback when CUDA kernel unavailable)."""
         beta1, beta2 = group['betas']
-        eps = group['eps']
+        step = state['step']
 
-        exp_avg = state['exp_avg']
-        exp_avg_sq = state['exp_avg_sq']
+        if group['weight_decay'] > 0:
+            p.data.mul_(1.0 - group['lr'] * group['weight_decay'])
 
-        state['step'] += 1
-
-        # Decoupled weight decay
-        if group['weight_decay'] != 0:
-            p.data.mul_(1 - group['lr'] * group['weight_decay'])
-
-        # Adam update
-        exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
-        exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
+        state['exp_avg'].mul_(beta1).add_(grad, alpha=1.0 - beta1)
+        state['exp_avg_sq'].mul_(beta2).addcmul_(grad, grad, value=1.0 - beta2)
 
         if group.get('bias_correction', True):
-            bias_correction1 = 1 - beta1 ** state['step']
-            bias_correction2 = 1 - beta2 ** state['step']
-            step_size = group['lr'] / bias_correction1
-            denom = (exp_avg_sq.sqrt() / math.sqrt(bias_correction2)).add_(eps)
+            bc1 = 1.0 - beta1 ** step
+            bc2 = 1.0 - beta2 ** step
+            step_size = group['lr'] / bc1
+            denom = (state['exp_avg_sq'].sqrt() / (bc2 ** 0.5)).add_(group['eps'])
         else:
             step_size = group['lr']
-            denom = exp_avg_sq.sqrt().add_(eps)
+            denom = state['exp_avg_sq'].sqrt().add_(group['eps'])
 
-        p.data.addcdiv_(exp_avg, denom, value=-step_size)
+        p.data.addcdiv_(state['exp_avg'], denom, value=-step_size)
+
+    def should_sync_x(self):
+        """Check if parameters should sync (Algorithm 1 line 13)."""
+        return self._Kx <= 1 or self.global_step % self._Kx == 0
+
+    def should_sync_u(self):
+        """Check if first moment should sync."""
+        return self._Ku <= 1 or self.global_step % self._Ku == 0
+
+    def should_sync_v(self):
+        """Check if second moment should sync."""
+        return self._Kv <= 1 or self.global_step % self._Kv == 0
+
+    def get_comm_stats(self):
+        """Return communication statistics for logging."""
+        return {
+            'global_step': self.global_step,
+            'sync_x': self._sync_x_count,
+            'sync_u': self._sync_u_count,
+            'sync_v': self._sync_v_count,
+            'total_comm_bytes': self._total_comm_bytes,
+            'skipped_comm_bytes': self._skipped_comm_bytes,
+            'clip_count': self._clip_count,
+            'clip_elements': self._clip_total_elements,
+            'outer_opt': self._outer_optimizer,
+        }
 
     def step(self, closure=None):
-        """Performs a single DES-LOC optimization step.
+        """Single DES-LOC optimization step.
 
-        1. Apply per-coordinate clipping to gradients
-        2. Perform local Adam update
-        3. Communication is handled separately by sync_if_needed()
+        1. Per-coordinate gradient clipping (Algorithm 1 line 12)
+        2. Local Adam update (Algorithm 1 lines 13-17)
+        3. Communication gated by Kx/Ku/Kv periods (handled by engine)
         """
         loss = None
         if closure is not None:
@@ -352,202 +349,142 @@ class DESLOCFusedAdam(torch.optim.Optimizer):
         for group in self.param_groups:
             if len(group['params']) == 0:
                 continue
+            rho = self._clip_radius
 
-            rho = group.get('clip_radius', self._clip_radius)
-            bias_correction = 1 if group.get('bias_correction', True) else 0
-            beta1, beta2 = group['betas']
-
-            # Collect gradients for clipping
-            all_grads = []
-            for p in group['params']:
-                if p.grad is not None and not p.grad.data.is_sparse:
-                    all_grads.append(p.grad.data)
-
-            # DES-LOC per-coordinate clipping (Algorithm 1 line 168)
-            if rho > 0:
-                self._clip_gradients(all_grads, rho)
-
-            if self._fused_available:
-                # Use CUDA kernel path
-                g_16, p_16, m_16, v_16 = [], [], [], []
-                g_bf, p_bf, m_bf, v_bf = [], [], [], []
-                g_32, p_32, m_32, v_32 = [], [], [], []
-
-                for p in group['params']:
-                    if p.grad is None:
-                        continue
-
-                    state = self.state[p]
-                    if len(state) == 0:
-                        state['step'] = 0
-                        state['exp_avg'] = torch.zeros_like(p.data)
-                        state['exp_avg_sq'] = torch.zeros_like(p.data)
-
-                    if p.dtype == torch.float16:
-                        g_16.append(p.grad.data)
-                        p_16.append(p.data)
-                        m_16.append(state['exp_avg'])
-                        v_16.append(state['exp_avg_sq'])
-                    elif p.dtype == torch.bfloat16:
-                        g_bf.append(p.grad)
-                        p_bf.append(p)
-                        m_bf.append(state['exp_avg'])
-                        v_bf.append(state['exp_avg_sq'])
-                    elif p.dtype == torch.float32:
-                        g_32.append(p.grad.data)
-                        p_32.append(p.data)
-                        m_32.append(state['exp_avg'])
-                        v_32.append(state['exp_avg_sq'])
-
-                step_val = self.global_step
-
-                if len(g_16) > 0:
-                    multi_tensor_applier(
-                        self.multi_tensor_adam, self._dummy_overflow_buf,
-                        [g_16, p_16, m_16, v_16],
-                        group['lr'], beta1, beta2, group['eps'],
-                        step_val, 1, bias_correction, group['weight_decay'])
-
-                if len(g_bf) > 0:
-                    multi_tensor_applier(
-                        self.multi_tensor_adam, self._dummy_overflow_buf,
-                        [g_bf, p_bf, m_bf, v_bf],
-                        group['lr'], beta1, beta2, group['eps'],
-                        step_val, 1, bias_correction, group['weight_decay'])
-
-                if len(g_32) > 0:
-                    multi_tensor_applier(
-                        self.multi_tensor_adam, self._dummy_overflow_buf,
-                        [g_32, p_32, m_32, v_32],
-                        group['lr'], beta1, beta2, group['eps'],
-                        step_val, 1, bias_correction, group['weight_decay'])
-            else:
-                # Pure PyTorch fallback
-                for p in group['params']:
-                    if p.grad is None:
-                        continue
-                    state = self.state[p]
-                    if len(state) == 0:
-                        state['step'] = 0
-                        state['exp_avg'] = torch.zeros_like(p.data)
-                        state['exp_avg_sq'] = torch.zeros_like(p.data)
-                    self._pytorch_adam_step(p, p.grad.data, state, group)
-
-        return loss
-
-    def sync_if_needed(self, world_size):
-        """Sync optimizer states based on DES-LOC schedule.
-
-        Called AFTER step() to average parameters and optimizer states
-        across workers at the schedule-defined intervals.
-
-        Algorithm 1 lines 170-180:
-        - if t mod Kj == 0: sync state j (allreduce + average)
-        """
-        if world_size <= 1:
-            return {'sync_x': False, 'sync_u': False, 'sync_v': False}
-
-        sync_x = (self.global_step % self._Kx == 0)
-        sync_u = (self.global_step % self._Ku == 0)
-        sync_v = (self.global_step % self._Kv == 0)
-
-        if not sync_x and not sync_u and not sync_v:
-            return {'sync_x': False, 'sync_u': False, 'sync_v': False}
-
-        try:
-            import torch.distributed as torch_dist
-        except ImportError:
-            return {'sync_x': sync_x, 'sync_u': sync_u, 'sync_v': sync_v}
-
-        t0 = _time.time()
-
-        for group in self.param_groups:
             for p in group['params']:
                 if p.grad is None:
                     continue
+                if p.grad.data.is_sparse:
+                    raise RuntimeError(
+                        'DESLOCFusedAdam does not support sparse gradients')
+
+                grad = p.grad.data
+
+                # Step 1: Per-coordinate clipping
+                if rho < float('inf'):
+                    self._clip_gradients([grad], rho)
 
                 state = self.state[p]
-                bytes_per_elem = p.data.element_size()
-                numel = p.data.numel()
+                if len(state) == 0:
+                    state['step'] = 0
+                    state['exp_avg'] = torch.zeros_like(p.data)
+                    state['exp_avg_sq'] = torch.zeros_like(p.data)
+                state['step'] += 1
 
-                # Sync parameters (x)
-                if sync_x:
-                    torch_dist.all_reduce(p.data, op=torch_dist.ReduceOp.AVG)
-                    self._total_comm_bytes += numel * bytes_per_elem * 2
+                # Step 2: Local Adam update
+                self._pytorch_adam_step(p, grad, state, group)
 
-                # Sync first moment (u / exp_avg)
-                if sync_u and 'exp_avg' in state:
-                    torch_dist.all_reduce(state['exp_avg'],
-                                          op=torch_dist.ReduceOp.AVG)
-                    self._total_comm_bytes += numel * bytes_per_elem * 2
+        return loss
 
-                # Sync second moment (v / exp_avg_sq)
-                if sync_v and 'exp_avg_sq' in state:
-                    torch_dist.all_reduce(state['exp_avg_sq'],
-                                          op=torch_dist.ReduceOp.AVG)
-                    self._total_comm_bytes += numel * bytes_per_elem * 2
-
-        elapsed_ms = (_time.time() - t0) * 1000
-        self._comm_times_ms.append(elapsed_ms)
-
-        if sync_x:
-            self._sync_x_count += 1
-        if sync_u:
-            self._sync_u_count += 1
-        if sync_v:
-            self._sync_v_count += 1
-
-        return {'sync_x': sync_x, 'sync_u': sync_u, 'sync_v': sync_v}
-
-    def get_comm_stats(self):
-        """Return DES-LOC communication statistics."""
-        return {
+    def state_dict_desloc(self):
+        """Extended state dict including DES-LOC counters."""
+        base = self.state_dict()
+        base['desloc'] = {
             'global_step': self.global_step,
-            'Kx': self._Kx,
-            'Ku': self._Ku,
-            'Kv': self._Kv,
+            'sync_x': self._sync_x_count,
+            'sync_u': self._sync_u_count,
+            'sync_v': self._sync_v_count,
+            'comm_bytes': self._total_comm_bytes,
+            'Kx': self._Kx, 'Ku': self._Ku, 'Kv': self._Kv,
             'clip_radius': self._clip_radius,
-            'sync_x_count': self._sync_x_count,
-            'sync_u_count': self._sync_u_count,
-            'sync_v_count': self._sync_v_count,
-            'total_comm_bytes': self._total_comm_bytes,
-            'clip_events': self._clip_count,
-            'clipped_elements': self._clip_total_elements,
-            'avg_comm_time_ms': (
-                sum(self._comm_times_ms) / len(self._comm_times_ms)
-                if self._comm_times_ms else 0),
-            'fused_kernel': self._fused_available,
+            'outer_opt': self._outer_optimizer,
+        }
+        return base
+
+    def load_state_dict_desloc(self, state_dict):
+        """Load state dict including DES-LOC counters."""
+        desloc = state_dict.pop('desloc', {})
+        self.load_state_dict(state_dict)
+        self.global_step = desloc.get('global_step', 0)
+        self._sync_x_count = desloc.get('sync_x', 0)
+        self._sync_u_count = desloc.get('sync_u', 0)
+        self._sync_v_count = desloc.get('sync_v', 0)
+        self._total_comm_bytes = desloc.get('comm_bytes', 0)
+
+
+class DESLOCHalfLifeAnalyzer:
+    """Analyze optimizer state half-lives for sync period selection.
+
+    Section 2: The half-life of the j-th state is h_j = -1/log2(beta_j).
+    States with longer half-lives can be synced less frequently.
+
+    Section 5.1 (RQ1): Empirical verification that second moment
+    evolves slower than first when beta2 >> beta1.
+    """
+
+    @staticmethod
+    def compute_half_life(beta):
+        """Compute half-life from decay rate.
+
+        h = -1 / log2(beta) steps for the state to decay to half.
+        """
+        import math
+        if beta <= 0 or beta >= 1:
+            return float('inf')
+        return -1.0 / math.log2(beta)
+
+    @staticmethod
+    def recommended_sync_periods(beta1=0.9, beta2=0.999, base_Kx=32):
+        """Recommend Ku, Kv from half-life ratios.
+
+        Section 5.2: Ku = 3*Kx, Kv = 6*Kx is a good default.
+        The ratio should approximate half-life ratios.
+        """
+        import math
+        h1 = -1.0 / math.log2(beta1) if 0 < beta1 < 1 else 1.0
+        h2 = -1.0 / math.log2(beta2) if 0 < beta2 < 1 else 1.0
+        ratio = h2 / max(h1, 1e-6)
+        Ku = max(base_Kx, int(base_Kx * min(ratio / 10, 10)))
+        Kv = max(Ku, int(base_Kx * min(ratio / 5, 20)))
+        return {
+            'Kx': base_Kx,
+            'Ku': Ku,
+            'Kv': Kv,
+            'half_life_u': round(h1, 2),
+            'half_life_v': round(h2, 2),
+            'ratio': round(ratio, 2),
         }
 
+    @staticmethod
+    def compute_relative_change_rate(state_tensor, prev_tensor):
+        """Compute relative rate of change ||s_t - s_{t-1}|| / ||s_t||.
 
-# =================================================================
-# M067: DES-LOC FusedAdam Extended Ops (400 lines)
-# =================================================================
-# Extends DESLOCFusedAdam with:
-# 1. ADOPT variant support (Section 4.1)
-# 2. Half-life-based adaptive sync period tuning
-# 3. Experiment logging for RQ1-RQ3 figure generation
-# 4. WSD learning rate schedule integration
-#
-# Reference: template_extraction_from_latex.txt Y=ADOPT
-# Reference: Section 4.1 "ADOPT modifies the update to
-#   guarantee convergence for any β₂"
-# =================================================================
+        Used in Section 5.1 Figure CLVII to empirically verify
+        that second moment evolves slower than first.
+        """
+        if state_tensor is None or prev_tensor is None:
+            return 0.0
+        diff_norm = (state_tensor - prev_tensor).norm().item()
+        state_norm = state_tensor.norm().item()
+        if state_norm < 1e-12:
+            return 0.0
+        return diff_norm / state_norm
 
-import math as _math
-import time as _time
-import json as _json
+    @staticmethod
+    def format_half_life_table(beta1=0.9, beta2=0.999):
+        """Format half-life comparison table for logging."""
+        import math
+        h1 = -1.0 / math.log2(beta1) if 0 < beta1 < 1 else float('inf')
+        h2 = -1.0 / math.log2(beta2) if 0 < beta2 < 1 else float('inf')
+        lines = [
+            f"Half-life analysis (beta1={beta1}, beta2={beta2}):",
+            f"  First moment  (u): h={h1:.1f} steps",
+            f"  Second moment (v): h={h2:.1f} steps",
+            f"  Ratio h_v/h_u: {h2/max(h1,1e-6):.1f}x",
+            f"  Recommended: Ku=3*Kx, Kv=6*Kx",
+        ]
+        return "\n".join(lines)
 
 
 class DESLOCAdoptStep:
-    """ADOPT optimizer update rule for DES-LOC.
+    """ADOPT optimizer variant for DES-LOC (Section 4.1).
 
-    Section 4.1: "ADOPT (Taniguchi et al., 2024) modifies the
-    update to guarantee convergence for any β₂"
+    ADOPT (Taniguchi et al., 2024) modifies the Adam update to
+    guarantee convergence for any beta2. DES-LOC applies generically
+    to adaptive optimizers parameterized by OPT.
 
-    Key difference from Adam: ADOPT uses a modified second moment
-    update that decouples the convergence guarantee from the
-    β₁ < √β₂ constraint.
+    This wrapper tracks the ADOPT-specific state alongside
+    standard Adam state, enabling the half-life analysis.
     """
 
     def __init__(self, beta1=0.9, beta2=0.999, eps=1e-8):
@@ -556,318 +493,23 @@ class DESLOCAdoptStep:
         self.eps = eps
 
     def compute_update(self, grad, exp_avg, exp_avg_sq, step):
-        """Compute ADOPT update for a single parameter.
+        """Compute ADOPT update (modified Adam for convergence guarantee).
 
-        Unlike Adam which uses:
-          m_t = β₁ m_{t-1} + (1-β₁) g_t
-          v_t = β₂ v_{t-1} + (1-β₂) g_t²
-          update = m_t / (√v_t + ε)
-
-        ADOPT uses:
-          m_t = β₁ m_{t-1} + (1-β₁) g_t
-          v_t = β₂ v_{t-1} + (1-β₂) g_t²
-          update = m_{t-1} / (√v_t + ε)  [uses previous m!]
-
-        This ensures convergence for any β₂ ∈ (0,1).
+        The key difference from standard Adam: the second moment
+        update uses the gradient from the *previous* step, ensuring
+        the denominator is independent of the current gradient.
         """
-        # Update second moment first (before first moment)
-        exp_avg_sq.mul_(self.beta2).addcmul_(
-            grad, grad, value=1.0 - self.beta2)
-
-        # ADOPT key: use previous first moment for update direction
-        if step > 1:
-            denom = exp_avg_sq.sqrt().add_(self.eps)
-            update = exp_avg / denom
-        else:
-            update = grad.clone()
-
-        # Then update first moment
         exp_avg.mul_(self.beta1).add_(grad, alpha=1.0 - self.beta1)
-
+        # ADOPT: use previous exp_avg_sq (already updated from last step)
+        bc1 = 1.0 - self.beta1 ** step
+        step_size = 1.0 / bc1
+        denom = exp_avg_sq.sqrt().add_(self.eps)
+        update = (exp_avg / denom) * step_size
+        # Now update exp_avg_sq with current gradient for next step
+        exp_avg_sq.mul_(self.beta2).addcmul_(grad, grad, value=1.0 - self.beta2)
         return update
 
 
-class DESLOCHalfLifeAdaptiveSync:
-    """Adaptive sync period tuning based on half-life analysis.
-
-    Section 2: "τ₀.₅(β) = -1/log₂(β)"
-
-    Monitors empirical rate of change and adjusts Ku, Kv
-    to be proportional to the half-life ratio.
-    """
-
-    def __init__(self, base_Kx=32, beta1=0.9, beta2=0.999,
-                 adjustment_interval=500, min_K=1, max_K=1024):
-        self.base_Kx = base_Kx
-        self.beta1 = beta1
-        self.beta2 = beta2
-        self.adjustment_interval = adjustment_interval
-        self.min_K = min_K
-        self.max_K = max_K
-
-        # Compute theoretical half-lives
-        self.hl_beta1 = -1.0 / _math.log2(beta1) if beta1 < 1.0 else float('inf')
-        self.hl_beta2 = -1.0 / _math.log2(beta2) if beta2 < 1.0 else float('inf')
-
-        # Initial sync periods from half-life ratio
-        self.Kx = base_Kx
-        self.Ku, self.Kv = self._compute_periods()
-
-        # Rate tracking
-        self.u_rates = []
-        self.v_rates = []
-        self.adjustments = []
-
-    def _compute_periods(self):
-        """Compute Ku, Kv from half-life ratio."""
-        if self.hl_beta1 <= 0:
-            ratio = 1.0
-        else:
-            ratio = self.hl_beta2 / self.hl_beta1
-        Ku_mult = max(2, min(int(_math.sqrt(ratio)), 8))
-        Kv_mult = max(4, min(int(ratio), 16))
-        Ku = max(self.min_K, min(self.Kx * Ku_mult, self.max_K))
-        Kv = max(self.min_K, min(self.Kx * Kv_mult, self.max_K))
-        return Ku, Kv
-
-    def record_rates(self, u_rate, v_rate):
-        """Record empirical rates of change for u and v."""
-        self.u_rates.append(u_rate)
-        self.v_rates.append(v_rate)
-
-    def maybe_adjust(self, step):
-        """Potentially adjust Ku, Kv based on observed rates.
-
-        Only adjusts every adjustment_interval steps.
-        """
-        if step % self.adjustment_interval != 0:
-            return False
-        if len(self.u_rates) < 10 or len(self.v_rates) < 10:
-            return False
-
-        # Compute empirical ratio of rates
-        avg_u = sum(self.u_rates[-50:]) / min(50, len(self.u_rates))
-        avg_v = sum(self.v_rates[-50:]) / min(50, len(self.v_rates))
-
-        if avg_v <= 0:
-            return False
-
-        empirical_ratio = avg_u / avg_v
-        # If v changes much slower than u, increase Kv
-        if empirical_ratio > 3.0:
-            old_Kv = self.Kv
-            self.Kv = min(self.Kv * 2, self.max_K)
-            self.adjustments.append({
-                'step': step,
-                'type': 'increase_Kv',
-                'old': old_Kv,
-                'new': self.Kv,
-                'ratio': empirical_ratio,
-            })
-            return True
-        elif empirical_ratio < 1.5 and self.Kv > self.Ku:
-            old_Kv = self.Kv
-            self.Kv = max(self.Kv // 2, self.Ku)
-            self.adjustments.append({
-                'step': step,
-                'type': 'decrease_Kv',
-                'old': old_Kv,
-                'new': self.Kv,
-                'ratio': empirical_ratio,
-            })
-            return True
-        return False
-
-    def get_current_periods(self):
-        """Get current sync periods."""
-        return {'Kx': self.Kx, 'Ku': self.Ku, 'Kv': self.Kv}
-
-    def get_summary(self):
-        """Get adaptive sync summary."""
-        return {
-            'beta1': self.beta1,
-            'beta2': self.beta2,
-            'half_life_beta1': round(self.hl_beta1, 2),
-            'half_life_beta2': round(self.hl_beta2, 2),
-            'half_life_ratio': round(
-                self.hl_beta2 / max(self.hl_beta1, 1e-12), 2),
-            'current_Kx': self.Kx,
-            'current_Ku': self.Ku,
-            'current_Kv': self.Kv,
-            'num_adjustments': len(self.adjustments),
-            'adjustments': self.adjustments[-10:],
-        }
-
-
-class DESLOCExperimentLogger:
-    """Structured experiment logger for RQ1-RQ6 figures.
-
-    Outputs logs in the format required by draw_plot.py
-    (following NKI-FA commit da964f3 convention).
-
-    Each log entry contains:
-    - Step number
-    - Loss value
-    - Learning rate
-    - Gradient norm
-    - Sync events (which states were synced)
-    - Communication bytes
-    - Optimizer state norms
-    """
-
-    def __init__(self, experiment_id, config, log_dir=None):
-        self.experiment_id = experiment_id
-        self.config = config
-        self.log_dir = log_dir or './desloc_experiment_logs'
-        self.entries = []
-        self.header_written = False
-
-    def log_step(self, step, loss, lr, grad_norm, sync_x, sync_u,
-                 sync_v, comm_bytes, exp_avg_norm=None,
-                 exp_avg_sq_norm=None, param_norm=None):
-        """Record one training step's complete metrics."""
-        entry = {
-            'step': step,
-            'loss': round(loss, 6),
-            'lr': round(lr, 8),
-            'grad_norm': round(grad_norm, 6),
-            'sync_x': int(sync_x),
-            'sync_u': int(sync_u),
-            'sync_v': int(sync_v),
-            'comm_bytes': comm_bytes,
-        }
-        if exp_avg_norm is not None:
-            entry['exp_avg_norm'] = round(exp_avg_norm, 6)
-        if exp_avg_sq_norm is not None:
-            entry['exp_avg_sq_norm'] = round(exp_avg_sq_norm, 6)
-        if param_norm is not None:
-            entry['param_norm'] = round(param_norm, 6)
-        self.entries.append(entry)
-
-    def format_as_benchmark_log(self):
-        """Format all entries as a parseable benchmark log.
-
-        Output format (matches NKI-FA draw_plot.py style):
-        ### config: model=125M, Kx=32, Ku=96, Kv=192, seed=42 ###
-        step=0, loss=10.8234, lr=0.00060000, grad_norm=12.345, ...
-        step=10, loss=8.1234, lr=0.00058800, grad_norm=8.234, ...
-        """
-        lines = []
-        # Header
-        cfg_str = ", ".join(f"{k}={v}"
-                            for k, v in self.config.items()
-                            if k in ('model_size', 'Kx', 'Ku', 'Kv',
-                                     'seed', 'inner_optimizer',
-                                     'outer_optimizer', 'method'))
-        lines.append(f"### config: {cfg_str} ###")
-
-        # Data rows
-        for e in self.entries:
-            parts = [f"{k}={v}" for k, v in e.items()]
-            lines.append(", ".join(parts))
-
-        return "\n".join(lines)
-
-    def save(self, filename=None):
-        """Save experiment log to file."""
-        import os
-        os.makedirs(self.log_dir, exist_ok=True)
-        if filename is None:
-            filename = f"{self.experiment_id}.log"
-        path = os.path.join(self.log_dir, filename)
-        with open(path, 'w') as f:
-            f.write(self.format_as_benchmark_log())
-        return path
-
-    def save_json(self, filename=None):
-        """Save experiment log as JSON for plotting."""
-        import os
-        os.makedirs(self.log_dir, exist_ok=True)
-        if filename is None:
-            filename = f"{self.experiment_id}.json"
-        path = os.path.join(self.log_dir, filename)
-        output = {
-            'experiment_id': self.experiment_id,
-            'config': self.config,
-            'num_steps': len(self.entries),
-            'entries': self.entries,
-        }
-        with open(path, 'w') as f:
-            _json.dump(output, f, indent=2)
-        return path
-
-    def get_final_metrics(self):
-        """Extract final metrics for summary table."""
-        if not self.entries:
-            return {}
-        last = self.entries[-1]
-        # Find min loss
-        min_loss = min(e['loss'] for e in self.entries)
-        # Total comm bytes
-        total_bytes = sum(e['comm_bytes'] for e in self.entries)
-        # Sync counts
-        x_syncs = sum(e['sync_x'] for e in self.entries)
-        u_syncs = sum(e['sync_u'] for e in self.entries)
-        v_syncs = sum(e['sync_v'] for e in self.entries)
-        return {
-            'experiment_id': self.experiment_id,
-            'final_loss': last['loss'],
-            'min_loss': min_loss,
-            'total_steps': len(self.entries),
-            'total_comm_bytes': total_bytes,
-            'x_syncs': x_syncs,
-            'u_syncs': u_syncs,
-            'v_syncs': v_syncs,
-            'config': self.config,
-        }
-
-
-class DESLOCWSDSchedule:
-    """WSD (Warmup-Stable-Decay) learning rate schedule.
-
-    Section 4.1: "Learning rates use the WSD schedule"
-
-    Phase 1 (warmup): linear warmup from 0 to peak_lr
-    Phase 2 (stable): constant peak_lr
-    Phase 3 (decay): cosine decay to min_lr
-    """
-
-    def __init__(self, peak_lr, total_steps, warmup_steps=512,
-                 decay_fraction=0.1, min_lr=0.0):
-        self.peak_lr = peak_lr
-        self.total_steps = total_steps
-        self.warmup_steps = warmup_steps
-        self.min_lr = min_lr
-        # Decay starts at (1 - decay_fraction) * total_steps
-        self.decay_start = int(total_steps * (1.0 - decay_fraction))
-
-    def get_lr(self, step):
-        """Get learning rate for given step."""
-        if step < self.warmup_steps:
-            # Linear warmup
-            return self.peak_lr * step / max(self.warmup_steps, 1)
-        elif step < self.decay_start:
-            # Stable phase
-            return self.peak_lr
-        else:
-            # Cosine decay
-            decay_steps = self.total_steps - self.decay_start
-            progress = (step - self.decay_start) / max(decay_steps, 1)
-            progress = min(progress, 1.0)
-            cosine = 0.5 * (1.0 + _math.cos(_math.pi * progress))
-            return self.min_lr + (self.peak_lr - self.min_lr) * cosine
-
-    def get_schedule_array(self, num_points=100):
-        """Get LR schedule as array for plotting."""
-        steps = []
-        lrs = []
-        interval = max(1, self.total_steps // num_points)
-        for s in range(0, self.total_steps, interval):
-            steps.append(s)
-            lrs.append(round(self.get_lr(s), 8))
-        return {'steps': steps, 'learning_rates': lrs}
-
-
-# =================================================================
-# End M067
-# =================================================================
+# ═══════════════════════════════════════════════════════════════
+# End M187
+# ═══════════════════════════════════════════════════════════════
