@@ -3532,6 +3532,59 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
             get_accelerator().synchronize()
 
 
+    # --- DES-LOC ZeRO-3 (M140) ---
+    def _desloc_z3_should_allgather(self, params):
+        e=self.desloc_engine
+        if e is None or not getattr(e,'desloc_enabled',False): return True
+        if e.desloc_step<512: return True
+        t=getattr(params[0],'desloc_tier','x') if params else 'x'
+        return {'x':e.desloc_is_param_sync_step,'u':e.desloc_is_momentum_sync_step,'v':e.desloc_is_variance_sync_step}.get(t,e.desloc_is_param_sync_step)()
+    def _desloc_z3_clip_grads(self, sgid):
+        e=self.desloc_engine
+        if e is None or not getattr(e,'desloc_enabled',False): return
+        rho=e.desloc_clip_rho
+        if rho<=0: return
+        if hasattr(self,'averaged_gradients') and sgid in self.averaged_gradients:
+            for g in (self.averaged_gradients[sgid] or []):
+                if g is not None: g.clamp_(-rho,rho)
+    def _desloc_z3_sync_states(self):
+        e=self.desloc_engine
+        if e is None or not getattr(e,'desloc_enabled',False): return
+        su=e.desloc_is_momentum_sync_step(); sv=e.desloc_is_variance_sync_step()
+        if not su and not sv: return
+        if not hasattr(self,'optimizer'): return
+        for g in self.optimizer.param_groups:
+            for p in g["params"]:
+                if p not in self.optimizer.state: continue
+                st=self.optimizer.state[p]
+                if su and 'exp_avg' in st and dist.get_world_size(self.dp_process_group)>1:
+                    dist.all_reduce(st['exp_avg'],op=dist.ReduceOp.AVG,group=self.dp_process_group)
+                if sv and 'exp_avg_sq' in st and dist.get_world_size(self.dp_process_group)>1:
+                    dist.all_reduce(st['exp_avg_sq'],op=dist.ReduceOp.AVG,group=self.dp_process_group)
+    def _desloc_z3_comm_volume(self):
+        e=self.desloc_engine
+        if e is None: return {'reduction':1.0}
+        tb=sum(p.numel()*p.element_size() for p in self.module.parameters() if p.requires_grad)
+        ws=dist.get_world_size(self.dp_process_group); ddp=2*tb*(ws-1)/ws
+        dl=ddp/e.desloc_Kx+ddp/e.desloc_Ku+ddp/e.desloc_Kv
+        return {'ddp':int(ddp),'desloc':int(dl),'reduction':round(ddp/max(dl,1),1)}
+    def _desloc_z3_nesterov(self, mu=0.9):
+        e=self.desloc_engine
+        if e is None or not getattr(e,'desloc_enabled',False) or not e.desloc_is_param_sync_step(): return
+        if not hasattr(self,'_dz3v'): self._dz3v,self._dz3p={},{}
+        for n,p in self.module.named_parameters():
+            if not p.requires_grad: continue
+            pid=id(p)
+            if pid not in self._dz3v: self._dz3v[pid]=p.data.new_zeros(p.data.shape);self._dz3p[pid]=p.data.clone();continue
+            d=p.data.float()-self._dz3p[pid].float();v=self._dz3v[pid];v.mul_(mu).add_(d)
+            p.data.add_(v.to(p.dtype),alpha=mu);self._dz3p[pid].copy_(p.data)
+    def _desloc_z3_log(self):
+        e=self.desloc_engine
+        if e is None or not getattr(e,'desloc_enabled',False): return
+        if e.desloc_step%500!=0 or dist.get_rank()!=0: return
+        v=self._desloc_z3_comm_volume()
+        print(f'### Z3 DES-LOC step={e.desloc_step} ### red={v["reduction"]:.1f}x')
+
 def _handle_overflow(cpu_sum, x, i):
     import math
     rank = dist.get_rank()
