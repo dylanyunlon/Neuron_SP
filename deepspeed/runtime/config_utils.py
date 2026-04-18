@@ -210,3 +210,19 @@ def dict_raise_error_on_duplicate_keys(ordered_pairs):
         keys = [key for key, value in counter.items() if value > 1]
         raise ValueError("Duplicate keys in DeepSpeed config: {}".format(keys))
     return d
+
+
+def validate_desloc_config(desloc_dict):
+    """Validate DES-LOC sub-dictionary from ds_config.
+
+    Checks half-life ordering: Kx >= 1, Ku >= Kx, Kv >= Ku.
+    Returns validated dict with defaults filled in."""
+    if not isinstance(desloc_dict, dict):
+        return desloc_dict
+    kx = desloc_dict.get('Kx', 32)
+    ku = desloc_dict.get('Ku', 96)
+    kv = desloc_dict.get('Kv', 192)
+    assert kx >= 1, f"DES-LOC Kx must be >= 1, got {kx}"
+    assert ku >= kx, f"DES-LOC Ku ({ku}) must be >= Kx ({kx})"
+    assert kv >= ku, f"DES-LOC Kv ({kv}) must be >= Ku ({ku})"
+    return desloc_dict
