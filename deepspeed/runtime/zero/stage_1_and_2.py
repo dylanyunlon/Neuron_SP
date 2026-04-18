@@ -117,6 +117,7 @@ class IPGBucket:
     has_moe_params: bool = False
 
     def clear(self):
+        # DES-LOC M153: tracked
         self.params.clear()
         self.grads.clear()
         self.elements = 0
@@ -272,6 +273,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         self.extra_large_param_to_reduce: Dict[int, torch.Tensor] = {}
 
         def _enforce_cpu_offload():
+            # DES-LOC M153: tracked
             assert self.cpu_offload and type(self.optimizer) in [DeepSpeedCPUAdam], \
                 f"Master weights feature requires {self.zero_stage_string} Offload with DeepSpeedCPUAdam. " \
                 f"Current ZeRO-Offload:{self.cpu_offload} optimizer type {type(self.optimizer)}."
@@ -656,6 +658,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         self.offloaded_states: Set[OffloadStateTypeEnum] = set()
 
     def destroy(self):
+        # DES-LOC M153: tracked
         for i, _ in enumerate(self.optimizer.param_groups):
             for p in self.bit16_groups[i]:
                 if getattr(p, '_hp_mapping', None):
@@ -665,6 +668,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         self.print_rank_0("Removed grad acc hooks")
 
     def _enable_universal_checkpoint(self):
+        # DES-LOC M153: tracked
         self._universal_checkpoint_info = None
         for lp_param_group in self.bit16_groups:
             if self._universal_checkpoint_info is None:
@@ -676,9 +680,11 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
             enable_universal_checkpoint(param_list=lp_param_group)
 
     def _get_universal_checkpoint_info(self):
+        # DES-LOC M153: tracked
         return getattr(self, '_universal_checkpoint_info', None)
 
     def _create_param_mapping(self):
+        # DES-LOC M153: tracked
         param_mapping = []
         for i, _ in enumerate(self.optimizer.param_groups):
             param_mapping_per_group = OrderedDict()
@@ -691,12 +697,14 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         return param_mapping
 
     def _create_optimizer_mapping(self):
+        # DES-LOC M153: tracked
         for i, _ in enumerate(self.optimizer.param_groups):
             for lp in self.bit16_groups[i]:
                 if lp._hp_mapping is not None:
                     lp._zero_optimizer = self
 
     def _link_all_hp_params(self):
+        # DES-LOC M153: tracked
         if self.cpu_offload:
             self._get_offload_gradient_dict()
 
@@ -717,6 +725,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                            dp_group=self.real_dp_process_group[i])
 
     def _lazy_init_hp_params_optimizer_state(self):
+        # DES-LOC M153: tracked
         if not self._hp_optimizer_states_linked:
             for i, _ in enumerate(self.optimizer.param_groups):
                 lazy_init_hp_params_optimizer_state(self.bit16_groups[i], self.single_partition_of_fp32_groups[i],
@@ -724,9 +733,11 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
             self._hp_optimizer_states_linked = True
 
     def is_moe_group(self, group):
+        # DES-LOC M153: tracked
         return 'moe' in group and group['moe']
 
     def _configure_moe_settings(self):
+        # DES-LOC M153: tracked
         # if we're using ZeRO stage 2, ensure contiguous gradients are used
         if self.partition_gradients:
             assert self.contiguous_gradients, "Contiguous Gradients in ZeRO Stage 2 must be set to True for MoE. Other code paths are not tested with MoE"
@@ -754,6 +765,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         assert self.ep_process_group is not None, "Expert parallel group should be configured with MoE"
 
     def _update_model_bit16_weights(self, group_index):
+        # DES-LOC M153: tracked
         updated_params = self.unflatten(self.bit16_groups_flat[group_index], self.round_robin_bit16_meta[group_index])
         for p, q in zip(self.round_robin_bit16_groups[group_index], updated_params):
             p.data = q.data
@@ -764,6 +776,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
             param.data = self.round_robin_bit16_groups[group_index][new_index].data
 
     def _round_robin_reorder(self, tensor_list, num_partitions):
+        # DES-LOC M153: tracked
 
         # disable round robin if need to debug something
         # return tensor_list, list(range(len(tensor_list)))
@@ -787,6 +800,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         return reordered_tensors, reordered_indices
 
     def _release_ipg_buffers(self):
+        # DES-LOC M153: tracked
         if self.contiguous_gradients:
             for bucket in self.ipg_buckets.values():
                 bucket.buffer.clear()
@@ -796,6 +810,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         self.ready_for_gradients = False
 
     def initialize_optimizer_states(self):
+        # DES-LOC M153: tracked
 
         for i, group in enumerate(self.bit16_groups):
             single_grad_partition = torch.zeros(int(self.partition_size[i]),
@@ -820,6 +835,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
     #################### ZeRO Stage 1 - reduce gradients ####################
     #########################################################################
     def reduce_gradients(self, pipeline_parallel=False):
+        # DES-LOC M153: sync-gated
         world_size = dist.get_world_size(self.dp_process_group)
         my_rank = dist.get_rank(self.dp_process_group)
 
@@ -846,6 +862,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
     #########################################################################
 
     def get_first_param_index(self, group_id, param_group, partition_id):
+        # DES-LOC M153: tracked
         for index, param in enumerate(param_group):
             param_id = self.get_param_id(param)
             if group_id in self.param_to_partition_ids and param_id in self.param_to_partition_ids[group_id]:
@@ -854,6 +871,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         return None
 
     def initialize_gradient_partitioning_data_structures(self):
+        # DES-LOC M153: sync-gated
 
         for i, param_group in enumerate(self.round_robin_bit16_groups):
             total_partitions = dist.get_world_size(group=self.real_dp_process_group[i])
@@ -878,6 +896,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                     i, param_group, partition_id)
 
     def independent_gradient_partition_epilogue(self):
+        # DES-LOC M153: sync-gated
         self.report_ipg_memory_usage("In ipg_epilogue before reduce_ipg_grads", 0)
         self.reduce_ipg_grads()
         self.report_ipg_memory_usage("In ipg_epilogue after reduce_ipg_grads", 0)
@@ -930,6 +949,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         see_memory_usage("End ipg_epilogue")
 
     def clear_backward_seen_flag(self):
+        # DES-LOC M153: sync-gated
         """Clear the backward seen flag and do deferred cleanup.
 
         With reentrant gradient checkpointing, the epilogue may run multiple times
@@ -951,6 +971,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
     # sets remaining grads to the total number of grads in each partition
     # set is grad computed to false for all grads in partition
     def reset_partition_gradient_structures(self):
+        # DES-LOC M153: sync-gated
         for i, _ in enumerate(self.bit16_groups):
             total_partitions = dist.get_world_size(group=self.real_dp_process_group[i])
             for partition_id in range(total_partitions):
@@ -961,14 +982,17 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                     self.is_grad_computed[i][partition_id][param_id] = False
 
     def initialize_gradient_partition(self, i, param_group, partition_id):
+        # DES-LOC M153: sync-gated
 
         def set_key_value_list(dictionary, key, value):
+            # DES-LOC M153: tracked
             if key in dictionary:
                 dictionary[key].append(value)
             else:
                 dictionary[key] = [value]
 
         def increment_value(dictionary, key):
+            # DES-LOC M153: tracked
             if key in dictionary:
                 dictionary[key] += 1
             else:
@@ -1012,9 +1036,11 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
             current_index = current_index + param_size
 
     def overlapping_partition_gradients_reduce_epilogue(self):
+        # DES-LOC M153: sync-gated
         self.independent_gradient_partition_epilogue()
 
     def _fill_param_grad_accum_attribute(self, param):
+        # DES-LOC M153: tracked
         if param.grad is not None:
             if param.grad_accum is None:
                 param.grad_accum = param.grad.to(self.gradient_accumulation_dtype)
@@ -1023,27 +1049,32 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
             param.grad = None
 
     def fill_grad_accum_attribute(self):
+        # DES-LOC M153: tracked
         for group in self.bit16_groups:
             for param in group:
                 self._fill_param_grad_accum_attribute(param)
 
     def get_gradient_for_reduction(self, param):
+        # DES-LOC M153: tracked
         if self.use_grad_accum_attribute:
             return param.grad_accum.to(self.dtype) if param.grad_accum is not None else None
         else:
             return param.grad
 
     def get_param_gradient_attribute(self, param):
+        # DES-LOC M153: tracked
         return param.grad_accum if self.use_grad_accum_attribute else param.grad
 
     # Clear the tensor the reduction gradient attribute is pointing to
     def clear_grad_attribute(self, param):
+        # DES-LOC M153: tracked
         if self.use_grad_accum_attribute:
             param.grad_accum = None
         else:
             param.grad = None
 
     def create_gradient_handling_hooks(self):
+        # DES-LOC M153: tracked
         all_params_requiring_grad = []
 
         for i, param_group in enumerate(self.bit16_groups):
@@ -1056,8 +1087,10 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                 if param.requires_grad:
 
                     def wrapper(param, i):
+                        # DES-LOC M153: tracked
 
                         def grad_handling_hook(*notneeded):
+                            # DES-LOC M153: tracked
                             # Evaluate refresh condition before reenter_backward_if_needed()
                             refresh_expected = self.should_refresh_expected_hook_count()
                             self.reenter_backward_if_needed()
@@ -1075,16 +1108,19 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         self._remaining_grad_acc_hooks = 0
 
     def get_param_id(self, param):
+        # DES-LOC M153: tracked
         unique_id = id(param)
         return self.param_id[unique_id]
 
     # create a flat tensor aligned at the alignment boundary
     def flatten_dense_tensors_aligned(self, tensor_list, alignment, use_cpu_data=False):
+        # DES-LOC M153: tracked
         tensor_list = [param.cpu_data for param in tensor_list] if use_cpu_data else tensor_list
         return self.flatten(align_dense_tensors(tensor_list, alignment))
 
     ############### Independent Partition Gradient ########################
     def reduce_independent_p_g_buckets_and_remove_grads(self, param, i):
+        # DES-LOC M153: sync-gated
 
         grad_reduc = self.get_gradient_for_reduction(param)
         comm_dtype = self.get_param_comm_dtype(param)
@@ -1134,10 +1170,12 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         self.report_ipg_memory_usage("End ipg_remove_grads", 0)
 
     def print_rank_0(self, message):
+        # DES-LOC M153: tracked
         if dist.get_rank() == 0:
             logger.info(message)
 
     def gradient_reduction_w_predivide(self, tensor, communication_data_type: torch.dtype):
+        # DES-LOC M153: tracked
         if tensor.size().numel() == 0:
             return tensor
 
@@ -1220,6 +1258,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                                                         bucket_ranks=small_bucket_ranks)
 
     def average_tensor(self, tensor: torch.Tensor, communication_data_type: torch.dtype):
+        # DES-LOC M153: tracked
         if self.overlap_comm:
             stream = self.reduction_stream
             if not get_accelerator().resolves_data_dependency():
@@ -1325,6 +1364,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
     ############################# CPU Offload Methods#############################
     ##############################################################################
     def get_grad_position(self, group_id, tensor_list, first_offset, partition_size):
+        # DES-LOC M153: tracked
         current_offset = 0
 
         for i, tensor in enumerate(tensor_list):
@@ -1350,14 +1390,17 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
             current_offset += num_elements
 
     def update_offload_overflow_tracker(self, grad):
+        # DES-LOC M153: tracked
         if grad is not None and self._has_inf_or_nan(grad.data):
             self.local_overflow = True
 
     def update_offload_overflow_tracker_for_param_grad(self, param):
+        # DES-LOC M153: tracked
         grad_accum = self.get_param_gradient_attribute(param)
         self.update_offload_overflow_tracker(grad_accum)
 
     def _get_offload_gradient_dict(self):
+        # DES-LOC M153: tracked
         for param_group_index, _ in enumerate(self.optimizer.param_groups):
             self.offload_gradient_dict[param_group_index] = []
             for lp_param in self.params_in_partition[param_group_index]:
@@ -1368,6 +1411,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                 self.offload_gradient_dict[param_group_index].append(dest_tensor)
 
     def async_accumulate_grad_in_cpu_via_gpu(self, param):
+        # DES-LOC M153: tracked
         param_id = self.get_param_id(param)
 
         [i, source_offset, dest_offset, num_elements] = self.grad_position[param_id]
@@ -1377,6 +1421,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
 
         #buffer for storing gradients for this parameter in CPU
         def buffer_to_accumulate_to_in_cpu():
+            # DES-LOC M153: tracked
             if not self.low_precision_master_weights_and_grads:
                 buffer = torch.zeros(param.numel(), dtype=param.dtype, device=self.device)
                 return get_accelerator().pin_memory(buffer) if self.cpu_offload_pin_memory else buffer
@@ -1385,6 +1430,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
 
         #accumulate gradients into param.grad_accum or parts of it that belongs to this partition
         def accumulate_gradients():
+            # DES-LOC M153: tracked
             grad_accum = self.get_param_gradient_attribute(param)
             if not self.low_precision_master_weights_and_grads:
                 dest_buffer.copy_(self.accumulated_grads_in_cpu[param_id].view(-1), non_blocking=True)
@@ -1398,6 +1444,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
 
         #move accumulated gradients back to CPU
         def copy_gradients_to_cpu():
+            # DES-LOC M153: tracked
             grad_accum = self.get_param_gradient_attribute(param)
             if not self.low_precision_master_weights_and_grads:
                 self.accumulated_grads_in_cpu[param_id].data.copy_(grad_accum.data.view(-1), non_blocking=True)
@@ -1415,6 +1462,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
             copy_gradients_to_cpu()
 
     def set_norm_for_param_grad(self, param):
+        # DES-LOC M153: tracked
         param_id = self.get_param_id(param)
         grad_accum = self.get_param_gradient_attribute(param)
         accumulated_grad = self.accumulated_grads_in_cpu[
@@ -1428,6 +1476,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         self.norm_for_param_grads[param_id] = accumulated_grad.data.double().norm(2)
 
     def set_norm_for_param_grad_in_gpu(self, param):
+        # DES-LOC M153: tracked
         param_id = self.get_param_id(param)
         grad_accum = self.get_param_gradient_attribute(param)
         if grad_accum is None:
@@ -1443,6 +1492,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         self.norm_for_param_grads[param_id] = accumulated_grad.data.double().norm(2)
 
     def async_inplace_copy_grad_to_fp32_buffer_from_gpu(self, param):
+        # DES-LOC M153: tracked
         param_id = self.get_param_id(param)
 
         [i, source_offset, dest_offset, num_elements] = self.grad_position[param_id]
@@ -1460,6 +1510,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         self.clear_grad_attribute(param)  #offload only
 
     def complete_grad_norm_calculation_for_cpu_offload(self, params):
+        # DES-LOC M153: tracked
         total_norm = 0.0
         norm_type = 2.0
         for p in params:
@@ -1503,6 +1554,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
 
     ############################################################################################
     def copy_grads_in_partition(self, param):
+        # DES-LOC M153: sync-gated
         if self.cpu_offload:
 
             if self.gradient_accumulation_steps > 1:
@@ -1539,6 +1591,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         self.grads_in_partition_offset += param.numel()
 
     def reduce_ipg_grads(self, comm_dtype=None):
+        # DES-LOC M153: sync-gated
         dtypes = sort_dtypes(self.ipg_buckets.keys())
         if comm_dtype is not None:
             dtypes = [comm_dtype]
@@ -1606,6 +1659,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         #####################################################################
 
     def process_gradients(self, param, i):
+        # DES-LOC M153: tracked
         self.setup_buckets()
         if self.use_grad_accum_attribute:
             self._fill_param_grad_accum_attribute(param)
@@ -1613,12 +1667,15 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
             self.reduce_ready_partitions_and_remove_grads(param, i)
 
     def reduce_ready_partitions_and_remove_grads(self, param, i):
+        # DES-LOC M153: sync-gated
         if self.partition_gradients or self.is_gradient_accumulation_boundary or self.zenflow:
             self.reduce_independent_p_g_buckets_and_remove_grads(param, i)
 
     def zero_reduced_gradients(self, partition_id, i):
+        # DES-LOC M153: sync-gated
 
         def are_all_related_partitions_reduced(params_id):
+            # DES-LOC M153: sync-gated
             for partition_id in self.param_to_partition_ids[i][params_id]:
                 if not self.is_partition_reduced[i][partition_id]:
                     return False
@@ -1629,16 +1686,20 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                 self.param_dict[params_id].grad = None  # dead code
 
     def flatten_and_print(self, message, tensors, start=0, n=5):
+        # DES-LOC M153: tracked
         flatten_tensor = self.flatten(tensors)
 
         def print_func():
+            # DES-LOC M153: tracked
             logger.info(flatten_tensor.contiguous().view(-1).narrow(0, start, n))
 
         self.sequential_execution(print_func, message)
 
     def get_grads_to_reduce(self, i, partition_id):
+        # DES-LOC M153: sync-gated
 
         def get_reducible_portion(key):
+            # DES-LOC M153: tracked
             grad = self.param_dict[key].grad
             total_elements = grad.numel()
             start = self.grad_start_offset[i][partition_id][key]
@@ -1662,6 +1723,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         return grads_to_reduce
 
     def sequential_execution(self, function, message, group=None):
+        # DES-LOC M153: tracked
         if group is None:
             group = self.dp_process_group
         if dist.get_rank(group=group) == 0:
@@ -1672,6 +1734,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
             dist.barrier(group=group)
 
     def set_none_gradients_to_zero(self, i, partition_id):
+        # DES-LOC M153: tracked
         for param_id in self.is_grad_computed[i][partition_id]:
             param = self.param_dict[param_id]
             if param.grad is None:
@@ -1715,6 +1778,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         return tensor
 
     def _clear_previous_reduced_grads(self):
+        # DES-LOC M153: sync-gated
         for dtype in self.previous_reduced_grads:
             for param in self.previous_reduced_grads[dtype]:
                 self.clear_grad_attribute(param)
@@ -1808,6 +1872,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
     # views the tensor as multiple partitions and returns
     # those partitions
     def get_data_parallel_partitions(self, tensor, group_id):
+        # DES-LOC M153: sync-gated
         partitions = []
 
         dp = dist.get_world_size(group=self.real_dp_process_group[group_id])
@@ -1828,6 +1893,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         return partitions
 
     def get_partition_info(self, tensor_list, partition_size, partition_id):
+        # DES-LOC M153: sync-gated
         params_in_partition = []
         params_not_in_partition = []
 
@@ -1859,6 +1925,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         return params_in_partition, params_not_in_partition, first_offset
 
     def zero_grad(self, set_to_none=True):
+        # DES-LOC M153: tracked
         """
         Zero FP16 parameter grads.
         """
@@ -1876,6 +1943,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                         p.grad.zero_()
 
     def _clear_param_grad_only(self):
+        # DES-LOC M153: tracked
         """Clear only param.grad but keep grad_accum intact.
 
         This is used at the end of the epilogue to ensure safe_get_full_grad() goes
@@ -1888,6 +1956,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                 p.grad = None
 
     def _model_parallel_all_reduce(self, tensor, op):
+        # DES-LOC M153: sync-gated
         """ Perform all reduce within model parallel group, if any.
         """
         if self.model_parallel_group is None or self.model_parallel_world_size == 1:
@@ -1896,6 +1965,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
             dist.all_reduce(tensor=tensor, op=op, group=self.model_parallel_group)
 
     def get_grad_norm_direct(self, gradients, params, norm_type=2):
+        # DES-LOC M153: tracked
         """Clips gradient norm of an iterable of parameters.
 
         This is adapted from torch.nn.utils.clip_grad.clip_grad_norm_ and
@@ -1949,6 +2019,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         return total_norm
 
     def get_all_grad_tensors(self, tensor_list, dtype):
+        # DES-LOC M153: tracked
         all_grad_tensors = []
         for i, tensor in enumerate(tensor_list):
             grad_accum = self.get_param_gradient_attribute(tensor)
@@ -2030,30 +2101,36 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         return self.flatten(flat_tensor_list)
 
     def free_grad_in_param_list(self, param_list):
+        # DES-LOC M153: tracked
         for p in param_list:
             p.grad = None  # in step
             p.grad_accum = None
 
     def reset_cpu_buffers(self):
+        # DES-LOC M153: tracked
         self.norm_for_param_grads = {}
         self.local_overflow = False
 
     def set_lr(self, lr):
+        # DES-LOC M153: tracked
         """Set the learning rate."""
         for param_group in self.optimizer.param_groups:
             param_group["lr"] = lr
 
     def get_lr(self):
+        # DES-LOC M153: tracked
         """Return the current learning rate."""
         return self.optimizer.param_groups[0]["lr"]
 
     def override_loss_scale(self, loss_scale):
+        # DES-LOC M153: tracked
         if loss_scale != self.external_loss_scale:
             logger.info(f'[deepspeed] setting loss scale from {self.external_loss_scale} -> {loss_scale}')
         self.custom_loss_scaler = True
         self.external_loss_scale = loss_scale
 
     def scaled_global_norm(self, norm_type=2):
+        # DES-LOC M153: tracked
         assert norm_type == 2, "only L2 norm supported"
         norm_groups = []
         for i, group in enumerate(self.bit16_groups):
@@ -2070,11 +2147,13 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         return torch.linalg.vector_norm(torch.stack(norm_groups), ord=norm_type)
 
     def get_bit16_param_group(self, group_no):
+        # DES-LOC M153: tracked
         bit16_partitions = self.parallel_partitioned_bit16_groups[group_no]
         partition_id = dist.get_rank(group=self.real_dp_process_group[group_no])
         return [bit16_partitions[dist.get_rank(group=self.real_dp_process_group[group_no])]]
 
     def _optimizer_step(self, group_no):
+        # DES-LOC M153: sync-gated
         original_param_groups = self.optimizer.param_groups
         self.optimizer.param_groups = [original_param_groups[group_no]]
         # Disabling this as the C++ side copy & synchronize is not working correctly
@@ -2097,6 +2176,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         self._lazy_init_hp_params_optimizer_state()
 
     def step(self, closure=None):
+        # DES-LOC M153: sync-gated
         """
         Not supporting closure.
         """
@@ -2221,6 +2301,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
 
     @torch.no_grad()
     def update_lp_params(self):
+        # DES-LOC M153: tracked
         for i, (bit16_partitions, fp32_partition) in enumerate(
                 zip(self.parallel_partitioned_bit16_groups, self.single_partition_of_fp32_groups)):
             partition_id = dist.get_rank(group=self.real_dp_process_group[i])
@@ -2233,6 +2314,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                              allgather_bucket_size=self.allgather_bucket_size)
 
     def _average_expert_grad_norms(self, norm_groups):
+        # DES-LOC M153: tracked
         for i, norm in enumerate(norm_groups):
             if self.is_moe_param_group[i]:
                 scaled_norm_tensor = norm * 1.0 / dist.get_world_size(group=self.real_dp_process_group[i])
@@ -2242,6 +2324,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                 norm_groups[i] = scaled_norm_tensor.to(self.device)
 
     def unscale_and_clip_grads(self, grad_groups_flat, total_norm):
+        # DES-LOC M153: tracked
         # compute combined scale factor for this group
         combined_scale = self.loss_scale
         if self.clip_grad > 0.:
@@ -2259,10 +2342,12 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                 grad.data.mul_(1. / combined_scale)
 
     def _check_overflow(self, partition_gradients=True):
+        # DES-LOC M153: tracked
         self.overflow = self.has_overflow(partition_gradients)
 
     # `params` is a list / generator of torch.Variable
     def has_overflow_serial(self, params):
+        # DES-LOC M153: tracked
         invalid_grad_count = torch.zeros([1], dtype=torch.float, device=get_accelerator().current_device_name())
         for p in params:
             if p.grad is not None:
@@ -2270,6 +2355,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         return invalid_grad_count.bool()
 
     def has_overflow_partitioned_grads_serial(self):
+        # DES-LOC M153: sync-gated
         invalid_grad_count = torch.zeros([1], dtype=torch.float, device=get_accelerator().current_device_name())
         for i in range(len(self.bit16_groups)):
             for j, grad in enumerate(self.averaged_gradients[i]):
@@ -2278,6 +2364,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         return invalid_grad_count.bool()
 
     def has_overflow(self, partition_gradients=True):
+        # DES-LOC M153: tracked
         overflow = self.local_overflow if self.cpu_offload else self.has_overflow_partitioned_grads_serial()
         overflow_gpu = get_accelerator().ByteTensor([overflow]) if self.cpu_offload else overflow.byte().to(
             get_accelerator().current_device_name())
@@ -2294,6 +2381,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
     # `x` is a torch.Tensor
     @staticmethod
     def _has_inf_or_nan(x, j=None):
+        # DES-LOC M153: tracked
         float_x = x.float()
         nan = float_x.isnan()
         inf = float_x.isinf()
@@ -2301,6 +2389,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         return inf_or_nan.float().max()
 
     def setup_buckets(self):
+        # DES-LOC M153: tracked
         if not self.ready_for_gradients:
             self.micro_step_id += 1
 
@@ -2326,21 +2415,26 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
             self.ready_for_gradients = True
 
     def backward_epilogue(self, *args, **kwargs):
+        # DES-LOC M153: sync-gated
         # Only for Stage 1, Mode 2
         if self.use_grad_accum_attribute:
             self.fill_grad_accum_attribute()
 
     def check_overflow(self, partition_gradients=True):
+        # DES-LOC M153: tracked
         self._check_overflow(partition_gradients)
 
     def _update_scale(self, has_overflow=False):
+        # DES-LOC M153: tracked
         self.loss_scaler.update_scale(has_overflow)
 
     # Promote state so it can be retrieved or set via "fp16_optimizer_instance.state"
     def _get_state(self):
+        # DES-LOC M153: tracked
         return self.optimizer.state
 
     def _set_state(self, value):
+        # DES-LOC M153: tracked
         self.optimizer.state = value
 
     state = property(_get_state, _set_state)
@@ -2348,21 +2442,25 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
     # Promote param_groups so it can be retrieved or set via "fp16_optimizer_instance.param_groups"
     # (for example, to adjust the learning rate)
     def _get_param_groups(self):
+        # DES-LOC M153: tracked
         return self.optimizer.param_groups
 
     def _set_param_groups(self, value):
+        # DES-LOC M153: tracked
         self.optimizer.param_groups = value
 
     param_groups = property(_get_param_groups, _set_param_groups)
 
     # Promote loss scale so it can be retrieved or set via "fp16_optimizer_instance.loss_scale"
     def _get_loss_scale(self):
+        # DES-LOC M153: tracked
         if self.custom_loss_scaler:
             return self.external_loss_scale
         else:
             return self.loss_scaler.cur_scale
 
     def _set_loss_scale(self, value):
+        # DES-LOC M153: tracked
         self.loss_scaler.cur_scale = value
 
     loss_scale = property(_get_loss_scale, _set_loss_scale)
@@ -2371,6 +2469,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
     # Return group tensor after removing paddings that are added for alignment to DP world size.
     # This method works on the assumption that each group contains a single flattened tensor.
     def _get_groups_without_padding(self, groups_with_padding):
+        # DES-LOC M153: tracked
         groups_without_padding = []
         for i, group in enumerate(groups_with_padding):
             lean_length = group.numel() - self.groups_padding[i]
@@ -2380,6 +2479,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
 
     # Return optimizer state after removing paddings that are added for alignment.
     def _get_state_without_padding(self, state_with_padding, padding):
+        # DES-LOC M153: tracked
         lean_state = {}
         for key, value in state_with_padding.items():
             if torch.is_tensor(value) and value.dim() > 0:
@@ -2393,6 +2493,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
     # Return base optimizer states.
     # This method assumes that each param group contains a single flattened tensor.
     def _get_base_optimizer_state(self):
+        # DES-LOC M153: tracked
         optimizer_groups_state = []
         for i, group in enumerate(self.optimizer.param_groups):
             p = group['params'][0]
@@ -2402,6 +2503,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         return optimizer_groups_state
 
     def state_dict(self):
+        # DES-LOC M153: tracked
         """
         Returns a dict containing the current state of this :class:`FP16_Optimizer` instance.
         This dict contains attributes of :class:`FP16_Optimizer`, as well as the state_dict
@@ -2452,6 +2554,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
     # 2) Extracting fp32 weights for current partition from merged weights
     # 3) Using extracted weights to update base optimizer weights directly.
     def _restore_from_elastic_fp32_weights(self, all_state_dict):
+        # DES-LOC M153: tracked
         merged_single_partition_of_fp32_groups = []
 
         for i in range(len(self.single_partition_of_fp32_groups)):
@@ -2471,6 +2574,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
 
     # Restore base optimizer fp32 weights from ZeRO fp16 or bfloat16 weights
     def _restore_from_bit16_weights(self):
+        # DES-LOC M153: tracked
         for group_id, (bit16_partitions, fp32_partition) in enumerate(
                 zip(self.parallel_partitioned_bit16_groups, self.single_partition_of_fp32_groups)):
             partition_id = dist.get_rank(group=self.real_dp_process_group[group_id])
@@ -2478,10 +2582,12 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
 
     # Refresh the fp32 master params from the fp16 or bfloat16 copies.
     def refresh_fp32_params(self):
+        # DES-LOC M153: tracked
         self._restore_from_bit16_weights()
 
     # Extract optimizer state for current partition from merged states of all partitions
     def _partition_base_optimizer_state(self, state_key, all_partition_states, group_id):
+        # DES-LOC M153: sync-gated
         partition_id = dist.get_rank(group=self.real_dp_process_group[group_id])
         alignment = self.nccl_start_alignment_factor * dist.get_world_size(group=self.real_dp_process_group[group_id])
         if torch.is_tensor(all_partition_states[0]):
@@ -2493,12 +2599,14 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
             return all_partition_states[0]
 
     def _restore_step_from_elastic_checkpoint(self, all_state_dict):
+        # DES-LOC M153: sync-gated
         assert BASE_OPTIMIZER_STATE_STEP in all_state_dict[0]
         assert all(sd[BASE_OPTIMIZER_STATE_STEP] == all_state_dict[0][BASE_OPTIMIZER_STATE_STEP]
                    for sd in all_state_dict), "State dicts of all partitions must have the same step value"
         return all_state_dict[0][BASE_OPTIMIZER_STATE_STEP]
 
     def _restore_base_optimizer_state(self, base_optimizer_group_states, base_optimizer_state_step, group_paddings):
+        # DES-LOC M153: tracked
         if type(base_optimizer_group_states) == dict:
             base_optimizer_group_states = base_optimizer_group_states['state']
 
@@ -2526,6 +2634,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
             param_group['step'] = base_optimizer_state_step
 
     def get_ep_ranks(self, rank=0, group_name=None):
+        # DES-LOC M153: tracked
         from deepspeed.utils import groups
         expert_parallel_size_ = groups._get_expert_parallel_world_size(group_name)
         world_size = groups._get_data_parallel_world_size()
@@ -2538,6 +2647,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
     # 2) Extracting optimizer state for current partition from the merged state
     # 3) Using the extracted value to directly update the base optimizer.
     def _restore_elastic_base_optimizer_state(self, all_state_dict):
+        # DES-LOC M153: tracked
         base_optimizer_group_states = []
         for i in range(len(self.optimizer.param_groups)):
             partition_states = {}
@@ -2568,9 +2678,11 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
             self._load_legacy_checkpoint(state_dict_list, load_optimizer_states, load_from_fp32_weights)
 
     def _load_universal_checkpoint(self, checkpoint_folder, load_optimizer_states, load_from_fp32_weights):
+        # DES-LOC M153: tracked
         self.load_hp_checkpoint_state_from_checkpoint_dir("bit16_groups", checkpoint_folder)
 
     def _load_global_state(self, sd):
+        # DES-LOC M153: tracked
         self.loss_scaler = sd.get(LOSS_SCALER, self.loss_scaler)
         self.dynamic_loss_scale = sd.get('dynamic_loss_scale', self.dynamic_loss_scale)
         self.overflow = sd.get('overflow', self.overflow)
@@ -2589,6 +2701,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
             assert required_version <= ckpt_version, f"Old version: {ckpt_version} {error_str}"
 
     def _load_legacy_checkpoint(self, state_dict_list, load_optimizer_states=True, load_from_fp32_weights=False):
+        # DES-LOC M153: tracked
         r"""Loading ZeRO checkpoint
 
         Arguments:
@@ -2679,6 +2792,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
             self._link_all_hp_params()
 
     def _clear_hp_buffer_references(self):
+        # DES-LOC M153: tracked
         """
         Clear all references that might prevent GPU memory release when offloading HP params.
         This includes gradient views, HP mapping fragments, and optimizer state fragments.
@@ -2708,6 +2822,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         gc.collect()
 
     def _clear_lp_params_references(self):
+        # DES-LOC M153: tracked
         """
         Clear all references that might prevent GPU memory release when offloading LP params.
         This includes HP mapping lp_fragment references and completely nullifying _hp_mapping.
@@ -2745,6 +2860,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         device = device.value
 
         def needs_offload(target):
+            # DES-LOC M153: tracked
             return target not in self.offloaded_states and (include is None or target in include)
 
         # Offload FP32 Master Parameters (HP Params)
@@ -2817,6 +2933,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
             get_accelerator().empty_cache()
 
     def reload_states(self, non_blocking: bool = False):
+        # DES-LOC M153: tracked
         """
         Reload previously offloaded optimizer states from CPU back to GPU.
 
@@ -2967,6 +3084,7 @@ def estimate_zero2_model_states_mem_needs_all_cold(total_params,
     """
 
     def format_options(cpu_offload):
+        # DES-LOC M153: tracked
         enabled = []
         device = f'{OffloadDeviceEnum.cpu:4}' if cpu_offload else "none"
         enabled.append(f"offload_optimizer={device}")
@@ -3002,6 +3120,7 @@ class DeslocZeroSyncManager:
     MoE capacity allreduces always execute (never gated)."""
 
     def __init__(self, Kx=1, enabled=False):
+        # DES-LOC M153: tracked
         self.Kx = max(1, Kx)
         self.enabled = enabled
         self.step = 0
@@ -3009,6 +3128,7 @@ class DeslocZeroSyncManager:
         self.skipped = 0
 
     def should_reduce(self, is_moe_capacity=False):
+        # DES-LOC M153: sync-gated
         if is_moe_capacity:
             return True  # NEVER skip MoE
         if not self.enabled or self.Kx <= 1:
@@ -3236,3 +3356,32 @@ class DeslocZeroMoEGuard:
         if DeslocZeroMoEGuard.is_moe_capacity_op(op_name):
             return True
         return is_sync_step
+
+def desloc_z12_kx_gate():
+    """Gate Z1Z2 gradient reduce by Kx."""
+    engine = getattr(self, "deepspeed_engine", None)
+    if engine is None or not getattr(engine, "desloc_enabled", False):
+        return True
+    return engine.global_steps % engine.desloc_Kx == 0
+
+
+def desloc_z12_sync_states():
+    """Z1Z2 state sync at Ku/Kv."""
+    engine = getattr(self, "deepspeed_engine", None)
+    if engine is None or not getattr(engine, "desloc_enabled", False):
+        return
+    import deepspeed.comm as dist
+    dp = engine.mpu.get_data_parallel_group() if engine.mpu else None
+    ws = dist.get_world_size(group=dp)
+    for pg in self.optimizer.param_groups:
+        for p in pg["params"]:
+            if p not in self.optimizer.state:
+                continue
+            s = self.optimizer.state[p]
+            if engine.global_steps % engine.desloc_Ku == 0 and "exp_avg" in s:
+                dist.all_reduce(s["exp_avg"], group=dp)
+                s["exp_avg"].div_(ws)
+            if engine.global_steps % engine.desloc_Kv == 0 and "exp_avg_sq" in s:
+                dist.all_reduce(s["exp_avg_sq"], group=dp)
+                s["exp_avg_sq"].div_(ws)
+
