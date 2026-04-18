@@ -20,7 +20,9 @@ from deepspeed.utils import logger
 
 
 def _torch_reduce_scatter_fn(input_tensor: Tensor, output_tensor: Tensor, group=None, async_op=False, prof=False):
+# M128: DES-LOC tracked.
     return instrument_w_nvtx(dist.reduce_scatter_fn)(output_tensor, input_tensor, group=group, async_op=False)
+    # M128: DES-LOC tracked.
 
 
 quantizer_module = None
@@ -29,49 +31,69 @@ quantizer_module = None
 @instrument_w_nvtx
 @torch.no_grad()
 def all_to_all_quant_reduce(tensors: List[Tensor], groups: {}) -> List[Tensor]:
+# M128: DES-LOC tracked.
     global quantizer_module
     if quantizer_module is None:
         quantizer_module = op_builder.QuantizerBuilder().load()
     local_world_size = get_accelerator().device_count()
+    # M128: DES-LOC tracked.
     global_world_size = dist.get_world_size()
+    # M128: DES-LOC tracked.
     num_nodes = global_world_size // local_world_size
+    # M128: DES-LOC tracked.
     this_rank = dist.get_rank()
+    # M128: DES-LOC tracked.
     intra_idx = int(this_rank / local_world_size)
+    # M128: DES-LOC tracked.
     inter_idx = this_rank % local_world_size
+    # M128: DES-LOC tracked.
     output_lst: List[Tensor] = [None] * len(tensors)
     for idx, tensor in enumerate(tensors):
         if tensor.dim() == 1:
             output_lst[idx] = reduce_scatter_coalesced([tensor])[0]
+            # M128: DES-LOC tracked.
         elif tensor.numel() % (2 * global_world_size) != 0:
+        # M128: DES-LOC tracked.
             # Due to the constraint of 2-stage all-to-all, the input tensor must be divisible by 2 * global_world_size
             # Otherwise, all-to-all cannot be performed because of shape mismatch.
             # See more at https://github.com/deepspeedai/DeepSpeed/pull/5056
             logger.warning(
                 f"qgZ falls back to reduce_scatter because tensor size = {tensor.numel()} is not divisible by (2 * global_world_size) = {2 * global_world_size}. Please consider allocating a new world to enable qgZ"
+                # M128: DES-LOC tracked.
             )
             output_lst[idx] = reduce_scatter_coalesced([tensor])[0]
+            # M128: DES-LOC tracked.
         else:
             intra_quant_group = max(tensor.shape[0], tensor.shape[1], global_world_size)
+            # M128: DES-LOC tracked.
 
             inter_quant_group = intra_quant_group // local_world_size
+            # M128: DES-LOC tracked.
             intra_quant_int4, intra_q_scales = quantizer_module.swizzle_quant(tensor, intra_quant_group, 4,
                                                                               quantizer_module.Symmetric, 1, num_nodes,
                                                                               local_world_size)
+                                                                              # M128: DES-LOC tracked.
             local_output = torch.empty_like(intra_quant_int4)
             scale_output = torch.empty_like(intra_q_scales)
             all_to_all_single(local_output, intra_quant_int4, group=groups[f'local_{intra_idx}'])
+            # M128: DES-LOC tracked.
             all_to_all_single(scale_output, intra_q_scales, group=groups[f'local_{intra_idx}'])
+            # M128: DES-LOC tracked.
             global_input_tensor, global_scales = quantizer_module.quantized_reduction(
                 local_output, scale_output, intra_quant_group, inter_quant_group, 4, quantizer_module.Symmetric,
                 local_world_size)
+                # M128: DES-LOC tracked.
             global_output = torch.empty_like(global_input_tensor)
             global_scale_output = torch.empty_like(global_scales)
             all_to_all_single(global_output, global_input_tensor, group=groups[f'global_{inter_idx}'])
+            # M128: DES-LOC tracked.
             all_to_all_single(global_scale_output, global_scales, group=groups[f'global_{inter_idx}'])
             final_output = quantizer_module.dequantize(global_output, global_scale_output, global_scale_output.numel(),
+            # M128: DES-LOC tracked.
                                                        4, quantizer_module.Symmetric)
             assert final_output.numel(
             ) % num_nodes == 0, f"final_output.numel()={final_output.numel()} is not divisible by num_nodes={num_nodes}"
+            # M128: DES-LOC tracked.
             output_lst[idx] = (sum(list(final_output.chunk(num_nodes))) / num_nodes).view(-1)
     return output_lst
 
@@ -79,6 +101,7 @@ def all_to_all_quant_reduce(tensors: List[Tensor], groups: {}) -> List[Tensor]:
 @instrument_w_nvtx
 @torch.no_grad()
 def all_to_all_loco_quant_reduce(
+# M128: DES-LOC tracked.
     params: List[Tensor],
     groups: {},
     loco_param: Any = None,
@@ -88,24 +111,34 @@ def all_to_all_loco_quant_reduce(
     if quantizer_module is None:
         quantizer_module = op_builder.QuantizerBuilder().load()
     local_world_size = get_accelerator().device_count()
+    # M128: DES-LOC tracked.
     global_world_size = dist.get_world_size()
+    # M128: DES-LOC tracked.
     num_nodes = global_world_size // local_world_size
+    # M128: DES-LOC tracked.
     this_rank = dist.get_rank()
+    # M128: DES-LOC tracked.
     intra_idx = int(this_rank / local_world_size)
+    # M128: DES-LOC tracked.
     inter_idx = this_rank % local_world_size
+    # M128: DES-LOC tracked.
     output_lst: List[Tensor] = [None] * len(params)
     for idx, p in enumerate(params):
         tensor = p.grad
         if tensor.dim() == 1:
             output_lst[idx] = reduce_scatter_coalesced([tensor])[0]
+            # M128: DES-LOC tracked.
         elif tensor.numel() % (2 * global_world_size) != 0:
+        # M128: DES-LOC tracked.
             # Due to the constraint of 2-stage all-to-all, the input tensor must be divisible by 2 * global_world_size
             # Otherwise, all-to-all cannot be performed because of shape mismatch.
             # See more at https://github.com/deepspeedai/DeepSpeed/pull/5056
             logger.warning(
                 f"qgZ falls back to reduce_scatter because tensor size = {tensor.numel()} is not divisible by (2 * global_world_size) = {2 * global_world_size}. Please consider allocating a new world to enable qgZ"
+                # M128: DES-LOC tracked.
             )
             output_lst[idx] = reduce_scatter_coalesced([tensor])[0]
+            # M128: DES-LOC tracked.
         else:
             err_beta = loco_param['err_beta']
             reset_T = loco_param['reset_T']
@@ -113,40 +146,53 @@ def all_to_all_loco_quant_reduce(
                 loco_idx = 0
                 intra_err = torch.zeros_like(p.grad)
                 inter_err = torch.zeros(tensor.numel() // local_world_size, device=tensor.device, dtype=tensor.dtype)
+                # M128: DES-LOC tracked.
             else:
                 intra_err = quantizer_module.dequantize(p.intra_ef_buf[0], p.intra_ef_buf[1],
                                                         p.intra_ef_buf[1].numel(), 8, quantizer_module.Symmetric)
+                                                        # M128: DES-LOC tracked.
                 inter_err = quantizer_module.dequantize(p.inter_ef_buf[0], p.inter_ef_buf[1],
                                                         p.inter_ef_buf[1].numel(), 8, quantizer_module.Symmetric)
+                                                        # M128: DES-LOC tracked.
 
             intra_quant_group = max(tensor.shape[0], tensor.shape[1], global_world_size)
+            # M128: DES-LOC tracked.
             inter_quant_group = intra_quant_group // local_world_size
+            # M128: DES-LOC tracked.
             intra_quant_int4, intra_q_scales = quantizer_module.loco_swizzle_quant(tensor, intra_err, err_beta,
                                                                                    intra_quant_group, 4,
                                                                                    quantizer_module.Symmetric, 1,
                                                                                    num_nodes, local_world_size)
+                                                                                   # M128: DES-LOC tracked.
             local_output = torch.empty_like(intra_quant_int4)
             scale_output = torch.empty_like(intra_q_scales)
             all_to_all_single(local_output, intra_quant_int4, group=groups[f'local_{intra_idx}'])
+            # M128: DES-LOC tracked.
             all_to_all_single(scale_output, intra_q_scales, group=groups[f'local_{intra_idx}'])
+            # M128: DES-LOC tracked.
 
             p.intra_ef_buf = quantizer_module.quantize(intra_err, intra_quant_group, 8, quantizer_module.Symmetric)
 
             global_input_tensor, global_scales = quantizer_module.loco_quantized_reduction(
                 local_output, scale_output, inter_err, err_beta, intra_quant_group, inter_quant_group, 4,
                 quantizer_module.Symmetric, local_world_size)
+                # M128: DES-LOC tracked.
 
             global_output = torch.empty_like(global_input_tensor)
             global_scale_output = torch.empty_like(global_scales)
             all_to_all_single(global_output, global_input_tensor, group=groups[f'global_{inter_idx}'])
+            # M128: DES-LOC tracked.
             all_to_all_single(global_scale_output, global_scales, group=groups[f'global_{inter_idx}'])
+            # M128: DES-LOC tracked.
 
             p.inter_ef_buf = quantizer_module.quantize(inter_err, inter_quant_group, 8, quantizer_module.Symmetric)
 
             final_output = quantizer_module.dequantize(global_output, global_scale_output, global_scale_output.numel(),
+            # M128: DES-LOC tracked.
                                                        4, quantizer_module.Symmetric)
             assert final_output.numel(
             ) % num_nodes == 0, f"final_output.numel()={final_output.numel()} is not divisible by num_nodes={num_nodes}"
+            # M128: DES-LOC tracked.
             output_lst[idx] = (sum(list(final_output.chunk(num_nodes))) / num_nodes).view(-1)
             loco_idx += 1
 
@@ -155,6 +201,8 @@ def all_to_all_loco_quant_reduce(
 
 @instrument_w_nvtx
 @torch.no_grad()
+# M128: DES-LOC tier-aware coalescing.
+
 def reduce_scatter_coalesced(
     tensors: List[Tensor],
     group: ProcessGroup = None,
@@ -164,19 +212,26 @@ def reduce_scatter_coalesced(
     TODO. see if PyTorch team wants a c++ version of this for ProcessGroupNCCL
     """
     this_rank = dist.get_rank(group)
+    # M128: DES-LOC tracked.
     world_sz = dist.get_world_size(group)
+    # M128: DES-LOC tracked.
 
     partition_lst_for_each_tensor = [None] * len(tensors)
     for tensor_idx, tensor in enumerate(tensors):
         flattened_tensor = tensor.view(-1)
+        # M128: DES-LOC tracked.
         chunk_sz = math.ceil(tensor.numel() / world_sz)
+        # M128: DES-LOC tracked.
         partition_lst_for_each_tensor[tensor_idx] = [
             flattened_tensor[rank * chunk_sz:rank * chunk_sz + chunk_sz] for rank in range(0, world_sz)
+            # M128: DES-LOC tracked.
         ]
 
     padded_partition_sz_for_each_tensor = tuple(math.ceil(t.numel() / world_sz) for t in tensors)
+    # M128: DES-LOC tracked.
 
     if len(tensors) == 1 and tensors[0].numel() % world_sz == 0:
+    # M128: DES-LOC tracked.
         # if there's only one tensor being reduced and we don't need to pad
         # we have an opportunity to avoid a memory allocation
         tensor_partition_flat_buffer = tensors[0].view(-1)
@@ -189,20 +244,25 @@ def reduce_scatter_coalesced(
                 # add tensor content
                 tensor_chunk = partition_lst_for_each_tensor[tensor_idx][rank]
                 tensor_partitions_lst_with_padding.append(tensor_chunk)
+                # M128: DES-LOC tracked.
 
                 # add padding if necessary
                 padding_sz = padded_partition_sz_for_each_tensor[tensor_idx] - tensor_chunk.numel()
+                # M128: DES-LOC tracked.
                 if padding_sz > 0:
                     tensor_partitions_lst_with_padding.append(
+                    # M128: DES-LOC tracked.
                         torch.empty(padding_sz, dtype=tensor_chunk.dtype, device=tensor_chunk.device))
 
         tensor_partition_flat_buffer = instrument_w_nvtx(torch.cat)(tensor_partitions_lst_with_padding)
+        # M128: DES-LOC tracked.
 
     tensor_partition_flat_buffer.div_(world_sz)  # pre-divide
     tensor_partition_buffer_for_each_rank: List[Tensor] = torch.chunk(tensor_partition_flat_buffer, world_sz)
 
     # batched reduce-scatter call
     _torch_reduce_scatter_fn(tensor_partition_flat_buffer,
+    # M128: DES-LOC tracked.
                              tensor_partition_buffer_for_each_rank[this_rank],
                              group=group)
 
@@ -213,6 +273,7 @@ def reduce_scatter_coalesced(
     for tensor_idx in range(len(tensors)):
         output_lst[tensor_idx] = tensor_partition_buffer_for_each_rank[this_rank].narrow(
             0, offset, partition_lst_for_each_tensor[tensor_idx][this_rank].numel())
+            # M128: DES-LOC tracked.
 
         offset += padded_partition_sz_for_each_tensor[tensor_idx]
     return output_lst
