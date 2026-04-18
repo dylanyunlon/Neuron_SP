@@ -1334,3 +1334,80 @@ def desloc_comm_time_table(param_bytes, num_workers, bandwidth_gbps,
         param_bytes, num_workers, bandwidth_gbps,
         Kx=kx, Ku=max(1, kx*3), Kv=max(1, kx*6)) * 1000, 4)
         for kx in kx_values}
+
+
+# --- DES-LOC Tiered Communication (M138) ---
+import time as _m138t; from collections import defaultdict as _m138dd
+
+class DESLOCCommScheduler:
+    def __init__(self, Kx=32, Ku=96, Kv=192, prob=False, seed=42):
+        self.Kx,self.Ku,self.Kv=Kx,Ku,Kv; self.prob,self.seed,self.step=prob,seed,0
+        self.syncs=_m138dd(int); self.skips=_m138dd(int); self.bytes=_m138dd(int)
+    def should_sync(self, tier='x'):
+        K={'x':self.Kx,'u':self.Ku,'v':self.Kv}.get(tier,1)
+        if K<=1: return True
+        if self.prob:
+            import hashlib; h=hashlib.md5(f"{self.step}:{tier}:{self.seed}".encode())
+            return int(h.hexdigest(),16)%K==0
+        return self.step%K==0
+    def advance(self): self.step+=1
+    def record_sync(self, tier, nb): self.syncs[tier]+=1; self.bytes[tier]+=nb
+    def record_skip(self, tier): self.skips[tier]+=1
+    def summary(self):
+        ts=sum(self.syncs.values()); tk=sum(self.skips.values())
+        return {'step':self.step,'syncs':ts,'skips':tk,'reduction':round((ts+tk)/max(ts,1),2)}
+    def state_dict(self): return {'step':self.step,'Kx':self.Kx,'Ku':self.Ku,'Kv':self.Kv}
+    def load_state_dict(self, sd): self.step=sd.get('step',0)
+
+class DESLOCTieredAllReduce:
+    def __init__(self, sched, group=None, async_op=False):
+        self.sched,self.group,self.async_op=sched,group,async_op; self._bw=_m138dd(list)
+    def all_reduce(self, tensor, tier='x', op=None):
+        if not self.sched.should_sync(tier): self.sched.record_skip(tier); return None,False
+        import torch.distributed as td
+        if op is None:
+            try: op=td.ReduceOp.AVG
+            except: op=td.ReduceOp.SUM
+        nb=tensor.numel()*tensor.element_size(); t0=_m138t.monotonic()
+        h=td.all_reduce(tensor,op=op,group=self.group,async_op=self.async_op)
+        el=_m138t.monotonic()-t0; self.sched.record_sync(tier,nb)
+        if el>0: self._bw[tier].append(nb/el/1e9)
+        if len(self._bw[tier])>100: self._bw[tier].pop(0)
+        return h,True
+    def reduce_scatter(self, out, inp, tier='x', op=None):
+        if not self.sched.should_sync(tier): self.sched.record_skip(tier); return None,False
+        import torch.distributed as td
+        if op is None: op=td.ReduceOp.SUM
+        nb=sum(t.numel()*t.element_size() for t in inp)
+        h=td.reduce_scatter(out,inp,op=op,group=self.group,async_op=self.async_op)
+        self.sched.record_sync(tier,nb); return h,True
+    def all_gather(self, tl, t, tier='x'):
+        if not self.sched.should_sync(tier): self.sched.record_skip(tier); return None,False
+        import torch.distributed as td
+        nb=t.numel()*t.element_size()
+        h=td.all_gather(tl,t,group=self.group,async_op=self.async_op)
+        self.sched.record_sync(tier,nb); return h,True
+    def bw_stats(self): return {t:{'avg':round(sum(s)/max(len(s),1),2)} for t,s in self._bw.items()}
+
+class DESLOCCommProfiler:
+    def __init__(self, interval=100): self.interval,self._records,self._step=interval,[],0
+    def record(self, Kx, Ku, Kv, synced, nb=0, ms=0):
+        self._records.append({'s':self._step,'Kx':Kx,'sx':'x' in synced,'b':nb,'ms':ms}); self._step+=1
+        if self._step%self.interval==0:
+            r=self._records[-self.interval:]; sc=sum(1 for x in r if x['sx'])
+            print(f"### DES-LOC step={self._step} ### {sc}/{len(r)} syncs")
+    def export_csv(self, path):
+        lines=['step,Kx,sx,bytes,ms']
+        for r in self._records: lines.append(f"{r['s']},{r['Kx']},{int(r['sx'])},{r['b']},{r['ms']:.3f}")
+        with open(path,'w') as f: f.write('\n'.join(lines))
+    def state_dict(self): return {'step':self._step}
+
+_desloc_sched=None; _desloc_tar=None; _desloc_prof=None
+def init_desloc_scheduler(Kx=32,Ku=96,Kv=192,prob=False,group=None,async_op=False,interval=100):
+    global _desloc_sched,_desloc_tar,_desloc_prof
+    _desloc_sched=DESLOCCommScheduler(Kx,Ku,Kv,prob)
+    _desloc_tar=DESLOCTieredAllReduce(_desloc_sched,group,async_op)
+    _desloc_prof=DESLOCCommProfiler(interval)
+def get_desloc_scheduler(): return _desloc_sched
+def get_desloc_tiered_ar(): return _desloc_tar
+def get_desloc_profiler(): return _desloc_prof
