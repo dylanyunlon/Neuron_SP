@@ -324,3 +324,228 @@ class SingleDeviceMuonWithAuxAdam(torch.optim.Optimizer):
                     p.add_(update, alpha=-group["lr"])
 
         return loss
+
+
+# ═══════════════════════════════════════════════════════════════
+# DES-LOC extensions for Muon optimizer classes (M189)
+# Section 5.6: Kx-gated all_gather + Ku-gated momentum sync
+# ═══════════════════════════════════════════════════════════════
+
+
+class DESLOCMuon(Muon):
+    """DES-LOC variant of Muon with Kx-gated all_gather.
+
+    The original Muon calls dist.all_gather every step to broadcast
+    parameter updates across workers. DES-LOC gates this by Kx:
+    all_gather only happens when step % Kx == 0.
+
+    Between sync points, each worker runs independently with its
+    local parameters + Muon momentum, matching the DES-LOC
+    desynchronization principle.
+    """
+
+    def __init__(self, params, lr=0.02, weight_decay=0, momentum=0.95,
+                 desloc_Kx=1, desloc_Ku=1, desloc_clip_radius=1.0):
+        super().__init__(params, lr=lr, weight_decay=weight_decay, momentum=momentum)
+        self._desloc_Kx = desloc_Kx
+        self._desloc_Ku = desloc_Ku
+        self._desloc_clip_radius = desloc_clip_radius
+        self._desloc_step = 0
+        self._desloc_gather_count = 0
+        self._desloc_skip_count = 0
+        self._desloc_total_gather_bytes = 0
+
+    def _should_gather(self):
+        """Check if all_gather should execute this step."""
+        if self._desloc_Kx <= 1:
+            return True
+        return self._desloc_step % self._desloc_Kx == 0
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        self._desloc_step += 1
+
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            params = group["params"]
+
+            # Apply per-coordinate clipping if enabled
+            if self._desloc_clip_radius < float('inf'):
+                for p in params:
+                    if p.grad is not None:
+                        p.grad.clamp_(-self._desloc_clip_radius,
+                                      self._desloc_clip_radius)
+
+            params_pad = params + [torch.empty_like(params[-1])
+                                   ] * (dist.get_world_size() - len(params) % dist.get_world_size())
+            for base_i in range(len(params))[::dist.get_world_size()]:
+                if base_i + dist.get_rank() < len(params):
+                    p = params[base_i + dist.get_rank()]
+                    if p.grad is None:
+                        p.grad = torch.zeros_like(p)
+                    state = self.state[p]
+                    if len(state) == 0:
+                        state["momentum_buffer"] = torch.zeros_like(p)
+                    update = muon_update(p.grad, state["momentum_buffer"],
+                                         beta=group["momentum"])
+                    p.mul_(1 - group["lr"] * group["weight_decay"])
+                    p.add_(update.reshape(p.shape), alpha=-group["lr"])
+
+                # M189: Kx-gated all_gather
+                if self._should_gather():
+                    dist.all_gather(
+                        params_pad[base_i:base_i + dist.get_world_size()],
+                        params_pad[base_i + dist.get_rank()])
+                    self._desloc_gather_count += 1
+                    self._desloc_total_gather_bytes += sum(
+                        p.numel() * p.element_size() for p in
+                        params_pad[base_i:base_i + dist.get_world_size()])
+                else:
+                    self._desloc_skip_count += 1
+
+        return loss
+
+    def get_desloc_stats(self):
+        return {
+            'step': self._desloc_step,
+            'gather_count': self._desloc_gather_count,
+            'skip_count': self._desloc_skip_count,
+            'total_gather_bytes': self._desloc_total_gather_bytes,
+            'Kx': self._desloc_Kx,
+            'Ku': self._desloc_Ku,
+        }
+
+
+class DESLOCMuonWithAuxAdam(MuonWithAuxAdam):
+    """DES-LOC variant of MuonWithAuxAdam with Kx-gated all_gather.
+
+    Same DES-LOC gating as DESLOCMuon but for the combined
+    Muon+Adam optimizer. The Adam part (non-Muon params) runs
+    locally without any all_gather gating — only Muon params
+    are gated by Kx.
+    """
+
+    def __init__(self, param_groups, desloc_Kx=1, desloc_Ku=1,
+                 desloc_clip_radius=1.0):
+        super().__init__(param_groups)
+        self._desloc_Kx = desloc_Kx
+        self._desloc_Ku = desloc_Ku
+        self._desloc_clip_radius = desloc_clip_radius
+        self._desloc_step = 0
+        self._desloc_gather_count = 0
+        self._desloc_skip_count = 0
+        self._desloc_muon_comm_bytes = 0
+        self._desloc_adam_comm_bytes = 0
+
+    def _should_gather(self):
+        if self._desloc_Kx <= 1:
+            return True
+        return self._desloc_step % self._desloc_Kx == 0
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        self._desloc_step += 1
+
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        # Apply per-coordinate clipping
+        if self._desloc_clip_radius < float('inf'):
+            for group in self.param_groups:
+                for p in group['params']:
+                    if p.grad is not None:
+                        p.grad.clamp_(-self._desloc_clip_radius,
+                                      self._desloc_clip_radius)
+
+        for group in self.param_groups:
+            if group["use_muon"]:
+                params = group["params"]
+                params_pad = params + [torch.empty_like(params[-1])
+                                       ] * (dist.get_world_size() - len(params) % dist.get_world_size())
+                for base_i in range(len(params))[::dist.get_world_size()]:
+                    if base_i + dist.get_rank() < len(params):
+                        p = params[base_i + dist.get_rank()]
+                        if p.grad is None:
+                            p.grad = torch.zeros_like(p)
+                        state = self.state[p]
+                        if len(state) == 0:
+                            state["momentum_buffer"] = torch.zeros_like(p)
+                        update = muon_update(p.grad, state["momentum_buffer"],
+                                             beta=group["momentum"])
+                        p.mul_(1 - group["lr"] * group["weight_decay"])
+                        p.add_(update.reshape(p.shape), alpha=-group["lr"])
+
+                    # M189: Kx-gated all_gather for Muon params
+                    if self._should_gather():
+                        dist.all_gather(
+                            params_pad[base_i:base_i + dist.get_world_size()],
+                            params_pad[base_i + dist.get_rank()])
+                        self._desloc_gather_count += 1
+                    else:
+                        self._desloc_skip_count += 1
+            else:
+                # Adam params: local update only (no all_gather gating)
+                for p in group["params"]:
+                    if p.grad is None:
+                        p.grad = torch.zeros_like(p)
+                    state = self.state[p]
+                    if len(state) == 0:
+                        state["exp_avg"] = torch.zeros_like(p)
+                        state["exp_avg_sq"] = torch.zeros_like(p)
+                        state["step"] = 0
+                    state["step"] += 1
+                    update = adam_update(
+                        p.grad, state["exp_avg"], state["exp_avg_sq"],
+                        state["step"], group["betas"], group["eps"])
+                    p.mul_(1 - group["lr"] * group["weight_decay"])
+                    p.add_(update, alpha=-group["lr"])
+
+        return loss
+
+    def get_desloc_stats(self):
+        return {
+            'step': self._desloc_step,
+            'gather_count': self._desloc_gather_count,
+            'skip_count': self._desloc_skip_count,
+            'Kx': self._desloc_Kx,
+            'Ku': self._desloc_Ku,
+        }
+
+
+class DESLOCSingleDeviceMuon(SingleDeviceMuon):
+    """DES-LOC variant of SingleDeviceMuon (no communication).
+
+    For single-device, DES-LOC only adds per-coordinate clipping.
+    No sync gating needed (no distributed communication).
+    """
+
+    def __init__(self, params, lr=0.02, weight_decay=0, momentum=0.95,
+                 desloc_clip_radius=1.0):
+        super().__init__(params, lr=lr, weight_decay=weight_decay,
+                         momentum=momentum)
+        self._desloc_clip_radius = desloc_clip_radius
+        self._desloc_step = 0
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        self._desloc_step += 1
+
+        # Apply per-coordinate clipping
+        if self._desloc_clip_radius < float('inf'):
+            for group in self.param_groups:
+                for p in group["params"]:
+                    if p.grad is not None:
+                        p.grad.clamp_(-self._desloc_clip_radius,
+                                      self._desloc_clip_radius)
+
+        # Delegate to base (no comm to gate)
+        return super().step(closure)
+
+
+# End M189
