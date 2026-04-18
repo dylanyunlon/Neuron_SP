@@ -378,22 +378,9 @@ class CommsLogger:
         return result_dict if return_dict else None
 
 
-# =================================================================
-# M071: DES-LOC Structured Experiment Logger (400 lines)
-# =================================================================
-# Produces structured logs parseable by the plotting pipeline.
-# Follows NKI-FA commit da964f3 draw_plot.py format:
-# - Header with config
-# - Parseable data lines with key=value format
-# - Summary section with aggregate metrics
-#
-# Reference: NKI-FA exp_utils/draw_plot.py
-# =================================================================
-
-import os as _os
-import json as _json
-import time as _time
-import math as _math
+# ── DES-LOC Structured Logger (M185) ───────────────────────────
+import time as _m185_time
+import os as _m185_os
 
 
 class DESLOCStructuredLogger:
@@ -404,20 +391,11 @@ class DESLOCStructuredLogger:
     is written with full precision and labeled explicitly.
 
     Log format:
-    ```
     ### DESLOC_EXPERIMENT_START ###
     # config: model=125M Kx=32 Ku=96 Kv=192 ...
     # benchmark: rq3_comm_reduction_125M
-    # timestamp: 2026-04-17T06:53:49
-    step=0 loss=10.8234 lr=6.0000e-04 grad_norm=12.345 ...
-    step=10 loss=8.1234 lr=5.8800e-04 ...
+    step=0 loss=10.8234 lr=6.0000e-04 ...
     ### DESLOC_EXPERIMENT_END ###
-    ### DESLOC_SUMMARY_START ###
-    final_loss=3.2145
-    min_loss=3.1892
-    ...
-    ### DESLOC_SUMMARY_END ###
-    ```
     """
 
     def __init__(self, benchmark_id, config, log_dir=None):
@@ -425,7 +403,7 @@ class DESLOCStructuredLogger:
         self.config = config
         self.log_dir = log_dir or './desloc_experiment_logs'
         self.entries = []
-        self.start_time = _time.time()
+        self.start_time = _m185_time.time()
         self.metadata = {}
 
     def set_metadata(self, key, value):
@@ -436,17 +414,21 @@ class DESLOCStructuredLogger:
                  sync_x=False, sync_u=False, sync_v=False,
                  comm_bytes=0, compute_ms=None, comm_ms=None,
                  exp_avg_norm=None, exp_avg_sq_norm=None,
-                 param_norm=None, tokens_per_sec=None):
-        """Log a single training step."""
-        entry = {'step': step, 'loss': loss}
+                 param_norm=None, tokens_per_sec=None,
+                 outer_optimizer=None):
+        """Log a single training step with full precision."""
+        entry = {
+            'step': step,
+            'loss': loss,
+            'sync_x': sync_x,
+            'sync_u': sync_u,
+            'sync_v': sync_v,
+            'comm_bytes': comm_bytes,
+        }
         if lr is not None:
             entry['lr'] = lr
         if grad_norm is not None:
             entry['grad_norm'] = grad_norm
-        entry['sync_x'] = int(sync_x)
-        entry['sync_u'] = int(sync_u)
-        entry['sync_v'] = int(sync_v)
-        entry['comm_bytes'] = comm_bytes
         if compute_ms is not None:
             entry['compute_ms'] = compute_ms
         if comm_ms is not None:
@@ -459,6 +441,8 @@ class DESLOCStructuredLogger:
             entry['param_norm'] = param_norm
         if tokens_per_sec is not None:
             entry['tokens_per_sec'] = tokens_per_sec
+        if outer_optimizer is not None:
+            entry['outer_optimizer'] = outer_optimizer
         self.entries.append(entry)
 
     def _format_value(self, key, value):
@@ -497,249 +481,112 @@ class DESLOCStructuredLogger:
         lines = []
         for entry in self.entries:
             parts = [self._format_value(k, v)
-                      for k, v in entry.items()]
-            lines.append(" ".join(parts))
+                     for k, v in entry.items()
+                     if v is not None and v is not False]
+            lines.append(' '.join(parts))
         return "\n".join(lines)
 
-    def compute_summary(self):
-        """Compute experiment summary metrics."""
-        if not self.entries:
-            return {}
-
-        losses = [e['loss'] for e in self.entries
-                  if not _math.isnan(e['loss'])]
-        total_comm = sum(e.get('comm_bytes', 0)
-                         for e in self.entries)
-        x_syncs = sum(e.get('sync_x', 0) for e in self.entries)
-        u_syncs = sum(e.get('sync_u', 0) for e in self.entries)
-        v_syncs = sum(e.get('sync_v', 0) for e in self.entries)
-        total_steps = len(self.entries)
-        elapsed = _time.time() - self.start_time
-
-        summary = {
-            'final_loss': losses[-1] if losses else 0.0,
-            'min_loss': min(losses) if losses else 0.0,
-            'total_steps': total_steps,
-            'total_comm_bytes': total_comm,
-            'x_syncs': x_syncs,
-            'u_syncs': u_syncs,
-            'v_syncs': v_syncs,
-            'elapsed_seconds': round(elapsed, 2),
-            'steps_per_second': round(
-                total_steps / max(elapsed, 0.01), 2),
-        }
-
-        # Convergence rate: avg loss over last 10%
-        tail = max(1, total_steps // 10)
-        tail_losses = losses[-tail:] if losses else [0.0]
-        summary['tail_avg_loss'] = round(
-            sum(tail_losses) / len(tail_losses), 6)
-
-        # Communication reduction vs DDP
-        if total_steps > 0:
-            ddp_syncs = total_steps * 3  # all 3 states every step
-            desloc_syncs = x_syncs + u_syncs + v_syncs
-            summary['reduction_vs_ddp'] = round(
-                ddp_syncs / max(desloc_syncs, 1), 2)
-
-        # Throughput
-        compute_times = [e.get('compute_ms', 0)
-                         for e in self.entries
-                         if 'compute_ms' in e]
-        if compute_times:
-            summary['avg_compute_ms'] = round(
-                sum(compute_times) / len(compute_times), 3)
-        comm_times = [e.get('comm_ms', 0)
-                      for e in self.entries if 'comm_ms' in e]
-        if comm_times:
-            summary['avg_comm_ms'] = round(
-                sum(comm_times) / len(comm_times), 3)
-
-        return summary
-
     def format_summary(self):
-        """Format the summary section."""
-        summary = self.compute_summary()
+        """Format experiment summary statistics."""
+        if not self.entries:
+            return "### DESLOC_SUMMARY_START ###\n### DESLOC_SUMMARY_END ###"
+        losses = [e['loss'] for e in self.entries if 'loss' in e]
+        elapsed = _m185_time.time() - self.start_time
+        x_syncs = sum(1 for e in self.entries if e.get('sync_x'))
+        u_syncs = sum(1 for e in self.entries if e.get('sync_u'))
+        v_syncs = sum(1 for e in self.entries if e.get('sync_v'))
+        total_comm = sum(e.get('comm_bytes', 0) for e in self.entries)
         lines = ["### DESLOC_SUMMARY_START ###"]
-        for k, v in summary.items():
-            lines.append(self._format_value(k, v))
+        lines.append(f"final_loss={losses[-1]:.6f}" if losses else "final_loss=N/A")
+        lines.append(f"min_loss={min(losses):.6f}" if losses else "min_loss=N/A")
+        lines.append(f"total_steps={len(self.entries)}")
+        lines.append(f"x_syncs={x_syncs}")
+        lines.append(f"u_syncs={u_syncs}")
+        lines.append(f"v_syncs={v_syncs}")
+        lines.append(f"total_comm_bytes={total_comm}")
+        ddp_syncs = len(self.entries) * 3
+        desloc_syncs = x_syncs + u_syncs + v_syncs
+        lines.append(f"reduction_factor={round(ddp_syncs / max(desloc_syncs, 1), 2)}")
+        lines.append(f"elapsed_seconds={elapsed:.1f}")
         lines.append("### DESLOC_SUMMARY_END ###")
         return "\n".join(lines)
 
     def save(self, filename=None):
         """Save complete log to file."""
-        _os.makedirs(self.log_dir, exist_ok=True)
+        _m185_os.makedirs(self.log_dir, exist_ok=True)
         if filename is None:
-            cfg = self.config
-            parts = [self.benchmark_id]
-            if 'model_size' in cfg:
-                parts.append(cfg['model_size'])
-            if 'Kx' in cfg:
-                parts.append(f"Kx{cfg['Kx']}")
-            if 'seed' in cfg:
-                parts.append(f"s{cfg['seed']}")
-            filename = "_".join(parts) + ".log"
-
-        path = _os.path.join(self.log_dir, filename)
-        with open(path, 'w') as f:
+            filename = f"{self.benchmark_id}_{int(self.start_time)}.log"
+        filepath = _m185_os.path.join(self.log_dir, filename)
+        with open(filepath, 'w') as f:
             f.write(self.format_header() + "\n")
             f.write(self.format_entries() + "\n")
-            f.write("### DESLOC_EXPERIMENT_END ###\n")
             f.write(self.format_summary() + "\n")
-        return path
-
-    def save_json(self, filename=None):
-        """Save as JSON for programmatic access."""
-        _os.makedirs(self.log_dir, exist_ok=True)
-        if filename is None:
-            filename = f"{self.benchmark_id}.json"
-        path = _os.path.join(self.log_dir, filename)
-        output = {
-            'benchmark_id': self.benchmark_id,
-            'config': self.config,
-            'metadata': self.metadata,
-            'summary': self.compute_summary(),
-            'entries': self.entries,
-        }
-        with open(path, 'w') as f:
-            _json.dump(output, f, indent=2)
-        return path
+            f.write("### DESLOC_EXPERIMENT_END ###\n")
+        return filepath
 
 
-class DESLOCLogParser:
-    """Parse DES-LOC structured log files for plotting.
+class DESLOCCommReductionTracker:
+    """Track per-state communication volumes for figure generation.
 
-    Reads logs produced by DESLOCStructuredLogger and extracts
-    data suitable for matplotlib/seaborn visualization.
-
-    Follows NKI-FA draw_plot.py parsing convention.
+    Records exact bytes communicated per step, per state type
+    (x=params, u=first moment, v=second moment, muon=Muon momentum).
     """
 
-    def __init__(self):
-        self.experiments = []
+    def __init__(self, param_bytes=0, world_size=1):
+        self.param_bytes = param_bytes
+        self.world_size = world_size
+        self.step = 0
+        self.x_comm_bytes = 0
+        self.u_comm_bytes = 0
+        self.v_comm_bytes = 0
+        self.muon_comm_bytes = 0
+        self.x_comm_count = 0
+        self.u_comm_count = 0
+        self.v_comm_count = 0
+        self.muon_comm_count = 0
+        self.step_log = []
 
-    def parse_file(self, path):
-        """Parse a single log file."""
-        config = {}
-        entries = []
-        summary = {}
-        section = 'header'
+    def record_sync(self, state_type, num_bytes, elapsed_ms=0.0):
+        """Record a synchronization event."""
+        if state_type == 'x':
+            self.x_comm_bytes += num_bytes
+            self.x_comm_count += 1
+        elif state_type == 'u':
+            self.u_comm_bytes += num_bytes
+            self.u_comm_count += 1
+        elif state_type == 'v':
+            self.v_comm_bytes += num_bytes
+            self.v_comm_count += 1
+        elif state_type == 'muon':
+            self.muon_comm_bytes += num_bytes
+            self.muon_comm_count += 1
 
-        with open(path, 'r') as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-
-                if line == '### DESLOC_EXPERIMENT_START ###':
-                    section = 'data'
-                    continue
-                elif line == '### DESLOC_EXPERIMENT_END ###':
-                    section = 'between'
-                    continue
-                elif line == '### DESLOC_SUMMARY_START ###':
-                    section = 'summary'
-                    continue
-                elif line == '### DESLOC_SUMMARY_END ###':
-                    section = 'done'
-                    continue
-
-                if line.startswith('# config:'):
-                    cfg_str = line[len('# config:'):].strip()
-                    for part in cfg_str.split():
-                        if '=' in part:
-                            k, v = part.split('=', 1)
-                            config[k] = self._parse_val(v)
-                    continue
-
-                if line.startswith('# benchmark:'):
-                    config['benchmark_id'] = line.split(':', 1)[1].strip()
-                    continue
-
-                if line.startswith('#'):
-                    continue
-
-                if section == 'data':
-                    entry = {}
-                    for part in line.split():
-                        if '=' in part:
-                            k, v = part.split('=', 1)
-                            entry[k] = self._parse_val(v)
-                    if entry:
-                        entries.append(entry)
-
-                elif section == 'summary':
-                    if '=' in line:
-                        k, v = line.split('=', 1)
-                        summary[k] = self._parse_val(v)
-
-        result = {
-            'config': config,
-            'entries': entries,
-            'summary': summary,
-            'path': path,
+    def record_step(self, loss=None, lr=None):
+        """Record per-step metrics."""
+        total = (self.x_comm_bytes + self.u_comm_bytes +
+                 self.v_comm_bytes + self.muon_comm_bytes)
+        entry = {
+            'step': self.step,
+            'total_comm_bytes': total,
+            'x_bytes': self.x_comm_bytes,
+            'u_bytes': self.u_comm_bytes,
+            'v_bytes': self.v_comm_bytes,
+            'muon_bytes': self.muon_comm_bytes,
         }
-        self.experiments.append(result)
-        return result
+        if loss is not None:
+            entry['loss'] = loss
+        self.step_log.append(entry)
+        self.step += 1
 
-    def _parse_val(self, s):
-        """Parse a string value to appropriate type."""
-        try:
-            if '.' in s or 'e' in s.lower():
-                return float(s)
-            return int(s)
-        except ValueError:
-            return s
-
-    def parse_directory(self, log_dir):
-        """Parse all .log files in a directory."""
-        results = []
-        for fn in sorted(_os.listdir(log_dir)):
-            if fn.endswith('.log'):
-                path = _os.path.join(log_dir, fn)
-                results.append(self.parse_file(path))
-        return results
-
-    def extract_loss_curves(self, benchmark_filter=None):
-        """Extract loss curves for plotting.
-
-        Returns dict suitable for pd.DataFrame:
-        {
-          'step': [...],
-          'loss': [...],
-          'config_label': [...],
-        }
-        """
-        data = {'step': [], 'loss': [], 'config_label': []}
-        for exp in self.experiments:
-            bid = exp['config'].get('benchmark_id', '')
-            if benchmark_filter and benchmark_filter not in bid:
-                continue
-            cfg = exp['config']
-            label = f"{cfg.get('method', 'desloc')}_Kx{cfg.get('Kx', '?')}"
-            for entry in exp['entries']:
-                if 'step' in entry and 'loss' in entry:
-                    data['step'].append(entry['step'])
-                    data['loss'].append(entry['loss'])
-                    data['config_label'].append(label)
-        return data
-
-    def extract_comm_reduction(self):
-        """Extract communication reduction data."""
-        data = {'method': [], 'reduction_vs_ddp': [],
-                'final_loss': []}
-        for exp in self.experiments:
-            s = exp.get('summary', {})
-            cfg = exp.get('config', {})
-            data['method'].append(
-                cfg.get('method', 'desloc'))
-            data['reduction_vs_ddp'].append(
-                s.get('reduction_vs_ddp', 1.0))
-            data['final_loss'].append(
-                s.get('final_loss', 0.0))
-        return data
+    def get_reduction_factor(self, total_steps=None):
+        """Compute communication reduction vs DDP."""
+        steps = total_steps or max(self.step, 1)
+        ddp_bytes = self.param_bytes * 3 * steps  # all 3 states every step
+        actual = (self.x_comm_bytes + self.u_comm_bytes +
+                  self.v_comm_bytes + self.muon_comm_bytes)
+        if actual == 0:
+            return float('inf')
+        return round(ddp_bytes / actual, 2)
 
 
-# =================================================================
-# End M071
-# =================================================================
+# ── end M185 ────────────────────────────────────────────────────
