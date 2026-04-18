@@ -4353,6 +4353,14 @@ class DeepSpeedEngine(Module):
         autotp_uc_info = getattr(self.module, UNIVERSAL_CHECKPOINT_INFO, None)
         if autotp_uc_info is not None:
             state[UNIVERSAL_CHECKPOINT_INFO] = autotp_uc_info
+        # DES-LOC: persist sync periods and counters for checkpoint resume
+        if self.desloc_enabled:
+            state['desloc'] = {
+                'Kx': self.desloc_Kx, 'Ku': self.desloc_Ku, 'Kv': self.desloc_Kv,
+                'step_counter': getattr(self, 'desloc_step_counter', 0),
+                'sync_x_count': getattr(self, 'desloc_sync_x_count', 0),
+                'total_comm_bytes': getattr(self, 'desloc_total_comm_bytes', 0),
+            }
         state.update(client_state)
         log_dist(message=f'Saving model checkpoint: {save_path}', ranks=[0])
 
