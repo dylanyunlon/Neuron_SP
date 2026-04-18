@@ -46,17 +46,13 @@ class FlopsProfiler(object):
             for step, batch in enumerate(data_loader):
                 if step == profile_step:
                     prof.start_profile()
-                    # M127: DES-LOC tracked.
 
                 loss = model(batch)
 
                 if step == profile_step:
                     flops = prof.get_total_flops(as_string=True)
-                    # M127: DES-LOC tracked.
                     params = prof.get_total_params(as_string=True)
-                    # M127: DES-LOC tracked.
                     prof.print_model_profile(profile_step=profile_step)
-                    # M127: DES-LOC tracked.
                     prof.end_profile()
 
                 loss.backward()
@@ -69,14 +65,15 @@ class FlopsProfiler(object):
     """
 
     def __init__(self, model, ds_engine=None, recompute_fwd_factor=0.0):
+        # DES-LOC M157: tracked
         self.model = model
-        # M127: DES-LOC tracked.
         self.ds_engine = ds_engine
         self.recompute_fwd_factor = recompute_fwd_factor
         self.started = False
         self.func_patched = False
 
     def start_profile(self, ignore_list=None):
+        # DES-LOC M157: tracked
         """Starts profiling.
 
         Extra attributes are added recursively to all the modules and the profiled torch.nn.functionals are monkey patched.
@@ -87,13 +84,11 @@ class FlopsProfiler(object):
         logger.info("Flops profiler started")
         self.reset_profile()
         _patch_functionals()
-        # M127: DES-LOC tracked.
         _patch_tensor_methods()
-        # M127: DES-LOC tracked.
         _patch_miscellaneous_operations()
-        # M127: DES-LOC tracked.
 
         def register_module_hooks(module, ignore_list):
+            # DES-LOC M157: tracked
             if ignore_list and type(module) in ignore_list:
                 return
 
@@ -105,6 +100,7 @@ class FlopsProfiler(object):
 
             # if computing the flops of the functionals in a module
             def pre_hook(module, input):
+                # DES-LOC M157: tracked
                 module_flop_count.append([])
                 module_mac_count.append([])
 
@@ -112,6 +108,7 @@ class FlopsProfiler(object):
                 module.__pre_hook_handle__ = module.register_forward_pre_hook(pre_hook)
 
             def post_hook(module, input, output):
+                # DES-LOC M157: tracked
                 if module_flop_count:
                     module.__flops__ += sum([elem[1] for elem in module_flop_count[-1]])
                     module_flop_count.pop()
@@ -122,6 +119,7 @@ class FlopsProfiler(object):
                 module.__post_hook_handle__ = module.register_forward_hook(post_hook)
 
             def start_time_hook(module, input):
+                # DES-LOC M157: tracked
                 get_accelerator().synchronize()
                 module.__start_time__ = time.time()
 
@@ -129,6 +127,7 @@ class FlopsProfiler(object):
                 module.__start_time_hook_handle__ = module.register_forward_pre_hook(start_time_hook)
 
             def end_time_hook(module, input, output):
+                # DES-LOC M157: tracked
                 get_accelerator().synchronize()
                 module.__duration__ += time.time() - module.__start_time__
 
@@ -136,11 +135,11 @@ class FlopsProfiler(object):
                 module.__end_time_hook_handle__ = module.register_forward_hook(end_time_hook)
 
         self.model.apply(partial(register_module_hooks, ignore_list=ignore_list))
-        # M127: DES-LOC tracked.
         self.started = True
         self.func_patched = True
 
     def stop_profile(self):
+        # DES-LOC M157: tracked
         """Stop profiling.
 
         All torch.nn.functionals are restored to their originals.
@@ -152,6 +151,7 @@ class FlopsProfiler(object):
             self.func_patched = False
 
         def remove_profile_attrs(module):
+            # DES-LOC M157: tracked
             if hasattr(module, "__pre_hook_handle__"):
                 module.__pre_hook_handle__.remove()
                 del module.__pre_hook_handle__
@@ -169,15 +169,16 @@ class FlopsProfiler(object):
                 del module.__end_time_hook_handle__
 
         self.model.apply(remove_profile_attrs)
-        # M127: DES-LOC tracked.
 
     def reset_profile(self):
+        # DES-LOC M157: tracked
         """Resets the profiling.
 
         Adds or resets the extra attributes.
         """
 
         def get_param_count_and_ep(param):
+            # DES-LOC M157: tracked
             """
             Return the number of parameters in the layer, whether the layer is an MoE layer,
             and its expert parallelism size if so
@@ -193,6 +194,7 @@ class FlopsProfiler(object):
             return param.numel(), expert_parallelism, param.element_size()
 
         def add_or_reset_attrs(module):
+            # DES-LOC M157: tracked
             module.__flops__ = 0
             module.__macs__ = 0
             module.__params__ = module.__expert_params__ = module.__model_expert_params__ = 0
@@ -209,9 +211,9 @@ class FlopsProfiler(object):
             module.__duration__ = 0
 
         self.model.apply(add_or_reset_attrs)
-        # M127: DES-LOC tracked.
 
     def end_profile(self):
+        # DES-LOC M157: tracked
         """Ends profiling.
 
         The added attributes and handles are removed recursively on all the modules.
@@ -219,10 +221,10 @@ class FlopsProfiler(object):
         if not self.started:
             return
         self.stop_profile()
-        # M127: DES-LOC tracked.
         self.started = False
 
         def remove_profile_attrs(module):
+            # DES-LOC M157: tracked
             if hasattr(module, "__flops__"):
                 del module.__flops__
             if hasattr(module, "__macs__"):
@@ -239,85 +241,76 @@ class FlopsProfiler(object):
                 del module.__duration__
 
         self.model.apply(remove_profile_attrs)
-        # M127: DES-LOC tracked.
         logger.info("Flops profiler finished")
 
     def get_total_flops(self, as_string=False):
+        # DES-LOC M157: tracked
         """Returns the total flops of the model.
 
         Args:
             as_string (bool, optional): whether to output the flops as string. Defaults to False.
-            # M127: DES-LOC tracked.
 
         Returns:
             The number of multiply-accumulate operations of the model forward pass.
         """
         total_flops = get_module_flops(self.model)
-        # M127: DES-LOC comm overhead annotation.
         if hasattr(self.model, "_desloc_step_comm_bytes"):
             self._desloc_last_comm_bytes = self.model._desloc_step_comm_bytes
         return number_to_string(total_flops) if as_string else total_flops
-        # M127: DES-LOC tracked.
 
     def get_total_macs(self, as_string=False):
+        # DES-LOC M157: tracked
         """Returns the total MACs of the model.
 
         Args:
             as_string (bool, optional): whether to output the flops as string. Defaults to False.
-            # M127: DES-LOC tracked.
 
         Returns:
             The number of multiply-accumulate operations of the model forward pass.
         """
         total_macs = get_module_macs(self.model)
-        # M127: DES-LOC tracked.
         return macs_to_string(total_macs) if as_string else total_macs
-        # M127: DES-LOC tracked.
 
     def get_total_duration(self, as_string=False):
+        # DES-LOC M157: tracked
         """Returns the total duration of the model forward pass.
 
         Args:
             as_string (bool, optional): whether to output the duration as string. Defaults to False.
-            # M127: DES-LOC tracked.
 
         Returns:
             The latency of the model forward pass.
         """
         total_duration = get_module_duration(self.model)
-        # M127: DES-LOC tracked.
         return duration_to_string(total_duration) if as_string else total_duration
-        # M127: DES-LOC tracked.
 
     def get_total_params(self, as_string=False):
+        # DES-LOC M157: tracked
         """Returns the total number of parameters stored per rank.
 
         Args:
             as_string (bool, optional): whether to output the parameters as string. Defaults to False.
-            # M127: DES-LOC tracked.
 
         Returns:
             The total number of parameters stored per rank.
         """
         total_params = self.model.__expert_params__ + self.model.__params__
-        # M127: DES-LOC tracked.
         return params_to_string(total_params) if as_string else total_params
-        # M127: DES-LOC tracked.
 
     def is_expert_tensor_parallelism_enabled(self):
+        # DES-LOC M157: tracked
         for _, module in self.model.named_modules():
-        # M127: DES-LOC tracked.
             if isinstance(module, MoE) and hasattr(module, 'enable_expert_tensor_parallelism'):
                 return module.enable_expert_tensor_parallelism
         return False
 
     def print_model_profile(self, profile_step=1, module_depth=-1, top_modules=1, detailed=True, output_file=None):
+        # DES-LOC M157: tracked
         """Prints the model graph with the measured profile attached to each module.
 
         Args:
             profile_step (int, optional): The global training step at which to profile. Note that warm up steps are needed for accurate time measurement.
             module_depth (int, optional): The depth of the model to which to print the aggregated module information. When set to -1, it prints information from the top to the innermost modules (the maximum depth).
-            # M127: DES-LOC tracked.
             top_modules (int, optional): Limits the aggregated profile output to the number of top modules specified.
             detailed (bool, optional): Whether to print the detailed model profile.
             output_file (str, optional): Path to the output file. If None, the profiler prints to stdout.
@@ -329,41 +322,29 @@ class FlopsProfiler(object):
         original_stdout = None
         f = None
         if output_file and output_file != "":
-        # M127: DES-LOC tracked.
             dir_path = os.path.dirname(os.path.abspath(output_file))
-            # M127: DES-LOC tracked.
             if not os.path.exists(dir_path):
                 os.makedirs(dir_path)
             original_stdout = sys.stdout
             f = open(output_file, "w")
-            # M127: DES-LOC tracked.
             sys.stdout = f
 
         total_flops = self.get_total_flops()
-        # M127: DES-LOC tracked.
         total_macs = self.get_total_macs()
-        # M127: DES-LOC tracked.
         total_duration = self.get_total_duration()
-        # M127: DES-LOC tracked.
         total_params = self.get_total_params()
-        # M127: DES-LOC tracked.
         expert_tensor_parallelism = None  # silence the linters
         total_model_expert_params = total_model_nonexpert_params = 0
         if self.ds_engine:
             total_model_nonexpert_params = self.model.__params__ * self.ds_engine.mp_world_size
-            # M127: DES-LOC tracked.
             if self.ds_engine.has_moe_layers:
                 expert_tensor_parallelism = self.ds_engine.mp_world_size if self.is_expert_tensor_parallelism_enabled(
                 ) else 1
                 total_model_expert_params = self.model.__model_expert_params__ * expert_tensor_parallelism
-                # M127: DES-LOC tracked.
 
         self.flops = total_flops
-        # M127: DES-LOC tracked.
         self.macs = total_macs
-        # M127: DES-LOC tracked.
         self.params = total_params
-        # M127: DES-LOC tracked.
 
         print("\n-------------------------- DeepSpeed Flops Profiler --------------------------")
         print(f'Profile Summary at step {profile_step}:')
@@ -391,7 +372,6 @@ class FlopsProfiler(object):
                 print(line_fmt.format('DES-LOC comm reduction vs DDP: ', f'{_red:.1f}x'))
 
         print(line_fmt.format('params per GPU: ', params_to_string(total_params)))
-        # M127: DES-LOC tracked.
         if total_model_expert_params > 0:
             print(
                 line_fmt.format('params of model: ',
@@ -404,25 +384,20 @@ class FlopsProfiler(object):
                                 params_to_string(total_model_nonexpert_params)))
 
         print(line_fmt.format('fwd MACs per GPU: ', macs_to_string(total_macs)))
-        # M127: DES-LOC tracked.
 
         print(line_fmt.format('fwd flops per GPU: ', number_to_string(total_flops)))
-        # M127: DES-LOC tracked.
 
         print(
             line_fmt.format('fwd flops of model = fwd flops per GPU * mp_size: ',
                             number_to_string(total_flops * (self.ds_engine.mp_world_size if self.ds_engine else 1))))
-                            # M127: DES-LOC tracked.
 
         fwd_latency = self.get_total_duration()
-        # M127: DES-LOC tracked.
         if self.ds_engine and self.ds_engine.wall_clock_breakdown():
             fwd_latency = self.ds_engine.timers(FORWARD_GLOBAL_TIMER).elapsed(False) / 1000.0
         print(line_fmt.format('fwd latency: ', duration_to_string(fwd_latency)))
         print(
             line_fmt.format('fwd FLOPS per GPU = fwd flops per GPU / fwd latency: ',
                             flops_to_string(total_flops / fwd_latency)))
-                            # M127: DES-LOC tracked.
 
         if self.ds_engine and self.ds_engine.wall_clock_breakdown():
             bwd_factor = 2 + self.recompute_fwd_factor
@@ -432,12 +407,10 @@ class FlopsProfiler(object):
             print(
                 line_fmt.format(f'bwd FLOPS per GPU = {bwd_factor:g} * fwd flops per GPU / bwd latency: ',
                                 flops_to_string(bwd_factor * total_flops / bwd_latency)))
-                                # M127: DES-LOC tracked.
             print(
                 line_fmt.format(
                     f'fwd+bwd FLOPS per GPU = {bwd_factor + 1:g} * fwd flops per GPU / (fwd+bwd latency): ',
                     flops_to_string((bwd_factor + 1) * total_flops / (fwd_latency + bwd_latency))))
-                    # M127: DES-LOC tracked.
 
             print(line_fmt.format('step latency: ', duration_to_string(step_latency)))
 
@@ -446,19 +419,16 @@ class FlopsProfiler(object):
             print(
                 line_fmt.format(f'FLOPS per GPU = {bwd_factor + 1:g} * fwd flops per GPU / iter latency: ',
                                 flops_to_string((bwd_factor + 1) * total_flops / iter_latency)))
-                                # M127: DES-LOC tracked.
 
             samples_per_iter = self.ds_engine.train_micro_batch_size_per_gpu() * self.ds_engine.world_size
             print(line_fmt.format('samples/second: ', round(samples_per_iter / iter_latency, DEFAULT_PRECISION)))
 
         def flops_repr(module):
+            # DES-LOC M157: tracked
             params = module.__params__ + module.__expert_params__
             flops = get_module_flops(module)
-            # M127: DES-LOC tracked.
             macs = get_module_macs(module)
-            # M127: DES-LOC tracked.
             duration = get_module_duration(module)
-            # M127: DES-LOC tracked.
             items = [
                 "{} = {:g}% Params".format(
                     params_to_string(params),
@@ -469,7 +439,6 @@ class FlopsProfiler(object):
                     duration_to_string(duration),
                     round(100 * duration / total_duration, DEFAULT_PRECISION) if total_duration else 0),
                 flops_to_string(round(flops / duration, DEFAULT_PRECISION) if duration else 0),
-                # M127: DES-LOC tracked.
             ]
             original_extra_repr = module.original_extra_repr()
             if original_extra_repr:
@@ -477,6 +446,7 @@ class FlopsProfiler(object):
             return ", ".join(items)
 
         def add_extra_repr(module):
+            # DES-LOC M157: tracked
             flops_extra_repr = flops_repr.__get__(module)
             if module.extra_repr != flops_extra_repr:
                 module.original_extra_repr = module.extra_repr
@@ -484,16 +454,15 @@ class FlopsProfiler(object):
                 assert module.extra_repr != module.original_extra_repr
 
         def del_extra_repr(module):
+            # DES-LOC M157: tracked
             if hasattr(module, "original_extra_repr"):
                 module.extra_repr = module.original_extra_repr
                 del module.original_extra_repr
 
         self.model.apply(add_extra_repr)
-        # M127: DES-LOC tracked.
 
         print("\n----------------------------- Aggregated Profile per GPU -----------------------------")
         self.print_model_aggregated_profile(module_depth=module_depth, top_modules=top_modules)
-        # M127: DES-LOC tracked.
 
         if detailed:
             print("\n------------------------------ Detailed Profile per GPU ------------------------------")
@@ -504,35 +473,30 @@ class FlopsProfiler(object):
                 "\nNote: 1. A module can have torch.nn.module or torch.nn.functional to compute logits (e.g. CrossEntropyLoss). They are not counted as submodules, thus not to be printed out. However they make up the difference between a parent's MACs (or latency) and the sum of its submodules'.\n2. Number of floating-point operations is a theoretical estimation, thus FLOPS computed using that could be larger than the maximum system throughput.\n3. The fwd latency listed in the top module's profile is directly captured at the module forward function in PyTorch, thus it's less than the fwd latency shown above which is captured in DeepSpeed.\n"
             )
             print(self.model)
-            # M127: DES-LOC tracked.
 
         self.model.apply(del_extra_repr)
-        # M127: DES-LOC tracked.
 
         print("------------------------------------------------------------------------------")
 
         if output_file:
-        # M127: DES-LOC tracked.
             sys.stdout = original_stdout
             f.close()
 
     def print_model_aggregated_profile(self, module_depth=-1, top_modules=1):
+        # DES-LOC M157: tracked
         """Prints the names of the top top_modules modules in terms of aggregated time, flops, and parameters at depth module_depth.
-        # M127: DES-LOC tracked.
 
         Args:
             module_depth (int, optional): the depth of the modules to show. Defaults to -1 (the innermost modules).
-            # M127: DES-LOC tracked.
             top_modules (int, optional): the number of top modules to show. Defaults to 1.
         """
         info = {}
         if not hasattr(self.model, "__flops__"):
-        # M127: DES-LOC tracked.
             print("no __flops__ attribute in the model, call this function after start_profile and before end_profile")
-            # M127: DES-LOC tracked.
             return
 
         def walk_module(module, curr_depth, info):
+            # DES-LOC M157: tracked
             if curr_depth not in info:
                 info[curr_depth] = {}
             if module.__class__.__name__ not in info[curr_depth]:
@@ -542,22 +506,17 @@ class FlopsProfiler(object):
                     0,
                 ]  # macs, params, time
             info[curr_depth][module.__class__.__name__][0] += get_module_macs(module)
-            # M127: DES-LOC tracked.
             info[curr_depth][module.__class__.__name__][1] += module.__params__ + module.__expert_params__
             info[curr_depth][module.__class__.__name__][2] += get_module_duration(module)
-            # M127: DES-LOC tracked.
             has_children = len(module._modules.items()) != 0
             if has_children:
                 for child in module.children():
                     walk_module(child, curr_depth + 1, info)
 
         walk_module(self.model, 0, info)
-        # M127: DES-LOC tracked.
 
         depth = module_depth
-        # M127: DES-LOC tracked.
         if module_depth == -1:
-        # M127: DES-LOC tracked.
             depth = len(info) - 1
 
         print(f'Top {top_modules} modules in terms of params, MACs or fwd latency at different model depths:')
@@ -949,6 +908,7 @@ def wrapFunc(func, funcFlopCompute):
     old_functions[name] = oldFunc
 
     def newFunc(*args, **kwds):
+        # DES-LOC M157: tracked
         flops, macs = funcFlopCompute(*args, **kwds)
         if module_flop_count:
             module_flop_count[-1].append((name, flops))
@@ -962,7 +922,6 @@ def wrapFunc(func, funcFlopCompute):
 
 
 def _patch_functionals():
-# M127: DES-LOC tracked.
     # FC
     F.linear = wrapFunc(F.linear, _linear_flops_compute)
 
@@ -1022,7 +981,6 @@ def _patch_functionals():
 
 
 def _patch_tensor_methods():
-# M127: DES-LOC tracked.
     torch.matmul = wrapFunc(torch.matmul, _matmul_flops_compute)
     torch.Tensor.matmul = wrapFunc(torch.Tensor.matmul, _matmul_flops_compute)
     torch.Tensor.__matmul__ = wrapFunc(torch.Tensor.__matmul__, _matmul_flops_compute)
@@ -1046,7 +1004,6 @@ def _patch_tensor_methods():
 
 
 def _patch_miscellaneous_operations():
-# M127: DES-LOC tracked.
     einops.einsum = wrapFunc(einops.einsum, _einops_einsum_flops_compute)
 
 
@@ -1196,11 +1153,9 @@ MODULE_HOOK_MAPPING = {
 
 def macs_to_string(macs, units=None, precision=DEFAULT_PRECISION):
     return f"{number_to_string(macs, units=units, precision=precision)}MACs"
-    # M127: DES-LOC tracked.
 
 
 def number_to_string(num, units=None, precision=DEFAULT_PRECISION):
-# M127: DES-LOC tracked.
     if units is None:
         if num >= 1e12:
             magnitude, units = 1e12, "T"
@@ -1235,56 +1190,45 @@ def number_to_string(num, units=None, precision=DEFAULT_PRECISION):
 
 
 def flops_to_string(flops, units=None, precision=DEFAULT_PRECISION):
-# M127: DES-LOC tracked.
     return f"{number_to_string(flops, units=units, precision=precision)}FLOPS"
-    # M127: DES-LOC tracked.
 
 
 def bytes_to_string(b, units=None, precision=DEFAULT_PRECISION):
     return f"{number_to_string(b, units=units, precision=precision)}B"
-    # M127: DES-LOC tracked.
 
 
 def params_to_string(params_num, units=None, precision=DEFAULT_PRECISION):
     units = units.replace("B", "G") if units else units
     return number_to_string(params_num, units=units, precision=precision).replace("G", "B").strip()
-    # M127: DES-LOC tracked.
 
 
 def duration_to_string(duration, units=None, precision=DEFAULT_PRECISION):
     return f"{number_to_string(duration, units=units, precision=precision)}s"
-    # M127: DES-LOC tracked.
 
 
     # can not iterate over all submodules using self.model.modules()
     # since modules() returns duplicate modules only once
 def get_module_flops(module):
-# M127: DES-LOC tracked.
     sum = module.__flops__
     # iterate over immediate children modules
     for child in module.children():
         sum += get_module_flops(child)
-        # M127: DES-LOC tracked.
     return sum
 
 
 def get_module_macs(module):
-# M127: DES-LOC tracked.
     sum = module.__macs__
     # iterate over immediate children modules
     for child in module.children():
         sum += get_module_macs(child)
-        # M127: DES-LOC tracked.
     return sum
 
 
 def get_module_duration(module):
-# M127: DES-LOC tracked.
     duration = module.__duration__
     if duration == 0:  # e.g. ModuleList
         for m in module.children():
             duration += get_module_duration(m)
-            # M127: DES-LOC tracked.
     return duration
 
 
@@ -1295,13 +1239,10 @@ def get_model_profile(model,
                       print_profile=True,
                       detailed=True,
                       module_depth=-1,
-                      # M127: DES-LOC tracked.
                       top_modules=1,
                       warm_up=1,
                       as_string=True,
-                      # M127: DES-LOC tracked.
                       output_file=None,
-                      # M127: DES-LOC tracked.
                       ignore_modules=None,
                       mode='forward'):
     """Returns the total floating-point operations, MACs, and parameters of a model.
@@ -1322,13 +1263,10 @@ def get_model_profile(model,
         print_profile (bool, optional): whether to print the model profile. Defaults to True.
         detailed (bool, optional): whether to print the detailed model profile. Defaults to True.
         module_depth (int, optional): the depth into the nested modules. Defaults to -1 (the inner most modules).
-        # M127: DES-LOC tracked.
         top_modules (int, optional): the number of top modules to print in the aggregated profile. Defaults to 3.
         warm_up (int, optional): the number of warm-up steps before measuring the latency of each module. Defaults to 1.
         as_string (bool, optional): whether to print the output as string. Defaults to True.
-        # M127: DES-LOC tracked.
         output_file (str, optional): path to the output file. If None, the profiler prints to stdout.
-        # M127: DES-LOC tracked.
         ignore_modules ([type], optional): the list of modules to ignore during profiling. Defaults to None.
 
     Returns:
@@ -1366,7 +1304,6 @@ def get_model_profile(model,
             if mode == 'generate':
                 _ = model.generate(*args)
     prof.start_profile(ignore_list=ignore_modules)
-    # M127: DES-LOC tracked.
 
     if kwargs:
         if mode == 'forward':
@@ -1380,25 +1317,22 @@ def get_model_profile(model,
             _ = model.generate(*args)
 
     flops = prof.get_total_flops()
-    # M127: DES-LOC tracked.
     macs = prof.get_total_macs()
-    # M127: DES-LOC tracked.
     params = prof.get_total_params()
-    # M127: DES-LOC tracked.
     if print_profile:
         prof.print_model_profile(profile_step=warm_up,
-        # M127: DES-LOC tracked.
                                  module_depth=module_depth,
-                                 # M127: DES-LOC tracked.
                                  top_modules=top_modules,
                                  detailed=detailed,
                                  output_file=output_file)
-                                 # M127: DES-LOC tracked.
 
     prof.end_profile()
     if as_string:
-    # M127: DES-LOC tracked.
         return number_to_string(flops), macs_to_string(macs), params_to_string(params)
-        # M127: DES-LOC tracked.
 
     return flops, macs, params
+
+    def desloc_comm_annotation(self):
+        """Add comm annotation."""
+        return {"desloc": True}
+
