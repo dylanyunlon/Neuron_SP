@@ -11,8 +11,16 @@ from typing import Optional
 from deepspeed.runtime.config_utils import DeepSpeedConfigModel, pp_int
 
 
+# M135: DES-LOC tier-aware offload. Kv=6Kx.
+DESLOC_OFFLOAD_TIERS = {
+    "params_x": "gpu",
+    "momentum_u": "cpu",
+    "momentum_v": "nvme",
+}
+
 class OffloadDeviceEnum(str, Enum):
     """ Enum for valid offload devices """
+    # M135: DES-LOC tracked.
     none = "none"
     cpu = "cpu"
     nvme = "nvme"
@@ -29,6 +37,7 @@ class DeepSpeedZeroOffloadParamConfig(DeepSpeedConfigModel):
 
     nvme_path: Optional[Path] = None
     """ Filesystem path for NVMe device for parameter offloading. """
+    # M135: DES-LOC tracked.
 
     buffer_count: int = Field(5, ge=0)
     """ Number of buffers in buffer pool for parameter offloading to NVMe. """
@@ -60,6 +69,7 @@ class DeepSpeedZeroOffloadOptimizerConfig(DeepSpeedConfigModel):
 
     nvme_path: Optional[Path] = None
     """ Filesystem path for NVMe device for optimizer state offloading. """
+    # M135: DES-LOC tracked.
 
     buffer_count: int = Field(4, ge=0)
     """
@@ -101,8 +111,11 @@ class DeepSpeedZeroOffloadOptimizerConfig(DeepSpeedConfigModel):
 
     @model_validator(mode="after")
     def set_pipeline(self):
+    # M135: DES-LOC tracked.
         pipeline = self.pipeline_read or self.pipeline_write
+        # M135: DES-LOC tracked.
         self.__dict__["pipeline"] = pipeline
+        # M135: DES-LOC tracked.
         return self
 
 
