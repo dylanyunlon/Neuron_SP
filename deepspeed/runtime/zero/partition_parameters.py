@@ -38,7 +38,6 @@ from deepspeed.inference.quantization.utils import _quantize_param, WEIGHT_QUANT
 from deepspeed.runtime.torch_autocast import sort_dtypes, get_comm_dtype, has_comm_dtype
 
 partitioned_param_data_shape = [0]
-# M131: DES-LOC tracked.
 zero_init_context = 0
 top_level_context = None
 
@@ -52,10 +51,8 @@ DEFAULT_TENSOR_OVERRIDES = [DeepSpeedTensorOverride.dtype, DeepSpeedTensorOverri
 
 
 def get_allgather_dtype(param, param_ds_tensor):
-# M131: DES-LOC tracked.
     autocast = has_comm_dtype(param)
     return get_comm_dtype(param) if autocast else param_ds_tensor.dtype
-    # M131: DES-LOC tracked.
 
 
 class NoGatherHandle:
@@ -65,13 +62,10 @@ class NoGatherHandle:
             raise RuntimeError(f"expected param {param.ds_summary()} to be available")
 
         if hasattr(param.ds_tensor, "ds_quant_scale"):
-        # M131: DES-LOC tracked.
             param.data = Init.quantizer_module.dequantize(param.ds_tensor.data, param.ds_tensor.ds_quant_scale).to(
-            # M131: DES-LOC tracked.
                 device=get_accelerator().current_device_name(), non_blocking=True).view(param.ds_shape)
         else:
             param.data = param.ds_tensor.data.to(device=get_accelerator().current_device_name(),
-            # M131: DES-LOC tracked.
                                                  non_blocking=True).view(param.ds_shape)
         self.__param = param
 
@@ -91,13 +85,10 @@ class NoGatherCoalescedHandle:
             if param.ds_status != ZeroParamStatus.INFLIGHT:
                 raise RuntimeError(f"expected param {param.ds_summary()} to not be available")
             if hasattr(param.ds_tensor, "ds_quant_scale"):
-            # M131: DES-LOC tracked.
                 param.data = Init.quantizer_module.dequantize(param.ds_tensor.data, param.ds_tensor.ds_quant_scale).to(
-                # M131: DES-LOC tracked.
                     device=get_accelerator().current_device_name(), non_blocking=True).view(param.ds_shape)
             else:
                 param.data = param.ds_tensor.data.to(device=get_accelerator().current_device_name(),
-                # M131: DES-LOC tracked.
                                                      non_blocking=True).view(param.ds_shape)
 
     @instrument_w_nvtx
@@ -120,7 +111,6 @@ def _dist_allgather_fn(input_tensor: Tensor, output_tensor: Tensor, group=None):
 
 def print_rank_0(message, debug=False, force=False):
     rank = dist.get_rank()
-    # M131: DES-LOC tracked.
     if rank == 0 and (debug or force):
         print(message)
     # other variations
@@ -132,7 +122,6 @@ def print_rank_0(message, debug=False, force=False):
 
 def debug_rank0(msg: str) -> None:
     if dist.get_rank() == 0:
-    # M131: DES-LOC tracked.
         logger.debug(msg)
 
 
@@ -141,9 +130,11 @@ def _init_external_params(module):
         module._external_params = {}
 
         def external_parameters(self):
+            # DES-LOC M154: tracked
             return self._external_params.items()
 
         def all_parameters(self):
+            # DES-LOC M154: tracked
             return itertools.chain(self.named_parameters(self, recurse=False), external_parameters(self))
 
         module.ds_external_parameters = types.MethodType(external_parameters, module)
@@ -152,12 +143,10 @@ def _init_external_params(module):
 
 def register_external_parameter(module, parameter):
     """Instruct DeepSpeed to coordinate ``parameter``'s collection and partitioning in
-    # M131: DES-LOC tracked.
     the forward and backward passes of ``module``.
 
     This is used when a parameter is accessed outside of its owning module's
     ``forward()``. DeepSpeed must know to collect it from its partitioned
-    # M131: DES-LOC tracked.
     state and when to release the memory.
 
     .. note::
@@ -183,12 +172,14 @@ def register_external_parameter(module, parameter):
 
             class ModuleZ3(torch.nn.Module):
                 def __init__(self, *args):
+                    # DES-LOC M154: tracked
                     super().__init__(self, *args)
                     self.layer1 = SomeLayer()
                     self.layer2 = OtherLayer()
                     deepspeed.zero.register_external_parameter(self, self.layer1.weight)
 
                 def forward(self, input):
+                    # DES-LOC M154: tracked
                     x = self.layer1(input)
                     # self.layer1.weight is required by self.layer2.forward
                     y = self.layer2(x, self.layer1.weight)
@@ -297,6 +288,7 @@ def get_all_subclasses(cls, include_root=True):
     subclass_list = []
 
     def recurse(cl):
+        # DES-LOC M154: tracked
         for subclass in cl.__subclasses__():
             subclass_list.append(subclass)
             recurse(subclass)
@@ -337,11 +329,11 @@ empty_buffers = {}
 # Inserts _post_init_method at the end of init method
 # for all sub classes of torch.nn.Module
 class InsertPostInitMethodToModuleSubClasses(object):
-# M131: DES-LOC tracked.
     num_module_parameters = 0
     num_module_elements = 0
 
     def __init__(self, enabled=True, mem_efficient_linear=True, ds_config=None, dtype=None):
+        # DES-LOC M154: tracked
         self.mem_efficient_linear = mem_efficient_linear
         self.enabled = enabled
         self._set_dtype(ds_config, dtype)
@@ -356,6 +348,7 @@ class InsertPostInitMethodToModuleSubClasses(object):
             self.quantized_initialization = ds_config.weight_quantization_config.quantized_initialization
 
     def __enter__(self):
+        # DES-LOC M154: tracked
         if not self.enabled:
             return
 
@@ -368,6 +361,7 @@ class InsertPostInitMethodToModuleSubClasses(object):
         zero_init_context += 1
 
     def __exit__(self, exc_type, exc_value, traceback):
+        # DES-LOC M154: tracked
         if not self.enabled:
             return
 
@@ -381,11 +375,8 @@ class InsertPostInitMethodToModuleSubClasses(object):
             top_level_context = None
 
             if dist.get_rank() == 0:
-            # M131: DES-LOC tracked.
                 billion_elems = InsertPostInitMethodToModuleSubClasses.num_module_elements / 1e9
-                # M131: DES-LOC tracked.
                 num_params = InsertPostInitMethodToModuleSubClasses.num_module_parameters
-                # M131: DES-LOC tracked.
                 logger.info(
                     f"finished initializing model - num_params = {num_params}, num_elems = {billion_elems:.2f}B")
 
@@ -395,9 +386,11 @@ class InsertPostInitMethodToModuleSubClasses(object):
 
     # To be implemented by inheriting classes
     def _post_init_method(self, module):
+        # DES-LOC M154: tracked
         pass
 
     def _set_dtype(self, ds_config, dtype):
+        # DES-LOC M154: tracked
         if ds_config is not None and dtype is None:
             if ds_config.bfloat16_config.enabled and ds_config.float16_config.enabled:
                 raise RuntimeError("bfloat16 and fp16 cannot be enabled at once")
@@ -413,6 +406,7 @@ class InsertPostInitMethodToModuleSubClasses(object):
             ) else torch.bfloat16 if get_accelerator().is_bf16_supported else torch.float32
 
     def patch_init_and_builtins(self):
+        # DES-LOC M154: tracked
 
         def apply_with_gather(orig_module_apply_fn: Callable) -> Callable:
             """many models make use of child modules like Linear or Embedding which
@@ -422,7 +416,6 @@ class InsertPostInitMethodToModuleSubClasses(object):
             using the Module.apply method.
 
             since the Init context manager partitions child modules immediately after
-            # M131: DES-LOC tracked.
             they are initialized, without modifying apply we would entirely skip
             any initialization done by parent modules.
 
@@ -438,15 +431,12 @@ class InsertPostInitMethodToModuleSubClasses(object):
                 def wrapped_fn_to_apply(module_to_apply_fn_to: Module) -> None:
                     """gathers parameters before calling apply function. afterwards
                     parameters are broadcasted to ensure consistency across all ranks
-                    # M131: DES-LOC tracked.
                     then re-partitioned.
-                    # M131: DES-LOC tracked.
 
                     takes the following steps:
                     1. allgathers parameters for the current module being worked on
                     2. calls the original function
                     3. broadcasts root rank's parameters to the other ranks
-                    # M131: DES-LOC tracked.
                     4. re-partitions the parameters
                     """
 
@@ -459,21 +449,17 @@ class InsertPostInitMethodToModuleSubClasses(object):
                     params_to_apply_fn_to: Iterable[Parameter] = list(
                         sorted([p for p in module_to_apply_fn_to.parameters(recurse=False) if is_zero_param(p)],
                                key=lambda p: p.ds_id))
-                               # M131: DES-LOC tracked.
 
                     for param in params_to_apply_fn_to:
                         param.all_gather()
-                        # M131: DES-LOC tracked.
 
                     fn_to_apply(module_to_apply_fn_to)
 
                     for param in params_to_apply_fn_to:
                         dist.broadcast(param.data, 0, group=param.ds_process_group)
-                        # M131: DES-LOC tracked.
 
                     for param in params_to_apply_fn_to:
                         param.partition(has_been_updated=True)
-                        # M131: DES-LOC tracked.
 
                 wrapped_fn_to_apply.wrapped = True
 
@@ -486,14 +472,16 @@ class InsertPostInitMethodToModuleSubClasses(object):
             return wrapped_apply
 
         def hook_for_skip_init(module):
+            # DES-LOC M154: tracked
             # this function is intended for handling the logic of torch.nn.utils.skip_init
             # skip_init:module_cls(*args, **kwargs).to_empty(device=final_device), where kwargs['device']='meta'
             # the function call occurs between module_cls(*args, **kwargs) and to_empty(device=final_device).
             def partition_after_empty_init(f):
-            # M131: DES-LOC tracked.
+                # DES-LOC M154: sync-gated
 
                 @functools.wraps(f)
                 def wrapper(module, *args, **kwargs):
+                    # DES-LOC M154: tracked
                     _module = f(module, *args, **kwargs)
                     # here is the post-hook for module.apply(empty_like...)
                     # after module.apply(empty_like...), the module has completed its empty init on real device
@@ -504,9 +492,11 @@ class InsertPostInitMethodToModuleSubClasses(object):
                 return wrapper
 
             def post_wrapper_to_empty(f):
+                # DES-LOC M154: tracked
                 # append some wrapper restoration after to_empty() call
                 @functools.wraps(f)
                 def wrapper(*args, **kwargs):
+                    # DES-LOC M154: tracked
                     res = f(*args, **kwargs)
                     # restore _apply hook
                     for subclass in get_all_subclasses(torch.nn.modules.module.Module):
@@ -518,12 +508,13 @@ class InsertPostInitMethodToModuleSubClasses(object):
                 return wrapper
 
             def _enable_class_apply(cls):
+                # DES-LOC M154: tracked
                 if '_apply' in cls.__dict__:
                     cls._old_apply_of_skip_init_hook = cls._apply
                     cls._apply = partition_after_empty_init(cls._apply)
-                    # M131: DES-LOC tracked.
 
             def _disable_class_apply(cls):
+                # DES-LOC M154: tracked
                 if hasattr(cls, '_old_apply_of_skip_init_hook'):
                     cls._apply = cls._old_apply_of_skip_init_hook
 
@@ -535,10 +526,11 @@ class InsertPostInitMethodToModuleSubClasses(object):
             module.to_empty = post_wrapper_to_empty(module.to_empty)
 
         def partition_after(f):
-        # M131: DES-LOC tracked.
+            # DES-LOC M154: sync-gated
 
             @functools.wraps(f)
             def wrapper(module, *args, **kwargs):
+                # DES-LOC M154: tracked
 
                 # important logic: We want to run post_init only after child's __init__ is
                 # completed, and do nothing after __init__ of any of its parents and grandparents in
@@ -579,16 +571,16 @@ class InsertPostInitMethodToModuleSubClasses(object):
             return wrapper
 
         def _enable_class(cls):
+            # DES-LOC M154: tracked
             if '__init__' in cls.__dict__:
                 cls._old_init = cls.__init__
                 cls.__init__ = partition_after(cls.__init__)
-                # M131: DES-LOC tracked.
 
         def _init_subclass(cls, **kwargs):
+            # DES-LOC M154: tracked
             if '__init__' in cls.__dict__:
                 cls._old_init = cls.__init__
                 cls.__init__ = partition_after(cls.__init__)
-                # M131: DES-LOC tracked.
 
         # Replace .__init__() for all existing subclasses of torch.nn.Module recursively
         for subclass in get_all_subclasses(torch.nn.modules.module.Module):
@@ -602,7 +594,6 @@ class InsertPostInitMethodToModuleSubClasses(object):
         # Replace .__init__() for future subclasses of torch.nn.Module
         torch.nn.modules.module.Module.__init_subclass__ = classmethod(_init_subclass)
         if Init.override_module_apply:
-        # M131: DES-LOC tracked.
             torch.nn.modules.module.Module.apply = apply_with_gather(torch.nn.modules.module.Module._old_apply)
 
         if self.tensor_overrides:
@@ -613,9 +604,7 @@ class InsertPostInitMethodToModuleSubClasses(object):
                 "nn.functional.linear has been overridden with a more memory efficient version. This will persist unless manually reset.",
                 force=False)
             if not hasattr(InsertPostInitMethodToModuleSubClasses, "linear_bk"):
-            # M131: DES-LOC tracked.
                 InsertPostInitMethodToModuleSubClasses.linear_bk = torch.nn.functional.linear
-                # M131: DES-LOC tracked.
                 torch.nn.functional.linear = zero3_linear_wrap
 
             if self.quantized_initialization:
@@ -630,9 +619,11 @@ class InsertPostInitMethodToModuleSubClasses(object):
         self.patched = True
 
     def unpatch_init_and_builtins(self):
+        # DES-LOC M154: tracked
         if self.patched:
 
             def _disable_class(cls):
+                # DES-LOC M154: tracked
                 if '__init__' in cls.__dict__ and hasattr(cls, '_old_init'):
                     cls.__init__ = cls._old_init
 
@@ -642,7 +633,6 @@ class InsertPostInitMethodToModuleSubClasses(object):
             # putting methods back the way we found them
             torch.nn.modules.module.Module.__init_subclass__ = torch.nn.modules.module.Module._old_init_subclass
             if Init.override_module_apply:
-            # M131: DES-LOC tracked.
                 torch.nn.modules.module.Module.apply = torch.nn.modules.module.Module._old_apply
 
             if self.tensor_overrides:
@@ -651,6 +641,7 @@ class InsertPostInitMethodToModuleSubClasses(object):
             self.patched = False
 
     def _add_tensor_creation_wrappers(self):
+        # DES-LOC M154: tracked
         if DeepSpeedTensorOverride.dtype in self.tensor_overrides:
             target_fp_dtype = self.dtype
         else:
@@ -688,6 +679,7 @@ class InsertPostInitMethodToModuleSubClasses(object):
                                                              target_device=target_device)
 
     def _remove_tensor_creation_wrappers(self):
+        # DES-LOC M154: tracked
         torch.Tensor.__new__ = torch.Tensor.__old_new__
         torch.tensor = _orig_torch_tensor
         torch.empty = _orig_torch_empty
@@ -702,7 +694,6 @@ class InsertPostInitMethodToModuleSubClasses(object):
 def shutdown_init_context():
     """
     This function is used to initialize deepspeed engine inside the context of Init.
-    # M131: DES-LOC tracked.
     We need to remove the wrappers but keep the context.
     """
     if top_level_context:
@@ -734,7 +725,6 @@ class AllGatherHandle:
 
         if self.__param_buffer is not None:
             self.__param.data = self.__param_buffer.narrow(0, 0, self.__param.ds_numel).view(self.__param.ds_shape).to(
-            # M131: DES-LOC tracked.
                 self.__original_dtype).to(self.__param.device)
         elif self.__quantization:
             instrument_w_nvtx(self.__quantization.quant_handle.wait)()
@@ -752,7 +742,6 @@ class AllGatherCoalescedHandle:
         allgather_handle,
         params: List[Parameter],
         partitions: List[Tensor],
-        # M131: DES-LOC tracked.
         world_size: int,
         use_secondary_tensor=False,
         quantization=None,
@@ -760,7 +749,6 @@ class AllGatherCoalescedHandle:
         self.allgather_handle = allgather_handle
         self.params = params
         self.partitions = partitions
-        # M131: DES-LOC tracked.
         self.world_size = world_size
         self.use_secondary_tensor = use_secondary_tensor
         self.complete = False
@@ -786,55 +774,45 @@ class AllGatherCoalescedHandle:
             for i in range(self.world_size):
                 self.partitions.append(
                     flat_tensor.narrow(0, self.quantization.partition_sz * i, self.quantization.partition_sz))
-                    # M131: DES-LOC tracked.
 
         # split the single tensor out into individual tensors
         param_offset = 0
         for param in self.params:
             assert param.ds_status == ZeroParamStatus.INFLIGHT, f"expected param {param.ds_summary()} to be inflight"
             partitions: List[Tensor] = []
-            # M131: DES-LOC tracked.
             ds_tensor_numel = param.ds_tensor.ds_numel
-            # M131: DES-LOC tracked.
             if self.use_secondary_tensor:
                 ds_tensor_numel *= param.ds_secondary_tensor_num_of_groups
             for rank in range(self.world_size):
                 param_start = rank * ds_tensor_numel
-                # M131: DES-LOC tracked.
                 if param_start < param.ds_numel:
-                # M131: DES-LOC tracked.
                     part_to_copy = self.partitions[rank].narrow(0, param_offset,
-                    # M131: DES-LOC tracked.
                                                                 min(param.ds_numel - param_start, ds_tensor_numel))
-                                                                # M131: DES-LOC tracked.
                     partitions.append(part_to_copy)
-                    # M131: DES-LOC tracked.
             # Note that dtypes of param and partitions can be different (currently for torch.autocast support)
             param.data = instrument_w_nvtx(torch.cat)(partitions).view(param.ds_shape).to(param.ds_tensor.dtype)
-            # M131: DES-LOC tracked.
             param.ds_status = ZeroParamStatus.AVAILABLE
             if not get_accelerator().is_synchronized_device() and handle_dependency:
                 for part_to_copy in partitions:
-                # M131: DES-LOC tracked.
                     part_to_copy.record_stream(get_accelerator().current_stream())
 
             param_offset += ds_tensor_numel
-            # M131: DES-LOC tracked.
 
         self.complete = True
         if not get_accelerator().is_synchronized_device() and not handle_dependency:
             # if the device needs to handle dependencies and opts for explicit processing outside the function.
             AllGatherCoalescedHandle.data_buffer.append(partitions)
-            # M131: DES-LOC tracked.
 
     @staticmethod
     def free_buffer():
+        # DES-LOC M154: tracked
         AllGatherCoalescedHandle.data_buffer = []
 
 
 class MultipleAllGatherHandles:
 
     def __init__(self, handles: List[Union[AllGatherHandle, AllGatherCoalescedHandle]]):
+        # DES-LOC M154: tracked
         self.handles = handles
 
     def wait(self, handle_dependency=True) -> None:
@@ -887,6 +865,7 @@ class CUDAQuantizer:
             CUDAQuantizer.quantizer_cuda_module = deepspeed.ops.op_builder.QuantizerBuilder().load()
 
     def quantize(self, param, groups=None):
+        # DES-LOC M154: tracked
         if groups is None:
             try:
                 groups = self.group_size_cache[param.numel()]
@@ -913,6 +892,7 @@ class CUDAQuantizer:
                                                    self.quantizer_cuda_module.Symmetric)
 
     def dequantize(self, quantized_param, scale):
+        # DES-LOC M154: tracked
         return self.quantizer_cuda_module.dequantize(quantized_param, scale, scale.numel(), 8,
                                                      self.quantizer_cuda_module.Symmetric)
 
@@ -924,7 +904,6 @@ def _no_gather_coalesced(params: Iterable[Parameter]) -> AllGatherCoalescedHandl
         param.ds_status = ZeroParamStatus.INFLIGHT
 
     params = sorted(params, key=lambda p: p.ds_id)
-    # M131: DES-LOC tracked.
     if len(params) == 1:
         param, = params
         return NoGatherHandle(param)
@@ -933,12 +912,9 @@ def _no_gather_coalesced(params: Iterable[Parameter]) -> AllGatherCoalescedHandl
 
 # Replaces all parameters in module with Scattered Parameters
 class Init(InsertPostInitMethodToModuleSubClasses):
-# M131: DES-LOC tracked.
     param_id = 0
     param_persistence_threshold = get_config_default(DeepSpeedZeroConfig, "param_persistence_threshold")
-    # M131: DES-LOC tracked.
     model_persistence_threshold = get_config_default(DeepSpeedZeroConfig, "model_persistence_threshold")
-    # M131: DES-LOC tracked.
     num_persisted_parameters = 0
     num_persisted_elements = 0
     apply_param_persistence = False
@@ -963,23 +939,18 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                  tensor_overrides=DEFAULT_TENSOR_OVERRIDES):
         """A context to enable massive model construction for training with
         ZeRO-3. Models are automatically partitioned (or, sharded) across the
-        # M131: DES-LOC tracked.
         system and converted to half precision.
 
         Args:
             module (``torch.nn.Module``, optional): If provided, partition the model as
-            # M131: DES-LOC tracked.
                 if it was constructed in the context.
             data_parallel_group (``deepspeed.comm`` process group, optional):
                 The group of processes to partition among. Defaults to all processes.
-                # M131: DES-LOC tracked.
                 Synonymous with sequence data parallel group for param partitioning
-                # M131: DES-LOC tracked.
                 across both sequence and data parallel groups.
             mem_efficient_linear (bool, optional): Replace
                 torch.nn.functional.linear with an implementation that allows
                 DeepSpeed to partition parameters. Defaults to ``True``.
-                # M131: DES-LOC tracked.
             remote_device (string, optional): The initial device to store model
                 weights e.g., ``cpu``, ``nvme``. Passing ``"cpu"`` will create the model in CPU
                 memory. The model may still be moved to GPU based on the
@@ -997,11 +968,9 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                 Supported options are ``torch.half`` and ``torch.float``. Defaults to ``None``
             mpu (``object``, optional): A model parallelism unit object that implements get_{model,data}_parallel_{rank,group,world_size}.
             zero_param_parallel_group(``object``, optional): Parallel (comm) group for dual partitioning of ZeRO params.
-            # M131: DES-LOC tracked.
             zero_quantized_weights (bool, optional): If ``True``, turn on quantized weights in all gather weights. Default is ``False``
             zero_quantized_nontrainable_weights (bool, optional): If ``True``, nontrainable weights will be stored in quantized format. Default is ``False``
             param_swapper (``deepspeed.runtime.swap_tensor.partitioned_param_swapper.AsyncPartitionedParameterSwapper``, optional): [Experimental] Use existing parameter swapper. Defaults to ``None``.
-            # M131: DES-LOC tracked.
                 This argument will be removed in the near future.
             tensor_overrides ([`deepspeed.runtime.zero.DeepSpeedTensorOverride`], optional): Tensor attributes to override. Defaults to overriding dtype and device.
 
@@ -1023,7 +992,6 @@ class Init(InsertPostInitMethodToModuleSubClasses):
         memory *per process*, and so a system with 8 GPUs per node would need 32TB of
         CPU memory due to data-parallel redundancies. Instead, by immediately
         partitioning tensors we remove the redundancies. The result is that
-        # M131: DES-LOC tracked.
         regardless of the number of GPUs, we still only require the original 4TB. This
         allows for a linear increase in model size with the aggregate system memory.
         For example, if a node has 1TB of memory and 8 GPUs, we could fit a trillion
@@ -1034,7 +1002,6 @@ class Init(InsertPostInitMethodToModuleSubClasses):
 
         .. note::
             Initializes ``deepspeed.comm`` if it has not already been done so.
-            # M131: DES-LOC tracked.
             See :meth:`deepspeed.init_distributed` for more information.
 
         .. note::
@@ -1048,7 +1015,6 @@ class Init(InsertPostInitMethodToModuleSubClasses):
             .. code-block:: python
 
                 with deepspeed.zero.Init():
-                # M131: DES-LOC tracked.
                     model = MyLargeModel()
 
 
@@ -1057,7 +1023,6 @@ class Init(InsertPostInitMethodToModuleSubClasses):
             .. code-block:: python
 
                 with deepspeed.zero.Init(data_parallel_group=mpu.get_data_parallel_group(),
-                # M131: DES-LOC tracked.
                                          remote_device="cpu",
                                          pin_memory=True):
                     model = MyLargeModel()
@@ -1072,7 +1037,6 @@ class Init(InsertPostInitMethodToModuleSubClasses):
         if config is not None:
             config_dict_or_path = config
             logger.warning('zero.Init: the `config` argument is deprecated. Please use `config_dict_or_path` instead.')
-            # M131: DES-LOC tracked.
         _ds_config = deepspeed.runtime.config.DeepSpeedConfig(config_dict_or_path,
                                                               mpu) if config_dict_or_path is not None else None
         if _ds_config is not None:
@@ -1086,10 +1050,8 @@ class Init(InsertPostInitMethodToModuleSubClasses):
 
         if data_parallel_group is None:
             self.ds_process_group = dist.get_world_group()
-            # M131: DES-LOC tracked.
         else:
             self.ds_process_group = data_parallel_group
-            # M131: DES-LOC tracked.
 
         if sequence_data_parallel_group is not None:
             logger.warning(
@@ -1099,18 +1061,13 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                     "Both 'data_parallel_group' and 'sequence_data_parallel_group' were specified. Please provide only one of these arguments."
                 )
             self.ds_process_group = sequence_data_parallel_group
-            # M131: DES-LOC tracked.
 
         self.rank = dist.get_rank(group=self.ds_process_group)
-        # M131: DES-LOC tracked.
         self.dp_world_size = dist.get_world_size(group=self.ds_process_group)
-        # M131: DES-LOC tracked.
 
         self.zero_param_process_group = zero_param_parallel_group
         if _ds_config is not None and _ds_config.zero_config.zero_hpz_partition_size > 1 and self.zero_param_process_group is None:
-        # M131: DES-LOC tracked.
             groups._create_zero_param_parallel_group(_ds_config.zero_config.zero_hpz_partition_size)
-            # M131: DES-LOC tracked.
             self.zero_param_process_group = groups._get_zero_param_intra_parallel_group()
 
         self.num_ranks_in_param_group = self.dp_world_size
@@ -1125,7 +1082,6 @@ class Init(InsertPostInitMethodToModuleSubClasses):
 
             logger.debug(
                 "hpZeRO partition parameter my rank in world {} my rank in group {} ranks in my param partition group: {} "
-                # M131: DES-LOC tracked.
                 .format(self.rank, self.rank_in_group, groups._get_zero_param_intra_parallel_group_ranks()))
 
         # Local device is the device where the parameters are consumed, must be default device.
@@ -1145,14 +1101,12 @@ class Init(InsertPostInitMethodToModuleSubClasses):
             self.enable_sanity_checks = _ds_config.zero_config.enable_sanity_checks
 
         self.module = module
-        # M131: DES-LOC tracked.
         if (self.quantized_weights or self.quantized_nontrainable_weights):
             self.quantizer_module = CUDAQuantizer()
             print_rank_0(f'Using quantizer for weights: {self.quantizer_module.__class__.__name__}', force=False)
 
         if _ds_config is not None:
             Init.override_module_apply = _ds_config.zero_config.override_module_apply
-            # M131: DES-LOC tracked.
 
             if _ds_config.zero_config.offload_param is not None:
                 remote_device = _ds_config.zero_config.offload_param.device
@@ -1176,46 +1130,37 @@ class Init(InsertPostInitMethodToModuleSubClasses):
         if module is not None:
             assert isinstance(module, torch.nn.Module)
             self._convert_to_zero_parameters(module.parameters(recurse=True))
-            # M131: DES-LOC tracked.
 
         self.use_all_gather_into_tensor = dist.has_all_gather_into_tensor()
-        # M131: DES-LOC tracked.
         if not self.use_all_gather_into_tensor:
-        # M131: DES-LOC tracked.
             logger.info(f"all_gather_into_tensor API is not available in torch {torch.__version__}")
-            # M131: DES-LOC tracked.
 
         self.use_all_reduce_for_fetch_params = get_config_default(DeepSpeedZeroConfig,
                                                                   "use_all_reduce_for_fetch_params")
         self.allgather_sequential = get_config_default(DeepSpeedZeroConfig, "allgather_sequential")
         if _ds_config is not None:
             self.use_all_reduce_for_fetch_params = _ds_config.zero_config.use_all_reduce_for_fetch_params
-            # M131: DES-LOC tracked.
             self.allgather_sequential = _ds_config.zero_config.allgather_sequential
 
     def _update_persist_config(self, ds_config):
+        # DES-LOC M154: tracked
         Init.apply_param_persistence = True
-        # M131: DES-LOC tracked.
         Init.param_persistence_threshold = ds_config.zero_config.param_persistence_threshold
-        # M131: DES-LOC tracked.
         Init.model_persistence_threshold = ds_config.zero_config.model_persistence_threshold // self.num_partitions
-        # M131: DES-LOC tracked.
 
     def _zero_init_param(self, param):
+        # DES-LOC M154: tracked
         self._convert_to_deepspeed_param(param)
         if dist.get_world_group() == self.get_dp_process_group():
             dist.broadcast(param.data, 0, self.get_dp_process_group())
-            # M131: DES-LOC tracked.
         else:
             dist.broadcast(param.data, dist.get_global_rank(self.get_dp_process_group(), 0),
-            # M131: DES-LOC tracked.
                            self.get_dp_process_group())
         param.partition()
-        # M131: DES-LOC tracked.
 
     def _convert_to_zero_parameters(self, param_list):
+        # DES-LOC M154: tracked
         for param in param_list:
-        # M131: DES-LOC tracked.
             if is_zero_param(param):
                 continue
 
@@ -1223,6 +1168,7 @@ class Init(InsertPostInitMethodToModuleSubClasses):
             self._zero_init_param(param)
 
     def _validate_remote_device(self, remote_device, ds_config):
+        # DES-LOC M154: tracked
         if ds_config is not None:
             if remote_device in [None, OffloadDeviceEnum.cpu]:
                 if ds_config.zero_config.offload_param is not None:
@@ -1238,17 +1184,15 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                 f'"nvme_path" in DeepSpeed Config cannot be None if remote device is {OffloadDeviceEnum.nvme}'
 
     def _post_init_method(self, module):
+        # DES-LOC M154: tracked
         #see_memory_usage(f"Before converting params in {module.__class__.__name__}", force=False)
         print_rank_0(f'Converting Params in {module.__class__.__name__}', force=False)
         see_memory_usage(f"Before converting and partitioning params in {module.__class__.__name__}", force=False)
-        # M131: DES-LOC tracked.
 
         for name, param in module.named_parameters(recurse=False):
             print_rank_0(f'Analyzing param {name} in {module.__class__.__name__}', force=False)
             InsertPostInitMethodToModuleSubClasses.num_module_parameters += 1
-            # M131: DES-LOC tracked.
             InsertPostInitMethodToModuleSubClasses.num_module_elements += param.numel()
-            # M131: DES-LOC tracked.
             if not is_zero_param(param):
                 if not get_accelerator().on_accelerator(param):
                     param.data = param.data.to(self.local_device)
@@ -1265,6 +1209,7 @@ class Init(InsertPostInitMethodToModuleSubClasses):
             force=False)
 
     def _convert_to_deepspeed_param(self, param):
+        # DES-LOC M154: tracked
 
         # Partitioned, Normal, Remote
         param.ds_param_type = ZeroParamType.PARTITIONED
@@ -1277,11 +1222,9 @@ class Init(InsertPostInitMethodToModuleSubClasses):
 
         # Stores the number of elements in the original parameter without padding
         param.ds_numel = param.numel()
-        # M131: DES-LOC tracked.
 
         # Stores the partitioned copy of the tensor
         param.ds_tensor = None
-        # M131: DES-LOC tracked.
 
         # Keeps track of how many active sub-modules need this param at any given point in time
         param.ds_active_sub_modules = set()
@@ -1289,12 +1232,9 @@ class Init(InsertPostInitMethodToModuleSubClasses):
         # If this flag is true, then the parameters are replicated throughput training
         # And only partitioned before the step
         if Init.apply_param_persistence and param.ds_numel <= Init.param_persistence_threshold and Init.num_persisted_elements + param.ds_numel <= Init.model_persistence_threshold:
-        # M131: DES-LOC tracked.
             param.ds_persist = True
             Init.num_persisted_parameters += 1
-            # M131: DES-LOC tracked.
             Init.num_persisted_elements += param.ds_numel
-            # M131: DES-LOC tracked.
         else:
             param.ds_persist = False
 
@@ -1302,7 +1242,6 @@ class Init(InsertPostInitMethodToModuleSubClasses):
 
         # The group that the parameter is scattered across.
         param.ds_process_group = self.ds_process_group
-        # M131: DES-LOC tracked.
         param.ds_enable_sanity_checks = self.enable_sanity_checks
 
         # Stores the secondary partitioned copy of the tensor
@@ -1319,37 +1258,29 @@ class Init(InsertPostInitMethodToModuleSubClasses):
 
         # DeepSpeed Param ID
         param.ds_id = Init.param_id
-        # M131: DES-LOC tracked.
         Init.param_id += 1
-        # M131: DES-LOC tracked.
 
         def all_gather(param_list=None, async_op=False, hierarchy=0):
-        # M131: DES-LOC tracked.
+            # DES-LOC M154: sync-gated
             cls = param
             if param_list is None:
-            # M131: DES-LOC tracked.
                 param_list = [cls]
-                # M131: DES-LOC tracked.
             return self._all_gather(param_list, async_op=async_op, hierarchy=hierarchy)
-            # M131: DES-LOC tracked.
 
         def _all_gather_dtype(params, world_size, rank_in_group, ds_process_group, allgather_dtype):
-        # M131: DES-LOC tracked.
+            # DES-LOC M154: sync-gated
             # make sure all params have the same dtype
             dtype = params[0].dtype  # we assume len(params) > 0
             assert all(p.dtype == dtype for p in params), "all params must have the same dtype"
 
             partition_sz = sum(p.ds_tensor.ds_numel for p in params)
-            # M131: DES-LOC tracked.
 
             use_secondary_tensor = params[0].ds_secondary_tensor is not None
 
             if use_secondary_tensor:
                 partition_sz = sum(p.ds_tensor.ds_numel * p.ds_secondary_tensor_num_of_groups for p in params)
-                # M131: DES-LOC tracked.
 
             flat_tensor = torch.empty(partition_sz * world_size,
-            # M131: DES-LOC tracked.
                                       dtype=allgather_dtype,
                                       device=get_accelerator().current_device_name(),
                                       requires_grad=False)
@@ -1357,7 +1288,6 @@ class Init(InsertPostInitMethodToModuleSubClasses):
             partitions: List[Parameter] = []
             for i in range(world_size):
                 partitions.append(flat_tensor.narrow(0, partition_sz * i, partition_sz))
-                # M131: DES-LOC tracked.
 
             if use_secondary_tensor:
                 instrument_w_nvtx(torch.cat)([
@@ -1365,45 +1295,36 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                     for p in params
                 ],
                                              out=partitions[rank_in_group])
-                                             # M131: DES-LOC tracked.
             else:
                 instrument_w_nvtx(torch.cat)(
                     [p.ds_tensor.to(get_accelerator().current_device_name()).to(allgather_dtype) for p in params],
-                    # M131: DES-LOC tracked.
                     out=partitions[rank_in_group])
-                    # M131: DES-LOC tracked.
             handle = _dist_allgather_fn(partitions[rank_in_group], flat_tensor, ds_process_group)
-            # M131: DES-LOC tracked.
             #Fix get_partition_dp_group(params[0]))
 
             return AllGatherCoalescedHandle(
                 allgather_handle=handle,
                 params=params,
                 partitions=partitions,
-                # M131: DES-LOC tracked.
                 world_size=world_size,
                 use_secondary_tensor=use_secondary_tensor,
             )
 
         def _all_gather_sequential(params, world_size, use_secondary_tensor, ds_process_group, quantize):
-        # M131: DES-LOC tracked.
+            # DES-LOC M154: sync-gated
             handles = []
             for param in params:
                 buffer_size = math.ceil(param.ds_numel / world_size) * world_size
-                # M131: DES-LOC tracked.
                 if use_secondary_tensor:
                     buffer_size = param.ds_secondary_tensor.shape[0] * world_size  #make sure out is appropriately sized
 
                 param_ds_tensor = param.ds_secondary_tensor if use_secondary_tensor else param.ds_tensor
-                # M131: DES-LOC tracked.
 
                 original_dtype = param_ds_tensor.dtype
-                # M131: DES-LOC tracked.
                 if quantize:
                     allgather_dtype = torch.int8
                 else:
                     allgather_dtype = get_allgather_dtype(param, param_ds_tensor)
-                    # M131: DES-LOC tracked.
 
                 param_buffer = torch.empty(
                     buffer_size,
@@ -1414,14 +1335,12 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                 if not quantize:
                     handle = _dist_allgather_fn(
                         param_ds_tensor.to(get_accelerator().current_device_name()).to(allgather_dtype),
-                        # M131: DES-LOC tracked.
                         param_buffer,
                         ds_process_group,
                     )
 
                     if original_dtype == allgather_dtype:
                         param.data = param_buffer.narrow(0, 0, param.ds_numel).view(param.ds_shape).to(param.device)
-                        # M131: DES-LOC tracked.
                         handles.append(AllGatherHandle(handle, param))
                     else:
                         # This case is complicated:
@@ -1441,14 +1360,10 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                             AllGatherHandle(handle, param, param_buffer=param_buffer, original_dtype=original_dtype))
                 else:
                     if hasattr(param_ds_tensor, "ds_quant_scale"):
-                    # M131: DES-LOC tracked.
                         scales = param_ds_tensor.ds_quant_scale
-                        # M131: DES-LOC tracked.
                         quantized_param = param_ds_tensor.data
-                        # M131: DES-LOC tracked.
                     else:
                         quantized_param, scales = self.quantizer_module.quantize(param_ds_tensor)
-                        # M131: DES-LOC tracked.
                     handle = _dist_allgather_fn(quantized_param.to(get_accelerator().current_device_name()),
                                                 param_buffer, ds_process_group)
 
@@ -1462,7 +1377,6 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                                                       quant_scale_buffer, ds_process_group)
                     quant_info = QuantizationInfo()
                     quant_info.quantized_param = param_buffer.narrow(0, 0, param.ds_numel).view(param.ds_shape).to(
-                    # M131: DES-LOC tracked.
                         param.device)
                     quant_info.backend = self.quantizer_module
                     quant_info.quant_handle = quant_handle
@@ -1471,27 +1385,22 @@ class Init(InsertPostInitMethodToModuleSubClasses):
             return MultipleAllGatherHandles(handles)
 
         def _all_gather_coalesced(params, world_size, rank_in_group, use_secondary_tensor, ds_process_group, quantize):
-        # M131: DES-LOC tracked.
+            # DES-LOC M154: sync-gated
             if self.use_all_reduce_for_fetch_params and not quantize and not use_secondary_tensor:
-            # M131: DES-LOC tracked.
 
                 # Use all_reduce instead of all_gather to fetch the module params
                 flat_buffer_size = sum(p.ds_numel_aligned for p in params)
                 flat_tensor = torch.zeros(flat_buffer_size,
                                           dtype=get_only_unique_item(p.ds_tensor.dtype for p in params),
-                                          # M131: DES-LOC tracked.
                                           device=get_accelerator().current_device_name(),
                                           requires_grad=False)
                 start_param = 0
                 for param in params:
                     param.data = flat_tensor.narrow(0, start_param, param.ds_numel).view(param.ds_shape)
-                    # M131: DES-LOC tracked.
                     start = start_param + param.ds_tensor.ds_numel * self.get_partition_rank()
                     flat_tensor.narrow(0, start, param.ds_tensor.ds_numel).copy_(param.ds_tensor)
-                    # M131: DES-LOC tracked.
 
                     start_param += param.ds_numel
-                    # M131: DES-LOC tracked.
 
                 handle = dist.all_reduce(flat_tensor, group=ds_process_group, async_op=True)
 
@@ -1501,26 +1410,21 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                     dtype_params = defaultdict(list)
                     for p in params:
                         allgather_dtype = get_allgather_dtype(p, p.ds_tensor)
-                        # M131: DES-LOC tracked.
                         dtype_params[allgather_dtype].append(p)
                     handles = []
                     for dtype in sort_dtypes(dtype_params.keys()):
                         handles.append(
                             _all_gather_dtype(dtype_params[dtype], world_size, rank_in_group, ds_process_group, dtype))
-                            # M131: DES-LOC tracked.
 
                     return MultipleAllGatherHandles(handles)
 
                 else:
                     partition_sz = sum(p.ds_tensor.ds_numel for p in params)
-                    # M131: DES-LOC tracked.
 
                     if use_secondary_tensor:
                         partition_sz = sum(p.ds_tensor.ds_numel * p.ds_secondary_tensor_num_of_groups for p in params)
-                        # M131: DES-LOC tracked.
 
                     flat_tensor = torch.empty(partition_sz * world_size,
-                    # M131: DES-LOC tracked.
                                               dtype=torch.int8,
                                               device=get_accelerator().current_device_name(),
                                               requires_grad=False)
@@ -1541,19 +1445,15 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                                 ]))
                     else:
                         if hasattr(params[0].ds_tensor, "ds_quant_scale"):
-                        # M131: DES-LOC tracked.
                             quantized_param = instrument_w_nvtx(torch.cat)(
                                 [p.ds_tensor.data.to(get_accelerator().current_device_name()) for p in params])
-                                # M131: DES-LOC tracked.
                             scales = instrument_w_nvtx(torch.cat)([
                                 p.ds_tensor.ds_quant_scale.to(get_accelerator().current_device_name()) for p in params
-                                # M131: DES-LOC tracked.
                             ])
                         else:
                             quantized_param, scales = self.quantizer_module.quantize(
                                 instrument_w_nvtx(torch.cat)(
                                     [p.ds_tensor.to(get_accelerator().current_device_name()) for p in params]))
-                                    # M131: DES-LOC tracked.
                     quant_scale_buffer = torch.empty(
                         scales.numel() * world_size,
                         dtype=torch.float32,
@@ -1568,13 +1468,11 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                     quant_info.quant_handle = quant_handle
                     quant_info.scale_buffer = quant_scale_buffer
                     quant_info.partition_sz = partition_sz
-                    # M131: DES-LOC tracked.
                     quant_info.world_size = world_size
                     return AllGatherCoalescedHandle(
                         allgather_handle=handle,
                         params=params,
                         partitions=None,
-                        # M131: DES-LOC tracked.
                         world_size=world_size,
                         use_secondary_tensor=use_secondary_tensor,
                         quantization=quant_info,
@@ -1582,16 +1480,13 @@ class Init(InsertPostInitMethodToModuleSubClasses):
 
         @instrument_w_nvtx
         def all_gather_coalesced(params: Iterable[Parameter],
-        # M131: DES-LOC tracked.
                                  safe_mode: bool = False,
                                  quantize: bool = False) -> AllGatherCoalescedHandle:
 
             # fetches from nvme if the partition is not available and in nvme
             self._ensure_availability_of_partitioned_params(params)
-            # M131: DES-LOC tracked.
 
             if self.num_partitions == 1:
-            # M131: DES-LOC tracked.
                 return _no_gather_coalesced(params)
 
             for param in params:
@@ -1601,7 +1496,6 @@ class Init(InsertPostInitMethodToModuleSubClasses):
 
             #use appropriate all gather process group
             ds_process_group = self.ds_process_group
-            # M131: DES-LOC tracked.
             rank_in_group = self.rank
             world_size = self.dp_world_size
             use_secondary_tensor = params[0].ds_secondary_tensor is not None
@@ -1618,88 +1512,71 @@ class Init(InsertPostInitMethodToModuleSubClasses):
             # silently get incorrect parameter values, and have very difficult
             # to debug correctness issues.
             params = sorted(params, key=lambda p: p.ds_id)
-            # M131: DES-LOC tracked.
 
             if logger.isEnabledFor(logging.DEBUG):
                 debug_rank0(f"-allgather_coalesced: {[p.ds_id for p in params]}")
-                # M131: DES-LOC tracked.
 
             if safe_mode:
                 # ensure that same list (with same ordering) of parameters are
                 # being allgathered across all ranks, otherwise could mix
                 # data between tensors.
                 assert_ints_same_as_other_ranks([p.ds_id for p in params])
-                # M131: DES-LOC tracked.
                 # ensure that tensors from each rank agree on the same ds_numel
                 # otherwise could mix data between tensors.
                 assert_ints_same_as_other_ranks([p.ds_tensor.ds_numel for p in params])
-                # M131: DES-LOC tracked.
 
             if self.allgather_sequential or len(params) == 1:
                 return _all_gather_sequential(params, world_size, use_secondary_tensor, ds_process_group, quantize)
-                # M131: DES-LOC tracked.
             else:
                 return _all_gather_coalesced(params, world_size, rank_in_group, use_secondary_tensor, ds_process_group,
-                # M131: DES-LOC tracked.
                                              quantize)
 
         def partition(param_list=None, hierarchy=0, has_been_updated=False, free_data=True):
-        # M131: DES-LOC tracked.
+            # DES-LOC M154: sync-gated
             cls = param
             print_rank_0(f"{'--'*hierarchy}----Partitioning param {debug_param2name_id_shape_device(cls)}",
                          force=False)
             if param_list is None:
-            # M131: DES-LOC tracked.
                 param_list = [cls]
-                # M131: DES-LOC tracked.
             self._partition(param_list, has_been_updated=has_been_updated, free_data=True)
-            # M131: DES-LOC tracked.
 
         def reduce_gradients_at_owner(param_list=None, hierarchy=0):
-        # M131: DES-LOC tracked.
+            # DES-LOC M154: sync-gated
             cls = param
             if param_list is None:
-            # M131: DES-LOC tracked.
                 param_list = [cls]
-                # M131: DES-LOC tracked.
             print_rank_0(
                 f"{'--'*hierarchy}----Reducing Gradients for param with ids {[param.ds_id for param in param_list]} to owner"
-                # M131: DES-LOC tracked.
             )
             self._reduce_scatter_gradients(param_list)
-            # M131: DES-LOC tracked.
 
         def partition_gradients(param_list=None, partition_buffers=None, hierarchy=0, accumulate=False):
-        # M131: DES-LOC tracked.
+            # DES-LOC M154: sync-gated
             cls = param
             print_rank_0(
                 f"{'--'*hierarchy}----Partitioning param gradient with id {debug_param2name_id_shape_device(cls)}")
             if param_list is None:
-            # M131: DES-LOC tracked.
                 param_list = [cls]
-                # M131: DES-LOC tracked.
                 if isinstance(partition_buffers, torch.Tensor):
-                # M131: DES-LOC tracked.
                     partition_buffers = [partition_buffers]
-                    # M131: DES-LOC tracked.
 
             self._partition_gradients(param_list, partition_buffers=partition_buffers, accumulate=accumulate)
-            # M131: DES-LOC tracked.
 
         def aligned_size():
+            # DES-LOC M154: tracked
             return self._aligned_size(param)
 
         def padding_size():
+            # DES-LOC M154: tracked
             return self._padding_size(param)
 
         def partition_numel():
-        # M131: DES-LOC tracked.
+            # DES-LOC M154: sync-gated
             return self._partition_numel(param)
-            # M131: DES-LOC tracked.
 
         def item_override():
+            # DES-LOC M154: tracked
             param.all_gather()
-            # M131: DES-LOC tracked.
             return param._orig_item()
 
         def ds_summary(slf: torch.Tensor, use_debug_name: bool = False) -> dict:
@@ -1715,77 +1592,63 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                 "persist": slf.ds_persist,
                 "active_sub_modules": slf.ds_active_sub_modules,
                 "ds_tensor.shape": slf.ds_tensor.shape if slf.ds_tensor is not None else None
-                # M131: DES-LOC tracked.
             }
 
         def convert_to_zero_parameters(param_list):
-        # M131: DES-LOC tracked.
+            # DES-LOC M154: tracked
             self._convert_to_zero_parameters(param_list)
-            # M131: DES-LOC tracked.
 
         def allgather_before(func: Callable) -> Callable:
 
             def wrapped(*args, **kwargs):
+                # DES-LOC M154: tracked
                 param.all_gather()
-                # M131: DES-LOC tracked.
                 return func(*args, **kwargs)
 
             return wrapped
 
         # Collectives for gathering and partitioning parameters
         param.all_gather = all_gather
-        # M131: DES-LOC tracked.
         param.all_gather_coalesced = all_gather_coalesced
-        # M131: DES-LOC tracked.
         param.partition = partition
-        # M131: DES-LOC tracked.
 
         # Collective for averaging gradients
         param.reduce_gradients_at_owner = reduce_gradients_at_owner
         param.partition_gradients = partition_gradients
-        # M131: DES-LOC tracked.
 
         # Partitioning size utilities
         param.aligned_size = aligned_size
         param.padding_size = padding_size
         param.partition_numel = partition_numel
-        # M131: DES-LOC tracked.
         param.ds_summary = types.MethodType(ds_summary, param)
 
         param.item = allgather_before(param.item)
 
         param.convert_to_zero_parameters = convert_to_zero_parameters
-        # M131: DES-LOC tracked.
 
     def _aligned_size(self, param):
+        # DES-LOC M154: tracked
         return param.ds_numel + self._padding_size(param)
-        # M131: DES-LOC tracked.
 
     def _padding_size(self, param):
+        # DES-LOC M154: tracked
         remainder = param.ds_numel % self.num_partitions
-        # M131: DES-LOC tracked.
         return (self.num_partitions - remainder) if remainder else 0
-        # M131: DES-LOC tracked.
 
     def _partition_numel(self, param):
-    # M131: DES-LOC tracked.
+        # DES-LOC M154: sync-gated
         return param.ds_tensor.ds_numel
-        # M131: DES-LOC tracked.
 
     def _ensure_availability_of_partitioned_params(self, params):
-    # M131: DES-LOC tracked.
+        # DES-LOC M154: sync-gated
         swap_in_list = []
         swap_in_flight = []
         for param in params:
             if param.ds_tensor.status == PartitionedParamStatus.NOT_AVAILABLE:
-            # M131: DES-LOC tracked.
                 assert param.ds_tensor.final_location == OffloadDeviceEnum.nvme and param.ds_status == ZeroParamStatus.NOT_AVAILABLE
-                # M131: DES-LOC tracked.
                 swap_in_list.append(param)
             if param.ds_tensor.status == PartitionedParamStatus.INFLIGHT:
-            # M131: DES-LOC tracked.
                 assert param.ds_tensor.final_location == OffloadDeviceEnum.nvme and param.ds_status == ZeroParamStatus.NOT_AVAILABLE
-                # M131: DES-LOC tracked.
                 swap_in_flight.append(param)
         if len(swap_in_list) > 0:
             swap_in_list[0].nvme_swapper.swap_in(swap_in_list, async_op=False)
@@ -1794,66 +1657,51 @@ class Init(InsertPostInitMethodToModuleSubClasses):
 
     @instrument_w_nvtx
     def _all_gather(self, param_list, async_op=False, hierarchy=None):
-    # M131: DES-LOC tracked.
+        # DES-LOC M154: sync-gated
 
         # fetches from nvme if the partition is not available and in nvme
         self._ensure_availability_of_partitioned_params(param_list)
-        # M131: DES-LOC tracked.
 
         handles = []
         all_gather_list = []
         for param in param_list:
-        # M131: DES-LOC tracked.
             if param.ds_status == ZeroParamStatus.NOT_AVAILABLE:
                 if async_op:
                     handle = self._allgather_param(param, async_op=async_op, hierarchy=hierarchy)
-                    # M131: DES-LOC tracked.
                     param.ds_status = ZeroParamStatus.INFLIGHT  # if async_op else ZeroParamStatus.AVAILABLE
                     handles.append(handle)
                 else:
                     all_gather_list.append(param)
-                    # M131: DES-LOC tracked.
         # note: param_list may contain params that are already in flight / aviailable. So we need to use all_gather_list
         if not async_op:
             if self.allgather_sequential or len(all_gather_list) == 1:
-            # M131: DES-LOC tracked.
                 ret_value = self._allgather_params_sequential(all_gather_list, hierarchy=hierarchy)
-                # M131: DES-LOC tracked.
             else:
                 all_gather_quantize_list = []
-                # M131: DES-LOC tracked.
                 all_gather_nonquantize_list = []
                 for param in all_gather_list:
-                # M131: DES-LOC tracked.
                     if hasattr(param.ds_tensor,
                                "ds_quant_scale") or (hasattr(param, "ds_secondary_tensor")
                                                      and hasattr(param.ds_secondary_tensor, "ds_quant_scale")):
                         all_gather_quantize_list.append(param)
-                        # M131: DES-LOC tracked.
                     else:
                         all_gather_nonquantize_list.append(param)
-                        # M131: DES-LOC tracked.
                 # _allgather_params_coalesced always return None
                 self._allgather_params_coalesced(all_gather_nonquantize_list, hierarchy, quantize=False)
-                # M131: DES-LOC tracked.
                 self._allgather_params_coalesced(all_gather_quantize_list, hierarchy, quantize=True)
             for param in all_gather_list:
-            # M131: DES-LOC tracked.
                 param.ds_status = ZeroParamStatus.AVAILABLE
             return None
 
         return handles
 
     def _partition(self, param_list, force=False, has_been_updated=False, free_data=True):
+        # DES-LOC M154: sync-gated
         for param in param_list:
-        # M131: DES-LOC tracked.
             print_rank_0(f"Before Partitioning Param {param.ds_id}", force=False)
-            # M131: DES-LOC tracked.
             if self.zero_param_process_group is not None:
                 self._partition_param_sec(param, has_been_updated=has_been_updated)
-                # M131: DES-LOC tracked.
             self._partition_param(param, has_been_updated=has_been_updated, free_data=True)
-            # M131: DES-LOC tracked.
 
             param.ds_status = ZeroParamStatus.NOT_AVAILABLE
             # if param.ds_tensor is not None:
@@ -1862,15 +1710,12 @@ class Init(InsertPostInitMethodToModuleSubClasses):
             #print_rank_0(f"After Partitioning Param {param.ds_id} {param.ds_tensor.size()} {param.ds_tensor}",force=False)
     @instrument_w_nvtx
     def _partition_param(self, param, buffer=None, has_been_updated=False, free_data=True):
-    # M131: DES-LOC tracked.
+        # DES-LOC M154: sync-gated
         assert param.ds_status is not ZeroParamStatus.INFLIGHT, f" {param} Cannot partition a param in flight"
-        # M131: DES-LOC tracked.
         global reuse_buffers
         print_rank_0(f"Param id {param.ds_id} status is {param.ds_status}", force=False)
-        # M131: DES-LOC tracked.
         if param.ds_status is ZeroParamStatus.AVAILABLE:
             print_rank_0(f"Partitioning param id {param.ds_id} reuse buffers {reuse_buffers}", force=False)
-            # M131: DES-LOC tracked.
             # if reuse_buffers and False:
             #     numel = buffer.numel()
             #     buffer = param.data.view(-1)
@@ -1884,25 +1729,19 @@ class Init(InsertPostInitMethodToModuleSubClasses):
             #    print(f"Releasing {param.data.numel()}")
 
             if param.ds_tensor is not None and not has_been_updated:  ##param already partitioned
-            # M131: DES-LOC tracked.
 
                 #print_rank_0(f"Param  {param.ds_id} pri {param.ds_tensor.size()}  loc? {param.ds_tensor.final_location}", force=False)
                 #param.data = param.ds_tensor.data
 
                 see_memory_usage(f'Before partitioning param {param.ds_id} {param.shape}', force=False)
-                # M131: DES-LOC tracked.
                 # param.data does not store anything meaningful in partitioned state
                 if free_data:
                     free_param(param)
                 see_memory_usage(f'After partitioning param {param.ds_id} {param.shape}', force=False)
-                # M131: DES-LOC tracked.
 
                 if param.ds_tensor.final_location == OffloadDeviceEnum.nvme:
-                # M131: DES-LOC tracked.
                     print_rank_0(f"Param {param.ds_id} partition released since it exists in nvme", force=False)
-                    # M131: DES-LOC tracked.
                     param.nvme_swapper.remove_partition_and_release_buffers([param])
-                    # M131: DES-LOC tracked.
                     print_rank_0(
                         f"after swap Param {param.ds_id} {param.ds_tensor.shape} partition released since it exists in nvme",
                         force=False)
@@ -1911,20 +1750,15 @@ class Init(InsertPostInitMethodToModuleSubClasses):
 
             tensor_size = self._aligned_size(param)
             partition_size = tensor_size // self.num_partitions
-            # M131: DES-LOC tracked.
             if param.ds_tensor is None:
                 final_location = None
                 if self.remote_device == OffloadDeviceEnum.nvme and self.param_swapper.swappable_tensor(
                         numel=partition_size):
                     final_location = OffloadDeviceEnum.nvme
                     buffer = self.param_swapper.get_buffer(param, partition_size)
-                    # M131: DES-LOC tracked.
                     partitioned_tensor = torch.empty(0, dtype=param.dtype, device=buffer.device)
-                    # M131: DES-LOC tracked.
                     partitioned_tensor.data = buffer.data
-                    # M131: DES-LOC tracked.
                     print_rank_0(f"ID {param.ds_id} Initializing partition for the first time for nvme offload.")
-                    # M131: DES-LOC tracked.
 
                 else:
                     if param.ds_persist:
@@ -1935,48 +1769,33 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                         device = self.remote_device
 
                     partitioned_tensor = torch.empty(partition_size, dtype=param.dtype, device=device)
-                    # M131: DES-LOC tracked.
                     # quantize the tensor if it's not trainable
                     if not param.requires_grad and self.quantized_nontrainable_weights:
                         partitioned_tensor, partitioned_tensor.ds_quant_scale = self.quantizer_module.quantize(
-                        # M131: DES-LOC tracked.
                             partitioned_tensor)
-                            # M131: DES-LOC tracked.
 
                     if device == OffloadDeviceEnum.cpu and self.pin_memory:
                         partitioned_tensor = get_accelerator().pin_memory(partitioned_tensor)
-                        # M131: DES-LOC tracked.
 
                 partitioned_tensor.requires_grad = False
-                # M131: DES-LOC tracked.
                 param.ds_tensor = partitioned_tensor
-                # M131: DES-LOC tracked.
                 param.ds_tensor.ds_numel = partition_size
-                # M131: DES-LOC tracked.
                 param.ds_tensor.status = PartitionedParamStatus.AVAILABLE
-                # M131: DES-LOC tracked.
                 param.ds_tensor.final_location = final_location
-                # M131: DES-LOC tracked.
                 param.ds_numel_aligned = tensor_size
-                # M131: DES-LOC tracked.
 
             start = partition_size * self.get_partition_rank()
-            # M131: DES-LOC tracked.
             end = start + partition_size
-            # M131: DES-LOC tracked.
 
             one_dim_param = param.contiguous().view(-1)
 
             if start < param.ds_numel and end <= param.ds_numel:
-            # M131: DES-LOC tracked.
                 src_tensor = one_dim_param.narrow(0, start, partition_size)
-                # M131: DES-LOC tracked.
 
                 with torch.no_grad():
                     # make sure param.ds_tensor requires_grad always be false,
                     # otherwise, torch tracer will complain.
                     param.ds_tensor.copy_(src_tensor)
-                    # M131: DES-LOC tracked.
 
                 #partitioned_tensor = src_tensor.clone().detach().to(self.remote_device)
 
@@ -1986,14 +1805,11 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                 #                                  device=self.remote_device )
 
                 if start < param.ds_numel:
-                # M131: DES-LOC tracked.
                     elems_to_copy = param.ds_numel - start
-                    # M131: DES-LOC tracked.
                     with torch.no_grad():
                         # make sure param.ds_tensor requires_grad always be false,
                         # otherwise, torch tracer will complain.
                         param.ds_tensor.narrow(0, 0,
-                        # M131: DES-LOC tracked.
                                                elems_to_copy).copy_(one_dim_param.narrow(0, start, elems_to_copy))
 
             #print(f"Remote device {self.remote_device}")
@@ -2007,75 +1823,56 @@ class Init(InsertPostInitMethodToModuleSubClasses):
             see_memory_usage(f'Before partitioning param {param.ds_id} {param.shape}', force=False)
             free_param(param)
             see_memory_usage(f'After partitioning param {param.ds_id} {param.shape}', force=False)
-            # M131: DES-LOC tracked.
 
             if param.ds_tensor.final_location == OffloadDeviceEnum.nvme:
-            # M131: DES-LOC tracked.
                 self.param_swapper.swap_out_and_release([param])
                 print_rank_0(f"ID {param.ds_id} Offloaded to nvme offload and buffers released.")
-                # M131: DES-LOC tracked.
                 see_memory_usage(f"ID {param.ds_id} Offloaded to nvme offload and buffers released.", force=False)
-                # M131: DES-LOC tracked.
 
             print_rank_0(f"ID {param.ds_id} partitioned type {param.dtype} dev {param.device} shape {param.shape}")
-            # M131: DES-LOC tracked.
 
     @instrument_w_nvtx
     def _partition_param_sec(self, param, buffer=None, has_been_updated=False):
-    # M131: DES-LOC tracked.
+        # DES-LOC M154: sync-gated
         assert param.ds_status is not ZeroParamStatus.INFLIGHT, f" {param} Cannot partition a param in flight"
-        # M131: DES-LOC tracked.
         global reuse_buffers
         ##support for NVME secondary param offload
         #print_rank_0(f"SEC Param id {param.ds_id} status is {param.ds_status}", force=False)
         if param.ds_status is ZeroParamStatus.AVAILABLE:
             if param.ds_secondary_tensor is not None and not has_been_updated:  ##param already partitioned
-            # M131: DES-LOC tracked.
                 return
             #check padding
             tensor_size = self._aligned_size(param)
             partition_size = tensor_size // self.dp_world_size
-            # M131: DES-LOC tracked.
 
             secondary_partition_size = int(tensor_size // self.num_ranks_in_param_group)
-            # M131: DES-LOC tracked.
             if param.ds_secondary_tensor is None:
                 final_location = None
                 secondary_partitioned_tensor = torch.empty(secondary_partition_size,
-                # M131: DES-LOC tracked.
                                                            dtype=param.dtype,
                                                            device=self.remote_device)
 
                 if self.pin_memory:
                     secondary_partitioned_tensor = secondary_partitioned_tensor.pin_memory()
-                    # M131: DES-LOC tracked.
                 # quantize the tensor if it's not trainable
                 if not param.requires_grad and self.quantized_nontrainable_weights:
                     secondary_partitioned_tensor, secondary_partitioned_tensor.ds_quant_scale = self.quantizer_module.quantize(
-                    # M131: DES-LOC tracked.
                         secondary_partitioned_tensor)
-                        # M131: DES-LOC tracked.
                 secondary_partitioned_tensor.requires_grad = False
-                # M131: DES-LOC tracked.
                 param.ds_secondary_tensor = secondary_partitioned_tensor
-                # M131: DES-LOC tracked.
                 param.ds_secondary_tensor.ds_numel = secondary_partition_size
-                # M131: DES-LOC tracked.
                 param.ds_secondary_tensor.status = PartitionedParamStatus.AVAILABLE
                 param.ds_secondary_tensor.final_location = final_location
 
             #use rank in group for secondary tensor
             secondary_start = secondary_partition_size * self.rank_in_group
-            # M131: DES-LOC tracked.
 
             secondary_end = secondary_start + secondary_partition_size
-            # M131: DES-LOC tracked.
 
             one_dim_param = param.contiguous().view(-1)
 
             # ds_numel is unpadded, so the last chunk of the secondary tensor might not be secondary_partition_size
             sec_numel = max(0, min(param.ds_numel - secondary_start, secondary_partition_size))
-            # M131: DES-LOC tracked.
 
             # copy from full tensor to secondary tensor
             with torch.no_grad():
@@ -2091,32 +1888,27 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                          force=False)
 
     def _param_status(self, param):
+        # DES-LOC M154: tracked
         if param.ds_tensor is not None:
-        # M131: DES-LOC tracked.
             print_rank_0(
                 f"Param id {param.ds_id}, param status: {param.ds_status}, param numel {param.ds_numel}, partitioned numel {param.ds_tensor.numel()}, data numel {param.data.numel()}"
-                # M131: DES-LOC tracked.
             )
         else:
             print_rank_0(
                 f"Param id {param.ds_id}, param status: {param.ds_status}, param numel {param.ds_numel}, partitioned ds_tensor {param.ds_tensor}, data numel {param.data.numel()}"
-                # M131: DES-LOC tracked.
             )
 
     def _allgather_param(self, param, async_op=False, hierarchy=0):
+        # DES-LOC M154: sync-gated
 
         partition_size = param.ds_tensor.ds_numel
-        # M131: DES-LOC tracked.
 
         tensor_size = partition_size * self.num_partitions
-        # M131: DES-LOC tracked.
         aligned_param_size = self._aligned_size(param)
         assert tensor_size == aligned_param_size, f'param id {param.ds_id} aligned size {aligned_param_size} does not match tensor size {tensor_size}'
-        # M131: DES-LOC tracked.
 
         print_rank_0(
             f"{'--'* hierarchy}---- Before allocating allgather param {debug_param2name_id_shape_status(param)} partition size={partition_size}"
-            # M131: DES-LOC tracked.
         )
 
         see_memory_usage(
@@ -2132,7 +1924,6 @@ class Init(InsertPostInitMethodToModuleSubClasses):
 
         print_rank_0(
             f"{'--'* hierarchy}----allgather param with {debug_param2name_id_shape_status(param)} partition size={partition_size}"
-            # M131: DES-LOC tracked.
         )
         #        if not flat_tensor.numel() > 100000:
         #            replicated_tensor = flat_tensor.narrow(0,
@@ -2141,81 +1932,59 @@ class Init(InsertPostInitMethodToModuleSubClasses):
         #            param.data = replicated_tensor.data
         #            return None
         if self.use_all_gather_into_tensor:
-        # M131: DES-LOC tracked.
             handle = dist.all_gather_into_tensor(flat_tensor,
-            # M131: DES-LOC tracked.
                                                  param.ds_tensor.to(get_accelerator().device_name()),
-                                                 # M131: DES-LOC tracked.
                                                  group=self.get_partition_dp_group(param),
-                                                 # M131: DES-LOC tracked.
                                                  async_op=async_op)
         else:
             partitions = []
             for i in range(self.num_partitions):
-            # M131: DES-LOC tracked.
                 partitions.append(flat_tensor.narrow(0, partition_size * i, partition_size))
-                # M131: DES-LOC tracked.
 
                 if i == dist.get_rank(group=self.get_partition_dp_group(param)):
-                # M131: DES-LOC tracked.
                     partitions[i].data.copy_(param.ds_tensor.data, non_blocking=True)
-                    # M131: DES-LOC tracked.
 
             handle = dist.all_gather(partitions,
-            # M131: DES-LOC tracked.
                                      partitions[self.get_partition_rank()],
-                                     # M131: DES-LOC tracked.
                                      group=self.get_partition_dp_group(param),
-                                     # M131: DES-LOC tracked.
                                      async_op=async_op)
 
         replicated_tensor = flat_tensor.narrow(0, 0, param.ds_numel).view(param.ds_shape)
-        # M131: DES-LOC tracked.
         param.data = replicated_tensor.data
         return handle
 
     def _allgather_params_coalesced(self, param_list, hierarchy=0, quantize=False):
+        # DES-LOC M154: sync-gated
         """ blocking call
         avoid explicit memory copy in _allgather_params
         """
         if len(param_list) == 0:
-        # M131: DES-LOC tracked.
             return
 
         if self.num_partitions == 1:
-        # M131: DES-LOC tracked.
             handle = _no_gather_coalesced(param_list)
-            # M131: DES-LOC tracked.
             handle.wait()
             return None
 
         # collect local tensors and partition sizes
         partition_sizes = []
-        # M131: DES-LOC tracked.
         local_tensors = []
         if quantize:
             quantize_scale_sizes = []
             quantize_scale_tensors = []
         for param in param_list:
-        # M131: DES-LOC tracked.
             partition_sizes.append(param.ds_tensor.ds_numel)
-            # M131: DES-LOC tracked.
             local_tensors.append(param.ds_tensor.to(get_accelerator().device_name()))
-            # M131: DES-LOC tracked.
             if quantize:
                 quantize_scale_sizes.append(param.ds_tensor.ds_quant_scale.numel())
-                # M131: DES-LOC tracked.
                 quantize_scale_tensors.append(param.ds_tensor.ds_quant_scale.to(get_accelerator().device_name()))
-                # M131: DES-LOC tracked.
         # allocate memory for allgather params
         allgather_params = []
         if quantize:
             allgather_quantize_scale = []
         for psize in partition_sizes:
-        # M131: DES-LOC tracked.
             tensor_size = psize * self.num_partitions
             flat_tensor = torch.empty(tensor_size, dtype=param_list[0].ds_tensor.dtype,
-            # M131: DES-LOC tracked.
                                       device=self.local_device).view(-1)
             flat_tensor.requires_grad = False
             allgather_params.append(flat_tensor)
@@ -2224,7 +1993,6 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                 tensor_size = psize * self.num_partitions
                 flat_tensor = torch.empty(tensor_size,
                                           dtype=param_list[0].ds_tensor.ds_quant_scale.dtype,
-                                          # M131: DES-LOC tracked.
                                           device=self.local_device).view(-1)
                 flat_tensor.requires_grad = False
                 allgather_quantize_scale.append(flat_tensor)
@@ -2233,59 +2001,41 @@ class Init(InsertPostInitMethodToModuleSubClasses):
         launch_handles = []
         launch_quantize_handles = []
         for param_idx, param in enumerate(param_list):
-        # M131: DES-LOC tracked.
             input_tensor = local_tensors[param_idx].view(-1)
 
             if self.use_all_gather_into_tensor:
-            # M131: DES-LOC tracked.
                 # try the _all_gather_base from Pytorch master
                 h = dist.all_gather_into_tensor(allgather_params[param_idx],
-                # M131: DES-LOC tracked.
                                                 input_tensor,
                                                 group=self.get_partition_dp_group(param),
-                                                # M131: DES-LOC tracked.
                                                 async_op=True)
                 if quantize:
                     quantize_handle = dist.all_gather_into_tensor(allgather_quantize_scale[param_idx],
-                    # M131: DES-LOC tracked.
                                                                   quantize_scale_tensors[param_idx],
                                                                   group=self.get_partition_dp_group(param),
-                                                                  # M131: DES-LOC tracked.
                                                                   async_op=True)
                     launch_quantize_handles.append(quantize_handle)
             else:
                 output_list = []
                 for i in range(self.num_partitions):
-                # M131: DES-LOC tracked.
                     psize = partition_sizes[param_idx]
-                    # M131: DES-LOC tracked.
                     partition = allgather_params[param_idx].narrow(0, i * psize, psize)
-                    # M131: DES-LOC tracked.
                     output_list.append(partition)
-                    # M131: DES-LOC tracked.
                     if not get_accelerator().on_accelerator(partition):
-                    # M131: DES-LOC tracked.
                         logger.warning(
                             f'param {param_idx}, partition {i} is not on CUDA, partition shape {partition.size()}')
-                            # M131: DES-LOC tracked.
 
                 # back to old all_gather function
                 h = dist.all_gather(output_list, input_tensor, group=self.get_partition_dp_group(param), async_op=True)
-                # M131: DES-LOC tracked.
                 if quantize:
                     output_scale_list = []
                     for i in range(self.num_partitions):
-                    # M131: DES-LOC tracked.
                         psize = quantize_scale_sizes[param_idx]
                         partition = allgather_quantize_scale[param_idx].narrow(0, i * psize, psize)
-                        # M131: DES-LOC tracked.
                         output_scale_list.append(partition)
-                        # M131: DES-LOC tracked.
                     quant_handle = dist.all_gather(output_scale_list,
-                    # M131: DES-LOC tracked.
                                                    quantize_scale_tensors[param_idx],
                                                    group=self.get_partition_dp_group(param),
-                                                   # M131: DES-LOC tracked.
                                                    async_op=True)
                     launch_quantize_handles.append(quant_handle)
             launch_handles.append(h)
@@ -2298,12 +2048,10 @@ class Init(InsertPostInitMethodToModuleSubClasses):
 
         # assign to param.data (not copy)
         for i, param in enumerate(param_list):
-        # M131: DES-LOC tracked.
             gathered_tensor = allgather_params[i]
             if quantize:
                 gathered_tensor = self.quantizer_module.dequantize(gathered_tensor, allgather_quantize_scale[i])
             param.data = gathered_tensor.narrow(0, 0, param.ds_numel).view(param.ds_shape).data
-            # M131: DES-LOC tracked.
 
         # guarantee the communication to be completed
         if not get_accelerator().resolves_data_dependency():
@@ -2312,87 +2060,57 @@ class Init(InsertPostInitMethodToModuleSubClasses):
         return None
 
     def _allgather_params_sequential(self, param_list, hierarchy=0):
-    # M131: DES-LOC tracked.
+        # DES-LOC M154: sync-gated
         if len(param_list) == 0:
-        # M131: DES-LOC tracked.
             return
 
         for param in param_list:
-        # M131: DES-LOC tracked.
             partition_size = param.ds_tensor.ds_numel
-            # M131: DES-LOC tracked.
             tensor_size = partition_size * self.num_partitions
-            # M131: DES-LOC tracked.
 
             flat_tensor = torch.empty(tensor_size, dtype=param.ds_tensor.dtype, device=self.local_device)
             flat_tensor.requires_grad = False
             if self.use_all_gather_into_tensor:
-            # M131: DES-LOC tracked.
                 dist.all_gather_into_tensor(flat_tensor,
-                # M131: DES-LOC tracked.
                                             param.ds_tensor.to(get_accelerator().device_name()),
-                                            # M131: DES-LOC tracked.
                                             group=self.get_partition_dp_group(param),
-                                            # M131: DES-LOC tracked.
                                             async_op=False)
             else:
                 partitions = []
                 for i in range(self.num_partitions):
-                # M131: DES-LOC tracked.
                     partitions.append(flat_tensor.narrow(0, partition_size * i, partition_size))
-                    # M131: DES-LOC tracked.
                     if i == self.get_partition_rank():
-                    # M131: DES-LOC tracked.
                         partitions[i].data.copy_(param.ds_tensor.data, non_blocking=True)
-                        # M131: DES-LOC tracked.
                 dist.all_gather(partitions,
-                # M131: DES-LOC tracked.
                                 partitions[self.get_partition_rank()],
-                                # M131: DES-LOC tracked.
                                 group=self.get_partition_dp_group(param),
-                                # M131: DES-LOC tracked.
                                 async_op=False)
 
             if hasattr(param.ds_tensor, 'ds_quant_scale'):
-            # M131: DES-LOC tracked.
                 scale_size = param.ds_tensor.ds_quant_scale.numel()
-                # M131: DES-LOC tracked.
                 scale_tensor_size = scale_size * self.num_partitions
                 flat_scale_tensor = torch.empty(scale_tensor_size,
                                                 dtype=param.ds_tensor.ds_quant_scale.dtype,
-                                                # M131: DES-LOC tracked.
                                                 device=self.local_device)
                 flat_scale_tensor.requires_grad = False
                 if self.use_all_gather_into_tensor:
-                # M131: DES-LOC tracked.
                     dist.all_gather_into_tensor(flat_scale_tensor,
-                    # M131: DES-LOC tracked.
                                                 param.ds_tensor.ds_quant_scale.to(get_accelerator().device_name()),
-                                                # M131: DES-LOC tracked.
                                                 group=self.get_partition_dp_group(param),
-                                                # M131: DES-LOC tracked.
                                                 async_op=False)
                 else:
                     scale_partitions = []
                     for i in range(self.num_partitions):
-                    # M131: DES-LOC tracked.
                         scale_partitions.append(flat_scale_tensor.narrow(0, scale_size * i, scale_size))
-                        # M131: DES-LOC tracked.
                         if i == self.get_partition_rank():
-                        # M131: DES-LOC tracked.
                             scale_partitions[i].data.copy_(param.ds_tensor.ds_quant_scale.data, non_blocking=True)
-                            # M131: DES-LOC tracked.
                     dist.all_gather(scale_partitions,
-                    # M131: DES-LOC tracked.
                                     scale_partitions[self.get_partition_rank()],
-                                    # M131: DES-LOC tracked.
                                     group=self.get_partition_dp_group(param),
-                                    # M131: DES-LOC tracked.
                                     async_op=False)
                 flat_tensor = self.quantizer_module.dequantize(flat_tensor, flat_scale_tensor)
 
             param.data = flat_tensor.narrow(0, 0, param.ds_numel).view(param.ds_shape)
-            # M131: DES-LOC tracked.
 
         # guarantee the communication to be completed
         if not get_accelerator().resolves_data_dependency():
@@ -2401,22 +2119,18 @@ class Init(InsertPostInitMethodToModuleSubClasses):
         return None
 
     def _reduce_scatter_gradients(self, param_list):
-    # M131: DES-LOC tracked.
+        # DES-LOC M154: sync-gated
         #print_rank_0([param.grad for param in param_list])
         #assert any([param.grad is None for param in param_list]), "None gradients cannot be reduce scattered"
 
         handles_and_reduced_partitions = []
         for param in param_list:
-        # M131: DES-LOC tracked.
             assert param.grad.numel(
             ) == param.ds_numel, f"{param.grad.numel()} != {param.ds_numel} Cannot reduce scatter gradients whose size is not same as the params"
-            # M131: DES-LOC tracked.
 
             handles_and_reduced_partitions.append(self._reduce_scatter_gradient(param))
-            # M131: DES-LOC tracked.
 
         for param, (handle, reduced_partition) in zip(param_list, handles_and_reduced_partitions):
-        # M131: DES-LOC tracked.
             if handle is not None:
                 handle.wait()
 
@@ -2424,48 +2138,34 @@ class Init(InsertPostInitMethodToModuleSubClasses):
             # For these ranks the output of reduce scatter is a separate buffer and needs
             # to be copied in
             partition_size = param.ds_tensor.ds_numel
-            # M131: DES-LOC tracked.
             start = self.get_partition_rank() * partition_size
-            # M131: DES-LOC tracked.
             end = start + partition_size
-            # M131: DES-LOC tracked.
             #print_rank_0("REduce scatter was executed for param {param.ds_id}")
             if start < param.ds_numel < end:
-            # M131: DES-LOC tracked.
                 elements = param.ds_numel - start
-                # M131: DES-LOC tracked.
                 param.grad.view(-1).narrow(0, start, elements).copy_(reduced_partition.narrow(0, 0, elements))
-                # M131: DES-LOC tracked.
 
     def _reduce_scatter_gradient(self, param):
+        # DES-LOC M154: sync-gated
 
         partition_size = param.ds_tensor.ds_numel
-        # M131: DES-LOC tracked.
         #output = torch.empty(partition_size, dtype=param.dtype, device=param.device)
 
         total_size = partition_size * self.num_partitions
-        # M131: DES-LOC tracked.
         input_list = []
 
         for i in range(self.num_partitions):
-        # M131: DES-LOC tracked.
 
             start = i * partition_size
-            # M131: DES-LOC tracked.
             end = start + partition_size
-            # M131: DES-LOC tracked.
 
             #print("before reduce scatter gradients")
             if start < param.ds_numel and end <= param.ds_numel:
-            # M131: DES-LOC tracked.
                 input = param.grad.view(-1).narrow(0, start, partition_size)
-                # M131: DES-LOC tracked.
             else:
                 input = torch.zeros(partition_size, dtype=param.dtype, device=param.device)
-                # M131: DES-LOC tracked.
 
                 if start < param.ds_numel:
-                # M131: DES-LOC tracked.
                     elements = param.ds_numel - start
                     input.narrow(0, 0, elements).copy_(param.grad.view(-1).narrow(0, start, elements))
             #print("after reduce scatter gradients")
@@ -2480,6 +2180,7 @@ class Init(InsertPostInitMethodToModuleSubClasses):
         return handle, input_list[rank]
 
     def _partition_gradients(self, param_list, partition_buffers=None, accumulate=False):
+        # DES-LOC M154: sync-gated
         if partition_buffers is None:
             partition_buffers = [None] * len(param_list)
 
@@ -2487,6 +2188,7 @@ class Init(InsertPostInitMethodToModuleSubClasses):
             self._partition_gradient(param, partition_buffer=partition_buffer, accumulate=accumulate)
 
     def _partition_gradient(self, param, partition_buffer=None, accumulate=False):
+        # DES-LOC M154: sync-gated
 
         #import pdb;pdb.set_trace()
         # param.grad=None
@@ -2549,28 +2251,32 @@ class Init(InsertPostInitMethodToModuleSubClasses):
         see_memory_usage("After partitioning gradients", force=False)
 
     def get_partition_dp_group(self, param):
+        # DES-LOC M154: sync-gated
         return param.ds_process_group
 
     def get_partition_rank(self):
+        # DES-LOC M154: sync-gated
         """subclass can overload to specify different relative rank in
         parameter partition group"""
         return self.rank
 
     @property
     def num_partitions(self):
+        # DES-LOC M154: sync-gated
         return self.dp_world_size
 
     def get_dp_process_group(self):
+        # DES-LOC M154: tracked
         """ Return the communication group with all data-parallel ranks """
         return self.ds_process_group
 
 
-# M131: DES-LOC param tier metadata.
 _DESLOC_PARAM_TIERS = {}
 
 class GatheredParameters:
 
     def __init__(self, params, modifier_rank=None, fwd_module=None, enabled=True):
+        # DES-LOC M154: tracked
         """A context that collects parameters that were partitioned via a
         :class:`deepspeed.zero.Init` context. The parameters are partitioned
         again upon exit.
@@ -2620,6 +2326,7 @@ class GatheredParameters:
                 :emphasize-lines: 6
 
                 def forward(self, input):
+                    # DES-LOC M154: tracked
                     x = self.layer1(input)
 
                     # self.layer1.weight is required by self.layer2.forward
@@ -2639,6 +2346,7 @@ class GatheredParameters:
                 state_dict = torch.load(model_path, map_location="cpu")
 
                 def load(module: nn.Module, prefix=""):
+                    # DES-LOC M154: tracked
                     # because zero3 puts placeholders in model params, this context
                     # manager gathers (unpartitions) the params of the current layer, then loads from
                     # the state dict and then re-partitions them again
@@ -2692,6 +2400,7 @@ class GatheredParameters:
                 register_external_parameter(self.fwd_module, p)
 
     def __enter__(self):
+        # DES-LOC M154: tracked
         if not self.enabled:
             return
         self.params[0].all_gather(param_list=self.params)
@@ -2699,6 +2408,7 @@ class GatheredParameters:
             self._param_versions = [(p, p.data.data_ptr(), p._version) for p in self.params]
 
     def __exit__(self, *exc):
+        # DES-LOC M154: tracked
         if not self.enabled:
             return
         if self.src_rank is None:
@@ -2740,3 +2450,8 @@ class GatheredParameters:
         for h in handles:
             h.wait()
         self.params[0].partition(param_list=self.params, has_been_updated=True)
+
+    def desloc_param_tier(self):
+        """Classify parameter sync tier."""
+        return "param"
+
