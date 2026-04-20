@@ -595,3 +595,239 @@ class DeslocOptimizerComparisonLogger:
                              f'{d["final_loss"]:.6f} | {d["min_loss"]:.6f} | '
                              f'{d["convergence_step"]} | {d["avg_step_ms"]:.3f} |')
         return '\n'.join(lines)
+
+# M248 — Claude-16: DES-LOC BF16-Safe Coordinate-Wise Clipping
+# Ref: DES-LOC Algorithm 1 line 12 — clip(g,ρ) per-coordinate
+# Ref: TransformerEngine — FP8 recipe precision management
+
+import math as _m248_math
+
+def desloc_coordinate_clip_fp32(grad_tensor, rho, inplace=True):
+    """Per-coordinate gradient clipping in FP32 precision.
+    DES-LOC Eq: [clip(X,ρ)]_i = sgn(X_i) * min(|X_i|, ρ)
+    MUST execute in FP32 to avoid BF16 precision loss when ρ < 2^-7.
+    Ref: TAOCP Knuth critique — BF16 clipping truncation bug"""
+    if rho <= 0:
+        return grad_tensor
+    import torch
+    original_dtype = grad_tensor.dtype
+    if original_dtype != torch.float32:
+        g = grad_tensor.float()
+    else:
+        g = grad_tensor if inplace else grad_tensor.clone()
+    g.clamp_(-rho, rho)
+    if original_dtype != torch.float32:
+        if inplace:
+            grad_tensor.copy_(g.to(original_dtype))
+            return grad_tensor
+        return g.to(original_dtype)
+    return g
+
+def desloc_adam_step_with_clipping(param, grad, exp_avg, exp_avg_sq,
+                                    step, lr, beta1, beta2, eps, rho,
+                                    weight_decay=0.0):
+    """DES-LOC-aware Adam step with coordinate-wise clipping.
+    Implements Algorithm 2 from DES-LOC paper:
+    1. Clip gradient: ĝ = clip(g, ρ)
+    2. Update first moment: u = β₁*u + (1-β₁)*ĝ
+    3. Update second moment: v = β₂*v + (1-β₂)*ĝ²
+    4. Bias correction + step
+    All in FP32 for numerical safety."""
+    import torch
+    with torch.no_grad():
+        p = param.float()
+        g = grad.float()
+        m = exp_avg.float()
+        v = exp_avg_sq.float()
+
+        # Step 1: coordinate-wise clipping (DES-LOC specific)
+        if rho > 0:
+            g.clamp_(-rho, rho)
+
+        # Weight decay (decoupled, AdamW style)
+        if weight_decay > 0:
+            p.mul_(1.0 - lr * weight_decay)
+
+        # Step 2: first moment
+        m.mul_(beta1).add_(g, alpha=1.0 - beta1)
+
+        # Step 3: second moment
+        v.mul_(beta2).addcmul_(g, g, value=1.0 - beta2)
+
+        # Step 4: bias correction
+        bc1 = 1.0 - beta1 ** step
+        bc2 = 1.0 - beta2 ** step
+        m_hat = m / bc1
+        v_hat = v / bc2
+
+        # Step 5: parameter update
+        denom = v_hat.sqrt().add_(eps)
+        p.addcdiv_(m_hat, denom, value=-lr)
+
+        # Copy back
+        param.data.copy_(p.to(param.dtype))
+        exp_avg.data.copy_(m.to(exp_avg.dtype))
+        exp_avg_sq.data.copy_(v.to(exp_avg_sq.dtype))
+
+class DeslocAdamHyperparamScaler:
+    """Scale Adam hyperparameters with model size.
+    Ref: Scaling laws — larger models need different lr/beta2 configs.
+    Ref: Nick Joseph — 'you can adjust these for small gains but compute matters more'"""
+    @staticmethod
+    def scale_lr(base_lr, base_N, target_N, exponent=-0.5):
+        ratio = target_N / max(1, base_N)
+        return base_lr * (ratio ** exponent)
+    @staticmethod
+    def scale_warmup(base_warmup, base_N, target_N):
+        ratio = target_N / max(1, base_N)
+        return int(base_warmup * _m248_math.sqrt(ratio))
+    @staticmethod
+    def scale_clip_rho(base_rho, base_N, target_N):
+        ratio = target_N / max(1, base_N)
+        return base_rho * (ratio ** 0.25)
+    @staticmethod
+    def recommend_config(model_params, base_config=None):
+        if base_config is None:
+            base_config = {
+                'lr': 6e-4, 'beta1': 0.9, 'beta2': 0.999,
+                'eps': 1e-8, 'weight_decay': 0.1, 'clip_rho': 1.0,
+                'warmup_steps': 512, 'base_N': 125_000_000,
+            }
+        base_N = base_config.get('base_N', 125_000_000)
+        return {
+            'lr': round(DeslocAdamHyperparamScaler.scale_lr(
+                base_config['lr'], base_N, model_params), 8),
+            'beta1': base_config['beta1'],
+            'beta2': base_config['beta2'],
+            'eps': base_config['eps'],
+            'weight_decay': base_config['weight_decay'],
+            'clip_rho': round(DeslocAdamHyperparamScaler.scale_clip_rho(
+                base_config['clip_rho'], base_N, model_params), 6),
+            'warmup_steps': DeslocAdamHyperparamScaler.scale_warmup(
+                base_config['warmup_steps'], base_N, model_params),
+            'model_params': model_params,
+        }
+
+class DeslocMomentumDriftMonitor:
+    """Monitor momentum drift between sync points.
+    Ref: DES-LOC Eq(1): ‖u_{t+K}−u_t‖_∞ ≤ 2ρ(1−β₁ᴷ)
+    Alerts if actual drift exceeds theoretical bound."""
+    def __init__(self, beta1=0.9, rho=1.0, max_history=100):
+        self._beta1 = beta1
+        self._rho = rho
+        self._max_history = max_history
+        self._drift_history = []
+        self._violations = 0
+    def theoretical_bound(self, K):
+        return 2.0 * self._rho * (1.0 - self._beta1 ** K)
+    def record_drift(self, actual_drift_inf_norm, K):
+        bound = self.theoretical_bound(K)
+        violation = actual_drift_inf_norm > bound * 1.1  # 10% tolerance
+        self._drift_history.append({
+            'actual': round(actual_drift_inf_norm, 8),
+            'bound': round(bound, 8),
+            'K': K,
+            'violation': violation,
+        })
+        if violation:
+            self._violations += 1
+        if len(self._drift_history) > self._max_history:
+            self._drift_history = self._drift_history[-self._max_history:]
+    def stats(self):
+        n = len(self._drift_history)
+        if n == 0:
+            return {'n_checks': 0, 'violations': 0, 'violation_rate': 0.0}
+        avg_drift = sum(d['actual'] for d in self._drift_history) / n
+        avg_bound = sum(d['bound'] for d in self._drift_history) / n
+        return {
+            'n_checks': n,
+            'violations': self._violations,
+            'violation_rate': round(self._violations / max(1, n), 6),
+            'avg_drift': round(avg_drift, 8),
+            'avg_bound': round(avg_bound, 8),
+            'drift_to_bound_ratio': round(avg_drift / max(1e-15, avg_bound), 6),
+        }
+
+# M248: end
+
+
+# =====================================================================
+# M248T — Claude-16
+# =====================================================================
+
+import math as _m248t_math
+
+class DeslocADOPTIntegration:
+    """Integrate ADOPT optimizer variant with DES-LOC.
+    ADOPT modifies Adam to guarantee convergence for any beta2.
+    Ref: DES-LOC Section 4.1 — ADOPT (Taniguchi et al., 2024)"""
+
+    def __init__(self, beta1=0.9, beta2=0.9999, eps=1e-6):
+        self._beta1 = beta1
+        self._beta2 = beta2
+        self._eps = eps
+        self._step = 0
+
+    def adopt_update(self, param, grad, m, v, lr):
+        import torch
+        self._step += 1
+        with torch.no_grad():
+            g = grad.float()
+            if self._step == 1:
+                v.copy_(g * g)
+                return
+            v.mul_(self._beta2).addcmul_(g, g, value=1 - self._beta2)
+            denom = v.sqrt().add_(self._eps)
+            normed_grad = g / denom
+            m.mul_(self._beta1).add_(normed_grad, alpha=1 - self._beta1)
+            param.data.add_(m.to(param.dtype), alpha=-lr)
+
+    def half_life(self):
+        if self._beta2 <= 0 or self._beta2 >= 1:
+            return float("inf")
+        return round(_m248t_math.log(0.5) / _m248t_math.log(self._beta2), 4)
+
+    def recommend_Kv(self, Kx):
+        hl = self.half_life()
+        if hl < Kx:
+            return Kx
+        mult = max(1, int(hl / max(1, Kx)))
+        return Kx * min(mult, 12)
+
+class DeslocGradientClipStats:
+    """Track gradient clipping statistics for DES-LOC."""
+
+    def __init__(self, rho=1.0):
+        self._rho = rho
+        self._total_elements = 0
+        self._clipped_elements = 0
+        self._max_grad_seen = 0.0
+
+    def update(self, grad_tensor):
+        import torch
+        with torch.no_grad():
+            n = grad_tensor.numel()
+            self._total_elements += n
+            clipped = (grad_tensor.abs() >= self._rho).sum().item()
+            self._clipped_elements += clipped
+            max_g = grad_tensor.abs().max().item()
+            if max_g > self._max_grad_seen:
+                self._max_grad_seen = max_g
+
+    def clip_fraction(self):
+        if self._total_elements == 0:
+            return 0.0
+        return round(self._clipped_elements / self._total_elements, 6)
+
+    def should_increase_rho(self, threshold=0.5):
+        return self.clip_fraction() > threshold
+
+    def stats(self):
+        return {"rho": self._rho,
+                "total_elements": self._total_elements,
+                "clipped_elements": self._clipped_elements,
+                "clip_fraction": self.clip_fraction(),
+                "max_grad": round(self._max_grad_seen, 6)}
+
+
+# M248T: end
