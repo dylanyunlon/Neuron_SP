@@ -1918,3 +1918,99 @@ class DeslocPipelineLossTracker:
             _w(f'final_loss: {self._aggregated[-1][1]:.6f}')
             _w(f'avg_bubble: {self.get_avg_bubble_ratio():.4f}')
             _w('--- end summary ---')
+
+# =====================================================================
+# M256 — Claude-16
+# =====================================================================
+
+import math as _m256_math
+
+class DeslocPipelineIntegration:
+    """Integrate DES-LOC with pipeline parallelism (1F1B schedule).
+    In pipeline parallel, micro-batches flow through stages.
+    DES-LOC Kx gating must coordinate with pipeline schedule.
+    Ref: Megatron-LM — 1F1B pipeline schedule"""
+
+    def __init__(self, num_stages, Kx=32, micro_batches=8):
+        self._num_stages = num_stages
+        self._Kx = max(1, Kx)
+        self._micro_batches = micro_batches
+        self._stage_step = [0] * num_stages
+        self._global_step = 0
+
+    def should_sync_at_stage(self, stage_id, global_step):
+        self._global_step = global_step
+        if self._Kx <= 1:
+            return True
+        effective_step = global_step * self._micro_batches + stage_id
+        return (global_step % self._Kx) == 0
+
+    def compute_pipeline_bubble_fraction(self):
+        p = self._num_stages
+        m = self._micro_batches
+        if m <= 0:
+            return 1.0
+        return round((p - 1) / (m + p - 1), 6)
+
+    def desloc_adjusted_bubble(self):
+        base_bubble = self.compute_pipeline_bubble_fraction()
+        if self._Kx <= 1:
+            return base_bubble
+        comm_saving = 1.0 - 1.0 / self._Kx
+        adjusted = base_bubble * (1.0 - comm_saving * 0.3)
+        return round(adjusted, 6)
+
+    def effective_throughput_ratio(self):
+        bubble = self.desloc_adjusted_bubble()
+        return round(1.0 - bubble, 6)
+
+    def sync_schedule_for_step(self, global_step):
+        schedule = []
+        for stage in range(self._num_stages):
+            do_sync = self.should_sync_at_stage(stage, global_step)
+            schedule.append({"stage": stage, "sync": do_sync})
+        return schedule
+
+    def report(self):
+        return {
+            "num_stages": self._num_stages,
+            "Kx": self._Kx,
+            "micro_batches": self._micro_batches,
+            "bubble_frac": self.compute_pipeline_bubble_fraction(),
+            "desloc_bubble_frac": self.desloc_adjusted_bubble(),
+            "effective_throughput": self.effective_throughput_ratio(),
+        }
+
+class DeslocPipeGradientSync:
+    """Manage gradient sync across pipeline stages with DES-LOC.
+    Gradients flow backward through stages. DES-LOC gates the
+    inter-stage gradient AllReduce."""
+
+    def __init__(self, num_stages, Kx=32):
+        self._num_stages = num_stages
+        self._Kx = max(1, Kx)
+        self._stage_grads_pending = [False] * num_stages
+        self._total_syncs = 0
+        self._total_skips = 0
+
+    def mark_stage_grads_ready(self, stage_id):
+        if 0 <= stage_id < self._num_stages:
+            self._stage_grads_pending[stage_id] = True
+
+    def should_sync_stage(self, stage_id, global_step):
+        if not self._stage_grads_pending[stage_id]:
+            return False
+        if self._Kx <= 1 or global_step % self._Kx == 0:
+            self._total_syncs += 1
+            self._stage_grads_pending[stage_id] = False
+            return True
+        self._total_skips += 1
+        return False
+
+    def stats(self):
+        total = self._total_syncs + self._total_skips
+        skip_pct = 100.0 * self._total_skips / max(1, total)
+        return {"syncs": self._total_syncs, "skips": self._total_skips,
+                "skip_pct": round(skip_pct, 2)}
+
+
