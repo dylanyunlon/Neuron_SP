@@ -664,54 +664,53 @@ class CommsLogger:
 
 
 # M283: Structured comm event logger
-class DeslocCommEventLog:
-    def __init__(self):
-        self._events = []; self._step = 0
-    def log(self, op, tier, nbytes, elapsed_ms):
-        self._events.append({"step":self._step,"op":op,"tier":tier,
-            "bytes":nbytes,"ms":round(elapsed_ms,4)})
-    def advance(self): self._step += 1
-    def to_csv(self, path):
-        import csv
-        with open(path,'w',newline='') as f:
-            w = csv.DictWriter(f, fieldnames=["step","op","tier","bytes","ms"])
-            w.writeheader(); w.writerows(self._events)
-    def tier_summary(self):
-        by_tier = {}
-        for e in self._events:
-            t = e["tier"]
-            if t not in by_tier: by_tier[t]={"count":0,"bytes":0,"ms":0}
-            by_tier[t]["count"]+=1; by_tier[t]["bytes"]+=e["bytes"]; by_tier[t]["ms"]+=e["ms"]
-        return by_tier
 
-# M298 — Claude-19: FigureDataPipeline
-import json as _j298,os as _o298
-DESLOC_FIGS_V2={'fig1':{'type':'line','x':'step','y':'loss','hue':'method'},'fig2':{'type':'bar','x':'method','y':'comm_bytes','hue':'tier'},'fig3':{'type':'line','x':'Kx','y':'bound','log_x':True},'fig5':{'type':'heatmap','x':'Ku','y':'Kv','z':'loss'},'fig6':{'type':'bar','x':'method','y':'throughput'}}
-class DeslocFigPipeline:
-    __slots__=('raw','agg','specs','warns')
-    def __init__(s):s.raw=[];s.agg={};s.specs=dict(DESLOC_FIGS_V2);s.warns=[]
-    def ingest(s,es):s.raw.extend(es)
-    def aggregate(s):
-        from deepspeed.runtime.utils import DeslocAggregator
-        a=DeslocAggregator();a.add(s.raw);s.agg=a.agg();return s.agg
-    def prepare(s,fn):
-        sp=s.specs.get(fn)
-        if not sp:return None
-        if not s.agg:s.aggregate()
-        pts=[]
-        for k,st in s.agg.items():
-            c=st.get('cfg',{});pts.append({'method':c.get('method',''),'Kx':c.get('Kx',1),'Ku':c.get('Ku',1),'Kv':c.get('Kv',1),'loss':st.get('lm'),'throughput':st.get('tm',0)})
-        return{'spec':sp,'points':pts}
-    def export(s,od):
-        _o298.makedirs(od,exist_ok=True);ex=[]
-        for fn in s.specs:
-            d=s.prepare(fn)
-            if d:fp=_o298.path.join(od,f"{fn}.json");open(fp,'w').write(_j298.dumps(d,indent=2,default=str));ex.append(fp)
-        return ex
-    def validate(s):
-        i=[];
-        if len(s.raw)<10:i.append(f"Only {len(s.raw)} exps")
-        ms=set(e.get('method')for e in s.raw);m={'DDP','LocalAdam','DESLOC'}-ms
-        if m:i.append(f"Missing: {m}")
-        return i
-# M298: end
+# M313: Tier logging + figure data
+import re as _cre
+
+def desloc_cl_op(tn):
+    n = tn.lower() if tn else ''
+    if 'exp_avg_sq' in n: return 2
+    elif 'exp_avg' in n: return 1
+    return 0
+
+def desloc_cl_entry(step, op, tier, nb, us, synced=True):
+    return "### comm_op=%s, tier=%d, step=%d ###\nbytes: %d\ntime_us: %.2f\nsynced: %d" % (op, tier, step, nb, us, int(synced))
+
+def desloc_cl_parse(path):
+    entries = []; cur = {}
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                m = _cre.match(r'^###\s*comm_op\s*=\s*(\w+),\s*tier\s*=\s*(\d+),\s*step\s*=\s*(\d+)', line)
+                if m:
+                    if cur: entries.append(cur)
+                    cur = {'op': m.group(1), 'tier': int(m.group(2)), 'step': int(m.group(3))}; continue
+                m = _cre.match(r'^(\w+)\s*:\s*(.+)$', line)
+                if m and cur:
+                    try: cur[m.group(1)] = float(m.group(2))
+                    except: cur[m.group(1)] = m.group(2)
+            if cur: entries.append(cur)
+    except FileNotFoundError: pass
+    return entries
+
+def desloc_cl_sum(entries):
+    ts = {i: {'b': 0, 'o': 0, 's': 0} for i in range(3)}
+    for e in entries:
+        t = e.get('tier', 0)
+        if t not in ts: ts[t] = {'b': 0, 'o': 0, 's': 0}
+        if e.get('synced', 1) == 1: ts[t]['b'] += e.get('bytes', 0); ts[t]['o'] += 1
+        else: ts[t]['s'] += 1
+    to = sum(s['o'] for s in ts.values()); sk = sum(s['s'] for s in ts.values())
+    return {'tiers': ts, 'ops': to, 'skips': sk, 'red': round((to + sk) / max(1, to), 2)}
+
+def desloc_fig_data(entries, kind='reduction'):
+    s = desloc_cl_sum(entries)
+    if kind == 'reduction':
+        t = s['ops'] + s['skips']
+        return {'x': ['DDP', 'DES-LOC'], 'y': [1.0, round(s['ops'] / max(1, t), 4)]}
+    elif kind == 'tier':
+        return {'x': ['Kx', 'Ku', 'Kv'], 'y': [s['tiers'].get(i, {}).get('b', 0) / 1e9 for i in range(3)]}
+    return {}
+# --- End M313 ---
