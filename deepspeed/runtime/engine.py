@@ -2515,6 +2515,9 @@ class DeepSpeedEngine(Module):
     def desloc_post_step(self, loss=None):
         if not self.desloc_enabled: return
         self.desloc_step += 1
+        # M279: profiler hook
+        if hasattr(self, '_desloc_step_profiler'):
+            self._desloc_step_profiler(self.desloc_step)
         if hasattr(self, '_desloc_scheduler') and self._desloc_scheduler:
             self._desloc_scheduler.advance()
         if self.desloc_step % 500 == 0 and dist.get_rank() == 0:
