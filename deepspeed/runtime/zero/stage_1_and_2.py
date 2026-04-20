@@ -3340,7 +3340,6 @@ def desloc_z12_sync_states():
                 s["exp_avg_sq"].div_(ws)
 
 
-
 # =============================================================================
 # M237 (Claude-15): ZeRO-1 vs ZeRO-2 comm comparison for Figure 2
 # Ref: ZeRO paper — Stage 1 partitions optimizer states, Stage 2 adds gradients
@@ -3433,3 +3432,86 @@ class DeslocZeroCommTracker:
         _w(f'### zero_stage = {d["zero_stage"]}, Kx = {d["Kx"]} ###')
         for k, v in sorted(d.items()):
             _w(f'{k}: {v}')
+
+# =====================================================================
+# M254 — Claude-16
+# =====================================================================
+
+import math as _m254_math
+
+class DeslocZeROBucketGating:
+    """Gate ZeRO gradient buckets by DES-LOC Kx period.
+    In ZeRO-1/2, reduce_scatter happens per bucket.
+    With DES-LOC, only execute at Kx boundaries.
+    Ref: DeepSpeed stage_1_and_2.py — reduce_ready_partitions()"""
+
+    def __init__(self, Kx=1, n_buckets=16):
+        self._Kx = max(1, Kx)
+        self._n_buckets = n_buckets
+        self._bucket_ready = [False] * n_buckets
+        self._bucket_deferred = [0] * n_buckets
+        self._step = 0
+
+    def mark_bucket_ready(self, bucket_id):
+        if 0 <= bucket_id < self._n_buckets:
+            self._bucket_ready[bucket_id] = True
+
+    def should_reduce_bucket(self, bucket_id, step):
+        self._step = step
+        if self._Kx <= 1:
+            return self._bucket_ready[bucket_id]
+        if step % self._Kx == 0:
+            if self._bucket_ready[bucket_id]:
+                return True
+        else:
+            if self._bucket_ready[bucket_id]:
+                self._bucket_deferred[bucket_id] += 1
+        return False
+
+    def flush_deferred(self):
+        flushed = []
+        for i in range(self._n_buckets):
+            if self._bucket_deferred[i] > 0:
+                flushed.append(i)
+                self._bucket_deferred[i] = 0
+                self._bucket_ready[i] = False
+        return flushed
+
+    def reset_step(self):
+        self._bucket_ready = [False] * self._n_buckets
+
+    def stats(self):
+        total_deferred = sum(self._bucket_deferred)
+        return {"step": self._step, "Kx": self._Kx,
+                "n_buckets": self._n_buckets,
+                "total_deferred": total_deferred}
+
+class DeslocPartitionAwareSync:
+    """Handle DES-LOC sync with ZeRO parameter partitioning.
+    Each worker holds 1/N of parameters. During Kx sync,
+    AllGather reconstructs full params before averaging."""
+
+    def __init__(self, world_size, Kx=32):
+        self._world_size = world_size
+        self._Kx = max(1, Kx)
+        self._sync_log = []
+
+    def compute_sync_bytes(self, partition_bytes):
+        allgather = partition_bytes * self._world_size
+        reduce_scatter = partition_bytes * self._world_size
+        return {"allgather_bytes": allgather,
+                "reduce_scatter_bytes": reduce_scatter,
+                "total_per_sync": allgather + reduce_scatter,
+                "amortized_per_step": (allgather + reduce_scatter) / max(1, self._Kx)}
+
+    def should_allgather(self, step, warmup_steps=512):
+        if step < warmup_steps:
+            return True
+        return step % self._Kx == 0
+
+    def record_sync(self, step, nbytes, duration_ms):
+        self._sync_log.append({"step": step, "bytes": nbytes, "ms": round(duration_ms, 4)})
+        if len(self._sync_log) > 1000:
+            self._sync_log = self._sync_log[-1000:]
+
+
