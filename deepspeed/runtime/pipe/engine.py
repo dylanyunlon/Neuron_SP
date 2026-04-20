@@ -1783,3 +1783,138 @@ class DeslocPipelineGradAccumulator:
     def scale_factor(self):
         """Gradient scaling factor (1/num_micro_batches for averaging)."""
         return 1.0 / max(self._num_micro, 1)
+
+    # --- DES-LOC Pipeline Extensions (M149) ---
+    def _desloc_pipe_comm_stats(self):
+        sb=sum(p.numel()*p.element_size() for p in self.module.parameters() if p.requires_grad)
+        Kx=self.desloc_Kx if self.desloc_enabled else 1
+        return {'dp':sb,'reduction':round(Kx,1),'tier':self._desloc_pipe_stage_tier()}
+    def _desloc_pipe_warmup_sched(self,W=512):
+        s=self.desloc_step;tKx,tKu,tKv=self.desloc_Kx,self.desloc_Ku,self.desloc_Kv
+        if s<W//4: return {'Kx':1,'Ku':1,'Kv':1,'phase':'full_sync'}
+        elif s<W//2: return {'Kx':max(1,tKx//4),'Ku':1,'Kv':1,'phase':'grad_x'}
+        elif s<W: return {'Kx':max(1,tKx//2),'Ku':max(1,tKu//4),'Kv':1,'phase':'grad_uv'}
+        return {'Kx':tKx,'Ku':tKu,'Kv':tKv,'phase':'full_desloc'}
+    def _desloc_pipe_stability(self):
+        import math
+        gn=sum(p.grad.data.norm(2).item()**2 for p in self.module.parameters() if p.grad is not None)
+        gn=math.sqrt(gn);t=torch.tensor([gn,gn**2],device=self.device)
+        ws=dist.get_world_size()
+        if ws>1: dist.all_reduce(t);t/=ws
+        mn,msq=t[0].item(),t[1].item();cv=math.sqrt(max(0,msq-mn**2))/max(mn,1e-8)
+        return {'stable':cv<0.5,'cv':round(cv,4)}
+    def _desloc_pipe_overlap_est(self):
+        ns=getattr(self,'num_stages',1)
+        if ns<=1: return 1.0
+        sb=sum(p.numel()*p.element_size() for p in self.module.parameters() if p.requires_grad)
+        cm=sb/10e9*1000/max(self.desloc_Kx,1);cp=100.0/ns
+        ol=min(cm,cp*(ns-1));ex=max(0,cm-ol);return round(cp/max(cp+ex,1e-8),3)
+    def _desloc_pipe_ckpt(self):
+        return {'stage':getattr(self,'stage_id',0),'tier':self._desloc_pipe_stage_tier(),'step':self.desloc_step}
+    def _desloc_pipe_init_ddp(self):
+        if not self.desloc_enabled: return
+        self.desloc_step=0
+        if self.grid and hasattr(self.grid,'get_data_parallel_group'):
+            dp=self.grid.get_data_parallel_group()
+            for p in self.module.parameters(): dist.broadcast(p.data,src=0,group=dp)
+
+
+# =============================================================================
+# M236 (Claude-15): Pipeline vs non-Pipeline loss for Figure 1
+# Ref: Section 5.4 — pipeline parallel scaling
+# Ref: Megatron-LM megatron/core/pipeline_parallel — 1F1B schedule
+# =============================================================================
+
+
+class DeslocPipelineLossTracker:
+    """Track pipeline parallel loss for Figure 1 comparison.
+
+    Pipeline parallelism introduces micro-batch loss variance.
+    This tracker records per-micro-batch losses and computes
+    the effective loss for comparison with non-pipeline DES-LOC.
+
+    From Megatron-LM: 1F1B schedule processes micro-batches in
+    interleaved order, causing different loss dynamics than DP-only.
+
+    From Section 5.4: DES-LOC + PP must maintain convergence
+    competitive with DDP across model scales.
+
+    Usage:
+        tracker = DeslocPipelineLossTracker(num_stages=4)
+        for micro_step in range(gas):
+            loss = forward_step()
+            tracker.record_micro_loss(step, micro_step, loss)
+        tracker.finalize_step(step)
+    """
+
+    def __init__(self, num_stages=1, gas=1):
+        self.num_stages = num_stages
+        self.gas = gas  # gradient accumulation steps
+        self._step_losses = {}  # {step: [micro_losses]}
+        self._aggregated = []   # [(step, avg_loss)]
+        self._bubble_ratios = []  # pipeline bubble overhead
+
+    def record_micro_loss(self, step, micro_step, loss):
+        """Record loss from one micro-batch."""
+        if step not in self._step_losses:
+            self._step_losses[step] = []
+        self._step_losses[step].append(float(loss))
+
+    def finalize_step(self, step, bubble_time_ms=0, total_time_ms=1):
+        """Finalize a training step, compute aggregated loss."""
+        if step in self._step_losses:
+            losses = self._step_losses[step]
+            avg = sum(losses) / len(losses) if losses else 0
+            self._aggregated.append((step, avg))
+        if total_time_ms > 0:
+            self._bubble_ratios.append(bubble_time_ms / total_time_ms)
+
+    def get_loss_curve(self):
+        """Return (steps, losses) for Figure 1.
+
+        Returns averaged loss per step (across micro-batches).
+        """
+        steps = [s for s, _ in self._aggregated]
+        losses = [l for _, l in self._aggregated]
+        return steps, losses
+
+    def get_avg_bubble_ratio(self):
+        """Average pipeline bubble ratio.
+
+        Returns: float — fraction of time spent in bubble.
+        Ideal = 0 (no bubble); typical = (P-1)/(M+P-1).
+        """
+        if not self._bubble_ratios:
+            return 0.0
+        return sum(self._bubble_ratios) / len(self._bubble_ratios)
+
+    def get_figure1_pipeline_data(self):
+        """Return Figure 1 data for pipeline configuration.
+
+        Returns: dict with loss curve and pipeline overhead.
+        """
+        steps, losses = self.get_loss_curve()
+        return {
+            'steps': steps,
+            'losses': losses,
+            'final_loss': round(losses[-1], 6) if losses else None,
+            'avg_bubble_ratio': round(self.get_avg_bubble_ratio(), 4),
+            'num_stages': self.num_stages,
+            'gas': self.gas,
+            'label': f'PP-{self.num_stages} (GAS={self.gas})',
+        }
+
+    def emit_nkifa_log(self, stream=None):
+        """Write pipeline loss data in NKI-FA format."""
+        def _w(line):
+            if stream: stream.write(line + '\n')
+            else: print(line)
+        _w(f'### pipeline_stages = {self.num_stages}, gas = {self.gas} ###')
+        for step, loss in self._aggregated:
+            _w(f'step: {step} | loss: {loss:.6f}')
+        if self._aggregated:
+            _w('')
+            _w('--- summary ---')
+            _w(f'final_loss: {self._aggregated[-1][1]:.6f}')
+            _w(f'avg_bubble: {self.get_avg_bubble_ratio():.4f}')
+            _w('--- end summary ---')
