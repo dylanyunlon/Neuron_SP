@@ -3245,3 +3245,191 @@ class DeslocZeroSyncManager:
 
     def load_state_dict(self, sd):
         self._step = sd.get('step', 0)
+
+        self.num_partitions = sd.get('n', self.num_partitions)
+        self.partition_sync_step = sd.get('sync', self.partition_sync_step)
+
+
+class DeslocZeroOverflowGuard:
+    """Guard against overflow during DES-LOC non-sync steps.
+    Overflow detection (NaN/Inf in gradients) must ALWAYS be synchronous.
+    Even when DES-LOC skips allreduce, overflow checks must run.
+
+    Ref: M092-M106 rule — 'MoE capacity allreduces must NOT be gated.'
+    Same principle: safety-critical ops are never skipped."""
+
+    def __init__(self):
+        self.overflow_at_non_sync = 0
+        self.overflow_at_sync = 0
+        self.total_checks = 0
+
+    def check(self, has_overflow, is_sync_step):
+        self.total_checks += 1
+        if has_overflow:
+            if is_sync_step:
+                self.overflow_at_sync += 1
+            else:
+                self.overflow_at_non_sync += 1
+        return has_overflow
+
+    def should_force_sync(self):
+        """If overflow detected at non-sync step, force sync next step."""
+        return self.overflow_at_non_sync > 0
+
+    def get_stats(self):
+        return {
+            'total_checks': self.total_checks,
+            'overflow_at_sync': self.overflow_at_sync,
+            'overflow_at_non_sync': self.overflow_at_non_sync,
+            'needs_force_sync': self.should_force_sync(),
+        }
+
+    def reset_non_sync_overflow(self):
+        self.overflow_at_non_sync = 0
+
+
+class DeslocZeroMoEGuard:
+    """Ensure MoE capacity allreduces are never gated by DES-LOC.
+    MoE expert capacity factor allreduces are required for load balancing.
+    Skipping them would cause experts to receive wrong number of tokens.
+
+    Ref: M094 rule — 'annotate capacity allreduce as DES-LOC-incompatible.'"""
+
+    @staticmethod
+    def is_moe_capacity_op(op_name):
+        """Check if an operation is a MoE capacity allreduce."""
+        if not isinstance(op_name, str):
+            return False
+        lower = op_name.lower()
+        return any(k in lower for k in ('capacity', 'expert_count', 'moe_gate',
+                                        'load_balance', 'aux_loss'))
+
+    @staticmethod
+    def should_execute(op_name, is_sync_step):
+        """Always execute MoE ops regardless of DES-LOC sync state."""
+        if DeslocZeroMoEGuard.is_moe_capacity_op(op_name):
+            return True
+        return is_sync_step
+
+def desloc_z12_kx_gate():
+    """Gate Z1Z2 gradient reduce by Kx."""
+    engine = getattr(self, "deepspeed_engine", None)
+    if engine is None or not getattr(engine, "desloc_enabled", False):
+        return True
+    return engine.global_steps % engine.desloc_Kx == 0
+
+
+def desloc_z12_sync_states():
+    """Z1Z2 state sync at Ku/Kv."""
+    engine = getattr(self, "deepspeed_engine", None)
+    if engine is None or not getattr(engine, "desloc_enabled", False):
+        return
+    import deepspeed.comm as dist
+    dp = engine.mpu.get_data_parallel_group() if engine.mpu else None
+    ws = dist.get_world_size(group=dp)
+    for pg in self.optimizer.param_groups:
+        for p in pg["params"]:
+            if p not in self.optimizer.state:
+                continue
+            s = self.optimizer.state[p]
+            if engine.global_steps % engine.desloc_Ku == 0 and "exp_avg" in s:
+                dist.all_reduce(s["exp_avg"], group=dp)
+                s["exp_avg"].div_(ws)
+            if engine.global_steps % engine.desloc_Kv == 0 and "exp_avg_sq" in s:
+                dist.all_reduce(s["exp_avg_sq"], group=dp)
+                s["exp_avg_sq"].div_(ws)
+
+
+
+# =============================================================================
+# M237 (Claude-15): ZeRO-1 vs ZeRO-2 comm comparison for Figure 2
+# Ref: ZeRO paper — Stage 1 partitions optimizer states, Stage 2 adds gradients
+# Ref: Section 5.3 — DES-LOC comm reduction compounds with ZeRO
+# =============================================================================
+
+
+class DeslocZeroCommTracker:
+    """Track ZeRO-specific communication for Figure 2 bars.
+
+    ZeRO-1: partition optimizer states across DP ranks.
+      Comm: AllGather params at forward, ReduceScatter grads at backward.
+    ZeRO-2: additionally partition gradients.
+      Comm: same as Z1 but gradient buckets are smaller.
+
+    DES-LOC reduces both: skip gradient ReduceScatter at non-Kx steps,
+    skip optimizer state AllGather at non-Ku/Kv steps.
+
+    From NCCL: AllGather and ReduceScatter have different bandwidth
+    characteristics. Track them separately for accurate Figure 2.
+
+    Usage:
+        tracker = DeslocZeroCommTracker(zero_stage=2, Kx=32)
+        tracker.record_reduce_scatter(step, bucket_bytes, was_skipped=False)
+        tracker.record_all_gather(step, bucket_bytes, was_skipped=True)
+        data = tracker.get_figure2_zero_data()
+    """
+
+    def __init__(self, zero_stage=1, Kx=1, Ku=3, Kv=6):
+        self.zero_stage = zero_stage
+        self.Kx = Kx
+        self.Ku = Ku
+        self.Kv = Kv
+        self._rs_bytes = 0    # ReduceScatter total
+        self._rs_ops = 0
+        self._rs_skipped = 0
+        self._ag_bytes = 0    # AllGather total
+        self._ag_ops = 0
+        self._ag_skipped = 0
+        self._total_steps = 0
+
+    def record_reduce_scatter(self, step, bucket_bytes, was_skipped=False):
+        """Record a gradient ReduceScatter event."""
+        self._total_steps = max(self._total_steps, step + 1)
+        if was_skipped:
+            self._rs_skipped += 1
+        else:
+            self._rs_bytes += bucket_bytes
+            self._rs_ops += 1
+
+    def record_all_gather(self, step, bucket_bytes, was_skipped=False):
+        """Record a parameter/state AllGather event."""
+        self._total_steps = max(self._total_steps, step + 1)
+        if was_skipped:
+            self._ag_skipped += 1
+        else:
+            self._ag_bytes += bucket_bytes
+            self._ag_ops += 1
+
+    def get_figure2_zero_data(self):
+        """Return Figure 2 ZeRO-specific bar data.
+
+        Returns: dict with ReduceScatter and AllGather breakdown.
+        """
+        total = self._rs_bytes + self._ag_bytes
+        rs_gb = self._rs_bytes / (1024**3)
+        ag_gb = self._ag_bytes / (1024**3)
+        total_gb = total / (1024**3)
+        total_ops = self._rs_ops + self._ag_ops
+        total_skipped = self._rs_skipped + self._ag_skipped
+        return {
+            'zero_stage': self.zero_stage,
+            'Kx': self.Kx,
+            'label': f'ZeRO-{self.zero_stage} + DES-LOC (Kx={self.Kx})',
+            'reduce_scatter_gb': round(rs_gb, 3),
+            'all_gather_gb': round(ag_gb, 3),
+            'total_gb': round(total_gb, 3),
+            'total_ops': total_ops,
+            'skipped_ops': total_skipped,
+            'skip_rate': round(total_skipped / max(1, total_ops + total_skipped), 4),
+            'total_steps': self._total_steps,
+        }
+
+    def emit_nkifa_log(self, stream=None):
+        """Write ZeRO comm data in NKI-FA format."""
+        def _w(line):
+            if stream: stream.write(line + '\n')
+            else: print(line)
+        d = self.get_figure2_zero_data()
+        _w(f'### zero_stage = {d["zero_stage"]}, Kx = {d["Kx"]} ###')
+        for k, v in sorted(d.items()):
+            _w(f'{k}: {v}')
