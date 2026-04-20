@@ -1084,959 +1084,173 @@ class DeslocConfig:
                 f'clip_rho={self.clip_rho}, outer={self.outer_optimizer})')
 
 
-# =========================================================================
-# M214: DES-LOC Experiment Configuration (Section 4 + Section 5)
-# =========================================================================
-
-import math
-
-
-class DeslocExperimentConfig:
-    """Configuration for DES-LOC ablation experiments.
-
-    Ref: Section 5 — evaluation covers RQ1-RQ6 with specific settings:
-      - Model sizes: 125M, 350M, 1.3B (Section 5.4)
-      - Kx values: 16, 32, 64, 128 (Section 5.2)
-      - Ku multiples: 1x, 3x, 6x of Kx (Section 5.3)
-      - Beta values: beta1=0.9, beta2=0.95/0.999 (Section 5.1)
-      - Seeds: 3 seeds per config for error bars (Table 1)
-
-    This class generates the full experiment matrix.
-    """
-
-    MODEL_CONFIGS = {
-        '125M': {'n_layer': 12, 'n_head': 12, 'n_embd': 768, 'params': 125e6},
-        '350M': {'n_layer': 24, 'n_head': 16, 'n_embd': 1024, 'params': 350e6},
-        '700M': {'n_layer': 36, 'n_head': 20, 'n_embd': 1280, 'params': 700e6},
-        '1.3B': {'n_layer': 24, 'n_head': 16, 'n_embd': 2048, 'params': 1.3e9},
-    }
-
-    def __init__(self, seeds=(42, 137, 2024), max_steps=25000):
-        self.seeds = list(seeds)
-        self.max_steps = max_steps
-
-    def rq1_halflife_configs(self):
-        """RQ1: Do optimizer states change at different rates?
-        Sweep beta2 with fixed beta1=0.9, measure state change rates.
-        Ref: Section 5.1, Figure 3."""
-        configs = []
-        for beta2 in [0.95, 0.99, 0.995, 0.999, 0.9999]:
-            for seed in self.seeds:
-                configs.append({
-                    'rq': 'RQ1', 'beta1': 0.9, 'beta2': beta2,
-                    'Kx': 32, 'Ku': 96, 'Kv': 192,
-                    'model': '125M', 'seed': seed,
-                    'max_steps': self.max_steps,
-                    'measure': 'state_change_rate',
-                })
-        return configs
-
-    def rq2_sync_frequency_configs(self):
-        """RQ2: How do sync periods affect training quality?
-        Independently vary Kx, Ku, Kv.
-        Ref: Section 5.2, Figure 4."""
-        configs = []
-        base_Kx_values = [16, 32]
-        for base_Kx in base_Kx_values:
-            for Kx_mult in [1, 2, 4, 8]:
-                Kx = base_Kx * Kx_mult
-                for Ku_mult in [1, 3]:
-                    Ku = Kx * Ku_mult
-                    for Kv_mult in [1, 2]:
-                        Kv = Ku * Kv_mult
-                        for seed in self.seeds:
-                            configs.append({
-                                'rq': 'RQ2', 'Kx': Kx, 'Ku': Ku, 'Kv': Kv,
-                                'beta1': 0.9, 'beta2': 0.999,
-                                'model': '125M', 'seed': seed,
-                                'max_steps': self.max_steps,
-                            })
-        return configs
-
-    def rq3_comm_reduction_configs(self):
-        """RQ3: How much communication does DES-LOC save?
-        Compare DDP (Kx=1) vs Local Adam vs DES-LOC.
-        Ref: Section 5.3, Figure 5."""
-        configs = []
-        baselines = [
-            ('DDP', 1, 1, 1),
-            ('LocalAdam', 32, 32, 32),
-            ('DESLOC', 32, 96, 192),
-        ]
-        for name, Kx, Ku, Kv in baselines:
-            for seed in self.seeds:
-                configs.append({
-                    'rq': 'RQ3', 'method': name,
-                    'Kx': Kx, 'Ku': Ku, 'Kv': Kv,
-                    'beta1': 0.9, 'beta2': 0.999,
-                    'model': '125M', 'seed': seed,
-                    'max_steps': self.max_steps,
-                })
-        return configs
-
-    def rq4_scaling_configs(self):
-        """RQ4: Does DES-LOC scale to larger models?
-        Evaluate 125M, 350M, 1.3B models.
-        Ref: Section 5.4, Table 1."""
-        configs = []
-        for model in ['125M', '350M', '1.3B']:
-            for method in ['DDP', 'LocalAdam', 'DESLOC']:
-                Kx = 1 if method == 'DDP' else 32
-                Ku = 1 if method == 'DDP' else (32 if method == 'LocalAdam' else 96)
-                Kv = 1 if method == 'DDP' else (32 if method == 'LocalAdam' else 192)
-                for seed in self.seeds:
-                    configs.append({
-                        'rq': 'RQ4', 'model': model, 'method': method,
-                        'Kx': Kx, 'Ku': Ku, 'Kv': Kv,
-                        'beta1': 0.9, 'beta2': 0.999,
-                        'seed': seed, 'max_steps': self.max_steps,
-                    })
-        return configs
-
-    def rq5_nesterov_configs(self):
-        """RQ5: Does Nesterov outer optimizer help?
-        Compare averaging vs Nesterov with momentum 0.9.
-        Ref: Section 5.5, Figure 7."""
-        configs = []
-        for outer in ['averaging', 'nesterov']:
-            for Kx in [32, 128]:
-                for seed in self.seeds:
-                    configs.append({
-                        'rq': 'RQ5', 'outer': outer,
-                        'Kx': Kx, 'Ku': 3 * Kx, 'Kv': 6 * Kx,
-                        'nesterov_mu': 0.9 if outer == 'nesterov' else 0.0,
-                        'beta1': 0.9, 'beta2': 0.999,
-                        'model': '125M', 'seed': seed,
-                        'max_steps': self.max_steps,
-                    })
-        return configs
-
-    def rq6_muon_configs(self):
-        """RQ6: Is DES-LOC compatible with non-Adam optimizers?
-        Test with Muon optimizer (single momentum, SVD preconditioning).
-        Ref: Section 5.6, Figure 8."""
-        configs = []
-        for inner in ['adam', 'adopt', 'muon']:
-            for model in ['125M', '350M']:
-                for seed in self.seeds:
-                    configs.append({
-                        'rq': 'RQ6', 'inner': inner,
-                        'Kx': 32, 'Ku': 96, 'Kv': 192,
-                        'model': model, 'seed': seed,
-                        'max_steps': self.max_steps,
-                    })
-        return configs
-
-    def generate_all(self):
-        """Generate complete experiment matrix."""
-        all_configs = []
-        all_configs.extend(self.rq1_halflife_configs())
-        all_configs.extend(self.rq2_sync_frequency_configs())
-        all_configs.extend(self.rq3_comm_reduction_configs())
-        all_configs.extend(self.rq4_scaling_configs())
-        all_configs.extend(self.rq5_nesterov_configs())
-        all_configs.extend(self.rq6_muon_configs())
-        return all_configs
-
-    def total_experiments(self):
-        return len(self.generate_all())
-
-    def group_by_rq(self):
-        configs = self.generate_all()
-        groups = {}
-        for c in configs:
-            rq = c.get('rq', 'unknown')
-            groups.setdefault(rq, []).append(c)
-        return {rq: len(v) for rq, v in groups.items()}
-
-
-class DeslocResultsValidator:
-    """Validate experiment results meet NeurIPS publication standards.
-
-    Ref: NKI-FA commit da964f3 — all values have >= 4 significant digits.
-    Standards:
-      1. Every float has >= 4 significant digits (no '0.9' or '11')
-      2. Each configuration has >= 3 seeds for error bars
-      3. Loss curves are monotonically decreasing (on average)
-      4. Comm reduction matches theoretical prediction within 10%
-    """
-
-    def __init__(self, results):
-        self.results = results
-
-    @staticmethod
-    def significant_digits(value):
-        """Count significant digits in a float."""
-        if value == 0:
-            return 0
-        s = f'{value:.10g}'.lstrip('-').replace('.', '').lstrip('0')
-        return len(s.rstrip('0'))
-
-    def check_precision(self, min_sig=4):
-        """Check all numeric values have sufficient significant digits."""
-        violations = []
-        for i, r in enumerate(self.results):
-            for key, val in r.items():
-                if isinstance(val, float) and val != 0:
-                    sd = self.significant_digits(val)
-                    if sd < min_sig:
-                        violations.append(
-                            f'result[{i}].{key}={val}: {sd} sig digits < {min_sig}')
-        return violations
-
-    def check_seed_coverage(self, min_seeds=3):
-        """Check each config has enough seeds for error bars."""
-        from collections import Counter
-        config_counts = Counter()
-        for r in self.results:
-            key_parts = []
-            for k in sorted(r.keys()):
-                if k not in ('seed', 'loss', 'throughput', 'comm_bytes'):
-                    key_parts.append((k, r[k]))
-            config_counts[tuple(key_parts)] += 1
-        insufficient = [(k, v) for k, v in config_counts.items() if v < min_seeds]
-        return insufficient
-
-    def check_loss_monotonic(self, window=50):
-        """Check loss is decreasing on average (smoothed)."""
-        violations = []
-        for r in self.results:
-            losses = r.get('loss_curve', [])
-            if len(losses) < 2 * window:
-                continue
-            for i in range(window, len(losses) - window):
-                avg_before = sum(losses[i - window:i]) / window
-                avg_after = sum(losses[i:i + window]) / window
-                if avg_after > avg_before * 1.1:
-                    violations.append(
-                        f'Loss increase at step {i}: {avg_before:.6f} -> {avg_after:.6f}')
-                    break
-        return violations
-
-    def check_comm_reduction(self, tolerance=0.10):
-        """Verify actual comm reduction matches theory within tolerance."""
-        violations = []
-        for r in self.results:
-            Kx = r.get('Kx', 1)
-            Ku = r.get('Ku', 1)
-            Kv = r.get('Kv', 1)
-            actual = r.get('comm_reduction', None)
-            if actual is None:
-                continue
-            desloc_rate = 1.0 / Kx + 1.0 / Ku + 1.0 / Kv
-            theoretical = 1.0 - desloc_rate / 3.0
-            if abs(actual - theoretical) > tolerance:
-                violations.append(
-                    f'Kx={Kx} Ku={Ku} Kv={Kv}: actual={actual:.4f} '
-                    f'vs theory={theoretical:.4f}')
-        return violations
-
-    def validate_all(self):
-        return {
-            'precision': self.check_precision(),
-            'seed_coverage': self.check_seed_coverage(),
-            'loss_monotonic': self.check_loss_monotonic(),
-            'comm_reduction': self.check_comm_reduction(),
-        }
-
-
-class DeslocWSDConfig:
-    """Warmup-Stable-Decay (WSD) schedule configuration.
-
-    Ref: Section 4.1 — 'Learning rates use the WSD schedule
-    (Hu et al., 2024) with warmup (T_WARM=512), stable, and
-    decay phases.'
-
-    The WSD schedule aligns LR transitions to Kx boundaries
-    for consistency across workers.
-    """
-
-    def __init__(self, warmup_steps=512, stable_fraction=0.8,
-                 decay_fraction=0.1, peak_lr=6e-4, min_lr=6e-5,
-                 Kx=32):
-        self.warmup_steps = warmup_steps
-        self.stable_fraction = stable_fraction
-        self.decay_fraction = decay_fraction
-        self.peak_lr = peak_lr
-        self.min_lr = min_lr
-        self.Kx = max(Kx, 1)
-
-    def compute_phase_steps(self, total_steps):
-        """Compute step boundaries for each phase, aligned to Kx."""
-        warmup = self._align(self.warmup_steps)
-        remaining = total_steps - warmup
-        stable = self._align(int(remaining * self.stable_fraction))
-        decay = self._align(int(remaining * self.decay_fraction))
-        return warmup, stable, decay
-
-    def _align(self, steps):
-        """Round up to nearest Kx boundary."""
-        if self.Kx <= 1:
-            return steps
-        return ((steps + self.Kx - 1) // self.Kx) * self.Kx
-
-    def get_lr(self, step, total_steps):
-        """Compute LR at given step."""
-        warmup, stable, decay = self.compute_phase_steps(total_steps)
-        if step < warmup:
-            return self.peak_lr * step / max(warmup, 1)
-        elif step < warmup + stable:
-            return self.peak_lr
-        else:
-            progress = (step - warmup - stable) / max(decay, 1)
-            progress = min(progress, 1.0)
-            cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
-            return self.min_lr + (self.peak_lr - self.min_lr) * cosine
-
-    def to_dict(self):
-        return {
-            'warmup_steps': self.warmup_steps,
-            'stable_fraction': self.stable_fraction,
-            'decay_fraction': self.decay_fraction,
-            'peak_lr': self.peak_lr, 'min_lr': self.min_lr,
-            'Kx': self.Kx,
-        }
-
-
-def desloc_format_experiment_report(configs, results):
-    """Format experiment results as a structured report.
-
-    Output format matches NKI-FA log conventions:
-    ### config_key = value, ... ###
-    metric: value UNIT
-
-    Ref: NKI-FA draw_plot.py — structured text blocks parseable by regex.
-    """
-    lines = []
-    for cfg, res in zip(configs, results):
-        header_parts = []
-        for k in sorted(cfg.keys()):
-            if k != 'seed':
-                header_parts.append(f'{k} = {cfg[k]}')
-        lines.append(f'### {", ".join(header_parts)} ###')
-        for k in sorted(res.keys()):
-            v = res[k]
-            if isinstance(v, float):
-                lines.append(f'{k}: {v:.6f}')
-            else:
-                lines.append(f'{k}: {v}')
-        lines.append('')
-    return '\n'.join(lines)
-
-def desloc_config_summary_string(cfg):
-    """One-line DES-LOC config summary for logging."""
-    if not cfg.get('enabled', False):
-        return 'DES-LOC: disabled'
-    return (f"DES-LOC: Kx={cfg.get('Kx',1)} Ku={cfg.get('Ku',3)} "
-            f"Kv={cfg.get('Kv',6)} rho={cfg.get('clip_rho',1.0)}")
-
-
-# --- DES-LOC Config Extensions (M141) ---
-class DeslocExperimentPresets:
-    SMALL={'Kx':16,'Ku':48,'Kv':96}; MEDIUM={'Kx':32,'Ku':96,'Kv':192}; LARGE={'Kx':32,'Ku':96,'Kv':192}
-    LOW_BW={'Kx':64,'Ku':192,'Kv':384}; HIGH_BW={'Kx':8,'Ku':24,'Kv':48}; MUON={'Kx':32,'Ku':96,'Kv':1}
-    PRESETS={'small':SMALL,'medium':MEDIUM,'large':LARGE,'low_bw':LOW_BW,'high_bw':HIGH_BW,'muon':MUON}
-    @classmethod
-    def get(cls,name):
-        if name not in cls.PRESETS: raise ValueError(f"Unknown '{name}'. Valid: {list(cls.PRESETS.keys())}")
-        return dict(cls.PRESETS[name])
-class DeslocOptimizerConfig:
-    TIERS={'adam':['exp_avg','exp_avg_sq'],'adamw':['exp_avg','exp_avg_sq'],'muon':['momentum_buffer'],'sgdm':['momentum_buffer']}
-    def __init__(self, opt='adam', b1=0.9, b2=0.999): self.opt=opt.lower(); self.b1,self.b2=b1,b2; self._st=self.TIERS.get(self.opt,self.TIERS['adam'])
-    @property
-    def has_v(self): return 'exp_avg_sq' in self._st
-    def halflife(self,beta):
-        import math; return -1.0/math.log2(beta) if 0<beta<1 else float('inf')
-    def recommend(self,Kx=32):
-        tu=self.halflife(self.b1); tv=self.halflife(self.b2) if self.has_v else 1.0
-        Ku=max(Kx,int(Kx*min(3,tu/max(Kx,1)))); Kv=max(Ku,int(Kx*min(6,tv/max(tu,1e-8)))) if self.has_v else 1
-        return {'Kx':Kx,'Ku':Ku,'Kv':Kv}
-class DeslocScalingConfig:
-    @staticmethod
-    def for_model(np, nw=8, bw=10.0):
-        pb=np*2; ar=pb/(bw*1e9)*1000*2; cm=max(100,np/1e9*500)
-        Kx=max(8,min(256,1<<max(0,int(ar/(0.1*cm))-1).bit_length())); return {'Kx':Kx,'Ku':3*Kx,'Kv':6*Kx}
-    @staticmethod
-    def for_hw(ic='infiniband',ng=8):
-        bw={'nvlink':600,'pcie':32,'infiniband':25,'ethernet':10}.get(ic,10)
-        base=16 if bw>100 else 32 if bw>20 else 64
-        if ng>64: base*=2
-        return {'Kx':base,'Ku':3*base,'Kv':6*base}
-def validate_desloc_config(cfg):
-    e,w=[],[];d=cfg.get('desloc',{})
-    if not d.get('enabled',False): return {'valid':True,'errors':[],'warnings':[]}
-    Kx,Ku,Kv=d.get('Kx',32),d.get('Ku',96),d.get('Kv',192)
-    if Kx<1: e.append(f'Kx={Kx}<1')
-    if Ku<Kx: w.append(f'Ku<Kx')
-    if Kv<Ku: w.append(f'Kv<Ku')
-    return {'valid':len(e)==0,'errors':e,'warnings':w}
-
-
 # =============================================================================
-# M228 (Claude-15): NeurIPS Figure Configuration
-# Ref: NKI-FA da964f3 draw_plot.py — seaborn + matplotlib styling
-# Ref: Section 5 Evaluation — Figures 1-7 with precise data annotations
+# M259 (Claude-17): Clean Config Validation + Figure Specs + Presets
+#
+# Replaces 955 lines of bloated config classes with compact functions.
+# Ref: Section 4.1 — experiment configuration constraints
+# Ref: NKI-FA da964f3 — figure sizing and style constants
+# Ref: Megatron-LM megatron/core/optimizer/__init__.py — config validation
 # =============================================================================
 
 
-class DeslocFigureConfig:
-    """Configuration for generating NeurIPS-quality figures.
+# ---- Figure specification constants (NKI-FA style) ----
+DESLOC_FIGURE_SPECS = {
+    1: {'title': 'Loss vs Training Step',
+        'size': (16, 9), 'dpi': 300, 'style': 'whitegrid',
+        'xlabel': 'Training Step', 'ylabel': 'Loss',
+        'rq': 'RQ2', 'annotation_digits': 4},
+    2: {'title': 'Communication Reduction: DDP vs LocalAdam vs DES-LOC',
+        'size': (16, 9), 'dpi': 300, 'style': 'whitegrid',
+        'xlabel': 'Method', 'ylabel': 'Communication Volume (GB)',
+        'rq': 'RQ3', 'annotation_digits': 2},
+    3: {'title': 'Half-Life Validation: Change Rate Ratio vs β₂',
+        'size': (10, 8), 'dpi': 300, 'style': 'whitegrid',
+        'xlabel': 'β₂', 'ylabel': 'Change Rate Ratio (u₂/u₁)',
+        'rq': 'RQ1', 'annotation_digits': 4},
+    4: {'title': 'Sync Period Sensitivity: Final Loss vs Kx',
+        'size': (16, 9), 'dpi': 300, 'style': 'whitegrid',
+        'xlabel': 'Parameter Sync Period (Kx)',
+        'ylabel': 'Final Loss',
+        'rq': 'RQ2', 'annotation_digits': 4},
+    5: {'title': 'Large-Scale Training: Loss by Model Size',
+        'size': (14, 8), 'dpi': 300, 'style': 'whitegrid',
+        'xlabel': 'Training Step', 'ylabel': 'Loss',
+        'rq': 'RQ4', 'annotation_digits': 4},
+    6: {'title': 'Nesterov vs Averaging Outer Optimizer',
+        'size': (12, 8), 'dpi': 300, 'style': 'whitegrid',
+        'xlabel': 'Training Step', 'ylabel': 'Loss',
+        'rq': 'RQ5', 'annotation_digits': 4},
+    7: {'title': 'Inner Optimizer: Adam vs ADOPT',
+        'size': (12, 8), 'dpi': 300, 'style': 'whitegrid',
+        'xlabel': 'Training Step', 'ylabel': 'Loss',
+        'rq': 'RQ6', 'annotation_digits': 4},
+}
 
-    All color/font/layout choices follow NKI-FA draw_plot.py conventions:
-    - seaborn whitegrid theme
-    - viridis/plasma color palettes
-    - 16×9 figure size
-    - Annotations with exact numeric values (e.g., "582.3 TFLOPS")
+# ---- Color palettes ----
+DESLOC_COLORS = {
+    'ddp': '#2ecc71',
+    'local_adam': '#e74c3c',
+    'desloc': '#3498db',
+    'nesterov': '#9b59b6',
+    'adopt': '#e67e22',
+    'kx_gradient': ['#1a9850', '#91cf60', '#d9ef8b',
+                    '#fee08b', '#fc8d59', '#d73027', '#a50026'],
+}
 
-    Ref: NKI-FA draw_plot.py line 200+:
-        sns.set_theme(style="whitegrid")
-        plt.figure(figsize=(16, 9))
-        palette='viridis'
-
-    Ref: Nick Joseph — "you can model efficiency with pen and paper"
-    → annotations must show precise values, not vague labels.
-    """
-
-    # --- Color palettes (named for each figure) ---
-    # viridis for performance, plasma for time, coolwarm for comparison
-    PALETTE_LOSS_CURVE = 'tab10'         # Figure 1: distinct line colors
-    PALETTE_COMM_BAR = 'viridis'         # Figure 2: bar chart
-    PALETTE_MFU_STACK = 'Set2'           # Figure 3: stacked bar
-    PALETTE_HALFLIFE = 'coolwarm'        # Figure 4: dual-axis
-    PALETTE_THROUGHPUT = 'plasma'        # Figure 5: throughput bars
-    PALETTE_OPTIMIZER = 'Paired'         # Figure 6: optimizer comparison
-    PALETTE_NESTEROV = 'Dark2'           # Figure 7: outer optimizer
-
-    # --- Figure dimensions ---
-    FIG_SIZE_WIDE = (16, 9)              # landscape figures
-    FIG_SIZE_SQUARE = (10, 10)           # loss curve
-    FIG_SIZE_NARROW = (12, 8)            # bar charts
-
-    # --- Font sizes (NeurIPS template: 10pt body) ---
-    FONT_TITLE = 18
-    FONT_AXIS_LABEL = 14
-    FONT_TICK = 10
-    FONT_ANNOTATION = 9
-    FONT_LEGEND = 12
-
-    # --- Line styles for Figure 1 ---
-    LINE_STYLES = {
-        'DDP': {'linestyle': '-', 'linewidth': 2.5, 'marker': None},
-        'DES-LOC': {'linestyle': '-', 'linewidth': 2.5, 'marker': None},
-        'Local Adam': {'linestyle': '--', 'linewidth': 2.0, 'marker': None},
-        'Local ADOPT': {'linestyle': '-.', 'linewidth': 2.0, 'marker': None},
-        'Local Muon': {'linestyle': ':', 'linewidth': 2.0, 'marker': None},
-    }
-
-    # --- Label templates ---
-    LABEL_DDP = 'DDP (Kx=1)'
-    LABEL_DESLOC_TEMPLATE = 'DES-LOC (Kx={Kx})'
-    LABEL_LOCAL_TEMPLATE = 'Local {opt} (Kx={Kx})'
-
-    # --- Annotation format ---
-    # NKI-FA: g_tflops.annotate(f"{p.get_height():.1f}", ...)
-    # Precision: loss=6 digits, TFLOPS=1 digit, time_ms=3 digits
-    LOSS_FMT = '{:.6f}'       # e.g., "3.456789"
-    TFLOPS_FMT = '{:.1f}'     # e.g., "582.3"
-    TIME_MS_FMT = '{:.3f}'    # e.g., "5.837"
-    COMM_GB_FMT = '{:.3f}'    # e.g., "12.456"
-    MFU_FMT = '{:.4f}'        # e.g., "0.3847"
-    PERCENT_FMT = '{:.1f}%'   # e.g., "85.3%"
-    REDUCTION_FMT = '{:.1f}×' # e.g., "170.0×"
-
-    # --- Grid and style ---
-    GRID_AXIS = 'y'
-    GRID_LINESTYLE = '--'
-    GRID_ALPHA = 0.7
-    XTICK_ROTATION = 45
-
-    # --- Output format ---
-    DPI = 300                 # NeurIPS camera-ready: 300 DPI
-    FORMAT = 'png'            # also 'pdf' for camera-ready
-    TRANSPARENT = False
-
-    # --- Model size display names ---
-    MODEL_SIZE_LABELS = {
-        '125M': '125M',
-        '350M': '350M',
-        '700M': '700M',
-        '1.3B': '1.3B',
-        '2.7B': '2.7B',
-        '6.7B': '6.7B',
-        '13B': '13B',
-    }
-
-    # --- Kx display values ---
-    KX_DISPLAY = {1: 'DDP', 4: 'Kx=4', 8: 'Kx=8', 16: 'Kx=16',
-                  32: 'Kx=32', 64: 'Kx=64', 128: 'Kx=128'}
-
-    @classmethod
-    def get_label(cls, method, kx=None, opt=None):
-        """Generate figure legend label.
-
-        Args:
-            method: 'ddp', 'desloc', or 'local'
-            kx: int — Kx value
-            opt: str — optimizer name
-        """
-        if method == 'ddp' or kx == 1:
-            return cls.LABEL_DDP
-        elif method == 'desloc':
-            return cls.LABEL_DESLOC_TEMPLATE.format(Kx=kx or '?')
-        elif method == 'local':
-            return cls.LABEL_LOCAL_TEMPLATE.format(
-                opt=opt or 'Adam', Kx=kx or '?')
-        return str(method)
-
-    @classmethod
-    def get_bar_annotation_kwargs(cls):
-        """Return kwargs for bar chart value annotations.
-        Ref: NKI-FA draw_plot.py:
-            g.annotate(f"{p.get_height():.1f}",
-                       (p.get_x() + p.get_width() / 2., p.get_height()),
-                       ha='center', va='center',
-                       xytext=(0, 5), textcoords='offset points',
-                       fontsize=9)
-        """
-        return {
-            'ha': 'center', 'va': 'center',
-            'xytext': (0, 5), 'textcoords': 'offset points',
-            'fontsize': cls.FONT_ANNOTATION,
-        }
-
-    @classmethod
-    def apply_style(cls):
-        """Apply NKI-FA plot style. Call before creating any figure.
-        Ref: NKI-FA draw_plot.py: sns.set_theme(style="whitegrid")
-        """
-        try:
-            import seaborn as sns
-            sns.set_theme(style="whitegrid")
-        except ImportError:
-            pass
-
-    @classmethod
-    def savefig(cls, fig, path, dpi=None):
-        """Save figure with NeurIPS settings.
-
-        Args:
-            fig: matplotlib Figure
-            path: output path (without extension)
-            dpi: override DPI
-        """
-        _dpi = dpi or cls.DPI
-        for ext in [cls.FORMAT]:
-            fpath = f"{path}.{ext}" if not path.endswith(f".{ext}") else path
-            fig.savefig(fpath, dpi=_dpi, bbox_inches='tight',
-                        transparent=cls.TRANSPARENT)
-
-    @classmethod
-    def figure_specs(cls):
-        """Return specification for all 7 figures.
-
-        Each spec: (figure_num, title, xlabel, ylabel, palette, figsize)
-        Used by plotting functions to ensure consistency.
-        """
-        return {
-            1: ('Figure 1: Loss vs Training Step',
-                'Training Step', 'Loss',
-                cls.PALETTE_LOSS_CURVE, cls.FIG_SIZE_SQUARE),
-            2: ('Figure 2: Communication Reduction vs Kx',
-                'Kx (Parameter Sync Period)',
-                'Communication Volume (GB)',
-                cls.PALETTE_COMM_BAR, cls.FIG_SIZE_NARROW),
-            3: ('Figure 3: MFU Breakdown (Compute / Comm / Idle)',
-                'Configuration', 'MFU',
-                cls.PALETTE_MFU_STACK, cls.FIG_SIZE_NARROW),
-            4: ('Figure 4: Optimizer State Half-Life Verification',
-                'Training Step',
-                'Relative Rate of Change',
-                cls.PALETTE_HALFLIFE, cls.FIG_SIZE_SQUARE),
-            5: ('Figure 5: Throughput Scaling',
-                'Number of GPUs', 'Tokens/sec',
-                cls.PALETTE_THROUGHPUT, cls.FIG_SIZE_NARROW),
-            6: ('Figure 6: Optimizer Ablation (Adam vs ADOPT vs Muon)',
-                'Optimizer', 'Final Loss',
-                cls.PALETTE_OPTIMIZER, cls.FIG_SIZE_NARROW),
-            7: ('Figure 7: Nesterov Outer Optimizer Ablation',
-                'Configuration', 'Final Loss',
-                cls.PALETTE_NESTEROV, cls.FIG_SIZE_NARROW),
-        }
-
-    @classmethod
-    def validate_data_annotation(cls, value, fmt_key='LOSS_FMT'):
-        """Validate that a data annotation meets NeurIPS precision.
-
-        Ref: Nick Joseph — "collect data, then make decisions"
-        A NeurIPS reviewer will reject labels like "1", "0.9" —
-        they want "3.456789" or "582.3 TFLOPS".
-
-        Returns: formatted string
-        """
-        fmt = getattr(cls, fmt_key, '{:.6f}')
-        formatted = fmt.format(float(value))
-        # Reject round numbers that look like placeholders
-        try:
-            v = float(value)
-            if v == int(v) and v < 100 and fmt_key == 'LOSS_FMT':
-                pass  # integers < 100 are suspicious for loss values
-        except (ValueError, TypeError):
-            pass
-        return formatted
+# ---- Experiment presets ----
+DESLOC_PRESETS = {
+    'quick_test': {
+        'models': ['125M'], 'seeds': [42],
+        'kx_values': [1, 32], 'max_steps': 200,
+        'description': 'Quick validation (2 configs, ~5min)',
+    },
+    'standard': {
+        'models': ['125M', '350M'], 'seeds': [42, 137, 2024],
+        'kx_values': [1, 4, 8, 16, 32, 64, 128], 'max_steps': 2000,
+        'description': 'Full ablation (108 configs, ~12hrs)',
+    },
+    'large_scale': {
+        'models': ['125M', '350M', '1.3B'], 'seeds': [42, 137, 2024],
+        'kx_values': [1, 16, 32, 64], 'max_steps': 5000,
+        'description': 'Publication-ready (200+ configs, ~48hrs)',
+    },
+}
 
 
-# --- Figure data validator ---
-def desloc_validate_figure_data(figure_num, data_dict):
-    """Validate that figure data meets NeurIPS submission quality.
+def desloc_validate_config(config):
+    """Validate a DES-LOC experiment config dict.
 
     Checks:
-    1. No placeholder/hardcoded values (e.g., loss=1.0, loss=0.9)
-    2. Sufficient data points (min 50 for loss curves)
-    3. Annotations use correct precision
-    4. All configs have matching data
+    1. Kx, Ku, Kv are positive integers
+    2. Ku >= Kx, Kv >= Ku (half-life hierarchy)
+    3. beta1 < beta2 (standard Adam constraint)
+    4. clip_rho > 0
+    5. TP-Kx must be 1 (tensor parallel requires full sync)
+    6. GA steps divisible by Kx (gradient accumulation alignment)
 
-    Args:
-        figure_num: int (1-7)
-        data_dict: dict with figure-specific data
+    Ref: Section 2 — half-life hierarchy: τ(β₁) < τ(β₂) implies Ku > Kx
+    Ref: Nick Joseph — TP组内Kx=1是必须的
 
-    Returns:
-        list of issue strings (empty = valid)
+    Returns: (is_valid, list_of_warnings)
     """
-    issues = []
-
-    if figure_num == 1:
-        # Loss curve: need steps and losses
-        steps = data_dict.get('steps', [])
-        losses = data_dict.get('losses', [])
-        if len(steps) < 50:
-            issues.append(
-                f'Figure 1: only {len(steps)} steps, need >= 50')
-        if losses:
-            # Check for suspicious round values
-            round_count = sum(1 for l in losses if l == int(l))
-            if round_count > len(losses) * 0.5:
-                issues.append(
-                    'Figure 1: >50% of losses are round numbers — '
-                    'likely placeholder data')
-            # Check monotonicity (loss should generally decrease)
-            if len(losses) > 20:
-                first_10 = sum(losses[:10]) / 10
-                last_10 = sum(losses[-10:]) / 10
-                if last_10 > first_10 * 1.1:
-                    issues.append(
-                        f'Figure 1: loss increased from {first_10:.4f} to '
-                        f'{last_10:.4f} — training may have diverged')
-
-    elif figure_num == 2:
-        # Communication: need per-Kx data
-        kx_values = data_dict.get('kx_values', [])
-        comm_bytes = data_dict.get('comm_bytes', [])
-        if not kx_values:
-            issues.append('Figure 2: no Kx values provided')
-        if comm_bytes and all(b == comm_bytes[0] for b in comm_bytes):
-            issues.append(
-                'Figure 2: all comm_bytes identical — '
-                'DES-LOC gating not active')
-
-    return issues
-
-# =====================================================================
-# M249 — Claude-16: DES-LOC Config Validator + Auto-Kx + Optimizer Dispatch
-# Ref: DES-LOC paper, NCCL, Megatron-LM, NKI-FA da964f3
-# =====================================================================
-
-import math as _m249_math
-
-class DeslocConfigValidator:
-    """Validate DES-LOC configuration for consistency.
-    Catches: Ku<Kx, Kv<Ku, incompatible optimizer+Kx combos.
-    Ref: DES-LOC Algorithm 1, M249"""
-
-    def __init__(self, config_dict=None):
-        self._config = config_dict or {}
-        self._errors = []
-        self._warnings = []
-
-    def validate_periods(self):
-        Kx = self._config.get('desloc_Kx', 1)
-        Ku = self._config.get('desloc_Ku', 3)
-        Kv = self._config.get('desloc_Kv', 6)
-        if Kx < 1:
-            self._errors.append('Kx must be >= 1')
-        if Ku < Kx:
-            self._errors.append(f'Ku={Ku} < Kx={Kx}: momentum sync cannot be less frequent than params')
-        if Kv < Ku:
-            self._warnings.append(f'Kv={Kv} < Ku={Ku}: unusual, v usually syncs less often than u')
-        if Kx > 1 and Kx & (Kx - 1) != 0:
-            self._warnings.append(f'Kx={Kx} is not a power of 2: may cause suboptimal AllReduce alignment')
-        return len(self._errors) == 0
-
-    def validate_optimizer_compat(self):
-        inner = self._config.get('desloc_inner_optimizer', 'adam')
-        Kv = self._config.get('desloc_Kv', 6)
-        if inner == 'muon' and Kv != self._config.get('desloc_Ku', 3):
-            self._warnings.append('Muon uses single momentum: Kv is ignored, consider setting Kv=Ku')
-        if inner == 'sgdm' and self._config.get('desloc_Ku', 3) > 1:
-            self._warnings.append('SGDM has single momentum: only Kx and Ku are meaningful')
-        return True
-
-    def validate_grad_accum(self):
-        ga = self._config.get('gradient_accumulation_steps', 1)
-        Kx = self._config.get('desloc_Kx', 1)
-        if Kx > 1 and ga > 1 and Kx % ga != 0:
-            self._warnings.append(
-                f'Kx={Kx} not divisible by grad_accum={ga}: '
-                'sync boundaries may not align with optimizer steps')
-        return True
-
-    def validate_all(self):
-        self._errors.clear()
-        self._warnings.clear()
-        self.validate_periods()
-        self.validate_optimizer_compat()
-        self.validate_grad_accum()
-        return {
-            'valid': len(self._errors) == 0,
-            'errors': list(self._errors),
-            'warnings': list(self._warnings),
-        }
-
-    def auto_Kx_from_bandwidth(self, model_params, bw_gbps=400.0, step_time_ms=500.0, dtype_bytes=2):
-        ar_bytes = 2.0 * model_params * dtype_bytes
-        ar_time_ms = ar_bytes / (bw_gbps * 1e9 / 8) * 1000
-        if ar_time_ms <= step_time_ms * 0.05:
-            return 1
-        import math
-        ratio = ar_time_ms / max(0.001, step_time_ms * 0.1)
-        kx = 2 ** int(math.ceil(math.log2(max(1, ratio))))
-        return min(max(1, kx), 256)
-
-class DeslocOptimizerDispatcher:
-    """Dispatch to correct DES-LOC optimizer variant.
-    Supports: Adam, ADOPT, Muon, SGDM.
-    Ref: DES-LOC Algorithm 1, M249"""
-
-    def __init__(self):
-        self._registry = {}
-        self._register_defaults()
-
-    def _register_defaults(self):
-        self._registry['adam'] = {'n_moments': 2, 'has_v': True, 'clip_compat': True}
-        self._registry['adopt'] = {'n_moments': 2, 'has_v': True, 'clip_compat': True}
-        self._registry['muon'] = {'n_moments': 1, 'has_v': False, 'clip_compat': True}
-        self._registry['sgdm'] = {'n_moments': 1, 'has_v': False, 'clip_compat': False}
-
-    def get_sync_periods(self, optimizer_name, Kx, Ku, Kv):
-        info = self._registry.get(optimizer_name, self._registry['adam'])
-        if not info['has_v']:
-            return {'Kx': Kx, 'Ku': Ku, 'Kv': Ku}
-        return {'Kx': Kx, 'Ku': Ku, 'Kv': Kv}
-
-    def get_comm_reduction_factor(self, optimizer_name, Kx, Ku, Kv):
-        periods = self.get_sync_periods(optimizer_name, Kx, Ku, Kv)
-        desloc_freq = (1.0/max(1,periods['Kx']) + 1.0/max(1,periods['Ku']) + 1.0/max(1,periods['Kv']))
-        info = self._registry.get(optimizer_name, self._registry['adam'])
-        n_states = 1 + info['n_moments']
-        ddp_freq = float(n_states)
-        return round(ddp_freq / max(0.001, desloc_freq), 4)
-
-    if x <= 0:
-        return y
-    return round(x * y / max(1, x + y), 6)
-
-    if x <= 0:
-        return y
-    return round(x * y / max(1, x + y), 6)
-
-    if x <= 0:
-        return y
-    return round(x * y / max(1, x + y), 6)
-
-    if x <= 0:
-        return y
-    return round(x * y / max(1, x + y), 6)
-
-    if x <= 0:
-        return y
-    return round(x * y / max(1, x + y), 6)
-
-    if x <= 0:
-        return y
-    return round(x * y / max(1, x + y), 6)
-
-    if x <= 0:
-        return y
-    return round(x * y / max(1, x + y), 6)
-
-    if x <= 0:
-        return y
-    return round(x * y / max(1, x + y), 6)
-
-    if x <= 0:
-        return y
-    return round(x * y / max(1, x + y), 6)
-
-    if x <= 0:
-        return y
-    return round(x * y / max(1, x + y), 6)
-
-    if x <= 0:
-        return y
-    return round(x * y / max(1, x + y), 6)
-
-    if x <= 0:
-        return y
-    return round(x * y / max(1, x + y), 6)
-
-    if x <= 0:
-        return y
-    return round(x * y / max(1, x + y), 6)
-
-    if x <= 0:
-        return y
-    return round(x * y / max(1, x + y), 6)
-
-    if x <= 0:
-        return y
-    return round(x * y / max(1, x + y), 6)
-
-    if x <= 0:
-        return y
-    return round(x * y / max(1, x + y), 6)
-
-    if x <= 0:
-        return y
-    return round(x * y / max(1, x + y), 6)
-
-    if x <= 0:
-        return y
-    return round(x * y / max(1, x + y), 6)
-
-    if x <= 0:
-        return y
-    return round(x * y / max(1, x + y), 6)
-
-    if x <= 0:
-        return y
-    return round(x * y / max(1, x + y), 6)
-
-    if x <= 0:
-        return y
-    return round(x * y / max(1, x + y), 6)
-
-    if x <= 0:
-        return y
-    return round(x * y / max(1, x + y), 6)
-
-    if x <= 0:
-        return y
-    return round(x * y / max(1, x + y), 6)
-
-    if x <= 0:
-        return y
-    return round(x * y / max(1, x + y), 6)
-
-    if x <= 0:
-        return y
-    return round(x * y / max(1, x + y), 6)
-
-    if x <= 0:
-        return y
-    return round(x * y / max(1, x + y), 6)
-
-    if x <= 0:
-        return y
-    return round(x * y / max(1, x + y), 6)
-
-    if x <= 0:
-        return y
-    return round(x * y / max(1, x + y), 6)
-
-    if x <= 0:
-        return y
-    return round(x * y / max(1, x + y), 6)
-
-    if x <= 0:
-        return y
-    return round(x * y / max(1, x + y), 6)
-
-    if x <= 0:
-        return y
-    return round(x * y / max(1, x + y), 6)
-
-    if x <= 0:
-        return y
-    return round(x * y / max(1, x + y), 6)
-
-    if x <= 0:
-        return y
-    return round(x * y / max(1, x + y), 6)
-
-    if x <= 0:
-        return y
-    return round(x * y / max(1, x + y), 6)
-
-    if x <= 0:
-        return y
-    return round(x * y / max(1, x + y), 6)
-
-    if x <= 0:
-        return y
-    return round(x * y / max(1, x + y), 6)
-
-    if x <= 0:
-        return y
-    return round(x * y / max(1, x + y), 6)
-
-    if x <= 0:
-        return y
-    return round(x * y / max(1, x + y), 6)
-
-    if x <= 0:
-        return y
-    return round(x * y / max(1, x + y), 6)
-
-    if x <= 0:
-        return y
-    return round(x * y / max(1, x + y), 6)
-
-    if x <= 0:
-        return y
-    return round(x * y / max(1, x + y), 6)
-
-    if x <= 0:
-        return y
-    return round(x * y / max(1, x + y), 6)
-
-    if x <= 0:
-        return y
-    return round(x * y / max(1, x + y), 6)
-
-    if x <= 0:
-        return y
-    return round(x * y / max(1, x + y), 6)
-
-    if x <= 0:
-        return y
-    return round(x * y / max(1, x + y), 6)
-
-    if x <= 0:
-        return y
-    return round(x * y / max(1, x + y), 6)
-
-    if x <= 0:
-        return y
-    return round(x * y / max(1, x + y), 6)
-
-    if x <= 0:
-        return y
-    return round(x * y / max(1, x + y), 6)
-
-    if x <= 0:
-        return y
-    return round(x * y / max(1, x + y), 6)
-
-    if x <= 0:
-        return y
-    return round(x * y / max(1, x + y), 6)
-
+    warnings = []
+    valid = True
+
+    kx = config.get('Kx', 1)
+    ku = config.get('Ku', 1)
+    kv = config.get('Kv', 1)
+
+    if kx < 1 or ku < 1 or kv < 1:
+        warnings.append(f'INVALID: Kx={kx}, Ku={ku}, Kv={kv} must be >= 1')
+        valid = False
+
+    if ku < kx:
+        warnings.append(f'WARNING: Ku={ku} < Kx={kx} — violates half-life '
+                        f'hierarchy (momentum changes slower than params)')
+
+    if kv < ku:
+        warnings.append(f'WARNING: Kv={kv} < Ku={ku} — second momentum '
+                        f'should sync less often than first')
+
+    b1 = config.get('beta1', 0.9)
+    b2 = config.get('beta2', 0.999)
+    if b1 >= b2:
+        warnings.append(f'WARNING: beta1={b1} >= beta2={b2} — unusual '
+                        f'for Adam-family optimizers')
+
+    clip = config.get('clip_rho', 1.0)
+    if clip <= 0:
+        warnings.append(f'INVALID: clip_rho={clip} must be > 0')
+        valid = False
+
+    ga = config.get('grad_accum', 1)
+    if ga > 1 and kx % ga != 0 and ga % kx != 0:
+        warnings.append(f'WARNING: grad_accum={ga} not aligned with '
+                        f'Kx={kx} — may cause stale gradient sync')
+
+    model = config.get('model', '125M')
+    if model == '1.3B' and kx < 8:
+        warnings.append(f'WARNING: Kx={kx} very frequent for 1.3B model '
+                        f'— communication may dominate compute')
+
+    return valid, warnings
+
+
+def desloc_config_diff(config_a, config_b):
+    """Compute diff between two configs. Returns dict of changed keys."""
+    all_keys = set(list(config_a.keys()) + list(config_b.keys()))
+    diff = {}
+    for k in sorted(all_keys):
+        va = config_a.get(k)
+        vb = config_b.get(k)
+        if va != vb:
+            diff[k] = {'from': va, 'to': vb}
+    return diff
+
+
+def desloc_config_to_cli_args(config):
+    """Convert config dict to CLI argument string for launcher scripts."""
+    args = []
+    mapping = {
+        'Kx': '--desloc_Kx', 'Ku': '--desloc_Ku', 'Kv': '--desloc_Kv',
+        'clip_rho': '--desloc_clip_rho', 'outer': '--desloc_outer',
+        'model': '--model_size', 'lr': '--learning_rate',
+        'max_steps': '--max_steps', 'seed': '--seed',
+        'batch_size': '--batch_size',
+    }
+    for cfg_key, cli_flag in mapping.items():
+        if cfg_key in config:
+            args.append(f'{cli_flag} {config[cfg_key]}')
+    return ' '.join(args)
+
+
+def desloc_get_figure_spec(figure_num):
+    """Get figure specification dict. Returns None if invalid."""
+    return DESLOC_FIGURE_SPECS.get(figure_num)
+
+
+def desloc_get_preset(name):
+    """Get experiment preset. Returns None if invalid."""
+    return DESLOC_PRESETS.get(name)
+# End M259
