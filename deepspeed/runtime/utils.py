@@ -1921,3 +1921,408 @@ def desloc_format_figure2_table(sweep_results, fmt='md'):
 
 
 # DES-LOC: end of M229 integration
+
+# DES-LOC: end of M169 integration
+
+
+# =====================================================================
+# M243 — Claude-16: DES-LOC Advanced Training Utilities
+# Cross-scale Kx extrapolation, power-law regression, MFU prediction,
+# comm-compute overlap, adaptive Kx, step time estimation
+# Ref: Chinchilla scaling laws, DES-LOC Theorem 1, NKI-FA benchmark
+# =====================================================================
+
+import math as _m243_math
+
+
+def desloc_extrapolate_Kx(small_N, small_loss_at_Kx, target_N,
+                          beta1=0.9, beta2=0.999, alpha=0.34):
+    """Extrapolate optimal Kx from small model to large model.
+
+    The key insight: DES-LOC's psi penalty scales with 1/T,
+    while larger models train for more steps T. So larger models
+    can tolerate larger Kx.
+
+    Args:
+        small_N: small model param count (e.g. 125M)
+        small_loss_at_Kx: dict of {Kx: final_loss} from small model
+        target_N: target model param count (e.g. 1B)
+        beta1, beta2: optimizer betas
+        alpha: scaling law exponent
+
+    Returns:
+        dict with recommended Kx and predicted losses
+    """
+    if not small_loss_at_Kx:
+        return {'recommended_Kx': 32, 'confidence': 'low', 'reason': 'no data'}
+
+    # Scale factor: larger model trains longer → psi penalty smaller
+    scale_ratio = target_N / max(1, small_N)
+    step_ratio = scale_ratio ** 0.5  # Chinchilla: T ∝ √(N*D) ∝ N^0.5
+
+    results = {}
+    for kx, loss in sorted(small_loss_at_Kx.items()):
+        # Extrapolate: at target_N, the psi penalty is divided by step_ratio
+        # because psi appears in O((1+psi)/T) and T is larger
+        psi = desloc_psi_factor(kx, max(1, kx * 3), beta1)
+        adjusted_penalty = psi / step_ratio
+        results[kx] = {
+            'small_loss': round(loss, 6),
+            'psi': round(psi, 6),
+            'adjusted_psi': round(adjusted_penalty, 6),
+        }
+
+    # Find largest Kx where adjusted psi < 1.0 (manageable overhead)
+    recommended = 1
+    for kx in sorted(results.keys(), reverse=True):
+        if results[kx]['adjusted_psi'] < 1.0:
+            recommended = kx
+            break
+
+    return {
+        'recommended_Kx': recommended,
+        'target_N': target_N,
+        'scale_ratio': round(scale_ratio, 4),
+        'step_ratio': round(step_ratio, 4),
+        'per_Kx_analysis': results,
+        'confidence': 'medium' if len(small_loss_at_Kx) >= 4 else 'low',
+    }
+
+
+def desloc_power_law_fit(compute_loss_pairs):
+    """Fit power law: loss = A * compute^(-alpha) + E.
+
+    Uses pure Python (no numpy) for log-linear regression.
+
+    Args:
+        compute_loss_pairs: list of (compute_flops, loss) tuples
+
+    Returns:
+        dict with fitted A, alpha, E, r_squared
+    """
+    if len(compute_loss_pairs) < 3:
+        return {'A': 406.4, 'alpha': 0.34, 'E': 1.69,
+                'r_squared': 0.0, 'fitted': False}
+
+    best_r2 = -1e9
+    best_params = None
+
+    for e_100x in range(100, 260, 5):  # E from 1.0 to 2.55
+        e_try = e_100x / 100.0
+
+        # Filter valid points
+        valid = [(c, l - e_try) for c, l in compute_loss_pairs
+                 if c > 0 and l > e_try]
+        if len(valid) < 2:
+            continue
+
+        n = len(valid)
+        sum_x = sum_y = sum_x2 = sum_xy = sum_y2 = 0.0
+
+        for c, l_adj in valid:
+            x = _m243_math.log(c)
+            y = _m243_math.log(l_adj)
+            sum_x += x
+            sum_y += y
+            sum_x2 += x * x
+            sum_xy += x * y
+            sum_y2 += y * y
+
+        denom = n * sum_x2 - sum_x * sum_x
+        if abs(denom) < 1e-15:
+            continue
+
+        slope = (n * sum_xy - sum_x * sum_y) / denom
+        intercept = (sum_y - slope * sum_x) / n
+
+        # R-squared
+        y_mean = sum_y / n
+        ss_tot = sum_y2 - n * y_mean * y_mean
+        ss_res = 0.0
+        for c, l_adj in valid:
+            x = _m243_math.log(c)
+            y = _m243_math.log(l_adj)
+            pred = intercept + slope * x
+            ss_res += (y - pred) ** 2
+
+        r2 = 1.0 - ss_res / max(1e-15, ss_tot)
+
+        if r2 > best_r2:
+            best_r2 = r2
+            best_params = (
+                _m243_math.exp(intercept),  # A
+                -slope,                      # alpha (negative slope = positive alpha)
+                e_try,                       # E
+            )
+
+    if best_params is None:
+        return {'A': 406.4, 'alpha': 0.34, 'E': 1.69,
+                'r_squared': 0.0, 'fitted': False}
+
+    A, alpha, E = best_params
+    return {
+        'A': round(A, 6),
+        'alpha': round(alpha, 6),
+        'E': round(E, 6),
+        'r_squared': round(best_r2, 6),
+        'fitted': True,
+        'n_points': len(compute_loss_pairs),
+    }
+
+
+def desloc_predict_mfu(model_params, batch_tokens, step_time_s,
+                       Kx=1, hardware_tflops=989.5, dtype_bytes=2):
+    """Predict Model FLOPS Utilization (MFU) under DES-LOC.
+
+    MFU = actual_FLOPS / peak_FLOPS
+    actual_FLOPS ≈ 6 * N * batch_tokens / step_time  (forward + backward)
+    peak_FLOPS = hardware_tflops * 1e12
+
+    DES-LOC effect: reduces comm time, so step_time decreases,
+    so MFU increases.
+
+    Args:
+        model_params: N (number of parameters)
+        batch_tokens: tokens per step (micro_batch * seq_len * grad_accum)
+        step_time_s: measured wall-clock time per step
+        Kx: parameter sync period
+        hardware_tflops: peak hardware TFLOPS (BF16)
+        dtype_bytes: bytes per parameter element
+
+    Returns:
+        dict with MFU breakdown
+    """
+    if step_time_s <= 0 or model_params <= 0:
+        return {'mfu': 0.0, 'compute_tflops': 0.0}
+
+    # 6*N*D FLOPS per step (approx: 2 for fwd, 4 for bwd)
+    flops_per_step = 6.0 * model_params * batch_tokens
+    actual_tflops = flops_per_step / step_time_s / 1e12
+
+    peak = hardware_tflops
+    mfu = actual_tflops / peak if peak > 0 else 0.0
+
+    # Estimate comm fraction
+    # AllReduce: 2 * model_params * dtype_bytes / bandwidth
+    # Assume 400 GB/s effective bandwidth (H100 NVLink)
+    effective_bw = 400e9  # bytes/sec
+    ar_time = 2.0 * model_params * dtype_bytes / effective_bw
+    comm_fraction = ar_time / max(1e-15, step_time_s)
+
+    # DES-LOC: comm only 1/Kx of the time
+    desloc_comm_fraction = comm_fraction / max(1, Kx)
+    desloc_mfu_gain = comm_fraction - desloc_comm_fraction
+
+    return {
+        'mfu': round(mfu, 6),
+        'compute_tflops': round(actual_tflops, 4),
+        'peak_tflops': peak,
+        'flops_per_step': int(flops_per_step),
+        'comm_fraction': round(comm_fraction, 6),
+        'desloc_comm_fraction': round(desloc_comm_fraction, 6),
+        'desloc_mfu_gain': round(desloc_mfu_gain, 6),
+        'Kx': Kx,
+    }
+
+
+def desloc_comm_compute_overlap_ratio(model_params, batch_tokens,
+                                       compute_tflops, bw_gbps,
+                                       Kx=1, dtype_bytes=2):
+    """Calculate comm-compute overlap ratio.
+
+    If AllReduce can be fully hidden behind compute → overlap = 1.0
+    If AllReduce dominates → overlap → 0.0
+
+    Ref: Megatron-LM — uses overlapped AllReduce with gradient bucketing
+    Ref: NCCL — async collective launch enables overlap
+    """
+    if compute_tflops <= 0 or bw_gbps <= 0:
+        return {'overlap_ratio': 0.0, 'bottleneck': 'unknown'}
+
+    # Compute time per step
+    flops = 6.0 * model_params * batch_tokens
+    compute_time = flops / (compute_tflops * 1e12)
+
+    # Communication time per DES-LOC sync step
+    comm_bytes = 2.0 * model_params * dtype_bytes  # AllReduce
+    comm_time = comm_bytes / (bw_gbps * 1e9 / 8)   # convert Gbps to bytes/s
+
+    # With Kx gating: amortized comm per step
+    amortized_comm = comm_time / max(1, Kx)
+
+    if compute_time >= amortized_comm:
+        overlap = 1.0
+        bottleneck = 'compute-bound'
+    else:
+        overlap = compute_time / max(1e-15, amortized_comm)
+        bottleneck = 'comm-bound'
+
+    return {
+        'overlap_ratio': round(overlap, 6),
+        'compute_time_ms': round(compute_time * 1000, 4),
+        'comm_time_ms': round(comm_time * 1000, 4),
+        'amortized_comm_ms': round(amortized_comm * 1000, 4),
+        'bottleneck': bottleneck,
+        'Kx': Kx,
+    }
+
+
+def desloc_adaptive_Kx(current_mfu, target_mfu=0.55, current_Kx=32,
+                        min_Kx=1, max_Kx=256, step_factor=2):
+    """Adaptively adjust Kx to reach target MFU.
+
+    If current MFU < target: reduce Kx (more syncs, but maybe we're
+    diverging due to stale params)
+    If current MFU > target: increase Kx (less syncs, save comm)
+
+    This is a simple multiplicative adjustment, not a control loop.
+    """
+    if current_mfu <= 0:
+        return current_Kx
+
+    if current_mfu < target_mfu * 0.9:
+        # MFU too low → might be diverging, reduce Kx
+        new_Kx = max(min_Kx, current_Kx // step_factor)
+        action = 'decrease'
+    elif current_mfu > target_mfu * 1.1:
+        # MFU already high → try increasing Kx for more savings
+        new_Kx = min(max_Kx, current_Kx * step_factor)
+        action = 'increase'
+    else:
+        new_Kx = current_Kx
+        action = 'hold'
+
+    return {
+        'new_Kx': new_Kx,
+        'old_Kx': current_Kx,
+        'action': action,
+        'current_mfu': round(current_mfu, 6),
+        'target_mfu': round(target_mfu, 6),
+    }
+
+
+def desloc_estimate_step_time(model_params, batch_tokens,
+                               hardware_tflops=989.5, mfu_estimate=0.45,
+                               Kx=1, bw_gbps=3200, dtype_bytes=2):
+    """Estimate wall-clock step time before training starts.
+
+    Useful for planning Kx and total training duration.
+
+    Args:
+        model_params: N
+        batch_tokens: tokens per step
+        hardware_tflops: peak TFLOPS
+        mfu_estimate: expected MFU (0.4-0.6 typical)
+        Kx: planned sync period
+        bw_gbps: network bandwidth in Gbps
+    """
+    if hardware_tflops <= 0 or mfu_estimate <= 0:
+        return {'step_time_ms': 0.0}
+
+    # Compute time
+    flops = 6.0 * model_params * batch_tokens
+    effective_tflops = hardware_tflops * mfu_estimate
+    compute_time = flops / (effective_tflops * 1e12)
+
+    # Comm time (amortized by Kx)
+    comm_bytes = 2.0 * model_params * dtype_bytes
+    comm_time = comm_bytes / (bw_gbps * 1e9 / 8)
+    amortized_comm = comm_time / max(1, Kx)
+
+    # Step time = max(compute, comm) if no overlap, sum if sequential
+    # Assume partial overlap (50%)
+    step_time = compute_time + amortized_comm * 0.5
+
+    return {
+        'step_time_ms': round(step_time * 1000, 4),
+        'compute_time_ms': round(compute_time * 1000, 4),
+        'comm_time_ms': round(comm_time * 1000, 4),
+        'amortized_comm_ms': round(amortized_comm * 1000, 4),
+        'Kx': Kx,
+        'estimated_mfu': round(mfu_estimate, 4),
+    }
+
+
+def desloc_nkifa_log_format(config_dict, metrics_dict):
+    """Format experiment results in NKI-FA commit da964f3 style.
+
+    Output format:
+    ### key1 = val1, key2 = val2, ... ###
+    metric1: value1
+    metric2: value2
+
+    All values must have >= 4 significant digits.
+    """
+    # Config line
+    config_parts = [f'{k} = {v}' for k, v in sorted(config_dict.items())]
+    header = '### ' + ', '.join(config_parts) + ' ###'
+
+    # Metric lines
+    metric_lines = []
+    for k, v in sorted(metrics_dict.items()):
+        if isinstance(v, float):
+            metric_lines.append(f'{k}: {v:.6f}')
+        elif isinstance(v, int):
+            metric_lines.append(f'{k}: {v}')
+        else:
+            metric_lines.append(f'{k}: {v}')
+
+    return header + '\n' + '\n'.join(metric_lines)
+
+
+def desloc_parse_nkifa_log(log_text):
+    """Parse NKI-FA formatted log back to structured data.
+
+    Inverse of desloc_nkifa_log_format().
+    Returns list of (config_dict, metrics_dict) pairs.
+    """
+    results = []
+    current_config = None
+    current_metrics = {}
+
+    for line in log_text.strip().split('\n'):
+        line = line.strip()
+        if not line:
+            continue
+
+        if line.startswith('###') and line.endswith('###'):
+            # Save previous record
+            if current_config is not None:
+                results.append((current_config, current_metrics))
+
+            # Parse new config
+            inner = line[3:-3].strip()
+            current_config = {}
+            for part in inner.split(','):
+                part = part.strip()
+                if '=' in part:
+                    k, v = part.split('=', 1)
+                    k, v = k.strip(), v.strip()
+                    # Try numeric conversion
+                    try:
+                        v = int(v)
+                    except ValueError:
+                        try:
+                            v = float(v)
+                        except ValueError:
+                            pass
+                    current_config[k] = v
+            current_metrics = {}
+
+        elif ':' in line and current_config is not None:
+            k, v = line.split(':', 1)
+            k, v = k.strip(), v.strip()
+            try:
+                v = float(v) if '.' in v else int(v)
+            except ValueError:
+                pass
+            current_metrics[k] = v
+
+    # Don't forget last record
+    if current_config is not None:
+        results.append((current_config, current_metrics))
+
+    return results
+
+
+# M243: end of Claude-16 utils integration
