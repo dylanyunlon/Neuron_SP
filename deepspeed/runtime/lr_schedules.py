@@ -943,3 +943,33 @@ import math
 from collections import OrderedDict
 
 
+
+# M294 — Claude-19: WSD v2 + CheckpointResumer
+import math as _m294
+class DeslocWSDV2:
+    __slots__=('lm','wu','stb','dec','tot','dt','lmn','Kx','st','lr','ph','phl')
+    def __init__(s,lm=6e-4,wu=512,stb=4000,dec=5000,dt='cosine',lmn=6e-5,Kx=1):
+        s.lm=lm;s.Kx=max(1,Kx);s.wu=((wu+Kx-1)//Kx)*Kx if Kx>1 else wu;s.stb=stb;s.dec=dec;s.tot=s.wu+stb+dec;s.dt=dt;s.lmn=lmn;s.st=0;s.lr=0.;s.ph='warmup';s.phl=[]
+    def step(s):
+        s.st+=1;op=s.ph
+        if s.st<=s.wu:s.ph='warmup';s.lr=s.lm*s.st/max(1,s.wu)
+        elif s.st<=s.wu+s.stb:s.ph='stable';s.lr=s.lm
+        else:
+            s.ph='decay';dp=min(1.,(s.st-s.wu-s.stb)/max(1,s.dec))
+            if s.dt=='cosine':s.lr=s.lmn+(s.lm-s.lmn)*(1+_m294.cos(_m294.pi*dp))/2
+            elif s.dt=='linear':s.lr=s.lm-(s.lm-s.lmn)*dp
+            else:s.lr=max(s.lmn,s.lm*_m294.exp(-3*dp))
+        if op!=s.ph:s.phl.append((s.st,op,s.ph))
+        return s.lr
+    def eff_Kx(s):return 1 if s.ph=='warmup'else s.Kx
+class DeslocCkptResumer:
+    __slots__=('cs','cl','sched','w')
+    def __init__(s,cs,cl=None):s.cs=cs;s.cl=cl;s.sched=s.w=None
+    def attach(s,sched):
+        s.sched=sched
+        for _ in range(s.cs):sched.step()
+        if s.cl is not None and abs(sched.lr-s.cl)>.01*s.cl:s.w=f"LR mismatch: {s.cl:.6f} vs {sched.lr:.6f}"
+def desloc_psi_lr(lr,Kx,Ku,b1=.9,w=.1):
+    px,pu=1./max(1,Kx),1./max(1,Ku);n=4*(1-px)*(1-b1)*(1-pu);d=px*px*6*(1-(1-pu)*b1)
+    psi=n/d if abs(d)>1e-15 else 0;return lr/_m294.sqrt(1+w*psi)
+# M294: end
