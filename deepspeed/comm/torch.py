@@ -5,8 +5,6 @@
 
 import deepspeed
 from deepspeed import utils
-from packaging import version
-import inspect
 
 from .utils import *
 from .backend import *
@@ -147,18 +145,11 @@ class TorchBackend(Backend):
 
     def init_process_group(self, backend, timeout, init_method, rank, world_size):
         if not torch.distributed.is_initialized():
-            kwargs = dict(timeout=timeout, init_method=init_method, rank=rank, world_size=world_size)
-
-            # 1. device_id arg was added in torch==2.3
-            # 2. setting device_id leads to hanging in 2.6.0<torch<2.7.1 https://github.com/pytorch/pytorch/issues/153960
-            # 3. device_id works and is needed for `cuda`, other accelerators may have issues at the moment. Therefore only do it for the `cuda` accelerator.
-            if ('device_id' in inspect.signature(torch.distributed.init_process_group).parameters
-                    and not (version.parse("2.6.0") < version.parse(torch.__version__) < version.parse("2.7.1"))
-                    and get_accelerator().device_name() == 'cuda'):
-                local_rank = int(os.environ.get('LOCAL_RANK', 0))
-                kwargs.update(device_id=get_accelerator().device(local_rank))
-            torch.distributed.init_process_group(backend, **kwargs)
-
+            torch.distributed.init_process_group(backend,
+                                                 timeout=timeout,
+                                                 init_method=init_method,
+                                                 rank=rank,
+                                                 world_size=world_size)
         self.using_mpi = torch.distributed.get_backend() == 'mpi'
 
     @disable_compiler_collective
@@ -167,11 +158,7 @@ class TorchBackend(Backend):
         return torch.distributed.all_reduce(tensor=tensor, op=op, group=group, async_op=async_op)
 
     def inference_all_reduce(self, tensor, op, group=None):
-        use_ds_op = hasattr(torch.ops, 'deepspeed') and hasattr(torch.ops.deepspeed, 'inference_all_reduce_')
-        world_size = torch.distributed.get_world_size(group=group)
-        if world_size <= 1:
-            return tensor
-        if not use_ds_op:
+        if not hasattr(torch.ops, 'deepspeed') or not hasattr(torch.ops.deepspeed, 'inference_all_reduce_'):
             op = self._reduce_op(op)
             return torch.distributed.all_reduce(tensor=tensor, op=op, group=group, async_op=False)
         else:
@@ -280,10 +267,6 @@ class TorchBackend(Backend):
                 return reqs[-1]
             else:
                 reqs[-1].wait()
-
-    @disable_compiler_collective
-    def all_gather_object(self, object_list, obj, group=None):
-        return torch.distributed.all_gather_object(object_list=object_list, obj=obj, group=group)
 
     @disable_compiler_collective
     def reduce_scatter_tensor(self, output_tensor, input_tensor, op=ReduceOp.SUM, group=None, async_op=False):
@@ -426,13 +409,6 @@ class TorchBackend(Backend):
                                                                   mesh_shape,
                                                                   mesh_dim_names=mesh_dim_names)
 
-    def enable_symm_mem_for_group(self, group_name):
-        if not required_torch_version(min_version=2.5):
-            raise RuntimeError(f"Torch version must be 2.5 or higher to use symmetric memory. "
-                               f"Current version: {torch.__version__}")
-        from torch.distributed._symmetric_memory import enable_symm_mem_for_group
-        return enable_symm_mem_for_group(group_name)
-
 
 # This will become a light-weight wrapper around torch.distributed functions
 # TODO: create some example to show how this wrapper can help profile communication
@@ -441,378 +417,399 @@ class TorchBackend(Backend):
 
 
 # =========================================================================
-# DES-LOC TorchBackend Extensions
-# Ref: Section 4.1 — Ring-AllReduce with independent sync periods
+# DES-LOC Torch Backend Extensions (Section 4.1)
 # =========================================================================
 
 class DeslocTorchCommTracker:
-    """Track DES-LOC communication through TorchBackend.
-    Wraps torch.distributed to track per-tier byte counts."""
+    """Track DES-LOC communication volume per tier on torch backend.
+    Ref: Algorithm 1 - independent sync periods for params/momenta."""
 
     def __init__(self):
-        self.tier_bytes = {0: 0, 1: 0, 2: 0}
-        self.tier_count = {0: 0, 1: 0, 2: 0}
-        self.tier_latency = {0: 0.0, 1: 0.0, 2: 0.0}
-        self.skipped = 0
+        self._tier_bytes = {0: 0, 1: 0, 2: 0}
+        self._tier_ops = {0: 0, 1: 0, 2: 0}
 
-    def record(self, tier, num_bytes, latency_ms=0.0):
-        if tier in self.tier_bytes:
-            self.tier_bytes[tier] += num_bytes
-            self.tier_count[tier] += 1
-            self.tier_latency[tier] += latency_ms
+    def record(self, tier, num_bytes):
+        """Record a communication event."""
+        t = min(tier, 2)
+        self._tier_bytes[t] += num_bytes
+        self._tier_ops[t] += 1
 
-    def record_skip(self):
-        self.skipped += 1
+    def total_bytes(self):
+        return sum(self._tier_bytes.values())
 
-    def get_report(self):
-        total = sum(self.tier_count.values())
-        return {
-            'total_bytes': sum(self.tier_bytes.values()),
-            'total_ops': total,
-            'skipped': self.skipped,
-            'tier_bytes': dict(self.tier_bytes),
-            'tier_count': dict(self.tier_count),
-            'skip_ratio': self.skipped / max(1, total + self.skipped),
-        }
+    def tier_summary(self):
+        return {f'tier{t}': {'bytes': b, 'ops': self._tier_ops[t]}
+                for t, b in self._tier_bytes.items()}
 
     def reset(self):
-        for t in self.tier_bytes:
-            self.tier_bytes[t] = 0
-            self.tier_count[t] = 0
-            self.tier_latency[t] = 0.0
-        self.skipped = 0
+        self._tier_bytes = {0: 0, 1: 0, 2: 0}
+        self._tier_ops = {0: 0, 1: 0, 2: 0}
 
 
-class DeslocEFABandwidthEstimator:
-    """Estimate EFA bandwidth for AWS Neuron/GPU.
-    Ref: Nick Joseph — 'chips might have lots of FLOPS but not much memory.'
-    EFA v2: ~100 Gbps = ~12.5 GB/s. NeuronLink: ~600 GB/s."""
+# =========================================================================
+# M213: DES-LOC TorchBackend Extensions (Algorithm 1 + Section 4.1)
+# Tier-aware AllReduce, NCCL group management, async comm overlap
+# =========================================================================
 
-    EFA_BW = 12.5
-    NVLINK_BW = 600
-    PCIE4_BW = 32
+import math
+import time
+from collections import defaultdict, deque
 
-    @staticmethod
-    def estimate_allreduce_time(param_bytes, num_workers, bw_gbps):
-        if num_workers <= 1 or bw_gbps <= 0:
-            return 0.0
-        ring = 2.0 * (num_workers - 1) / num_workers
-        return ring * param_bytes / (bw_gbps * 1e9)
 
-    @staticmethod
-    def recommend_Kx(param_bytes, num_workers, compute_s, bw_gbps):
-        ar = DeslocEFABandwidthEstimator.estimate_allreduce_time(
-            param_bytes, num_workers, bw_gbps)
-        if ar <= compute_s:
-            return 1
-        import math
-        return min(256, 2 ** int(math.ceil(math.log2(ar / compute_s))))
+class DeslocTieredAllReduce:
+    """Tier-aware AllReduce that respects DES-LOC sync periods.
+
+    Wraps torch.distributed collective operations to gate them by tier.
+    Tier 0 (params) syncs at Kx, Tier 1 (momentum) at Ku, Tier 2 (variance) at Kv.
+
+    Ref: Algorithm 1 lines 14-19 — conditional sync based on t mod K.
+    Ref: Section 4.1 — 'Ring-AllReduce algorithm scaling linearly with model size.'
+
+    Key invariant: when Kx=1, this is identical to standard DDP AllReduce.
+    """
+
+    def __init__(self, scheduler):
+        """Args:
+            scheduler: DeslocCommScheduler instance that tracks step/period.
+        """
+        self._sched = scheduler
+        self._pending_ops = []
+        self._tier_buffers = {0: [], 1: [], 2: []}
+        self._comm_log = deque(maxlen=1000)
+
+    def maybe_allreduce(self, tensor, tier=0, group=None, async_op=False,
+                        is_safety_critical=False):
+        """Conditionally AllReduce tensor based on DES-LOC schedule.
+
+        Args:
+            tensor: torch.Tensor to reduce.
+            tier: 0=param, 1=momentum, 2=variance.
+            group: process group (None = default world group).
+            async_op: if True, return a handle for later wait().
+            is_safety_critical: if True, always sync (MoE capacity, overflow).
+
+        Returns:
+            handle if async_op and sync happened, None otherwise.
+        """
+        should = self._sched.should_sync(tier, is_safety_critical)
+        num_bytes = tensor.numel() * tensor.element_size()
+
+        self._sched.record_comm(tier, num_bytes, should)
+
+        if not should:
+            return None
+
+        try:
+            import torch.distributed as dist
+            handle = dist.all_reduce(tensor, group=group, async_op=async_op)
+            self._comm_log.append({
+                'step': self._sched.step,
+                'tier': tier,
+                'bytes': num_bytes,
+                'async': async_op,
+                'ts': time.monotonic(),
+            })
+            return handle
+        except Exception:
+            return None
+
+    def maybe_allreduce_with_average(self, tensor, tier=0, group=None,
+                                     world_size=None, is_safety_critical=False):
+        """AllReduce + divide by world_size (averaging).
+        This is what Algorithm 1 line 15 does: E_m[s] = average across workers."""
+        handle = self.maybe_allreduce(tensor, tier, group,
+                                      is_safety_critical=is_safety_critical)
+        if handle is not None:
+            if world_size is not None and world_size > 1:
+                tensor.div_(world_size)
+        elif self._sched.should_sync(tier, is_safety_critical):
+            if world_size is not None and world_size > 1:
+                tensor.div_(world_size)
+        return handle
+
+    def flush_pending(self):
+        """Wait for all pending async operations."""
+        for op in self._pending_ops:
+            if op is not None:
+                op.wait()
+        self._pending_ops.clear()
+
+    def recent_comm_bytes(self, last_n=100):
+        """Total bytes communicated in last N logged operations."""
+        recent = list(self._comm_log)[-last_n:]
+        return sum(r['bytes'] for r in recent)
 
 
 class DeslocNCCLGroupManager:
-    """Manage NCCL process groups for tiered DES-LOC communication.
+    """Manage NCCL process groups for DES-LOC tier-separated communication.
 
-    Ref: NCCL src/group.cc — grouped execution for multiple collectives.
-    DES-LOC can group momentum allreduces that happen at same step
-    (e.g. when Ku divides Kv, variance sync coincides with momentum sync).
+    In standard DDP, one process group handles all AllReduce.
+    DES-LOC can optionally use separate groups per tier for isolation,
+    but defaults to sharing the data-parallel group.
 
-    This reduces NCCL launch overhead by batching allreduces.
+    Ref: Section 4.1 — 'bandwidth-optimal Ring-AllReduce'
+    uses the same group topology but at different frequencies.
     """
 
-    def __init__(self, Kx=1, Ku=3, Kv=6):
-        self.Kx = max(1, Kx)
-        self.Ku = max(1, Ku)
-        self.Kv = max(1, Kv)
-        self.grouped_ops = 0
-        self.ungrouped_ops = 0
+    def __init__(self):
+        self._tier_groups = {}
+        self._default_group = None
+        self._world_size = 1
 
-    def get_concurrent_tiers(self, step):
-        """Return list of tiers that sync at this step.
-        When multiple tiers sync simultaneously, they can be grouped."""
-        tiers = []
-        if step % self.Kx == 0:
-            tiers.append(0)
-        if step % self.Ku == 0:
-            tiers.append(1)
-        if step % self.Kv == 0:
-            tiers.append(2)
-        return tiers
+    def set_default_group(self, group, world_size):
+        """Set the default data-parallel group."""
+        self._default_group = group
+        self._world_size = world_size
 
-    def should_group(self, step):
-        """Check if multiple tiers can be grouped at this step."""
-        tiers = self.get_concurrent_tiers(step)
-        can_group = len(tiers) > 1
-        if can_group:
-            self.grouped_ops += 1
-        else:
-            self.ungrouped_ops += 1
-        return can_group, tiers
+    def set_tier_group(self, tier, group):
+        """Optionally assign a dedicated group to a tier."""
+        self._tier_groups[int(tier)] = group
 
-    def get_grouping_efficiency(self):
-        total = self.grouped_ops + self.ungrouped_ops
-        if total == 0:
-            return 0.0
-        return round(self.grouped_ops / total, 4)
+    def get_group(self, tier):
+        """Get process group for tier (falls back to default)."""
+        return self._tier_groups.get(int(tier), self._default_group)
+
+    @property
+    def world_size(self):
+        return self._world_size
 
 
-class DeslocAsyncAllreduceManager:
-    """Manage async allreduce handles for DES-LOC overlap.
+class DeslocAsyncOverlapManager:
+    """Overlap DES-LOC communication with computation.
 
-    At Kx sync steps, start async allreduce of gradients.
-    While allreduce proceeds, compute next forward pass.
-    At next step, wait for allreduce completion.
+    Strategy: on non-sync steps, compute runs unblocked.
+    On sync steps, we overlap the AllReduce with the next micro-batch's forward.
 
-    This overlaps communication with computation, further reducing
-    the effective comm time.
-
-    Ref: Megatron-LM — async_comm_handle pattern.
+    Ref: Section 4.1 — DES-LOC sync naturally provides overlap opportunities
+    because non-sync steps are pure compute.
     """
 
     def __init__(self):
         self._pending_handles = {}
+        self._overlap_stats = {'overlapped': 0, 'waited': 0}
 
-    def start_async(self, tensor, tier, op=None):
-        """Start async allreduce. Returns handle."""
-        import deepspeed.comm as dist
-        if op is None:
-            from deepspeed.comm.reduce_op import ReduceOp
-            op = ReduceOp.SUM
-        handle = dist.all_reduce(tensor, op=op, async_op=True)
-        self._pending_handles[tier] = handle
-        return handle
+    def submit(self, tier, handle):
+        """Submit an async AllReduce handle."""
+        if handle is not None:
+            self._pending_handles[tier] = handle
 
     def wait(self, tier):
-        """Wait for pending async allreduce on given tier."""
-        handle = self._pending_handles.pop(tier, None)
-        if handle is not None:
-            handle.wait()
+        """Wait for a specific tier's pending AllReduce."""
+        h = self._pending_handles.pop(tier, None)
+        if h is not None:
+            h.wait()
+            self._overlap_stats['waited'] += 1
 
     def wait_all(self):
-        """Wait for all pending async allreduces."""
+        """Wait for all pending AllReduces."""
         for tier in list(self._pending_handles.keys()):
             self.wait(tier)
 
-    def has_pending(self, tier=None):
-        if tier is not None:
-            return tier in self._pending_handles
-        return len(self._pending_handles) > 0
+    def has_pending(self, tier):
+        return tier in self._pending_handles
+
+    def stats(self):
+        return dict(self._overlap_stats)
 
 
-# =========================================================================
-# DES-LOC Torch Comm Extensions
-# Ref: NCCL group.cc — grouped collective execution
-# Ref: Megatron param_and_grad_buffer.py — async overlap
-# =========================================================================
+class DeslocGradientBucketer:
+    """Bucket gradients by DES-LOC tier for efficient AllReduce.
 
-class DeslocNCCLGroupManager:
-    """Group NCCL collectives when multiple tiers sync simultaneously.
-    When step % lcm(Kx, Ku) == 0, param and momentum sync at same step.
-    Grouping reduces kernel launch overhead.
-    Ref: NCCL ncclGroupStart/ncclGroupEnd pattern."""
+    Standard DDP buckets all gradients together.
+    DES-LOC separates them by tier so each tier can be AllReduced independently.
 
-    def __init__(self, Kx=1, Ku=3, Kv=6):
-        self.Kx = max(1, Kx)
-        self.Ku = max(1, Ku)
-        self.Kv = max(1, Kv)
-        self.grouped = 0
-        self.ungrouped = 0
+    Ref: Algorithm 1 — parameters (tier 0) and optimizer states (tiers 1,2)
+    have independent sync schedules.
+    """
 
-    def get_concurrent_tiers(self, step):
-        tiers = []
-        if step % self.Kx == 0: tiers.append(0)
-        if step % self.Ku == 0: tiers.append(1)
-        if step % self.Kv == 0: tiers.append(2)
-        return tiers
+    def __init__(self, bucket_size_mb=25.0):
+        self._bucket_bytes = int(bucket_size_mb * 1024 * 1024)
+        self._tier_buckets = {0: [], 1: [], 2: []}
+        self._tier_sizes = {0: 0, 1: 0, 2: 0}
 
-    def should_group(self, step):
-        tiers = self.get_concurrent_tiers(step)
-        if len(tiers) > 1:
-            self.grouped += 1
-            return True, tiers
-        self.ungrouped += 1
-        return False, tiers
+    def assign_param_to_tier(self, param_name, param):
+        """Assign a parameter to a DES-LOC tier based on its role.
+        Parameters → tier 0, exp_avg → tier 1, exp_avg_sq → tier 2."""
+        name_lower = param_name.lower()
+        if 'exp_avg_sq' in name_lower or 'v_hat' in name_lower:
+            tier = 2
+        elif 'exp_avg' in name_lower or 'momentum_buffer' in name_lower:
+            tier = 1
+        else:
+            tier = 0
+        nbytes = param.numel() * param.element_size()
+        self._tier_buckets[tier].append({
+            'name': param_name,
+            'numel': param.numel(),
+            'bytes': nbytes,
+        })
+        self._tier_sizes[tier] += nbytes
+        return tier
 
-    def efficiency(self):
-        t = self.grouped + self.ungrouped
-        return round(self.grouped / max(1, t), 4)
+    def tier_total_bytes(self, tier):
+        return self._tier_sizes.get(int(tier), 0)
 
-
-class DeslocAsyncAllreduceManager:
-    """Async allreduce for communication-computation overlap.
-    Start allreduce at Kx step, overlap with next forward pass.
-    Ref: Megatron async_comm_handle pattern."""
-
-    def __init__(self):
-        self._pending = {}
-
-    def start_async(self, tensor, tier):
-        import deepspeed.comm as dist
-        from deepspeed.comm.reduce_op import ReduceOp
-        handle = dist.all_reduce(tensor, op=ReduceOp.SUM, async_op=True)
-        self._pending[tier] = handle
-        return handle
-
-    def wait(self, tier):
-        h = self._pending.pop(tier, None)
-        if h is not None:
-            h.wait()
-
-    def wait_all(self):
-        for t in list(self._pending.keys()):
-            self.wait(t)
-
-    def has_pending(self, tier=None):
-        if tier is not None:
-            return tier in self._pending
-        return len(self._pending) > 0
-
-
-class DeslocCommProfiler:
-    """Profile DES-LOC communication patterns over training.
-    Records per-step: which tiers synced, latency, bytes.
-    Useful for post-hoc analysis of comm/compute overlap."""
-
-    def __init__(self, max_history=10000):
-        self.max_history = max_history
-        self.history = []
-
-    def record_step(self, step, synced_tiers, latencies_ms=None, bytes_sent=None):
-        if len(self.history) >= self.max_history:
-            self.history = self.history[-self.max_history//2:]
-        entry = {'step': step, 'tiers': synced_tiers}
-        if latencies_ms:
-            entry['latencies'] = latencies_ms
-        if bytes_sent:
-            entry['bytes'] = bytes_sent
-        self.history.append(entry)
-
-    def get_sync_frequency(self):
-        """Return actual sync frequency per tier."""
-        if not self.history:
-            return {}
-        n = len(self.history)
-        tier_counts = {0: 0, 1: 0, 2: 0}
-        for h in self.history:
-            for t in h.get('tiers', []):
-                tier_counts[t] = tier_counts.get(t, 0) + 1
-        return {t: round(c / n, 4) for t, c in tier_counts.items()}
-
-    def get_avg_latency(self):
-        """Return average comm latency per tier."""
-        tier_lats = {0: [], 1: [], 2: []}
-        for h in self.history:
-            lats = h.get('latencies', {})
-            for t, l in lats.items():
-                tier_lats.setdefault(t, []).append(l)
-        return {t: round(sum(ls)/len(ls), 4) if ls else 0
-                for t, ls in tier_lats.items()}
-
-    def summary(self):
-        return {
-            'total_steps': len(self.history),
-            'sync_freq': self.get_sync_frequency(),
-            'avg_latency': self.get_avg_latency(),
-        }
-
-
-class DeslocBucketedAllreduce:
-    """Bucketed allreduce for DES-LOC — group small tensors.
-    Standard DeepSpeed uses bucketed allreduce for gradients.
-    DES-LOC extends: separate buckets per tier, flush at tier boundary.
-
-    Ref: PyTorch DDP bucket_size_mb — same principle for comm efficiency."""
-
-    def __init__(self, bucket_size_mb=25, Kx=1, Ku=3, Kv=6):
-        self.bucket_size_bytes = bucket_size_mb * 1024 * 1024
-        self.Kx = Kx
-        self.Ku = Ku
-        self.Kv = Kv
-        self.tier_buckets = {0: [], 1: [], 2: []}
-        self.tier_bucket_bytes = {0: 0, 1: 0, 2: 0}
-        self.total_flushed = 0
-
-    def add_tensor(self, tensor, tier):
-        self.tier_buckets[tier].append(tensor)
-        self.tier_bucket_bytes[tier] += tensor.numel() * tensor.element_size()
-        if self.tier_bucket_bytes[tier] >= self.bucket_size_bytes:
-            return True  # bucket full, should flush
-        return False
-
-    def flush_tier(self, tier, sync_fn):
-        """Flush all tensors in tier's bucket via allreduce."""
-        if not self.tier_buckets[tier]:
+    def num_buckets_for_tier(self, tier):
+        """How many AllReduce buckets needed for this tier."""
+        total = self._tier_sizes.get(int(tier), 0)
+        if total == 0:
             return 0
-        import torch
-        flat = torch.cat([t.contiguous().view(-1) for t in self.tier_buckets[tier]])
-        sync_fn(flat)
-        # Copy back
-        offset = 0
-        for t in self.tier_buckets[tier]:
-            numel = t.numel()
-            t.copy_(flat[offset:offset+numel].view_as(t))
-            offset += numel
-        count = len(self.tier_buckets[tier])
-        self.tier_buckets[tier].clear()
-        self.tier_bucket_bytes[tier] = 0
-        self.total_flushed += count
-        return count
+        return max(1, int(math.ceil(total / self._bucket_bytes)))
 
-    def get_stats(self):
+    def summary(self):
         return {
-            'total_flushed': self.total_flushed,
-            'pending': {t: len(b) for t, b in self.tier_buckets.items()},
-            'pending_bytes': dict(self.tier_bucket_bytes),
+            f'tier{t}': {
+                'params': len(self._tier_buckets[t]),
+                'bytes': self._tier_sizes[t],
+                'buckets': self.num_buckets_for_tier(t),
+            }
+            for t in range(3)
         }
 
 
-# --- DES-LOC NCCL Hooks (M145) ---
-import time as _t145
-class DeslocNCCLProfiler:
-    def __init__(self):
-        from collections import defaultdict as dd
-        self._times=dd(list);self._bytes=dd(int);self._counts=dd(int)
-    def record(self,op,nb,el): self._counts[op]+=1;self._bytes[op]+=nb;self._times[op].append(el*1000)
-    def summary(self):
-        s={}
-        for op in self._counts:
-            t=self._times[op];n=self._counts[op];avg=sum(t)/len(t) if t else 0
-            bw=(self._bytes[op]/n)/(avg/1000)/1e9 if avg>0 and n>0 else 0
-            s[op]={'count':n,'avg_ms':round(avg,3),'bw_gbps':round(bw,2)}
-        return s
-    def export_csv(self,path):
-        lines=['op,count,avg_ms,bw_gbps']
-        for op,s in self.summary().items(): lines.append(f"{op},{s['count']},{s['avg_ms']},{s['bw_gbps']}")
-        with open(path,'w') as f: f.write('\n'.join(lines))
-class DeslocNCCLWrapper:
-    def __init__(self,backend,profiler=None):
-        from collections import defaultdict as dd
-        self.backend=backend;self.profiler=profiler or DeslocNCCLProfiler();self._bytes=dd(int);self._skips=dd(int)
-    def all_reduce(self,tensor,tier='x',op=None,group=None,async_op=False):
-        from deepspeed.comm.comm import desloc_should_sync
-        if not desloc_should_sync(tier): self._skips[tier]+=1;return None,False
-        import torch.distributed as td
-        if op is None:
-            try: op=td.ReduceOp.AVG
-            except: op=td.ReduceOp.SUM
-        nb=tensor.numel()*tensor.element_size();t0=_t145.monotonic()
-        h=self.backend.all_reduce(tensor,op=op,group=group,async_op=async_op)
-        self._bytes[tier]+=nb;self.profiler.record(f'ar_{tier}',nb,_t145.monotonic()-t0);return h,True
-    def get_reduction(self):
-        total=sum(self._bytes.values());skip_est=sum(self._skips[t] for t in self._bytes)
-        return round((total+skip_est)/max(total,1),2)
-class DeslocBandwidthEstimator:
-    SIZES=[1024,16384,262144,4194304]
-    @staticmethod
-    def probe(group=None):
-        import torch,torch.distributed as td
-        results=[];dev='cuda' if torch.cuda.is_available() else 'cpu'
-        for sz in DeslocBandwidthEstimator.SIZES:
-            t=torch.zeros(sz//4,dtype=torch.float32,device=dev);td.barrier(group=group)
-            t0=_t145.monotonic()
-            for _ in range(3): td.all_reduce(t,group=group)
-            el=(_t145.monotonic()-t0)/3;bw=sz*2/max(el,1e-9)/1e9;results.append((sz,round(bw,2)));del t
-        return results
-_desloc_nccl_wrap=None
-def init_desloc_nccl(backend,profiler=None):
-    global _desloc_nccl_wrap;_desloc_nccl_wrap=DeslocNCCLWrapper(backend,profiler);return _desloc_nccl_wrap
-def get_desloc_nccl(): return _desloc_nccl_wrap
+class DeslocEFABandwidthEstimator:
+    """Estimate available bandwidth on AWS EFA (Elastic Fabric Adapter).
+
+    Anthropic uses AWS infrastructure (per Nick Joseph interview).
+    EFA provides 100-400 Gbps inter-node bandwidth via SRD protocol.
+    Intra-node uses NVLink (600 GB/s on H100) or PCIe.
+
+    This estimates effective bandwidth for DES-LOC comm scheduling.
+    Ref: Section 4.1 — '100Gb/s links' (Table 1).
+    """
+
+    # Known bandwidth tiers (Gbps)
+    NVLINK_H100 = 900.0
+    NVLINK_A100 = 600.0
+    PCIE_GEN4 = 32.0
+    PCIE_GEN5 = 64.0
+    EFA_V1 = 100.0
+    EFA_V2 = 400.0
+
+    def __init__(self, intra_node_gbps=None, inter_node_gbps=None):
+        self._intra = intra_node_gbps or self.NVLINK_A100
+        self._inter = inter_node_gbps or self.EFA_V1
+
+    def effective_bandwidth(self, is_intra_node):
+        """Return bandwidth in Gbps."""
+        return self._intra if is_intra_node else self._inter
+
+    def allreduce_time_estimate(self, msg_bytes, num_workers, is_intra):
+        """Estimate Ring-AllReduce time in seconds."""
+        bw = self.effective_bandwidth(is_intra) * 1e9 / 8.0  # bytes/sec
+        coeff = 2.0 * (num_workers - 1) / max(num_workers, 1)
+        return coeff * msg_bytes / max(bw, 1.0)
+
+    def recommend_Kx(self, param_bytes, compute_time_sec, num_workers,
+                     is_intra=False):
+        """Recommend minimum Kx to make training compute-bound.
+        Kx should be large enough that comm_time/Kx < compute_time.
+        Ref: Section 5.4 — 'set Kx for sufficient throughput based on bandwidth.'"""
+        ar_time = self.allreduce_time_estimate(param_bytes, num_workers, is_intra)
+        if compute_time_sec <= 0 or ar_time <= 0:
+            return 1
+        Kx = int(math.ceil(ar_time / compute_time_sec))
+        # Round up to power of 2 for cleaner scheduling
+        p = 1
+        while p < Kx:
+            p *= 2
+        return max(1, p)
+
+
+class DeslocPerCoordinateClipper:
+    """Per-coordinate gradient clipping as specified in DES-LOC Algorithm 1.
+
+    Ref: Section 2 — 'With coordinate-wise clipping, each gradient component
+    satisfies |(g_t)_i| <= rho.'
+    Algorithm 1 line 12: g_hat_t^m <- clip(g_t^m, rho)
+
+    Standard gradient clipping clips by NORM (L2).
+    DES-LOC uses COORDINATE-WISE clipping: clamp each element independently.
+    This is crucial for the convergence guarantees in Theorem 1.
+    """
+
+    def __init__(self, rho=1.0):
+        self._rho = max(float(rho), 0.0)
+        self._clip_count = 0
+        self._total_count = 0
+
+    @property
+    def rho(self):
+        return self._rho
+
+    def clip(self, gradient_tensor):
+        """Apply per-coordinate clipping: clip(X,rho)_i = sgn(X_i)*min(|X_i|, rho).
+        This is equivalent to torch.clamp(tensor, -rho, rho)."""
+        if self._rho <= 0:
+            return gradient_tensor
+        self._total_count += 1
+        max_val = gradient_tensor.abs().max().item()
+        if max_val > self._rho:
+            self._clip_count += 1
+            gradient_tensor.clamp_(-self._rho, self._rho)
+        return gradient_tensor
+
+    def clip_fraction(self):
+        """Fraction of steps where any coordinate was clipped."""
+        if self._total_count == 0:
+            return 0.0
+        return self._clip_count / self._total_count
+
+    def stats(self):
+        return {
+            'rho': self._rho,
+            'total': self._total_count,
+            'clipped': self._clip_count,
+            'clip_fraction': round(self.clip_fraction(), 4),
+        }
+
+
+class DeslocNesterovOuterOptimizer:
+    """Nesterov momentum outer optimizer for parameter averaging.
+
+    Ref: Section 5.5 — 'using Nesterov as the outer optimizer improves
+    performance over averaging by ~0.03 eval loss.'
+
+    At each Kx sync boundary:
+      v_{k+1} = mu * v_k + (x_avg - x_prev)
+      x_{k+1} = x_avg + mu * v_{k+1}
+
+    With mu=0 this degrades to simple averaging (standard DES-LOC).
+    """
+
+    def __init__(self, momentum=0.9, lr=1.0):
+        self._mu = momentum
+        self._lr = lr
+        self._velocity = {}
+        self._prev_params = {}
+        self._apply_count = 0
+
+    def apply(self, param_name, averaged_param, param_tensor):
+        """Apply Nesterov outer step after AllReduce averaging.
+
+        Args:
+            param_name: unique key for this parameter.
+            averaged_param: result of AllReduce average (x_avg).
+            param_tensor: the tensor to update in-place.
+        """
+        pid = param_name
+        if pid not in self._velocity:
+            self._velocity[pid] = param_tensor.new_zeros(param_tensor.shape)
+            self._prev_params[pid] = averaged_param.clone()
+            param_tensor.copy_(averaged_param)
+            return
+
+        delta = averaged_param.float() - self._prev_params[pid].float()
+        v = self._velocity[pid]
+        v.mul_(self._mu).add_(delta.to(v.dtype), alpha=self._lr)
+        param_tensor.copy_(averaged_param)
+        param_tensor.add_(v.to(param_tensor.dtype), alpha=self._mu)
+        self._prev_params[pid].copy_(param_tensor)
+        self._apply_count += 1
+
+    def state_dict(self):
+        return {'mu': self._mu, 'lr': self._lr, 'count': self._apply_count}
+
+    def load_state_dict(self, sd):
+        self._mu = sd.get('mu', self._mu)
+        self._lr = sd.get('lr', self._lr)
