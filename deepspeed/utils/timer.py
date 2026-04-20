@@ -654,3 +654,17 @@ DESLOC_HW_PRESETS = {
 # =============================================================================
 
 
+
+
+# M284: Phase timer convenience
+def desloc_time_step(fn, phase_timer=None, phase="compute"):
+    import time
+    t0 = time.monotonic(); result = fn(); elapsed = time.monotonic()-t0
+    if phase_timer: phase_timer.start(phase); phase_timer.stop()
+    return result, elapsed*1000
+
+def desloc_format_breakdown(bd):
+    total = sum(bd.values())
+    if total <= 0: return "no data"
+    return " | ".join(f"{p}={bd.get(p,0):.1f}ms ({bd.get(p,0)/total*100:.1f}%)"
+                      for p in ["compute","comm","idle"])
