@@ -6326,3 +6326,122 @@ def desloc_format_table_row(agg_result, fmt="nips"):
                 f"| {mc:.1f}× | {n} |")
 
 # =====================================================================
+
+
+# M287 — Claude-19: AdaptiveSyncController + StalenessCompensator + BWOptimizer
+import math as _m287_math
+class DeslocAdaptiveSyncController:
+    """Dynamically adjust Kx/Ku/Kv. Ref: Theorem 1 ψ factor."""
+    __slots__=('bKx','bKu','bKv','cKx','cKu','cKv','mnKx','mxKx','gve','gva','le','la','lp','vh','lh','ai','rs','tKx','rc','b1','b2','bw','mb','cb','sc','al')
+    def __init__(s,Kx,Ku,Kv,b1=.9,b2=.999,mnKx=1,mxKx=256,ai=100,rs=50,bw=25.,mb=0,cb=50.):
+        s.bKx,s.bKu,s.bKv=Kx,Ku,Kv;s.cKx,s.cKu,s.cKv=Kx,Ku,Kv;s.mnKx,s.mxKx=max(1,mnKx),mxKx
+        s.gve,s.gva=0.,.05;s.le,s.la,s.lp=0.,.02,None;s.vh,s.lh=[],[];s.ai,s.rs=ai,rs
+        s.tKx,s.rc=Kx,0;s.b1,s.b2=b1,b2;s.bw,s.mb,s.cb=bw,mb,cb;s.sc=0;s.al=[]
+    def hl(s,b):return-1./_m287_math.log2(b)if 0<b<1 else(float('inf')if b>=1 else 0.)
+    def psi(s,px,pu,b):
+        n=4*(1-px)*(1-b)*(1-pu);d=px*px*6*(1-(1-pu)*b);return n/d if abs(d)>1e-12 else float('inf')
+    def obs_gv(s,v):s.gve=s.gva*v+(1-s.gva)*s.gve;s.vh.append((s.sc,s.gve));s.vh=s.vh[-5000:]if len(s.vh)>10000 else s.vh
+    def obs_loss(s,v):s.le=s.la*v+(1-s.la)*s.le;s.lh.append((s.sc,s.le));s.lh=s.lh[-5000:]if len(s.lh)>10000 else s.lh;s.lp=v
+    def _div(s):
+        if len(s.lh)<20:return 0.
+        r=[l for _,l in s.lh[-20:]];o=[l for _,l in s.lh[-40:-20]]if len(s.lh)>=40 else r[:10]
+        if not o:return 0.;mr,mo=sum(r)/len(r),sum(o)/len(o);return max(0.,min(1.,(mr-mo)/(abs(mo)+1e-8)*5))
+    def _vs(s):
+        if len(s.vh)<20:return 1.;r=[v for _,v in s.vh[-10:]];b=[v for _,v in s.vh[-50:-10]]if len(s.vh)>=50 else[v for _,v in s.vh[:10]]
+        if not b:return 1.;return sum(r)/len(r)/(sum(b)/len(b)+1e-12)
+    def _bwo(s):
+        if s.mb<=0 or s.bw<=0:return s.bKx;bm=s.bw*1e9/8/1000;am=s.mb/(bm+1e-12)
+        return min(s.mxKx,max(s.mnKx,int(_m287_math.ceil(s.bKx*am/s.cb))))if am>s.cb else s.bKx
+    def adapt(s):
+        s.sc+=1
+        if s.rc>0:
+            s.rc-=1;d=s.tKx-s.cKx
+            if s.rc==0:s.cKx=s.tKx
+            else:p=1.-s.rc/s.rs;s.cKx=max(s.mnKx,min(s.mxKx,int(round(s.bKx+d*p))))
+            s._ukv();return(s.cKx,s.cKu,s.cKv)
+        if s.sc%s.ai!=0:return None
+        dv,vs,bw=s._div(),s._vs(),s._bwo()
+        if dv>.5:nk=max(s.mnKx,s.bKx//2)
+        elif dv>.2:nk=max(s.mnKx,int(s.bKx*.75))
+        elif vs>3:nk=max(s.mnKx,s.bKx//2)
+        elif vs>1.5:nk=max(s.mnKx,int(s.bKx*.8))
+        elif vs<.5 and dv<.05:nk=min(s.mxKx,int(s.bKx*1.5))
+        else:nk=s.bKx
+        nk=max(nk,bw);nk=max(s.mnKx,min(s.mxKx,nk))
+        if nk!=s.cKx:s.tKx=nk;s.rc=s.rs;s.al.append((s.sc,s.cKx,nk,dv,vs))
+        return None
+    def _ukv(s):
+        h1,h2=s.hl(s.b1),s.hl(s.b2);kr=max(1,int(round(h1/6.6)))if h1>0 else 3
+        vr=max(1,int(round(h2/6.6)))if h2<float('inf')else 6;s.cKu=max(1,s.cKx*kr);s.cKv=max(1,s.cKx*vr)
+    def report(s):return f"AdaptSync(Kx={s.cKx},Ku={s.cKu},Kv={s.cKv}) adaptations={len(s.al)} gve={s.gve:.6f} le={s.le:.6f}"
+    def sd(s):return{k:getattr(s,k)for k in('sc','cKx','cKu','cKv','gve','le','tKx','rc')}
+    def ld(s,d):
+        for k in('sc','cKx','cKu','cKv','gve','le','tKx','rc'):
+            if k in d:setattr(s,k,d[k])
+
+class DeslocStalenessComp:
+    """lr correction 1/√(1+staleness·Kx). Ref: Section 3."""
+    __slots__=('Kx','se','a','tn','mn','mx','st')
+    def __init__(s,Kx,a=.01,mn=.5,mx=1.):s.Kx=max(1,Kx);s.se={};s.a=a;s.tn={'x':[],'u':[],'v':[]};s.mn,s.mx,s.st=mn,mx,0
+    def obs(s,n,dn,t='x'):
+        if n not in s.se:s.se[n]=dn
+        else:s.se[n]=s.a*dn+(1-s.a)*s.se[n]
+        s.tn[t].append(dn);s.tn[t]=s.tn[t][-500:]if len(s.tn[t])>1000 else s.tn[t]
+    def corr(s,t='x'):
+        if s.Kx<=1:return 1.;ns=s.tn.get(t,[])
+        if len(ns)<10:return 1.;r,o=ns[-10:],ns[-50:-10]if len(ns)>=50 else ns[:10]
+        mr,mo=sum(r)/len(r),sum(o)/len(o)if o else sum(r)/len(r);sr=max(0.,mr/(mo+1e-12)-1.)
+        return max(s.mn,min(s.mx,1./_m287_math.sqrt(1.+sr*s.Kx)))
+
+class DeslocBWOpt:
+    """NVLink/PCIe/Net hierarchy. Ref: Nick Joseph hardware layout."""
+    NV,PC,NT=0,1,2
+    __slots__=('Kx','Ku','Kv','tp','bw','lt','pf','sc')
+    def __init__(s,Kx,Ku,Kv):
+        s.Kx,s.Ku,s.Kv=Kx,Ku,Kv;s.tp={};s.bw={0:300e9,1:32e9,2:25e9/8};s.lt={0:.005,1:.01,2:.05};s.pf=[];s.sc={}
+    def detect(s):
+        import subprocess
+        try:
+            r=subprocess.run(['nvidia-smi','topo','-m'],capture_output=True,text=True,timeout=10)
+            if r.returncode==0:
+                nv=[];
+                for i,ln in enumerate(r.stdout.strip().split('\n')):
+                    for j,c in enumerate(ln.split()):
+                        if'NV'in c and i!=j:nv.append((i,j))
+                s.tp['nvp']=nv;s.tp['has_nv']=len(nv)>0
+        except:pass
+        try:
+            import torch;s.tp['ngpu']=torch.cuda.device_count()
+            for i in range(s.tp['ngpu']):
+                p=torch.cuda.get_device_properties(i);s.tp[f'g{i}']={'n':p.name,'m':p.total_mem/(1024**3),'sm':p.multi_processor_count}
+        except:pass
+    def est(s,sz,t):return(s.lt.get(t,.05)+sz/(s.bw.get(t,25e9/8)+1e-12))*1000
+    def plan(s,st,mb):
+        ck=(st%max(1,s.Kx*s.Ku*s.Kv),mb)
+        if ck in s.sc:return s.sc[ck]
+        p={'ps':st%max(1,s.Kx)==0,'ms':st%max(1,s.Ku)==0,'vs':st%max(1,s.Kv)==0,'ms_t':0.}
+        if p['ps']:p['ms_t']+=s.est(mb,s.NT)
+        if p['ms']:p['ms_t']+=s.est(mb,s.NV if s.tp.get('has_nv')else s.NT)
+        if p['vs']:p['ms_t']+=s.est(mb*.5,s.NT)
+        s.sc[ck]=p;s.pf.append((st,p['ms_t']));s.pf=s.pf[-2500:]if len(s.pf)>5000 else s.pf;return p
+
+def init_desloc_adaptive(engine):
+    if not getattr(engine,'desloc_enabled',False):return
+    mb=sum(p.numel()*p.element_size()for p in engine.module.parameters()if p.requires_grad)
+    engine._da=DeslocAdaptiveSyncController(Kx=engine.desloc_Kx,Ku=engine.desloc_Ku,Kv=engine.desloc_Kv,mb=mb)
+    engine._ds=DeslocStalenessComp(Kx=engine.desloc_Kx)
+    engine._db=DeslocBWOpt(Kx=engine.desloc_Kx,Ku=engine.desloc_Ku,Kv=engine.desloc_Kv);engine._db.detect()
+
+def desloc_adaptive_post_step(engine,loss=None,gn=None):
+    if not getattr(engine,'desloc_enabled',False):return
+    c=getattr(engine,'_da',None)
+    if not c:return
+    if loss is not None:c.obs_loss(float(loss))
+    if gn is not None:c.obs_gv(float(gn)**2)
+    r=c.adapt()
+    if r:engine.desloc_Kx,engine.desloc_Ku,engine.desloc_Kv=r
+    s=getattr(engine,'_ds',None)
+    if s and engine.desloc_is_param_sync_step():
+        for n,p in engine.module.named_parameters():
+            if p.requires_grad and p.grad is not None:s.obs(n,p.grad.float().norm().item(),getattr(p,'desloc_tier','x'))
+# M287: end
