@@ -1460,3 +1460,332 @@ def desloc_generate_all_figures(log_dir, output_dir='./figures'):
 
 
 # =============================================================================
+
+# === M272: Figure 3 — Half-life validation scatter ===
+    def plot_figure3_halflife(self, experiments, title=None):
+        """Figure 3: Half-life validation — β₂ vs empirical change rate.
+
+        Section 5.1 RQ1: 'relative rates of change for the two momenta
+        scale with their beta under gradient clipping (ρ = 1.0)'
+
+        X-axis: theoretical half-life (-ln2/lnβ)
+        Y-axis: empirical relative change rate from logs
+        """
+        if not self._setup():
+            return
+        plt = self._plt
+        fig, ax = plt.subplots(figsize=(10, 8))
+
+        beta_values = []
+        half_lives = []
+        change_rates = []
+        labels = []
+        import math
+
+        for exp in experiments:
+            cfg = exp.get('config')
+            if cfg is None:
+                continue
+            b2 = getattr(cfg, 'beta2', None) or cfg.get('beta2', 0.999)
+            if b2 <= 0 or b2 >= 1:
+                continue
+            hl = -math.log(2) / math.log(b2)
+            steps = exp.get('steps', [])
+            if len(steps) < 10:
+                continue
+            # Empirical change rate: avg |loss[t] - loss[t-1]| / |loss[t-1]|
+            changes = []
+            for i in range(1, len(steps)):
+                l_prev = steps[i-1].get('loss', 0)
+                l_curr = steps[i].get('loss', 0)
+                if abs(l_prev) > 1e-8:
+                    changes.append(abs(l_curr - l_prev) / abs(l_prev))
+            if not changes:
+                continue
+            avg_change = sum(changes) / len(changes)
+            beta_values.append(b2)
+            half_lives.append(hl)
+            change_rates.append(avg_change)
+            labels.append(f'β₂={b2}')
+
+        if not half_lives:
+            print("  No half-life data available for Figure 3")
+            return
+
+        scatter = ax.scatter(half_lives, change_rates,
+                            s=100, c=beta_values, cmap='viridis',
+                            edgecolors='black', linewidth=0.5, alpha=0.8)
+        for i, lbl in enumerate(labels):
+            ax.annotate(lbl, (half_lives[i], change_rates[i]),
+                       xytext=(5, 5), textcoords='offset points',
+                       fontsize=9)
+
+        cbar = plt.colorbar(scatter, ax=ax)
+        cbar.set_label('β₂ value', fontsize=14)
+        ax.set_xlabel('Theoretical Half-life (steps)', fontsize=14)
+        ax.set_ylabel('Empirical Change Rate', fontsize=14)
+        ax.set_title(title or 'Figure 3: Half-life vs Change Rate', fontsize=18)
+        ax.set_xscale('log')
+        ax.grid(True, linestyle='--', alpha=0.7)
+        ax.tick_params(labelsize=10)
+
+        import os
+        fig_path = os.path.join(self.output_dir, 'figure3_halflife.png')
+        fig.savefig(fig_path, dpi=self.dpi, bbox_inches='tight')
+        plt.close(fig)
+        print(f"Figure 3 saved: {fig_path}")
+        return fig_path
+
+    def plot_figure4_sync_sensitivity(self, experiments, title=None):
+        """Figure 4: Sync sensitivity — final loss vs Kx.
+
+        Section 5.2 RQ2: 'effect of independently varying sync periods'
+        Grouped bar chart: Kx on X, final loss on Y, hue=Ku multiplier.
+        """
+        if not self._setup():
+            return
+        plt = self._plt
+        fig, ax = plt.subplots(figsize=(16, 9))
+
+        data_rows = []
+        for exp in experiments:
+            cfg = exp.get('config')
+            steps = exp.get('steps', [])
+            if cfg is None or not steps:
+                continue
+            Kx = getattr(cfg, 'Kx', None) or cfg.get('Kx', 1)
+            Ku = getattr(cfg, 'Ku', None) or cfg.get('Ku', 1)
+            final_loss = steps[-1].get('loss', None)
+            if final_loss is None:
+                continue
+            ku_mult = Ku // max(1, Kx)
+            data_rows.append({'Kx': Kx, 'Ku_mult': f'Ku={ku_mult}×Kx',
+                             'final_loss': final_loss})
+
+        if not data_rows:
+            print("  No data for Figure 4")
+            return
+
+        # Group by Kx and Ku_mult
+        groups = {}
+        for r in data_rows:
+            key = (r['Kx'], r['Ku_mult'])
+            if key not in groups:
+                groups[key] = []
+            groups[key].append(r['final_loss'])
+
+        kx_vals = sorted(set(r['Kx'] for r in data_rows))
+        ku_labels = sorted(set(r['Ku_mult'] for r in data_rows))
+        colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728']
+
+        bar_width = 0.8 / max(1, len(ku_labels))
+        for j, ku_l in enumerate(ku_labels):
+            x_positions = []
+            heights = []
+            for i, kx in enumerate(kx_vals):
+                key = (kx, ku_l)
+                if key in groups:
+                    avg = sum(groups[key]) / len(groups[key])
+                    x_positions.append(i + j * bar_width)
+                    heights.append(avg)
+            bars = ax.bar(x_positions, heights, width=bar_width,
+                         label=ku_l, color=colors[j % len(colors)],
+                         edgecolor='black', linewidth=0.5)
+            for bar in bars:
+                h = bar.get_height()
+                ax.annotate(f'{h:.4f}',
+                           xy=(bar.get_x() + bar.get_width()/2, h),
+                           xytext=(0, 3), textcoords='offset points',
+                           ha='center', fontsize=9)
+
+        ax.set_xticks([i + bar_width*(len(ku_labels)-1)/2 for i in range(len(kx_vals))])
+        ax.set_xticklabels([str(kx) for kx in kx_vals])
+        ax.set_xlabel('Kx (parameter sync period)', fontsize=14)
+        ax.set_ylabel('Final Loss', fontsize=14)
+        ax.set_title(title or 'Figure 4: Sync Sensitivity', fontsize=18)
+        ax.legend(fontsize=12)
+        ax.grid(True, axis='y', linestyle='--', alpha=0.7)
+        ax.tick_params(labelsize=10)
+
+        import os
+        fig_path = os.path.join(self.output_dir, 'figure4_sync_sensitivity.png')
+        fig.savefig(fig_path, dpi=self.dpi, bbox_inches='tight')
+        plt.close(fig)
+        print(f"Figure 4 saved: {fig_path}")
+        return fig_path
+
+    def plot_figure5_scaling(self, experiments, title=None):
+        """Figure 5: Large-scale training — loss by model size.
+
+        Section 5.4 RQ4: 'DES-LOC reliably scales to 1.3B models'
+        Grouped bars: model size on X, final loss on Y, hue=method.
+        """
+        if not self._setup():
+            return
+        plt = self._plt
+        fig, ax = plt.subplots(figsize=(12, 8))
+
+        data = {}
+        for exp in experiments:
+            cfg = exp.get('config')
+            steps = exp.get('steps', [])
+            if cfg is None or not steps:
+                continue
+            model = getattr(cfg, 'model_size', None) or cfg.get('model_size', '125M')
+            Kx = getattr(cfg, 'Kx', None) or cfg.get('Kx', 1)
+            method = 'DDP' if Kx == 1 else f'DES-LOC Kx={Kx}'
+            final_loss = steps[-1].get('loss', None)
+            if final_loss is None:
+                continue
+            key = (model, method)
+            if key not in data:
+                data[key] = []
+            data[key].append(final_loss)
+
+        if not data:
+            print("  No data for Figure 5")
+            return
+
+        models = sorted(set(k[0] for k in data.keys()),
+                       key=lambda x: float(x.replace('M','e6').replace('B','e9').replace('.','').replace('e6','e6').replace('e9','e9')) if x[0].isdigit() else 0)
+        methods = sorted(set(k[1] for k in data.keys()))
+        colors = {'DDP': '#1f77b4'}
+        palette = ['#ff7f0e', '#2ca02c', '#d62728', '#9467bd']
+        for i, m in enumerate(methods):
+            if m not in colors:
+                colors[m] = palette[i % len(palette)]
+
+        bar_w = 0.8 / max(1, len(methods))
+        for j, meth in enumerate(methods):
+            xs, ys = [], []
+            for i, model in enumerate(models):
+                key = (model, meth)
+                if key in data:
+                    avg = sum(data[key]) / len(data[key])
+                    xs.append(i + j * bar_w)
+                    ys.append(avg)
+            bars = ax.bar(xs, ys, width=bar_w, label=meth,
+                         color=colors.get(meth, '#999'),
+                         edgecolor='black', linewidth=0.5)
+            for bar in bars:
+                h = bar.get_height()
+                ax.annotate(f'{h:.4f}',
+                           xy=(bar.get_x() + bar.get_width()/2, h),
+                           xytext=(0, 3), textcoords='offset points',
+                           ha='center', fontsize=9)
+
+        ax.set_xticks([i + bar_w*(len(methods)-1)/2 for i in range(len(models))])
+        ax.set_xticklabels(models)
+        ax.set_xlabel('Model Size', fontsize=14)
+        ax.set_ylabel('Final Loss', fontsize=14)
+        ax.set_title(title or 'Figure 5: Scaling to Large Models', fontsize=18)
+        ax.legend(fontsize=12)
+        ax.grid(True, axis='y', linestyle='--', alpha=0.7)
+        ax.tick_params(labelsize=10)
+
+        import os
+        fig_path = os.path.join(self.output_dir, 'figure5_scaling.png')
+        fig.savefig(fig_path, dpi=self.dpi, bbox_inches='tight')
+        plt.close(fig)
+        print(f"Figure 5 saved: {fig_path}")
+        return fig_path
+
+    def plot_figure6_nesterov(self, experiments, title=None):
+        """Figure 6: Nesterov vs Averaging outer optimizer.
+        Section 5.5 RQ5."""
+        if not self._setup():
+            return
+        plt = self._plt
+        fig, ax = plt.subplots(figsize=(10, 8))
+        data = {}
+        for exp in experiments:
+            cfg = exp.get('config')
+            steps = exp.get('steps', [])
+            if cfg is None or not steps:
+                continue
+            outer = getattr(cfg, 'outer_optimizer', None) or cfg.get('outer_optimizer', 'averaging')
+            Kx = getattr(cfg, 'Kx', None) or cfg.get('Kx', 1)
+            final_loss = steps[-1].get('loss', None)
+            if final_loss is None:
+                continue
+            label = f'{outer} Kx={Kx}'
+            if label not in data:
+                data[label] = []
+            data[label].append(final_loss)
+        if not data:
+            print("  No data for Figure 6")
+            return
+        labels = sorted(data.keys())
+        avgs = [sum(data[l])/len(data[l]) for l in labels]
+        colors_map = {'averaging': '#1f77b4', 'nesterov': '#ff7f0e'}
+        bar_colors = [colors_map.get(l.split()[0], '#999') for l in labels]
+        bars = ax.bar(range(len(labels)), avgs, color=bar_colors,
+                     edgecolor='black', linewidth=0.5)
+        for bar in bars:
+            h = bar.get_height()
+            ax.annotate(f'{h:.4f}', xy=(bar.get_x()+bar.get_width()/2, h),
+                       xytext=(0, 3), textcoords='offset points',
+                       ha='center', fontsize=9)
+        ax.set_xticks(range(len(labels)))
+        ax.set_xticklabels(labels, rotation=30, ha='right')
+        ax.set_xlabel('Configuration', fontsize=14)
+        ax.set_ylabel('Final Loss', fontsize=14)
+        ax.set_title(title or 'Figure 6: Nesterov vs Averaging', fontsize=18)
+        ax.grid(True, axis='y', linestyle='--', alpha=0.7)
+        ax.tick_params(labelsize=10)
+        import os
+        fig_path = os.path.join(self.output_dir, 'figure6_nesterov.png')
+        fig.savefig(fig_path, dpi=self.dpi, bbox_inches='tight')
+        plt.close(fig)
+        print(f"Figure 6 saved: {fig_path}")
+        return fig_path
+
+    def plot_figure7_optimizer(self, experiments, title=None):
+        """Figure 7: Adam vs Muon inner optimizer.
+        Section 5.6 RQ6."""
+        if not self._setup():
+            return
+        plt = self._plt
+        fig, ax = plt.subplots(figsize=(10, 8))
+        data = {}
+        for exp in experiments:
+            cfg = exp.get('config')
+            steps = exp.get('steps', [])
+            if cfg is None or not steps:
+                continue
+            opt = getattr(cfg, 'optimizer', None) or cfg.get('optimizer', 'adam')
+            Kx = getattr(cfg, 'Kx', None) or cfg.get('Kx', 1)
+            final_loss = steps[-1].get('loss', None)
+            if final_loss is None:
+                continue
+            label = f'{opt} Kx={Kx}'
+            if label not in data:
+                data[label] = []
+            data[label].append(final_loss)
+        if not data:
+            print("  No data for Figure 7")
+            return
+        labels = sorted(data.keys())
+        avgs = [sum(data[l])/len(data[l]) for l in labels]
+        bars = ax.bar(range(len(labels)), avgs,
+                     color=['#2ca02c' if 'muon' in l else '#1f77b4' for l in labels],
+                     edgecolor='black', linewidth=0.5)
+        for bar in bars:
+            h = bar.get_height()
+            ax.annotate(f'{h:.4f}', xy=(bar.get_x()+bar.get_width()/2, h),
+                       xytext=(0, 3), textcoords='offset points',
+                       ha='center', fontsize=9)
+        ax.set_xticks(range(len(labels)))
+        ax.set_xticklabels(labels, rotation=30, ha='right')
+        ax.set_xlabel('Configuration', fontsize=14)
+        ax.set_ylabel('Final Loss', fontsize=14)
+        ax.set_title(title or 'Figure 7: Adam vs Muon Optimizer', fontsize=18)
+        ax.grid(True, axis='y', linestyle='--', alpha=0.7)
+        ax.tick_params(labelsize=10)
+        import os
+        fig_path = os.path.join(self.output_dir, 'figure7_optimizer.png')
+        fig.savefig(fig_path, dpi=self.dpi, bbox_inches='tight')
+        plt.close(fig)
+        print(f"Figure 7 saved: {fig_path}")
+        return fig_path
+# End M275-M278
