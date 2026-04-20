@@ -1661,3 +1661,333 @@ class DeslocCommComparisonTable:
             _w(f'desloc_total_gb: {exp["desloc_gb"]:.3f}')
             _w(f'reduction: {exp["reduction"]:.1f}')
             _w('')
+
+# =====================================================================
+# M246 — Claude-16: DES-LOC Topology-Aware Comm Primitives
+# Adaptive AllReduce routing, bandwidth probing, comm group mgmt
+# Ref: NCCL transport.cc — selectTransport(P2P/SHM/NET)
+# Ref: PyTorch c10d — ProcessGroupNCCL async collectives
+# =====================================================================
+
+import math as _m246_math
+
+
+class DeslocCommGroupManager:
+    """Manage DES-LOC communication groups and topology.
+
+    DES-LOC uses different sync periods for different parameter tiers.
+    This manager creates sub-groups for each tier to enable independent
+    AllReduce scheduling.
+
+    Ref: Megatron-LM — mpu.get_data_parallel_group()
+    """
+
+    def __init__(self, world_size=1, rank=0):
+        self._world_size = world_size
+        self._rank = rank
+        self._tier_groups = {}  # tier -> group handle
+        self._bw_probes = {}   # (src, dst) -> bandwidth_gbps
+        self._topology_cache = None
+
+    def create_tier_groups(self, process_group=None):
+        """Create separate comm groups for each DES-LOC tier.
+
+        In practice, all tiers use the same underlying group
+        but with different scheduling. We track them separately
+        for logging and profiling.
+        """
+        for tier in ('x', 'u', 'v'):
+            self._tier_groups[tier] = {
+                'group': process_group,
+                'tier': tier,
+                'total_bytes': 0,
+                'total_ops': 0,
+                'total_skipped': 0,
+                'last_sync_step': -1,
+            }
+
+    def record_tier_comm(self, tier, nbytes, step):
+        """Record communication for a specific tier."""
+        if tier not in self._tier_groups:
+            return
+        self._tier_groups[tier]['total_bytes'] += nbytes
+        self._tier_groups[tier]['total_ops'] += 1
+        self._tier_groups[tier]['last_sync_step'] = step
+
+    def record_tier_skip(self, tier):
+        """Record a skipped communication for a specific tier."""
+        if tier not in self._tier_groups:
+            return
+        self._tier_groups[tier]['total_skipped'] += 1
+
+    def probe_bandwidth(self, target_rank, nbytes=1024*1024, dtype_bytes=2):
+        """Estimate bandwidth to target rank (placeholder for real probing).
+
+        In production, this would send a test tensor and measure RTT.
+        Here we return a cached or estimated value.
+        """
+        key = (self._rank, target_rank)
+        if key in self._bw_probes:
+            return self._bw_probes[key]
+
+        # Heuristic: same-node GPUs have ~600 GB/s (NVLink)
+        # Cross-node has ~25-100 GB/s (Ethernet/IB)
+        if abs(self._rank - target_rank) <= 7:
+            # Likely same node (8 GPUs per node typical)
+            bw = 600.0
+        else:
+            bw = 50.0
+
+        self._bw_probes[key] = bw
+        return bw
+
+    def recommend_bucket_size(self, model_params, Kx,
+                               target_bucket_time_ms=1.0,
+                               bandwidth_gbps=400.0):
+        """Recommend AllReduce bucket size for DES-LOC.
+
+        Larger buckets amortize launch overhead but increase latency.
+        With DES-LOC (Kx>1), each sync is more important,
+        so we use slightly larger buckets for efficiency.
+
+        Ref: Megatron-LM — distributed_data_parallel.py bucket management
+        """
+        # Bytes per ms at given bandwidth
+        bytes_per_ms = bandwidth_gbps * 1e9 / 8 / 1000.0
+
+        base_bucket = int(bytes_per_ms * target_bucket_time_ms)
+        base_bucket = max(1024 * 1024, base_bucket)  # min 1MB
+
+        # With large Kx, each sync handles more stale params
+        # → use larger buckets to reduce launch overhead
+        if Kx > 1:
+            kx_adjustment = _m246_math.log2(max(1, Kx))
+            base_bucket = int(base_bucket * (1 + kx_adjustment * 0.1))
+
+        # Cap at model size
+        max_bucket = model_params * 2  # 2 bytes per param (BF16)
+        return min(base_bucket, max_bucket)
+
+    def get_comm_stats(self):
+        """Aggregate comm stats across all tiers."""
+        total_bytes = sum(g['total_bytes'] for g in self._tier_groups.values())
+        total_ops = sum(g['total_ops'] for g in self._tier_groups.values())
+        total_skipped = sum(g['total_skipped'] for g in self._tier_groups.values())
+
+        per_tier = {}
+        for tier, data in self._tier_groups.items():
+            tier_total = data['total_ops'] + data['total_skipped']
+            skip_pct = 100.0 * data['total_skipped'] / max(1, tier_total)
+            per_tier[tier] = {
+                'bytes': data['total_bytes'],
+                'ops': data['total_ops'],
+                'skipped': data['total_skipped'],
+                'skip_pct': round(skip_pct, 2),
+                'last_sync_step': data['last_sync_step'],
+            }
+
+        return {
+            'total_bytes': total_bytes,
+            'total_ops': total_ops,
+            'total_skipped': total_skipped,
+            'per_tier': per_tier,
+        }
+
+
+class DeslocBandwidthEstimator:
+    """Runtime bandwidth estimation for DES-LOC.
+
+    Measures actual AllReduce bandwidth during training
+    to feed back into Kx optimization.
+
+    Ref: NCCL — bandwidth measurement via NCCL_TESTS
+    """
+
+    def __init__(self, window_size=50):
+        self._window_size = window_size
+        self._measurements = []  # (bytes, duration_s)
+
+    def record(self, nbytes, duration_s):
+        """Record a bandwidth measurement."""
+        if duration_s > 0:
+            self._measurements.append((nbytes, duration_s))
+            if len(self._measurements) > self._window_size:
+                self._measurements = self._measurements[-self._window_size:]
+
+    def get_bandwidth_gbps(self):
+        """Get estimated bandwidth in Gbps."""
+        if not self._measurements:
+            return 0.0
+        total_bytes = sum(m[0] for m in self._measurements)
+        total_time = sum(m[1] for m in self._measurements)
+        if total_time <= 0:
+            return 0.0
+        return round((total_bytes * 8) / (total_time * 1e9), 4)
+
+    def get_latency_ms(self):
+        """Get average AllReduce latency in ms."""
+        if not self._measurements:
+            return 0.0
+        total_time_ms = sum(m[1] * 1000 for m in self._measurements)
+        return round(total_time_ms / len(self._measurements), 4)
+
+    def recommend_Kx(self, compute_time_ms, target_comm_fraction=0.1):
+        """Recommend Kx to achieve target comm fraction.
+
+        comm_fraction = comm_time / (compute_time + comm_time)
+        With DES-LOC: amortized_comm = comm_time / Kx
+        Target: amortized_comm / (compute_time + amortized_comm) = target
+
+        Solving: Kx = comm_time * (1 - target) / (compute_time * target)
+        """
+        avg_lat = self.get_latency_ms()
+        if avg_lat <= 0 or compute_time_ms <= 0 or target_comm_fraction <= 0:
+            return 1
+
+        kx_raw = avg_lat * (1 - target_comm_fraction) / (
+            compute_time_ms * target_comm_fraction
+        )
+
+        # Round up to nearest power of 2
+        if kx_raw <= 1:
+            return 1
+        kx_p2 = 2 ** int(_m246_math.ceil(_m246_math.log2(kx_raw)))
+        return min(kx_p2, 256)
+
+
+class DeslocReduceScheduler:
+    """Schedule AllReduce operations across tiers with overlap.
+
+    Instead of doing all AllReduces synchronously, this scheduler
+    can interleave param AllReduce with momentum AllReduce,
+    overlapping comm with compute where possible.
+
+    Ref: DeepSpeed — overlapping_partition_gradients_reduce_epilogue()
+    """
+
+    def __init__(self, Kx=1, Ku=3, Kv=6):
+        self._Kx = max(1, Kx)
+        self._Ku = max(1, Ku)
+        self._Kv = max(1, Kv)
+        self._step = 0
+        self._pending = []  # list of (tier, work_handle)
+        self._schedule_log = []
+
+    def plan_step(self, step):
+        """Plan which reductions to execute at this step.
+
+        Returns list of tiers to reduce.
+        """
+        self._step = step
+        tiers = []
+
+        if step % self._Kx == 0:
+            tiers.append('x')
+        if step % self._Ku == 0:
+            tiers.append('u')
+        if step % self._Kv == 0:
+            tiers.append('v')
+
+        self._schedule_log.append({
+            'step': step,
+            'tiers': list(tiers),
+            'n_reductions': len(tiers),
+        })
+
+        return tiers
+
+    def get_schedule_summary(self, last_n=100):
+        """Summarize scheduling decisions."""
+        recent = self._schedule_log[-last_n:]
+        if not recent:
+            return {'avg_reductions_per_step': 0.0}
+
+        total_reductions = sum(r['n_reductions'] for r in recent)
+        steps_with_any = sum(1 for r in recent if r['n_reductions'] > 0)
+        steps_with_all = sum(1 for r in recent if r['n_reductions'] == 3)
+
+        return {
+            'avg_reductions_per_step': round(total_reductions / len(recent), 4),
+            'steps_with_any_sync': steps_with_any,
+            'steps_with_full_sync': steps_with_all,
+            'total_steps': len(recent),
+            'Kx': self._Kx,
+            'Ku': self._Ku,
+            'Kv': self._Kv,
+        }
+
+
+# M246: end of Claude-16 comm integration
+
+
+# =====================================================================
+# M246T — Claude-16
+# =====================================================================
+
+import math as _m246t_math
+
+class DeslocCommCoalescer:
+    """Coalesce multiple small AllReduces into fewer large ones.
+    When DES-LOC syncs multiple tiers on the same step,
+    coalescing reduces NCCL launch overhead."""
+
+    def __init__(self, min_coalesce_bytes=1024*1024):
+        self._min_bytes = min_coalesce_bytes
+        self._pending = []
+        self._coalesced_count = 0
+
+    def add_pending(self, tensor_bytes, tier, priority=0):
+        self._pending.append({"bytes": tensor_bytes, "tier": tier, "pri": priority})
+
+    def plan_coalesced(self):
+        if not self._pending:
+            return []
+        self._pending.sort(key=lambda x: x["pri"])
+        groups = []
+        current_group = []
+        current_bytes = 0
+        for item in self._pending:
+            current_group.append(item)
+            current_bytes += item["bytes"]
+            if current_bytes >= self._min_bytes:
+                groups.append({"items": current_group, "total_bytes": current_bytes})
+                current_group = []
+                current_bytes = 0
+        if current_group:
+            groups.append({"items": current_group, "total_bytes": current_bytes})
+        self._coalesced_count += len(groups)
+        self._pending.clear()
+        return groups
+
+    def stats(self):
+        return {"coalesced_ops": self._coalesced_count, "pending": len(self._pending)}
+
+class DeslocCommProfiler:
+    """Profile DES-LOC communication for NKI-FA formatted output."""
+
+    def __init__(self):
+        self._records = []
+
+    def record(self, step, tier, op, nbytes, dur_ms):
+        self._records.append({"step": step, "tier": tier, "op": op,
+                              "bytes": nbytes, "ms": round(dur_ms, 4)})
+        if len(self._records) > 10000:
+            self._records = self._records[-10000:]
+
+    def export_csv(self, filepath):
+        with open(filepath, "w") as f:
+            f.write("step,tier,op,bytes,ms\n")
+            for r in self._records:
+                row = f"{r['step']},{r['tier']},{r['op']},{r['bytes']},{r['ms']}\n"
+                f.write(row)
+
+    def summary(self):
+        if not self._records:
+            return {}
+        total_bytes = sum(r["bytes"] for r in self._records)
+        total_ms = sum(r["ms"] for r in self._records)
+        return {"n_events": len(self._records),
+                "total_bytes": total_bytes, "total_ms": round(total_ms, 4)}
+
+
+# M246T: end
