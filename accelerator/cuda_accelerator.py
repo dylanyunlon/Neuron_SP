@@ -387,454 +387,143 @@ class CUDA_Accelerator(DeepSpeedAccelerator):
 # Ref: Nick Joseph — 'understand physical layout of hardware'
 # =========================================================================
 
-class DeslocGPUCapabilityProbe:
-    """Probe GPU capabilities for DES-LOC Kx selection.
-    Key factors: compute capability, memory size, interconnect bandwidth."""
 
-    @staticmethod
-    def probe_all():
+
+    # M302: GPU DB + topo + hetero scheduling (INTO CUDA_Accelerator class)
+    _DESLOC_GPU_DB = {
+        'h100_sxm':{'tf':989.5,'hbm':3350,'nvl':900},'h100_nvl':{'tf':835,'hbm':3350,'nvl':600},
+        'h100_pcie':{'tf':756,'hbm':2000,'nvl':0},'h200':{'tf':989.5,'hbm':4800,'nvl':900},
+        'a100_sxm':{'tf':312,'hbm':2039,'nvl':600},'a100_pcie':{'tf':312,'hbm':2039,'nvl':0},
+        'a6000':{'tf':38.7,'hbm':768,'nvl':0},'rtx4090':{'tf':165.2,'hbm':1008,'nvl':0},
+        'rtx3090':{'tf':71,'hbm':936,'nvl':0},'l40s':{'tf':181,'hbm':864,'nvl':0},
+        'b200':{'tf':1800,'hbm':8000,'nvl':1800},'gh200':{'tf':989.5,'hbm':4800,'nvl':900},
+    }
+    _DESLOC_MATCH = [('GH200','gh200'),('H200','h200'),('B200','b200'),
+        ('H100 SXM','h100_sxm'),('H100 NVL','h100_nvl'),('H100 PCIE','h100_pcie'),('H100','h100_sxm'),
+        ('A100 SXM','a100_sxm'),('A100 PCIE','a100_pcie'),('A100','a100_sxm'),
+        ('RTX A6000','a6000'),('A6000','a6000'),('4090','rtx4090'),('3090','rtx3090'),('L40S','l40s'),('L40','l40s')]
+
+    def _desloc_match_gpu(self, name):
+        u = name.upper()
+        for s, k in self._DESLOC_MATCH:
+            if s in u: return dict(self._DESLOC_GPU_DB[k], key=k)
+        return {'tf': 50, 'hbm': 500, 'nvl': 0, 'key': 'est'}
+
+    def desloc_probe_gpus(self):
+        if hasattr(self, '_dl_cache') and self._dl_cache: return self._dl_cache
+        import torch as _t
+        r = []
+        if not _t.cuda.is_available(): self._dl_cache = r; return r
+        for i in range(_t.cuda.device_count()):
+            p = _t.cuda.get_device_properties(i); db = self._desloc_match_gpu(p.name)
+            r.append({'idx': i, 'name': p.name, 'mem_gb': round(p.total_mem / (1024**3), 2),
+                      'sm': p.multi_processor_count, 'cc': f'{p.major}.{p.minor}',
+                      'tf': db['tf'], 'hbm': db['hbm'], 'nvl': db['nvl'], 'key': db['key']})
+        if r:
+            mx = max(x['tf'] for x in r)
+            for x in r: x['rs'] = round(x['tf'] / max(0.1, mx), 4)
+        self._dl_cache = r; return r
+
+    def desloc_detect_topo(self):
+        if hasattr(self, '_dl_topo') and self._dl_topo: return self._dl_topo
+        import torch as _t; ps = self.desloc_probe_gpus(); n = len(ps)
+        r = {'n': n, 'het': False, 'nvl': [], 'pcie': [], 'grp': [], 'nm': []}
+        if n == 0: self._dl_topo = r; return r
+        nms = set(); mems = []
+        for p in ps: nms.add(p['name']); mems.append(p['mem_gb']); r['nm'].append(p['name'])
+        r['het'] = len(nms) > 1 or (max(mems) / max(.01, min(mems)) > 1.5 if mems else False)
+        for i in range(n):
+            for j in range(i + 1, n):
+                try: c = _t.cuda.can_device_access_peer(i, j)
+                except: c = False
+                (r['nvl'] if c else r['pcie']).append((i, j))
+        par = list(range(n))
+        def _f(x):
+            while par[x] != x: par[x] = par[par[x]]; x = par[x]
+            return x
+        for a, b in r['nvl']:
+            pa, pb = _f(a), _f(b)
+            if pa != pb: par[pa] = pb
+        g = {}
+        for i in range(n): ri = _f(i); g.setdefault(ri, set()).add(i)
+        r['grp'] = [sorted(s) for s in g.values()]
+        self._dl_topo = r; return r
+
+    def desloc_alloc_mb(self, gbs, gas=1):
+        ps = self.desloc_probe_gpus(); n = len(ps)
+        if n == 0: return {}
+        spd = [p['tf'] for p in ps]
+        if max(spd) / max(.01, min(spd)) < 1.3:
+            per = gbs // n; rem = gbs % n
+            return {ps[i]['idx']: per + (1 if i < rem else 0) for i in range(n)}
+        ts = sum(spd); raw = [(s / ts) * gbs for s in spd]
+        al = [max(1, int(round(x))) for x in raw]; d = gbs - sum(al)
+        o = sorted(range(n), key=lambda i: spd[i], reverse=True)
+        for k in range(abs(d)): al[o[k % n]] += 1 if d > 0 else -1; al[o[k % n]] = max(1, al[o[k % n]])
+        return {ps[i]['idx']: al[i] for i in range(n)}
+
+    def desloc_recommend(self, mp, bs=4, sl=512):
+        import math; t = self.desloc_detect_topo(); ps = self.desloc_probe_gpus()
+        if not ps: return {'Kx': 1, 'Ku': 1, 'Kv': 1, 'w': ['no GPU']}
+        w = []
+        if t['het']: w.append(f"hetero: {t['nm']}")
+        mn = min(p['tf'] for p in ps); mx = max(p['tf'] for p in ps); rt = mx / max(.1, mn)
+        if rt > 4: w.append(f"ratio {rt:.1f}x")
+        fl = 6 * mp * sl * bs; cs = fl / max(1, mn * 1e12); pb = mp * 2; n = len(ps)
+        nvl = len(t['nvl']) > 0; bw = 600e9 if (nvl and not t['pcie']) else 32e9
+        if nvl and t['pcie']: w.append("mixed NVL/PCIe")
+        rf = 2.0 * (n - 1) / max(1, n); ar = rf * pb / bw
+        if ar <= cs: kx = 1
+        else: kx = 2 ** int(math.ceil(math.log2(max(1, ar / cs)))); kx = min(kx, 256)
+        return {'Kx': kx, 'Ku': max(1, kx * 3), 'Kv': max(1, kx * 6), 'n': n,
+                'het': t['het'], 'nvl': nvl, 'comp_ms': round(cs * 1e3, 4),
+                'comm_ms': round(ar * 1e3, 4), 'ratio': round(rt, 2), 'w': w}
+
+    def desloc_step_est(self, mp, bs=4, sl=512, Kx=32):
+        import math; ps = self.desloc_probe_gpus(); n = len(ps)
+        if n == 0: return {}
+        pb = mp * 2; rf = 2.0 * (n - 1) / max(1, n); r = {}
+        for p in ps:
+            fl = 6 * mp * sl * bs; cs = fl / max(1, p['tf'] * 1e12)
+            bw = p['nvl'] * 1e9 if p['nvl'] > 0 else 32e9; ar = rf * pb / bw
+            ac = ar / max(1, Kx); os_ = 6 * pb / max(1, p['hbm'] * 1e9)
+            tot = cs + ac + os_; mfu = (fl / max(1e-12, tot)) / max(1, p['tf'] * 1e12)
+            r[p['idx']] = {'comp': round(cs * 1e3, 4), 'comm': round(ar * 1e3, 4),
+                'acm': round(ac * 1e3, 4), 'opt': round(os_ * 1e3, 4),
+                'tot': round(tot * 1e3, 4), 'mfu': round(mfu, 4), 'gpu': p['name']}
+        return r
+
+    def desloc_hw_summary(self):
+        ps = self.desloc_probe_gpus(); t = self.desloc_detect_topo()
+        if not ps: return {'summary': 'No GPU'}
+        tm = sum(p['mem_gb'] for p in ps); tt = sum(p['tf'] for p in ps)
+        gl = ', '.join(f"{p['name']}({p['mem_gb']}GB)" for p in ps)
+        return {'n': len(ps), 'gpus': gl, 'mem': round(tm, 1), 'tf': round(tt, 1),
+                'het': t['het'], 'nvl': len(t['nvl']),
+                'summary': f"{len(ps)} GPUs: {gl} | {tm:.0f}GB | {tt:.0f}TF | {'Het' if t['het'] else 'Hom'}"}
+
+    def desloc_validate(self, mp):
+        ps = self.desloc_probe_gpus(); e, w = [], []
+        if not ps: return {'ok': False, 'e': ['no GPU'], 'w': []}
+        mn = (mp * 12) / 1e9
+        for p in ps:
+            if p['mem_gb'] < mn: e.append(f"GPU{p['idx']}:{p['mem_gb']:.1f}GB<{mn:.1f}GB")
+            if int(p['cc'].split('.')[0]) < 8: e.append(f"GPU{p['idx']}:CC{p['cc']}")
+        if self.desloc_detect_topo()['het']: w.append("hetero")
+        return {'ok': not e, 'e': e, 'w': w}
+
+    def desloc_snap(self, dev=0, step=0, sync=False):
+        import torch as _t
+        s = {'step': step, 'sync': sync, 'dev': dev}
         try:
-            import torch
-            if not torch.cuda.is_available():
-                return []
-            return [{
-                'idx': i,
-                'name': torch.cuda.get_device_properties(i).name,
-                'cc': f'{torch.cuda.get_device_properties(i).major}.{torch.cuda.get_device_properties(i).minor}',
-                'mem_gb': round(torch.cuda.get_device_properties(i).total_mem / 1e9, 2),
-                'sms': torch.cuda.get_device_properties(i).multi_processor_count,
-                'hopper': torch.cuda.get_device_properties(i).major >= 9,
-                'bf16': torch.cuda.get_device_properties(i).major >= 8,
-            } for i in range(torch.cuda.device_count())]
-        except Exception:
-            return []
-
-    @staticmethod
-    def estimate_peak_tflops(info):
-        name = info.get('name', '').upper()
-        if 'H100' in name or 'H200' in name:
-            return 312.0
-        elif 'A100' in name:
-            return 312.0
-        elif 'A6000' in name:
-            return 77.4
-        elif '4090' in name:
-            return 165.2
-        return info.get('sms', 0) * 0.5
-
-    @staticmethod
-    def recommend_Kx(info, model_params, batch_size=4, seq_len=512):
-        import math
-        peak = DeslocGPUCapabilityProbe.estimate_peak_tflops(info)
-        if peak <= 0:
-            return 32
-        flops = 6 * model_params * seq_len * batch_size
-        compute_s = flops / (peak * 1e12)
-        param_bytes = model_params * 2
-        bw = 32e9  # conservative PCIe estimate
-        ar_s = 2 * param_bytes / bw
-        if ar_s <= compute_s:
-            return 1
-        return min(256, 2 ** int(math.ceil(math.log2(ar_s / compute_s))))
-
-    @staticmethod
-    def detect_heterogeneous():
-        devices = DeslocGPUCapabilityProbe.probe_all()
-        if len(devices) <= 1:
-            return {'hetero': False}
-        names = set(d['name'] for d in devices)
-        mems = set(d['mem_gb'] for d in devices)
-        return {
-            'hetero': len(names) > 1 or (max(mems)/min(mems) > 1.5 if mems else False),
-            'gpus': list(names),
-            'mem_range': [min(mems), max(mems)] if mems else [],
-        }
-
-
-class DeslocDeviceMapper:
-    """Map DES-LOC tiers to GPU devices in heterogeneous clusters.
-    Faster GPUs get more frequent sync (lower effective Kx).
-    Slower GPUs get less frequent sync (higher effective Kx).
-    Ref: Nick Joseph — 'some chips have lots of FLOPS but not much memory'"""
-
-    def __init__(self, device_infos):
-        self.devices = device_infos
-        self.device_Kx = {}
-
-    def compute_per_device_Kx(self, base_Kx, model_params):
-        """Compute per-device Kx scaled by relative compute capability."""
-        if not self.devices:
-            return {}
-        peak_tflops = [DeslocGPUCapabilityProbe.estimate_peak_tflops(d) for d in self.devices]
-        max_peak = max(peak_tflops) if peak_tflops else 1
-        for i, d in enumerate(self.devices):
-            ratio = max_peak / max(0.1, peak_tflops[i])
-            self.device_Kx[i] = max(1, int(round(base_Kx * ratio)))
-        return dict(self.device_Kx)
-
-
-class DeslocDeviceMapper:
-    """Map DES-LOC tiers to devices in heterogeneous clusters.
-    Faster GPUs get more frequent sync (lower effective Kx).
-    Ref: Nick Joseph — 'some chips have lots of FLOPS but not much memory'."""
-
-    def __init__(self, device_infos=None):
-        self.devices = device_infos or []
-        self.device_Kx = {}
-
-    def compute_per_device_Kx(self, base_Kx, model_params=0):
-        if not self.devices:
-            return {}
-        peaks = []
-        for d in self.devices:
-            name = d.get('name', '').upper()
-            if 'H100' in name: peaks.append(312)
-            elif 'A100' in name: peaks.append(312)
-            elif 'A6000' in name: peaks.append(77)
-            else: peaks.append(d.get('sms', 50) * 0.5)
-        max_peak = max(peaks) if peaks else 1
-        for i, p in enumerate(peaks):
-            import math
-            ratio = max_peak / max(0.1, p)
-            self.device_Kx[i] = max(1, int(round(base_Kx * ratio)))
-        return dict(self.device_Kx)
-
-
-class DeslocHardwareProfiler:
-    """Comprehensive hardware profiler for DES-LOC config selection.
-    Measures: compute throughput, memory bandwidth, interconnect BW.
-    Recommends optimal Kx, Ku, Kv based on hardware profile.
-
-    Ref: Nick Joseph — 'six or seven bottleneck constraints'."""
-
-    def __init__(self):
-        self.compute_tflops = 0
-        self.memory_bw_gbps = 0
-        self.network_bw_gbps = 0
-        self.device_count = 0
-
-    def probe(self):
-        """Run hardware profiling."""
-        try:
-            import torch
-            if not torch.cuda.is_available():
-                return self
-            self.device_count = torch.cuda.device_count()
-            props = torch.cuda.get_device_properties(0)
-            name = props.name.upper()
-            # Estimate compute
-            if 'H100' in name: self.compute_tflops = 312
-            elif 'A100' in name: self.compute_tflops = 312
-            elif 'A6000' in name: self.compute_tflops = 77
-            else: self.compute_tflops = props.multi_processor_count * 0.5
-            # Estimate memory BW
-            if 'H100' in name: self.memory_bw_gbps = 3350
-            elif 'A100' in name: self.memory_bw_gbps = 2039
-            else: self.memory_bw_gbps = 768
-            # Estimate network BW
-            has_nvlink = any(g in name for g in ('H100', 'A100', 'H200'))
-            self.network_bw_gbps = 600 if has_nvlink else 32
-        except Exception:
-            pass
-        return self
-
-    def recommend_config(self, model_params, batch_size=4, seq_len=512):
-        """Recommend DES-LOC config based on hardware profile."""
-        import math
-        if self.compute_tflops <= 0:
-            return {'Kx': 32, 'Ku': 96, 'Kv': 192}
-        flops = 6 * model_params * seq_len * batch_size
-        compute_s = flops / (self.compute_tflops * 1e12)
-        if self.network_bw_gbps <= 0 or self.device_count <= 1:
-            return {'Kx': 1, 'Ku': 1, 'Kv': 1}
-        ring = 2.0 * (self.device_count - 1) / self.device_count
-        ar_s = ring * model_params * 2 / (self.network_bw_gbps * 1e9)
-        if ar_s <= compute_s:
-            kx = 1
-        else:
-            kx = 2 ** int(math.ceil(math.log2(ar_s / compute_s)))
-            kx = min(kx, 256)
-        return {'Kx': kx, 'Ku': max(1, kx * 3), 'Kv': max(1, kx * 6),
-                'compute_ms': round(compute_s * 1000, 4),
-                'comm_ms': round(ar_s * 1000, 4),
-                'bottleneck': 'comm' if ar_s > compute_s else 'compute'}
-
-    def summary(self):
-        return {
-            'compute_tflops': self.compute_tflops,
-            'memory_bw_gbps': self.memory_bw_gbps,
-            'network_bw_gbps': self.network_bw_gbps,
-            'device_count': self.device_count,
-        }
-
-
-class DeslocNVLinkDetector:
-    """Detect NVLink topology for intra-node DES-LOC optimization.
-    NVLink provides ~600 GB/s — much higher than PCIe ~32 GB/s.
-    With NVLink, intra-node allreduce is nearly free, so DES-LOC
-    primarily benefits inter-node (EFA/InfiniBand) communication.
-
-    Strategy: use Kx=1 for intra-node, Kx>1 for inter-node.
-    Ref: Megatron — separate intra/inter-node parallelism groups."""
-
-    @staticmethod
-    def detect_nvlink():
-        try:
-            import torch
-            if not torch.cuda.is_available():
-                return {'has_nvlink': False}
-            name = torch.cuda.get_device_name(0).upper()
-            has = any(g in name for g in ('H100', 'A100', 'H200', 'GH200'))
-            count = torch.cuda.device_count()
-            return {
-                'has_nvlink': has,
-                'device_count': count,
-                'device_name': name,
-                'estimated_bw_gbps': 600 if has else 32,
-                'intra_node_kx_recommendation': 1 if has else 4,
-            }
-        except Exception:
-            return {'has_nvlink': False}
-
-    @staticmethod
-    def recommend_hierarchical_Kx(intra_bw_gbps, inter_bw_gbps, model_params,
-                                   compute_time_s):
-        """Recommend separate Kx for intra/inter-node communication.
-        Returns dict with intra_Kx and inter_Kx."""
-        import math
-        param_bytes = model_params * 2
-        intra_ar = 2 * param_bytes / (intra_bw_gbps * 1e9) if intra_bw_gbps > 0 else 0
-        inter_ar = 2 * param_bytes / (inter_bw_gbps * 1e9) if inter_bw_gbps > 0 else 0
-        intra_kx = 1 if intra_ar <= compute_time_s else min(16, 2 ** int(math.ceil(math.log2(intra_ar / compute_time_s))))
-        inter_kx = 1 if inter_ar <= compute_time_s else min(256, 2 ** int(math.ceil(math.log2(inter_ar / compute_time_s))))
-        return {'intra_Kx': intra_kx, 'inter_Kx': inter_kx,
-                'intra_ar_ms': round(intra_ar * 1000, 4),
-                'inter_ar_ms': round(inter_ar * 1000, 4)}
-
-
-# =============================================================================
-# M239 (Claude-15): GPU utilization timeline data for Figure 1+2
-# Ref: Nick Joseph — "profiler per-step timing, compare to expectation"
-# Ref: nvidia-smi --query-gpu= for real-time GPU metrics
-# =============================================================================
-
-
-class DeslocGPUTimelineCollector:
-    """Collect per-step GPU utilization for Figure 1 background overlay.
-
-    Overlays GPU utilization timeline on loss curve to show
-    correlation between DES-LOC sync events and GPU activity.
-
-    From Nick Joseph: "we had to write our own distributed profiler
-    to aggregate traces across hundreds of GPUs."
-
-    From nvidia-smi: query gpu_util, mem_util, temperature, power.
-
-    Usage:
-        collector = DeslocGPUTimelineCollector(device_id=0)
-        collector.snapshot(step=100)  # records current GPU state
-        timeline = collector.get_timeline()
-    """
-
-    def __init__(self, device_id=0):
-        self.device_id = device_id
-        self._snapshots = []
-        self._max_snapshots = 10000
-
-    def snapshot(self, step, is_sync=False):
-        """Take GPU utilization snapshot.
-
-        Uses torch.cuda for memory stats. Temperature/power
-        require nvidia-smi (optional, graceful fallback).
-        """
-        import torch
-        snap = {
-            'step': step,
-            'is_sync': is_sync,
-        }
-        try:
-            if torch.cuda.is_available():
-                dev = self.device_id
-                snap['mem_alloc_mb'] = round(
-                    torch.cuda.memory_allocated(dev) / (1024**2), 1)
-                snap['mem_reserved_mb'] = round(
-                    torch.cuda.memory_reserved(dev) / (1024**2), 1)
-                snap['mem_max_mb'] = round(
-                    torch.cuda.max_memory_allocated(dev) / (1024**2), 1)
-                # GPU utilization via NVML if available
-                try:
-                    import pynvml
-                    pynvml.nvmlInit()
-                    handle = pynvml.nvmlDeviceGetHandleByIndex(dev)
-                    util = pynvml.nvmlDeviceGetUtilizationRates(handle)
-                    snap['gpu_util_pct'] = util.gpu
-                    snap['mem_util_pct'] = util.memory
-                    temp = pynvml.nvmlDeviceGetTemperature(
-                        handle, pynvml.NVML_TEMPERATURE_GPU)
-                    snap['temp_c'] = temp
-                    power = pynvml.nvmlDeviceGetPowerUsage(handle)
-                    snap['power_w'] = round(power / 1000, 1)
-                except Exception:
-                    pass  # pynvml not available
-        except Exception:
-            pass
-
-        if len(self._snapshots) < self._max_snapshots:
-            self._snapshots.append(snap)
-
-    def get_timeline(self):
-        """Return timeline data for plotting.
-
-        Returns: list of snapshot dicts.
-        """
-        return list(self._snapshots)
-
-    def get_memory_curve(self):
-        """Extract memory usage curve for Figure annotation.
-
-        Returns: (steps, mem_alloc_mb) lists.
-        """
-        steps = [s['step'] for s in self._snapshots if 'mem_alloc_mb' in s]
-        mems = [s['mem_alloc_mb'] for s in self._snapshots if 'mem_alloc_mb' in s]
-        return steps, mems
-
-    def get_utilization_at_sync(self):
-        """Compare GPU utilization at sync vs non-sync steps.
-
-        Returns: dict with avg_util_sync, avg_util_nosync.
-        DES-LOC should show higher GPU util at non-sync steps
-        (more time spent on compute, less on comm).
-        """
-        sync_utils = [s['gpu_util_pct'] for s in self._snapshots
-                      if s.get('is_sync') and 'gpu_util_pct' in s]
-        nosync_utils = [s['gpu_util_pct'] for s in self._snapshots
-                        if not s.get('is_sync') and 'gpu_util_pct' in s]
-        avg_sync = sum(sync_utils) / max(1, len(sync_utils))
-        avg_nosync = sum(nosync_utils) / max(1, len(nosync_utils))
-        return {
-            'avg_util_sync': round(avg_sync, 1),
-            'avg_util_nosync': round(avg_nosync, 1),
-            'n_sync_samples': len(sync_utils),
-            'n_nosync_samples': len(nosync_utils),
-            'util_improvement_pct': round(avg_nosync - avg_sync, 1),
-        }
-
-    def get_peak_memory_by_config(self):
-        """Get peak memory for hardware requirements section."""
-        if not self._snapshots:
-            return {'peak_mb': 0}
-        peaks = [s.get('mem_max_mb', 0) for s in self._snapshots]
-        return {'peak_mb': max(peaks) if peaks else 0}
-
-    def emit_nkifa_log(self, stream=None):
-        """Write GPU timeline in NKI-FA format."""
-        def _w(line):
-            if stream: stream.write(line + '\n')
-            else: print(line)
-        _w(f'### gpu_timeline device={self.device_id} ###')
-        for s in self._snapshots[-20:]:  # last 20 for summary
-            parts = [f'step: {s["step"]}']
-            if 'mem_alloc_mb' in s:
-                parts.append(f'mem_mb: {s["mem_alloc_mb"]:.1f}')
-            if 'gpu_util_pct' in s:
-                parts.append(f'gpu_util: {s["gpu_util_pct"]}')
-            parts.append(f'sync: {int(s.get("is_sync", False))}')
-            _w(' | '.join(parts))
-        util_data = self.get_utilization_at_sync()
-        _w('--- summary ---')
-        for k, v in sorted(util_data.items()):
-            _w(f'{k}: {v}')
-        _w('--- end summary ---')
-
-    def state_dict(self):
-        return {'snapshots': self._snapshots[-100:]}
-
-    def load_state_dict(self, sd):
-        self._snapshots = sd.get('snapshots', [])
-
-# =====================================================================
-# M255 — Claude-16
-# =====================================================================
-
-import math as _m255_math
-
-class DeslocGPUTopologyProbe:
-    """Probe GPU topology for DES-LOC optimization.
-    Detects: NVLink vs PCIe, mixed GPU types, NUMA affinity."""
-
-    def __init__(self):
-        self._gpus = {}
-        self._nvlink_pairs = set()
-        self._mixed = False
-        self._probed = False
-
-    def probe(self):
-        try:
-            import torch
-            if not torch.cuda.is_available():
-                self._probed = True
-                return
-            n = torch.cuda.device_count()
-            names = set()
-            for i in range(n):
-                p = torch.cuda.get_device_properties(i)
-                self._gpus[i] = {
-                    "name": p.name,
-                    "mem_gb": round(p.total_mem / 1e9, 1),
-                    "sm": p.multi_processor_count,
-                    "cc": f"{p.major}.{p.minor}",
-                }
-                names.add(p.name)
-            self._mixed = len(names) > 1
-            for i in range(n):
-                for j in range(i+1, n):
-                    try:
-                        can = torch.cuda.can_device_access_peer(i, j)
-                        if can:
-                            self._nvlink_pairs.add((i, j))
-                    except Exception:
-                        pass
-            self._probed = True
-        except Exception:
-            self._probed = True
-
-    def is_mixed_gpu(self):
-        if not self._probed:
-            self.probe()
-        return self._mixed
-
-    def has_nvlink(self, gpu_a, gpu_b):
-        if not self._probed:
-            self.probe()
-        pair = tuple(sorted((gpu_a, gpu_b)))
-        return pair in self._nvlink_pairs
-
-    def recommend_kx_per_gpu_pair(self, gpu_a, gpu_b, base_Kx=32):
-        if self.has_nvlink(gpu_a, gpu_b):
-            return base_Kx
-        return base_Kx * 2
-
-    def get_gpu_tflops(self, gpu_id, dtype="bf16"):
-        if not self._probed:
-            self.probe()
-        info = self._gpus.get(gpu_id, {})
-        name = info.get("name", "").lower()
-        if "h100" in name:
-            return 989.5 if "sxm" in name else 835.0
-        if "a100" in name:
-            return 312.0
-        if "a6000" in name:
-            return 38.7
-        return 100.0
-
-    def report(self):
-        if not self._probed:
-            self.probe()
-        return {
-            "n_gpus": len(self._gpus),
-            "mixed": self._mixed,
-            "nvlink_pairs": len(self._nvlink_pairs),
-            "gpus": dict(self._gpus),
-        }
-
-
+            if _t.cuda.is_available():
+                s['mem'] = round(_t.cuda.memory_allocated(dev) / (1024**2), 1)
+                s['max'] = round(_t.cuda.max_memory_allocated(dev) / (1024**2), 1)
+            if pynvml:
+                h = pynvml.nvmlDeviceGetHandleByIndex(dev)
+                u = pynvml.nvmlDeviceGetUtilizationRates(h); s['gpu%'] = u.gpu; s['mem%'] = u.memory
+                s['temp'] = pynvml.nvmlDeviceGetTemperature(h, pynvml.NVML_TEMPERATURE_GPU)
+                s['watt'] = round(pynvml.nvmlDeviceGetPowerUsage(h) / 1000, 1)
+        except: pass
+        return s
+    # --- End M302 ---
