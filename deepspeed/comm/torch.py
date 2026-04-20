@@ -420,96 +420,29 @@ class TorchBackend(Backend):
 # DES-LOC Torch Backend Extensions (Section 4.1)
 # =========================================================================
 
-class DeslocTorchCommTracker:
-    """Track DES-LOC communication volume per tier on torch backend.
-    Ref: Algorithm 1 - independent sync periods for params/momenta."""
-
-    def __init__(self):
-        self._tier_bytes = {0: 0, 1: 0, 2: 0}
-        self._tier_ops = {0: 0, 1: 0, 2: 0}
-
-    def record(self, tier, num_bytes):
-        """Record a communication event."""
-        t = min(tier, 2)
-        self._tier_bytes[t] += num_bytes
-        self._tier_ops[t] += 1
-
-    def total_bytes(self):
-        return sum(self._tier_bytes.values())
-
-    def tier_summary(self):
-        return {f'tier{t}': {'bytes': b, 'ops': self._tier_ops[t]}
-                for t, b in self._tier_bytes.items()}
-
-    def reset(self):
-        self._tier_bytes = {0: 0, 1: 0, 2: 0}
-        self._tier_ops = {0: 0, 1: 0, 2: 0}
 
 
-# =========================================================================
-# M213: DES-LOC TorchBackend Extensions (Algorithm 1 + Section 4.1)
-# Tier-aware AllReduce, NCCL group management, async comm overlap
-# =========================================================================
+# M308: Torch adapter + BW tracker
+class DeslocTorchAdapt:
+    def __init__(self, Kx=1, Ku=3, Kv=6, warmup=512):
+        self.Kx, self.Ku, self.Kv, self.warmup = Kx, Ku, Kv, warmup
+        self._s = 0; self._bs = 0; self._bk = 0
+    def should(self, step, tier=0):
+        if step < self.warmup: return True
+        p = {0: self.Kx, 1: self.Ku, 2: self.Kv}.get(tier, self.Kx)
+        return p <= 1 or step % p == 0
+    def rec_s(self, nb): self._bs += nb
+    def rec_k(self, nb): self._bk += nb
+    def step(self): self._s += 1
+    def stats(self): return {'sent': self._bs, 'skip': self._bk, 'red%': round(100 * self._bk / max(1, self._bs + self._bk), 2)}
+    def state_dict(self): return {'s': self._s, 'bs': self._bs, 'bk': self._bk}
+    def load_state_dict(self, d): self._s = d.get('s', 0); self._bs = d.get('bs', 0); self._bk = d.get('bk', 0)
 
-import math
-import time
-from collections import defaultdict, deque
-
-
-
-# M291 — Claude-19: NCCLStream + AsyncReducer + LatencyModel + Profiler
-class DeslocNCCLStream:
-    __slots__=('stream','pending','on','st')
-    def __init__(s,on=True):s.stream=None;s.pending=[];s.on=on;s.st={'ov':0,'sr':0,'b':0}
-    def init(s):
-        try:
-            import torch
-            if torch.cuda.is_available():s.stream=torch.cuda.Stream()
-        except:pass
-    def ar(s,t,tier='x'):
-        import torch
-        if not s.stream or not s.on:s.st['sr']+=1;s.st['b']+=t.numel()*t.element_size();return None
-        eb,ea=torch.cuda.Event(enable_timing=True),torch.cuda.Event(enable_timing=True);eb.record()
-        with torch.cuda.stream(s.stream):
-            import torch.distributed as dist
-            if dist.is_initialized():dist.all_reduce(t)
-            ea.record()
-        h={'eb':eb,'ea':ea,'tier':tier,'b':t.numel()*t.element_size()};s.pending.append(h);s.st['ov']+=1;s.st['b']+=h['b'];return h
-    def wait(s):
-        for h in s.pending:h['ea'].synchronize()
-        s.pending.clear()
-class DeslocAsyncRed:
-    __slots__=('Kx','sm','gb','rb','st','wu','stats')
-    def __init__(s,Kx,wu=512):s.Kx=max(1,Kx);s.wu=wu;s.sm=DeslocNCCLStream();s.gb={};s.rb={};s.st=0;s.stats={'a':0,'s':0}
-    def init(s):s.sm.init()
-    def acc(s,n,g):s.gb[n]=g.clone()if n not in s.gb else s.gb[n].add_(g)
-    def reduce(s,st):
-        s.st=st
-        if st%s.Kx!=0:return
-        if st<s.wu:
-            import torch.distributed as dist
-            if dist.is_initialized():
-                w=dist.get_world_size()
-                for n,b in s.gb.items():dist.all_reduce(b);b.div_(w);s.rb[n]=b
-            s.gb.clear();s.stats['s']+=1;return
-        for n,b in s.gb.items():s.sm.ar(b);s.rb[n]=b
-        s.gb.clear();s.stats['a']+=1
-    def sync(s):s.sm.wait()
-class DeslocLatModel:
-    __slots__=('a','b','nw','cal','r2')
-    def __init__(s,nw=2):s.nw=nw;s.a=.05;s.b=.04;s.cal=False;s.r2=0.
-    def predict(s,sz,op='ar'):mb=sz/1048576;rf=2.*(s.nw-1)/max(1,s.nw)if op=='ar'else 1.;return s.a+s.b*mb*rf
-    def calibrate(s,ms):
-        if len(ms)<3:return
-        xs=[z/1048576 for z,_ in ms];ys=[t for _,t in ms];n=len(xs);sx,sy=sum(xs),sum(ys);sxy=sum(x*y for x,y in zip(xs,ys));sx2=sum(x*x for x in xs)
-        d=n*sx2-sx*sx
-        if abs(d)<1e-12:return
-        s.b=(n*sxy-sx*sy)/d;s.a=(sy-s.b*sx)/n;my=sy/n;sst=sum((y-my)**2 for y in ys);ssr=sum((y-(s.a+s.b*x))**2 for x,y in zip(xs,ys));s.r2=1.-ssr/(sst+1e-12);s.cal=True
-class DeslocTProf:
-    __slots__=('log','tt','er','mx')
-    def __init__(s,mx=50000):s.log=[];s.mx=mx;s.er=0;s.tt={t:{'b':0,'t':0,'o':0}for t in('x','u','v')}
-    def rec(s,st,t,sz,ms,ok=True):
-        s.log.append((st,t,sz,ms,ok));s.log=s.log[-s.mx//2:]if len(s.log)>s.mx else s.log
-        if ok and t in s.tt:s.tt[t]['b']+=sz;s.tt[t]['t']+=ms;s.tt[t]['o']+=1
-        elif not ok:s.er+=1
-# M291: end
+class DeslocBWTrack:
+    def __init__(self, w=100): self._w = w; self._r = []
+    def record(self, nb, us, step=0):
+        bw = nb / max(1, us) * 1e6 / 1e9; self._r.append({'step': step, 'gbps': round(bw, 4)})
+        if len(self._r) > self._w: self._r.pop(0)
+    def avg(self): return sum(r['gbps'] for r in self._r) / max(1, len(self._r)) if self._r else 0
+    def peak(self): return max((r['gbps'] for r in self._r), default=0)
+# --- End M308 ---
