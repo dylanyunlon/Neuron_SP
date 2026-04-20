@@ -683,3 +683,35 @@ class DeslocCommEventLog:
             if t not in by_tier: by_tier[t]={"count":0,"bytes":0,"ms":0}
             by_tier[t]["count"]+=1; by_tier[t]["bytes"]+=e["bytes"]; by_tier[t]["ms"]+=e["ms"]
         return by_tier
+
+# M298 — Claude-19: FigureDataPipeline
+import json as _j298,os as _o298
+DESLOC_FIGS_V2={'fig1':{'type':'line','x':'step','y':'loss','hue':'method'},'fig2':{'type':'bar','x':'method','y':'comm_bytes','hue':'tier'},'fig3':{'type':'line','x':'Kx','y':'bound','log_x':True},'fig5':{'type':'heatmap','x':'Ku','y':'Kv','z':'loss'},'fig6':{'type':'bar','x':'method','y':'throughput'}}
+class DeslocFigPipeline:
+    __slots__=('raw','agg','specs','warns')
+    def __init__(s):s.raw=[];s.agg={};s.specs=dict(DESLOC_FIGS_V2);s.warns=[]
+    def ingest(s,es):s.raw.extend(es)
+    def aggregate(s):
+        from deepspeed.runtime.utils import DeslocAggregator
+        a=DeslocAggregator();a.add(s.raw);s.agg=a.agg();return s.agg
+    def prepare(s,fn):
+        sp=s.specs.get(fn)
+        if not sp:return None
+        if not s.agg:s.aggregate()
+        pts=[]
+        for k,st in s.agg.items():
+            c=st.get('cfg',{});pts.append({'method':c.get('method',''),'Kx':c.get('Kx',1),'Ku':c.get('Ku',1),'Kv':c.get('Kv',1),'loss':st.get('lm'),'throughput':st.get('tm',0)})
+        return{'spec':sp,'points':pts}
+    def export(s,od):
+        _o298.makedirs(od,exist_ok=True);ex=[]
+        for fn in s.specs:
+            d=s.prepare(fn)
+            if d:fp=_o298.path.join(od,f"{fn}.json");open(fp,'w').write(_j298.dumps(d,indent=2,default=str));ex.append(fp)
+        return ex
+    def validate(s):
+        i=[];
+        if len(s.raw)<10:i.append(f"Only {len(s.raw)} exps")
+        ms=set(e.get('method')for e in s.raw);m={'DDP','LocalAdam','DESLOC'}-ms
+        if m:i.append(f"Missing: {m}")
+        return i
+# M298: end
