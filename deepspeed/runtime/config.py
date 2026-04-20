@@ -1268,3 +1268,66 @@ def desloc_auto_recommend_Kx(gpu="A6000", model="125M", target_pct=5.0):
     tgt = comp_s*target_pct/100
     Kx = max(1, int(math.ceil(comm_s/tgt))) if tgt > 0 else 1
     return {"Kx":Kx,"Ku":Kx*3,"Kv":Kx*6}
+
+
+# M288 — Claude-19: ExperimentConfig + ScalingLaw + HW AutoTuner
+import math as _m288m
+DESLOC_PRESETS_V2={'rq1':{'models':['125M'],'Kx':[1],'b2':[.95,.99,.999,.9999],'steps':2000},'rq2':{'models':['125M','350M'],'Kx':[1,4,8,16,32,64],'steps':5000,'seeds':[42,137,2024]},'rq3':{'models':['125M','350M'],'methods':['DDP','LocalAdam','DESLOC'],'Kx':[32],'steps':10000,'seeds':[42,137,2024]},'rq4':{'models':['125M','350M','1.3B'],'Kx':[32,64],'steps':20000},'rq5':{'models':['125M'],'methods':['DESLOC_avg','DESLOC_nesterov'],'Kx':[8,32],'steps':10000},'rq6':{'models':['125M','350M'],'Kx':[8,32],'steps':10000}}
+class DeslocExpCfg:
+    __slots__=('name','model','Kx','Ku','Kv','b1','b2','lr','rho','warmup','steps','bs','ga','method','outer','nm','seed','ngpu','gpu','tags')
+    def __init__(s,**k):
+        d={'name':'?','model':'125M','Kx':1,'Ku':1,'Kv':1,'b1':.9,'b2':.95,'lr':6e-4,'rho':1.,'warmup':512,'steps':5000,'bs':4,'ga':8,'method':'DESLOC','outer':'average','nm':.9,'seed':42,'ngpu':2,'gpu':'A6000','tags':[]}
+        for a,v in d.items():setattr(s,a,k.get(a,v))
+    def validate(s):
+        e=[];
+        if s.Kx<1:e.append(f"Kx<1");
+        if s.Ku<s.Kx:e.append(f"Ku<Kx");
+        if s.Kv<s.Ku:e.append(f"Kv<Ku");return e
+    def _ps(s):
+        u=s.model.upper()
+        for x,m in[('T',1e12),('B',1e9),('M',1e6),('K',1e3)]:
+            if u.endswith(x):
+                try:return int(float(u[:-1])*m)
+                except:return 0
+        try:return int(u)
+        except:return 0
+    def comm(s):
+        mb=s._ps()*4
+        if s.method=='DDP':return 2*mb
+        if s.method=='LocalAdam':return 2*mb/max(1,s.Kx)*3
+        return 2*mb/max(1,s.Kx)+2*mb/max(1,s.Ku)+2*mb/max(1,s.Kv)
+    def cr_ddp(s):return 2*s._ps()*4/max(1,s.comm())
+def desloc_gen_matrix(preset='rq2',seeds=None):
+    p=DESLOC_PRESETS_V2.get(preset,{});
+    if not p:return[]
+    if seeds is None:seeds=p.get('seeds',[42])
+    cs=[]
+    for mod in p.get('models',['125M']):
+        for kx in p.get('Kx',[1]):
+            for meth in p.get('methods',['DESLOC']):
+                for s in seeds:
+                    c=DeslocExpCfg(name=f"{preset}_{mod}_Kx{kx}_{meth}_s{s}",model=mod,Kx=kx if meth!='DDP'else 1,Ku=max(1,kx*3)if meth!='DDP'else 1,Kv=max(1,kx*6)if meth!='DDP'else 1,method=meth,steps=p.get('steps',5000),seed=s,tags=[preset,mod,meth])
+                    if not c.validate():cs.append(c)
+    return cs
+class DeslocScalingLaw:
+    __slots__=('a','al','li','dl','pts','r2')
+    def __init__(s,a=.076,al=.4,li=1.69,dl=.001):s.a,s.al,s.li,s.dl=a,al,li,dl;s.pts=[];s.r2=0.
+    def predict(s,C,Kx=1):b=s.al*(C**(-s.a))+s.li;return b+s.dl*_m288m.log(Kx)if Kx>1 else b
+    def add(s,C,l,Kx=1):s.pts.append((C,l,Kx))
+    def fit(s):
+        bp=[(c,l)for c,l,k in s.pts if k<=1]
+        if len(bp)<2:bp=[(c,l)for c,l,k in s.pts[:3]]
+        if len(bp)<2:return 0.
+        lc=[_m288m.log(c)for c,_ in bp];ll=[_m288m.log(max(1e-8,l-s.li))for _,l in bp];n=len(lc)
+        sx,sy=sum(lc),sum(ll);sxy=sum(x*y for x,y in zip(lc,ll));sx2=sum(x*x for x in lc)
+        d=n*sx2-sx*sx
+        if abs(d)<1e-12:return 0.
+        sl=(n*sxy-sx*sy)/d;ic=(sy-sl*sx)/n;s.a=-sl;s.al=_m288m.exp(ic)
+        my=sy/n;sst=sum((y-my)**2 for y in ll);ssr=sum((y-(sl*x+ic))**2 for x,y in zip(lc,ll))
+        s.r2=1.-ssr/(sst+1e-12);return s.r2
+HW_P={'H100':{'tf':989.5,'hbm':94,'bw':3.35,'nv':900,'pc':128},'A100':{'tf':312,'hbm':80,'bw':2.,'nv':600,'pc':64},'A6000':{'tf':155,'hbm':48,'bw':.768,'nv':0,'pc':64},'RTX4090':{'tf':330,'hbm':24,'bw':1.,'nv':0,'pc':64}}
+def desloc_auto_tune(gpu='A6000',ng=2,mp=125e6,bs=4,seq=2048):
+    p=HW_P.get(gpu,HW_P['A6000']);mb=mp*4;f=6*mp*bs*seq;ct=f/(p['tf']*1e12)*1000
+    bw=p['nv']*.7 if p.get('nv',0)>0 and ng<=8 else p.get('pc',32)*.6;bm=bw*1e9/8/1000;ar=2*mb/(bm+1e-12)
+    tg=ct*.1/.9;Kx=1 if ar<=tg else max(1,min(256,int(_m288m.ceil(ar/tg))));return{'Kx':Kx,'Ku':max(1,Kx*3),'Kv':max(1,Kx*6),'ct_ms':round(ct,2),'ar_ms':round(ar,2)}
+# M288: end
