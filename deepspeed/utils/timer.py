@@ -671,33 +671,53 @@ def desloc_format_breakdown(bd):
 
 # M299 — Claude-19: PhaseTimer + Roofline + MFU
 import time as _t299
-class DeslocPhaseV2:
-    PH=('compute','comm','idle','data')
-    __slots__=('pt','cur','start','steps','sn','mh')
-    def __init__(s,mh=10000):s.pt={p:0. for p in s.PH};s.cur=None;s.start=0.;s.steps=[];s.sn=0;s.mh=mh
-    def begin(s,p):
-        now=_t299.monotonic()
-        if s.cur:s.pt[s.cur]=s.pt.get(s.cur,0)+now-s.start
-        s.cur=p;s.start=now
-    def end(s):
-        if s.cur:s.pt[s.cur]=s.pt.get(s.cur,0)+_t299.monotonic()-s.start;s.cur=None
-    def end_step(s):
-        s.end();s.sn+=1;s.steps.append({'s':s.sn,'t':sum(s.pt.values())*1000,**{p:t*1000 for p,t in s.pt.items()}})
-        s.steps=s.steps[-s.mh//2:]if len(s.steps)>s.mh else s.steps;s.pt={p:0. for p in s.PH}
-    def bd(s,w=100):
-        r=s.steps[-w:]
-        if not r:return{}
-        d={}
-        for p in s.PH:vs=[x.get(p,0)for x in r];d[p]={'m':sum(vs)/len(vs),'f':sum(vs)/max(1e-6,sum(x.get('t',0)for x in r))}
-        return d
-GPU_DB={'H100':{'tf':989.5,'bw':3.35},'A100':{'tf':312,'bw':2.},'A6000':{'tf':155,'bw':.768},'RTX4090':{'tf':330,'bw':1.}}
-class DeslocRoof:
-    __slots__=('pk','bw','gpu','eff')
-    def __init__(s,gpu='A6000',eff=.5):sp=GPU_DB.get(gpu,GPU_DB['A6000']);s.pk=sp['tf'];s.bw=sp['bw'];s.gpu=gpu;s.eff=eff
-    def mfu(s,N,B,S,t):return 6*N*B*S/t/1e12/s.pk if t>0 else 0.
-class DeslocMFU:
-    __slots__=('rf','hist','st','N','B','S')
-    def __init__(s,gpu='A6000',N=125e6,B=4,S=2048):s.rf=DeslocRoof(gpu);s.hist=[];s.st=0;s.N=N;s.B=B;s.S=S
-    def rec(s,t,c=0):s.st+=1;m=s.rf.mfu(s.N,s.B,s.S,t);s.hist.append({'s':s.st,'m':m,'t':t});s.hist=s.hist[-5000:]if len(s.hist)>10000 else s.hist;return m
-    def avg(s,w=100):r=s.hist[-w:];return sum(e['m']for e in r)/len(r)if r else 0.
-# M299: end
+
+
+# M314: MFU + roofline + progress
+import time as _tm; import math as _tmath
+
+class DeslocSTimer:
+    def __init__(self): self._ss = 0; self._cp = None; self._ps = 0; self._pt = {}; self._st = []; self._w = 100
+    def start_step(self): self._ss = _tm.perf_counter_ns()
+    def end_step(self):
+        e = _tm.perf_counter_ns() - self._ss; self._st.append(e)
+        if len(self._st) > self._w: self._st.pop(0)
+        return e / 1e6
+    def start_ph(self, n): self._cp = n; self._ps = _tm.perf_counter_ns()
+    def end_ph(self):
+        if self._cp is None: return
+        self._pt[self._cp] = self._pt.get(self._cp, 0) + _tm.perf_counter_ns() - self._ps; self._cp = None
+    def avg_ms(self): return sum(self._st) / max(1, len(self._st)) / 1e6 if self._st else 0
+    def breakdown(self):
+        t = sum(self._pt.values())
+        return {p: {'ms': round(n / 1e6, 4), '%': round(100 * n / max(1, t), 2)} for p, n in self._pt.items()} if t > 0 else {}
+    def reset(self): self._pt.clear(); self._st.clear()
+
+def desloc_mfu(ach, peak): return round(ach / max(.01, peak), 4) if peak > 0 else 0
+
+def desloc_roof(flops, bytesacc, peak_tf, peak_bw):
+    if bytesacc <= 0 or peak_bw <= 0: return ('compute', 1.0, 0)
+    ai = flops / bytesacc; ridge = (peak_tf * 1e12) / (peak_bw * 1e9)
+    if ai >= ridge: return ('compute', round(flops / max(1, peak_tf * 1e12), 4), round(ridge, 2))
+    a = ai * peak_bw * 1e9; return ('memory', round(a / max(1, peak_tf * 1e12), 4), round(ridge, 2))
+
+def desloc_h_mfu(profiles, times):
+    pd = {}; ta = 0; tp = 0
+    for p in profiles:
+        idx = p.get('idx', 0); pk = p.get('tf', 50); tp += pk
+        if idx in times:
+            m = times[idx].get('mfu', 0); a = pk * m; ta += a
+            pd[idx] = {'gpu': p.get('name', '?'), 'mfu': round(m, 4), 'ach': round(a, 2)}
+    return {'pd': pd, 'cmfu': round(ta / max(.01, tp), 4), 'ach': round(ta, 2), 'peak': round(tp, 2)}
+
+class DeslocProgress:
+    def __init__(self): self._l = []; self._m = []; self._t = []; self._c = []
+    def record(self, step, loss=None, mfu=None, tps=None, cb=None):
+        if loss is not None: self._l.append((step, loss))
+        if mfu is not None: self._m.append((step, mfu))
+        if tps is not None: self._t.append((step, tps))
+        if cb is not None: self._c.append((step, cb))
+    def summary(self):
+        def _a(l): return sum(x[1] for x in l) / max(1, len(l)) if l else 0
+        return {'loss': round(_a(self._l), 6), 'mfu': round(_a(self._m), 4), 'tps': round(_a(self._t), 1), 'n': max(len(self._l), len(self._m))}
+# --- End M314 ---
