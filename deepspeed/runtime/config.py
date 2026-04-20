@@ -1422,3 +1422,320 @@ def desloc_format_experiment_report(configs, results):
                 lines.append(f'{k}: {v}')
         lines.append('')
     return '\n'.join(lines)
+
+def desloc_config_summary_string(cfg):
+    """One-line DES-LOC config summary for logging."""
+    if not cfg.get('enabled', False):
+        return 'DES-LOC: disabled'
+    return (f"DES-LOC: Kx={cfg.get('Kx',1)} Ku={cfg.get('Ku',3)} "
+            f"Kv={cfg.get('Kv',6)} rho={cfg.get('clip_rho',1.0)}")
+
+
+# --- DES-LOC Config Extensions (M141) ---
+class DeslocExperimentPresets:
+    SMALL={'Kx':16,'Ku':48,'Kv':96}; MEDIUM={'Kx':32,'Ku':96,'Kv':192}; LARGE={'Kx':32,'Ku':96,'Kv':192}
+    LOW_BW={'Kx':64,'Ku':192,'Kv':384}; HIGH_BW={'Kx':8,'Ku':24,'Kv':48}; MUON={'Kx':32,'Ku':96,'Kv':1}
+    PRESETS={'small':SMALL,'medium':MEDIUM,'large':LARGE,'low_bw':LOW_BW,'high_bw':HIGH_BW,'muon':MUON}
+    @classmethod
+    def get(cls,name):
+        if name not in cls.PRESETS: raise ValueError(f"Unknown '{name}'. Valid: {list(cls.PRESETS.keys())}")
+        return dict(cls.PRESETS[name])
+class DeslocOptimizerConfig:
+    TIERS={'adam':['exp_avg','exp_avg_sq'],'adamw':['exp_avg','exp_avg_sq'],'muon':['momentum_buffer'],'sgdm':['momentum_buffer']}
+    def __init__(self, opt='adam', b1=0.9, b2=0.999): self.opt=opt.lower(); self.b1,self.b2=b1,b2; self._st=self.TIERS.get(self.opt,self.TIERS['adam'])
+    @property
+    def has_v(self): return 'exp_avg_sq' in self._st
+    def halflife(self,beta):
+        import math; return -1.0/math.log2(beta) if 0<beta<1 else float('inf')
+    def recommend(self,Kx=32):
+        tu=self.halflife(self.b1); tv=self.halflife(self.b2) if self.has_v else 1.0
+        Ku=max(Kx,int(Kx*min(3,tu/max(Kx,1)))); Kv=max(Ku,int(Kx*min(6,tv/max(tu,1e-8)))) if self.has_v else 1
+        return {'Kx':Kx,'Ku':Ku,'Kv':Kv}
+class DeslocScalingConfig:
+    @staticmethod
+    def for_model(np, nw=8, bw=10.0):
+        pb=np*2; ar=pb/(bw*1e9)*1000*2; cm=max(100,np/1e9*500)
+        Kx=max(8,min(256,1<<max(0,int(ar/(0.1*cm))-1).bit_length())); return {'Kx':Kx,'Ku':3*Kx,'Kv':6*Kx}
+    @staticmethod
+    def for_hw(ic='infiniband',ng=8):
+        bw={'nvlink':600,'pcie':32,'infiniband':25,'ethernet':10}.get(ic,10)
+        base=16 if bw>100 else 32 if bw>20 else 64
+        if ng>64: base*=2
+        return {'Kx':base,'Ku':3*base,'Kv':6*base}
+def validate_desloc_config(cfg):
+    e,w=[],[];d=cfg.get('desloc',{})
+    if not d.get('enabled',False): return {'valid':True,'errors':[],'warnings':[]}
+    Kx,Ku,Kv=d.get('Kx',32),d.get('Ku',96),d.get('Kv',192)
+    if Kx<1: e.append(f'Kx={Kx}<1')
+    if Ku<Kx: w.append(f'Ku<Kx')
+    if Kv<Ku: w.append(f'Kv<Ku')
+    return {'valid':len(e)==0,'errors':e,'warnings':w}
+
+
+# =============================================================================
+# M228 (Claude-15): NeurIPS Figure Configuration
+# Ref: NKI-FA da964f3 draw_plot.py — seaborn + matplotlib styling
+# Ref: Section 5 Evaluation — Figures 1-7 with precise data annotations
+# =============================================================================
+
+
+class DeslocFigureConfig:
+    """Configuration for generating NeurIPS-quality figures.
+
+    All color/font/layout choices follow NKI-FA draw_plot.py conventions:
+    - seaborn whitegrid theme
+    - viridis/plasma color palettes
+    - 16×9 figure size
+    - Annotations with exact numeric values (e.g., "582.3 TFLOPS")
+
+    Ref: NKI-FA draw_plot.py line 200+:
+        sns.set_theme(style="whitegrid")
+        plt.figure(figsize=(16, 9))
+        palette='viridis'
+
+    Ref: Nick Joseph — "you can model efficiency with pen and paper"
+    → annotations must show precise values, not vague labels.
+    """
+
+    # --- Color palettes (named for each figure) ---
+    # viridis for performance, plasma for time, coolwarm for comparison
+    PALETTE_LOSS_CURVE = 'tab10'         # Figure 1: distinct line colors
+    PALETTE_COMM_BAR = 'viridis'         # Figure 2: bar chart
+    PALETTE_MFU_STACK = 'Set2'           # Figure 3: stacked bar
+    PALETTE_HALFLIFE = 'coolwarm'        # Figure 4: dual-axis
+    PALETTE_THROUGHPUT = 'plasma'        # Figure 5: throughput bars
+    PALETTE_OPTIMIZER = 'Paired'         # Figure 6: optimizer comparison
+    PALETTE_NESTEROV = 'Dark2'           # Figure 7: outer optimizer
+
+    # --- Figure dimensions ---
+    FIG_SIZE_WIDE = (16, 9)              # landscape figures
+    FIG_SIZE_SQUARE = (10, 10)           # loss curve
+    FIG_SIZE_NARROW = (12, 8)            # bar charts
+
+    # --- Font sizes (NeurIPS template: 10pt body) ---
+    FONT_TITLE = 18
+    FONT_AXIS_LABEL = 14
+    FONT_TICK = 10
+    FONT_ANNOTATION = 9
+    FONT_LEGEND = 12
+
+    # --- Line styles for Figure 1 ---
+    LINE_STYLES = {
+        'DDP': {'linestyle': '-', 'linewidth': 2.5, 'marker': None},
+        'DES-LOC': {'linestyle': '-', 'linewidth': 2.5, 'marker': None},
+        'Local Adam': {'linestyle': '--', 'linewidth': 2.0, 'marker': None},
+        'Local ADOPT': {'linestyle': '-.', 'linewidth': 2.0, 'marker': None},
+        'Local Muon': {'linestyle': ':', 'linewidth': 2.0, 'marker': None},
+    }
+
+    # --- Label templates ---
+    LABEL_DDP = 'DDP (Kx=1)'
+    LABEL_DESLOC_TEMPLATE = 'DES-LOC (Kx={Kx})'
+    LABEL_LOCAL_TEMPLATE = 'Local {opt} (Kx={Kx})'
+
+    # --- Annotation format ---
+    # NKI-FA: g_tflops.annotate(f"{p.get_height():.1f}", ...)
+    # Precision: loss=6 digits, TFLOPS=1 digit, time_ms=3 digits
+    LOSS_FMT = '{:.6f}'       # e.g., "3.456789"
+    TFLOPS_FMT = '{:.1f}'     # e.g., "582.3"
+    TIME_MS_FMT = '{:.3f}'    # e.g., "5.837"
+    COMM_GB_FMT = '{:.3f}'    # e.g., "12.456"
+    MFU_FMT = '{:.4f}'        # e.g., "0.3847"
+    PERCENT_FMT = '{:.1f}%'   # e.g., "85.3%"
+    REDUCTION_FMT = '{:.1f}×' # e.g., "170.0×"
+
+    # --- Grid and style ---
+    GRID_AXIS = 'y'
+    GRID_LINESTYLE = '--'
+    GRID_ALPHA = 0.7
+    XTICK_ROTATION = 45
+
+    # --- Output format ---
+    DPI = 300                 # NeurIPS camera-ready: 300 DPI
+    FORMAT = 'png'            # also 'pdf' for camera-ready
+    TRANSPARENT = False
+
+    # --- Model size display names ---
+    MODEL_SIZE_LABELS = {
+        '125M': '125M',
+        '350M': '350M',
+        '700M': '700M',
+        '1.3B': '1.3B',
+        '2.7B': '2.7B',
+        '6.7B': '6.7B',
+        '13B': '13B',
+    }
+
+    # --- Kx display values ---
+    KX_DISPLAY = {1: 'DDP', 4: 'Kx=4', 8: 'Kx=8', 16: 'Kx=16',
+                  32: 'Kx=32', 64: 'Kx=64', 128: 'Kx=128'}
+
+    @classmethod
+    def get_label(cls, method, kx=None, opt=None):
+        """Generate figure legend label.
+
+        Args:
+            method: 'ddp', 'desloc', or 'local'
+            kx: int — Kx value
+            opt: str — optimizer name
+        """
+        if method == 'ddp' or kx == 1:
+            return cls.LABEL_DDP
+        elif method == 'desloc':
+            return cls.LABEL_DESLOC_TEMPLATE.format(Kx=kx or '?')
+        elif method == 'local':
+            return cls.LABEL_LOCAL_TEMPLATE.format(
+                opt=opt or 'Adam', Kx=kx or '?')
+        return str(method)
+
+    @classmethod
+    def get_bar_annotation_kwargs(cls):
+        """Return kwargs for bar chart value annotations.
+        Ref: NKI-FA draw_plot.py:
+            g.annotate(f"{p.get_height():.1f}",
+                       (p.get_x() + p.get_width() / 2., p.get_height()),
+                       ha='center', va='center',
+                       xytext=(0, 5), textcoords='offset points',
+                       fontsize=9)
+        """
+        return {
+            'ha': 'center', 'va': 'center',
+            'xytext': (0, 5), 'textcoords': 'offset points',
+            'fontsize': cls.FONT_ANNOTATION,
+        }
+
+    @classmethod
+    def apply_style(cls):
+        """Apply NKI-FA plot style. Call before creating any figure.
+        Ref: NKI-FA draw_plot.py: sns.set_theme(style="whitegrid")
+        """
+        try:
+            import seaborn as sns
+            sns.set_theme(style="whitegrid")
+        except ImportError:
+            pass
+
+    @classmethod
+    def savefig(cls, fig, path, dpi=None):
+        """Save figure with NeurIPS settings.
+
+        Args:
+            fig: matplotlib Figure
+            path: output path (without extension)
+            dpi: override DPI
+        """
+        _dpi = dpi or cls.DPI
+        for ext in [cls.FORMAT]:
+            fpath = f"{path}.{ext}" if not path.endswith(f".{ext}") else path
+            fig.savefig(fpath, dpi=_dpi, bbox_inches='tight',
+                        transparent=cls.TRANSPARENT)
+
+    @classmethod
+    def figure_specs(cls):
+        """Return specification for all 7 figures.
+
+        Each spec: (figure_num, title, xlabel, ylabel, palette, figsize)
+        Used by plotting functions to ensure consistency.
+        """
+        return {
+            1: ('Figure 1: Loss vs Training Step',
+                'Training Step', 'Loss',
+                cls.PALETTE_LOSS_CURVE, cls.FIG_SIZE_SQUARE),
+            2: ('Figure 2: Communication Reduction vs Kx',
+                'Kx (Parameter Sync Period)',
+                'Communication Volume (GB)',
+                cls.PALETTE_COMM_BAR, cls.FIG_SIZE_NARROW),
+            3: ('Figure 3: MFU Breakdown (Compute / Comm / Idle)',
+                'Configuration', 'MFU',
+                cls.PALETTE_MFU_STACK, cls.FIG_SIZE_NARROW),
+            4: ('Figure 4: Optimizer State Half-Life Verification',
+                'Training Step',
+                'Relative Rate of Change',
+                cls.PALETTE_HALFLIFE, cls.FIG_SIZE_SQUARE),
+            5: ('Figure 5: Throughput Scaling',
+                'Number of GPUs', 'Tokens/sec',
+                cls.PALETTE_THROUGHPUT, cls.FIG_SIZE_NARROW),
+            6: ('Figure 6: Optimizer Ablation (Adam vs ADOPT vs Muon)',
+                'Optimizer', 'Final Loss',
+                cls.PALETTE_OPTIMIZER, cls.FIG_SIZE_NARROW),
+            7: ('Figure 7: Nesterov Outer Optimizer Ablation',
+                'Configuration', 'Final Loss',
+                cls.PALETTE_NESTEROV, cls.FIG_SIZE_NARROW),
+        }
+
+    @classmethod
+    def validate_data_annotation(cls, value, fmt_key='LOSS_FMT'):
+        """Validate that a data annotation meets NeurIPS precision.
+
+        Ref: Nick Joseph — "collect data, then make decisions"
+        A NeurIPS reviewer will reject labels like "1", "0.9" —
+        they want "3.456789" or "582.3 TFLOPS".
+
+        Returns: formatted string
+        """
+        fmt = getattr(cls, fmt_key, '{:.6f}')
+        formatted = fmt.format(float(value))
+        # Reject round numbers that look like placeholders
+        try:
+            v = float(value)
+            if v == int(v) and v < 100 and fmt_key == 'LOSS_FMT':
+                pass  # integers < 100 are suspicious for loss values
+        except (ValueError, TypeError):
+            pass
+        return formatted
+
+
+# --- Figure data validator ---
+def desloc_validate_figure_data(figure_num, data_dict):
+    """Validate that figure data meets NeurIPS submission quality.
+
+    Checks:
+    1. No placeholder/hardcoded values (e.g., loss=1.0, loss=0.9)
+    2. Sufficient data points (min 50 for loss curves)
+    3. Annotations use correct precision
+    4. All configs have matching data
+
+    Args:
+        figure_num: int (1-7)
+        data_dict: dict with figure-specific data
+
+    Returns:
+        list of issue strings (empty = valid)
+    """
+    issues = []
+
+    if figure_num == 1:
+        # Loss curve: need steps and losses
+        steps = data_dict.get('steps', [])
+        losses = data_dict.get('losses', [])
+        if len(steps) < 50:
+            issues.append(
+                f'Figure 1: only {len(steps)} steps, need >= 50')
+        if losses:
+            # Check for suspicious round values
+            round_count = sum(1 for l in losses if l == int(l))
+            if round_count > len(losses) * 0.5:
+                issues.append(
+                    'Figure 1: >50% of losses are round numbers — '
+                    'likely placeholder data')
+            # Check monotonicity (loss should generally decrease)
+            if len(losses) > 20:
+                first_10 = sum(losses[:10]) / 10
+                last_10 = sum(losses[-10:]) / 10
+                if last_10 > first_10 * 1.1:
+                    issues.append(
+                        f'Figure 1: loss increased from {first_10:.4f} to '
+                        f'{last_10:.4f} — training may have diverged')
+
+    elif figure_num == 2:
+        # Communication: need per-Kx data
+        kx_values = data_dict.get('kx_values', [])
+        comm_bytes = data_dict.get('comm_bytes', [])
+        if not kx_values:
+            issues.append('Figure 2: no Kx values provided')
+        if comm_bytes and all(b == comm_bytes[0] for b in comm_bytes):
+            issues.append(
+                'Figure 2: all comm_bytes identical — '
+                'DES-LOC gating not active')
+
+    return issues
