@@ -271,3 +271,58 @@ def desloc_config_from_env():
 
 import math as _m252_math
 
+
+# M301 — Claude-19: validate + env + migration + cost + recommend
+import os as _o301,math as _m301
+def desloc_validate_v2(cfg):
+    e,w=[],[];d=cfg.get('desloc',cfg)
+    if not isinstance(d,dict):return False,['not dict'],[]
+    if not d.get('enabled',True):return True,[],['disabled']
+    Kx=int(d.get('Kx',1));Ku=d.get('Ku');Kv=d.get('Kv')
+    if Kx<1:e.append(f"Kx<1:{Kx}")
+    if Kx>4096:w.append(f"Kx={Kx} huge")
+    if Ku is None:Ku=Kx*3;w.append(f"Ku->{Ku}")
+    else:Ku=int(Ku)
+    if Kv is None:Kv=Kx*6;w.append(f"Kv->{Kv}")
+    else:Kv=int(Kv)
+    if Ku<Kx:w.append(f"Ku<Kx")
+    if Kv<Ku:w.append(f"Kv<Ku")
+    rho=float(d.get('clip_rho',1.))
+    if rho<=0:e.append("rho<=0")
+    outer=d.get('outer_optimizer','average')
+    if outer not in('average','nesterov'):e.append(f"bad outer:{outer}")
+    if outer=='nesterov':
+        m=float(d.get('nesterov_momentum',.9))
+        if not(0<m<1):e.append(f"mom OOB:{m}")
+    return len(e)==0,e,w
+def desloc_from_env():
+    if not _o301.environ.get('DESLOC_ENABLED'):return None
+    return{'enabled':_o301.environ.get('DESLOC_ENABLED','0')=='1','Kx':int(_o301.environ.get('DESLOC_KX','32')),'Ku':int(_o301.environ.get('DESLOC_KU','96')),'Kv':int(_o301.environ.get('DESLOC_KV','192')),'clip_rho':float(_o301.environ.get('DESLOC_CLIP_RHO','1.')),'warmup_steps':int(_o301.environ.get('DESLOC_WARMUP','512')),'outer_optimizer':_o301.environ.get('DESLOC_OUTER','average')}
+def desloc_to_env(cfg):
+    d=cfg.get('desloc',cfg);env={'DESLOC_ENABLED':'1'if d.get('enabled',True)else'0','DESLOC_KX':str(d.get('Kx',32)),'DESLOC_KU':str(d.get('Ku',96)),'DESLOC_KV':str(d.get('Kv',192)),'DESLOC_CLIP_RHO':str(d.get('clip_rho',1.)),'DESLOC_WARMUP':str(d.get('warmup_steps',512)),'DESLOC_OUTER':str(d.get('outer_optimizer','average'))}
+    for k,v in env.items():_o301.environ[k]=v
+    return env
+def desloc_migrate(old):
+    if'desloc'in old and isinstance(old['desloc'],dict):return old
+    m=dict(old);dl={};rm=[]
+    pm={'desloc_Kx':'Kx','desloc_Ku':'Ku','desloc_Kv':'Kv','desloc_clip_rho':'clip_rho','desloc_warmup':'warmup_steps','desloc_warmup_steps':'warmup_steps','desloc_outer':'outer_optimizer','desloc_outer_optimizer':'outer_optimizer','desloc_nesterov_momentum':'nesterov_momentum','desloc_enabled':'enabled'}
+    for ok,nk in pm.items():
+        if ok in m:dl[nk]=m[ok];rm.append(ok)
+    for k in rm:del m[k]
+    if dl:dl.setdefault('enabled',True);m['desloc']=dl
+    return m
+def desloc_cost(steps,Kx,ngpu=2,cost_hr=1.,step_s=.5):
+    dh=steps*step_s/3600;dlh=steps*step_s*.85/3600;dc=dh*ngpu*cost_hr;dlc=dlh*ngpu*cost_hr
+    return{'ddp_h':round(dh,2),'dl_h':round(dlh,2),'save_pct':round((1-dlc/max(.01,dc))*100,1)}
+def desloc_psi(Kx,Ku,b):px,pu=1./max(1,Kx),1./max(1,Ku);n=4*(1-px)*(1-b)*(1-pu);d=px*px*6*(1-(1-pu)*b);return n/d if abs(d)>1e-15 else float('inf')
+def desloc_recommend(gpu,ng,ms,ic='PCIe'):
+    mp=125e6;s=ms.upper()
+    for x,m in[('T',1e12),('B',1e9),('M',1e6)]:
+        if s.endswith(x):
+            try:mp=float(s[:-1])*m
+            except:pass;break
+    bw={'NVLink':300,'PCIe':32,'InfiniBand':50,'EFA':100,'RoCE':25}.get(ic,25)
+    mb=mp*4;bs=bw*1e9/8;ar=2*mb/(bs+1e-12);ct=6*mp*4*2048/(155e12+1e-12)
+    Kx=1 if ar<.1*ct else max(1,min(256,int(_m301.ceil(ar/(.1*ct)))))
+    return Kx,max(1,Kx*3),max(1,Kx*6)
+# M301: end
