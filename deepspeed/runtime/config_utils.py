@@ -213,209 +213,50 @@ def dict_raise_error_on_duplicate_keys(ordered_pairs):
 
 
 # ═══════════════════════════════════════════════════════════════
-# DES-LOC Configuration Validation & Utilities (M192)
-# ═══════════════════════════════════════════════════════════════
-import warnings as _m192_warnings
-import math as _m192_math
+
+# =========================================================================
+# DES-LOC Configuration Utilities (Algorithm 1)
+# =========================================================================
+
+def desloc_validate_config(cfg):
+    """Validate DES-LOC configuration dict.
+    Ref: Algorithm 1 constraints + Theorem 1 step size restriction."""
+    errors = []
+    Kx = cfg.get('Kx', 1)
+    Ku = cfg.get('Ku', 3)
+    Kv = cfg.get('Kv', 6)
+    if Kx < 1:
+        errors.append(f'Kx must be >= 1, got {Kx}')
+    if Ku < 1:
+        errors.append(f'Ku must be >= 1, got {Ku}')
+    if Kv < Ku:
+        errors.append(f'Kv ({Kv}) should be >= Ku ({Ku}), per half-life ordering')
+    clip = cfg.get('clip_radius', 1.0)
+    if clip <= 0:
+        errors.append(f'clip_radius must be > 0, got {clip}')
+    outer = cfg.get('outer_optimizer', 'averaging')
+    if outer not in ('averaging', 'nesterov'):
+        errors.append(f'outer_optimizer must be averaging or nesterov, got {outer}')
+    return errors
 
 
-def validate_desloc_config(desloc_dict):
-    """Validate DES-LOC sub-dictionary from ds_config.
-
-    Performs comprehensive validation:
-    1. Half-life ordering: Kx >= 1, Ku >= Kx, Kv >= Ku
-    2. Clip radius sanity: rho > 0
-    3. Outer optimizer compatibility
-    4. Muon compatibility (Kv ignored when muon_compat=True)
-    5. Nesterov momentum bounds
-    6. Warmup steps non-negative
-
-    Returns validated dict with defaults filled in.
-
-    Knuth critique (user perspective):
-    - If Kx > total_steps, DES-LOC never syncs → divergence risk
-    - If clip_radius too small, gradient signal destroyed
-    - If nesterov_momentum >= 1.0, Nesterov diverges
-
-    Knuth critique (system perspective):
-    - muon_compat + Kv != Ku wastes config space
-    - probabilistic sync with small Kx adds variance without saving comm
-    """
-    if not isinstance(desloc_dict, dict):
-        return desloc_dict
-
-    # Fill defaults
-    d = dict(desloc_dict)
-    d.setdefault('enabled', False)
-    d.setdefault('Kx', 32)
-    d.setdefault('Ku', 96)
-    d.setdefault('Kv', 192)
-    d.setdefault('clip_radius', 1.0)
-    d.setdefault('outer_optimizer', 'averaging')
-    d.setdefault('nesterov_momentum', 0.9)
-    d.setdefault('nesterov_lr', 1.0)
-    d.setdefault('muon_compat', False)
-    d.setdefault('warmup_sync_steps', 0)
-    d.setdefault('comm_logging', False)
-    d.setdefault('probabilistic_sync', False)
-
-    if not d['enabled']:
-        return d
-
-    kx, ku, kv = d['Kx'], d['Ku'], d['Kv']
-
-    # 1. Basic bounds
-    assert kx >= 1, f"DES-LOC Kx must be >= 1, got {kx}"
-    assert ku >= 1, f"DES-LOC Ku must be >= 1, got {ku}"
-    assert kv >= 1, f"DES-LOC Kv must be >= 1, got {kv}"
-
-    # 2. Half-life ordering
-    if ku < kx:
-        _m192_warnings.warn(
-            f"DES-LOC: Ku ({ku}) < Kx ({kx}). "
-            f"Paper recommends Ku >= Kx (first moment decays faster).",
-            UserWarning)
-    if kv < ku:
-        _m192_warnings.warn(
-            f"DES-LOC: Kv ({kv}) < Ku ({ku}). "
-            f"Paper recommends Kv >= Ku (second moment is most stable).",
-            UserWarning)
-
-    # 3. Clip radius
-    assert d['clip_radius'] > 0,         f"DES-LOC: clip_radius must be > 0, got {d['clip_radius']}"
-
-    # 4. Outer optimizer
-    outer = d['outer_optimizer']
-    assert outer in ('averaging', 'nesterov'),         f"DES-LOC: outer_optimizer must be 'averaging' or 'nesterov', got '{outer}'"
-
-    # 5. Nesterov bounds
-    if outer == 'nesterov':
-        mom = d['nesterov_momentum']
-        assert 0.0 < mom < 1.0,             f"DES-LOC: nesterov_momentum must be in (0, 1), got {mom}"
-        olr = d['nesterov_lr']
-        assert olr > 0,             f"DES-LOC: nesterov_lr must be > 0, got {olr}"
-
-    # 6. Muon compatibility
-    if d['muon_compat']:
-        if kv != ku:
-            _m192_warnings.warn(
-                f"DES-LOC muon_compat=True: Kv ({kv}) is ignored for Muon "
-                f"(single-momentum optimizer). Setting Kv=Ku={ku}.",
-                UserWarning)
-            d['Kv'] = ku
-
-    # 7. Warmup steps
-    assert d['warmup_sync_steps'] >= 0,         f"DES-LOC: warmup_sync_steps must be >= 0, got {d['warmup_sync_steps']}"
-
-    return d
-
-
-def compute_desloc_comm_estimate(param_bytes, total_steps, Kx=32, Ku=96, Kv=192,
-                                  world_size=1, bandwidth_gbps=25.0):
-    """Estimate DES-LOC communication cost and compare with DDP.
-
-    Returns dict with:
-    - ddp_total_bytes: what DDP would communicate
-    - desloc_total_bytes: what DES-LOC communicates
-    - reduction_factor: ddp / desloc
-    - estimated_time_saved_sec: wallclock savings estimate
-
-    This is a planning tool — actual savings depend on overlap.
-    """
-    # DDP: allreduce all params every step (3 states: grad, exp_avg, exp_avg_sq)
-    bytes_per_allreduce = param_bytes * 2 * (world_size - 1) / max(world_size, 1)
-    ddp_total = bytes_per_allreduce * 3 * total_steps
-
-    # DES-LOC: allreduce at different rates
-    x_syncs = total_steps // max(Kx, 1)
-    u_syncs = total_steps // max(Ku, 1)
-    v_syncs = total_steps // max(Kv, 1)
-    desloc_total = bytes_per_allreduce * (x_syncs + u_syncs + v_syncs)
-
-    bandwidth_bps = bandwidth_gbps * 1e9 / 8
-    ddp_time = ddp_total / max(bandwidth_bps, 1)
-    desloc_time = desloc_total / max(bandwidth_bps, 1)
-
-    return {
-        'ddp_total_bytes': int(ddp_total),
-        'desloc_total_bytes': int(desloc_total),
-        'reduction_factor': round(ddp_total / max(desloc_total, 1), 2),
-        'x_syncs': x_syncs,
-        'u_syncs': u_syncs,
-        'v_syncs': v_syncs,
-        'ddp_time_sec': round(ddp_time, 2),
-        'desloc_time_sec': round(desloc_time, 2),
-        'time_saved_sec': round(ddp_time - desloc_time, 2),
-    }
-
-
-def format_desloc_config_summary(config_dict):
-    """Format DES-LOC configuration as human-readable summary."""
-    if not isinstance(config_dict, dict) or not config_dict.get('enabled'):
-        return "DES-LOC: disabled"
-
-    lines = ["DES-LOC Configuration:"]
-    lines.append(f"  Sync periods: Kx={config_dict.get('Kx', '?')}, "
-                 f"Ku={config_dict.get('Ku', '?')}, "
-                 f"Kv={config_dict.get('Kv', '?')}")
-    lines.append(f"  Clip radius (rho): {config_dict.get('clip_radius', 1.0)}")
-    lines.append(f"  Outer optimizer: {config_dict.get('outer_optimizer', 'averaging')}")
-    if config_dict.get('outer_optimizer') == 'nesterov':
-        lines.append(f"  Nesterov momentum: {config_dict.get('nesterov_momentum', 0.9)}")
-        lines.append(f"  Nesterov lr: {config_dict.get('nesterov_lr', 1.0)}")
-    if config_dict.get('muon_compat'):
-        lines.append("  Muon compatibility: enabled (Kv=Ku)")
-    if config_dict.get('warmup_sync_steps', 0) > 0:
-        lines.append(f"  Warmup sync steps: {config_dict['warmup_sync_steps']}")
-
-    # Half-life info
-    beta1, beta2 = 0.9, 0.999  # defaults
-    h1 = -1.0 / _m192_math.log2(beta1) if 0 < beta1 < 1 else float('inf')
-    h2 = -1.0 / _m192_math.log2(beta2) if 0 < beta2 < 1 else float('inf')
-    lines.append(f"  Half-life ratio (h_v/h_u): {h2/max(h1, 1e-6):.0f}x "
-                 f"(h_u={h1:.0f}, h_v={h2:.0f} steps)")
-
-    return "\n".join(lines)
-
-
-def desloc_config_to_env_vars(config_dict):
-    """Convert DES-LOC config dict to environment variable dict.
-
-    For use with launcher (runner.py, launch.py) to propagate
-    DES-LOC settings to worker processes.
-    """
-    if not isinstance(config_dict, dict):
-        return {}
-    env = {}
-    if config_dict.get('enabled'):
-        env['DESLOC_ENABLED'] = '1'
-        env['DESLOC_KX'] = str(config_dict.get('Kx', 32))
-        env['DESLOC_KU'] = str(config_dict.get('Ku', 96))
-        env['DESLOC_KV'] = str(config_dict.get('Kv', 192))
-        env['DESLOC_CLIP_RADIUS'] = str(config_dict.get('clip_radius', 1.0))
-        env['DESLOC_OUTER_OPT'] = config_dict.get('outer_optimizer', 'averaging')
-        if config_dict.get('muon_compat'):
-            env['DESLOC_MUON_COMPAT'] = '1'
-    return env
+def desloc_config_to_env_vars(cfg):
+    """Export DES-LOC config as environment variables for shell scripts."""
+    import os
+    os.environ['DESLOC_ENABLED'] = str(cfg.get('enabled', False))
+    os.environ['DESLOC_KX'] = str(cfg.get('Kx', 32))
+    os.environ['DESLOC_KU'] = str(cfg.get('Ku', 96))
+    os.environ['DESLOC_KV'] = str(cfg.get('Kv', 192))
+    os.environ['DESLOC_CLIP_RHO'] = str(cfg.get('clip_radius', 1.0))
 
 
 def desloc_config_from_env():
-    """Read DES-LOC config from environment variables.
-
-    Inverse of desloc_config_to_env_vars().
-    """
+    """Read DES-LOC config from environment variables."""
     import os
-    if os.environ.get('DESLOC_ENABLED', '').lower() not in ('1', 'true'):
-        return {'enabled': False}
     return {
-        'enabled': True,
-        'Kx': int(os.environ.get('DESLOC_KX', 32)),
-        'Ku': int(os.environ.get('DESLOC_KU', 96)),
-        'Kv': int(os.environ.get('DESLOC_KV', 192)),
-        'clip_radius': float(os.environ.get('DESLOC_CLIP_RADIUS', 1.0)),
-        'outer_optimizer': os.environ.get('DESLOC_OUTER_OPT', 'averaging'),
-        'muon_compat': os.environ.get('DESLOC_MUON_COMPAT', '') == '1',
+        'enabled': os.environ.get('DESLOC_ENABLED', 'False').lower() == 'true',
+        'Kx': int(os.environ.get('DESLOC_KX', '32')),
+        'Ku': int(os.environ.get('DESLOC_KU', '96')),
+        'Kv': int(os.environ.get('DESLOC_KV', '192')),
+        'clip_radius': float(os.environ.get('DESLOC_CLIP_RHO', '1.0')),
     }
-
-
-# End M192
