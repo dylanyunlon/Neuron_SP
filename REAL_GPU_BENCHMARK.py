@@ -1457,3 +1457,6 @@ def desloc_generate_all_figures(log_dir, output_dir='./figures'):
     plotter.plot_figure2(sweep)
 
     print(f"All figures saved to {output_dir}")
+
+
+# =============================================================================
