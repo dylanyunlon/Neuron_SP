@@ -3250,3 +3250,29 @@ class DeslocZeroSyncManager:
         self.partition_sync_step = sd.get('sync', self.partition_sync_step)
 
 
+
+# M296 — Claude-19: ZeRO BucketGating + PartitionSync
+class DeslocBktGate:
+    __slots__=('Kx','red','skp','ovf','st','tiers')
+    def __init__(s,Kx):s.Kx=max(1,Kx);s.red=s.skp=0;s.ovf=False;s.st=0;s.tiers={}
+    def should(s,st):return s.Kx<=1 or st%s.Kx==0
+    def acc(s,g):
+        import torch;s.ovf=s.ovf or torch.isnan(g).any().item()or torch.isinf(g).any().item()
+    def reduce(s,st,bkts):
+        if not s.should(st):s.skp+=len(bkts);return False
+        s.red+=len(bkts);s.ovf=False;return True
+    def ratio(s):t=s.red+s.skp;return t/max(1,s.red)if t>0 else 1.
+class DeslocPartSync:
+    __slots__=('Kx','Ku','Kv','ws','rk','pm','ss','st')
+    def __init__(s,Kx,Ku,Kv,ws=1,rk=0):s.Kx=max(1,Kx);s.Ku=max(1,Ku);s.Kv=max(1,Kv);s.ws=ws;s.rk=rk;s.pm={};s.ss={t+'s':0 for t in'xuv'};s.st=0
+    def build(s,gs):
+        ps=[p for g in gs for p in g['params']if p.requires_grad];tot=sum(p.numel()for p in ps);pp=tot//max(1,s.ws);c=n=0
+        for p in ps:s.pm[id(p)]=c;n+=p.numel()
+        if n>=pp and c<s.ws-1:c+=1;n=0
+    def sync(s,st):
+        s.st=st;r={t:False for t in'xuv'}
+        if st%s.Kx==0:r['x']=True;s.ss['xs']+=1
+        if st%s.Ku==0:r['u']=True;s.ss['us']+=1
+        if st%s.Kv==0:r['v']=True;s.ss['vs']+=1
+        return r
+# M296: end
