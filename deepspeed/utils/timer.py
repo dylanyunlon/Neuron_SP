@@ -635,3 +635,206 @@ def desloc_mfu(actual_tflops, peak_tflops):
     if peak_tflops <= 0:
         return 0.0
     return actual_tflops / peak_tflops
+
+# Hardware presets for common GPU configurations
+DESLOC_HW_PRESETS = {
+    'H100_NVL': DeslocRooflineModel(312, 3350, 600),
+    'H100_PCIe': DeslocRooflineModel(312, 3350, 32),
+    'A100_80GB': DeslocRooflineModel(312, 2039, 600),
+    'A6000': DeslocRooflineModel(77.4, 768, 32),
+    'Trainium2': DeslocRooflineModel(380, 3200, 100),
+}
+
+
+# =============================================================================
+# M232 (Claude-15): Training Time vs Comm Time Separator for Figure 2
+# Ref: Section 5.3 — throughput speedup = f(compute_time, comm_time)
+# Ref: Nick Joseph — "model with pen-and-paper, verify with profiler"
+# Ref: NKI-FA draw_plot.py — Time (ms) bar chart
+# =============================================================================
+
+
+class DeslocTimeBreakdown:
+    """Track compute vs communication time for Figure 2 and Figure 3.
+
+    From Nick Joseph: "efficiency = compute_time / (compute + comm + idle)"
+    This class separates wall-clock time into three phases and computes
+    the speedup that DES-LOC's reduced communication provides.
+
+    From NKI-FA: time displayed as "5.837ms" with 3-decimal precision.
+
+    Lifecycle:
+        tb = DeslocTimeBreakdown()
+        for step in training:
+            tb.begin_compute()
+            ... forward + backward ...
+            tb.end_compute()
+            tb.begin_comm()
+            ... allreduce ...
+            tb.end_comm(was_skipped=not is_sync)
+            tb.end_step()
+        speedup = tb.compute_speedup_vs_ddp()
+    """
+
+    def __init__(self):
+        import time as _time_mod
+        self._time = _time_mod
+        self._step = 0
+        # Per-step accumulators (nanosecond precision)
+        self._compute_start = 0
+        self._comm_start = 0
+        self._step_start = 0
+        # Running totals (seconds)
+        self._total_compute_s = 0.0
+        self._total_comm_s = 0.0
+        self._total_idle_s = 0.0
+        self._total_wall_s = 0.0
+        self._total_skipped_comm_s = 0.0  # time saved by skipping
+        # Per-step history for plotting
+        self._history = []  # [(step, compute_ms, comm_ms, idle_ms)]
+        self._max_history = 10000
+
+    def begin_step(self):
+        """Mark start of training step."""
+        self._step_start = self._time.monotonic()
+
+    def begin_compute(self):
+        """Mark start of forward+backward compute phase."""
+        self._compute_start = self._time.monotonic()
+
+    def end_compute(self):
+        """Mark end of compute phase. Returns elapsed seconds."""
+        elapsed = self._time.monotonic() - self._compute_start
+        self._total_compute_s += elapsed
+        return elapsed
+
+    def begin_comm(self):
+        """Mark start of communication phase."""
+        self._comm_start = self._time.monotonic()
+
+    def end_comm(self, was_skipped=False):
+        """Mark end of communication phase.
+
+        Args:
+            was_skipped: True if DES-LOC skipped this AllReduce.
+                If skipped, the time is counted as "saved" not "idle".
+        """
+        elapsed = self._time.monotonic() - self._comm_start
+        if was_skipped:
+            self._total_skipped_comm_s += elapsed
+            # DES-LOC converts comm time to useful compute overlap
+        else:
+            self._total_comm_s += elapsed
+        return elapsed
+
+    def end_step(self):
+        """Mark end of step. Compute idle time as residual."""
+        wall = self._time.monotonic() - self._step_start
+        self._total_wall_s += wall
+        # Idle = wall - compute - comm - skipped_comm
+        idle = max(0, wall - self._total_compute_s -
+                   self._total_comm_s - self._total_skipped_comm_s)
+        # Record per-step if within budget
+        if len(self._history) < self._max_history:
+            # We only record the step-level delta, not running totals
+            compute_ms = (self._total_compute_s * 1000
+                          if self._step == 0 else 0)  # placeholder
+            self._history.append(
+                (self._step, wall * 1000, 0, 0))
+        self._step += 1
+
+    def get_breakdown(self):
+        """Get time breakdown as dict.
+
+        Returns:
+            dict with total_s and percentage for compute/comm/idle
+        """
+        total = max(1e-9, self._total_wall_s)
+        compute_pct = 100.0 * self._total_compute_s / total
+        comm_pct = 100.0 * self._total_comm_s / total
+        saved_pct = 100.0 * self._total_skipped_comm_s / total
+        idle_pct = max(0, 100.0 - compute_pct - comm_pct - saved_pct)
+        return {
+            'total_wall_s': round(self._total_wall_s, 3),
+            'compute_s': round(self._total_compute_s, 3),
+            'comm_s': round(self._total_comm_s, 3),
+            'skipped_comm_s': round(self._total_skipped_comm_s, 3),
+            'idle_s': round(max(0, self._total_wall_s -
+                               self._total_compute_s -
+                               self._total_comm_s), 3),
+            'compute_pct': round(compute_pct, 1),
+            'comm_pct': round(comm_pct, 1),
+            'saved_pct': round(saved_pct, 1),
+            'idle_pct': round(idle_pct, 1),
+            'total_steps': self._step,
+        }
+
+    def compute_speedup_vs_ddp(self):
+        """Compute DES-LOC wall-clock speedup over DDP.
+
+        DDP time = compute + comm (full AllReduce every step)
+        DES-LOC time = compute + reduced_comm
+        Speedup = DDP_time / DES-LOC_time
+
+        Ref: Section 5.4 — ≈2× training speedup over DDP.
+        """
+        if self._total_wall_s <= 0:
+            return 1.0
+        ddp_wall = self._total_compute_s + self._total_comm_s + self._total_skipped_comm_s
+        desloc_wall = self._total_compute_s + self._total_comm_s
+        if desloc_wall <= 0:
+            return 1.0
+        return ddp_wall / desloc_wall
+
+    def compute_mfu_improvement(self, peak_tflops, model_flops_per_step):
+        """Compute MFU with and without DES-LOC.
+
+        MFU = actual_flops / peak_flops
+        actual_flops = model_flops * steps / wall_time
+
+        Ref: Nick Joseph — "MFU gap = HBM bandwidth + comm + CPU overhead"
+        """
+        if self._total_wall_s <= 0 or self._step <= 0:
+            return {'mfu_desloc': 0, 'mfu_ddp_est': 0}
+        actual_tflops = (model_flops_per_step * self._step /
+                         self._total_wall_s / 1e12)
+        mfu_desloc = actual_tflops / peak_tflops if peak_tflops > 0 else 0
+        # Estimate DDP MFU (slower due to more comm)
+        ddp_wall = self._total_wall_s + self._total_skipped_comm_s
+        ddp_tflops = (model_flops_per_step * self._step /
+                      ddp_wall / 1e12) if ddp_wall > 0 else 0
+        mfu_ddp = ddp_tflops / peak_tflops if peak_tflops > 0 else 0
+        return {
+            'mfu_desloc': round(mfu_desloc, 4),
+            'mfu_ddp_est': round(mfu_ddp, 4),
+            'speedup': round(self.compute_speedup_vs_ddp(), 2),
+        }
+
+    def emit_nkifa_log(self, stream=None):
+        """Write time breakdown in NKI-FA format."""
+        def _w(line):
+            if stream:
+                stream.write(line + '\n')
+            else:
+                print(line)
+        bd = self.get_breakdown()
+        _w('### time_breakdown ###')
+        for k, v in sorted(bd.items()):
+            _w(f'{k}: {v}')
+        _w(f'speedup_vs_ddp: {self.compute_speedup_vs_ddp():.2f}')
+
+    def state_dict(self):
+        return {
+            'step': self._step,
+            'compute_s': self._total_compute_s,
+            'comm_s': self._total_comm_s,
+            'skipped_s': self._total_skipped_comm_s,
+            'wall_s': self._total_wall_s,
+        }
+
+    def load_state_dict(self, sd):
+        self._step = sd.get('step', 0)
+        self._total_compute_s = sd.get('compute_s', 0)
+        self._total_comm_s = sd.get('comm_s', 0)
+        self._total_skipped_comm_s = sd.get('skipped_s', 0)
+        self._total_wall_s = sd.get('wall_s', 0)
