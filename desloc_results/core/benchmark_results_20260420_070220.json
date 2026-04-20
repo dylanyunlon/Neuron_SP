@@ -1,0 +1,22 @@
+{
+  "timestamp": "20260420_070220",
+  "config": {
+    "model_size": "125M",
+    "batch_size": 4,
+    "gradient_accumulation": 8,
+    "max_steps": 500,
+    "Kx": 1,
+    "Ku": 1,
+    "Kv": 1
+  },
+  "results": {
+    "DDP": {
+      "final_loss": 10.837939739227295,
+      "avg_loss": 10.837592756748199,
+      "total_time_seconds": 299.15520119667053,
+      "tokens_per_second": 54767.55855977525,
+      "peak_memory_gb": 9.816805888,
+      "sync_counts": {}
+    }
+  }
+}

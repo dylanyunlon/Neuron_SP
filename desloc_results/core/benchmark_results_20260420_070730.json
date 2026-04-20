@@ -1,0 +1,26 @@
+{
+  "timestamp": "20260420_070730",
+  "config": {
+    "model_size": "125M",
+    "batch_size": 4,
+    "gradient_accumulation": 8,
+    "max_steps": 500,
+    "Kx": 32,
+    "Ku": 96,
+    "Kv": 192
+  },
+  "results": {
+    "DESLOC": {
+      "final_loss": 10.836642026901245,
+      "avg_loss": 10.837038726806641,
+      "total_time_seconds": 299.7281413078308,
+      "tokens_per_second": 109325.73717309437,
+      "peak_memory_gb": 9.816805888,
+      "sync_counts": {
+        "x": 15,
+        "u": 5,
+        "v": 2
+      }
+    }
+  }
+}

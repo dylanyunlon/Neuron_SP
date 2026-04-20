@@ -1,0 +1,3 @@
+run_id,tag,model,Kx,Ku,Kv,seed,method,exit_code,elapsed_s
+1,rq2_sweep,125M,1,1,1,42,DESLOC,0,307
+2,rq2_sweep,125M,1,1,1,137,DESLOC,0,309
