@@ -51,77 +51,46 @@ class Backend(object):
 # DES-LOC Backend Mixin (Algorithm 1 communication tier awareness)
 # =========================================================================
 
-class DeslocBackendMixin:
-    """Mixin adding DES-LOC tier awareness to any comm backend.
-    Ref: Section 4.1 - Ring-AllReduce with independent sync periods."""
-
-    def init_desloc(self, Kx=1, Ku=3, Kv=6):
-        self._desloc_Kx = Kx
-        self._desloc_Ku = Ku
-        self._desloc_Kv = Kv
-        self._desloc_step = 0
-        self._desloc_bytes_sent = 0
-        self._desloc_bytes_skipped = 0
-
-    def desloc_should_comm(self, tier):
-        """Check if communication should happen for given tier at current step."""
-        period = {0: self._desloc_Kx, 1: self._desloc_Ku,
-                  2: self._desloc_Kv}.get(tier, 1)
-        if period <= 1:
-            return True
-        return self._desloc_step % period == 0
-
-    def desloc_advance(self):
-        self._desloc_step += 1
-
-    def desloc_stats(self):
-        return {
-            'step': self._desloc_step,
-            'bytes_sent': self._desloc_bytes_sent,
-            'bytes_skipped': self._desloc_bytes_skipped,
-        }
 
 
-# =========================================================================
-# M212: DES-LOC Communication Scheduler (Algorithm 1, lines 9-21)
-# =========================================================================
-
-import math
-import time
-from collections import defaultdict, deque
-
-
-
-# M292 — Claude-19: HealthMon + FaultTolerantReducer
+# M307: Health + NaN + watchdog
 class DeslocHealthMon:
-    __slots__=('gh','fl','cf','mcf','ns','st','lc')
-    def __init__(s,ci=100,mcf=5):s.gh={};s.fl=[];s.cf=0;s.mcf=mcf;s.ns=[];s.st=s.lc=0
-    def ok(s,st,g=0,ms=0,b=0):s.st=st;s.cf=0;s.gh.setdefault(g,{'ok':0,'fail':0,'t':0,'b':0})['ok']+=1;h=s.gh[g];h['t']+=ms;h['b']+=b
-    def fail(s,st,g=0,et='',em=''):s.st=st;s.cf+=1;s.gh.setdefault(g,{'ok':0,'fail':0,'t':0,'b':0})['fail']+=1;s.fl.append({'st':st,'g':g,'et':et});s.fl=s.fl[-500:]if len(s.fl)>1000 else s.fl
-    def nan(s,st,n=''):s.ns.append((st,n));s.ns=s.ns[-500:]if len(s.ns)>1000 else s.ns
-    def check(s,st):
-        r={'status':'healthy','issues':[]}
-        if s.cf>=s.mcf:r['status']='failed';r['issues'].append(f"{s.cf} consecutive failures")
-        for g,h in s.gh.items():
-            t=h['ok']+h['fail']
-            if t>10 and h['fail']/t>.1:r['status']='degraded';r['issues'].append(f"GPU{g}: {h['fail']}/{t} fail")
-        rn=[x for x,_ in s.ns if x>st-100]
-        if len(rn)>5:r['status']='critical';r['issues'].append(f"{len(rn)} NaN")
-        return r
-class DeslocFTReducer:
-    __slots__=('mr','bt','tm','sb','sk','hm','st')
-    def __init__(s,mr=3,bt=5000,tm=2.,sb=3):s.mr=mr;s.bt=bt;s.tm=tm;s.sb=sb;s.sk=0;s.hm=DeslocHealthMon();s.st={'t':0,'ok':0,'rt':0,'sk':0,'f':0}
-    def reduce(s,t,st,g=0):
-        import time;s.st['t']+=1
-        for a in range(s.mr+1):
-            try:
-                import torch.distributed as dist
-                if not dist.is_initialized():return True
-                t0=time.monotonic();dist.all_reduce(t);w=dist.get_world_size();t.div_(w)
-                s.hm.ok(st,g,(time.monotonic()-t0)*1000,t.numel()*t.element_size());s.st['ok']+=1;s.sk=0;return True
-            except RuntimeError as e:
-                s.hm.fail(st,g,'RT',str(e))
-                if a<s.mr:time.sleep(s.bt*(s.tm**a)/1000);s.st['rt']+=1
-        if s.sk<s.sb:s.sk+=1;s.st['sk']+=1;return False
-        s.st['f']+=1;return False
-# M292: end
+    def __init__(self, w=100): self._w = w; self._l = []; self._nan = 0; self._ops = 0; self._ok = True
+    def record(self, lat_us, nan=False):
+        self._ops += 1; self._l.append(lat_us)
+        if len(self._l) > self._w: self._l.pop(0)
+        if nan: self._nan += 1
+        if self._ops > 10: self._ok = self._nan / self._ops < 0.05
+    def avg(self): return sum(self._l) / max(1, len(self._l)) if self._l else 0
+    def p99(self):
+        if not self._l: return 0
+        s = sorted(self._l); return s[min(int(len(s) * 0.99), len(s) - 1)]
+    def ok(self): return self._ok
+    def stats(self): return {'ok': self._ok, 'ops': self._ops, 'nan': self._nan, 'avg': round(self.avg(), 2), 'p99': round(self.p99(), 2)}
+
+class DeslocNaNDet:
+    def __init__(self, freq=1): self._f = freq; self._s = 0; self._ev = []
+    def check(self, t, lbl='?'):
+        self._s += 1
+        if self._s % self._f != 0: return True
+        try:
+            if bool(t.isnan().any()) or bool(t.isinf().any()): self._ev.append({'s': self._s, 'l': lbl}); return False
+        except: pass
+        return True
+    def events(self): return list(self._ev)
+
+class DeslocWatchdog:
+    def __init__(self, base=300): self._b = base; self._t = []; self._on = False; self._ns = 0
+    def start(self): import time; self._on = True; self._ns = time.perf_counter_ns()
+    def stop(self):
+        import time
+        if not self._on: return 0
+        e = (time.perf_counter_ns() - self._ns) / 1e9; self._on = False
+        self._t.append(e)
+        if len(self._t) > 50: self._t.pop(0)
+        return e
+    def timeout(self): return max(self._b, sum(self._t) / max(1, len(self._t)) * 10) if len(self._t) >= 5 else self._b
+    def expired(self):
+        import time
+        return self._on and (time.perf_counter_ns() - self._ns) / 1e9 > self.timeout()
+# --- End M307 ---
