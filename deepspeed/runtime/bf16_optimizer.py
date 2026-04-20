@@ -686,3 +686,42 @@ def _get_padded_tensor(src_tensor, size):
 # =============================================================================
 
 
+
+# M295 — Claude-19: BF16TierSync + FP32MasterMgr
+class DeslocBF16Tier:
+    __slots__=('Kx','Ku','Kv','bf16v','fri','sn','frn','pe','st')
+    def __init__(s,Kx,Ku,Kv,bf16v=True,fri=10):s.Kx=max(1,Kx);s.Ku=max(1,Ku);s.Kv=max(1,Kv);s.bf16v=bf16v;s.fri=fri;s.sn={'x':0,'u':0,'v':0};s.frn=0;s.pe=[];s.st=0
+    def sync(s,st,t):return st%s.Kx==0 if t=='x'else st%s.Ku==0 if t=='u'else st%s.Kv==0
+    def cdt(s,t,st):return'fp32'if t!='v'or not s.bf16v else('fp32'if(st//max(1,s.Kv))%s.fri==0 else'bf16')
+    def sync_m(s,ps,st):
+        if not s.sync(st,'x'):return
+        s.sn['x']+=1
+        import torch.distributed as d
+        if not d.is_initialized():return
+        w=d.get_world_size()
+        for p in ps:
+            if p.requires_grad:d.all_reduce(p.data);p.data.div_(w)
+    def sync_v(s,bs,st):
+        if not s.sync(st,'v'):return
+        s.sn['v']+=1;dt=s.cdt('v',st)
+        import torch,torch.distributed as d
+        if not d.is_initialized():return
+        w=d.get_world_size()
+        for b in bs:
+            if dt=='bf16':bf=b.bfloat16();d.all_reduce(bf);b.copy_(bf.float().div_(w))
+            else:d.all_reduce(b);b.div_(w);s.frn+=1
+    def savings(s):vs=s.sn.get('v',0);return(vs-s.frn)/vs*50 if vs>0 else 0.
+class DeslocFP32Mgr:
+    __slots__=('ms','bfs','ce','st')
+    def __init__(s):s.ms=[];s.bfs=[];s.ce=[];s.st=0
+    def init(s,model):
+        import torch;s.ms=[];s.bfs=[]
+        for p in model.parameters():
+            if p.requires_grad:s.ms.append(p.data.float().clone());s.bfs.append(p)
+    def sync_kx(s,ws):
+        import torch.distributed as d
+        if not d.is_initialized():return
+        te=0.
+        for m,b in zip(s.ms,s.bfs):d.all_reduce(m);m.div_(ws);import torch;e=(m-m.bfloat16().float()).abs().max().item();te=max(te,e);b.data.copy_(m.bfloat16())
+        s.ce.append((s.st,te));s.ce=s.ce[-500:]if len(s.ce)>1000 else s.ce
+# M295: end
