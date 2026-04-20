@@ -1546,3 +1546,378 @@ def desloc_validate_precision(value, min_sig=4):
         return True
     s = f'{value:.10g}'.lstrip('-').replace('.', '').lstrip('0')
     return len(s.rstrip('0')) >= min_sig
+
+    s = f'{value:.10g}'.lstrip('-0').replace('.', '')
+    sig = len(s.rstrip('0'))
+    if sig < min_sig_digits:
+        return False
+    return True
+
+
+# =============================================================================
+# M229 (Claude-15): Figure 2 Communication Reduction Computation
+# Ref: Section 5.3 RQ3 — DES-LOC halves comm vs Local Adam
+# Ref: NKI-FA da964f3 — data from logs, not hardcoded
+# Ref: Megatron-LM megatron/core/distributed — comm volume tracking
+# Ref: NCCL src/include/profiler — byte-level event tracking
+# =============================================================================
+
+
+class DeslocCommReductionCalculator:
+    """Compute DES-LOC communication reduction ratios for Figure 2.
+
+    From Section 5.3: DES-LOC reduces communication 2× vs Local Adam
+    and 170× vs DDP by assigning Ku=3Kx, Kv=6Kx.
+
+    From NCCL profiler pattern: track bytes per collective op,
+    aggregate by tier (param/momentum/variance), compare to baseline.
+
+    The calculator accepts raw comm events from engine.py's
+    desloc_record_comm() and computes Figure 2 data.
+
+    Lifecycle:
+        calc = DeslocCommReductionCalculator(Kx=32, Ku=96, Kv=192)
+        # During training:
+        calc.record_allreduce(step=100, num_params=125_000_000, tier='x')
+        calc.record_allreduce(step=100, num_params=125_000_000, tier='u')
+        # After training:
+        fig2_data = calc.compute_figure2_data()
+    """
+
+    def __init__(self, Kx=1, Ku=3, Kv=6, num_params=0, dtype_bytes=2,
+                 num_workers=1):
+        """Initialize calculator.
+
+        Args:
+            Kx: parameter sync period
+            Ku: first momentum sync period
+            Kv: second momentum sync period
+            num_params: model parameter count
+            dtype_bytes: bytes per parameter element (BF16=2, FP32=4)
+            num_workers: number of data-parallel workers
+        """
+        self.Kx = max(1, Kx)
+        self.Ku = max(1, Ku)
+        self.Kv = max(1, Kv)
+        self.num_params = num_params
+        self.dtype_bytes = dtype_bytes
+        self.num_workers = max(1, num_workers)
+        # Per-tier accumulators
+        self._tier_bytes = {'x': 0, 'u': 0, 'v': 0}
+        self._tier_ops = {'x': 0, 'u': 0, 'v': 0}
+        self._tier_steps = {'x': [], 'u': [], 'v': []}
+        self._total_steps = 0
+        self._events = []  # raw event log
+
+    def record_allreduce(self, step, num_elements=None, tier='x',
+                         dtype_bytes=None):
+        """Record a single AllReduce event.
+
+        Args:
+            step: training step number
+            num_elements: number of elements reduced (default: num_params)
+            tier: 'x' (param), 'u' (momentum), 'v' (variance)
+            dtype_bytes: override per-element bytes
+        """
+        if tier not in self._tier_bytes:
+            tier = 'x'
+        n = num_elements if num_elements is not None else self.num_params
+        db = dtype_bytes if dtype_bytes is not None else self.dtype_bytes
+        nbytes = n * db
+        self._tier_bytes[tier] += nbytes
+        self._tier_ops[tier] += 1
+        self._tier_steps[tier].append(step)
+        self._total_steps = max(self._total_steps, step + 1)
+        self._events.append({
+            'step': step, 'tier': tier, 'bytes': nbytes, 'elements': n
+        })
+
+    def record_step(self, step, is_sync_x=False, is_sync_u=False,
+                    is_sync_v=False):
+        """Record sync decisions for a step (alternative to record_allreduce).
+
+        Automatically computes bytes from num_params.
+        """
+        self._total_steps = max(self._total_steps, step + 1)
+        if is_sync_x:
+            self.record_allreduce(step, tier='x')
+        if is_sync_u:
+            self.record_allreduce(step, tier='u')
+        if is_sync_v:
+            self.record_allreduce(step, tier='v')
+
+    def _ddp_baseline_bytes(self):
+        """Compute DDP baseline: AllReduce every step, all params.
+
+        DDP syncs gradients (1 AllReduce per step).
+        Bytes = num_params * dtype_bytes * total_steps
+        Ref: Section 5.3 — DDP as upper bound.
+        """
+        per_step = self.num_params * self.dtype_bytes
+        return per_step * self._total_steps
+
+    def _local_adam_baseline_bytes(self):
+        """Compute Local Adam baseline: sync all 3 states at Kx.
+
+        Local Adam syncs params + m1 + m2 every Kx steps.
+        Bytes = 3 * num_params * dtype * (total_steps / Kx)
+        Ref: Section 5.3 — Local Adam as middle baseline.
+        """
+        per_sync = 3 * self.num_params * self.dtype_bytes
+        num_syncs = max(1, self._total_steps // self.Kx)
+        return per_sync * num_syncs
+
+    def _desloc_actual_bytes(self):
+        """Total bytes actually communicated by DES-LOC."""
+        return sum(self._tier_bytes.values())
+
+    def compute_reduction_vs_ddp(self):
+        """Compute DES-LOC / DDP communication ratio.
+
+        Returns: float — how many times less DES-LOC communicates.
+        E.g., 170.0 means DES-LOC uses 170× less comm than DDP.
+        """
+        ddp = self._ddp_baseline_bytes()
+        desloc = self._desloc_actual_bytes()
+        if desloc <= 0:
+            return float('inf') if ddp > 0 else 1.0
+        return ddp / desloc
+
+    def compute_reduction_vs_local_adam(self):
+        """Compute DES-LOC / Local Adam communication ratio.
+
+        Returns: float — DES-LOC advantage over Local Adam.
+        Ref: Section 5.3 — DES-LOC halves comm vs Local Adam.
+        """
+        la = self._local_adam_baseline_bytes()
+        desloc = self._desloc_actual_bytes()
+        if desloc <= 0:
+            return float('inf') if la > 0 else 1.0
+        return la / desloc
+
+    def compute_theoretical_reduction(self):
+        """Compute theoretical comm reduction from Kx/Ku/Kv.
+
+        DDP: 1 AllReduce/step (params only)
+        DES-LOC: 1/Kx + 1/Ku + 1/Kv AllReduces/step (across 3 tiers)
+        Theoretical ratio = 1 / (1/Kx + 1/Ku + 1/Kv) × 3
+        (× 3 because DDP only syncs params, DES-LOC can sync 3 things
+         but less frequently)
+
+        Actually vs DDP (params only):
+            ratio = Kx  (only param tier matters for DDP comparison)
+        Vs Local Adam (all 3 tiers at same Kx):
+            ratio = 3 / (1 + Kx/Ku + Kx/Kv)
+        """
+        # vs DDP
+        ddp_ratio = float(self.Kx)
+        # vs Local Adam
+        if self.Ku > 0 and self.Kv > 0:
+            la_ratio = 3.0 / (1.0 + float(self.Kx) / self.Ku +
+                              float(self.Kx) / self.Kv)
+        else:
+            la_ratio = 1.0
+        return {'vs_ddp': ddp_ratio, 'vs_local_adam': la_ratio}
+
+    def compute_per_tier_breakdown(self):
+        """Break down communication by tier.
+
+        Returns: dict with per-tier stats.
+        Format matches NKI-FA bar chart data structure.
+        """
+        total = self._desloc_actual_bytes()
+        result = {}
+        for tier in ['x', 'u', 'v']:
+            tb = self._tier_bytes[tier]
+            to = self._tier_ops[tier]
+            tier_name = {'x': 'Parameters', 'u': 'Momentum (m1)',
+                         'v': 'Variance (m2)'}[tier]
+            result[tier] = {
+                'name': tier_name,
+                'bytes': tb,
+                'gb': tb / (1024**3),
+                'ops': to,
+                'fraction': tb / total if total > 0 else 0.0,
+                'avg_bytes_per_op': tb / to if to > 0 else 0,
+            }
+        return result
+
+    def compute_figure2_data(self):
+        """Generate complete Figure 2 data structure.
+
+        Returns dict ready for NKI-FA style plotting:
+        {
+            'kx': 32,
+            'methods': {
+                'DDP': {'total_gb': ..., 'label': 'DDP'},
+                'Local Adam': {'total_gb': ..., 'label': 'Local Adam (Kx=32)'},
+                'DES-LOC': {'total_gb': ..., 'label': 'DES-LOC (Kx=32, Ku=96, Kv=192)',
+                            'per_tier': {...}},
+            },
+            'reduction_vs_ddp': 170.0,
+            'reduction_vs_local_adam': 2.0,
+            'annotation': '170.0×'  # for bar chart label
+        }
+
+        Ref: NKI-FA draw_plot.py — each bar gets exact value annotation.
+        """
+        ddp_bytes = self._ddp_baseline_bytes()
+        la_bytes = self._local_adam_baseline_bytes()
+        dl_bytes = self._desloc_actual_bytes()
+        tier_data = self.compute_per_tier_breakdown()
+        r_ddp = self.compute_reduction_vs_ddp()
+        r_la = self.compute_reduction_vs_local_adam()
+        theoretical = self.compute_theoretical_reduction()
+
+        return {
+            'Kx': self.Kx,
+            'Ku': self.Ku,
+            'Kv': self.Kv,
+            'total_steps': self._total_steps,
+            'num_params': self.num_params,
+            'methods': {
+                'DDP': {
+                    'total_bytes': ddp_bytes,
+                    'total_gb': ddp_bytes / (1024**3),
+                    'label': 'DDP (AllReduce every step)',
+                },
+                'Local Adam': {
+                    'total_bytes': la_bytes,
+                    'total_gb': la_bytes / (1024**3),
+                    'label': f'Local Adam (Kx={self.Kx})',
+                },
+                'DES-LOC': {
+                    'total_bytes': dl_bytes,
+                    'total_gb': dl_bytes / (1024**3),
+                    'label': (f'DES-LOC (Kx={self.Kx}, '
+                              f'Ku={self.Ku}, Kv={self.Kv})'),
+                    'per_tier': tier_data,
+                },
+            },
+            'reduction_vs_ddp': round(r_ddp, 1),
+            'reduction_vs_local_adam': round(r_la, 1),
+            'theoretical_vs_ddp': round(theoretical['vs_ddp'], 1),
+            'theoretical_vs_local_adam': round(theoretical['vs_local_adam'], 1),
+            'annotation_ddp': f'{r_ddp:.1f}×',
+            'annotation_la': f'{r_la:.1f}×',
+        }
+
+    def emit_nkifa_log(self, stream=None):
+        """Write Figure 2 data in NKI-FA log format.
+
+        Format:
+            ### Kx = 32, Ku = 96, Kv = 192 ###
+            ddp_total_gb: 12.456
+            local_adam_total_gb: 6.228
+            desloc_total_gb: 3.114
+            ...
+
+        Args:
+            stream: file-like object (default: stdout via print)
+        """
+        def _w(line):
+            if stream:
+                stream.write(line + '\n')
+            else:
+                print(line)
+
+        _w(f'### Kx = {self.Kx}, Ku = {self.Ku}, Kv = {self.Kv} ###')
+        data = self.compute_figure2_data()
+        for method, mdata in data['methods'].items():
+            tag = method.lower().replace(' ', '_')
+            _w(f'{tag}_total_gb: {mdata["total_gb"]:.3f}')
+        _w(f'reduction_vs_ddp: {data["reduction_vs_ddp"]:.1f}')
+        _w(f'reduction_vs_local_adam: {data["reduction_vs_local_adam"]:.1f}')
+        tier_data = data['methods']['DES-LOC'].get('per_tier', {})
+        for tier, td in sorted(tier_data.items()):
+            _w(f'tier_{tier}_gb: {td["gb"]:.3f}')
+            _w(f'tier_{tier}_ops: {td["ops"]}')
+            _w(f'tier_{tier}_fraction: {td["fraction"]:.4f}')
+
+
+def desloc_comm_reduction_sweep(kx_values, num_params, total_steps,
+                                 beta1=0.9, beta2=0.999, dtype_bytes=2):
+    """Compute Figure 2 data across multiple Kx values.
+
+    Returns list of Figure 2 data dicts, one per Kx.
+    For each Kx, simulates sync decisions using DES-LOC rules
+    (deterministic, no randomness — pure modular arithmetic).
+
+    Ref: Algorithm 1 — sync when step % K == 0
+    Ref: Section 5.3 — Ku=3Kx, Kv=6Kx heuristic
+
+    Args:
+        kx_values: list of Kx values to sweep
+        num_params: model parameter count
+        total_steps: number of training steps
+        beta1: Adam beta1 (for half-life heuristic)
+        beta2: Adam beta2
+        dtype_bytes: 2 for BF16, 4 for FP32
+    """
+    results = []
+    for kx in kx_values:
+        ku = 3 * kx
+        kv = 6 * kx
+        calc = DeslocCommReductionCalculator(
+            Kx=kx, Ku=ku, Kv=kv,
+            num_params=num_params, dtype_bytes=dtype_bytes)
+        # Simulate training steps — deterministic sync decisions
+        warmup = min(512, total_steps // 4)
+        for step in range(total_steps):
+            if step < warmup:
+                # During warmup: sync everything (Kx=1 effective)
+                calc.record_step(step, is_sync_x=True,
+                                 is_sync_u=True, is_sync_v=True)
+            else:
+                is_x = (step % kx) == 0
+                is_u = (step % ku) == 0
+                is_v = (step % kv) == 0
+                calc.record_step(step, is_sync_x=is_x,
+                                 is_sync_u=is_u, is_sync_v=is_v)
+        results.append(calc.compute_figure2_data())
+    return results
+
+
+def desloc_format_figure2_table(sweep_results, fmt='md'):
+    """Format Figure 2 sweep results as a table.
+
+    Ref: NKI-FA — annotations with exact values, not placeholders.
+
+    Args:
+        sweep_results: list from desloc_comm_reduction_sweep()
+        fmt: 'md' for markdown, 'latex' for NeurIPS submission
+    """
+    lines = []
+    if fmt == 'latex':
+        lines.append(r'\begin{tabular}{cccccc}')
+        lines.append(r'\toprule')
+        lines.append(r'$K_x$ & $K_u$ & $K_v$ & '
+                     r'DDP (GB) & DES-LOC (GB) & Reduction \\')
+        lines.append(r'\midrule')
+    else:
+        lines.append('| Kx | Ku | Kv | DDP (GB) | DES-LOC (GB) | '
+                     'vs DDP | vs Local Adam |')
+        lines.append('|---|---|---|---|---|---|---|')
+
+    for r in sweep_results:
+        kx, ku, kv = r['Kx'], r['Ku'], r['Kv']
+        ddp_gb = r['methods']['DDP']['total_gb']
+        dl_gb = r['methods']['DES-LOC']['total_gb']
+        r_ddp = r['reduction_vs_ddp']
+        r_la = r['reduction_vs_local_adam']
+        if fmt == 'latex':
+            lines.append(
+                f'{kx} & {ku} & {kv} & {ddp_gb:.3f} & '
+                f'{dl_gb:.3f} & {r_ddp:.1f}$\\times$ \\\\')
+        else:
+            lines.append(
+                f'| {kx} | {ku} | {kv} | {ddp_gb:.3f} | '
+                f'{dl_gb:.3f} | {r_ddp:.1f}× | {r_la:.1f}× |')
+
+    if fmt == 'latex':
+        lines.append(r'\bottomrule')
+        lines.append(r'\end{tabular}')
+    return '\n'.join(lines)
+
+
+# DES-LOC: end of M229 integration
