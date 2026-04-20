@@ -668,3 +668,36 @@ def desloc_format_breakdown(bd):
     if total <= 0: return "no data"
     return " | ".join(f"{p}={bd.get(p,0):.1f}ms ({bd.get(p,0)/total*100:.1f}%)"
                       for p in ["compute","comm","idle"])
+
+# M299 — Claude-19: PhaseTimer + Roofline + MFU
+import time as _t299
+class DeslocPhaseV2:
+    PH=('compute','comm','idle','data')
+    __slots__=('pt','cur','start','steps','sn','mh')
+    def __init__(s,mh=10000):s.pt={p:0. for p in s.PH};s.cur=None;s.start=0.;s.steps=[];s.sn=0;s.mh=mh
+    def begin(s,p):
+        now=_t299.monotonic()
+        if s.cur:s.pt[s.cur]=s.pt.get(s.cur,0)+now-s.start
+        s.cur=p;s.start=now
+    def end(s):
+        if s.cur:s.pt[s.cur]=s.pt.get(s.cur,0)+_t299.monotonic()-s.start;s.cur=None
+    def end_step(s):
+        s.end();s.sn+=1;s.steps.append({'s':s.sn,'t':sum(s.pt.values())*1000,**{p:t*1000 for p,t in s.pt.items()}})
+        s.steps=s.steps[-s.mh//2:]if len(s.steps)>s.mh else s.steps;s.pt={p:0. for p in s.PH}
+    def bd(s,w=100):
+        r=s.steps[-w:]
+        if not r:return{}
+        d={}
+        for p in s.PH:vs=[x.get(p,0)for x in r];d[p]={'m':sum(vs)/len(vs),'f':sum(vs)/max(1e-6,sum(x.get('t',0)for x in r))}
+        return d
+GPU_DB={'H100':{'tf':989.5,'bw':3.35},'A100':{'tf':312,'bw':2.},'A6000':{'tf':155,'bw':.768},'RTX4090':{'tf':330,'bw':1.}}
+class DeslocRoof:
+    __slots__=('pk','bw','gpu','eff')
+    def __init__(s,gpu='A6000',eff=.5):sp=GPU_DB.get(gpu,GPU_DB['A6000']);s.pk=sp['tf'];s.bw=sp['bw'];s.gpu=gpu;s.eff=eff
+    def mfu(s,N,B,S,t):return 6*N*B*S/t/1e12/s.pk if t>0 else 0.
+class DeslocMFU:
+    __slots__=('rf','hist','st','N','B','S')
+    def __init__(s,gpu='A6000',N=125e6,B=4,S=2048):s.rf=DeslocRoof(gpu);s.hist=[];s.st=0;s.N=N;s.B=B;s.S=S
+    def rec(s,t,c=0):s.st+=1;m=s.rf.mfu(s.N,s.B,s.S,t);s.hist.append({'s':s.st,'m':m,'t':t});s.hist=s.hist[-5000:]if len(s.hist)>10000 else s.hist;return m
+    def avg(s,w=100):r=s.hist[-w:];return sum(e['m']for e in r)/len(r)if r else 0.
+# M299: end
