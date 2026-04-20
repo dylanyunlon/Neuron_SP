@@ -1049,285 +1049,37 @@ class DeepSpeedConfig(object):
 # DES-LOC Configuration (Algorithm 1 sync periods)
 # =========================================================================
 
-class DeslocConfig:
-    """DES-LOC configuration parsed from DeepSpeed JSON.
-    Ref: Algorithm 1 - Kx (param sync), Ku (1st moment), Kv (2nd moment)."""
-
-    def __init__(self, cfg_dict=None):
-        d = cfg_dict or {}
-        self.enabled = d.get('enabled', False)
-        self.Kx = d.get('Kx', 1)
-        self.Ku = d.get('Ku', 3)
-        self.Kv = d.get('Kv', 6)
-        self.clip_rho = d.get('clip_rho', 1.0)
-        self.warmup_steps = d.get('warmup_steps', 512)
-        self.outer_optimizer = d.get('outer_optimizer', 'average')
-
-    def validate(self):
-        """Validate config. Kx=1 must degrade to standard DDP."""
-        assert self.Kx >= 1, f'Kx must be >= 1, got {self.Kx}'
-        assert self.Ku >= 1, f'Ku must be >= 1, got {self.Ku}'
-        assert self.Kv >= self.Ku, f'Kv must be >= Ku, got Kv={self.Kv} Ku={self.Ku}'
-        assert self.clip_rho > 0, f'clip_rho must be > 0, got {self.clip_rho}'
-        return True
-
-    def to_dict(self):
-        return {
-            'enabled': self.enabled, 'Kx': self.Kx, 'Ku': self.Ku,
-            'Kv': self.Kv, 'clip_rho': self.clip_rho,
-            'warmup_steps': self.warmup_steps,
-            'outer_optimizer': self.outer_optimizer,
-        }
-
-    def __repr__(self):
-        return (f'DeslocConfig(Kx={self.Kx}, Ku={self.Ku}, Kv={self.Kv}, '
-                f'clip_rho={self.clip_rho}, outer={self.outer_optimizer})')
 
 
-# =============================================================================
-# M259 (Claude-17): Clean Config Validation + Figure Specs + Presets
-#
-# Replaces 955 lines of bloated config classes with compact functions.
-# Ref: Section 4.1 — experiment configuration constraints
-# Ref: NKI-FA da964f3 — figure sizing and style constants
-# Ref: Megatron-LM megatron/core/optimizer/__init__.py — config validation
-# =============================================================================
+# M304: Hetero config + env overrides + presets
+DESLOC_HETERO_KEY = "desloc_heterogeneous"
+DESLOC_AUTO_KX_KEY = "desloc_auto_Kx"
 
+def desloc_hetero_cfg(base, profiles):
+    if not profiles: return {}
+    kx = base.get('Kx', 1); spd = [p.get('tf', 50) for p in profiles]; mx = max(spd) if spd else 1
+    return {p.get('idx', 0): {'Kx': kx, 'scale': round(p.get('tf', 50) / max(.1, mx), 3)} for p in profiles}
 
-# ---- Figure specification constants (NKI-FA style) ----
-DESLOC_FIGURE_SPECS = {
-    1: {'title': 'Loss vs Training Step',
-        'size': (16, 9), 'dpi': 300, 'style': 'whitegrid',
-        'xlabel': 'Training Step', 'ylabel': 'Loss',
-        'rq': 'RQ2', 'annotation_digits': 4},
-    2: {'title': 'Communication Reduction: DDP vs LocalAdam vs DES-LOC',
-        'size': (16, 9), 'dpi': 300, 'style': 'whitegrid',
-        'xlabel': 'Method', 'ylabel': 'Communication Volume (GB)',
-        'rq': 'RQ3', 'annotation_digits': 2},
-    3: {'title': 'Half-Life Validation: Change Rate Ratio vs β₂',
-        'size': (10, 8), 'dpi': 300, 'style': 'whitegrid',
-        'xlabel': 'β₂', 'ylabel': 'Change Rate Ratio (u₂/u₁)',
-        'rq': 'RQ1', 'annotation_digits': 4},
-    4: {'title': 'Sync Period Sensitivity: Final Loss vs Kx',
-        'size': (16, 9), 'dpi': 300, 'style': 'whitegrid',
-        'xlabel': 'Parameter Sync Period (Kx)',
-        'ylabel': 'Final Loss',
-        'rq': 'RQ2', 'annotation_digits': 4},
-    5: {'title': 'Large-Scale Training: Loss by Model Size',
-        'size': (14, 8), 'dpi': 300, 'style': 'whitegrid',
-        'xlabel': 'Training Step', 'ylabel': 'Loss',
-        'rq': 'RQ4', 'annotation_digits': 4},
-    6: {'title': 'Nesterov vs Averaging Outer Optimizer',
-        'size': (12, 8), 'dpi': 300, 'style': 'whitegrid',
-        'xlabel': 'Training Step', 'ylabel': 'Loss',
-        'rq': 'RQ5', 'annotation_digits': 4},
-    7: {'title': 'Inner Optimizer: Adam vs ADOPT',
-        'size': (12, 8), 'dpi': 300, 'style': 'whitegrid',
-        'xlabel': 'Training Step', 'ylabel': 'Loss',
-        'rq': 'RQ6', 'annotation_digits': 4},
-}
+def desloc_env_merge(cfg):
+    import os
+    em = {'DESLOC_KX': ('Kx', int), 'DESLOC_KU': ('Ku', int), 'DESLOC_KV': ('Kv', int),
+          'DESLOC_CLIP_RHO': ('clip_rho', float), 'DESLOC_WARMUP': ('warmup_steps', int),
+          'DESLOC_ENABLED': ('enabled', lambda x: x.lower() in ('1', 'true'))}
+    for ek, (ck, cv) in em.items():
+        v = os.environ.get(ek)
+        if v:
+            try: cfg[ck] = cv(v)
+            except: pass
 
-# ---- Color palettes ----
-DESLOC_COLORS = {
-    'ddp': '#2ecc71',
-    'local_adam': '#e74c3c',
-    'desloc': '#3498db',
-    'nesterov': '#9b59b6',
-    'adopt': '#e67e22',
-    'kx_gradient': ['#1a9850', '#91cf60', '#d9ef8b',
-                    '#fee08b', '#fc8d59', '#d73027', '#a50026'],
-}
+def desloc_opt_periods(b1=0.9, b2=0.999, bk=32):
+    import math; e = 1e-10
+    h1 = math.log(2) / max(e, math.log(1 / max(e, b1))); h2 = math.log(2) / max(e, math.log(1 / max(e, b2)))
+    r1 = max(1, min(16, int(round(h1)))); r2 = max(1, min(64, int(round(h2))))
+    ku = max(1, bk * r1); kv = max(1, bk * r2); dl = 1 / max(1, bk) + 1 / max(1, ku) + 1 / max(1, kv)
+    return {'Kx': bk, 'Ku': ku, 'Kv': kv, 'hl_u': round(h1, 2), 'hl_v': round(h2, 2), 'red': round(3 / max(.001, dl), 2)}
 
-# ---- Experiment presets ----
-DESLOC_PRESETS = {
-    'quick_test': {
-        'models': ['125M'], 'seeds': [42],
-        'kx_values': [1, 32], 'max_steps': 200,
-        'description': 'Quick validation (2 configs, ~5min)',
-    },
-    'standard': {
-        'models': ['125M', '350M'], 'seeds': [42, 137, 2024],
-        'kx_values': [1, 4, 8, 16, 32, 64, 128], 'max_steps': 2000,
-        'description': 'Full ablation (108 configs, ~12hrs)',
-    },
-    'large_scale': {
-        'models': ['125M', '350M', '1.3B'], 'seeds': [42, 137, 2024],
-        'kx_values': [1, 16, 32, 64], 'max_steps': 5000,
-        'description': 'Publication-ready (200+ configs, ~48hrs)',
-    },
-}
-
-
-def desloc_validate_config(config):
-    """Validate a DES-LOC experiment config dict.
-
-    Checks:
-    1. Kx, Ku, Kv are positive integers
-    2. Ku >= Kx, Kv >= Ku (half-life hierarchy)
-    3. beta1 < beta2 (standard Adam constraint)
-    4. clip_rho > 0
-    5. TP-Kx must be 1 (tensor parallel requires full sync)
-    6. GA steps divisible by Kx (gradient accumulation alignment)
-
-    Ref: Section 2 — half-life hierarchy: τ(β₁) < τ(β₂) implies Ku > Kx
-    Ref: Nick Joseph — TP组内Kx=1是必须的
-
-    Returns: (is_valid, list_of_warnings)
-    """
-    warnings = []
-    valid = True
-
-    kx = config.get('Kx', 1)
-    ku = config.get('Ku', 1)
-    kv = config.get('Kv', 1)
-
-    if kx < 1 or ku < 1 or kv < 1:
-        warnings.append(f'INVALID: Kx={kx}, Ku={ku}, Kv={kv} must be >= 1')
-        valid = False
-
-    if ku < kx:
-        warnings.append(f'WARNING: Ku={ku} < Kx={kx} — violates half-life '
-                        f'hierarchy (momentum changes slower than params)')
-
-    if kv < ku:
-        warnings.append(f'WARNING: Kv={kv} < Ku={ku} — second momentum '
-                        f'should sync less often than first')
-
-    b1 = config.get('beta1', 0.9)
-    b2 = config.get('beta2', 0.999)
-    if b1 >= b2:
-        warnings.append(f'WARNING: beta1={b1} >= beta2={b2} — unusual '
-                        f'for Adam-family optimizers')
-
-    clip = config.get('clip_rho', 1.0)
-    if clip <= 0:
-        warnings.append(f'INVALID: clip_rho={clip} must be > 0')
-        valid = False
-
-    ga = config.get('grad_accum', 1)
-    if ga > 1 and kx % ga != 0 and ga % kx != 0:
-        warnings.append(f'WARNING: grad_accum={ga} not aligned with '
-                        f'Kx={kx} — may cause stale gradient sync')
-
-    model = config.get('model', '125M')
-    if model == '1.3B' and kx < 8:
-        warnings.append(f'WARNING: Kx={kx} very frequent for 1.3B model '
-                        f'— communication may dominate compute')
-
-    return valid, warnings
-
-
-def desloc_config_diff(config_a, config_b):
-    """Compute diff between two configs. Returns dict of changed keys."""
-    all_keys = set(list(config_a.keys()) + list(config_b.keys()))
-    diff = {}
-    for k in sorted(all_keys):
-        va = config_a.get(k)
-        vb = config_b.get(k)
-        if va != vb:
-            diff[k] = {'from': va, 'to': vb}
-    return diff
-
-
-def desloc_config_to_cli_args(config):
-    """Convert config dict to CLI argument string for launcher scripts."""
-    args = []
-    mapping = {
-        'Kx': '--desloc_Kx', 'Ku': '--desloc_Ku', 'Kv': '--desloc_Kv',
-        'clip_rho': '--desloc_clip_rho', 'outer': '--desloc_outer',
-        'model': '--model_size', 'lr': '--learning_rate',
-        'max_steps': '--max_steps', 'seed': '--seed',
-        'batch_size': '--batch_size',
-    }
-    for cfg_key, cli_flag in mapping.items():
-        if cfg_key in config:
-            args.append(f'{cli_flag} {config[cfg_key]}')
-    return ' '.join(args)
-
-
-def desloc_get_figure_spec(figure_num):
-    """Get figure specification dict. Returns None if invalid."""
-    return DESLOC_FIGURE_SPECS.get(figure_num)
-
-
-def desloc_get_preset(name):
-    """Get experiment preset. Returns None if invalid."""
-    return DESLOC_PRESETS.get(name)
-# End M259
-
-
-# M281: Auto Kx recommendation
-def desloc_auto_recommend_Kx(gpu="A6000", model="125M", target_pct=5.0):
-    import math
-    gpus = {"A6000":{"tf":38.7,"bw":768},"H100":{"tf":989.4,"bw":3352}}
-    models = {"125M":124439808,"350M":354823168,"1.3B":1315692544}
-    s = gpus.get(gpu, gpus["A6000"])
-    p = models.get(model, models["125M"])
-    comm_s = 2*p*2/(s["bw"]*1e9)
-    comp_s = 6*p*4*1024/(s["tf"]*1e12)
-    tgt = comp_s*target_pct/100
-    Kx = max(1, int(math.ceil(comm_s/tgt))) if tgt > 0 else 1
-    return {"Kx":Kx,"Ku":Kx*3,"Kv":Kx*6}
-
-
-# M288 — Claude-19: ExperimentConfig + ScalingLaw + HW AutoTuner
-import math as _m288m
-DESLOC_PRESETS_V2={'rq1':{'models':['125M'],'Kx':[1],'b2':[.95,.99,.999,.9999],'steps':2000},'rq2':{'models':['125M','350M'],'Kx':[1,4,8,16,32,64],'steps':5000,'seeds':[42,137,2024]},'rq3':{'models':['125M','350M'],'methods':['DDP','LocalAdam','DESLOC'],'Kx':[32],'steps':10000,'seeds':[42,137,2024]},'rq4':{'models':['125M','350M','1.3B'],'Kx':[32,64],'steps':20000},'rq5':{'models':['125M'],'methods':['DESLOC_avg','DESLOC_nesterov'],'Kx':[8,32],'steps':10000},'rq6':{'models':['125M','350M'],'Kx':[8,32],'steps':10000}}
-class DeslocExpCfg:
-    __slots__=('name','model','Kx','Ku','Kv','b1','b2','lr','rho','warmup','steps','bs','ga','method','outer','nm','seed','ngpu','gpu','tags')
-    def __init__(s,**k):
-        d={'name':'?','model':'125M','Kx':1,'Ku':1,'Kv':1,'b1':.9,'b2':.95,'lr':6e-4,'rho':1.,'warmup':512,'steps':5000,'bs':4,'ga':8,'method':'DESLOC','outer':'average','nm':.9,'seed':42,'ngpu':2,'gpu':'A6000','tags':[]}
-        for a,v in d.items():setattr(s,a,k.get(a,v))
-    def validate(s):
-        e=[];
-        if s.Kx<1:e.append(f"Kx<1");
-        if s.Ku<s.Kx:e.append(f"Ku<Kx");
-        if s.Kv<s.Ku:e.append(f"Kv<Ku");return e
-    def _ps(s):
-        u=s.model.upper()
-        for x,m in[('T',1e12),('B',1e9),('M',1e6),('K',1e3)]:
-            if u.endswith(x):
-                try:return int(float(u[:-1])*m)
-                except:return 0
-        try:return int(u)
-        except:return 0
-    def comm(s):
-        mb=s._ps()*4
-        if s.method=='DDP':return 2*mb
-        if s.method=='LocalAdam':return 2*mb/max(1,s.Kx)*3
-        return 2*mb/max(1,s.Kx)+2*mb/max(1,s.Ku)+2*mb/max(1,s.Kv)
-    def cr_ddp(s):return 2*s._ps()*4/max(1,s.comm())
-def desloc_gen_matrix(preset='rq2',seeds=None):
-    p=DESLOC_PRESETS_V2.get(preset,{});
-    if not p:return[]
-    if seeds is None:seeds=p.get('seeds',[42])
-    cs=[]
-    for mod in p.get('models',['125M']):
-        for kx in p.get('Kx',[1]):
-            for meth in p.get('methods',['DESLOC']):
-                for s in seeds:
-                    c=DeslocExpCfg(name=f"{preset}_{mod}_Kx{kx}_{meth}_s{s}",model=mod,Kx=kx if meth!='DDP'else 1,Ku=max(1,kx*3)if meth!='DDP'else 1,Kv=max(1,kx*6)if meth!='DDP'else 1,method=meth,steps=p.get('steps',5000),seed=s,tags=[preset,mod,meth])
-                    if not c.validate():cs.append(c)
-    return cs
-class DeslocScalingLaw:
-    __slots__=('a','al','li','dl','pts','r2')
-    def __init__(s,a=.076,al=.4,li=1.69,dl=.001):s.a,s.al,s.li,s.dl=a,al,li,dl;s.pts=[];s.r2=0.
-    def predict(s,C,Kx=1):b=s.al*(C**(-s.a))+s.li;return b+s.dl*_m288m.log(Kx)if Kx>1 else b
-    def add(s,C,l,Kx=1):s.pts.append((C,l,Kx))
-    def fit(s):
-        bp=[(c,l)for c,l,k in s.pts if k<=1]
-        if len(bp)<2:bp=[(c,l)for c,l,k in s.pts[:3]]
-        if len(bp)<2:return 0.
-        lc=[_m288m.log(c)for c,_ in bp];ll=[_m288m.log(max(1e-8,l-s.li))for _,l in bp];n=len(lc)
-        sx,sy=sum(lc),sum(ll);sxy=sum(x*y for x,y in zip(lc,ll));sx2=sum(x*x for x in lc)
-        d=n*sx2-sx*sx
-        if abs(d)<1e-12:return 0.
-        sl=(n*sxy-sx*sy)/d;ic=(sy-sl*sx)/n;s.a=-sl;s.al=_m288m.exp(ic)
-        my=sy/n;sst=sum((y-my)**2 for y in ll);ssr=sum((y-(sl*x+ic))**2 for x,y in zip(lc,ll))
-        s.r2=1.-ssr/(sst+1e-12);return s.r2
-HW_P={'H100':{'tf':989.5,'hbm':94,'bw':3.35,'nv':900,'pc':128},'A100':{'tf':312,'hbm':80,'bw':2.,'nv':600,'pc':64},'A6000':{'tf':155,'hbm':48,'bw':.768,'nv':0,'pc':64},'RTX4090':{'tf':330,'hbm':24,'bw':1.,'nv':0,'pc':64}}
-def desloc_auto_tune(gpu='A6000',ng=2,mp=125e6,bs=4,seq=2048):
-    p=HW_P.get(gpu,HW_P['A6000']);mb=mp*4;f=6*mp*bs*seq;ct=f/(p['tf']*1e12)*1000
-    bw=p['nv']*.7 if p.get('nv',0)>0 and ng<=8 else p.get('pc',32)*.6;bm=bw*1e9/8/1000;ar=2*mb/(bm+1e-12)
-    tg=ct*.1/.9;Kx=1 if ar<=tg else max(1,min(256,int(_m288m.ceil(ar/tg))));return{'Kx':Kx,'Ku':max(1,Kx*3),'Kv':max(1,Kx*6),'ct_ms':round(ct,2),'ar_ms':round(ar,2)}
-# M288: end
+def desloc_presets():
+    return {'ddp': {'Kx': 1, 'Ku': 1, 'Kv': 1}, 'local': {'Kx': 32, 'Ku': 32, 'Kv': 32},
+            'std': {'Kx': 32, 'Ku': 96, 'Kv': 192}, 'agg': {'Kx': 64, 'Ku': 192, 'Kv': 384},
+            'ext': {'Kx': 128, 'Ku': 384, 'Kv': 768}}
+# --- End M304 ---
