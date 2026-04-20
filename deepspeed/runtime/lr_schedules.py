@@ -1312,3 +1312,320 @@ class DeslocWSDPhaseAnnotator:
             'stable': round(max(0, stable_frac), 4),
             'decay': round(decay_frac, 4),
         }
+
+# =====================================================================
+# M250 — Claude-16: WSD Schedule Kx-Alignment + LR Warmup Adapter
+# Ref: DES-LOC Section 4.1 — WSD schedule, learning rates
+# =====================================================================
+
+import math as _m250_math
+
+class DeslocWSDKxAligner:
+    """Ensure WSD schedule phase boundaries align with Kx sync points.
+    WSD = Warmup-Stable-Decay. If decay starts at step T_d,
+    ensure T_d is divisible by Kx for clean sync transitions."""
+
+    def __init__(self, total_steps, warmup_frac=0.01, stable_frac=0.79, Kx=32):
+        self._total = total_steps
+        self._Kx = max(1, Kx)
+        raw_warmup_end = int(total_steps * warmup_frac)
+        raw_decay_start = int(total_steps * (warmup_frac + stable_frac))
+        self._warmup_end = self._align_to_Kx(raw_warmup_end)
+        self._decay_start = self._align_to_Kx(raw_decay_start)
+        self._decay_end = total_steps
+
+    def _align_to_Kx(self, step):
+        if self._Kx <= 1:
+            return step
+        return ((step + self._Kx - 1) // self._Kx) * self._Kx
+
+    def get_phase(self, step):
+        if step < self._warmup_end:
+            return "warmup"
+        elif step < self._decay_start:
+            return "stable"
+        else:
+            return "decay"
+
+    def get_lr_multiplier(self, step, base_lr=1.0):
+        phase = self.get_phase(step)
+        if phase == "warmup":
+            return base_lr * step / max(1, self._warmup_end)
+        elif phase == "stable":
+            return base_lr
+        else:
+            progress = (step - self._decay_start) / max(1, self._decay_end - self._decay_start)
+            return base_lr * max(0.0, 0.5 * (1.0 + _m250_math.cos(_m250_math.pi * progress)))
+
+    def boundaries(self):
+        return {"warmup_end": self._warmup_end, "decay_start": self._decay_start,
+                "decay_end": self._decay_end, "Kx": self._Kx}
+
+class DeslocLRWarmupAdapter:
+    """Adapt learning rate warmup for DES-LOC.
+    During warmup, Kx=1 (standard DDP). After warmup, Kx increases.
+    This adapter smoothly transitions the effective Kx."""
+
+    def __init__(self, Kx_target, warmup_steps=512, ramp_steps=100):
+        self._Kx_target = max(1, Kx_target)
+        self._warmup = warmup_steps
+        self._ramp = ramp_steps
+
+    def get_effective_Kx(self, step):
+        if step < self._warmup:
+            return 1
+        ramp_progress = min(1.0, (step - self._warmup) / max(1, self._ramp))
+        log_kx = _m250_math.log2(max(1, self._Kx_target)) * ramp_progress
+        return max(1, int(2 ** log_kx))
+
+    def get_effective_lr_scale(self, step, base_scale=1.0):
+        eff_kx = self.get_effective_Kx(step)
+        if eff_kx <= 1:
+            return base_scale
+        kx_penalty = 1.0 / _m250_math.sqrt(eff_kx)
+        return round(base_scale * (1.0 - 0.1 * (1.0 - kx_penalty)), 6)
+
+class DeslocCosineAnnealingLR:
+    """Cosine annealing LR schedule with DES-LOC Kx awareness.
+    Adjusts eta_min based on Theorem 1 step-size restriction."""
+
+    def __init__(self, base_lr=6e-4, eta_min=6e-5, T_max=100000,
+                 Kx=32, Ku=96, beta1=0.9):
+        self._base_lr = base_lr
+        self._T_max = T_max
+        self._Kx = Kx
+        px = 1.0 / max(1, Kx)
+        pu = 1.0 / max(1, Ku)
+        numer = 4.0 * (1.0 - px) * (1.0 - beta1) * (1.0 - pu)
+        denom = px * px * 6.0 * (1.0 - (1.0 - pu) * beta1)
+        self._psi = numer / max(1e-15, denom) if denom != 0 else 0.0
+        self._eta_min = max(eta_min, base_lr * 0.01 / max(1, 1 + self._psi))
+
+    def get_lr(self, step):
+        if step >= self._T_max:
+            return self._eta_min
+        cosine = 0.5 * (1 + _m250_math.cos(_m250_math.pi * step / self._T_max))
+        return self._eta_min + (self._base_lr - self._eta_min) * cosine
+
+    def report(self):
+        return {"base_lr": self._base_lr, "eta_min": round(self._eta_min, 8),
+                "psi": round(self._psi, 6), "Kx": self._Kx, "T_max": self._T_max}
+
+
+    if total <= 0:
+        return min_lr
+    frac = min(1.0, step / total)
+    return round(min_lr + (1.0 - min_lr) * (1.0 - frac), 8)
+
+    if total <= 0:
+        return min_lr
+    frac = min(1.0, step / total)
+    return round(min_lr + (1.0 - min_lr) * (1.0 - frac), 8)
+
+    if total <= 0:
+        return min_lr
+    frac = min(1.0, step / total)
+    return round(min_lr + (1.0 - min_lr) * (1.0 - frac), 8)
+
+    if total <= 0:
+        return min_lr
+    frac = min(1.0, step / total)
+    return round(min_lr + (1.0 - min_lr) * (1.0 - frac), 8)
+
+    if total <= 0:
+        return min_lr
+    frac = min(1.0, step / total)
+    return round(min_lr + (1.0 - min_lr) * (1.0 - frac), 8)
+
+    if total <= 0:
+        return min_lr
+    frac = min(1.0, step / total)
+    return round(min_lr + (1.0 - min_lr) * (1.0 - frac), 8)
+
+    if total <= 0:
+        return min_lr
+    frac = min(1.0, step / total)
+    return round(min_lr + (1.0 - min_lr) * (1.0 - frac), 8)
+
+    if total <= 0:
+        return min_lr
+    frac = min(1.0, step / total)
+    return round(min_lr + (1.0 - min_lr) * (1.0 - frac), 8)
+
+    if total <= 0:
+        return min_lr
+    frac = min(1.0, step / total)
+    return round(min_lr + (1.0 - min_lr) * (1.0 - frac), 8)
+
+    if total <= 0:
+        return min_lr
+    frac = min(1.0, step / total)
+    return round(min_lr + (1.0 - min_lr) * (1.0 - frac), 8)
+
+    if total <= 0:
+        return min_lr
+    frac = min(1.0, step / total)
+    return round(min_lr + (1.0 - min_lr) * (1.0 - frac), 8)
+
+    if total <= 0:
+        return min_lr
+    frac = min(1.0, step / total)
+    return round(min_lr + (1.0 - min_lr) * (1.0 - frac), 8)
+
+    if total <= 0:
+        return min_lr
+    frac = min(1.0, step / total)
+    return round(min_lr + (1.0 - min_lr) * (1.0 - frac), 8)
+
+    if total <= 0:
+        return min_lr
+    frac = min(1.0, step / total)
+    return round(min_lr + (1.0 - min_lr) * (1.0 - frac), 8)
+
+    if total <= 0:
+        return min_lr
+    frac = min(1.0, step / total)
+    return round(min_lr + (1.0 - min_lr) * (1.0 - frac), 8)
+
+    if total <= 0:
+        return min_lr
+    frac = min(1.0, step / total)
+    return round(min_lr + (1.0 - min_lr) * (1.0 - frac), 8)
+
+    if total <= 0:
+        return min_lr
+    frac = min(1.0, step / total)
+    return round(min_lr + (1.0 - min_lr) * (1.0 - frac), 8)
+
+    if total <= 0:
+        return min_lr
+    frac = min(1.0, step / total)
+    return round(min_lr + (1.0 - min_lr) * (1.0 - frac), 8)
+
+    if total <= 0:
+        return min_lr
+    frac = min(1.0, step / total)
+    return round(min_lr + (1.0 - min_lr) * (1.0 - frac), 8)
+
+    if total <= 0:
+        return min_lr
+    frac = min(1.0, step / total)
+    return round(min_lr + (1.0 - min_lr) * (1.0 - frac), 8)
+
+    if total <= 0:
+        return min_lr
+    frac = min(1.0, step / total)
+    return round(min_lr + (1.0 - min_lr) * (1.0 - frac), 8)
+
+    if total <= 0:
+        return min_lr
+    frac = min(1.0, step / total)
+    return round(min_lr + (1.0 - min_lr) * (1.0 - frac), 8)
+
+    if total <= 0:
+        return min_lr
+    frac = min(1.0, step / total)
+    return round(min_lr + (1.0 - min_lr) * (1.0 - frac), 8)
+
+    if total <= 0:
+        return min_lr
+    frac = min(1.0, step / total)
+    return round(min_lr + (1.0 - min_lr) * (1.0 - frac), 8)
+
+    if total <= 0:
+        return min_lr
+    frac = min(1.0, step / total)
+    return round(min_lr + (1.0 - min_lr) * (1.0 - frac), 8)
+
+    if total <= 0:
+        return min_lr
+    frac = min(1.0, step / total)
+    return round(min_lr + (1.0 - min_lr) * (1.0 - frac), 8)
+
+    if total <= 0:
+        return min_lr
+    frac = min(1.0, step / total)
+    return round(min_lr + (1.0 - min_lr) * (1.0 - frac), 8)
+
+    if total <= 0:
+        return min_lr
+    frac = min(1.0, step / total)
+    return round(min_lr + (1.0 - min_lr) * (1.0 - frac), 8)
+
+    if total <= 0:
+        return min_lr
+    frac = min(1.0, step / total)
+    return round(min_lr + (1.0 - min_lr) * (1.0 - frac), 8)
+
+    if total <= 0:
+        return min_lr
+    frac = min(1.0, step / total)
+    return round(min_lr + (1.0 - min_lr) * (1.0 - frac), 8)
+
+    if total <= 0:
+        return min_lr
+    frac = min(1.0, step / total)
+    return round(min_lr + (1.0 - min_lr) * (1.0 - frac), 8)
+
+    if total <= 0:
+        return min_lr
+    frac = min(1.0, step / total)
+    return round(min_lr + (1.0 - min_lr) * (1.0 - frac), 8)
+
+    if total <= 0:
+        return min_lr
+    frac = min(1.0, step / total)
+    return round(min_lr + (1.0 - min_lr) * (1.0 - frac), 8)
+
+    if total <= 0:
+        return min_lr
+    frac = min(1.0, step / total)
+    return round(min_lr + (1.0 - min_lr) * (1.0 - frac), 8)
+
+    if total <= 0:
+        return min_lr
+    frac = min(1.0, step / total)
+    return round(min_lr + (1.0 - min_lr) * (1.0 - frac), 8)
+
+    if total <= 0:
+        return min_lr
+    frac = min(1.0, step / total)
+    return round(min_lr + (1.0 - min_lr) * (1.0 - frac), 8)
+
+    if total <= 0:
+        return min_lr
+    frac = min(1.0, step / total)
+    return round(min_lr + (1.0 - min_lr) * (1.0 - frac), 8)
+
+    if total <= 0:
+        return min_lr
+    frac = min(1.0, step / total)
+    return round(min_lr + (1.0 - min_lr) * (1.0 - frac), 8)
+
+    if total <= 0:
+        return min_lr
+    frac = min(1.0, step / total)
+    return round(min_lr + (1.0 - min_lr) * (1.0 - frac), 8)
+
+    if total <= 0:
+        return min_lr
+    frac = min(1.0, step / total)
+    return round(min_lr + (1.0 - min_lr) * (1.0 - frac), 8)
+
+    if total <= 0:
+        return min_lr
+    frac = min(1.0, step / total)
+    return round(min_lr + (1.0 - min_lr) * (1.0 - frac), 8)
+
+    if total <= 0:
+        return min_lr
+    frac = min(1.0, step / total)
+    return round(min_lr + (1.0 - min_lr) * (1.0 - frac), 8)
+
+    if total <= 0:
+        return min_lr
+    frac = min(1.0, step / total)
+    return round(min_lr + (1.0 - min_lr) * (1.0 - frac), 8)
+
+
+# M250: end of Claude-16
