@@ -2393,54 +2393,27 @@ def desloc_detect_outliers(values, threshold=2.0):
 
 # M289 — Claude-19: LogParserV2 + Aggregator + ConvergenceBound
 import re as _r289,json as _j289,math as _m289,os as _o289
-class DeslocLogParserV2:
-    def __init__(s):s.exps=[];s.errs=[]
-    def parse_json(s,fp):
-        try:
-            with open(fp)as f:d=_j289.load(f)
-        except Exception as e:s.errs.append((fp,str(e)));return
-        cfg,res=d.get('config',{}),d.get('results',{})
-        for mth,met in res.items():s.exps.append({'src':fp,'method':mth,'model':cfg.get('model_size',''),'Kx':cfg.get('Kx',1),'Ku':cfg.get('Ku',1),'Kv':cfg.get('Kv',1),'loss':met.get('final_loss'),'tps':met.get('tokens_per_second',0),'syncs':met.get('sync_counts',{})})
-    def parse_csv(s,fp):
-        try:
-            with open(fp)as f:ls=f.readlines()
-        except Exception as e:s.errs.append((fp,str(e)));return
-        if not ls:return
-        h=ls[0].strip().split(',')
-        for ln in ls[1:]:
-            v=ln.strip().split(',')
-            if len(v)!=len(h):continue
-            r=dict(zip(h,v));s.exps.append({'src':fp,'model':r.get('model',''),'Kx':int(r.get('Kx',1)),'Ku':int(r.get('Ku',1)),'Kv':int(r.get('Kv',1)),'seed':int(r.get('seed',42)),'method':r.get('method',''),'exit_code':int(r.get('exit_code',-1))})
-    def parse_dir(s,d):
-        if not _o289.path.isdir(d):return
-        for rt,_,fs in _o289.walk(d):
-            for fn in sorted(fs):
-                fp=_o289.path.join(rt,fn)
-                if fn.endswith('.json')and'benchmark'in fn:s.parse_json(fp)
-                elif fn=='experiment_log.csv':s.parse_csv(fp)
-    def summary(s):ms={};[ms.__setitem__(e.get('method','?'),ms.get(e.get('method','?'),0)+1)for e in s.exps];return{'total':len(s.exps),'methods':ms}
-class DeslocAggregator:
-    def __init__(s):s.g={}
-    def add(s,exps):
-        for e in exps:k=(e.get('model',''),e.get('Kx',1),e.get('Ku',1),e.get('Kv',1),e.get('method',''));s.g.setdefault(k,[]).append(e)
-    def agg(s):
-        r={}
-        for k,es in s.g.items():
-            ls=[e.get('loss')for e in es if e.get('loss')is not None];st={'cfg':{'model':k[0],'Kx':k[1],'Ku':k[2],'Kv':k[3],'method':k[4]},'n':len(es),'nv':len(ls)}
-            if ls:st['lm']=sum(ls)/len(ls);st['lmn']=min(ls);st['lmx']=max(ls);st['ls']=_m289.sqrt(sum((x-st['lm'])**2 for x in ls)/(len(ls)-1))if len(ls)>=2 else 0.;st['lc']=1.96*st['ls']/_m289.sqrt(len(ls))if len(ls)>=2 else 0.
-            tps=[e.get('tps',0)for e in es if e.get('tps',0)>0]
-            if tps:st['tm']=sum(tps)/len(tps)
-            r[k]=st
-        return r
-    def nips_table(s,r=None):
-        if r is None:r=s.agg()
-        ls=["| Model | Method | Kx/Ku/Kv | Loss | Tput | Seeds |","| --- | --- | --- | --- | --- | --- |"]
-        for k in sorted(r):st=r[k];c=st['cfg'];l=f"{st.get('lm',0):.4f}±{st.get('ls',0):.4f}"if st.get('lm')is not None else"N/A";t=f"{st.get('tm',0):.0f}"if st.get('tm')else"N/A";ls.append(f"| {c['model']} | {c['method']} | {c['Kx']}/{c['Ku']}/{c['Kv']} | {l} | {t} | {st['nv']}/{st['n']} |")
-        return"\n".join(ls)
-class DeslocConvBound:
-    def __init__(s,L=1.,s2=1.,M=2,f0=10.):s.L,s.s2,s.M,s.f0=L,s2,M,f0
-    def psi(s,Kx,Ku,b):px,pu=1./max(1,Kx),1./max(1,Ku);n=4*(1-px)*(1-b)*(1-pu);d=px*px*6*(1-(1-pu)*b);return n/d if abs(d)>1e-15 else float('inf')
-    def bound(s,Kx,Ku,Kv,b1,b2,eta,T):p=s.psi(Kx,Ku,b1)+s.psi(Kx,Kv,b2);return 2*s.f0/(eta*max(1,T))+eta*s.L*s.s2/max(1,s.M)+eta**2*s.L**2*p*s.s2
-    def opt_eta(s,Kx,Ku,Kv,b1,b2,T):p=s.psi(Kx,Ku,b1)+s.psi(Kx,Kv,b2);d=max(1,T)*s.L*s.s2*(1./max(1,s.M)+s.L*p*s.s2);return _m289.sqrt(2*s.f0/d)if d>0 else 1e-4
-    def sweep(s,kxs,kr=3,vr=6,b1=.9,b2=.999,T=10000):return[{'Kx':kx,'Ku':max(1,kx*kr),'Kv':max(1,kx*vr),'bound':s.bound(kx,max(1,kx*kr),max(1,kx*vr),b1,b2,s.opt_eta(kx,max(1,kx*kr),max(1,kx*vr),b1,b2,T),T),'psi1':s.psi(kx,max(1,kx*kr),b1),'psi2':s.psi(kx,max(1,kx*vr),b2)}for kx in kxs]
-# M289: end
+
+
+# M305: Hetero step times + adaptive Kx
+def desloc_h_step(profiles, mp, Kx=32, bs=4, sl=512):
+    n = len(profiles); pb = mp * 2; rf = 2 * (n - 1) / max(1, n); r = {}
+    for p in profiles:
+        fl = 6 * mp * sl * bs; cs = fl / max(1, p.get('tf', 50) * 1e12)
+        bw = p.get('nvl', 0) * 1e9 if p.get('nvl', 0) > 0 else 32e9
+        ar = rf * pb / bw; ac = ar / max(1, Kx); os_ = 6 * pb / max(1, p.get('hbm', 500) * 1e9)
+        tot = cs + ac + os_; mfu = (fl / max(1e-12, tot)) / max(1, p.get('tf', 50) * 1e12)
+        r[p.get('idx', 0)] = {'tot': round(tot * 1e3, 4), 'mfu': round(mfu, 4), 'gpu': p.get('name', '?')}
+    return r
+
+def desloc_adapt_Kx(losses, ck, w=100, thr=0.02):
+    if len(losses) < w * 2: return ck
+    ar = sum(losses[-w:]) / w; ao = sum(losses[-2 * w:-w]) / w; d = (ao - ar) / max(1e-8, ao)
+    if d < thr: return min(256, ck * 2)
+    elif d > thr * 5: return max(1, ck // 2)
+    return ck
+
+def desloc_savings(Kx, Ku, Kv, steps, mp):
+    pb = mp * 2; ddp = 3 * pb * steps; dl = pb * (steps / max(1, Kx) + steps / max(1, Ku) + steps / max(1, Kv))
+    return {'ddp_gb': round(ddp / 1e9, 2), 'dl_gb': round(dl / 1e9, 2), 'red': round(ddp / max(1, dl), 2)}
+# --- End M305 ---
