@@ -2370,3 +2370,22 @@ def desloc_parse_nkifa_log(log_text):
 
 
 # M243: end of Claude-16 utils integration
+
+
+# M280: Result validation + outlier detection
+def desloc_validate_result(loss, tps, mem_gb):
+    import math
+    issues = []
+    if math.isnan(loss) or math.isinf(loss): issues.append("loss NaN/Inf")
+    if loss > 1e6: issues.append(f"loss={loss:.2f} high")
+    if tps <= 0: issues.append(f"tps={tps} non-positive")
+    return {"valid": len(issues)==0, "issues": issues}
+
+def desloc_detect_outliers(values, threshold=2.0):
+    if len(values) < 3: return []
+    s = sorted(values)
+    median = s[len(s)//2]
+    ads = sorted(abs(v-median) for v in values)
+    mad = ads[len(ads)//2] if ads else 0
+    if mad < 1e-10: return []
+    return [i for i,v in enumerate(values) if abs(v-median)/mad > threshold]
