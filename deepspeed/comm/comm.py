@@ -977,3 +977,21 @@ DESLOC_COMM_TIER_MOMENTUM = 1
 DESLOC_COMM_TIER_VARIANCE = 2
 
 
+
+
+# M282: Bandwidth measurement
+def desloc_measure_bandwidth(tensor_bytes=10000000, n_iters=5):
+    import time
+    try:
+        import torch, torch.distributed as dist
+        if not dist.is_initialized(): return {"bw_gbps":0}
+        buf = torch.zeros(tensor_bytes//4, dtype=torch.float32, device=torch.cuda.current_device())
+        dist.all_reduce(buf); torch.cuda.synchronize()
+        times = []
+        for _ in range(n_iters):
+            torch.cuda.synchronize(); t0=time.monotonic()
+            dist.all_reduce(buf); torch.cuda.synchronize()
+            times.append(time.monotonic()-t0)
+        avg = sum(times)/len(times)
+        return {"bw_gbps": round(tensor_bytes/avg/1e9,4), "latency_us": round(avg*1e6,2)}
+    except Exception: return {"bw_gbps":0}
