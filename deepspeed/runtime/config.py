@@ -1254,3 +1254,17 @@ def desloc_get_preset(name):
     """Get experiment preset. Returns None if invalid."""
     return DESLOC_PRESETS.get(name)
 # End M259
+
+
+# M281: Auto Kx recommendation
+def desloc_auto_recommend_Kx(gpu="A6000", model="125M", target_pct=5.0):
+    import math
+    gpus = {"A6000":{"tf":38.7,"bw":768},"H100":{"tf":989.4,"bw":3352}}
+    models = {"125M":124439808,"350M":354823168,"1.3B":1315692544}
+    s = gpus.get(gpu, gpus["A6000"])
+    p = models.get(model, models["125M"])
+    comm_s = 2*p*2/(s["bw"]*1e9)
+    comp_s = 6*p*4*1024/(s["tf"]*1e12)
+    tgt = comp_s*target_pct/100
+    Kx = max(1, int(math.ceil(comm_s/tgt))) if tgt > 0 else 1
+    return {"Kx":Kx,"Ku":Kx*3,"Kv":Kx*6}
