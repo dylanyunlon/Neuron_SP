@@ -997,23 +997,33 @@ def desloc_measure_bandwidth(tensor_bytes=10000000, n_iters=5):
     except Exception: return {"bw_gbps":0}
 
 # M290 — Claude-19: HierarchicalAR + RingOptimizer
-class DeslocHierAR:
-    NV,PC,NT=0,1,2
-    __slots__=('Kx','Ku','Kv','bw','lt','log','bs','ops','st')
-    def __init__(s,Kx,Ku,Kv):s.Kx,s.Ku,s.Kv=max(1,Kx),max(1,Ku),max(1,Kv);s.bw={0:300e9,1:32e9,2:25e9/8};s.lt={0:.005,1:.01,2:.05};s.log=[];s.bs=s.ops=s.st=0
-    def sync(s,st,t):return st%s.Kx==0 if t=='x'else st%s.Ku==0 if t=='u'else st%s.Kv==0
-    def lvl(s,t,st):return s.NT if t=='x'else(s.PC if st%(s.Ku*4)!=0 else s.NT)if t=='u'else(s.PC if st%(s.Kv*8)!=0 else s.NT)
-    def est(s,sz,l):return(s.lt.get(l,.05)+sz/(s.bw.get(l,25e9/8)+1e-12))*1000
-    def step(s,st,mb):
-        s.st=st;t=0.
-        for tier in('x','u','v'):
-            if s.sync(st,tier)and mb.get(tier,0)>0:t+=s.est(mb[tier],s.lvl(tier,st));s.bs+=mb[tier];s.ops+=1
-        s.log.append((st,t));s.log=s.log[-5000:]if len(s.log)>10000 else s.log;return t
-    def report(s):return f"HierAR(Kx={s.Kx},Ku={s.Ku},Kv={s.Kv}): {s.bs/1e9:.2f}GB {s.ops}ops"
-class DeslocRingOpt:
-    __slots__=('nw','comp','st')
-    def __init__(s,nw=2):s.nw=max(1,nw);s.comp={'x':'none','u':'none','v':'fp16'};s.st={'o':0,'c':0}
-    def xfer(s,b):return 2*(s.nw-1)/s.nw*b if s.nw>1 else 0
-    def compress(s,b,t):c=b//2 if s.comp.get(t)=='fp16'else b;s.st['o']+=b;s.st['c']+=c;return c
-    def est(s,b,t,bw=25e9/8):c=s.compress(b,t);return(c/(bw+1e-12))*1000
-# M290: end
+
+
+# M306: Tier scheduling + comm tracking
+def desloc_should_ar(step, Kx, warmup=512):
+    if Kx <= 1 or step < warmup: return True
+    return (step % Kx) == 0
+
+def desloc_tier(tn, Kx=32, Ku=96, Kv=192):
+    n = tn.lower() if tn else ''
+    if 'exp_avg_sq' in n or 'moment2' in n: return (2, Kv)
+    elif 'exp_avg' in n or 'moment1' in n: return (1, Ku)
+    return (0, Kx)
+
+def desloc_budget(mp, Kx, Ku, Kv, steps):
+    pb = mp * 2; ddp = 3 * pb * steps; dl = pb * (steps / max(1, Kx) + steps / max(1, Ku) + steps / max(1, Kv))
+    return {'ddp': ddp, 'dl': round(dl), 'red': round(ddp / max(1, dl), 2)}
+
+class DeslocCommTracker:
+    def __init__(self, Kx=1, Ku=3, Kv=6):
+        self.Kx, self.Ku, self.Kv = Kx, Ku, Kv
+        self._s = {0: 0, 1: 0, 2: 0}; self._k = {0: 0, 1: 0, 2: 0}; self._n = 0
+    def sync(self, t, nb): self._s[t] = self._s.get(t, 0) + nb
+    def skip(self, t, nb): self._k[t] = self._k.get(t, 0) + nb
+    def step(self): self._n += 1
+    def stats(self):
+        ts = sum(self._s.values()); tk = sum(self._k.values())
+        return {'sent': ts, 'skip': tk, 'red': round((ts + tk) / max(1, ts), 2), 'n': self._n}
+    def state_dict(self): return {'s': dict(self._s), 'k': dict(self._k), 'n': self._n}
+    def load_state_dict(self, d): self._s = {int(k): v for k, v in d.get('s', {}).items()}; self._k = {int(k): v for k, v in d.get('k', {}).items()}; self._n = d.get('n', 0)
+# --- End M306 ---
