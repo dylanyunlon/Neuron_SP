@@ -3742,31 +3742,16 @@ def estimate_zero3_model_states_mem_needs_all_cold(total_params,
                                              zero_init=zero_init)
                 print(f" {cpu_mem/2**30:7.2f}GB | {gpu_mem/2**30:6.2f}GB | {options_str}")
 
-def desloc_z3_kx_gate():
-    """Gate Z3 allgather by Kx period."""
-    engine = getattr(self, "deepspeed_engine", None)
-    if engine is None or not getattr(engine, "desloc_enabled", False):
+
+# =========================================================================
+# DES-LOC ZeRO-3 gating (Algorithm 1 + Section 4.1)
+# =========================================================================
+
+def desloc_z3_should_allgather(engine):
+    """Gate Z3 allgather by Kx period.
+    Kx=1 always returns True (standard Z3 behavior)."""
+    if engine is None or not getattr(engine, 'desloc_enabled', False):
         return True
-    return engine.global_steps % engine.desloc_Kx == 0
-
-
-def desloc_z3_sync_states():
-    """Sync exp_avg/exp_avg_sq at Ku/Kv boundaries."""
-    engine = getattr(self, "deepspeed_engine", None)
-    if engine is None or not getattr(engine, "desloc_enabled", False):
-        return
-    import deepspeed.comm as dist
-    dp = engine.mpu.get_data_parallel_group() if engine.mpu else None
-    ws = dist.get_world_size(group=dp)
-    for pg in self.optimizer.param_groups:
-        for p in pg["params"]:
-            if p not in self.optimizer.state:
-                continue
-            s = self.optimizer.state[p]
-            if engine.global_steps % engine.desloc_Ku == 0 and "exp_avg" in s:
-                dist.all_reduce(s["exp_avg"], group=dp)
-                s["exp_avg"].div_(ws)
-            if engine.global_steps % engine.desloc_Kv == 0 and "exp_avg_sq" in s:
-                dist.all_reduce(s["exp_avg_sq"], group=dp)
-                s["exp_avg_sq"].div_(ws)
-
+    if engine.desloc_Kx <= 1:
+        return True
+    return engine.desloc_step % engine.desloc_Kx == 0
