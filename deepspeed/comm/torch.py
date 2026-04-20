@@ -813,3 +813,228 @@ class DeslocNesterovOuterOptimizer:
     def load_state_dict(self, sd):
         self._mu = sd.get('mu', self._mu)
         self._lr = sd.get('lr', self._lr)
+
+# --- DES-LOC NCCL Hooks (M145) ---
+import time as _t145
+class DeslocNCCLProfiler:
+    def __init__(self):
+        from collections import defaultdict as dd
+        self._times=dd(list);self._bytes=dd(int);self._counts=dd(int)
+    def record(self,op,nb,el): self._counts[op]+=1;self._bytes[op]+=nb;self._times[op].append(el*1000)
+    def summary(self):
+        s={}
+        for op in self._counts:
+            t=self._times[op];n=self._counts[op];avg=sum(t)/len(t) if t else 0
+            bw=(self._bytes[op]/n)/(avg/1000)/1e9 if avg>0 and n>0 else 0
+            s[op]={'count':n,'avg_ms':round(avg,3),'bw_gbps':round(bw,2)}
+        return s
+    def export_csv(self,path):
+        lines=['op,count,avg_ms,bw_gbps']
+        for op,s in self.summary().items(): lines.append(f"{op},{s['count']},{s['avg_ms']},{s['bw_gbps']}")
+        with open(path,'w') as f: f.write('\n'.join(lines))
+class DeslocNCCLWrapper:
+    def __init__(self,backend,profiler=None):
+        from collections import defaultdict as dd
+        self.backend=backend;self.profiler=profiler or DeslocNCCLProfiler();self._bytes=dd(int);self._skips=dd(int)
+    def all_reduce(self,tensor,tier='x',op=None,group=None,async_op=False):
+        from deepspeed.comm.comm import desloc_should_sync
+        if not desloc_should_sync(tier): self._skips[tier]+=1;return None,False
+        import torch.distributed as td
+        if op is None:
+            try: op=td.ReduceOp.AVG
+            except: op=td.ReduceOp.SUM
+        nb=tensor.numel()*tensor.element_size();t0=_t145.monotonic()
+        h=self.backend.all_reduce(tensor,op=op,group=group,async_op=async_op)
+        self._bytes[tier]+=nb;self.profiler.record(f'ar_{tier}',nb,_t145.monotonic()-t0);return h,True
+    def get_reduction(self):
+        total=sum(self._bytes.values());skip_est=sum(self._skips[t] for t in self._bytes)
+        return round((total+skip_est)/max(total,1),2)
+class DeslocBandwidthEstimator:
+    SIZES=[1024,16384,262144,4194304]
+    @staticmethod
+    def probe(group=None):
+        import torch,torch.distributed as td
+        results=[];dev='cuda' if torch.cuda.is_available() else 'cpu'
+        for sz in DeslocBandwidthEstimator.SIZES:
+            t=torch.zeros(sz//4,dtype=torch.float32,device=dev);td.barrier(group=group)
+            t0=_t145.monotonic()
+            for _ in range(3): td.all_reduce(t,group=group)
+            el=(_t145.monotonic()-t0)/3;bw=sz*2/max(el,1e-9)/1e9;results.append((sz,round(bw,2)));del t
+        return results
+_desloc_nccl_wrap=None
+def init_desloc_nccl(backend,profiler=None):
+    global _desloc_nccl_wrap;_desloc_nccl_wrap=DeslocNCCLWrapper(backend,profiler);return _desloc_nccl_wrap
+def get_desloc_nccl(): return _desloc_nccl_wrap
+
+
+# =============================================================================
+# M240 (Claude-15): AllReduce latency vs data volume curve for Figure 2
+# Ref: NCCL benchmark — latency = α + β*N (linear model)
+# Ref: Nick Joseph — "bandwidth bottleneck vs compute bottleneck"
+# Ref: Section 5.3 — comm overhead as function of message size
+# =============================================================================
+
+
+class DeslocAllReduceLatencyModel:
+    """Model AllReduce latency as function of message size.
+
+    From NCCL: AllReduce latency = α (startup) + N/β (bandwidth).
+    For ring AllReduce: α_ring = 2(P-1)·α, β_ring = 2(P-1)/P · N/β.
+
+    This model collects (message_size, latency) pairs from actual
+    AllReduce calls and fits the linear model for Figure 2 annotation.
+
+    Knowing the latency model enables predicting the optimal Kx:
+    if Kx·compute_time > AllReduce_latency, comm is hidden.
+
+    Usage:
+        model = DeslocAllReduceLatencyModel()
+        for each allreduce:
+            model.record(message_bytes, latency_us)
+        alpha, beta = model.fit()
+        predicted_us = model.predict(new_message_bytes)
+    """
+
+    def __init__(self, max_samples=5000):
+        self._sizes = []      # message sizes in bytes
+        self._latencies = []  # latencies in microseconds
+        self._max_samples = max_samples
+        self._alpha = None    # fitted startup latency (us)
+        self._beta = None     # fitted bandwidth (us/byte)
+        self._fitted = False
+
+    def record(self, message_bytes, latency_us):
+        """Record one AllReduce measurement.
+
+        Args:
+            message_bytes: int — total bytes reduced
+            latency_us: float — wall-clock latency in microseconds
+        """
+        if len(self._sizes) >= self._max_samples:
+            self._sizes.pop(0)
+            self._latencies.pop(0)
+        self._sizes.append(int(message_bytes))
+        self._latencies.append(float(latency_us))
+        self._fitted = False
+
+    def fit(self):
+        """Fit linear model: latency = alpha + beta * bytes.
+
+        Uses least-squares (pure python, no numpy).
+        Returns: (alpha, beta) tuple.
+        """
+        n = len(self._sizes)
+        if n < 2:
+            self._alpha = 0
+            self._beta = 0
+            self._fitted = True
+            return (0, 0)
+        # Pure-python least squares: y = a + b*x
+        sx = sum(self._sizes)
+        sy = sum(self._latencies)
+        sxx = sum(x * x for x in self._sizes)
+        sxy = sum(x * y for x, y in zip(self._sizes, self._latencies))
+        denom = n * sxx - sx * sx
+        if abs(denom) < 1e-12:
+            self._alpha = sy / n
+            self._beta = 0
+        else:
+            self._beta = (n * sxy - sx * sy) / denom
+            self._alpha = (sy - self._beta * sx) / n
+        self._alpha = max(0, self._alpha)
+        self._beta = max(0, self._beta)
+        self._fitted = True
+        return (self._alpha, self._beta)
+
+    def predict(self, message_bytes):
+        """Predict latency for given message size.
+
+        Returns: float — predicted latency in microseconds.
+        """
+        if not self._fitted:
+            self.fit()
+        return self._alpha + self._beta * message_bytes
+
+    def get_effective_bandwidth_gbps(self):
+        """Compute effective bandwidth from fitted model.
+
+        bandwidth = 1 / beta (bytes/us = MB/s → convert to Gb/s)
+        """
+        if not self._fitted:
+            self.fit()
+        if self._beta <= 0:
+            return 0.0
+        bw_bytes_per_us = 1.0 / self._beta
+        bw_gbps = bw_bytes_per_us * 8 / 1e3  # bytes/us → Gb/s
+        return round(bw_gbps, 2)
+
+    def get_optimal_kx(self, compute_time_us, message_bytes):
+        """Compute minimum Kx to hide communication.
+
+        Kx should be large enough that:
+            Kx * compute_time >= allreduce_latency
+        → Kx >= allreduce_latency / compute_time
+
+        Returns: int — recommended Kx (power of 2).
+        """
+        import math
+        lat = self.predict(message_bytes)
+        if compute_time_us <= 0:
+            return 1
+        ratio = lat / compute_time_us
+        if ratio <= 1:
+            return 1
+        kx = 2 ** math.ceil(math.log2(ratio))
+        return min(256, max(1, kx))
+
+    def get_figure2_annotation(self, message_bytes):
+        """Get annotation string for Figure 2.
+
+        Returns: str like "AllReduce 250MB: 12.3ms (α=50µs, BW=25Gb/s)"
+        """
+        lat = self.predict(message_bytes)
+        bw = self.get_effective_bandwidth_gbps()
+        mb = message_bytes / (1024**2)
+        return (f'AllReduce {mb:.0f}MB: {lat/1000:.3f}ms '
+                f'(α={self._alpha:.0f}µs, BW={bw:.1f}Gb/s)')
+
+    def emit_nkifa_log(self, stream=None):
+        """Write latency model in NKI-FA format."""
+        def _w(line):
+            if stream: stream.write(line + '\n')
+            else: print(line)
+        if not self._fitted:
+            self.fit()
+        _w('### allreduce_latency_model ###')
+        _w(f'alpha_us: {self._alpha:.2f}')
+        _w(f'beta_us_per_byte: {self._beta:.10f}')
+        _w(f'effective_bw_gbps: {self.get_effective_bandwidth_gbps():.2f}')
+        _w(f'n_samples: {len(self._sizes)}')
+        if self._sizes:
+            _w(f'min_msg_bytes: {min(self._sizes)}')
+            _w(f'max_msg_bytes: {max(self._sizes)}')
+            _w(f'min_latency_us: {min(self._latencies):.2f}')
+            _w(f'max_latency_us: {max(self._latencies):.2f}')
+
+    def get_latency_curve_data(self, msg_sizes=None):
+        """Generate (message_size, predicted_latency) for plotting.
+
+        Returns: (sizes_mb, latencies_ms) lists.
+        For overlaying on Figure 2 as inset plot.
+        """
+        if msg_sizes is None:
+            msg_sizes = [1e6, 5e6, 10e6, 50e6, 100e6, 250e6, 500e6, 1e9]
+        sizes_mb = [s / (1024**2) for s in msg_sizes]
+        lats_ms = [self.predict(int(s)) / 1000 for s in msg_sizes]
+        return sizes_mb, lats_ms
+
+    def state_dict(self):
+        if not self._fitted:
+            self.fit()
+        return {'alpha': self._alpha, 'beta': self._beta,
+                'n': len(self._sizes)}
+
+    def load_state_dict(self, sd):
+        self._alpha = sd.get('alpha', 0)
+        self._beta = sd.get('beta', 0)
+        self._fitted = True
