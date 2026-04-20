@@ -415,3 +415,183 @@ class DeslocAdamHyperparamScaler:
             'base_beta2': self.base_beta2,
             'lr_table': self.get_lr_table(),
         }
+
+
+# =============================================================================
+# M234 (Claude-15): Adam vs ADOPT loss comparison data for Figure 6
+# Ref: Section 5.6 — DES-LOC with Adam vs ADOPT vs Muon
+# Ref: Algorithm 2 — ADOPT modifies update to guarantee convergence for any β2
+# Ref: NKI-FA da964f3 — structured comparison data
+# =============================================================================
+
+
+class DeslocOptimizerComparisonLogger:
+    """Log optimizer comparison data for Figure 6.
+
+    Tracks per-step metrics for Adam, ADOPT, and Muon variants
+    under the same DES-LOC configuration, enabling side-by-side
+    loss curve comparison.
+
+    From Section 5.6: DES-LOC is inner-optimizer-agnostic.
+    ADOPT guarantees convergence for any β2, while Adam requires β1 < √β2.
+    Muon uses SVD preconditioning instead of second moments.
+
+    From NKI-FA: each optimizer variant produces its own log block
+    with '### optimizer = adam, Kx = 32 ###' header.
+
+    Usage:
+        logger = DeslocOptimizerComparisonLogger()
+        logger.begin_experiment('adam', Kx=32, Ku=96, Kv=192)
+        for step in training:
+            logger.record(step, loss=loss.item(), grad_norm=gn)
+        logger.end_experiment()
+    """
+
+    def __init__(self):
+        self._experiments = {}
+        self._current_key = None
+        self._current_data = None
+
+    def begin_experiment(self, optimizer_name, Kx=32, Ku=96, Kv=192,
+                         model_size='125M', seed=42):
+        """Start recording for one optimizer variant.
+
+        Args:
+            optimizer_name: 'adam', 'adopt', 'muon'
+            Kx, Ku, Kv: DES-LOC sync periods
+            model_size: model parameter count label
+            seed: random seed
+        """
+        key = (optimizer_name, Kx, model_size, seed)
+        self._current_key = key
+        self._current_data = {
+            'optimizer': optimizer_name,
+            'Kx': Kx, 'Ku': Ku, 'Kv': Kv,
+            'model_size': model_size, 'seed': seed,
+            'steps': [], 'losses': [], 'grad_norms': [],
+            'lr_values': [], 'step_times_ms': [],
+        }
+
+    def record(self, step, loss=None, grad_norm=None, lr=None,
+               step_time_ms=None):
+        """Record one training step."""
+        if self._current_data is None:
+            return
+        self._current_data['steps'].append(step)
+        if loss is not None:
+            self._current_data['losses'].append(float(loss))
+        if grad_norm is not None:
+            self._current_data['grad_norms'].append(float(grad_norm))
+        if lr is not None:
+            self._current_data['lr_values'].append(float(lr))
+        if step_time_ms is not None:
+            self._current_data['step_times_ms'].append(float(step_time_ms))
+
+    def end_experiment(self):
+        """Finalize current experiment and store."""
+        if self._current_key is not None and self._current_data is not None:
+            self._experiments[self._current_key] = self._current_data
+        self._current_key = None
+        self._current_data = None
+
+    def get_figure6_data(self):
+        """Extract Figure 6 comparison data.
+
+        Returns: dict {optimizer_label: {
+            'final_loss': float,
+            'min_loss': float,
+            'convergence_step': int,  # step where loss < threshold
+            'loss_curve': [(step, loss)],
+            'avg_step_ms': float,
+        }}
+        """
+        result = {}
+        for key, data in self._experiments.items():
+            opt_name = data['optimizer']
+            kx = data['Kx']
+            label = f'{opt_name.upper()} (Kx={kx})'
+            losses = data['losses']
+            if not losses:
+                continue
+            # Find convergence step (loss within 5% of minimum)
+            min_loss = min(losses)
+            threshold = min_loss * 1.05
+            conv_step = len(losses)
+            for i, l in enumerate(losses):
+                if l <= threshold:
+                    conv_step = data['steps'][i] if i < len(data['steps']) else i
+                    break
+            avg_ms = 0.0
+            if data['step_times_ms']:
+                avg_ms = sum(data['step_times_ms']) / len(data['step_times_ms'])
+            result[label] = {
+                'final_loss': round(losses[-1], 6),
+                'min_loss': round(min_loss, 6),
+                'convergence_step': conv_step,
+                'loss_curve': list(zip(data['steps'][:len(losses)], losses)),
+                'avg_step_ms': round(avg_ms, 3),
+                'n_steps': len(losses),
+                'optimizer': opt_name,
+                'Kx': kx,
+            }
+        return result
+
+    def emit_nkifa_log(self, output_path=None):
+        """Write all experiments in NKI-FA format.
+
+        Each experiment block:
+            ### optimizer = adam, Kx = 32, model = 125M ###
+            step: 0 | loss: 10.234567
+            ...
+        """
+        blocks = []
+        for key, data in sorted(self._experiments.items()):
+            lines = [f'### optimizer = {data["optimizer"]}, '
+                     f'Kx = {data["Kx"]}, Ku = {data["Ku"]}, '
+                     f'Kv = {data["Kv"]}, '
+                     f'model = {data["model_size"]} ###']
+            for i, step in enumerate(data['steps']):
+                parts = [f'step: {step}']
+                if i < len(data['losses']):
+                    parts.append(f'loss: {data["losses"][i]:.6f}')
+                if i < len(data['grad_norms']):
+                    parts.append(f'grad_norm: {data["grad_norms"][i]:.6f}')
+                lines.append(' | '.join(parts))
+            # Summary
+            if data['losses']:
+                lines.append('')
+                lines.append('--- summary ---')
+                lines.append(f'final_loss: {data["losses"][-1]:.6f}')
+                lines.append(f'min_loss: {min(data["losses"]):.6f}')
+                lines.append(f'total_steps: {len(data["losses"])}')
+                lines.append('--- end summary ---')
+            blocks.append('\n'.join(lines))
+        content = '\n\n'.join(blocks)
+        if output_path:
+            with open(output_path, 'w') as f:
+                f.write(content)
+        return content
+
+    def get_comparison_table(self, fmt='md'):
+        """Generate comparison table across optimizers.
+
+        Ref: NKI-FA — exact value annotations.
+        """
+        fig6 = self.get_figure6_data()
+        if fmt == 'latex':
+            lines = [r'\begin{tabular}{lccccc}', r'\toprule',
+                     r'Optimizer & $K_x$ & Final Loss & Min Loss & Conv Step & Step (ms) \\',
+                     r'\midrule']
+            for label, d in sorted(fig6.items()):
+                lines.append(f'{d["optimizer"]} & {d["Kx"]} & '
+                             f'{d["final_loss"]:.6f} & {d["min_loss"]:.6f} & '
+                             f'{d["convergence_step"]} & {d["avg_step_ms"]:.3f} \\\\')
+            lines.extend([r'\bottomrule', r'\end{tabular}'])
+        else:
+            lines = ['| Optimizer | Kx | Final Loss | Min Loss | Conv Step | Step (ms) |',
+                     '|---|---|---|---|---|---|']
+            for label, d in sorted(fig6.items()):
+                lines.append(f'| {d["optimizer"]} | {d["Kx"]} | '
+                             f'{d["final_loss"]:.6f} | {d["min_loss"]:.6f} | '
+                             f'{d["convergence_step"]} | {d["avg_step_ms"]:.3f} |')
+        return '\n'.join(lines)
