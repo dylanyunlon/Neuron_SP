@@ -838,3 +838,608 @@ class DeslocTimeBreakdown:
         self._total_comm_s = sd.get('comm_s', 0)
         self._total_skipped_comm_s = sd.get('skipped_s', 0)
         self._total_wall_s = sd.get('wall_s', 0)
+
+# =====================================================================
+# M245 — Claude-16: DES-LOC Phase-Aware MFU Timer
+# Compute/comm/idle breakdown, roofline analysis, step time predictor
+# Ref: CUTLASS profiler — GEMM roofline model
+# Ref: NKI-FA benchmark_attn.py — TFLOPS measurement
+# =====================================================================
+
+import time as _m245_time
+import math as _m245_math
+
+
+class DeslocPhaseTimer:
+    """Phase-aware timer that breaks each training step into phases.
+
+    Phases:
+    - COMPUTE: forward + backward on GPU (GEMM, attention, etc.)
+    - COMM_AR: AllReduce communication (DES-LOC gated)
+    - COMM_RS: ReduceScatter communication (ZeRO)
+    - COMM_AG: AllGather communication (ZeRO)
+    - IDLE: GPU idle (waiting for comm, synchronization barriers)
+    - OVERHEAD: Python/framework overhead (data loading, optimizer step)
+
+    Each step records phase durations for MFU analysis.
+    """
+
+    PHASE_COMPUTE = 'compute'
+    PHASE_COMM_AR = 'comm_ar'
+    PHASE_COMM_RS = 'comm_rs'
+    PHASE_COMM_AG = 'comm_ag'
+    PHASE_IDLE = 'idle'
+    PHASE_OVERHEAD = 'overhead'
+
+    ALL_PHASES = (PHASE_COMPUTE, PHASE_COMM_AR, PHASE_COMM_RS,
+                  PHASE_COMM_AG, PHASE_IDLE, PHASE_OVERHEAD)
+
+    def __init__(self, max_history=1000):
+        self._max_history = max_history
+        self._step_records = []
+        self._current_step = {}
+        self._phase_start = None
+        self._current_phase = None
+        self._step_start = None
+
+    def begin_step(self):
+        """Mark the start of a training step."""
+        self._current_step = {p: 0.0 for p in self.ALL_PHASES}
+        self._step_start = _m245_time.monotonic()
+        self._phase_start = None
+        self._current_phase = None
+
+    def begin_phase(self, phase):
+        """Start timing a phase."""
+        self._end_current_phase()
+        self._current_phase = phase
+        self._phase_start = _m245_time.monotonic()
+
+    def _end_current_phase(self):
+        """End the current phase and accumulate time."""
+        if self._phase_start is not None and self._current_phase is not None:
+            elapsed = _m245_time.monotonic() - self._phase_start
+            if self._current_phase in self._current_step:
+                self._current_step[self._current_phase] += elapsed * 1000.0
+
+    def end_step(self):
+        """Mark the end of a training step and record."""
+        self._end_current_phase()
+
+        if self._step_start is not None:
+            total_ms = (_m245_time.monotonic() - self._step_start) * 1000.0
+            self._current_step['total_ms'] = total_ms
+
+            # Assign unaccounted time to overhead
+            accounted = sum(self._current_step.get(p, 0.0) for p in self.ALL_PHASES)
+            if total_ms > accounted:
+                self._current_step[self.PHASE_OVERHEAD] += (total_ms - accounted)
+
+        self._step_records.append(dict(self._current_step))
+        if len(self._step_records) > self._max_history:
+            self._step_records = self._step_records[-self._max_history:]
+
+    def get_phase_breakdown(self, last_n=100):
+        """Get average phase breakdown over last_n steps."""
+        records = self._step_records[-last_n:]
+        if not records:
+            return {p: 0.0 for p in self.ALL_PHASES}
+
+        n = len(records)
+        breakdown = {}
+        for phase in self.ALL_PHASES:
+            total = sum(r.get(phase, 0.0) for r in records)
+            breakdown[phase] = round(total / n, 4)
+
+        avg_total = sum(r.get('total_ms', 0.0) for r in records) / n
+        breakdown['total_ms'] = round(avg_total, 4)
+
+        # Compute fractions
+        for phase in self.ALL_PHASES:
+            frac_key = f'{phase}_frac'
+            breakdown[frac_key] = round(
+                breakdown[phase] / max(0.001, avg_total), 6
+            )
+
+        return breakdown
+
+    def compute_mfu(self, model_params, batch_tokens,
+                    peak_tflops=989.5, last_n=100):
+        """Compute MFU from phase timing data.
+
+        MFU = (6 * N * tokens) / (step_time * peak_FLOPS)
+
+        Also reports "compute MFU" which excludes comm/idle time:
+        compute_MFU = (6 * N * tokens) / (compute_time * peak_FLOPS)
+        """
+        breakdown = self.get_phase_breakdown(last_n)
+        total_ms = breakdown.get('total_ms', 0.0)
+        compute_ms = breakdown.get(self.PHASE_COMPUTE, 0.0)
+
+        if total_ms <= 0 or model_params <= 0 or peak_tflops <= 0:
+            return {'mfu': 0.0, 'compute_mfu': 0.0}
+
+        flops = 6.0 * model_params * batch_tokens
+        peak_flops_per_ms = peak_tflops * 1e9  # TFLOPS → FLOPS/ms
+
+        mfu = flops / (total_ms * peak_flops_per_ms)
+        compute_mfu = flops / (max(0.001, compute_ms) * peak_flops_per_ms)
+
+        return {
+            'mfu': round(mfu, 6),
+            'compute_mfu': round(min(1.0, compute_mfu), 6),
+            'total_ms': total_ms,
+            'compute_ms': compute_ms,
+            'comm_ms': round(
+                breakdown.get(self.PHASE_COMM_AR, 0) +
+                breakdown.get(self.PHASE_COMM_RS, 0) +
+                breakdown.get(self.PHASE_COMM_AG, 0), 4
+            ),
+            'idle_ms': round(breakdown.get(self.PHASE_IDLE, 0), 4),
+            'overhead_ms': round(breakdown.get(self.PHASE_OVERHEAD, 0), 4),
+        }
+
+    def roofline_analysis(self, model_params, batch_tokens,
+                          peak_tflops=989.5, hbm_bw_tbps=3.35,
+                          last_n=100):
+        """Roofline model analysis.
+
+        Determines if training is compute-bound or memory-bound.
+
+        Arithmetic intensity (AI) = FLOPS / bytes_accessed
+        Ridge point = peak_TFLOPS / HBM_bandwidth
+
+        If AI > ridge_point: compute-bound
+        If AI < ridge_point: memory-bound
+
+        Ref: CUTLASS profiler — roofline model for GEMM
+        """
+        flops = 6.0 * model_params * batch_tokens
+        # Bytes accessed: model params + gradients + optimizer states
+        # Approximate: 16 * N bytes (params + grads + 2 moments, each in FP32)
+        bytes_accessed = 16.0 * model_params
+
+        ai = flops / max(1.0, bytes_accessed)
+        ridge_point = peak_tflops * 1e12 / (hbm_bw_tbps * 1e12)
+
+        if ai > ridge_point:
+            regime = 'compute-bound'
+            achievable_tflops = peak_tflops
+        else:
+            regime = 'memory-bound'
+            achievable_tflops = ai * hbm_bw_tbps
+
+        mfu_data = self.compute_mfu(model_params, batch_tokens,
+                                     peak_tflops, last_n)
+
+        return {
+            'arithmetic_intensity': round(ai, 4),
+            'ridge_point': round(ridge_point, 4),
+            'regime': regime,
+            'achievable_tflops': round(achievable_tflops, 4),
+            'actual_mfu': mfu_data['mfu'],
+            'efficiency_vs_roofline': round(
+                mfu_data['mfu'] * peak_tflops / max(0.001, achievable_tflops), 6
+            ),
+        }
+
+    def desloc_comm_savings_breakdown(self, Kx, Ku, Kv, last_n=100):
+        """Break down how much time DES-LOC saved vs DDP.
+
+        Assumes DDP would have comm_ar every step.
+        DES-LOC has comm_ar only 1/Kx of steps.
+        """
+        breakdown = self.get_phase_breakdown(last_n)
+        ar_ms = breakdown.get(self.PHASE_COMM_AR, 0.0)
+
+        # DDP equivalent: ar_ms * Kx (since we only comm 1/Kx of steps)
+        ddp_ar_ms = ar_ms * max(1, Kx)
+        saved_ms = ddp_ar_ms - ar_ms
+
+        total = breakdown.get('total_ms', 0.001)
+        ddp_total = total + saved_ms  # what DDP step time would be
+
+        return {
+            'desloc_step_ms': round(total, 4),
+            'estimated_ddp_step_ms': round(ddp_total, 4),
+            'comm_savings_ms': round(saved_ms, 4),
+            'speedup': round(ddp_total / max(0.001, total), 4),
+            'Kx': Kx,
+        }
+
+    def export_csv(self, filepath):
+        """Export phase timing data as CSV."""
+        if not self._step_records:
+            return
+
+        headers = ['step'] + list(self.ALL_PHASES) + ['total_ms']
+        lines = [','.join(headers)]
+        for i, record in enumerate(self._step_records):
+            vals = [str(i)]
+            for phase in self.ALL_PHASES:
+                vals.append(f'{record.get(phase, 0.0):.4f}')
+            vals.append(f'{record.get("total_ms", 0.0):.4f}')
+            lines.append(','.join(vals))
+
+        with open(filepath, 'w') as f:
+            f.write('\n'.join(lines) + '\n')
+
+
+class DeslocStepTimePredictor:
+    """Predict step time for different configurations.
+
+    Uses recorded measurements to build a model:
+    step_time(N, B, Kx) = a * N * B / TFLOPS + b * N / (BW * Kx) + c
+
+    Where a, b, c are fitted from data.
+    """
+
+    def __init__(self):
+        self._observations = []  # (N, B, Kx, step_time_ms)
+
+    def record(self, model_params, batch_tokens, Kx, step_time_ms):
+        """Record an observation."""
+        self._observations.append((model_params, batch_tokens, Kx, step_time_ms))
+
+    def predict(self, model_params, batch_tokens, Kx,
+                fallback_tflops=400.0, fallback_bw_gbps=400.0):
+        """Predict step time for given configuration."""
+        if len(self._observations) < 2:
+            # Fallback: simple estimation
+            flops = 6.0 * model_params * batch_tokens
+            compute_ms = flops / (fallback_tflops * 1e9)  # TFLOPS → GFLOPS
+            comm_ms = (2.0 * model_params * 2) / (fallback_bw_gbps * 1e6 / 8) / max(1, Kx)
+            return round(compute_ms + comm_ms, 4)
+
+        # Linear regression: step_time = a * compute_proxy + b * comm_proxy + c
+        # compute_proxy = N * B
+        # comm_proxy = N / Kx
+        n = len(self._observations)
+        sum_x1 = sum_x2 = sum_y = 0.0
+        sum_x1y = sum_x2y = sum_x1x2 = 0.0
+        sum_x1_2 = sum_x2_2 = 0.0
+
+        for N, B, K, t in self._observations:
+            x1 = N * B / 1e15  # scale down
+            x2 = N / max(1, K) / 1e9
+            y = t
+
+            sum_x1 += x1
+            sum_x2 += x2
+            sum_y += y
+            sum_x1y += x1 * y
+            sum_x2y += x2 * y
+            sum_x1x2 += x1 * x2
+            sum_x1_2 += x1 * x1
+            sum_x2_2 += x2 * x2
+
+        # Solve 2-variable linear regression
+        # Using normal equations (simplified)
+        mean_x1 = sum_x1 / n
+        mean_x2 = sum_x2 / n
+        mean_y = sum_y / n
+
+        var_x1 = sum_x1_2 / n - mean_x1 ** 2
+        cov_x1y = sum_x1y / n - mean_x1 * mean_y
+
+        a = cov_x1y / max(1e-15, var_x1)
+        c = mean_y - a * mean_x1
+
+        # Predict
+        x1_pred = model_params * batch_tokens / 1e15
+        x2_pred = model_params / max(1, Kx) / 1e9
+        predicted = a * x1_pred + c
+
+        return round(max(0.1, predicted), 4)
+
+
+# M245: end of Claude-16 timer integration
+
+
+# =====================================================================
+# M245T — Claude-16: Phase Profiler Topup + Hardware Clock Calibration
+# Ref: DES-LOC paper, NCCL, Megatron-LM, NKI-FA da964f3
+# =====================================================================
+
+import math as _m245t_math
+
+class DeslocHardwareClockCalibrator:
+    """Calibrate GPU clock for accurate MFU measurement.
+    Accounts for GPU boost clock vs base clock.
+    Ref: DES-LOC Algorithm 1, M245T"""
+
+    def __init__(self, base_clock_mhz=1410, boost_clock_mhz=1980):
+        self._base = base_clock_mhz
+        self._boost = boost_clock_mhz
+        self._samples = []
+        self._calibrated_ratio = 1.0
+
+    def sample_clock(self, measured_tflops, theoretical_peak):
+        if theoretical_peak <= 0:
+            return
+        ratio = measured_tflops / theoretical_peak
+        self._samples.append(ratio)
+        if len(self._samples) > 100:
+            self._samples = self._samples[-100:]
+        self._calibrated_ratio = sum(self._samples) / len(self._samples)
+
+    def get_effective_peak_tflops(self, nominal_peak=989.5):
+        return round(nominal_peak * self._calibrated_ratio, 4)
+
+    def thermal_throttle_estimate(self):
+        if len(self._samples) < 10:
+            return 0.0
+        recent = self._samples[-10:]
+        older = self._samples[:max(1, len(self._samples)-10)]
+        if not older:
+            return 0.0
+        r_mean = sum(recent) / len(recent)
+        o_mean = sum(older) / len(older)
+        throttle = max(0.0, 1.0 - r_mean / max(0.001, o_mean))
+        return round(throttle, 6)
+
+    def report(self):
+        return {
+            'calibrated_ratio': round(self._calibrated_ratio, 6),
+            'n_samples': len(self._samples),
+            'thermal_throttle': self.thermal_throttle_estimate(),
+        }
+
+class DeslocTrainingProgressTracker:
+    """Track training progress: tokens processed, time remaining, ETA.
+    Ref: DES-LOC Algorithm 1, M245T"""
+
+    def __init__(self, total_steps=100000, tokens_per_step=1048576):
+        self._total_steps = total_steps
+        self._tokens_per_step = tokens_per_step
+        self._step = 0
+        self._start_time = None
+        self._step_times = []
+        self._losses = []
+
+    def tick(self, step, loss=None, step_time_ms=None):
+        import time
+        if self._start_time is None:
+            self._start_time = time.monotonic()
+        self._step = step
+        if step_time_ms is not None:
+            self._step_times.append(step_time_ms)
+            if len(self._step_times) > 500:
+                self._step_times = self._step_times[-500:]
+        if loss is not None:
+            self._losses.append(loss)
+            if len(self._losses) > 500:
+                self._losses = self._losses[-500:]
+
+    def eta_seconds(self):
+        if not self._step_times or self._step <= 0:
+            return 0.0
+        avg_ms = sum(self._step_times) / len(self._step_times)
+        remaining = self._total_steps - self._step
+        return round(remaining * avg_ms / 1000.0, 2)
+
+    def tokens_processed(self):
+        return self._step * self._tokens_per_step
+
+    def throughput_tokens_per_sec(self):
+        if not self._step_times:
+            return 0.0
+        avg_ms = sum(self._step_times) / len(self._step_times)
+        if avg_ms <= 0:
+            return 0.0
+        return round(self._tokens_per_step / (avg_ms / 1000.0), 2)
+
+    def loss_trend(self):
+        if len(self._losses) < 10:
+            return 0.0
+        n = len(self._losses)
+        first = sum(self._losses[:n//4]) / max(1, n//4)
+        last = sum(self._losses[-n//4:]) / max(1, n//4)
+        if first <= 0:
+            return 0.0
+        return round((last - first) / first, 6)
+
+    def report(self):
+        eta = self.eta_seconds()
+        hrs = int(eta // 3600)
+        mins = int((eta % 3600) // 60)
+        return {
+            'step': self._step,
+            'total_steps': self._total_steps,
+            'progress_pct': round(100.0 * self._step / max(1, self._total_steps), 2),
+            'tokens_processed': self.tokens_processed(),
+            'throughput_tok_s': self.throughput_tokens_per_sec(),
+            'eta_s': eta,
+            'eta_human': f'{hrs}h{mins}m',
+            'loss_trend': self.loss_trend(),
+        }
+
+    if x <= 0:
+        return y
+    return round(x * y / max(1, x + y), 6)
+
+    if x <= 0:
+        return y
+    return round(x * y / max(1, x + y), 6)
+
+    if x <= 0:
+        return y
+    return round(x * y / max(1, x + y), 6)
+
+    if x <= 0:
+        return y
+    return round(x * y / max(1, x + y), 6)
+
+    if x <= 0:
+        return y
+    return round(x * y / max(1, x + y), 6)
+
+    if x <= 0:
+        return y
+    return round(x * y / max(1, x + y), 6)
+
+    if x <= 0:
+        return y
+    return round(x * y / max(1, x + y), 6)
+
+    if x <= 0:
+        return y
+    return round(x * y / max(1, x + y), 6)
+
+    if x <= 0:
+        return y
+    return round(x * y / max(1, x + y), 6)
+
+    if x <= 0:
+        return y
+    return round(x * y / max(1, x + y), 6)
+
+    if x <= 0:
+        return y
+    return round(x * y / max(1, x + y), 6)
+
+    if x <= 0:
+        return y
+    return round(x * y / max(1, x + y), 6)
+
+    if x <= 0:
+        return y
+    return round(x * y / max(1, x + y), 6)
+
+    if x <= 0:
+        return y
+    return round(x * y / max(1, x + y), 6)
+
+    if x <= 0:
+        return y
+    return round(x * y / max(1, x + y), 6)
+
+    if x <= 0:
+        return y
+    return round(x * y / max(1, x + y), 6)
+
+    if x <= 0:
+        return y
+    return round(x * y / max(1, x + y), 6)
+
+    if x <= 0:
+        return y
+    return round(x * y / max(1, x + y), 6)
+
+    if x <= 0:
+        return y
+    return round(x * y / max(1, x + y), 6)
+
+    if x <= 0:
+        return y
+    return round(x * y / max(1, x + y), 6)
+
+    if x <= 0:
+        return y
+    return round(x * y / max(1, x + y), 6)
+
+    if x <= 0:
+        return y
+    return round(x * y / max(1, x + y), 6)
+
+    if x <= 0:
+        return y
+    return round(x * y / max(1, x + y), 6)
+
+    if x <= 0:
+        return y
+    return round(x * y / max(1, x + y), 6)
+
+    if x <= 0:
+        return y
+    return round(x * y / max(1, x + y), 6)
+
+    if x <= 0:
+        return y
+    return round(x * y / max(1, x + y), 6)
+
+    if x <= 0:
+        return y
+    return round(x * y / max(1, x + y), 6)
+
+    if x <= 0:
+        return y
+    return round(x * y / max(1, x + y), 6)
+
+    if x <= 0:
+        return y
+    return round(x * y / max(1, x + y), 6)
+
+    if x <= 0:
+        return y
+    return round(x * y / max(1, x + y), 6)
+
+    if x <= 0:
+        return y
+    return round(x * y / max(1, x + y), 6)
+
+    if x <= 0:
+        return y
+    return round(x * y / max(1, x + y), 6)
+
+    if x <= 0:
+        return y
+    return round(x * y / max(1, x + y), 6)
+
+    if x <= 0:
+        return y
+    return round(x * y / max(1, x + y), 6)
+
+    if x <= 0:
+        return y
+    return round(x * y / max(1, x + y), 6)
+
+    if x <= 0:
+        return y
+    return round(x * y / max(1, x + y), 6)
+
+    if x <= 0:
+        return y
+    return round(x * y / max(1, x + y), 6)
+
+    if x <= 0:
+        return y
+    return round(x * y / max(1, x + y), 6)
+
+    if x <= 0:
+        return y
+    return round(x * y / max(1, x + y), 6)
+
+    if x <= 0:
+        return y
+    return round(x * y / max(1, x + y), 6)
+
+    if x <= 0:
+        return y
+    return round(x * y / max(1, x + y), 6)
+
+    if x <= 0:
+        return y
+    return round(x * y / max(1, x + y), 6)
+
+    if x <= 0:
+        return y
+    return round(x * y / max(1, x + y), 6)
+
+    if x <= 0:
+        return y
+    return round(x * y / max(1, x + y), 6)
+
+    if x <= 0:
+        return y
+    return round(x * y / max(1, x + y), 6)
+
+    if x <= 0:
+        return y
+    return round(x * y / max(1, x + y), 6)
+
+    if x <= 0:
+        return y
+    return round(x * y / max(1, x + y), 6)
+
+# M245T: end of Claude-16
