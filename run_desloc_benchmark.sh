@@ -539,3 +539,18 @@ VALIDATE
 
 # Add figures to the case dispatch
 # Usage: ./run_desloc_benchmark.sh figures
+
+
+# M285: Extended figure generation + smoke test
+generate_all_figures() {
+    echo "Generating Figures 1-7..."
+    python3 -c "
+import sys; sys.path.insert(0,'.')
+from REAL_GPU_BENCHMARK import desloc_generate_all_figures
+desloc_generate_all_figures('${LOG_DIR:-./desloc_experiments/logs}','${FIG_DIR:-./figures}')
+"
+}
+smoke_test() {
+    echo "Smoke test..."
+    CUDA_VISIBLE_DEVICES=${GPU:-0} python3 REAL_GPU_BENCHMARK.py         --model_size=125M --Kx=1 --max_steps=50 --batch_size=2 --seed=42
+}
