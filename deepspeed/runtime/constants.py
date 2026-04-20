@@ -692,3 +692,22 @@ DESLOC_FIG7_SPEC = {"title":"Adam vs Muon","type":"bar"}
 DESLOC_ALL_FIGS = ["figure1_loss_curve","figure2_comm_cumulative",
     "figure3_halflife","figure4_sync_sensitivity","figure5_scaling",
     "figure6_nesterov","figure7_optimizer"]
+
+# M300 — Claude-19: Protocol v2 + Trainium2/NKI + Megatron map
+DESLOC_V2=2;DESLOC_MN_KX=1;DESLOC_MX_KX=4096;DESLOC_DKX=32;DESLOC_DKU_R=3;DESLOC_DKV_R=6
+DESLOC_DRHO=1.;DESLOC_DWU=512;DESLOC_DOUTER='average';DESLOC_DNM=.9
+DESLOC_PSI_S='4(1-px)/px^2*(1-b)(1-pu)/(6(1-(1-pu)*b))'
+DESLOC_HL={'b1_09':6.579,'b1_095':13.513,'b2_095':13.513,'b2_099':68.968,'b2_0999':692.802,'b2_09999':6931.472}
+DESLOC_OPTS=['Adam','AdamW','ADOPT','SGDM','Muon','LAMB']
+DESLOC_INNER=['Adam','AdamW','ADOPT','Muon']
+DESLOC_OUTER=['average','nesterov']
+DESLOC_COMM={'param':'allreduce','momentum':'allreduce','variance':'allreduce','gradient':'reduce_scatter','reconstruct':'allgather'}
+DESLOC_WSD={'warmup':.05,'stable':.8,'decay':.15,'type':'cosine'}
+DESLOC_BENCH={'models':['125M','350M','1.3B','2.7B'],'Kx':[1,2,4,8,16,32,64,128,256],'seeds':[42,137,2024],'steps':5000}
+DESLOC_ACC={'cuda':{'cc':(7,0),'dt':['bf16','fp16','fp32'],'be':'nccl'},'neuron':{'dt':['bf16','fp32'],'be':'xla','nki':True},'tpu':{'dt':['bf16','fp32'],'be':'xla'}}
+DESLOC_NEURON={'tile':128,'pdim':0,'pipe':4,'efa_bw':400,'trn2_hbm':96,'trn2_tf':380,'cc':['cc.allreduce','cc.reduce_scatter','cc.allgather']}
+DESLOC_MEGA={'tp':{'rel':'none'},'pp':{'rel':'partial','note':'Kx=N*micro_batches'},'dp':{'rel':'full'},'cp':{'rel':'none'},'ep':{'rel':'partial','note':'MoE capacity NOT gated'}}
+DESLOC_FIG={'dpi':300,'font':'serif','fs':11,'w':6.5,'h':4.}
+DESLOC_PAL={'DDP':'#2196F3','LocalAdam':'#FF9800','DESLOC':'#4CAF50','DESLOC_nesterov':'#9C27B0','Muon':'#F44336'}
+DESLOC_CK='desloc';DESLOC_KXK='Kx';DESLOC_KUK='Ku';DESLOC_KVK='Kv';DESLOC_CLK='clip_rho';DESLOC_WUK='warmup_steps';DESLOC_OUK='outer_optimizer';DESLOC_ENK='enabled'
+# M300: end
