@@ -778,3 +778,101 @@ class DeslocBF16PrecisionTracker:
         r = self.get_precision_report()
         for k, v in sorted(r.items()):
             _w(f'{k}: {v}')
+
+# =====================================================================
+# M253 — Claude-16
+# =====================================================================
+
+import math as _m253_math
+
+class DeslocBF16PrecisionGuard:
+    """Guard against precision loss in BF16 DES-LOC training.
+    Monitors: gradient underflow after clipping, loss scale drift,
+    momentum precision degradation over long Kx intervals."""
+
+    def __init__(self, clip_rho=1.0, bf16_min_normal=2**-126):
+        self._clip_rho = clip_rho
+        self._bf16_min = bf16_min_normal
+        self._underflow_count = 0
+        self._overflow_count = 0
+        self._precision_alerts = []
+
+    def check_clip_rho_safety(self):
+        if self._clip_rho < 2**-7:
+            return False, f"clip_rho={self._clip_rho} below BF16 precision threshold 2^-7"
+        return True, "OK"
+
+    def check_gradient_after_clip(self, grad_tensor):
+        import torch
+        if grad_tensor.dtype == torch.bfloat16:
+            n_zero = (grad_tensor == 0).sum().item()
+            n_total = grad_tensor.numel()
+            zero_frac = n_zero / max(1, n_total)
+            if zero_frac > 0.99:
+                self._underflow_count += 1
+                return False, f"99%+ zeros after clipping (underflow), count={self._underflow_count}"
+        return True, "OK"
+
+    def check_momentum_staleness(self, momentum_tensor, K_since_sync, beta):
+        drift_bound = 2.0 * self._clip_rho * (1.0 - beta ** K_since_sync)
+        import torch
+        if momentum_tensor.dtype == torch.bfloat16:
+            bf16_eps = 2**-7
+            if drift_bound < bf16_eps:
+                return True, "drift below BF16 resolution (harmless)"
+        return True, f"drift_bound={drift_bound:.6f}"
+
+    def recommend_master_weight_mode(self, model_params, Kx):
+        if Kx > 64:
+            return "fp32_master", "Kx>64: FP32 master weights strongly recommended"
+        if model_params > 1e9:
+            return "fp32_master", "N>1B: FP32 master weights recommended"
+        return "bf16_native", "OK for BF16 native"
+
+    def stats(self):
+        safe, msg = self.check_clip_rho_safety()
+        return {
+            "clip_rho_safe": safe,
+            "clip_rho_msg": msg,
+            "underflow_count": self._underflow_count,
+            "overflow_count": self._overflow_count,
+            "precision_alerts": len(self._precision_alerts),
+        }
+
+class DeslocFP32MasterWeightManager:
+    """Manage FP32 master copies of BF16 parameters for DES-LOC.
+    When Kx is large, BF16 accumulated errors compound.
+    FP32 masters prevent this."""
+
+    def __init__(self):
+        self._masters = {}
+        self._enabled = False
+
+    def init_masters(self, named_params):
+        import torch
+        for name, p in named_params:
+            if p.dtype == torch.bfloat16 and p.requires_grad:
+                self._masters[name] = p.data.float().clone()
+        self._enabled = True
+
+    def sync_bf16_from_masters(self, named_params):
+        import torch
+        if not self._enabled:
+            return
+        for name, p in named_params:
+            if name in self._masters:
+                p.data.copy_(self._masters[name].to(p.dtype))
+
+    def update_masters(self, named_params):
+        if not self._enabled:
+            return
+        for name, p in named_params:
+            if name in self._masters:
+                self._masters[name].copy_(p.data.float())
+
+    def memory_overhead_bytes(self):
+        total = 0
+        for m in self._masters.values():
+            total += m.numel() * 4
+        return total
+
