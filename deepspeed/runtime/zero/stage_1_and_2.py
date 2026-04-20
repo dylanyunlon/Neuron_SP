@@ -3208,71 +3208,30 @@ def estimate_zero2_model_states_mem_needs_all_cold(total_params,
 # DES-LOC ZeRO-1/2 Extensions (Algorithm 1 + Section 4.1)
 # =========================================================================
 
-class DeslocZeroSyncManager:
-    """Manage sync decisions for ZeRO-1/2 partitioned parameters.
-    MoE capacity allreduces are NEVER gated by Kx (M092 rule).
-    Overflow detection is ALWAYS synchronous (safety-critical)."""
-
-    def __init__(self, Kx=1, Ku=3, Kv=6):
-        self.Kx = Kx
-        self.Ku = Ku
-        self.Kv = Kv
-        self._step = 0
-        self._overflow_force_sync = False
-
-    def should_reduce(self, tier=0, is_moe_capacity=False):
-        """Decide if allreduce should happen.
-        tier 0=params(Kx), 1=momentum(Ku), 2=variance(Kv).
-        MoE capacity ops always sync. Overflow forces sync."""
-        if is_moe_capacity:
-            return True
-        if self._overflow_force_sync:
-            return True
-        period = {0: self.Kx, 1: self.Ku, 2: self.Kv}.get(tier, 1)
-        if period <= 1:
-            return True
-        return self._step % period == 0
-
-    def advance(self):
-        self._step += 1
-        self._overflow_force_sync = False
-
-    def force_sync_on_overflow(self):
-        self._overflow_force_sync = True
-
-    def state_dict(self):
-        return {'step': self._step, 'Kx': self.Kx, 'Ku': self.Ku, 'Kv': self.Kv}
-
-    def load_state_dict(self, sd):
-        self._step = sd.get('step', 0)
-
-        self.num_partitions = sd.get('n', self.num_partitions)
-        self.partition_sync_step = sd.get('sync', self.partition_sync_step)
 
 
+# M312: ZeRO + DES-LOC
+def desloc_z_reduce(step, Kx, warmup=512):
+    if Kx <= 1 or step < warmup: return True
+    return (step % Kx) == 0
 
-# M296 — Claude-19: ZeRO BucketGating + PartitionSync
-class DeslocBktGate:
-    __slots__=('Kx','red','skp','ovf','st','tiers')
-    def __init__(s,Kx):s.Kx=max(1,Kx);s.red=s.skp=0;s.ovf=False;s.st=0;s.tiers={}
-    def should(s,st):return s.Kx<=1 or st%s.Kx==0
-    def acc(s,g):
-        import torch;s.ovf=s.ovf or torch.isnan(g).any().item()or torch.isinf(g).any().item()
-    def reduce(s,st,bkts):
-        if not s.should(st):s.skp+=len(bkts);return False
-        s.red+=len(bkts);s.ovf=False;return True
-    def ratio(s):t=s.red+s.skp;return t/max(1,s.red)if t>0 else 1.
-class DeslocPartSync:
-    __slots__=('Kx','Ku','Kv','ws','rk','pm','ss','st')
-    def __init__(s,Kx,Ku,Kv,ws=1,rk=0):s.Kx=max(1,Kx);s.Ku=max(1,Ku);s.Kv=max(1,Kv);s.ws=ws;s.rk=rk;s.pm={};s.ss={t+'s':0 for t in'xuv'};s.st=0
-    def build(s,gs):
-        ps=[p for g in gs for p in g['params']if p.requires_grad];tot=sum(p.numel()for p in ps);pp=tot//max(1,s.ws);c=n=0
-        for p in ps:s.pm[id(p)]=c;n+=p.numel()
-        if n>=pp and c<s.ws-1:c+=1;n=0
-    def sync(s,st):
-        s.st=st;r={t:False for t in'xuv'}
-        if st%s.Kx==0:r['x']=True;s.ss['xs']+=1
-        if st%s.Ku==0:r['u']=True;s.ss['us']+=1
-        if st%s.Kv==0:r['v']=True;s.ss['vs']+=1
-        return r
-# M296: end
+def desloc_z_part(pc, profiles):
+    if not profiles: return {}
+    n = len(profiles)
+    if n <= 1: return {0: pc}
+    mems = [p.get('mem_gb', 16) for p in profiles]
+    if max(mems) / max(.01, min(mems)) < 1.3:
+        per = pc // n; return {i: per + (1 if i < pc % n else 0) for i in range(n)}
+    av = [m * 0.8 for m in mems]; ta = sum(av); raw = [(a / ta) * pc for a in av]
+    al = [max(1, int(round(x))) for x in raw]; d = pc - sum(al)
+    for k in range(abs(d)): al[k % n] += 1 if d > 0 else -1; al[k % n] = max(1, al[k % n])
+    return {i: al[i] for i in range(n)}
+
+def desloc_z_comm(pc, Kx, Ku, Kv, steps, zs=2):
+    pb = pc * 2; m = 2 if zs >= 2 else 1; ddp = m * pb * steps; dl = m * pb * (steps / max(1, Kx))
+    return {'ddp': ddp, 'dl': round(dl), 'red': round(ddp / max(1, dl), 2)}
+
+def desloc_z_mem(pc, zs=2, ng=1):
+    mb = pc * 2; ob = (pc // ng) * 12; gb = (pc // ng) * 2 if zs >= 2 else 0
+    return {'gb': round((mb + ob + gb) / 1e9, 2), 'zs': zs}
+# --- End M312 ---
