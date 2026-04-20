@@ -614,113 +614,24 @@ def trim_mean(data, trim_percent):
 
 
 # =========================================================================
-# DES-LOC Roofline Model
-# Ref: Nick Joseph — "you can use paper and pen to calculate theoretical MFU.
-# The reasons for efficiency gap are usually: HBM bandwidth bottleneck,
-# CPU transfer bottleneck, etc. About six or seven constraints."
+
+# =========================================================================
+# DES-LOC Roofline: compute vs comm bound estimation (Section 4.1)
 # =========================================================================
 
-class DeslocRooflineModel:
-    """Analytical performance model for DES-LOC training.
-
-    Models three bottleneck dimensions:
-    1. Compute bound: FLOPS / peak_FLOPS
-    2. Memory bound: bytes_accessed / HBM_bandwidth
-    3. Communication bound: comm_bytes / network_bandwidth
-
-    DES-LOC specifically targets #3 by reducing comm_bytes via
-    independent sync periods (Kx, Ku, Kv).
-
-    Ref: Section 4.1 — Ring-AllReduce: 2*(N-1)/N * data_size bytes.
-    """
-
-    def __init__(self, peak_tflops, hbm_bw_gbps, net_bw_gbps):
-        """Initialize with hardware specifications.
-
-        Args:
-            peak_tflops: Peak TFLOPS (e.g. 312 for H100 BF16 Tensor Core).
-            hbm_bw_gbps: HBM bandwidth in GB/s (e.g. 3350 for H100).
-            net_bw_gbps: Network bandwidth in GB/s.
-                NVLink 4.0: ~600, PCIe Gen4: ~32, EFA v2: ~12.5.
-        """
-        self.peak_tflops = peak_tflops
-        self.hbm_bw = hbm_bw_gbps
-        self.net_bw = net_bw_gbps
-
-    def predict_step_time(self, model_flops, param_bytes, num_workers,
-                          Kx=1, Ku=3, Kv=6):
-        """Predict training step time under DES-LOC.
-
-        Ref: Section 4.1 — DES-LOC comm cost per step:
-          comm_rate = 1/Kx + 1/Ku + 1/Kv (allreduces per step)
-          allreduce_time = 2*(N-1)/N * param_bytes / net_bw
-
-        Returns dict with predicted times, MFU, and bottleneck diagnosis.
-        """
-        compute_s = model_flops / (self.peak_tflops * 1e12) if self.peak_tflops > 0 else 0
-        if num_workers <= 1:
-            comm_s = 0.0
-            ddp_comm_s = 0.0
-        else:
-            ring = 2.0 * (num_workers - 1) / num_workers
-            single_ar_s = ring * param_bytes / (self.net_bw * 1e9) if self.net_bw > 0 else 0
-            desloc_rate = 1.0/max(1,Kx) + 1.0/max(1,Ku) + 1.0/max(1,Kv)
-            comm_s = single_ar_s * desloc_rate
-            ddp_comm_s = single_ar_s * 3.0
-
-        total_s = compute_s + comm_s
-        ddp_total_s = compute_s + ddp_comm_s
-        mfu = model_flops / (total_s * self.peak_tflops * 1e12) if total_s > 0 and self.peak_tflops > 0 else 0
-        ddp_mfu = model_flops / (ddp_total_s * self.peak_tflops * 1e12) if ddp_total_s > 0 and self.peak_tflops > 0 else 0
-        bottleneck = 'comm_bound' if comm_s > compute_s else 'compute_bound'
-
-        return {
-            'compute_ms': round(compute_s * 1000, 4),
-            'comm_ms': round(comm_s * 1000, 4),
-            'total_ms': round(total_s * 1000, 4),
-            'ddp_total_ms': round(ddp_total_s * 1000, 4),
-            'speedup_vs_ddp': round(ddp_total_s / total_s, 4) if total_s > 0 else 1.0,
-            'mfu': round(mfu, 6),
-            'ddp_mfu': round(ddp_mfu, 6),
-            'bottleneck': bottleneck,
-        }
-
-    def sweep_kx(self, model_flops, param_bytes, num_workers,
-                 kx_values=None):
-        """Sweep Kx to find optimal operating point.
-
-        Ref: Section 5.4 — "setting Kx for sufficient throughput."
-        """
-        if kx_values is None:
-            kx_values = [1, 2, 4, 8, 16, 32, 64, 128, 256]
-        results = []
-        for kx in kx_values:
-            ku = max(1, kx * 3)
-            kv = max(1, kx * 6)
-            pred = self.predict_step_time(model_flops, param_bytes, num_workers,
-                                          Kx=kx, Ku=ku, Kv=kv)
-            pred.update({'Kx': kx, 'Ku': ku, 'Kv': kv})
-            results.append(pred)
-        return results
-
-    def find_optimal_kx(self, model_flops, param_bytes, num_workers):
-        """Find smallest Kx where training becomes compute-bound.
-
-        Returns the prediction dict for the optimal Kx, or the
-        largest tested Kx if always comm-bound.
-        """
-        sweep = self.sweep_kx(model_flops, param_bytes, num_workers)
-        for pred in sweep:
-            if pred['bottleneck'] == 'compute_bound':
-                return pred
-        return sweep[-1] if sweep else None
+def desloc_roofline_bound(flops_per_step, bytes_per_allreduce,
+                          peak_tflops, bandwidth_gbps, Kx=32):
+    """Determine if training is compute-bound or comm-bound under DES-LOC.
+    Ref: Section 4.1 + Appendix G.1 wall-clock model.
+    Returns (bound_type, compute_time_ms, comm_time_ms)."""
+    compute_ms = flops_per_step / (peak_tflops * 1e9)  # TFLOPS -> GFLOPS/ms
+    comm_ms = bytes_per_allreduce / (bandwidth_gbps * 1e6 / 8.0) / Kx
+    bound = 'compute' if compute_ms > comm_ms else 'comm'
+    return bound, compute_ms, comm_ms
 
 
-# Hardware presets for common GPU configurations
-DESLOC_HW_PRESETS = {
-    'H100_NVL': DeslocRooflineModel(312, 3350, 600),
-    'H100_PCIe': DeslocRooflineModel(312, 3350, 32),
-    'A100_80GB': DeslocRooflineModel(312, 2039, 600),
-    'A6000': DeslocRooflineModel(77.4, 768, 32),
-    'Trainium2': DeslocRooflineModel(380, 3200, 100),
-}
+def desloc_mfu(actual_tflops, peak_tflops):
+    """Model FLOPs Utilization. Ref: PaLM paper definition."""
+    if peak_tflops <= 0:
+        return 0.0
+    return actual_tflops / peak_tflops
