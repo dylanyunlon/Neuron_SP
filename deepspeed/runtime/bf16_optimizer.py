@@ -644,3 +644,137 @@ def _get_padded_tensor(src_tensor, size):
         pb = tp * 2  # BF16 = 2 bytes
         desloc_rate = pb / e.desloc_Kx + pb / e.desloc_Ku + pb / e.desloc_Kv
         return {'params': tp, 'reduction': round(pb * 3.0 / max(desloc_rate, 1), 2)}
+
+    # --- DES-LOC BF16 Extensions (M150) ---
+    def _desloc_bf16_stability(self):
+        import math
+        gn=sum(gp.norm(2).item()**2 for gp in self.fp32_groups_gradient_flat_partition if gp is not None)
+        gn=math.sqrt(gn);t=torch.tensor([gn,gn**2],device=self.fp32_groups_flat_partition[0].device if self.fp32_groups_flat_partition else 'cpu')
+        ws=dist.get_world_size(group=self.real_dp_process_group[0])
+        if ws>1: dist.all_reduce(t,group=self.real_dp_process_group[0]);t/=ws
+        mn=t[0].item();cv=math.sqrt(max(0,t[1].item()-mn**2))/max(mn,1e-8)
+        return {'stable':cv<0.5,'cv':round(cv,4),'norm':round(mn,4)}
+    def _desloc_bf16_halflife_rec(self):
+        import math
+        for g in self.optimizer.param_groups:
+            b=g.get('betas',(0.9,0.999));break
+        else: return None
+        e=getattr(self,'deepspeed_engine',None) or getattr(self,'ds_engine',None)
+        Kx=e.desloc_Kx if e else 32
+        tu=-1.0/math.log2(b[0]) if 0<b[0]<1 else float('inf');tv=-1.0/math.log2(b[1]) if 0<b[1]<1 else float('inf')
+        Ku=max(Kx,int(Kx*min(3,tu/max(Kx,1))));Kv=max(Ku,int(Kx*min(6,tv/max(tu,1e-8))))
+        return {'Kx':Kx,'Ku':Ku,'Kv':Kv,'tau_u':round(tu,1),'tau_v':round(tv,1)}
+    def _desloc_bf16_auto_tune(self):
+        e=getattr(self,'deepspeed_engine',None) or getattr(self,'ds_engine',None)
+        if e is None or not getattr(e,'desloc_enabled',False): return
+        st=self._desloc_bf16_stability()
+        if not st['stable']:
+            e.desloc_Kx=max(1,e.desloc_Kx//2);e.desloc_Ku=max(1,e.desloc_Ku//2);e.desloc_Kv=max(1,e.desloc_Kv//2)
+            if dist.get_rank()==0: print(f"[DES-LOC BF16] Stability fix: Kx->{e.desloc_Kx}")
+    def _desloc_bf16_log(self):
+        e=getattr(self,'deepspeed_engine',None) or getattr(self,'ds_engine',None)
+        if e is None or not getattr(e,'desloc_enabled',False): return
+        if e.desloc_step%500!=0 or dist.get_rank()!=0: return
+        s=self._desloc_bf16_comm_stats()
+        print(f"### BF16 DES-LOC step={e.desloc_step} ### red={s['reduction']:.1f}x params={s['params']/1e6:.1f}M")
+
+
+# =============================================================================
+# M235 (Claude-15): BF16 vs FP32 loss comparison for Figure 1 overlay
+# Ref: Section 4.1 — BF16 training with loss scaling
+# Ref: Nick Joseph — "precision errors in kernels cause large-scale failures"
+# =============================================================================
+
+
+class DeslocBF16PrecisionTracker:
+    """Track BF16 precision impact on loss for Figure 1 annotation.
+
+    BF16 training introduces small numerical differences vs FP32.
+    This tracker compares BF16 loss trajectory against FP32 reference
+    to quantify the precision gap for Figure 1.
+
+    From Nick Joseph: wrong precision in a kernel can ruin months of training.
+    We track: loss delta (BF16-FP32), gradient norm ratio, overflow events.
+
+    Usage:
+        tracker = DeslocBF16PrecisionTracker()
+        tracker.record_step(step, bf16_loss, fp32_ref_loss, overflow)
+        report = tracker.get_precision_report()
+    """
+
+    def __init__(self, tolerance=0.01):
+        self.tolerance = tolerance
+        self._steps = []
+        self._bf16_losses = []
+        self._fp32_losses = []
+        self._deltas = []
+        self._overflow_steps = []
+        self._grad_scale_history = []
+
+    def record_step(self, step, bf16_loss, fp32_loss=None,
+                    overflow=False, grad_scale=None):
+        """Record one step's precision data.
+
+        Args:
+            step: training step
+            bf16_loss: loss computed in BF16
+            fp32_loss: optional FP32 reference loss
+            overflow: whether gradient overflow occurred
+            grad_scale: current loss scaling factor
+        """
+        self._steps.append(step)
+        self._bf16_losses.append(float(bf16_loss))
+        if fp32_loss is not None:
+            self._fp32_losses.append(float(fp32_loss))
+            delta = abs(float(bf16_loss) - float(fp32_loss))
+            self._deltas.append(delta)
+        if overflow:
+            self._overflow_steps.append(step)
+        if grad_scale is not None:
+            self._grad_scale_history.append((step, float(grad_scale)))
+
+    def get_precision_report(self):
+        """Generate precision impact report.
+
+        Returns: dict with precision metrics for Figure 1 annotation.
+        """
+        report = {
+            'total_steps': len(self._steps),
+            'overflow_count': len(self._overflow_steps),
+            'overflow_rate': (len(self._overflow_steps) /
+                              max(1, len(self._steps))),
+        }
+        if self._deltas:
+            avg_delta = sum(self._deltas) / len(self._deltas)
+            max_delta = max(self._deltas)
+            report['avg_bf16_fp32_delta'] = round(avg_delta, 8)
+            report['max_bf16_fp32_delta'] = round(max_delta, 8)
+            report['precision_ok'] = max_delta < self.tolerance
+        if self._bf16_losses:
+            report['bf16_final_loss'] = round(self._bf16_losses[-1], 6)
+        if self._fp32_losses:
+            report['fp32_final_loss'] = round(self._fp32_losses[-1], 6)
+        if self._grad_scale_history:
+            final_scale = self._grad_scale_history[-1][1]
+            report['final_grad_scale'] = round(final_scale, 2)
+        return report
+
+    def get_figure1_annotation(self):
+        """Get annotation string for Figure 1 precision note.
+
+        Returns: str like 'BF16 Δloss=0.00123 (3 overflows)'
+        """
+        r = self.get_precision_report()
+        delta = r.get('avg_bf16_fp32_delta', 0)
+        ovf = r.get('overflow_count', 0)
+        return f'BF16 Δloss={delta:.5f} ({ovf} overflows)'
+
+    def emit_nkifa_log(self, stream=None):
+        """Write precision data in NKI-FA format."""
+        def _w(line):
+            if stream: stream.write(line + '\n')
+            else: print(line)
+        _w('### bf16_precision ###')
+        r = self.get_precision_report()
+        for k, v in sorted(r.items()):
+            _w(f'{k}: {v}')
