@@ -681,3 +681,14 @@ def desloc_get_default_config():
         DESLOC_INNER_OPT_KEY: DESLOC_INNER_OPT_ADAM,
     }
 
+
+
+# M286: Figure 3-7 specs
+DESLOC_FIG3_SPEC = {"title":"Half-life vs Change Rate","type":"scatter"}
+DESLOC_FIG4_SPEC = {"title":"Sync Sensitivity","type":"grouped_bar"}
+DESLOC_FIG5_SPEC = {"title":"Scaling to Large Models","type":"grouped_bar"}
+DESLOC_FIG6_SPEC = {"title":"Nesterov vs Averaging","type":"bar"}
+DESLOC_FIG7_SPEC = {"title":"Adam vs Muon","type":"bar"}
+DESLOC_ALL_FIGS = ["figure1_loss_curve","figure2_comm_cumulative",
+    "figure3_halflife","figure4_sync_sensitivity","figure5_scaling",
+    "figure6_nesterov","figure7_optimizer"]
