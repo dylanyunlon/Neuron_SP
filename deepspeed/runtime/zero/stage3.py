@@ -3755,3 +3755,23 @@ def desloc_z3_should_allgather(engine):
     if engine.desloc_Kx <= 1:
         return True
     return engine.desloc_step % engine.desloc_Kx == 0
+
+# M297 — Claude-19: Z3 AllGather Gating + Prefetcher
+class DeslocZ3Gate:
+    __slots__=('Kx','Ku','Kv','gated','pin','st','fg','br')
+    def __init__(s,Kx,Ku,Kv):s.Kx=max(1,Kx);s.Ku=max(1,Ku);s.Kv=max(1,Kv);s.gated=0;s.pin=set();s.st=s.fg=s.br=0
+    def should_rs(s,st):return s.Kx<=1 or st%s.Kx==0
+    def should_ss(s,st,t):return st%s.Ku==0 if t=='u'else st%s.Kv==0 if t=='v'else st%s.Kx==0
+    def on_fwd(s,st):s.fg+=1
+    def on_bwd(s,st,did):s.br+=1;s.gated+=0 if did else 1
+    def pin_p(s,pid):s.pin.add(pid)
+    def unpin(s,pid):s.pin.discard(pid)
+    def ratio(s):r=s.br-s.gated;return s.br/max(1,r)if r>0 and s.br>0 else 1.
+class DeslocZ3PF:
+    __slots__=('Ku','Kv','w','pn')
+    def __init__(s,Ku,Kv,w=1):s.Ku=max(1,Ku);s.Kv=max(1,Kv);s.w=w;s.pn=0
+    def should_m1(s,st):return((st//s.Ku)+1)*s.Ku-st<=s.w
+    def should_m2(s,st):return((st//s.Kv)+1)*s.Kv-st<=s.w
+    def start(s,st,t):
+        if(t=='u'and s.should_m1(st))or(t=='v'and s.should_m2(st)):s.pn+=1
+# M297: end
