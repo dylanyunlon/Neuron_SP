@@ -1142,3 +1142,173 @@ class DeslocScheduleValidator:
         if warmup < self.Kx:
             issues.append(f'Warmup {warmup} < Kx {self.Kx}')
         return issues
+
+    return max(min_warmup, aligned)
+
+
+# =============================================================================
+# M233 (Claude-15): WSD phase loss annotation for Figure 1
+# Ref: Section 4.1 — WSD schedule (warmup/stable/decay)
+# Ref: Section 5.4 — loss curve shows phase transitions
+# Ref: NKI-FA draw_plot.py — annotated data points
+# =============================================================================
+
+
+class DeslocWSDPhaseAnnotator:
+    """Annotate loss curve with WSD schedule phase boundaries for Figure 1.
+
+    The WSD (Warmup-Stable-Decay) schedule has three distinct phases.
+    Figure 1 loss curves should show vertical lines at phase transitions
+    with annotations like 'warmup→stable at step 512'.
+
+    From Section 4.1: WSD schedule with linear warmup, constant LR,
+    then cosine/linear decay. Phase boundaries affect DES-LOC sync
+    behavior: during warmup, Kx=1 (full DDP); after warmup, Kx>1.
+
+    Usage:
+        annotator = DeslocWSDPhaseAnnotator(
+            warmup_steps=512, total_steps=5000, decay_start=4000)
+        phase = annotator.get_phase(step=100)  # -> 'warmup'
+        boundaries = annotator.get_boundaries()  # for Figure 1 vlines
+    """
+
+    PHASES = ('warmup', 'stable', 'decay')
+
+    def __init__(self, warmup_steps=512, total_steps=5000,
+                 decay_start=None, decay_style='cosine',
+                 desloc_warmup=None):
+        """Initialize annotator.
+
+        Args:
+            warmup_steps: LR warmup duration
+            total_steps: total training steps
+            decay_start: step where decay begins (default: total - total/5)
+            decay_style: 'cosine' or 'linear'
+            desloc_warmup: DES-LOC Kx=1 warmup (may differ from LR warmup)
+        """
+        self.warmup_steps = warmup_steps
+        self.total_steps = total_steps
+        self.decay_start = decay_start or max(
+            warmup_steps + 1, total_steps - total_steps // 5)
+        self.decay_style = decay_style
+        self.desloc_warmup = desloc_warmup or warmup_steps
+
+    def get_phase(self, step):
+        """Get WSD phase for a given step.
+
+        Returns: str — 'warmup', 'stable', or 'decay'
+        """
+        if step < self.warmup_steps:
+            return 'warmup'
+        elif step < self.decay_start:
+            return 'stable'
+        else:
+            return 'decay'
+
+    def get_boundaries(self):
+        """Get phase transition points for Figure 1 annotations.
+
+        Returns: list of dicts:
+            [{'step': 512, 'from': 'warmup', 'to': 'stable',
+              'label': 'warmup→stable'},
+             {'step': 4000, 'from': 'stable', 'to': 'decay',
+              'label': 'stable→decay'}]
+        """
+        boundaries = []
+        if self.warmup_steps > 0:
+            boundaries.append({
+                'step': self.warmup_steps,
+                'from': 'warmup', 'to': 'stable',
+                'label': f'warmup→stable (step {self.warmup_steps})',
+                'desloc_note': f'DES-LOC activates Kx>1 at step {self.desloc_warmup}',
+            })
+        if self.decay_start < self.total_steps:
+            boundaries.append({
+                'step': self.decay_start,
+                'from': 'stable', 'to': 'decay',
+                'label': f'stable→decay (step {self.decay_start})',
+                'desloc_note': 'Kx maintained during decay',
+            })
+        return boundaries
+
+    def get_lr_at_step(self, step, base_lr=6e-4):
+        """Compute WSD learning rate at a given step.
+
+        Args:
+            step: training step
+            base_lr: peak learning rate
+
+        Returns: float — learning rate value
+        """
+        import math
+        if step < self.warmup_steps:
+            return base_lr * (step + 1) / max(1, self.warmup_steps)
+        elif step < self.decay_start:
+            return base_lr
+        else:
+            progress = (step - self.decay_start) / max(
+                1, self.total_steps - self.decay_start)
+            if self.decay_style == 'cosine':
+                return base_lr * 0.5 * (1.0 + math.cos(math.pi * progress))
+            else:
+                return base_lr * (1.0 - progress)
+
+    def annotate_loss_data(self, steps, losses):
+        """Add phase annotations to loss curve data.
+
+        Returns: list of (step, loss, phase) triples.
+        Useful for color-coding loss curve by WSD phase in Figure 1.
+        """
+        annotated = []
+        for step, loss in zip(steps, losses):
+            phase = self.get_phase(step)
+            annotated.append((step, loss, phase))
+        return annotated
+
+    def get_figure1_vline_specs(self):
+        """Return vertical line specs for matplotlib.
+
+        Usage:
+            for vline in annotator.get_figure1_vline_specs():
+                ax.axvline(x=vline['x'], color=vline['color'],
+                           linestyle=vline['ls'], label=vline['label'])
+        """
+        specs = []
+        colors = {'warmup→stable': '#e74c3c', 'stable→decay': '#3498db'}
+        for b in self.get_boundaries():
+            key = f'{b["from"]}→{b["to"]}'
+            specs.append({
+                'x': b['step'],
+                'color': colors.get(key, '#95a5a6'),
+                'ls': '--',
+                'label': b['label'],
+                'alpha': 0.7,
+            })
+        return specs
+
+    def emit_nkifa_log(self, stream=None):
+        """Write phase info in NKI-FA format."""
+        def _w(line):
+            if stream:
+                stream.write(line + '\n')
+            else:
+                print(line)
+        _w('### wsd_phases ###')
+        _w(f'warmup_steps: {self.warmup_steps}')
+        _w(f'decay_start: {self.decay_start}')
+        _w(f'total_steps: {self.total_steps}')
+        _w(f'decay_style: {self.decay_style}')
+        _w(f'desloc_warmup: {self.desloc_warmup}')
+        for b in self.get_boundaries():
+            _w(f'boundary: step={b["step"]} {b["label"]}')
+
+    def get_phase_durations(self):
+        """Get duration of each phase as fraction of total training."""
+        warmup_frac = self.warmup_steps / max(1, self.total_steps)
+        decay_frac = (self.total_steps - self.decay_start) / max(1, self.total_steps)
+        stable_frac = 1.0 - warmup_frac - decay_frac
+        return {
+            'warmup': round(warmup_frac, 4),
+            'stable': round(max(0, stable_frac), 4),
+            'decay': round(decay_frac, 4),
+        }
