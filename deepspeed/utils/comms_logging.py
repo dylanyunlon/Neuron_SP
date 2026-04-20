@@ -696,3 +696,212 @@ class DeslocLogParser:
                 if m:
                     records.append(float(m.group(1)))
         return records
+
+
+class DeslocFigureDataPreparer:
+    """Prepare parsed experiment data for NeurIPS figures.
+    Ref: Section 5 RQ1-RQ6. All data from logs only."""
+
+    def __init__(self, parser):
+        self.parser = parser
+
+    def prepare_rq3_comm(self):
+        groups = self.parser.group_by('Kx')
+        return {kx: {
+            'avg_bytes': sum(e['metrics'].get('comm_bytes', 0) for e in exps) / max(1, len(exps)),
+            'n': len(exps),
+            'theory': desloc_comm_reduction(kx, kx * 3, kx * 6),
+        } for kx, exps in groups.items()}
+
+    def prepare_figure1_loss(self, model_size=None):
+        """Extract Figure 1 loss curve data grouped by method.
+
+        Returns: dict {method_label: [(step, loss), ...]}
+
+        Ref: Section 5.4 — Figure shows loss vs step for DDP, DES-LOC,
+        Local Adam across model scales.
+        Ref: NKI-FA draw_plot.py — parsed from log strings.
+        """
+        groups = self.parser.group_by('Kx')
+        result = {}
+        for kx, exps in sorted(groups.items()):
+            if model_size and any(e.get('config', {}).get('model_size') != model_size for e in exps):
+                continue
+            label = 'DDP' if kx == 1 else f'DES-LOC (Kx={kx})'
+            curves = []
+            for exp in exps:
+                m = exp.get('metrics', {})
+                steps = m.get('steps', [])
+                losses = m.get('losses', [])
+                if steps and losses:
+                    curves.append(list(zip(steps, losses)))
+            if curves:
+                # Average across seeds
+                avg_curve = self._average_curves(curves)
+                result[label] = avg_curve
+        return result
+
+    def prepare_figure2_comm(self):
+        """Extract Figure 2 communication data grouped by Kx.
+
+        Returns: list of dicts for bar chart:
+            [{'Kx': 1, 'label': 'DDP', 'comm_gb': 12.456,
+              'reduction_vs_ddp': 1.0}, ...]
+
+        Ref: Section 5.3 — comm volume comparison.
+        """
+        groups = self.parser.group_by('Kx')
+        ddp_bytes = None
+        results = []
+        for kx, exps in sorted(groups.items()):
+            avg_bytes = sum(
+                e.get('metrics', {}).get('comm_bytes', 0)
+                for e in exps) / max(1, len(exps))
+            if kx == 1:
+                ddp_bytes = avg_bytes
+            results.append({
+                'Kx': kx,
+                'label': 'DDP' if kx == 1 else f'Kx={kx}',
+                'comm_gb': round(avg_bytes / (1024**3), 3),
+                'comm_bytes': int(avg_bytes),
+                'n_runs': len(exps),
+            })
+        # Compute reduction ratios
+        if ddp_bytes and ddp_bytes > 0:
+            for r in results:
+                r['reduction_vs_ddp'] = round(
+                    ddp_bytes / max(1, r['comm_bytes']), 1)
+        else:
+            for r in results:
+                r['reduction_vs_ddp'] = 1.0
+        return results
+
+    def _average_curves(self, curves):
+        """Average multiple (step, value) curves.
+
+        Aligns by step index, computes mean across seeds.
+        Pure python — no numpy.
+        """
+        if not curves:
+            return []
+        if len(curves) == 1:
+            return curves[0]
+        # Find common step range
+        min_len = min(len(c) for c in curves)
+        averaged = []
+        for i in range(min_len):
+            step = curves[0][i][0]
+            values = [c[i][1] for c in curves if i < len(c)]
+            avg_val = sum(values) / len(values)
+            averaged.append((step, avg_val))
+        return averaged
+
+
+class DeslocFigure1Formatter:
+    """Format Figure 1 data for NKI-FA log output.
+
+    Ref: NKI-FA da964f3 draw_plot.py — each experiment block starts
+    with ### config ### header, then metric: value lines.
+
+    Figure 1 = Loss vs Training Step, multiple lines (DDP, DES-LOC variants).
+    """
+
+    @staticmethod
+    def format_loss_curve(label, curve_data, kx, ku, kv):
+        """Format one loss curve as NKI-FA log block.
+
+        Args:
+            label: str — legend label
+            curve_data: list of (step, loss) tuples
+            kx, ku, kv: sync periods
+
+        Returns: str — NKI-FA format block
+        """
+        lines = [f'### method = {label}, Kx = {kx}, '
+                 f'Ku = {ku}, Kv = {kv} ###']
+        for step, loss in curve_data:
+            lines.append(f'step: {step} | loss: {loss:.6f}')
+        if curve_data:
+            lines.append('')
+            lines.append('--- summary ---')
+            losses = [l for _, l in curve_data]
+            lines.append(f'first_loss: {losses[0]:.6f}')
+            lines.append(f'final_loss: {losses[-1]:.6f}')
+            lines.append(f'min_loss: {min(losses):.6f}')
+            lines.append(f'total_points: {len(losses)}')
+            lines.append('--- end summary ---')
+        return '\n'.join(lines)
+
+    @staticmethod
+    def format_all_curves(prepared_data, output_path=None):
+        """Format all Figure 1 curves into single log file.
+
+        Args:
+            prepared_data: dict from prepare_figure1_loss()
+            output_path: optional file path to write
+
+        Returns: str — complete log content
+        """
+        blocks = []
+        for label, curve in sorted(prepared_data.items()):
+            # Infer Kx from label
+            if 'DDP' in label:
+                kx, ku, kv = 1, 1, 1
+            elif 'Kx=' in label:
+                import re
+                m = re.search(r'Kx=(\d+)', label)
+                kx = int(m.group(1)) if m else 32
+                ku, kv = 3 * kx, 6 * kx
+            else:
+                kx, ku, kv = 32, 96, 192
+            block = DeslocFigure1Formatter.format_loss_curve(
+                label, curve, kx, ku, kv)
+            blocks.append(block)
+        content = '\n\n'.join(blocks)
+        if output_path:
+            with open(output_path, 'w') as f:
+                f.write(content)
+        return content
+
+
+class DeslocFigure2Formatter:
+    """Format Figure 2 data for NKI-FA log output.
+
+    Figure 2 = Communication Volume bar chart (DDP vs DES-LOC at various Kx).
+    Annotations show exact GB values and reduction ratios.
+
+    Ref: NKI-FA draw_plot.py:
+        g_tflops.annotate(f"{p.get_height():.1f}", ...)
+    """
+
+    @staticmethod
+    def format_comm_bars(bar_data, output_path=None):
+        """Format Figure 2 bar chart data.
+
+        Args:
+            bar_data: list from prepare_figure2_comm()
+            output_path: optional output file
+
+        Returns: str — NKI-FA format log
+        """
+        lines = ['### figure = 2, type = comm_reduction ###']
+        for item in bar_data:
+            lines.append(
+                f'Kx: {item["Kx"]} | label: {item["label"]} | '
+                f'comm_gb: {item["comm_gb"]:.3f} | '
+                f'reduction_vs_ddp: {item["reduction_vs_ddp"]:.1f}')
+        lines.append('')
+        lines.append('--- summary ---')
+        if len(bar_data) >= 2:
+            ddp_gb = bar_data[0]['comm_gb']
+            best = min(bar_data, key=lambda x: x['comm_gb'])
+            lines.append(f'ddp_comm_gb: {ddp_gb:.3f}')
+            lines.append(f'best_config: {best["label"]}')
+            lines.append(f'best_comm_gb: {best["comm_gb"]:.3f}')
+            lines.append(f'max_reduction: {best["reduction_vs_ddp"]:.1f}')
+        lines.append('--- end summary ---')
+        content = '\n'.join(lines)
+        if output_path:
+            with open(output_path, 'w') as f:
+                f.write(content)
+        return content
