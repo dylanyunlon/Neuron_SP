@@ -1430,377 +1430,356 @@ class PipelineEngine(DeepSpeedEngine):
 # Ref: Algorithm 1 + Megatron PipelineParallel — gradient allreduce gating
 # =========================================================================
 
+
+# =========================================================================
+# DES-LOC Pipeline Parallel Extensions (Section 4.1 + 1F1B)
+# =========================================================================
+
 class DeslocPipelineSyncManager:
-    """Manage DES-LOC sync within pipeline parallelism.
+    """Manage DES-LOC sync within pipeline parallel micro-batches.
+    Key rule: sync happens at MACRO-step (after all micro-batches),
+    not at each micro-batch boundary.
+    Ref: Algorithm 1 — t indexes macro optimization steps."""
 
-    In pipeline parallel, gradient allreduce happens at pipeline flush.
-    DES-LOC gates this allreduce by Kx: only sync at Kx boundaries.
-
-    Between Kx boundaries, each pipeline stage accumulates gradients
-    locally without cross-pipeline communication.
-
-    Ref: Section 4.1 — DES-LOC applies to data-parallel communication.
-    Pipeline-parallel communication (send/recv between stages) is NOT
-    gated by Kx — it is always required for correctness.
-    """
-
-    def __init__(self, Kx=1, num_stages=1, enabled=False):
-        # DES-LOC M155: tracked
-        self.Kx = max(1, Kx)
+    def __init__(self, Kx=1, num_stages=1):
+        self.Kx = Kx
         self.num_stages = num_stages
-        self.enabled = enabled
-        self.step = 0
-        self.dp_syncs = 0
-        self.dp_skips = 0
+        self._macro_step = 0
 
-    def should_dp_sync(self):
-        # DES-LOC M155: tracked
-        """Check if data-parallel gradient sync should happen.
-        Pipeline-parallel send/recv always happens."""
-        if not self.enabled or self.Kx <= 1:
-            return True
-        return (self.step % self.Kx) == 0
-
-    def record_dp_sync(self, synced):
-        # DES-LOC M155: tracked
-        if synced:
-            self.dp_syncs += 1
-        else:
-            self.dp_skips += 1
-
-    def advance(self):
-        # DES-LOC M155: tracked
-        self.step += 1
-
-    def get_stats(self):
-        # DES-LOC M155: tracked
-        total = self.dp_syncs + self.dp_skips
-        return {
-            'dp_syncs': self.dp_syncs,
-            'dp_skips': self.dp_skips,
-            'skip_ratio': round(self.dp_skips / max(1, total), 4),
-            'Kx': self.Kx,
-            'num_stages': self.num_stages,
-        }
-
-    def state_dict(self):
-        # DES-LOC M155: tracked
-        return {'step': self.step, 'Kx': self.Kx,
-                'stages': self.num_stages, 'enabled': self.enabled,
-                'syncs': self.dp_syncs, 'skips': self.dp_skips}
-
-    def load_state_dict(self, sd):
-        # DES-LOC M155: tracked
-        self.step = sd.get('step', 0)
-        self.Kx = sd.get('Kx', self.Kx)
-        self.num_stages = sd.get('stages', self.num_stages)
-        self.enabled = sd.get('enabled', self.enabled)
-        self.dp_syncs = sd.get('syncs', 0)
-        self.dp_skips = sd.get('skips', 0)
-
-
-class DeslocPipelineGradientAccumulator:
-    """Accumulate gradients across pipeline micro-batches with DES-LOC.
-
-    In pipeline parallel, gradient_accumulation_steps controls
-    how many micro-batches are run before a pipeline flush.
-    DES-LOC adds another level: across Kx pipeline flushes,
-    the data-parallel allreduce is skipped.
-
-    So the hierarchy is:
-    1. micro-batch → accumulate within pipeline
-    2. pipeline flush → reduce across pipeline stages (always)
-    3. Kx boundary → allreduce across data-parallel (DES-LOC gated)
-    """
-
-    def __init__(self, Kx=1, gas=1):
-        # DES-LOC M155: tracked
-        self.Kx = max(1, Kx)
-        self.gas = max(1, gas)  # gradient accumulation steps
-        self.micro_step = 0
-        self.global_step = 0
-
-    def step_micro(self):
-        # DES-LOC M155: sync-gated
-        """Called after each micro-batch."""
-        self.micro_step += 1
-
-    def is_pipeline_flush(self):
-        # DES-LOC M155: tracked
-        """Check if gradient accumulation is complete."""
-        return self.micro_step >= self.gas
-
-    def step_global(self):
-        # DES-LOC M155: sync-gated
-        """Called at pipeline flush. Returns whether DP sync should happen."""
-        self.global_step += 1
-        self.micro_step = 0
+    def should_sync_at_macro_step(self):
+        """Check if current macro-step is a Kx sync boundary."""
         if self.Kx <= 1:
             return True
-        return (self.global_step % self.Kx) == 0
+        return self._macro_step % self.Kx == 0
+
+    def advance_macro_step(self):
+        self._macro_step += 1
+
+    def is_last_micro_batch(self, micro_step, num_micro_batches):
+        """Only sync at the last micro-batch of the macro-step."""
+        return micro_step == num_micro_batches - 1
 
     def state_dict(self):
-        # DES-LOC M155: tracked
-        return {'Kx': self.Kx, 'gas': self.gas,
-                'micro': self.micro_step, 'global': self.global_step}
+        return {'macro_step': self._macro_step, 'Kx': self.Kx}
+
+    def load_state_dict(self, sd):
+        self._macro_step = sd.get('macro_step', 0)
 
 
-class DeslocPipelineTimingAnalyzer:
-    """Analyze pipeline bubble overhead with DES-LOC.
+# =========================================================================
+# M215: DES-LOC Pipeline Parallel Integration (Algorithm 1 + 1F1B)
+# =========================================================================
 
-    Pipeline parallelism introduces bubbles (idle time at startup/end).
-    DES-LOC reduces DP comm time, which changes the relative
-    cost of bubbles vs communication.
+import math
+import time
+from collections import defaultdict
 
-    Key insight: if DES-LOC makes DP comm negligible, pipeline
-    bubbles become the dominant overhead. This analysis helps
-    decide whether to use more pipeline stages vs more DES-LOC.
 
-    Ref: Megatron-LM — pipeline bubble analysis.
+class DeslocPipelineScheduler:
+    """Schedule DES-LOC sync within pipeline parallel training.
+
+    Key insight: In pipeline parallel, each 'step' consists of multiple
+    micro-batches processed in 1F1B (one-forward-one-backward) pattern.
+    DES-LOC sync happens at MACRO-step boundaries (after all micro-batches),
+    not at each micro-batch.
+
+    Ref: Algorithm 1 — t indexes macro optimization steps.
     """
 
-    def __init__(self, num_stages, micro_batches):
-        # DES-LOC M155: tracked
-        self.num_stages = num_stages
-        self.micro_batches = micro_batches
+    def __init__(self, Kx=1, Ku=3, Kv=6, num_stages=1, num_micro_batches=1):
+        self._Kx = max(int(Kx), 1)
+        self._Ku = max(int(Ku), 1)
+        self._Kv = max(int(Kv), 1)
+        self._num_stages = max(num_stages, 1)
+        self._num_micro = max(num_micro_batches, 1)
+        self._macro_step = 0
+        self._micro_step = 0
+        self._stage_comm_bytes = defaultdict(int)
+        self._stage_skip_bytes = defaultdict(int)
 
-    def bubble_fraction(self):
-        # DES-LOC M155: tracked
-        """Compute pipeline bubble fraction.
-        bubble_frac = (p-1) / m where p=stages, m=micro_batches."""
-        if self.micro_batches <= 0:
-            return 1.0
-        return (self.num_stages - 1) / self.micro_batches
+    def is_last_micro_batch(self):
+        """Check if current micro-batch is the last in the macro-step."""
+        return self._micro_step >= self._num_micro - 1
 
-    def effective_throughput(self, compute_time_ms, dp_comm_time_ms, Kx=1):
-        # DES-LOC M155: tracked
-        """Compute effective throughput considering bubbles and DES-LOC.
+    def should_reduce_at_micro(self, tier=0, is_safety_critical=False):
+        """Should we AllReduce gradients at this micro-batch?
 
-        effective_time = compute * (1 + bubble_frac) + dp_comm/Kx
+        DES-LOC rule: only reduce at the LAST micro-batch of a macro-step,
+        AND only if the macro-step is a sync boundary for this tier.
+        Exception: safety-critical ops (MoE, overflow) always reduce.
         """
-        bubble_overhead = compute_time_ms * self.bubble_fraction()
-        comm_per_step = dp_comm_time_ms / max(1, Kx)
-        total = compute_time_ms + bubble_overhead + comm_per_step
-        return {
-            'total_ms': round(total, 4),
-            'compute_ms': round(compute_time_ms, 4),
-            'bubble_ms': round(bubble_overhead, 4),
-            'comm_ms': round(comm_per_step, 4),
-            'bubble_pct': round(100 * bubble_overhead / total, 2) if total > 0 else 0,
-            'comm_pct': round(100 * comm_per_step / total, 2) if total > 0 else 0,
-        }
+        if is_safety_critical:
+            return True
+        if not self.is_last_micro_batch():
+            return False
+        period = {0: self._Kx, 1: self._Ku, 2: self._Kv}.get(tier, 1)
+        if period <= 1:
+            return True
+        return self._macro_step % period == 0
 
-    def recommend_stages_vs_kx(self, compute_ms, comm_ms, max_stages=8, max_kx=128):
-        # DES-LOC M155: tracked
-        """Find best (stages, Kx) combination for given hardware.
-        Returns list of (stages, Kx, total_time) sorted by total_time."""
-        import math
-        results = []
-        for stages in range(1, max_stages + 1):
-            for kx_exp in range(int(math.log2(max_kx)) + 1):
-                kx = 2 ** kx_exp
-                analyzer = DeslocPipelineTimingAnalyzer(stages, 4)
-                eff = analyzer.effective_throughput(compute_ms, comm_ms, kx)
-                results.append({
-                    'stages': stages, 'Kx': kx,
-                    'total_ms': eff['total_ms'],
-                    'bubble_pct': eff['bubble_pct'],
-                    'comm_pct': eff['comm_pct'],
-                })
-        results.sort(key=lambda x: x['total_ms'])
-        return results[:10]  # top 10 configs
+    def advance_micro(self):
+        """Advance to next micro-batch."""
+        self._micro_step += 1
 
+    def advance_macro(self):
+        """Advance to next macro-step (resets micro counter)."""
+        self._macro_step += 1
+        self._micro_step = 0
 
-class DeslocPipelineGradAccumulator:
-    """Gradient accumulation across pipeline flushes with DES-LOC.
-    Hierarchy: micro-batch → pipeline flush → Kx boundary.
-    Pipeline send/recv always happens. DP allreduce is Kx-gated."""
+    def record_stage_comm(self, stage_id, num_bytes, did_reduce):
+        """Track per-stage communication volume."""
+        if did_reduce:
+            self._stage_comm_bytes[stage_id] += num_bytes
+        else:
+            self._stage_skip_bytes[stage_id] += num_bytes
 
-    def __init__(self, Kx=1, gas=1):
-        # DES-LOC M155: tracked
-        self.Kx = max(1, Kx)
-        self.gas = max(1, gas)
-        self.micro = 0
-        self.global_step = 0
+    @property
+    def macro_step(self):
+        return self._macro_step
 
-    def step_micro(self):
-        # DES-LOC M155: sync-gated
-        self.micro += 1
+    @property
+    def micro_step(self):
+        return self._micro_step
 
-    def is_pipeline_flush(self):
-        # DES-LOC M155: tracked
-        return self.micro >= self.gas
+    def pipeline_bubble_fraction(self):
+        """Estimate pipeline bubble as fraction of total time.
+        Bubble = (num_stages - 1) / (num_stages - 1 + num_micro_batches).
+        DES-LOC doesn't change the bubble, but reduces what happens in it."""
+        p = self._num_stages
+        m = self._num_micro
+        return (p - 1) / (p - 1 + m)
 
-    def step_global(self):
-        # DES-LOC M155: sync-gated
-        self.global_step += 1
-        self.micro = 0
-        return (self.global_step % self.Kx) == 0 if self.Kx > 1 else True
+    def effective_throughput_multiplier(self):
+        """How much DES-LOC improves effective throughput in pipeline.
+        On non-sync steps, the comm phase of the bubble is eliminated."""
+        bubble = self.pipeline_bubble_fraction()
+        sync_rate = 1.0 / self._Kx
+        comm_in_bubble = bubble * sync_rate
+        return 1.0 / (1.0 - bubble + comm_in_bubble)
 
     def state_dict(self):
-        # DES-LOC M155: tracked
-        return {'Kx': self.Kx, 'gas': self.gas,
-                'micro': self.micro, 'global': self.global_step}
-
-
-class DeslocPipelineTimingAnalyzer:
-    """Analyze pipeline bubble overhead with DES-LOC.
-    Bubbles become relatively more important as DES-LOC reduces comm.
-    Ref: Megatron pipeline bubble analysis."""
-
-    def __init__(self, num_stages, micro_batches):
-        # DES-LOC M155: tracked
-        self.num_stages = num_stages
-        self.micro_batches = micro_batches
-
-    def bubble_fraction(self):
-        # DES-LOC M155: tracked
-        if self.micro_batches <= 0:
-            return 1.0
-        return (self.num_stages - 1) / self.micro_batches
-
-    def effective_throughput(self, compute_ms, comm_ms, Kx=1):
-        # DES-LOC M155: tracked
-        bubble = compute_ms * self.bubble_fraction()
-        comm_per_step = comm_ms / max(1, Kx)
-        total = compute_ms + bubble + comm_per_step
         return {
-            'total_ms': round(total, 4),
-            'compute_ms': round(compute_ms, 4),
-            'bubble_ms': round(bubble, 4),
-            'comm_ms': round(comm_per_step, 4),
-            'bubble_pct': round(100 * bubble / max(0.001, total), 2),
-            'comm_pct': round(100 * comm_per_step / max(0.001, total), 2),
+            'macro': self._macro_step, 'micro': self._micro_step,
+            'Kx': self._Kx, 'Ku': self._Ku, 'Kv': self._Kv,
+            'stages': self._num_stages, 'micros': self._num_micro,
         }
 
-    def recommend_config(self, compute_ms, comm_ms, max_stages=8, max_kx=128):
-        # DES-LOC M155: tracked
-        """Find best (stages, Kx) for given hardware."""
-        import math
-        results = []
-        for stages in range(1, max_stages + 1):
-            for kx_exp in range(int(math.log2(max(1, max_kx))) + 1):
-                kx = 2 ** kx_exp
-                a = DeslocPipelineTimingAnalyzer(stages, 4)
-                e = a.effective_throughput(compute_ms, comm_ms, kx)
-                results.append({'stages': stages, 'Kx': kx, 'total_ms': e['total_ms']})
-        results.sort(key=lambda x: x['total_ms'])
-        return results[:5]
+    def load_state_dict(self, sd):
+        self._macro_step = sd.get('macro', 0)
+        self._micro_step = sd.get('micro', 0)
+
+
+class DeslocCrossStageSyncManager:
+    """Manage cross-stage state synchronization for pipeline parallel.
+
+    In pipeline parallel, different stages may need different sync frequencies.
+    Early layers (near input) may benefit from more frequent sync (smaller Kx)
+    because their gradients change faster. Later layers can use larger Kx.
+
+    Ref: Section 5.4 — 'We recommend setting Kx for sufficient throughput.'
+    """
+
+    def __init__(self, num_stages, default_Kx=32, default_Ku=96, default_Kv=192):
+        self._num_stages = num_stages
+        self._stage_periods = {}
+        for s in range(num_stages):
+            self._stage_periods[s] = {
+                'Kx': default_Kx, 'Ku': default_Ku, 'Kv': default_Kv
+            }
+
+    def set_stage_periods(self, stage_id, Kx=None, Ku=None, Kv=None):
+        """Override sync periods for a specific stage."""
+        if stage_id not in self._stage_periods:
+            return
+        if Kx is not None:
+            self._stage_periods[stage_id]['Kx'] = max(int(Kx), 1)
+        if Ku is not None:
+            self._stage_periods[stage_id]['Ku'] = max(int(Ku), 1)
+        if Kv is not None:
+            self._stage_periods[stage_id]['Kv'] = max(int(Kv), 1)
+
+    def should_sync_stage(self, stage_id, tier, step):
+        """Check if a stage should sync at given step."""
+        periods = self._stage_periods.get(stage_id, {'Kx': 1, 'Ku': 1, 'Kv': 1})
+        period_key = {0: 'Kx', 1: 'Ku', 2: 'Kv'}.get(tier, 'Kx')
+        period = periods[period_key]
+        if period <= 1:
+            return True
+        return step % period == 0
+
+    def adaptive_stage_periods(self, stage_gradient_norms):
+        """Auto-adjust per-stage Kx based on gradient norm variability.
+
+        Stages with higher gradient variance need more frequent sync.
+        This is a heuristic extending the half-life principle to pipeline stages.
+        """
+        if not stage_gradient_norms:
+            return
+        max_norm = max(stage_gradient_norms.values())
+        if max_norm <= 0:
+            return
+        for stage_id, norm in stage_gradient_norms.items():
+            ratio = norm / max_norm
+            base_Kx = self._stage_periods[stage_id]['Kx']
+            adjusted = max(1, int(base_Kx / max(ratio, 0.1)))
+            self._stage_periods[stage_id]['Kx'] = adjusted
+
+    def summary(self):
+        return dict(self._stage_periods)
 
 
 class DeslocPipelineCheckpointGuard:
-    """Ensure pipeline checkpoint happens at DES-LOC sync boundary.
-    If checkpoint is requested at a non-sync step, force a sync first.
-    This ensures checkpoint contains globally consistent parameters."""
+    """Ensure checkpoint save/load happens at DES-LOC sync boundaries.
 
-    def __init__(self, Kx=1):
-        # DES-LOC M155: tracked
-        self.Kx = max(1, Kx)
+    Saving at a non-sync step would capture inconsistent state
+    (some workers updated, others not). Always force sync before checkpoint.
 
-    def should_force_sync(self, step, checkpoint_requested):
-        # DES-LOC M155: tracked
-        if not checkpoint_requested:
-            return False
-        if self.Kx <= 1:
-            return False
-        return (step % self.Kx) != 0
+    Ref: Section A.1 — 'resume from DDP checkpoint.'
+    """
 
-    def nearest_sync_step(self, step):
-        # DES-LOC M155: sync-gated
-        if self.Kx <= 1:
-            return step
-        return ((step + self.Kx - 1) // self.Kx) * self.Kx
+    def __init__(self, scheduler):
+        self._sched = scheduler
 
-    def desloc_pipe_kx_gate(self):
-        """Gate pipe allreduce by Kx."""
-        if not getattr(self, "desloc_enabled", False):
-            return True
-        return self.global_steps % self.desloc_Kx == 0
+    def is_safe_to_checkpoint(self):
+        """True if all tiers are at a sync boundary."""
+        step = self._sched.macro_step
+        safe_x = step % self._sched._Kx == 0
+        safe_u = step % self._sched._Ku == 0
+        safe_v = step % self._sched._Kv == 0
+        return safe_x and safe_u and safe_v
 
+    def next_safe_step(self):
+        """Find the next step where all tiers sync (LCM of periods)."""
+        def _lcm(a, b):
+            return abs(a * b) // math.gcd(a, b)
+        period = _lcm(self._sched._Kx, _lcm(self._sched._Ku, self._sched._Kv))
+        current = self._sched.macro_step
+        if current % period == 0:
+            return current
+        return ((current // period) + 1) * period
 
-    def _desloc_pipe_sync(self):
-        """Sync optimizer states in pipeline."""
-        import deepspeed.comm as dist
-        dp = self.mpu.get_data_parallel_group() if self.mpu else None
-        ws = dist.get_world_size(group=dp)
-        for pg in self.optimizer.param_groups:
-            for p in pg["params"]:
-                if p not in self.optimizer.state:
-                    continue
-                s = self.optimizer.state[p]
-                if self.global_steps % self.desloc_Ku == 0 and "exp_avg" in s:
-                    dist.all_reduce(s["exp_avg"], group=dp)
-                    s["exp_avg"].div_(ws)
-                if self.global_steps % self.desloc_Kv == 0 and "exp_avg_sq" in s:
-                    dist.all_reduce(s["exp_avg_sq"], group=dp)
-                    s["exp_avg_sq"].div_(ws)
+    def steps_until_safe(self):
+        return self.next_safe_step() - self._sched.macro_step
 
 
-    # --- DES-LOC Pipeline (M142) ---
-    def _desloc_pipe_should_reduce(self,mb):
-        if not self.desloc_enabled: return True
-        if not self.is_gradient_accumulation_boundary(): return False
-        return self.desloc_is_param_sync_step()
-    def _desloc_pipe_stage_tier(self):
-        ns=getattr(self,'num_stages',1); sid=getattr(self,'stage_id',0)
-        if ns<=1 or sid==0 or sid==ns-1: return 'x'
-        return 'u' if sid<ns//2 else 'v'
-    def _desloc_pipe_1f1b(self,nmb):
-        ns=getattr(self,'num_stages',1); sid=getattr(self,'stage_id',0); w=min(nmb,ns-1-sid); s=nmb-w; c=w
-        ph=[('fwd',i,False) for i in range(w)]
-        for i in range(s): ph+=[('fwd',w+i,False),('bwd',i,False)]
-        for i in range(c): ph.append(('bwd',s+i,i==c-1 and self.desloc_is_param_sync_step()))
-        return ph
-    def _desloc_pipe_cross_stage_check(self):
-        if not self.desloc_enabled: return True
-        l=torch.tensor([int(self.desloc_is_param_sync_step())],device=self.device,dtype=torch.int32)
-        if self.grid and hasattr(self.grid,'get_pipe_parallel_group'):
-            pp=self.grid.get_pipe_parallel_group()
-            if pp: dist.broadcast(l,src=0,group=pp)
-        return bool(l.item())==self.desloc_is_param_sync_step()
-    def _desloc_pipe_nesterov(self,mu=0.9):
-        if not self.desloc_enabled or not self.desloc_is_param_sync_step(): return
-        if not hasattr(self,'_dpv'): self._dpv,self._dpp={},{}
-        for n,p in self.module.named_parameters():
-            if not p.requires_grad: continue
-            pid=id(p)
-            if pid not in self._dpv: self._dpv[pid]=p.data.new_zeros(p.data.shape);self._dpp[pid]=p.data.clone();continue
-            d=p.data.float()-self._dpp[pid].float();v=self._dpv[pid];v.mul_(mu).add_(d)
-            p.data.add_(v.to(p.dtype),alpha=mu);self._dpp[pid].copy_(p.data)
-    def _desloc_pipe_log(self):
-        if not self.desloc_enabled or dist.get_rank()!=0: return
-        print(f"### PP DES-LOC step={self.desloc_step} stage={getattr(self,'stage_id',0)} tier={self._desloc_pipe_stage_tier()} ###")
+class DeslocPipelineTimingAnalyzer:
+    """Analyze timing breakdown of pipeline parallel with DES-LOC.
 
-    # --- DES-LOC Pipeline Extensions (M149) ---
-    def _desloc_pipe_comm_stats(self):
-        sb=sum(p.numel()*p.element_size() for p in self.module.parameters() if p.requires_grad)
-        Kx=self.desloc_Kx if self.desloc_enabled else 1
-        return {'dp':sb,'reduction':round(Kx,1),'tier':self._desloc_pipe_stage_tier()}
-    def _desloc_pipe_warmup_sched(self,W=512):
-        s=self.desloc_step;tKx,tKu,tKv=self.desloc_Kx,self.desloc_Ku,self.desloc_Kv
-        if s<W//4: return {'Kx':1,'Ku':1,'Kv':1,'phase':'full_sync'}
-        elif s<W//2: return {'Kx':max(1,tKx//4),'Ku':1,'Kv':1,'phase':'grad_x'}
-        elif s<W: return {'Kx':max(1,tKx//2),'Ku':max(1,tKu//4),'Kv':1,'phase':'grad_uv'}
-        return {'Kx':tKx,'Ku':tKu,'Kv':tKv,'phase':'full_desloc'}
-    def _desloc_pipe_stability(self):
-        import math
-        gn=sum(p.grad.data.norm(2).item()**2 for p in self.module.parameters() if p.grad is not None)
-        gn=math.sqrt(gn);t=torch.tensor([gn,gn**2],device=self.device)
-        ws=dist.get_world_size()
-        if ws>1: dist.all_reduce(t);t/=ws
-        mn,msq=t[0].item(),t[1].item();cv=math.sqrt(max(0,msq-mn**2))/max(mn,1e-8)
-        return {'stable':cv<0.5,'cv':round(cv,4)}
-    def _desloc_pipe_overlap_est(self):
-        ns=getattr(self,'num_stages',1)
-        if ns<=1: return 1.0
-        sb=sum(p.numel()*p.element_size() for p in self.module.parameters() if p.requires_grad)
-        cm=sb/10e9*1000/max(self.desloc_Kx,1);cp=100.0/ns
-        ol=min(cm,cp*(ns-1));ex=max(0,cm-ol);return round(cp/max(cp+ex,1e-8),3)
-    def _desloc_pipe_ckpt(self):
-        return {'stage':getattr(self,'stage_id',0),'tier':self._desloc_pipe_stage_tier(),'step':self.desloc_step}
-    def _desloc_pipe_init_ddp(self):
-        if not self.desloc_enabled: return
-        self.desloc_step=0
-        if self.grid and hasattr(self.grid,'get_data_parallel_group'):
-            dp=self.grid.get_data_parallel_group()
-            for p in self.module.parameters(): dist.broadcast(p.data,src=0,group=dp)
+    Decomposes wall-clock time into:
+      - Forward time (per micro-batch)
+      - Backward time (per micro-batch)
+      - Communication time (AllReduce, only at sync boundaries)
+      - Pipeline bubble (idle time due to stage imbalance)
+      - DES-LOC overhead (sync gating checks, tier classification)
+
+    Ref: Appendix G.1 wall-clock model.
+    """
+
+    def __init__(self, num_stages, num_micro_batches):
+        self._stages = num_stages
+        self._micros = num_micro_batches
+        self._fwd_times = []
+        self._bwd_times = []
+        self._comm_times = []
+        self._idle_times = []
+        self._step_count = 0
+
+    def record_macro_step(self, fwd_ms, bwd_ms, comm_ms, idle_ms):
+        """Record timing for one complete macro-step."""
+        self._fwd_times.append(fwd_ms)
+        self._bwd_times.append(bwd_ms)
+        self._comm_times.append(comm_ms)
+        self._idle_times.append(idle_ms)
+        self._step_count += 1
+
+    def avg_breakdown(self):
+        """Average timing breakdown over all recorded steps."""
+        n = max(self._step_count, 1)
+        return {
+            'fwd_ms': sum(self._fwd_times) / n,
+            'bwd_ms': sum(self._bwd_times) / n,
+            'comm_ms': sum(self._comm_times) / n,
+            'idle_ms': sum(self._idle_times) / n,
+            'total_ms': (sum(self._fwd_times) + sum(self._bwd_times)
+                        + sum(self._comm_times) + sum(self._idle_times)) / n,
+        }
+
+    def mfu_estimate(self, model_flops_per_step, peak_tflops):
+        """Estimate MFU from timing data.
+        MFU = actual_TFLOPS / peak_TFLOPS
+        actual_TFLOPS = flops / (total_time_in_seconds * 1e12)."""
+        bd = self.avg_breakdown()
+        total_sec = bd['total_ms'] / 1000.0
+        if total_sec <= 0 or peak_tflops <= 0:
+            return 0.0
+        actual = model_flops_per_step / (total_sec * 1e12)
+        return actual / peak_tflops
+
+    def comm_fraction(self):
+        """Fraction of time spent on communication."""
+        bd = self.avg_breakdown()
+        total = bd['total_ms']
+        if total <= 0:
+            return 0.0
+        return bd['comm_ms'] / total
+
+    def desloc_improvement_over_ddp(self, ddp_comm_ms):
+        """Compute wall-clock improvement vs DDP baseline.
+        DDP has comm every step; DES-LOC has comm only at Kx boundaries."""
+        bd = self.avg_breakdown()
+        ddp_total = bd['fwd_ms'] + bd['bwd_ms'] + ddp_comm_ms + bd['idle_ms']
+        desloc_total = bd['total_ms']
+        if desloc_total <= 0:
+            return 1.0
+        return ddp_total / desloc_total
+
+    def format_report(self, step=None):
+        """Format timing report in NKI-FA parseable format."""
+        bd = self.avg_breakdown()
+        lines = []
+        if step is not None:
+            lines.append(f'### step = {step}, stages = {self._stages}, '
+                        f'micro_batches = {self._micros} ###')
+        lines.append(f'fwd_ms: {bd["fwd_ms"]:.4f}')
+        lines.append(f'bwd_ms: {bd["bwd_ms"]:.4f}')
+        lines.append(f'comm_ms: {bd["comm_ms"]:.4f}')
+        lines.append(f'idle_ms: {bd["idle_ms"]:.4f}')
+        lines.append(f'total_ms: {bd["total_ms"]:.4f}')
+        lines.append(f'comm_fraction: {self.comm_fraction():.6f}')
+        return '\n'.join(lines)
+
+
+class DeslocPipelineGradAccumulator:
+    """Accumulate gradients across micro-batches with DES-LOC awareness.
+
+    In standard pipeline, gradients accumulate across all micro-batches
+    then get AllReduced. With DES-LOC, on non-sync steps we skip the
+    AllReduce but still accumulate locally.
+
+    Key: gradient accumulation itself is never skipped.
+    Only the AllReduce is conditionally gated.
+    """
+
+    def __init__(self, num_micro_batches):
+        self._num_micro = num_micro_batches
+        self._micro_count = 0
+        self._accumulation_ready = False
+
+    def accumulate(self):
+        """Mark one micro-batch as accumulated."""
+        self._micro_count += 1
+        if self._micro_count >= self._num_micro:
+            self._accumulation_ready = True
+
+    def is_ready_for_reduce(self):
+        """All micro-batches accumulated, ready for AllReduce."""
+        return self._accumulation_ready
+
+    def reset(self):
+        """Reset for next macro-step."""
+        self._micro_count = 0
+        self._accumulation_ready = False
+
+    def scale_factor(self):
+        """Gradient scaling factor (1/num_micro_batches for averaging)."""
+        return 1.0 / max(self._num_micro, 1)
