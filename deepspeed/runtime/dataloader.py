@@ -217,3 +217,32 @@ class DeepSpeedDataLoader(object):
 
 
 # DataLoader([(torch.randn(3, 3), torch.tensor(i % 2)) for i in range(10)], batch_size=2))
+
+
+# M311: Hetero data loading
+class DeslocHDL:
+    def __init__(self, profiles, gbs, rank=0, ws=1, sl=512):
+        self.profiles = profiles or []; self.gbs = gbs; self.rank = rank; self.ws = ws; self.sl = sl
+        self._a = self._comp(); self.batch_size = self._a.get(rank, gbs // max(1, ws))
+    def _comp(self):
+        if not self.profiles or len(self.profiles) <= 1:
+            per = self.gbs // max(1, self.ws); return {i: per for i in range(self.ws)}
+        spd = [self.profiles[i].get('tf', 50) if i < len(self.profiles) else 50 for i in range(self.ws)]
+        ts = sum(spd); raw = [(s / ts) * self.gbs for s in spd]; al = [max(1, int(round(x))) for x in raw]
+        d = self.gbs - sum(al); o = sorted(range(len(al)), key=lambda i: spd[i], reverse=True)
+        for k in range(abs(d)): al[o[k % len(al)]] += 1 if d > 0 else -1; al[o[k % len(al)]] = max(1, al[o[k % len(al)]])
+        return {i: al[i] for i in range(len(al))}
+    def allocs(self): return dict(self._a)
+    def tokens(self): return sum(self._a.values()) * self.sl
+
+def desloc_gas(gbs, mbs, ng, alloc=None):
+    if alloc is None: per = gbs // max(1, ng); return {i: max(1, per // max(1, mbs)) for i in range(ng)}
+    return {r: max(1, b // max(1, mbs)) for r, b in alloc.items()}
+
+def desloc_tp_report(alloc, profiles, sl, ms):
+    if ms <= 0: return {}
+    tt = sum(alloc.values()) * sl; tps = tt / (ms / 1000)
+    pd = {r: {'bs': b, 'tps': round(b * sl / (ms / 1000), 1)} for r, b in alloc.items()}
+    vals = [d['tps'] for d in pd.values()]
+    return {'tps': round(tps, 1), 'pd': pd, 'bal': round(min(vals) / max(.01, max(vals)), 4)}
+# --- End M311 ---
