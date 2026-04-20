@@ -661,122 +661,38 @@ class CommsLogger:
         return result_dict if return_dict else None
 
 
+
+
 class DeslocLogParser:
-    """Parse DES-LOC experiment logs in NKI-FA format.
+    """Parse DES-LOC experiment logs into structured records.
+    Ref: NKI-FA exp_utils/draw_plot.py — regex-based log parsing."""
 
-    Log format produced by run_desloc_benchmark.sh:
-        ### Kx = 32, Ku = 96, Kv = 192, beta2 = 0.999, model = 125M ###
-        step: 100
-        loss: 5.4321
-        throughput_samples_sec: 128.4500
+    STEP_PATTERN = r'desloc_step:\s*(\d+)\s*\|\s*is_sync:\s*(\d)\s*\|.*?loss:\s*([\d.]+)'
 
-    Ref: NKI-FA commit da964f3 draw_plot.py — parse_data() pattern.
-    All values must have >= 4 significant digits (NeurIPS standard).
-    """
-
-    CONFIG_RE = _re.compile(r'###\s*(.*?)\s*###')
-    METRIC_RE = _re.compile(r'^([\w./]+):\s+([\d.eE+-]+)')
-
-    def __init__(self):
-        self.experiments = []
-
-    def parse_file(self, filepath):
-        """Parse one log file. Returns list of experiment dicts."""
-        results = []
-        cfg, met = None, {}
+    @staticmethod
+    def parse_file(filepath):
+        import re
+        records = []
+        pat = re.compile(DeslocLogParser.STEP_PATTERN)
         with open(filepath) as f:
             for line in f:
-                line = line.strip()
-                cm = self.CONFIG_RE.search(line)
-                if cm:
-                    if cfg is not None and met:
-                        results.append({'config': dict(cfg), 'metrics': dict(met)})
-                    cfg = {}
-                    for part in cm.group(1).split(','):
-                        if '=' in part:
-                            k, v = part.split('=', 1)
-                            k, v = k.strip(), v.strip()
-                            try:
-                                cfg[k] = int(v)
-                            except ValueError:
-                                try:
-                                    cfg[k] = float(v)
-                                except ValueError:
-                                    cfg[k] = v
-                    met = {}
-                    continue
-                mm = self.METRIC_RE.match(line)
-                if mm and cfg is not None:
-                    met[mm.group(1)] = float(mm.group(2))
-        if cfg is not None and met:
-            results.append({'config': dict(cfg), 'metrics': dict(met)})
-        self.experiments.extend(results)
-        return results
+                m = pat.search(line)
+                if m:
+                    records.append({
+                        'step': int(m.group(1)),
+                        'is_sync': int(m.group(2)),
+                        'loss': float(m.group(3)),
+                    })
+        return records
 
-    def parse_directory(self, dirpath, pattern='*.log'):
-        """Parse all matching files in a directory."""
-        import glob
-        import os
-        results = []
-        for fp in sorted(glob.glob(os.path.join(dirpath, pattern))):
-            results.extend(self.parse_file(fp))
-        return results
-
-    def filter_by(self, **kwargs):
-        """Filter experiments by config values."""
-        return [e for e in self.experiments
-                if all(e['config'].get(k) == v for k, v in kwargs.items())]
-
-    def group_by(self, key):
-        """Group experiments by a config key."""
-        groups = {}
-        for e in self.experiments:
-            val = e['config'].get(key)
-            groups.setdefault(val, []).append(e)
-        return groups
-
-    def summary_stats(self, metric_key, group_key=None):
-        """Compute mean/std/min/max with >= 4 significant digits."""
-        def _stats(vals):
-            vals = [v for v in vals if v is not None]
-            if not vals:
-                return {'mean': 0.0, 'std': 0.0, 'n': 0}
-            n = len(vals)
-            m = sum(vals) / n
-            s = math.sqrt(sum((x - m)**2 for x in vals) / (n - 1)) if n > 1 else 0.0
-            return {'mean': round(m, 6), 'std': round(s, 6),
-                    'min': round(min(vals), 6), 'max': round(max(vals), 6), 'n': n}
-        if group_key is None:
-            return _stats([e['metrics'].get(metric_key) for e in self.experiments])
-        groups = self.group_by(group_key)
-        return {g: _stats([e['metrics'].get(metric_key) for e in exps])
-                for g, exps in sorted(groups.items(), key=lambda x: str(x[0]))}
-
-    def to_json(self, filepath):
-        """Save experiments to JSON."""
-        with open(filepath, 'w') as f:
-            _json.dump(self.experiments, f, indent=2, default=str)
-
-    @classmethod
-    def from_json(cls, filepath):
-        """Load experiments from JSON."""
-        parser = cls()
+    @staticmethod
+    def parse_throughput(filepath):
+        import re
+        records = []
+        pat = re.compile(r'throughput:\s*([\d.]+)\s*samples/s')
         with open(filepath) as f:
-            parser.experiments = _json.load(f)
-        return parser
-
-
-class DeslocFigureDataPreparer:
-    """Prepare parsed experiment data for NeurIPS figures.
-    Ref: Section 5 RQ1-RQ6. All data from logs only."""
-
-    def __init__(self, parser):
-        self.parser = parser
-
-    def prepare_rq3_comm(self):
-        groups = self.parser.group_by('Kx')
-        return {kx: {
-            'avg_bytes': sum(e['metrics'].get('comm_bytes', 0) for e in exps) / max(1, len(exps)),
-            'n': len(exps),
-            'theory': desloc_comm_reduction(kx, kx * 3, kx * 6),
-        } for kx, exps in groups.items()}
+            for line in f:
+                m = pat.search(line)
+                if m:
+                    records.append(float(m.group(1)))
+        return records
