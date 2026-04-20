@@ -4712,316 +4712,54 @@ class DeepSpeedEngine(Module):
 
 
 # =========================================================================
-# DES-LOC Engine Extensions
-# Ref: Algorithm 1 + Section 4.1 + Section 5
+
+# =========================================================================
+# DES-LOC: Minimal engine extensions (Algorithm 1, Section 4.1)
 # =========================================================================
 
 def desloc_state_dict(engine):
-    """Extract DES-LOC state for checkpointing.
-    Ref: Section A.1 — resume from DDP checkpoint with DES-LOC state."""
+    """Checkpoint DES-LOC state. Ref: Section A.1."""
+    if not engine.desloc_enabled:
+        return {}
     return {
-        'enabled': engine.desloc_enabled,
         'Kx': engine.desloc_Kx, 'Ku': engine.desloc_Ku, 'Kv': engine.desloc_Kv,
-        'step': engine.desloc_step,
-        'skipped': engine.desloc_skipped_allreduces,
+        'step': engine.desloc_step, 'skipped': engine.desloc_skipped_allreduces,
         'clip_rho': engine.desloc_clip_rho,
-        'warmup': engine.desloc_warmup_steps,
-        'global_steps': engine.global_steps,
     }
 
 
 def desloc_load_state_dict(engine, sd):
-    """Restore DES-LOC state from checkpoint."""
-    engine.desloc_enabled = sd.get('enabled', False)
+    """Restore DES-LOC state. Ref: Section A.1."""
+    if not sd:
+        return
     engine.desloc_Kx = sd.get('Kx', 1)
     engine.desloc_Ku = sd.get('Ku', 3)
     engine.desloc_Kv = sd.get('Kv', 6)
     engine.desloc_step = sd.get('step', 0)
     engine.desloc_skipped_allreduces = sd.get('skipped', 0)
     engine.desloc_clip_rho = sd.get('clip_rho', 1.0)
-    engine.desloc_warmup_steps = sd.get('warmup', 512)
 
 
 def desloc_log_step(engine, loss=None, lr=None):
-    """Log DES-LOC step info in NKI-FA format.
-    Ref: NKI-FA draw_plot.py — structured 'metric: value' lines."""
+    """Log one line per step in parseable format. Ref: NKI-FA draw_plot.py."""
     if not engine.desloc_enabled:
         return
-    parts = [
-        f'desloc_step: {engine.desloc_step}',
-        f'is_sync: {int(engine.desloc_is_param_sync_step())}',
-        f'effective_Kx: {engine.desloc_get_effective_Kx()}',
-        f'skipped: {engine.desloc_skipped_allreduces}',
-    ]
+    sync = int(engine.desloc_step % engine.desloc_Kx == 0)
+    msg = (f'desloc_step: {engine.desloc_step} | is_sync: {sync} | '
+           f'Kx: {engine.desloc_Kx} | skipped: {engine.desloc_skipped_allreduces}')
     if loss is not None:
-        parts.append(f'loss: {loss:.6f}')
+        msg += f' | loss: {loss:.6f}'
     if lr is not None:
-        parts.append(f'lr: {lr:.8f}')
-    print(' | '.join(parts))
+        msg += f' | lr: {lr:.8f}'
+    print(msg)
 
 
 def desloc_report_comm_savings(engine):
-    """Report communication savings summary.
-    Ref: Section 5.3 — comm reduction vs DDP and Local Adam."""
+    """Print comm reduction summary. Ref: Section 5.3."""
     if not engine.desloc_enabled or engine.desloc_step == 0:
         return
     total = engine.desloc_step
-    synced = total - engine.desloc_skipped_allreduces
     skip_pct = 100.0 * engine.desloc_skipped_allreduces / total
-    desloc_freq = (1.0/engine.desloc_Kx + 1.0/engine.desloc_Ku +
-                   1.0/engine.desloc_Kv)
-    theoretical = (1.0 - desloc_freq / 3.0) * 100
-    print(f'DES-LOC Communication Report:')
-    print(f'  Steps: {total}, Param allreduces: {synced} '
-          f'(skipped {engine.desloc_skipped_allreduces}, {skip_pct:.1f}%)')
-    print(f'  Kx={engine.desloc_Kx} Ku={engine.desloc_Ku} Kv={engine.desloc_Kv}')
-    print(f'  Theoretical reduction vs DDP: {theoretical:.1f}%')
-
-
-class DeslocOuterOptimizer:
-    """Outer optimizer for parameter averaging at Kx sync boundaries.
-
-    Ref: Section 5.5 — 'Nesterov outer optimizer improves over averaging.'
-
-    At each Kx sync boundary:
-    - 'average': simple mean of all workers' parameters
-    - 'nesterov': Nesterov momentum on the averaging step
-    """
-
-    def __init__(self, mode='average', beta_outer=0.9):
-        self.mode = mode
-        self.beta_outer = beta_outer
-        self.velocity = {}
-
-    def step(self, named_parameters, sync_fn):
-        """Execute outer optimization step at sync boundary."""
-        if self.mode == 'average':
-            for name, param in named_parameters:
-                if param.requires_grad:
-                    sync_fn(param.data)
-        elif self.mode == 'nesterov':
-            for name, param in named_parameters:
-                if not param.requires_grad:
-                    continue
-                x_local = param.data.clone()
-                sync_fn(param.data)
-                x_avg = param.data
-                if name not in self.velocity:
-                    self.velocity[name] = param.data.new_zeros(param.data.shape)
-                v = self.velocity[name]
-                v.mul_(self.beta_outer).add_(x_avg - x_local)
-                param.data.add_(v, alpha=self.beta_outer)
-
-    def reset(self):
-        self.velocity.clear()
-
-    def state_dict(self):
-        return {'mode': self.mode, 'beta': self.beta_outer}
-
-
-class DeslocMomentumSyncer:
-    """Handles momentum state sync at Ku/Kv boundaries.
-    Ref: Algorithm 1 lines 14-15 — momentum averaging."""
-
-    def __init__(self, strategy='allreduce'):
-        self.strategy = strategy
-        self.syncs = {'momentum': 0, 'variance': 0}
-        self.skips = {'momentum': 0, 'variance': 0}
-
-    def sync_if_needed(self, engine):
-        if not engine.desloc_enabled:
-            return
-        if engine.desloc_is_momentum_sync_step():
-            self.syncs['momentum'] += 1
-        else:
-            self.skips['momentum'] += 1
-        if engine.desloc_is_variance_sync_step():
-            self.syncs['variance'] += 1
-        else:
-            self.skips['variance'] += 1
-
-    def get_stats(self):
-        tm = self.syncs['momentum'] + self.skips['momentum']
-        tv = self.syncs['variance'] + self.skips['variance']
-        return {
-            'momentum_sync_ratio': round(self.syncs['momentum']/max(1,tm), 4),
-            'variance_sync_ratio': round(self.syncs['variance']/max(1,tv), 4),
-        }
-
-
-class DeslocPerCoordinateClipper:
-    """Per-coordinate gradient clipping. Ref: Algorithm 1 line 12.
-    Unlike global norm clipping, clips each component: |g_i| <= rho."""
-
-    def __init__(self, rho=1.0):
-        self.rho = rho
-        self.clip_count = 0
-        self.total_count = 0
-
-    def clip_gradients(self, parameters):
-        clipped = 0
-        total = 0
-        for p in parameters:
-            if p.grad is None:
-                continue
-            g = p.grad.data
-            total += g.numel()
-            mask = g.abs() > self.rho
-            clipped += mask.sum().item()
-            g.clamp_(-self.rho, self.rho)
-        self.clip_count += clipped
-        self.total_count += total
-        return clipped / max(1, total)
-
-    @property
-    def clip_ratio(self):
-        return self.clip_count / max(1, self.total_count)
-
-    def reset(self):
-        self.clip_count = 0
-        self.total_count = 0
-
-
-class DeslocCommScheduler:
-    """Schedule collective communication by DES-LOC sync tier.
-    Ref: Megatron-LM DistributedDataParallel — overlap_grad_reduce.
-    DES-LOC extends: each optimizer state has its own comm schedule.
-
-    At each step, determines:
-    - Should param gradient allreduce happen? (step % Kx == 0)
-    - Should first momentum allreduce happen? (step % Ku == 0)
-    - Should second momentum allreduce happen? (step % Kv == 0)
-    """
-
-    def __init__(self, Kx=1, Ku=3, Kv=6, warmup_steps=0):
-        self.Kx = max(1, Kx)
-        self.Ku = max(1, Ku)
-        self.Kv = max(1, Kv)
-        self.warmup_steps = warmup_steps
-        self.step = 0
-        self.bytes_by_tier = {0: 0, 1: 0, 2: 0}
-        self.ops_by_tier = {0: 0, 1: 0, 2: 0}
-        self.skipped_by_tier = {0: 0, 1: 0, 2: 0}
-
-    def should_communicate(self, tier, step=None):
-        s = step if step is not None else self.step
-        if s < self.warmup_steps:
-            return True
-        period = {0: self.Kx, 1: self.Ku, 2: self.Kv}.get(tier, 1)
-        return (s % period) == 0
-
-    def record_op(self, tier, num_bytes, skipped=False):
-        if skipped:
-            self.skipped_by_tier[tier] = self.skipped_by_tier.get(tier, 0) + 1
-        else:
-            self.bytes_by_tier[tier] = self.bytes_by_tier.get(tier, 0) + num_bytes
-            self.ops_by_tier[tier] = self.ops_by_tier.get(tier, 0) + 1
-
-    def advance_step(self):
-        self.step += 1
-
-    def get_schedule(self):
-        return {0: self.should_communicate(0),
-                1: self.should_communicate(1),
-                2: self.should_communicate(2)}
-
-    def get_savings(self):
-        total = sum(self.ops_by_tier.values()) + sum(self.skipped_by_tier.values())
-        if total == 0:
-            return {'skip_ratio': 0.0}
-        return {
-            'total_ops': total,
-            'executed': sum(self.ops_by_tier.values()),
-            'skipped': sum(self.skipped_by_tier.values()),
-            'skip_ratio': round(sum(self.skipped_by_tier.values()) / total, 4),
-            'bytes_sent': sum(self.bytes_by_tier.values()),
-        }
-
-    def state_dict(self):
-        return {'step': self.step, 'Kx': self.Kx, 'Ku': self.Ku, 'Kv': self.Kv,
-                'warmup': self.warmup_steps, 'bytes': dict(self.bytes_by_tier),
-                'ops': dict(self.ops_by_tier), 'skipped': dict(self.skipped_by_tier)}
-
-    def load_state_dict(self, sd):
-        self.step = sd.get('step', 0)
-        self.Kx = sd.get('Kx', self.Kx)
-        self.Ku = sd.get('Ku', self.Ku)
-        self.Kv = sd.get('Kv', self.Kv)
-        self.warmup_steps = sd.get('warmup', self.warmup_steps)
-        self.bytes_by_tier = sd.get('bytes', {0: 0, 1: 0, 2: 0})
-        self.ops_by_tier = sd.get('ops', {0: 0, 1: 0, 2: 0})
-        self.skipped_by_tier = sd.get('skipped', {0: 0, 1: 0, 2: 0})
-
-
-class DeslocBandwidthProber:
-    """Measure network bandwidth for DES-LOC Kx selection.
-    Ref: Nick Joseph — 'colleague ran clustering algorithm to figure out
-    which chips are in which datacenter rooms, because latency differed.'"""
-
-    def __init__(self):
-        self.measurements = []
-
-    def probe(self, tensor_size_bytes, num_trials=5):
-        """Measure allreduce bandwidth. Returns GB/s or None."""
-        import time as _time
-        try:
-            import torch
-            import deepspeed.comm as dist
-            if not dist.is_initialized():
-                return None
-            t = torch.zeros(tensor_size_bytes // 4, dtype=torch.float32,
-                           device=torch.cuda.current_device())
-            for _ in range(2):
-                dist.all_reduce(t)
-            torch.cuda.synchronize()
-            times = []
-            for _ in range(num_trials):
-                torch.cuda.synchronize()
-                s = _time.perf_counter()
-                dist.all_reduce(t)
-                torch.cuda.synchronize()
-                times.append(_time.perf_counter() - s)
-            avg = sum(times) / len(times)
-            bw = tensor_size_bytes / avg / 1e9
-            self.measurements.append({'size': tensor_size_bytes, 'bw_gbps': bw})
-            return bw
-        except Exception:
-            return None
-
-    def recommend_Kx(self, model_params, compute_time_s):
-        """Recommend Kx from measured bandwidth."""
-        if not self.measurements:
-            return 32
-        import math
-        bw = self.measurements[-1]['bw_gbps']
-        if bw <= 0:
-            return 128
-        ar_time = model_params * 2 * 2 / (bw * 1e9)
-        if ar_time <= compute_time_s:
-            return 1
-        kx = 2 ** int(math.ceil(math.log2(max(1, ar_time / compute_time_s))))
-        return min(kx, 256)
-
-
-def desloc_engine_summary(engine):
-    """Print one-line DES-LOC engine state summary."""
-    if not engine.desloc_enabled:
-        return 'DES-LOC: disabled'
-    eff_kx = engine.desloc_get_effective_Kx()
-    warmup = 'warmup' if engine.desloc_step < engine.desloc_warmup_steps else 'active'
-    skip_pct = 100.0 * engine.desloc_skipped_allreduces / max(1, engine.desloc_step)
-    return (f'DES-LOC [{warmup}]: step={engine.desloc_step} '
-            f'eff_Kx={eff_kx} skipped={engine.desloc_skipped_allreduces} '
-            f'({skip_pct:.1f}%) Ku={engine.desloc_Ku} Kv={engine.desloc_Kv}')
-
-
-def desloc_should_force_sync(engine, loss_current, loss_previous):
-    """Force param sync if loss spikes (divergence detection).
-    Ref: Nick Joseph — 'when the curve departs from power law, something is wrong.'
-    A sudden loss spike during DES-LOC training may indicate stale parameters."""
-    if loss_previous <= 0:
-        return False
-    ratio = loss_current / loss_previous
-    if ratio > 2.0:  # loss doubled — force sync
-        return True
-    return False
+    print(f'DES-LOC: {total} steps, skipped {engine.desloc_skipped_allreduces} '
+          f'allreduces ({skip_pct:.1f}%), Kx={engine.desloc_Kx} '
+          f'Ku={engine.desloc_Ku} Kv={engine.desloc_Kv}')
