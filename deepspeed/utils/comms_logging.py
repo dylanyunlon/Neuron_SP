@@ -661,3 +661,25 @@ class CommsLogger:
         return result_dict if return_dict else None
 
 
+
+
+# M283: Structured comm event logger
+class DeslocCommEventLog:
+    def __init__(self):
+        self._events = []; self._step = 0
+    def log(self, op, tier, nbytes, elapsed_ms):
+        self._events.append({"step":self._step,"op":op,"tier":tier,
+            "bytes":nbytes,"ms":round(elapsed_ms,4)})
+    def advance(self): self._step += 1
+    def to_csv(self, path):
+        import csv
+        with open(path,'w',newline='') as f:
+            w = csv.DictWriter(f, fieldnames=["step","op","tier","bytes","ms"])
+            w.writeheader(); w.writerows(self._events)
+    def tier_summary(self):
+        by_tier = {}
+        for e in self._events:
+            t = e["tier"]
+            if t not in by_tier: by_tier[t]={"count":0,"bytes":0,"ms":0}
+            by_tier[t]["count"]+=1; by_tier[t]["bytes"]+=e["bytes"]; by_tier[t]["ms"]+=e["ms"]
+        return by_tier
