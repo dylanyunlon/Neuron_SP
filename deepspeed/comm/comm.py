@@ -1412,4 +1412,252 @@ def get_desloc_scheduler(): return _desloc_sched
 def get_desloc_tiered_ar(): return _desloc_tar
 def get_desloc_profiler(): return _desloc_prof
 
-# M213: refactor complete
+
+# =============================================================================
+# M230 (Claude-15): DDP Baseline Comm Statistics for Figure 2
+# Ref: Section 5.3 — DDP as upper-bound comm baseline
+# Ref: NCCL src/include/profiler — byte-level AllReduce tracking
+# Ref: Megatron-LM megatron/core/distributed — gradient bucket accounting
+# =============================================================================
+
+
+class DeslocDDPBaselineTracker:
+    """Track what DDP *would* communicate for Figure 2 comparison.
+
+    DDP calls AllReduce on every gradient bucket at every step.
+    This tracker accumulates the hypothetical DDP communication volume
+    alongside actual DES-LOC volume, enabling precise reduction ratios.
+
+    From NCCL profiler: each AllReduce event carries {bytes, op, stream}.
+    We track: total_bytes, total_ops, per_step_bytes.
+
+    From Megatron-LM: gradient buckets are ~25M elements each.
+    We track per-bucket statistics for accurate comparison.
+
+    Usage (integrated into engine.allreduce_gradients):
+        tracker.on_step_begin(step)
+        tracker.record_gradient_bucket(bucket_bytes)  # for each bucket
+        tracker.on_step_end(was_synced=engine.desloc_is_param_sync_step())
+    """
+
+    def __init__(self):
+        self._step = 0
+        self._ddp_total_bytes = 0       # bytes DDP would have sent
+        self._desloc_total_bytes = 0     # bytes DES-LOC actually sent
+        self._ddp_total_ops = 0
+        self._desloc_total_ops = 0
+        self._step_bucket_bytes = 0      # accumulator for current step
+        self._per_step_log = []          # [(step, ddp_bytes, desloc_bytes)]
+        self._bucket_sizes = []          # observed bucket sizes
+        self._max_log_entries = 50000    # cap memory usage
+
+    def on_step_begin(self, step):
+        """Signal start of a training step."""
+        self._step = step
+        self._step_bucket_bytes = 0
+
+    def record_gradient_bucket(self, bucket_bytes):
+        """Record a gradient bucket that would be AllReduced.
+
+        Called once per bucket in allreduce_gradients().
+        DDP would always send this; DES-LOC may skip.
+
+        Args:
+            bucket_bytes: int — size of this bucket in bytes
+        """
+        self._step_bucket_bytes += bucket_bytes
+        if len(self._bucket_sizes) < 1000:
+            self._bucket_sizes.append(bucket_bytes)
+
+    def on_step_end(self, was_synced):
+        """Signal end of step. Update running totals.
+
+        Args:
+            was_synced: bool — True if DES-LOC actually did AllReduce
+        """
+        step_bytes = self._step_bucket_bytes
+        # DDP always syncs
+        self._ddp_total_bytes += step_bytes
+        self._ddp_total_ops += 1
+        # DES-LOC only syncs on Kx boundaries
+        if was_synced:
+            self._desloc_total_bytes += step_bytes
+            self._desloc_total_ops += 1
+        if len(self._per_step_log) < self._max_log_entries:
+            self._per_step_log.append(
+                (self._step, step_bytes, step_bytes if was_synced else 0))
+
+    def get_reduction_ratio(self):
+        """Compute DDP/DES-LOC byte ratio.
+
+        Returns: float — e.g. 32.0 means DES-LOC used 32× less.
+        """
+        if self._desloc_total_bytes <= 0:
+            return float('inf') if self._ddp_total_bytes > 0 else 1.0
+        return self._ddp_total_bytes / self._desloc_total_bytes
+
+    def get_figure2_bar_data(self):
+        """Return data for Figure 2 bar chart.
+
+        Returns:
+            dict with 'ddp_gb', 'desloc_gb', 'reduction',
+            'ddp_ops', 'desloc_ops', 'avg_bucket_mb'
+        """
+        ddp_gb = self._ddp_total_bytes / (1024**3)
+        dl_gb = self._desloc_total_bytes / (1024**3)
+        avg_bucket = 0.0
+        if self._bucket_sizes:
+            avg_bucket = (sum(self._bucket_sizes) /
+                          len(self._bucket_sizes) / (1024**2))
+        return {
+            'ddp_gb': round(ddp_gb, 3),
+            'desloc_gb': round(dl_gb, 3),
+            'reduction': round(self.get_reduction_ratio(), 1),
+            'ddp_ops': self._ddp_total_ops,
+            'desloc_ops': self._desloc_total_ops,
+            'avg_bucket_mb': round(avg_bucket, 2),
+            'total_steps': self._step + 1,
+        }
+
+    def get_cumulative_curve(self):
+        """Return cumulative comm bytes over time for Figure 2 line plot.
+
+        Returns: (steps, ddp_cumulative_gb, desloc_cumulative_gb)
+        """
+        steps = []
+        ddp_cum = []
+        dl_cum = []
+        ddp_running = 0
+        dl_running = 0
+        for step, db, dlb in self._per_step_log:
+            ddp_running += db
+            dl_running += dlb
+            steps.append(step)
+            ddp_cum.append(ddp_running / (1024**3))
+            dl_cum.append(dl_running / (1024**3))
+        return steps, ddp_cum, dl_cum
+
+    def emit_nkifa_log(self, stream=None):
+        """Write tracking data in NKI-FA format.
+
+        Format:
+            ### comm_tracking ###
+            ddp_total_gb: 12.456
+            desloc_total_gb: 0.073
+            reduction: 170.0
+        """
+        def _w(line):
+            if stream:
+                stream.write(line + '\n')
+            else:
+                print(line)
+        data = self.get_figure2_bar_data()
+        _w('### comm_tracking ###')
+        _w(f'ddp_total_gb: {data["ddp_gb"]:.3f}')
+        _w(f'desloc_total_gb: {data["desloc_gb"]:.3f}')
+        _w(f'reduction: {data["reduction"]:.1f}')
+        _w(f'ddp_ops: {data["ddp_ops"]}')
+        _w(f'desloc_ops: {data["desloc_ops"]}')
+        _w(f'avg_bucket_mb: {data["avg_bucket_mb"]:.2f}')
+
+    def state_dict(self):
+        """Serialize for checkpoint."""
+        return {
+            'ddp_bytes': self._ddp_total_bytes,
+            'dl_bytes': self._desloc_total_bytes,
+            'ddp_ops': self._ddp_total_ops,
+            'dl_ops': self._desloc_total_ops,
+            'step': self._step,
+        }
+
+    def load_state_dict(self, sd):
+        """Restore from checkpoint."""
+        self._ddp_total_bytes = sd.get('ddp_bytes', 0)
+        self._desloc_total_bytes = sd.get('dl_bytes', 0)
+        self._ddp_total_ops = sd.get('ddp_ops', 0)
+        self._desloc_total_ops = sd.get('dl_ops', 0)
+        self._step = sd.get('step', 0)
+
+
+class DeslocCommComparisonTable:
+    """Generate comparison tables for multiple Kx configs.
+
+    Aggregates DeslocDDPBaselineTracker data across experiments
+    to produce Figure 2 multi-bar chart data.
+
+    Ref: NKI-FA draw_plot.py — grouped bar chart with
+    'Before'/'After' hue and exact annotations.
+
+    Usage:
+        table = DeslocCommComparisonTable()
+        table.add_experiment('DDP', kx=1, tracker_data)
+        table.add_experiment('Kx=32', kx=32, tracker_data)
+        table.add_experiment('Kx=64', kx=64, tracker_data)
+        fig2_all = table.get_figure2_grouped_data()
+    """
+
+    def __init__(self):
+        self._experiments = []
+
+    def add_experiment(self, label, kx, ku, kv, tracker_data):
+        """Add one experiment's comm data.
+
+        Args:
+            label: str — display label for figure legend
+            kx, ku, kv: int — sync periods
+            tracker_data: dict from DeslocDDPBaselineTracker.get_figure2_bar_data()
+        """
+        self._experiments.append({
+            'label': label,
+            'Kx': kx, 'Ku': ku, 'Kv': kv,
+            **tracker_data,
+        })
+
+    def get_figure2_grouped_data(self):
+        """Return data for grouped bar chart.
+
+        Returns: list of dicts, each with:
+            'label', 'ddp_gb', 'desloc_gb', 'reduction'
+
+        Sorted by Kx ascending.
+        """
+        return sorted(self._experiments, key=lambda x: x['Kx'])
+
+    def emit_latex_table(self):
+        """Generate LaTeX table for NeurIPS submission.
+
+        Format:
+            \\begin{tabular}{lcccc}
+            Method & Kx & Comm (GB) & vs DDP & vs Local Adam \\\\
+        """
+        lines = [
+            r'\begin{tabular}{lcccc}',
+            r'\toprule',
+            r'Config & $K_x$ & Comm (GB) & vs DDP & vs Local Adam \\',
+            r'\midrule',
+        ]
+        for exp in sorted(self._experiments, key=lambda x: x['Kx']):
+            lines.append(
+                f'{exp["label"]} & {exp["Kx"]} & '
+                f'{exp["desloc_gb"]:.3f} & '
+                f'{exp["reduction"]:.1f}$\\times$ & '
+                f'--- \\\\')
+        lines.append(r'\bottomrule')
+        lines.append(r'\end{tabular}')
+        return '\n'.join(lines)
+
+    def emit_nkifa_log(self, stream=None):
+        """Write all experiment comm data in NKI-FA format."""
+        def _w(line):
+            if stream:
+                stream.write(line + '\n')
+            else:
+                print(line)
+        for exp in sorted(self._experiments, key=lambda x: x['Kx']):
+            _w(f'### Kx = {exp["Kx"]}, Ku = {exp["Ku"]}, '
+               f'Kv = {exp["Kv"]} ###')
+            _w(f'label: {exp["label"]}')
+            _w(f'ddp_total_gb: {exp["ddp_gb"]:.3f}')
+            _w(f'desloc_total_gb: {exp["desloc_gb"]:.3f}')
+            _w(f'reduction: {exp["reduction"]:.1f}')
+            _w('')
