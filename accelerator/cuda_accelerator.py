@@ -610,3 +610,144 @@ class DeslocNVLinkDetector:
         return {'intra_Kx': intra_kx, 'inter_Kx': inter_kx,
                 'intra_ar_ms': round(intra_ar * 1000, 4),
                 'inter_ar_ms': round(inter_ar * 1000, 4)}
+
+
+# =============================================================================
+# M239 (Claude-15): GPU utilization timeline data for Figure 1+2
+# Ref: Nick Joseph — "profiler per-step timing, compare to expectation"
+# Ref: nvidia-smi --query-gpu= for real-time GPU metrics
+# =============================================================================
+
+
+class DeslocGPUTimelineCollector:
+    """Collect per-step GPU utilization for Figure 1 background overlay.
+
+    Overlays GPU utilization timeline on loss curve to show
+    correlation between DES-LOC sync events and GPU activity.
+
+    From Nick Joseph: "we had to write our own distributed profiler
+    to aggregate traces across hundreds of GPUs."
+
+    From nvidia-smi: query gpu_util, mem_util, temperature, power.
+
+    Usage:
+        collector = DeslocGPUTimelineCollector(device_id=0)
+        collector.snapshot(step=100)  # records current GPU state
+        timeline = collector.get_timeline()
+    """
+
+    def __init__(self, device_id=0):
+        self.device_id = device_id
+        self._snapshots = []
+        self._max_snapshots = 10000
+
+    def snapshot(self, step, is_sync=False):
+        """Take GPU utilization snapshot.
+
+        Uses torch.cuda for memory stats. Temperature/power
+        require nvidia-smi (optional, graceful fallback).
+        """
+        import torch
+        snap = {
+            'step': step,
+            'is_sync': is_sync,
+        }
+        try:
+            if torch.cuda.is_available():
+                dev = self.device_id
+                snap['mem_alloc_mb'] = round(
+                    torch.cuda.memory_allocated(dev) / (1024**2), 1)
+                snap['mem_reserved_mb'] = round(
+                    torch.cuda.memory_reserved(dev) / (1024**2), 1)
+                snap['mem_max_mb'] = round(
+                    torch.cuda.max_memory_allocated(dev) / (1024**2), 1)
+                # GPU utilization via NVML if available
+                try:
+                    import pynvml
+                    pynvml.nvmlInit()
+                    handle = pynvml.nvmlDeviceGetHandleByIndex(dev)
+                    util = pynvml.nvmlDeviceGetUtilizationRates(handle)
+                    snap['gpu_util_pct'] = util.gpu
+                    snap['mem_util_pct'] = util.memory
+                    temp = pynvml.nvmlDeviceGetTemperature(
+                        handle, pynvml.NVML_TEMPERATURE_GPU)
+                    snap['temp_c'] = temp
+                    power = pynvml.nvmlDeviceGetPowerUsage(handle)
+                    snap['power_w'] = round(power / 1000, 1)
+                except Exception:
+                    pass  # pynvml not available
+        except Exception:
+            pass
+
+        if len(self._snapshots) < self._max_snapshots:
+            self._snapshots.append(snap)
+
+    def get_timeline(self):
+        """Return timeline data for plotting.
+
+        Returns: list of snapshot dicts.
+        """
+        return list(self._snapshots)
+
+    def get_memory_curve(self):
+        """Extract memory usage curve for Figure annotation.
+
+        Returns: (steps, mem_alloc_mb) lists.
+        """
+        steps = [s['step'] for s in self._snapshots if 'mem_alloc_mb' in s]
+        mems = [s['mem_alloc_mb'] for s in self._snapshots if 'mem_alloc_mb' in s]
+        return steps, mems
+
+    def get_utilization_at_sync(self):
+        """Compare GPU utilization at sync vs non-sync steps.
+
+        Returns: dict with avg_util_sync, avg_util_nosync.
+        DES-LOC should show higher GPU util at non-sync steps
+        (more time spent on compute, less on comm).
+        """
+        sync_utils = [s['gpu_util_pct'] for s in self._snapshots
+                      if s.get('is_sync') and 'gpu_util_pct' in s]
+        nosync_utils = [s['gpu_util_pct'] for s in self._snapshots
+                        if not s.get('is_sync') and 'gpu_util_pct' in s]
+        avg_sync = sum(sync_utils) / max(1, len(sync_utils))
+        avg_nosync = sum(nosync_utils) / max(1, len(nosync_utils))
+        return {
+            'avg_util_sync': round(avg_sync, 1),
+            'avg_util_nosync': round(avg_nosync, 1),
+            'n_sync_samples': len(sync_utils),
+            'n_nosync_samples': len(nosync_utils),
+            'util_improvement_pct': round(avg_nosync - avg_sync, 1),
+        }
+
+    def get_peak_memory_by_config(self):
+        """Get peak memory for hardware requirements section."""
+        if not self._snapshots:
+            return {'peak_mb': 0}
+        peaks = [s.get('mem_max_mb', 0) for s in self._snapshots]
+        return {'peak_mb': max(peaks) if peaks else 0}
+
+    def emit_nkifa_log(self, stream=None):
+        """Write GPU timeline in NKI-FA format."""
+        def _w(line):
+            if stream: stream.write(line + '\n')
+            else: print(line)
+        _w(f'### gpu_timeline device={self.device_id} ###')
+        for s in self._snapshots[-20:]:  # last 20 for summary
+            parts = [f'step: {s["step"]}']
+            if 'mem_alloc_mb' in s:
+                parts.append(f'mem_mb: {s["mem_alloc_mb"]:.1f}')
+            if 'gpu_util_pct' in s:
+                parts.append(f'gpu_util: {s["gpu_util_pct"]}')
+            parts.append(f'sync: {int(s.get("is_sync", False))}')
+            _w(' | '.join(parts))
+        util_data = self.get_utilization_at_sync()
+        _w('--- summary ---')
+        for k, v in sorted(util_data.items()):
+            _w(f'{k}: {v}')
+        _w('--- end summary ---')
+
+    def state_dict(self):
+        return {'snapshots': self._snapshots[-100:]}
+
+    def load_state_dict(self, sd):
+        self._snapshots = sd.get('snapshots', [])
