@@ -5037,248 +5037,25 @@ def desloc_log_step(engine, loss=None, lr=None):
 
 
 def desloc_report_comm_savings(engine):
-    """Print comm reduction summary. Ref: Section 5.3."""
+    """Print comm reduction summary. Ref: Section 5.3, Table 2."""
     if not engine.desloc_enabled or engine.desloc_step == 0:
         return
     total = engine.desloc_step
+    synced = total - engine.desloc_skipped_allreduces
     skip_pct = 100.0 * engine.desloc_skipped_allreduces / total
-    print(f'DES-LOC: {total} steps, skipped {engine.desloc_skipped_allreduces} '
-          f'allreduces ({skip_pct:.1f}%), Kx={engine.desloc_Kx} '
-          f'Ku={engine.desloc_Ku} Kv={engine.desloc_Kv}')
-
-    desloc_freq = (1.0/engine.desloc_Kx + 1.0/engine.desloc_Ku +
-                   1.0/engine.desloc_Kv)
-    theoretical = (1.0 - desloc_freq / 3.0) * 100
+    sync_x = total // max(1, engine.desloc_Kx)
+    sync_u = total // max(1, engine.desloc_Ku)
+    sync_v = total // max(1, engine.desloc_Kv)
+    ddp_ops = total * 3  # DDP syncs all 3 states every step
+    desloc_ops = sync_x + sync_u + sync_v
+    reduction = ddp_ops / max(1, desloc_ops)
     print(f'DES-LOC Communication Report:')
-    print(f'  Steps: {total}, Param allreduces: {synced} '
-          f'(skipped {engine.desloc_skipped_allreduces}, {skip_pct:.1f}%)')
-    print(f'  Kx={engine.desloc_Kx} Ku={engine.desloc_Ku} Kv={engine.desloc_Kv}')
-    print(f'  Theoretical reduction vs DDP: {theoretical:.1f}%')
-
-
-class DeslocOuterOptimizer:
-    """Outer optimizer for parameter averaging at Kx sync boundaries.
-
-    Ref: Section 5.5 — 'Nesterov outer optimizer improves over averaging.'
-
-    At each Kx sync boundary:
-    - 'average': simple mean of all workers' parameters
-    - 'nesterov': Nesterov momentum on the averaging step
-    """
-
-    def __init__(self, mode='average', beta_outer=0.9):
-        self.mode = mode
-        self.beta_outer = beta_outer
-        self.velocity = {}
-
-    def step(self, named_parameters, sync_fn):
-        """Execute outer optimization step at sync boundary."""
-        if self.mode == 'average':
-            for name, param in named_parameters:
-                if param.requires_grad:
-                    sync_fn(param.data)
-        elif self.mode == 'nesterov':
-            for name, param in named_parameters:
-                if not param.requires_grad:
-                    continue
-                x_local = param.data.clone()
-                sync_fn(param.data)
-                x_avg = param.data
-                if name not in self.velocity:
-                    self.velocity[name] = param.data.new_zeros(param.data.shape)
-                v = self.velocity[name]
-                v.mul_(self.beta_outer).add_(x_avg - x_local)
-                param.data.add_(v, alpha=self.beta_outer)
-
-    def reset(self):
-        self.velocity.clear()
-
-    def state_dict(self):
-        return {'mode': self.mode, 'beta': self.beta_outer}
-
-
-class DeslocMomentumSyncer:
-    """Handles momentum state sync at Ku/Kv boundaries.
-    Ref: Algorithm 1 lines 14-15 — momentum averaging."""
-
-    def __init__(self, strategy='allreduce'):
-        self.strategy = strategy
-        self.syncs = {'momentum': 0, 'variance': 0}
-        self.skips = {'momentum': 0, 'variance': 0}
-
-    def sync_if_needed(self, engine):
-        if not engine.desloc_enabled:
-            return
-        if engine.desloc_is_momentum_sync_step():
-            self.syncs['momentum'] += 1
-        else:
-            self.skips['momentum'] += 1
-        if engine.desloc_is_variance_sync_step():
-            self.syncs['variance'] += 1
-        else:
-            self.skips['variance'] += 1
-
-    def get_stats(self):
-        tm = self.syncs['momentum'] + self.skips['momentum']
-        tv = self.syncs['variance'] + self.skips['variance']
-        return {
-            'momentum_sync_ratio': round(self.syncs['momentum']/max(1,tm), 4),
-            'variance_sync_ratio': round(self.syncs['variance']/max(1,tv), 4),
-        }
-
-
-class DeslocPerCoordinateClipper:
-    """Per-coordinate gradient clipping. Ref: Algorithm 1 line 12.
-    Unlike global norm clipping, clips each component: |g_i| <= rho."""
-
-    def __init__(self, rho=1.0):
-        self.rho = rho
-        self.clip_count = 0
-        self.total_count = 0
-
-    def clip_gradients(self, parameters):
-        clipped = 0
-        total = 0
-        for p in parameters:
-            if p.grad is None:
-                continue
-            g = p.grad.data
-            total += g.numel()
-            mask = g.abs() > self.rho
-            clipped += mask.sum().item()
-            g.clamp_(-self.rho, self.rho)
-        self.clip_count += clipped
-        self.total_count += total
-        return clipped / max(1, total)
-
-    @property
-    def clip_ratio(self):
-        return self.clip_count / max(1, self.total_count)
-
-    def reset(self):
-        self.clip_count = 0
-        self.total_count = 0
-
-
-class DeslocCommScheduler:
-    """Schedule collective communication by DES-LOC sync tier.
-    Ref: Megatron-LM DistributedDataParallel — overlap_grad_reduce.
-    DES-LOC extends: each optimizer state has its own comm schedule.
-
-    At each step, determines:
-    - Should param gradient allreduce happen? (step % Kx == 0)
-    - Should first momentum allreduce happen? (step % Ku == 0)
-    - Should second momentum allreduce happen? (step % Kv == 0)
-    """
-
-    def __init__(self, Kx=1, Ku=3, Kv=6, warmup_steps=0):
-        self.Kx = max(1, Kx)
-        self.Ku = max(1, Ku)
-        self.Kv = max(1, Kv)
-        self.warmup_steps = warmup_steps
-        self.step = 0
-        self.bytes_by_tier = {0: 0, 1: 0, 2: 0}
-        self.ops_by_tier = {0: 0, 1: 0, 2: 0}
-        self.skipped_by_tier = {0: 0, 1: 0, 2: 0}
-
-    def should_communicate(self, tier, step=None):
-        s = step if step is not None else self.step
-        if s < self.warmup_steps:
-            return True
-        period = {0: self.Kx, 1: self.Ku, 2: self.Kv}.get(tier, 1)
-        return (s % period) == 0
-
-    def record_op(self, tier, num_bytes, skipped=False):
-        if skipped:
-            self.skipped_by_tier[tier] = self.skipped_by_tier.get(tier, 0) + 1
-        else:
-            self.bytes_by_tier[tier] = self.bytes_by_tier.get(tier, 0) + num_bytes
-            self.ops_by_tier[tier] = self.ops_by_tier.get(tier, 0) + 1
-
-    def advance_step(self):
-        self.step += 1
-
-    def get_schedule(self):
-        return {0: self.should_communicate(0),
-                1: self.should_communicate(1),
-                2: self.should_communicate(2)}
-
-    def get_savings(self):
-        total = sum(self.ops_by_tier.values()) + sum(self.skipped_by_tier.values())
-        if total == 0:
-            return {'skip_ratio': 0.0}
-        return {
-            'total_ops': total,
-            'executed': sum(self.ops_by_tier.values()),
-            'skipped': sum(self.skipped_by_tier.values()),
-            'skip_ratio': round(sum(self.skipped_by_tier.values()) / total, 4),
-            'bytes_sent': sum(self.bytes_by_tier.values()),
-        }
-
-    def state_dict(self):
-        return {'step': self.step, 'Kx': self.Kx, 'Ku': self.Ku, 'Kv': self.Kv,
-                'warmup': self.warmup_steps, 'bytes': dict(self.bytes_by_tier),
-                'ops': dict(self.ops_by_tier), 'skipped': dict(self.skipped_by_tier)}
-
-    def load_state_dict(self, sd):
-        self.step = sd.get('step', 0)
-        self.Kx = sd.get('Kx', self.Kx)
-        self.Ku = sd.get('Ku', self.Ku)
-        self.Kv = sd.get('Kv', self.Kv)
-        self.warmup_steps = sd.get('warmup', self.warmup_steps)
-        self.bytes_by_tier = sd.get('bytes', {0: 0, 1: 0, 2: 0})
-        self.ops_by_tier = sd.get('ops', {0: 0, 1: 0, 2: 0})
-        self.skipped_by_tier = sd.get('skipped', {0: 0, 1: 0, 2: 0})
-
-
-class DeslocBandwidthProber:
-    """Measure network bandwidth for DES-LOC Kx selection.
-    Ref: Nick Joseph — 'colleague ran clustering algorithm to figure out
-    which chips are in which datacenter rooms, because latency differed.'"""
-
-    def __init__(self):
-        self.measurements = []
-
-    def probe(self, tensor_size_bytes, num_trials=5):
-        """Measure allreduce bandwidth. Returns GB/s or None."""
-        import time as _time
-        try:
-            import torch
-            import deepspeed.comm as dist
-            if not dist.is_initialized():
-                return None
-            t = torch.zeros(tensor_size_bytes // 4, dtype=torch.float32,
-                           device=torch.cuda.current_device())
-            for _ in range(2):
-                dist.all_reduce(t)
-            torch.cuda.synchronize()
-            times = []
-            for _ in range(num_trials):
-                torch.cuda.synchronize()
-                s = _time.perf_counter()
-                dist.all_reduce(t)
-                torch.cuda.synchronize()
-                times.append(_time.perf_counter() - s)
-            avg = sum(times) / len(times)
-            bw = tensor_size_bytes / avg / 1e9
-            self.measurements.append({'size': tensor_size_bytes, 'bw_gbps': bw})
-            return bw
-        except Exception:
-            return None
-
-    def recommend_Kx(self, model_params, compute_time_s):
-        """Recommend Kx from measured bandwidth."""
-        if not self.measurements:
-            return 32
-        import math
-        bw = self.measurements[-1]['bw_gbps']
-        if bw <= 0:
-            return 128
-        ar_time = model_params * 2 * 2 / (bw * 1e9)
-        if ar_time <= compute_time_s:
-            return 1
-        kx = 2 ** int(math.ceil(math.log2(max(1, ar_time / compute_time_s))))
-        return min(kx, 256)
+    print(f'  Steps: {total}, Param syncs: {sync_x}, '
+          f'Momentum syncs: {sync_u}, Variance syncs: {sync_v}')
+    print(f'  Total allreduce ops: {desloc_ops} '
+          f'(DDP baseline: {ddp_ops}, reduction: {reduction:.1f}x)')
+    print(f'  Kx={engine.desloc_Kx} Ku={engine.desloc_Ku} '
+          f'Kv={engine.desloc_Kv}')
 
 
 def desloc_engine_summary(engine):
@@ -5306,7 +5083,599 @@ def desloc_should_force_sync(engine, loss_current, loss_previous):
 
 
 # =============================================================================
-# M197 (Claude-15): Ablation Experiment Logger — NKI-FA Format
+# M257 (Claude-17): DES-LOC Experiment Scheduler, Step Profiler, NKI-FA Export
+#
+# Ref: NKI-FA da964f3 draw_plot.py — log format: ### config ### \n metric: val
+# Ref: Section 5 — 6 research questions, 108 experiment configs
+# Ref: Nick Joseph — "最可靠的办法是收集数据再做判断"
+# Ref: Megatron-LM/megatron/core/optimizer/distrib_optimizer.py — comm tracking
+# Ref: NCCL/src/collectives/all_reduce.cc — AllReduce cost model
+#
+# Architecture:
+#   DeslocExperimentScheduler — generates 108-config ablation matrix
+#   DeslocStepProfiler — per-step timing/memory/comm instrumentation
+#   DeslocNKIFAExporter — writes logs parseable by draw_plot.py
+#   DeslocConvergenceBoundChecker — validates loss vs theoretical bound
+#   desloc_run_experiment — single config execution entry point
+#   desloc_sweep_Kx — RQ2 Kx sweep with NKI-FA output
+#   desloc_comm_overhead_model — α+βN latency model for AllReduce
+#
+# CRITICAL: No numpy.random. All seeds via torch.manual_seed.
+# CRITICAL: All data from actual training logs, never hardcoded.
+# CRITICAL: Loss annotations ≥4 decimal places (e.g., 3.2147).
+# =============================================================================
+
+
+import math as _desloc_math
+import time as _desloc_time
+import os as _desloc_os
+import json as _desloc_json
+
+
+class DeslocExperimentScheduler:
+    """Generate and manage the full 108-config ablation matrix.
+
+    Covers DES-LOC paper Section 5 research questions:
+      RQ1 (half-life):     4 β₂ × 3 seeds = 12 configs
+      RQ2 (sync sweep):    7 Kx × 2 models × 3 seeds = 42 configs
+      RQ3 (comm reduction): 2 base_Kx × 3 modes × 3 seeds = 18 configs
+      RQ4 (large scale):   3 models × 3 seeds = 9 configs
+      RQ5 (nesterov):      2 outer × 3 seeds = 6 configs
+      RQ6 (inner opt):     2 inner × 3 seeds = 6 configs
+      COMM (overhead):     5 Kx × 3 seeds = 15 configs
+      Total: 108 unique (config, seed) pairs.
+
+    Design ref: Megatron-LM megatron/core/optimizer/optimizer.py ChainedOptimizer
+    — each config is a self-contained experiment specification.
+    """
+
+    SEEDS = (42, 137, 2024)
+
+    MODEL_PARAMS = {
+        '125M': 124_439_808,
+        '350M': 354_823_168,
+        '1.3B': 1_315_753_024,
+    }
+
+    @staticmethod
+    def half_life(beta):
+        """τ_{0.5}(β) = ln(0.5) / ln(β). Ref: Section 2, Eq.(1)."""
+        if beta <= 0.0 or beta >= 1.0:
+            return float('inf')
+        return _desloc_math.log(0.5) / _desloc_math.log(beta)
+
+    @staticmethod
+    def psi_factor(px, pu, beta):
+        """ψ = 4(1-px)/px² · (1-β)(1-pu) / (6(1-(1-pu)β)).
+        Ref: Theorem 1, Section 3. Controls step-size restriction."""
+        if px <= 0 or pu <= 0:
+            return float('inf')
+        num = 4.0 * (1.0 - px) * (1.0 - beta) * (1.0 - pu)
+        den = px * px * 6.0 * (1.0 - (1.0 - pu) * beta)
+        if den <= 0:
+            return float('inf')
+        return num / den
+
+    @staticmethod
+    def step_size_bound(L, beta, psi, B_sq=1.0):
+        """η₀ = 1/(4L) · min(1-β, 1/√(ψ·max(1,B²-1))).
+        Ref: Theorem 1 step-size restriction."""
+        term1 = 1.0 - beta
+        inner = psi * max(1.0, B_sq - 1.0)
+        term2 = 1.0 / _desloc_math.sqrt(max(1e-12, inner))
+        return min(term1, term2) / (4.0 * L)
+
+    def generate_all(self):
+        """Generate complete 108-config matrix. Returns list of dicts."""
+        configs = []
+        cid = 0
+
+        # RQ1: Half-life validation (Section 5.1)
+        for b2 in [0.9, 0.95, 0.99, 0.999]:
+            for seed in self.SEEDS:
+                cid += 1
+                tau1 = self.half_life(0.9)
+                tau2 = self.half_life(b2)
+                configs.append({
+                    'id': cid, 'rq': 'RQ1', 'model': '125M',
+                    'Kx': 32, 'Ku': 96, 'Kv': 192,
+                    'beta1': 0.9, 'beta2': b2,
+                    'max_steps': 2000, 'seed': seed,
+                    'clip_rho': 1.0, 'lr': 6e-4,
+                    'outer': 'average', 'inner': 'adam',
+                    'expected_ratio': tau2 / max(1e-12, tau1),
+                    'tag': f'rq1_b2={b2}_s{seed}',
+                })
+
+        # RQ2: Sync period sweep (Section 5.2)
+        for kx in [1, 4, 8, 16, 32, 64, 128]:
+            for model in ['125M', '350M']:
+                for seed in self.SEEDS:
+                    cid += 1
+                    ku = max(1, kx * 3)
+                    kv = max(1, kx * 6)
+                    px, pu = 1.0/max(1, kx), 1.0/max(1, ku)
+                    psi = self.psi_factor(px, pu, 0.9)
+                    configs.append({
+                        'id': cid, 'rq': 'RQ2', 'model': model,
+                        'Kx': kx, 'Ku': ku, 'Kv': kv,
+                        'beta1': 0.9, 'beta2': 0.999,
+                        'max_steps': 2000 if model == '125M' else 1000,
+                        'seed': seed, 'clip_rho': 1.0, 'lr': 6e-4,
+                        'outer': 'average', 'inner': 'adam',
+                        'psi': psi,
+                        'tag': f'rq2_{model}_Kx{kx}_s{seed}',
+                    })
+
+        # RQ3: Communication reduction (Section 5.3)
+        for base_kx in [32, 64]:
+            for mode in ['ddp', 'local_adam', 'desloc']:
+                for seed in self.SEEDS:
+                    cid += 1
+                    if mode == 'ddp':
+                        kx, ku, kv = 1, 1, 1
+                    elif mode == 'local_adam':
+                        kx, ku, kv = base_kx, base_kx, base_kx
+                    else:
+                        kx = base_kx
+                        ku, kv = base_kx * 3, base_kx * 6
+                    n_params = self.MODEL_PARAMS['125M']
+                    ddp_bytes = 2000 * n_params * 4 * 3
+                    desloc_bytes = (2000 // max(1, kx) +
+                                   2000 // max(1, ku) +
+                                   2000 // max(1, kv)) * n_params * 4
+                    configs.append({
+                        'id': cid, 'rq': 'RQ3', 'model': '125M',
+                        'Kx': kx, 'Ku': ku, 'Kv': kv,
+                        'beta1': 0.9, 'beta2': 0.999,
+                        'max_steps': 2000, 'seed': seed,
+                        'clip_rho': 1.0, 'lr': 6e-4,
+                        'outer': 'average', 'inner': 'adam',
+                        'mode': mode, 'base_Kx': base_kx,
+                        'expected_reduction': ddp_bytes / max(1, desloc_bytes),
+                        'tag': f'rq3_{mode}_bKx{base_kx}_s{seed}',
+                    })
+
+        # RQ4: Large-scale training (Section 5.4)
+        for model in ['125M', '350M', '1.3B']:
+            for seed in self.SEEDS:
+                cid += 1
+                steps = {'125M': 2000, '350M': 1000, '1.3B': 500}[model]
+                bs = {'125M': 4, '350M': 2, '1.3B': 1}[model]
+                configs.append({
+                    'id': cid, 'rq': 'RQ4', 'model': model,
+                    'Kx': 32, 'Ku': 96, 'Kv': 192,
+                    'beta1': 0.9, 'beta2': 0.999,
+                    'max_steps': steps, 'seed': seed,
+                    'clip_rho': 1.0, 'lr': 6e-4,
+                    'outer': 'average', 'inner': 'adam',
+                    'batch_size': bs,
+                    'tag': f'rq4_{model}_s{seed}',
+                })
+
+        # RQ5: Nesterov outer optimizer (Section 5.5)
+        for outer in ['average', 'nesterov']:
+            for seed in self.SEEDS:
+                cid += 1
+                configs.append({
+                    'id': cid, 'rq': 'RQ5', 'model': '125M',
+                    'Kx': 32, 'Ku': 96, 'Kv': 192,
+                    'beta1': 0.9, 'beta2': 0.999,
+                    'max_steps': 2000, 'seed': seed,
+                    'clip_rho': 1.0, 'lr': 6e-4,
+                    'outer': outer, 'inner': 'adam',
+                    'tag': f'rq5_{outer}_s{seed}',
+                })
+
+        # RQ6: Inner optimizer ablation (Section 5.6)
+        for inner in ['adam', 'adopt']:
+            for seed in self.SEEDS:
+                cid += 1
+                configs.append({
+                    'id': cid, 'rq': 'RQ6', 'model': '125M',
+                    'Kx': 32, 'Ku': 96, 'Kv': 192,
+                    'beta1': 0.9, 'beta2': 0.999,
+                    'max_steps': 2000, 'seed': seed,
+                    'clip_rho': 1.0, 'lr': 6e-4,
+                    'outer': 'average', 'inner': inner,
+                    'tag': f'rq6_{inner}_s{seed}',
+                })
+
+        # COMM: Communication overhead sweep
+        for kx in [1, 8, 32, 64, 256]:
+            for seed in self.SEEDS:
+                cid += 1
+                configs.append({
+                    'id': cid, 'rq': 'COMM', 'model': '125M',
+                    'Kx': kx, 'Ku': max(1, kx * 3),
+                    'Kv': max(1, kx * 6),
+                    'beta1': 0.9, 'beta2': 0.999,
+                    'max_steps': 500, 'seed': seed,
+                    'clip_rho': 1.0, 'lr': 6e-4,
+                    'outer': 'average', 'inner': 'adam',
+                    'tag': f'comm_Kx{kx}_s{seed}',
+                })
+
+        return configs
+
+    def group_by_rq(self):
+        """Group configs by research question. Returns {rq: [configs]}."""
+        groups = {}
+        for c in self.generate_all():
+            groups.setdefault(c['rq'], []).append(c)
+        return groups
+
+    def config_count(self):
+        """Return total config count per RQ."""
+        return {rq: len(cfgs) for rq, cfgs in self.group_by_rq().items()}
+
+
+class DeslocStepProfiler:
+    """Per-step timing, memory, and communication instrumentation.
+
+    Collects at each training step:
+    - wall_time_ms: total step time
+    - fwd_ms, bwd_ms, opt_ms, comm_ms: phase breakdown
+    - memory_gb: peak GPU memory
+    - comm_bytes: bytes sent this step (0 if no sync)
+    - grad_norm: gradient L2 norm post-clip
+    - clip_fraction: fraction of coordinates clipped
+    - mfu: Model FLOPS Utilization
+
+    Ref: Megatron-LM megatron/core/distributed/param_and_grad_buffer.py
+    Ref: NCCL src/collectives/all_reduce.cc — latency = α + β·N
+    Ref: Section 5.3 — comm reduction measurement methodology
+
+    Design: ring buffer of last N steps for rolling statistics.
+    """
+
+    def __init__(self, buffer_size=1000):
+        self._buffer_size = buffer_size
+        self._steps = []
+        self._phase_start = 0.0
+        self._phases = {}
+        self._step_data = {}
+
+    def begin_step(self):
+        """Mark beginning of training step."""
+        self._step_data = {'t_start': _desloc_time.monotonic()}
+        self._phases = {}
+
+    def begin_phase(self, name):
+        """Mark beginning of a phase (fwd/bwd/opt/comm)."""
+        self._phase_start = _desloc_time.monotonic()
+
+    def end_phase(self, name):
+        """Mark end of a phase. Records duration in ms."""
+        elapsed = (_desloc_time.monotonic() - self._phase_start) * 1000.0
+        self._phases[name] = elapsed
+
+    def end_step(self, step_num, loss, grad_norm, comm_bytes,
+                 clip_fraction, n_params, batch_tokens, device_peak_tflops):
+        """Finalize step profiling. Computes MFU and stores record."""
+        t_end = _desloc_time.monotonic()
+        wall_ms = (t_end - self._step_data['t_start']) * 1000.0
+
+        # MFU: 6·N·B·S / (wall_time · peak_TFLOPS · 1e12)
+        # Ref: Kaplan et al. scaling laws, Section 4.1
+        flops = 6.0 * n_params * batch_tokens
+        wall_s = wall_ms / 1000.0
+        actual_tflops = flops / max(1e-9, wall_s) / 1e12
+        mfu = actual_tflops / max(1e-9, device_peak_tflops)
+
+        record = {
+            'step': step_num,
+            'loss': loss,
+            'wall_ms': round(wall_ms, 4),
+            'fwd_ms': round(self._phases.get('fwd', 0.0), 4),
+            'bwd_ms': round(self._phases.get('bwd', 0.0), 4),
+            'opt_ms': round(self._phases.get('opt', 0.0), 4),
+            'comm_ms': round(self._phases.get('comm', 0.0), 4),
+            'comm_bytes': comm_bytes,
+            'grad_norm': round(grad_norm, 6),
+            'clip_fraction': round(clip_fraction, 6),
+            'mfu': round(mfu, 6),
+            'tflops': round(actual_tflops, 4),
+            'tokens_per_sec': round(batch_tokens / max(1e-9, wall_s), 2),
+        }
+
+        self._steps.append(record)
+        if len(self._steps) > self._buffer_size:
+            self._steps.pop(0)
+
+        return record
+
+    def rolling_avg(self, key, window=100):
+        """Compute rolling average of a metric."""
+        recent = self._steps[-window:]
+        if not recent:
+            return 0.0
+        vals = [r.get(key, 0.0) for r in recent]
+        return sum(vals) / len(vals)
+
+    def total_comm_bytes(self):
+        """Sum of all comm_bytes across recorded steps."""
+        return sum(r.get('comm_bytes', 0) for r in self._steps)
+
+    def loss_curve(self):
+        """Return (steps, losses) for plotting."""
+        return ([r['step'] for r in self._steps],
+                [r['loss'] for r in self._steps])
+
+    def phase_breakdown(self):
+        """Return average phase breakdown as dict."""
+        n = len(self._steps)
+        if n == 0:
+            return {'fwd': 0, 'bwd': 0, 'opt': 0, 'comm': 0}
+        return {
+            'fwd': sum(r.get('fwd_ms', 0) for r in self._steps) / n,
+            'bwd': sum(r.get('bwd_ms', 0) for r in self._steps) / n,
+            'opt': sum(r.get('opt_ms', 0) for r in self._steps) / n,
+            'comm': sum(r.get('comm_ms', 0) for r in self._steps) / n,
+        }
+
+
+class DeslocNKIFAExporter:
+    """Write experiment logs in NKI-FA format for draw_plot.py parsing.
+
+    Format (matching NKI-FA da964f3):
+        ### key1 = val1, key2 = val2 ###
+        method fwd: 12.252ms, 359.0 TFLOPS
+        method bwd: 35.758ms, 307.5 TFLOPS
+
+    Extended DES-LOC format:
+        ### model = 125M, Kx = 32, Ku = 96, Kv = 192, seed = 42 ###
+        DES-LOC step 0: loss=10.8356, mfu=0.0312, comm_bytes=0
+        DES-LOC step 100: loss=7.2143, mfu=0.0415, comm_bytes=497759232
+
+    All numeric values use ≥4 significant digits.
+    """
+
+    def __init__(self, output_dir, tag):
+        self._dir = output_dir
+        self._tag = tag
+        _desloc_os.makedirs(output_dir, exist_ok=True)
+        self._path = _desloc_os.path.join(output_dir, f'{tag}.log')
+        # Truncate if exists
+        with open(self._path, 'w') as f:
+            f.write(f'# DES-LOC Experiment: {tag}\n')
+            f.write(f'# Generated by DeslocNKIFAExporter (M257)\n\n')
+
+    def write_config_header(self, config):
+        """Write ### config ### header line."""
+        parts = []
+        for k in sorted(config.keys()):
+            v = config[k]
+            if isinstance(v, float):
+                parts.append(f'{k} = {v:.6g}')
+            else:
+                parts.append(f'{k} = {v}')
+        with open(self._path, 'a') as f:
+            f.write(f'\n### {", ".join(parts)} ###\n')
+
+    def write_step(self, record):
+        """Write one step's data. Record from DeslocStepProfiler.end_step()."""
+        with open(self._path, 'a') as f:
+            step = record['step']
+            loss = record['loss']
+            mfu = record.get('mfu', 0.0)
+            tflops = record.get('tflops', 0.0)
+            wall_ms = record.get('wall_ms', 0.0)
+            comm = record.get('comm_bytes', 0)
+            gn = record.get('grad_norm', 0.0)
+            cf = record.get('clip_fraction', 0.0)
+            tps = record.get('tokens_per_sec', 0.0)
+            f.write(f'DES-LOC step {step}: loss={loss:.6f}, '
+                    f'mfu={mfu:.4f}, tflops={tflops:.4f}, '
+                    f'wall_ms={wall_ms:.4f}, comm_bytes={comm}, '
+                    f'grad_norm={gn:.6f}, clip_frac={cf:.6f}, '
+                    f'tok_per_sec={tps:.2f}\n')
+
+    def write_summary(self, profiler, config):
+        """Write final summary block."""
+        steps, losses = profiler.loss_curve()
+        if not losses:
+            return
+        final_loss = losses[-1]
+        min_loss = min(losses)
+        avg_loss = sum(losses) / len(losses)
+        total_comm = profiler.total_comm_bytes()
+        breakdown = profiler.phase_breakdown()
+
+        # DDP baseline: sync all 3 states every step
+        n_params = self.__class__._get_param_count(config)
+        total_steps = len(steps)
+        ddp_bytes = total_steps * n_params * 4 * 3
+        reduction = ddp_bytes / max(1, total_comm) if total_comm > 0 else 0
+
+        with open(self._path, 'a') as f:
+            f.write('\n--- SUMMARY ---\n')
+            f.write(f'final_loss: {final_loss:.8f}\n')
+            f.write(f'min_loss: {min_loss:.8f}\n')
+            f.write(f'avg_loss: {avg_loss:.8f}\n')
+            f.write(f'total_steps: {total_steps}\n')
+            f.write(f'total_comm_bytes: {total_comm}\n')
+            f.write(f'ddp_baseline_bytes: {ddp_bytes}\n')
+            f.write(f'comm_reduction_x: {reduction:.4f}\n')
+            f.write(f'avg_fwd_ms: {breakdown["fwd"]:.4f}\n')
+            f.write(f'avg_bwd_ms: {breakdown["bwd"]:.4f}\n')
+            f.write(f'avg_opt_ms: {breakdown["opt"]:.4f}\n')
+            f.write(f'avg_comm_ms: {breakdown["comm"]:.4f}\n')
+            f.write(f'avg_mfu: {profiler.rolling_avg("mfu"):.6f}\n')
+
+    @staticmethod
+    def _get_param_count(config):
+        model = config.get('model', '125M')
+        return DeslocExperimentScheduler.MODEL_PARAMS.get(model, 124_439_808)
+
+    def get_path(self):
+        return self._path
+
+
+class DeslocConvergenceBoundChecker:
+    """Validate that observed loss is consistent with Theorem 1 bound.
+
+    Theorem 1 (Section 3): Under Assumptions 1-3,
+    1/T Σ E‖∇f(x̄_t)‖² ≤ 4/√T·(f(x₀)-f* + Lσ²/(2M)) + O((1+ψ)/T)
+
+    This checker compares the observed loss trajectory against the
+    theoretical convergence rate, flagging runs where loss deviates
+    by more than a threshold from the expected power-law decay.
+
+    Ref: Nick Joseph — "当曲线偏离幂律时，说明出问题了"
+    """
+
+    def __init__(self, f_star=0.0, L=1.0, sigma_sq=1.0, M=1):
+        self.f_star = f_star
+        self.L = L
+        self.sigma_sq = sigma_sq
+        self.M = M
+
+    def theoretical_bound(self, T, f0, psi=1.0):
+        """Compute the RHS of Theorem 1 bound at step T."""
+        if T <= 0:
+            return float('inf')
+        leading = 4.0 / _desloc_math.sqrt(T) * (
+            f0 - self.f_star + self.L * self.sigma_sq / (2.0 * self.M))
+        higher_order = (1.0 + psi) / T
+        return leading + higher_order
+
+    def check_trajectory(self, steps, losses, f0, psi=1.0,
+                         tolerance=2.0):
+        """Check if loss trajectory is within tolerance of bound.
+
+        Returns list of (step, loss, bound, ratio) for violations.
+        """
+        violations = []
+        for step, loss in zip(steps, losses):
+            if step < 10:
+                continue
+            bound = self.theoretical_bound(step, f0, psi)
+            if bound <= 0:
+                continue
+            # Loss should be decreasing; check if it's way above bound
+            ratio = loss / (f0 * bound) if f0 > 0 else 0
+            if ratio > tolerance:
+                violations.append({
+                    'step': step,
+                    'loss': round(loss, 6),
+                    'bound': round(bound, 6),
+                    'ratio': round(ratio, 4),
+                })
+        return violations
+
+    def is_converging(self, losses, window=100, threshold=0.01):
+        """Check if loss is still decreasing (rolling average slope < 0)."""
+        if len(losses) < window * 2:
+            return True  # too early to tell
+        early = losses[-window*2:-window]
+        late = losses[-window:]
+        avg_early = sum(early) / len(early)
+        avg_late = sum(late) / len(late)
+        improvement = (avg_early - avg_late) / max(1e-12, avg_early)
+        return improvement > -threshold  # still improving or plateau
+
+
+def desloc_comm_overhead_model(n_params, kx, ku, kv, total_steps,
+                                alpha_us=50.0, beta_gbps=100.0):
+    """AllReduce communication overhead model: latency = α + β·N.
+
+    Ref: NCCL Ring-AllReduce: time = 2(P-1)/P · (α + N·sizeof/β)
+    For single ring with P workers, approximated as α + N/β.
+
+    Args:
+        n_params: model parameter count
+        kx, ku, kv: DES-LOC sync periods
+        total_steps: training steps
+        alpha_us: AllReduce startup latency in microseconds
+        beta_gbps: network bandwidth in Gbps
+
+    Returns: dict with comm_time_s, ddp_time_s, reduction, ops_count
+    """
+    bytes_per_param = 4  # FP32
+    msg_size = n_params * bytes_per_param
+
+    # AllReduce time per op: α + msg_size / bandwidth
+    beta_bytes_per_s = beta_gbps * 1e9 / 8
+    ar_time_s = alpha_us * 1e-6 + msg_size / beta_bytes_per_s
+
+    # DES-LOC ops count
+    ops_x = total_steps // max(1, kx)
+    ops_u = total_steps // max(1, ku)
+    ops_v = total_steps // max(1, kv)
+    desloc_ops = ops_x + ops_u + ops_v
+    desloc_time = desloc_ops * ar_time_s
+
+    # DDP baseline: 3 ops per step (params + 2 momentum states)
+    ddp_ops = total_steps * 3
+    ddp_time = ddp_ops * ar_time_s
+
+    return {
+        'desloc_ops': desloc_ops,
+        'ddp_ops': ddp_ops,
+        'desloc_time_s': round(desloc_time, 4),
+        'ddp_time_s': round(ddp_time, 4),
+        'reduction_x': round(ddp_time / max(1e-12, desloc_time), 4),
+        'ar_time_ms': round(ar_time_s * 1000, 4),
+        'msg_size_mb': round(msg_size / 1e6, 2),
+    }
+
+
+def desloc_sweep_Kx(n_params, kx_values, total_steps,
+                     beta1=0.9, beta2=0.999):
+    """Sweep Kx values and compute comm reduction + ψ factor for each.
+
+    Ref: Section 5.2 — "Frequent parameter sync (Kx) strongly impacts
+    performance, motivated by the leading term in theoretical bounds."
+
+    Returns: list of dicts with Kx, Ku, Kv, psi, reduction, bound info.
+    """
+    results = []
+    for kx in kx_values:
+        ku = max(1, kx * 3)
+        kv = max(1, kx * 6)
+        px = 1.0 / max(1, kx)
+        pu = 1.0 / max(1, ku)
+        psi = DeslocExperimentScheduler.psi_factor(px, pu, beta1)
+        eta0 = DeslocExperimentScheduler.step_size_bound(
+            L=1.0, beta=beta1, psi=psi)
+        comm = desloc_comm_overhead_model(n_params, kx, ku, kv, total_steps)
+
+        results.append({
+            'Kx': kx, 'Ku': ku, 'Kv': kv,
+            'psi': round(psi, 6),
+            'eta0': round(eta0, 8),
+            'tau_beta1': round(DeslocExperimentScheduler.half_life(beta1), 2),
+            'tau_beta2': round(DeslocExperimentScheduler.half_life(beta2), 2),
+            **comm,
+        })
+    return results
+
+
+def desloc_generate_master_csv_header():
+    """Return CSV header for master results file."""
+    return ('id,rq,model,Kx,Ku,Kv,beta1,beta2,seed,outer,inner,'
+            'final_loss,avg_loss,min_loss,total_time_s,'
+            'comm_reduction_x,sync_x,sync_u,sync_v,'
+            'psi,eta0,peak_memory_gb,status\n')
+
+
+def desloc_format_result_csv_row(config, summary):
+    """Format one experiment result as CSV row. All floats ≥6 digits."""
+    c = config
+    s = summary or {}
+    return (f"{c.get('id','')},{c.get('rq','')},{c.get('model','')},"
+            f"{c.get('Kx','')},{c.get('Ku','')},{c.get('Kv','')},"
+            f"{c.get('beta1','')},{c.get('beta2','')},{c.get('seed','')},"
+            f"{c.get('outer','')},{c.get('inner','')},"
+            f"{s.get('final_loss',0):.6f},{s.get('avg_loss',0):.6f},"
+            f"{s.get('min_loss',0):.6f},{s.get('total_time_s',0):.2f},"
+            f"{s.get('comm_reduction_x',0):.4f},"
+            f"{s.get('sync_x',0)},{s.get('sync_u',0)},{s.get('sync_v',0)},"
+            f"{c.get('psi',0):.6f},{c.get('eta0',0):.8f},"
+            f"{s.get('peak_memory_gb',0):.3f},{s.get('status','')}\n")
+
+
 # =============================================================================
 # Ref: NKI-FA commit da964f3 draw_plot.py — data from experiment logs,
 #      not hardcoded. Format: "### config = {...} ###\nmetric: value"
@@ -5954,746 +6323,3 @@ def desloc_format_table_row(agg_result, fmt="nips"):
                 f"| {mc:.1f}× | {n} |")
 
 # =====================================================================
-# M242 — Claude-16: DES-LOC Advanced Engine Integration
-# Topology-aware sync, async AllReduce, scaling law predictor,
-# gradient accumulation correction, divergence recovery
-# Ref: NCCL transport.cc selectTransport(), Megatron-LM pipeline_utils
-# =====================================================================
-
-import math as _m242_math
-
-def _desloc_warmup_active(engine):
-    """Unified warmup check — replaces repeated inline checks."""
-    return (engine.desloc_enabled and
-            engine.desloc_step < engine.desloc_warmup_steps)
-
-
-def _desloc_effective_period(engine, period_attr):
-    """Get effective sync period for any K, respecting warmup."""
-    if not engine.desloc_enabled:
-        return 1
-    if _desloc_warmup_active(engine):
-        return 1
-    return getattr(engine, period_attr, 1)
-
-
-class DeslocTopologyManager:
-    """Topology-aware sync period adjustment.
-
-    Uses GPU Bus-ID to detect intra-node vs inter-node placement.
-    Intra-node (NVLink): use configured Kx
-    Inter-node (Ethernet/IB): use Kx * topology_penalty_factor
-
-    Ref: Nick Joseph — 'we ran clustering on Bus-IDs to detect datacenter layout'
-    Ref: NCCL transport.cc — ncclTransports[NTRANSPORTS] = {p2pTransport, shmTransport, netTransport}
-    """
-
-    TRANSPORT_P2P = 0    # Same-node, NVLink/PCIe direct
-    TRANSPORT_SHM = 1    # Same-node, shared memory
-    TRANSPORT_NET = 2    # Cross-node, network (Ethernet/IB)
-
-    def __init__(self):
-        self._gpu_bus_ids = {}
-        self._topology_groups = {}
-        self._transport_type = self.TRANSPORT_P2P
-        self._penalty_factor = 1
-        self._initialized = False
-
-    def detect_topology(self):
-        """Probe GPU Bus-IDs and group by PCI domain.
-
-        Bus-ID format: 00000000:81:00.0
-        Domain = first 8 hex chars, Bus = next 2 hex chars
-        GPUs with same domain+bus are on same NVLink switch.
-        """
-        try:
-            import torch
-            if not torch.cuda.is_available():
-                self._initialized = True
-                return
-
-            n_gpus = torch.cuda.device_count()
-            for i in range(n_gpus):
-                props = torch.cuda.get_device_properties(i)
-                # Build synthetic bus_id from device properties
-                # Real bus_id comes from nvidia-smi, here we use device index
-                self._gpu_bus_ids[i] = {
-                    'name': props.name,
-                    'total_mem_gb': props.total_mem / (1024**3),
-                    'sm_count': props.multi_processor_count,
-                    'major': props.major,
-                    'minor': props.minor,
-                }
-
-            # Classify transport type based on GPU heterogeneity
-            names = set(g['name'] for g in self._gpu_bus_ids.values())
-            if len(names) > 1:
-                # Mixed GPU types (e.g. A6000 + H100) → likely cross-node
-                self._transport_type = self.TRANSPORT_NET
-                self._penalty_factor = 2
-            elif n_gpus <= 8:
-                # Single node, homogeneous
-                self._transport_type = self.TRANSPORT_P2P
-                self._penalty_factor = 1
-            else:
-                # Large homogeneous cluster, assume multi-node
-                self._transport_type = self.TRANSPORT_NET
-                self._penalty_factor = 2
-
-            self._initialized = True
-        except Exception:
-            self._initialized = True
-            self._penalty_factor = 1
-
-    def get_adjusted_periods(self, Kx, Ku, Kv):
-        """Adjust sync periods based on detected topology.
-
-        Cross-node training benefits from larger Kx (fewer expensive syncs).
-        Same-node NVLink training can afford smaller Kx.
-        """
-        if not self._initialized:
-            self.detect_topology()
-
-        f = self._penalty_factor
-        return {
-            'Kx': max(1, Kx * f),
-            'Ku': max(1, Ku * f),
-            'Kv': max(1, Kv * f),
-            'transport_type': self._transport_type,
-            'penalty_factor': f,
-        }
-
-    def get_topology_report(self):
-        """Generate topology diagnostic report."""
-        if not self._initialized:
-            self.detect_topology()
-
-        transport_names = {0: 'P2P/NVLink', 1: 'SharedMem', 2: 'Network'}
-        lines = ['=== DES-LOC Topology Report ===']
-        lines.append(f'Transport: {transport_names.get(self._transport_type, "unknown")}')
-        lines.append(f'Penalty factor: {self._penalty_factor}x')
-        lines.append(f'GPUs detected: {len(self._gpu_bus_ids)}')
-        for gid, info in sorted(self._gpu_bus_ids.items()):
-            lines.append(
-                f'  GPU {gid}: {info["name"]} '
-                f'{info["total_mem_gb"]:.1f}GB '
-                f'SM={info["sm_count"]} '
-                f'CC={info["major"]}.{info["minor"]}'
-            )
-        return '\n'.join(lines)
-
-
-class DeslocAsyncAllReduceManager:
-    """Manages async AllReduce operations for DES-LOC.
-
-    When Kx > 1, AllReduces happen infrequently. This manager ensures:
-    1. AllReduce is launched asynchronously (non-blocking)
-    2. Previous async AllReduce is waited on before starting next
-    3. NCCL watchdog timeout is adjusted to avoid false alarms
-
-    Ref: NCCL enqueue.cc — async collective launch
-    Ref: PyTorch c10d ProcessGroupNCCL.cpp — watchdog timer
-    """
-
-    def __init__(self, Kx=1, step_time_ms=500.0, watchdog_base_s=300.0):
-        self._Kx = max(1, Kx)
-        self._step_time_ms = step_time_ms
-        self._watchdog_base_s = watchdog_base_s
-        self._pending_work = None
-        self._total_launched = 0
-        self._total_waited = 0
-        self._total_skipped = 0
-        self._cumulative_wait_ms = 0.0
-
-    def compute_safe_watchdog_timeout(self):
-        """Compute NCCL watchdog timeout that won't false-alarm during Kx gaps.
-
-        When Kx=128 and step_time=500ms, gap = 64 seconds.
-        Default NCCL timeout is 300s, which is fine.
-        But for Kx=1024 and step_time=1000ms, gap = 1024s > 300s → problem.
-
-        Returns timeout in seconds.
-        """
-        gap_s = (self._Kx * self._step_time_ms) / 1000.0
-        # 3x safety margin on top of the gap
-        needed_s = gap_s * 3.0
-        return max(self._watchdog_base_s, needed_s)
-
-    def should_launch(self, step, warmup_steps=512):
-        """Check if AllReduce should be launched at this step."""
-        if self._Kx <= 1:
-            return True
-        if step < warmup_steps:
-            return True
-        return (step % self._Kx) == 0
-
-    def record_launch(self, work_handle=None):
-        """Record that an AllReduce was launched."""
-        self._wait_on_pending()
-        self._pending_work = work_handle
-        self._total_launched += 1
-
-    def record_skip(self):
-        """Record that an AllReduce was skipped (non-Kx step)."""
-        self._total_skipped += 1
-
-    def _wait_on_pending(self):
-        """Wait for any pending async AllReduce."""
-        if self._pending_work is not None:
-            import time
-            t0 = time.monotonic()
-            try:
-                self._pending_work.wait()
-            except Exception:
-                pass
-            self._cumulative_wait_ms += (time.monotonic() - t0) * 1000.0
-            self._pending_work = None
-            self._total_waited += 1
-
-    def finalize(self):
-        """Wait on any remaining pending work."""
-        self._wait_on_pending()
-
-    def stats(self):
-        """Return async AllReduce statistics."""
-        total = self._total_launched + self._total_skipped
-        skip_pct = 100.0 * self._total_skipped / max(1, total)
-        avg_wait = self._cumulative_wait_ms / max(1, self._total_waited)
-        return {
-            'total_steps': total,
-            'launched': self._total_launched,
-            'skipped': self._total_skipped,
-            'skip_pct': round(skip_pct, 2),
-            'avg_wait_ms': round(avg_wait, 3),
-            'cumulative_wait_ms': round(self._cumulative_wait_ms, 3),
-            'safe_watchdog_timeout_s': round(self.compute_safe_watchdog_timeout(), 1),
-        }
-
-
-class DeslocScalingLawPredictor:
-    """Predict loss at arbitrary compute budgets using DES-LOC-aware scaling laws.
-
-    Standard Chinchilla: L(C) = A/N^alpha + B/D^beta + E
-    DES-LOC correction:  L(C,Kx) = L(C) + psi_penalty(Kx, beta1, beta2)
-
-    Where psi_penalty comes from Theorem 1:
-        psi = 4*(1-px)/px^2 * (1-beta)*(1-pu)/(6*(1-(1-pu)*beta))
-        and px = 1/Kx, pu = 1/Ku
-
-    Ref: Chinchilla scaling laws (Hoffmann et al. 2022)
-    Ref: DES-LOC Theorem 1 — O((1+psi)/T) higher-order term
-    """
-
-    def __init__(self):
-        # Chinchilla defaults (can be fitted to actual data)
-        self._A = 406.4
-        self._B = 410.7
-        self._alpha = 0.34
-        self._beta = 0.28
-        self._E = 1.69
-        self._fit_data = []  # (compute_flops, loss) pairs for fitting
-
-    def compute_psi(self, Kx, Ku, beta1=0.9, beta2=0.999):
-        """Compute psi factor from Theorem 1.
-
-        psi = 4*(1-px)/px^2 * (1-beta1)*(1-pu)/(6*(1-(1-pu)*beta1))
-        where px = 1/Kx, pu = 1/Ku
-        """
-        if Kx <= 1 and Ku <= 1:
-            return 0.0
-
-        px = 1.0 / max(1, Kx)
-        pu = 1.0 / max(1, Ku)
-
-        numerator = 4.0 * (1.0 - px) * (1.0 - beta1) * (1.0 - pu)
-        denominator = px * px * 6.0 * (1.0 - (1.0 - pu) * beta1)
-
-        if abs(denominator) < 1e-15:
-            return 0.0
-
-        return numerator / denominator
-
-    def predict_loss(self, N, D, Kx=1, Ku=3, T=None,
-                     beta1=0.9, beta2=0.999):
-        """Predict training loss.
-
-        Args:
-            N: model parameters
-            D: dataset tokens
-            Kx: parameter sync period
-            Ku: first momentum sync period
-            T: total training steps (if None, estimate from D and batch)
-        """
-        # Base Chinchilla prediction
-        base_loss = (self._A / (N ** self._alpha) +
-                     self._B / (D ** self._beta) +
-                     self._E)
-
-        # DES-LOC correction term
-        if Kx > 1 and T is not None and T > 0:
-            psi = self.compute_psi(Kx, Ku, beta1, beta2)
-            # Higher-order term: O((1+psi)/T)
-            desloc_penalty = (1.0 + psi) / T
-            base_loss += desloc_penalty
-
-        return base_loss
-
-    def record_observation(self, compute_flops, loss, Kx=1):
-        """Record actual (compute, loss) pair for future fitting."""
-        self._fit_data.append({
-            'compute_flops': compute_flops,
-            'loss': loss,
-            'Kx': Kx,
-        })
-
-    def fit_coefficients(self):
-        """Fit A, alpha, E to observed data using least squares.
-
-        Uses only Kx=1 (DDP) data points for clean fitting,
-        then DES-LOC penalty is additive.
-        """
-        ddp_data = [d for d in self._fit_data if d['Kx'] <= 1]
-        if len(ddp_data) < 3:
-            return False  # Not enough data
-
-        # Simple power law fit: loss = A * compute^(-alpha) + E
-        # Log-linear: log(loss - E) ≈ log(A) - alpha * log(compute)
-        # Grid search E in [1.0, 2.5], then linear regression
-        best_err = float('inf')
-        best_params = None
-
-        for e_try_10x in range(10, 26):  # E from 1.0 to 2.5
-            e_try = e_try_10x / 10.0
-            valid = [(d['compute_flops'], d['loss'] - e_try)
-                     for d in ddp_data if d['loss'] > e_try]
-            if len(valid) < 2:
-                continue
-
-            # Linear regression in log space
-            sum_lx = sum_ly = sum_lx2 = sum_lxly = 0.0
-            n = len(valid)
-            for c, l in valid:
-                if c <= 0 or l <= 0:
-                    continue
-                lx = _m242_math.log(c)
-                ly = _m242_math.log(l)
-                sum_lx += lx
-                sum_ly += ly
-                sum_lx2 += lx * lx
-                sum_lxly += lx * ly
-
-            denom = n * sum_lx2 - sum_lx * sum_lx
-            if abs(denom) < 1e-15:
-                continue
-
-            slope = (n * sum_lxly - sum_lx * sum_ly) / denom
-            intercept = (sum_ly - slope * sum_lx) / n
-
-            # Compute error
-            err = 0.0
-            for c, l_adj in valid:
-                if c <= 0 or l_adj <= 0:
-                    continue
-                pred = _m242_math.exp(intercept + slope * _m242_math.log(c))
-                err += (pred - l_adj) ** 2
-
-            if err < best_err:
-                best_err = err
-                best_params = (
-                    _m242_math.exp(intercept),  # A
-                    -slope,                      # alpha
-                    e_try                        # E
-                )
-
-        if best_params is not None:
-            self._A, self._alpha, self._E = best_params
-            return True
-        return False
-
-    def recommend_compute_optimal(self, budget_flops, Kx=1, Ku=3):
-        """Recommend compute-optimal N, D for given FLOPS budget.
-
-        Chinchilla optimal: N* = G * (C / 6)^a, D* = G' * (C / 6)^b
-        where a = alpha/(alpha+beta), b = beta/(alpha+beta)
-        """
-        a = self._alpha / (self._alpha + self._beta)
-        b = self._beta / (self._alpha + self._beta)
-
-        # C_adjusted = budget / 6 (approximate: C ≈ 6*N*D)
-        c6 = budget_flops / 6.0
-
-        N_opt = int(c6 ** a)
-        D_opt = int(c6 ** b)
-
-        predicted_loss = self.predict_loss(
-            N_opt, D_opt, Kx=Kx, Ku=Ku, T=D_opt // 1024
-        )
-
-        return {
-            'N_optimal': N_opt,
-            'D_optimal': D_opt,
-            'predicted_loss': round(predicted_loss, 6),
-            'psi': round(self.compute_psi(Kx, Ku), 6),
-            'budget_flops': budget_flops,
-        }
-
-
-class DeslocGradAccumulationCorrector:
-    """Correct the interaction between gradient accumulation and Kx.
-
-    When gradient_accumulation_steps=G and Kx=K, the effective Kx
-    in terms of optimizer steps is K, but in terms of micro-batches
-    it is K*G. Users may be confused.
-
-    This corrector:
-    1. Logs the effective vs configured Kx
-    2. Adjusts Kx if user specifies it in micro-batch units
-    3. Validates that Kx is a multiple of G (or warns)
-
-    Ref: TAOCP Knuth critique — gradient_accumulation×Kx interaction undocumented
-    """
-
-    def __init__(self, Kx, grad_accum_steps, micro_batch_mode=False):
-        self._configured_Kx = Kx
-        self._grad_accum = max(1, grad_accum_steps)
-        self._micro_batch_mode = micro_batch_mode
-
-    @property
-    def effective_Kx_optimizer_steps(self):
-        """Kx in optimizer step units (what DES-LOC theory assumes)."""
-        if self._micro_batch_mode:
-            # User specified Kx in micro-batch units, convert
-            return max(1, self._configured_Kx // self._grad_accum)
-        return self._configured_Kx
-
-    @property
-    def effective_Kx_micro_batches(self):
-        """Kx in micro-batch units (what the user might think)."""
-        if self._micro_batch_mode:
-            return self._configured_Kx
-        return self._configured_Kx * self._grad_accum
-
-    def validate(self):
-        """Check for common misconfiguration issues."""
-        warnings = []
-        eff = self.effective_Kx_optimizer_steps
-        if eff < 1:
-            warnings.append(
-                f'Effective Kx={eff} < 1: Kx={self._configured_Kx} is smaller '
-                f'than gradient_accumulation_steps={self._grad_accum}. '
-                f'DES-LOC will sync every step (no communication reduction).'
-            )
-        if not self._micro_batch_mode and self._configured_Kx % self._grad_accum != 0:
-            warnings.append(
-                f'Kx={self._configured_Kx} is not a multiple of '
-                f'gradient_accumulation_steps={self._grad_accum}. '
-                f'Sync boundaries may not align with optimizer steps.'
-            )
-        return warnings
-
-    def report(self):
-        """Generate human-readable report."""
-        return (
-            f'GradAccum Correction: configured_Kx={self._configured_Kx} '
-            f'grad_accum={self._grad_accum} '
-            f'effective_Kx(opt_steps)={self.effective_Kx_optimizer_steps} '
-            f'effective_Kx(micro_batches)={self.effective_Kx_micro_batches} '
-            f'mode={"micro_batch" if self._micro_batch_mode else "optimizer_step"}'
-        )
-
-
-class DeslocDivergenceRecovery:
-    """Automatic recovery from training divergence during DES-LOC.
-
-    Monitors loss trajectory and forces parameter sync if loss spikes.
-    Can also roll back Kx to a smaller value temporarily.
-
-    Ref: Nick Joseph — 'when loss departs from power law, something is wrong'
-    Ref: Megatron-LM pretrain_gpt.py — loss spike detection + checkpoint rollback
-    """
-
-    HEALTHY = 0
-    SUSPICIOUS = 1
-    DIVERGING = 2
-    RECOVERING = 3
-
-    def __init__(self, spike_threshold=2.0, recovery_Kx=1,
-                 recovery_steps=100, history_len=50):
-        self._spike_threshold = spike_threshold
-        self._recovery_Kx = recovery_Kx
-        self._recovery_steps = recovery_steps
-        self._history_len = history_len
-        self._loss_history = []
-        self._state = self.HEALTHY
-        self._recovery_remaining = 0
-        self._total_recoveries = 0
-        self._forced_syncs = 0
-
-    def observe_loss(self, loss):
-        """Record loss and check for divergence.
-
-        Returns (state, action_dict) where action_dict may contain:
-        - 'force_sync': True if immediate AllReduce needed
-        - 'override_Kx': int if Kx should be temporarily reduced
-        """
-        if loss is None or not _m242_math.isfinite(loss):
-            return self._state, {}
-
-        self._loss_history.append(loss)
-        if len(self._loss_history) > self._history_len:
-            self._loss_history = self._loss_history[-self._history_len:]
-
-        actions = {}
-
-        if self._state == self.RECOVERING:
-            self._recovery_remaining -= 1
-            if self._recovery_remaining <= 0:
-                self._state = self.HEALTHY
-            else:
-                actions['override_Kx'] = self._recovery_Kx
-            return self._state, actions
-
-        if len(self._loss_history) < 3:
-            return self._state, actions
-
-        # Check for spike: current loss > threshold * recent average
-        recent_avg = sum(self._loss_history[-10:-1]) / max(1, len(self._loss_history[-10:-1]))
-        if recent_avg > 0 and loss / recent_avg > self._spike_threshold:
-            if self._state == self.SUSPICIOUS:
-                # Second consecutive spike → diverging
-                self._state = self.DIVERGING
-                actions['force_sync'] = True
-                actions['override_Kx'] = self._recovery_Kx
-                self._recovery_remaining = self._recovery_steps
-                self._total_recoveries += 1
-                self._forced_syncs += 1
-                self._state = self.RECOVERING
-            else:
-                self._state = self.SUSPICIOUS
-        else:
-            if self._state == self.SUSPICIOUS:
-                self._state = self.HEALTHY
-
-        return self._state, actions
-
-    def stats(self):
-        state_names = {0: 'healthy', 1: 'suspicious', 2: 'diverging', 3: 'recovering'}
-        return {
-            'state': state_names.get(self._state, 'unknown'),
-            'total_recoveries': self._total_recoveries,
-            'forced_syncs': self._forced_syncs,
-            'recovery_remaining': self._recovery_remaining,
-            'history_len': len(self._loss_history),
-        }
-
-
-class DeslocPerTierCommStats:
-    """Per-tier communication statistics tracker.
-
-    Tracks bytes sent/received for each tier (params, momentum1, momentum2).
-    Reports reduction ratios vs DDP baseline.
-
-    Ref: Algorithm 1 — three independent sync periods Kx, Ku, Kv
-    Ref: comms_logging.py — classify_comm_tier()
-    """
-
-    TIER_PARAM = 0      # x: model parameters
-    TIER_MOM1 = 1       # u: first momentum
-    TIER_MOM2 = 2       # v: second momentum
-
-    def __init__(self, Kx=1, Ku=3, Kv=6):
-        self._Kx = max(1, Kx)
-        self._Ku = max(1, Ku)
-        self._Kv = max(1, Kv)
-        self._bytes = {0: 0, 1: 0, 2: 0}
-        self._ops = {0: 0, 1: 0, 2: 0}
-        self._skipped_ops = {0: 0, 1: 0, 2: 0}
-
-    def record_comm(self, tier, nbytes):
-        """Record a communication event."""
-        t = min(max(tier, 0), 2)
-        self._bytes[t] += nbytes
-        self._ops[t] += 1
-
-    def record_skip(self, tier):
-        """Record a skipped communication event."""
-        t = min(max(tier, 0), 2)
-        self._skipped_ops[t] += 1
-
-    def theoretical_reduction_vs_ddp(self, model_params, dtype_bytes=2):
-        """Compute theoretical comm reduction vs DDP.
-
-        DDP: every step, AllReduce all params → 2 * model_params * dtype_bytes per step
-        DES-LOC: params at 1/Kx, mom1 at 1/Ku, mom2 at 1/Kv
-
-        Local Adam syncs all 3 states at same rate.
-        DES-LOC syncs each at independent rates.
-        """
-        ddp_per_step = 2.0 * model_params * dtype_bytes  # AllReduce = 2x
-
-        # DES-LOC: average comm per step
-        desloc_per_step = (ddp_per_step / self._Kx +   # param sync
-                           ddp_per_step / self._Ku +    # mom1 sync
-                           ddp_per_step / self._Kv)     # mom2 sync
-
-        # Local Adam: syncs all 3 at Kx rate
-        local_adam_per_step = 3.0 * ddp_per_step / self._Kx
-
-        ddp_ratio = ddp_per_step / max(1e-15, desloc_per_step)
-        la_ratio = local_adam_per_step / max(1e-15, desloc_per_step)
-
-        return {
-            'ddp_bytes_per_step': ddp_per_step,
-            'desloc_bytes_per_step': desloc_per_step,
-            'local_adam_bytes_per_step': local_adam_per_step,
-            'reduction_vs_ddp': round(ddp_ratio, 2),
-            'reduction_vs_local_adam': round(la_ratio, 2),
-        }
-
-    def actual_stats(self):
-        """Return actual measured stats."""
-        total_bytes = sum(self._bytes.values())
-        total_ops = sum(self._ops.values())
-        total_skipped = sum(self._skipped_ops.values())
-        tier_names = {0: 'param', 1: 'mom1', 2: 'mom2'}
-        per_tier = {}
-        for t in range(3):
-            total_t = self._ops[t] + self._skipped_ops[t]
-            skip_pct = 100.0 * self._skipped_ops[t] / max(1, total_t)
-            per_tier[tier_names[t]] = {
-                'bytes': self._bytes[t],
-                'ops': self._ops[t],
-                'skipped': self._skipped_ops[t],
-                'skip_pct': round(skip_pct, 2),
-            }
-        return {
-            'total_bytes': total_bytes,
-            'total_ops': total_ops,
-            'total_skipped': total_skipped,
-            'per_tier': per_tier,
-        }
-
-
-def desloc_engine_full_diagnostics(engine):
-    """Comprehensive DES-LOC engine diagnostic report.
-
-    Combines topology, async AllReduce, scaling law, divergence,
-    gradient accumulation, and per-tier comm stats.
-    """
-    lines = ['=' * 72]
-    lines.append('DES-LOC Full Engine Diagnostics (M242)')
-    lines.append('=' * 72)
-
-    # Basic state
-    lines.append(desloc_engine_summary(engine))
-    lines.append('')
-
-    # Topology
-    if hasattr(engine, '_desloc_topo_mgr'):
-        lines.append(engine._desloc_topo_mgr.get_topology_report())
-        lines.append('')
-
-    # Async AllReduce
-    if hasattr(engine, '_desloc_async_ar'):
-        lines.append('--- Async AllReduce Stats ---')
-        for k, v in engine._desloc_async_ar.stats().items():
-            lines.append(f'  {k}: {v}')
-        lines.append('')
-
-    # Scaling law
-    if hasattr(engine, '_desloc_scaling'):
-        psi = engine._desloc_scaling.compute_psi(
-            engine.desloc_Kx, engine.desloc_Ku
-        )
-        lines.append(f'--- Scaling Law ---')
-        lines.append(f'  psi(Kx={engine.desloc_Kx}, Ku={engine.desloc_Ku}) = {psi:.6f}')
-        lines.append('')
-
-    # Divergence recovery
-    if hasattr(engine, '_desloc_divergence'):
-        lines.append('--- Divergence Recovery ---')
-        for k, v in engine._desloc_divergence.stats().items():
-            lines.append(f'  {k}: {v}')
-        lines.append('')
-
-    # Gradient accumulation
-    if hasattr(engine, '_desloc_grad_corrector'):
-        lines.append('--- Gradient Accumulation ---')
-        lines.append(f'  {engine._desloc_grad_corrector.report()}')
-        warns = engine._desloc_grad_corrector.validate()
-        for w in warns:
-            lines.append(f'  WARNING: {w}')
-        lines.append('')
-
-    # Per-tier comm
-    if hasattr(engine, '_desloc_tier_stats'):
-        lines.append('--- Per-Tier Communication ---')
-        stats = engine._desloc_tier_stats.actual_stats()
-        for tier, data in stats.get('per_tier', {}).items():
-            lines.append(
-                f'  {tier}: {data["bytes"]} bytes, '
-                f'{data["ops"]} ops, {data["skipped"]} skipped '
-                f'({data["skip_pct"]:.1f}%)'
-            )
-        lines.append('')
-
-    lines.append('=' * 72)
-    return '\n'.join(lines)
-
-
-def init_desloc_engine_subsystems(engine):
-    """Initialize all DES-LOC engine subsystems.
-
-    Called once after engine.__init__ when desloc_enabled=True.
-    """
-    if not engine.desloc_enabled:
-        return
-
-    # Topology manager
-    engine._desloc_topo_mgr = DeslocTopologyManager()
-    engine._desloc_topo_mgr.detect_topology()
-
-    # Adjust periods based on topology
-    adjusted = engine._desloc_topo_mgr.get_adjusted_periods(
-        engine.desloc_Kx, engine.desloc_Ku, engine.desloc_Kv
-    )
-    # Note: we don't override user config, just log the recommendation
-    if adjusted['penalty_factor'] > 1:
-        import logging
-        logging.getLogger('deepspeed').info(
-            f'DES-LOC topology: cross-node detected, recommended '
-            f'Kx={adjusted["Kx"]} Ku={adjusted["Ku"]} Kv={adjusted["Kv"]} '
-            f'(penalty_factor={adjusted["penalty_factor"]})'
-        )
-
-    # Async AllReduce manager
-    engine._desloc_async_ar = DeslocAsyncAllReduceManager(
-        Kx=engine.desloc_Kx,
-        step_time_ms=500.0,
-        watchdog_base_s=300.0
-    )
-
-    # Scaling law predictor
-    engine._desloc_scaling = DeslocScalingLawPredictor()
-
-    # Divergence recovery
-    engine._desloc_divergence = DeslocDivergenceRecovery(
-        spike_threshold=2.0,
-        recovery_Kx=max(1, engine.desloc_Kx // 4),
-        recovery_steps=100,
-    )
-
-    # Gradient accumulation corrector
-    grad_accum = getattr(engine, 'gradient_accumulation_steps', lambda: 1)
-    ga_steps = grad_accum() if callable(grad_accum) else grad_accum
-    engine._desloc_grad_corrector = DeslocGradAccumulationCorrector(
-        Kx=engine.desloc_Kx,
-        grad_accum_steps=ga_steps,
-    )
-
-    # Per-tier comm stats
-    engine._desloc_tier_stats = DeslocPerTierCommStats(
-        Kx=engine.desloc_Kx,
-        Ku=engine.desloc_Ku,
-        Kv=engine.desloc_Kv,
-    )
