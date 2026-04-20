@@ -201,3 +201,44 @@ class FusedAdam(torch.optim.Optimizer):
 # Ref: Section 5.6 — ADOPT variant support
 # =========================================================================
 
+
+# M293 — Claude-19: PerCoordClipper + ADOPT + HalfLife
+import math as _m293
+class DeslocClipV2:
+    __slots__=('rho','adp','cn','tn','rh','pct','ui','st')
+    def __init__(s,rho=1.,adp=False,pct=.99,ui=100):s.rho=rho;s.adp=adp;s.cn=s.tn=0;s.rh=[];s.pct=pct;s.ui=ui;s.st=0
+    def clip32(s,g):
+        import torch
+        with torch.no_grad():a=(g.abs()>s.rho).sum().item();t=g.numel();s.cn+=a;s.tn+=t;g.clamp_(-s.rho,s.rho)
+        return g,a/max(1,t)
+    def clip_bf16(s,g):
+        import torch
+        with torch.no_grad():f=g.float();a=(f.abs()>s.rho).sum().item();t=f.numel();s.cn+=a;s.tn+=t;f.clamp_(-s.rho,s.rho);g.copy_(f.to(g.dtype))
+        return g,a/max(1,t)
+    def upd(s,g):
+        if not s.adp:return
+        s.st+=1
+        if s.st%s.ui!=0:return
+        import torch
+        with torch.no_grad():sv=g.abs().flatten().sort().values;i=min(int(s.pct*len(sv)),len(sv)-1);nr=sv[i].item()
+        if nr>0:s.rho=.9*s.rho+.1*nr;s.rh.append((s.st,s.rho));s.rh=s.rh[-500:]if len(s.rh)>1000 else s.rh
+class DeslocADOPT:
+    __slots__=('b1','b2','eps','wd')
+    def __init__(s,b1=.9,b2=.999,eps=1e-8,wd=.1):s.b1,s.b2,s.eps,s.wd=b1,b2,eps,wd
+    def apply(s,p,g,state):
+        import torch
+        if'exp_avg'not in state:state['exp_avg']=torch.zeros_like(p.data);state['exp_avg_sq']=g.data.float().square();state['step']=0;return p
+        state['step']+=1;m,vp=state['exp_avg'],state['exp_avg_sq']
+        if s.wd>0:p.data.mul_(1.-s.wd/(1.-s.b1**state['step']))
+        ng=g.float()/(vp.sqrt()+s.eps);m.mul_(s.b1).add_(ng,alpha=1-s.b1)
+        p.data.add_(m.to(p.dtype),alpha=-1./(1.-s.b1**state['step']))
+        state['exp_avg_sq']=vp.mul_(s.b2).add_(g.float().square(),alpha=1-s.b2);return p
+class DeslocHL:
+    __slots__=('theo','snaps')
+    def __init__(s,b1=.9,b2=.999):s.theo={};s.snaps={}
+    @staticmethod
+    def hl(b):return-1./_m293.log2(b)if 0<b<1 else float('inf')
+    def rec(s,Kx,b1=.9,b2=.999):
+        t1,t2=s.hl(b1),s.hl(b2);kr=max(1,round(t1/6.6));vr=max(1,round(t2/6.6))
+        return{'Ku':max(Kx,Kx*kr),'Kv':max(Kx,Kx*vr),'t1':t1,'t2':t2}
+# M293: end
