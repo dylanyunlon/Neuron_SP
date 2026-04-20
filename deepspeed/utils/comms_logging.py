@@ -661,8 +661,6 @@ class CommsLogger:
         return result_dict if return_dict else None
 
 
-
-
 class DeslocLogParser:
     """Parse DES-LOC experiment logs into structured records.
     Ref: NKI-FA exp_utils/draw_plot.py — regex-based log parsing."""
@@ -905,3 +903,616 @@ class DeslocFigure2Formatter:
             with open(output_path, 'w') as f:
                 f.write(content)
         return content
+
+
+# =====================================================================
+# M244 — Claude-16: DES-LOC Hierarchical Communication Logger
+# Intra-node vs inter-node tracking, bandwidth utilization,
+# per-tier histograms, NKI-FA log export
+# Ref: NCCL transport.cc — P2P/SHM/NET transport classification
+# Ref: Megatron-LM — distributed_data_parallel.py bucket logging
+# =====================================================================
+
+import time as _m244_time
+import math as _m244_math
+
+
+class DeslocHierarchicalCommLogger:
+    """Hierarchical communication logger for DES-LOC.
+
+    Tracks communication at three levels:
+    1. Transport level: P2P (NVLink), SHM (shared memory), NET (Ethernet/IB)
+    2. Tier level: params (Kx), momentum1 (Ku), momentum2 (Kv)
+    3. Operation level: AllReduce, ReduceScatter, AllGather, Broadcast
+
+    Each event records: timestamp, bytes, duration, tier, transport, op_type.
+    """
+
+    TRANSPORT_P2P = 'p2p'
+    TRANSPORT_SHM = 'shm'
+    TRANSPORT_NET = 'net'
+
+    OP_ALLREDUCE = 'all_reduce'
+    OP_REDUCE_SCATTER = 'reduce_scatter'
+    OP_ALLGATHER = 'all_gather'
+    OP_BROADCAST = 'broadcast'
+
+    def __init__(self, max_events=100000):
+        self._max_events = max_events
+        self._events = []
+        self._tier_bytes = {'x': 0, 'u': 0, 'v': 0}
+        self._tier_ops = {'x': 0, 'u': 0, 'v': 0}
+        self._tier_skipped = {'x': 0, 'u': 0, 'v': 0}
+        self._transport_bytes = {'p2p': 0, 'shm': 0, 'net': 0}
+        self._op_counts = {}
+        self._total_duration_ms = 0.0
+        self._peak_bw_gbps = 0.0
+        self._start_time = _m244_time.monotonic()
+
+    def record_event(self, nbytes, duration_ms, tier='x',
+                     transport='p2p', op_type='all_reduce'):
+        """Record a single communication event."""
+        if len(self._events) < self._max_events:
+            self._events.append({
+                't': _m244_time.monotonic() - self._start_time,
+                'bytes': nbytes,
+                'dur_ms': duration_ms,
+                'tier': tier,
+                'transport': transport,
+                'op': op_type,
+            })
+
+        # Update aggregates
+        if tier in self._tier_bytes:
+            self._tier_bytes[tier] += nbytes
+            self._tier_ops[tier] += 1
+
+        if transport in self._transport_bytes:
+            self._transport_bytes[transport] += nbytes
+
+        self._op_counts[op_type] = self._op_counts.get(op_type, 0) + 1
+        self._total_duration_ms += duration_ms
+
+        # Track peak bandwidth
+        if duration_ms > 0:
+            bw_gbps = (nbytes * 8) / (duration_ms * 1e6)  # bits/ms → Gbps
+            if bw_gbps > self._peak_bw_gbps:
+                self._peak_bw_gbps = bw_gbps
+
+    def record_skip(self, tier='x'):
+        """Record a skipped communication (DES-LOC gated)."""
+        if tier in self._tier_skipped:
+            self._tier_skipped[tier] += 1
+
+    def bandwidth_utilization(self, peak_bw_gbps=400.0):
+        """Calculate bandwidth utilization as fraction of peak."""
+        total_bytes = sum(self._tier_bytes.values())
+        total_dur_s = self._total_duration_ms / 1000.0
+        if total_dur_s <= 0:
+            return 0.0
+        actual_gbps = (total_bytes * 8) / (total_dur_s * 1e9)
+        return round(actual_gbps / peak_bw_gbps, 6)
+
+    def tier_report(self):
+        """Generate per-tier communication report."""
+        report = {}
+        for tier in ('x', 'u', 'v'):
+            total_ops = self._tier_ops[tier] + self._tier_skipped[tier]
+            skip_pct = (100.0 * self._tier_skipped[tier] /
+                        max(1, total_ops))
+            tier_name = {'x': 'params', 'u': 'momentum1', 'v': 'momentum2'}
+            report[tier_name[tier]] = {
+                'bytes': self._tier_bytes[tier],
+                'bytes_gb': round(self._tier_bytes[tier] / 1e9, 4),
+                'ops': self._tier_ops[tier],
+                'skipped': self._tier_skipped[tier],
+                'skip_pct': round(skip_pct, 2),
+            }
+        return report
+
+    def transport_report(self):
+        """Generate per-transport communication report."""
+        total = sum(self._transport_bytes.values())
+        report = {}
+        for transport in ('p2p', 'shm', 'net'):
+            frac = self._transport_bytes[transport] / max(1, total)
+            transport_name = {'p2p': 'NVLink/PCIe', 'shm': 'SharedMem',
+                              'net': 'Ethernet/IB'}
+            report[transport_name[transport]] = {
+                'bytes': self._transport_bytes[transport],
+                'fraction': round(frac, 4),
+            }
+        return report
+
+    def latency_histogram(self, nbins=10):
+        """Build latency histogram from recorded events."""
+        if not self._events:
+            return {'bins': [], 'counts': []}
+
+        durations = [e['dur_ms'] for e in self._events if e['dur_ms'] > 0]
+        if not durations:
+            return {'bins': [], 'counts': []}
+
+        min_d = min(durations)
+        max_d = max(durations)
+        if max_d <= min_d:
+            return {'bins': [min_d], 'counts': [len(durations)]}
+
+        bin_width = (max_d - min_d) / nbins
+        bins = [min_d + i * bin_width for i in range(nbins + 1)]
+        counts = [0] * nbins
+
+        for d in durations:
+            idx = min(int((d - min_d) / bin_width), nbins - 1)
+            counts[idx] += 1
+
+        return {
+            'bins': [round(b, 4) for b in bins],
+            'counts': counts,
+            'mean_ms': round(sum(durations) / len(durations), 4),
+            'p50_ms': round(sorted(durations)[len(durations) // 2], 4),
+            'p99_ms': round(sorted(durations)[min(len(durations) - 1,
+                            int(len(durations) * 0.99))], 4),
+        }
+
+    def export_nkifa_format(self, config_dict=None):
+        """Export stats in NKI-FA log format.
+
+        ### Kx = 32, tier = params, transport = NVLink ###
+        total_bytes: 15099494400
+        total_ops: 156
+        ...
+        """
+        lines = []
+        tier_rep = self.tier_report()
+        for tier_name, data in tier_rep.items():
+            cfg = dict(config_dict or {})
+            cfg['tier'] = tier_name
+            header_parts = [f'{k} = {v}' for k, v in sorted(cfg.items())]
+            lines.append('### ' + ', '.join(header_parts) + ' ###')
+            for k, v in sorted(data.items()):
+                if isinstance(v, float):
+                    lines.append(f'{k}: {v:.6f}')
+                else:
+                    lines.append(f'{k}: {v}')
+            lines.append('')
+        return '\n'.join(lines)
+
+    def summary(self):
+        """One-line summary."""
+        total_bytes = sum(self._tier_bytes.values())
+        total_ops = sum(self._tier_ops.values())
+        total_skipped = sum(self._tier_skipped.values())
+        total_all = total_ops + total_skipped
+        skip_pct = 100.0 * total_skipped / max(1, total_all)
+        return (f'CommLog: {total_bytes/1e9:.2f}GB in {total_ops} ops, '
+                f'{total_skipped} skipped ({skip_pct:.1f}%), '
+                f'peak_bw={self._peak_bw_gbps:.1f}Gbps')
+
+
+class DeslocCommBudgetTracker:
+    """Track communication budget relative to DDP baseline.
+
+    Computes running "comm savings" in real-time during training.
+    Alerts if actual comm exceeds expected DES-LOC budget.
+    """
+
+    def __init__(self, model_params, Kx, Ku, Kv, dtype_bytes=2):
+        self._model_params = model_params
+        self._Kx = max(1, Kx)
+        self._Ku = max(1, Ku)
+        self._Kv = max(1, Kv)
+        self._dtype_bytes = dtype_bytes
+        self._step = 0
+        self._actual_bytes = 0
+        self._ddp_baseline_bytes = 0
+
+    def step(self, actual_bytes_this_step):
+        """Record actual comm for this step and update baseline."""
+        self._step += 1
+        self._actual_bytes += actual_bytes_this_step
+        # DDP would have communicated every step
+        ar_bytes = 2 * self._model_params * self._dtype_bytes
+        self._ddp_baseline_bytes += ar_bytes
+
+    def savings_ratio(self):
+        """Fraction of DDP comm that was saved."""
+        if self._ddp_baseline_bytes <= 0:
+            return 0.0
+        return round(1.0 - self._actual_bytes / self._ddp_baseline_bytes, 6)
+
+    def theoretical_savings(self):
+        """Expected savings from DES-LOC config."""
+        desloc_freq = (1.0 / self._Kx + 1.0 / self._Ku + 1.0 / self._Kv)
+        ddp_freq = 3.0  # params + mom1 + mom2 every step
+        return round(1.0 - desloc_freq / ddp_freq, 6)
+
+    def is_on_budget(self, tolerance=0.1):
+        """Check if actual savings are within tolerance of theoretical."""
+        actual = self.savings_ratio()
+        theoretical = self.theoretical_savings()
+        return abs(actual - theoretical) < tolerance
+
+    def report(self):
+        return {
+            'step': self._step,
+            'actual_bytes': self._actual_bytes,
+            'ddp_baseline_bytes': self._ddp_baseline_bytes,
+            'actual_savings': self.savings_ratio(),
+            'theoretical_savings': self.theoretical_savings(),
+            'on_budget': self.is_on_budget(),
+        }
+
+
+# M244: end of Claude-16 comms_logging integration
+
+
+# =====================================================================
+# M244-TOPUP — Claude-16: DES-LOC Comm Anomaly Detector + Rate Limiter
+# Detects: bandwidth drops, latency spikes, asymmetric traffic
+# Ref: Nick Joseph — 'a capacitor fault can crash the entire training'
+# Ref: NCCL debug.cc — multi-level logging (WARN/INFO/TRACE)
+# =====================================================================
+
+import math as _m244t_math
+
+
+class DeslocCommAnomalyDetector:
+    """Detect anomalous communication patterns during DES-LOC training.
+
+    Anomaly types:
+    1. Bandwidth drop: sustained < 50% of baseline
+    2. Latency spike: > 5x median latency
+    3. Asymmetric traffic: one tier sends 10x more than expected
+    4. Silent failure: no comm for > 2*Kx steps (possible NCCL hang)
+    5. NaN propagation: NaN detected in post-AllReduce buffer
+    """
+
+    ANOMALY_BW_DROP = 'bandwidth_drop'
+    ANOMALY_LAT_SPIKE = 'latency_spike'
+    ANOMALY_ASYMMETRIC = 'asymmetric_traffic'
+    ANOMALY_SILENT = 'silent_failure'
+    ANOMALY_NAN = 'nan_propagation'
+
+    def __init__(self, Kx=32, baseline_bw_gbps=None,
+                 bw_drop_threshold=0.5, lat_spike_factor=5.0,
+                 max_anomalies=1000):
+        self._Kx = max(1, Kx)
+        self._baseline_bw = baseline_bw_gbps
+        self._bw_threshold = bw_drop_threshold
+        self._lat_factor = lat_spike_factor
+        self._max_anomalies = max_anomalies
+
+        self._bw_samples = []
+        self._lat_samples = []
+        self._tier_bytes = {'x': 0, 'u': 0, 'v': 0}
+        self._last_comm_step = 0
+        self._anomalies = []
+        self._nan_count = 0
+
+    def record_comm_event(self, step, nbytes, duration_ms, tier='x',
+                          had_nan=False):
+        """Record a communication event and check for anomalies."""
+        self._last_comm_step = step
+
+        # Track bandwidth
+        if duration_ms > 0:
+            bw = (nbytes * 8) / (duration_ms * 1e6)  # Gbps
+            self._bw_samples.append(bw)
+            if len(self._bw_samples) > 200:
+                self._bw_samples = self._bw_samples[-200:]
+
+            # Set baseline from first 20 samples
+            if self._baseline_bw is None and len(self._bw_samples) >= 20:
+                self._baseline_bw = sum(self._bw_samples[:20]) / 20
+
+            # Check bandwidth drop
+            if (self._baseline_bw and len(self._bw_samples) >= 10):
+                recent_bw = sum(self._bw_samples[-10:]) / 10
+                if recent_bw < self._baseline_bw * self._bw_threshold:
+                    self._record_anomaly(step, self.ANOMALY_BW_DROP, {
+                        'recent_bw': round(recent_bw, 4),
+                        'baseline_bw': round(self._baseline_bw, 4),
+                        'ratio': round(recent_bw / self._baseline_bw, 4),
+                    })
+
+        # Track latency
+        self._lat_samples.append(duration_ms)
+        if len(self._lat_samples) > 200:
+            self._lat_samples = self._lat_samples[-200:]
+
+        # Check latency spike
+        if len(self._lat_samples) >= 20:
+            sorted_lats = sorted(self._lat_samples[-50:])
+            median_lat = sorted_lats[len(sorted_lats) // 2]
+            if median_lat > 0 and duration_ms > median_lat * self._lat_factor:
+                self._record_anomaly(step, self.ANOMALY_LAT_SPIKE, {
+                    'current_ms': round(duration_ms, 4),
+                    'median_ms': round(median_lat, 4),
+                    'factor': round(duration_ms / median_lat, 2),
+                })
+
+        # Track per-tier traffic
+        if tier in self._tier_bytes:
+            self._tier_bytes[tier] += nbytes
+
+        # NaN check
+        if had_nan:
+            self._nan_count += 1
+            self._record_anomaly(step, self.ANOMALY_NAN, {
+                'total_nans': self._nan_count,
+                'tier': tier,
+            })
+
+    def check_silent_failure(self, current_step):
+        """Check if comm has been silent for too long."""
+        gap = current_step - self._last_comm_step
+        max_gap = self._Kx * 2
+        if gap > max_gap and self._last_comm_step > 0:
+            self._record_anomaly(current_step, self.ANOMALY_SILENT, {
+                'gap_steps': gap,
+                'max_expected': max_gap,
+                'last_comm_step': self._last_comm_step,
+            })
+            return True
+        return False
+
+    def check_asymmetric_traffic(self, expected_ratios=None):
+        """Check for asymmetric per-tier traffic.
+
+        Expected ratios: x:u:v ≈ Ku/Kx : 1 : Kx/Kv
+        (params sync most, mom2 syncs least)
+        """
+        total = sum(self._tier_bytes.values())
+        if total <= 0:
+            return False
+
+        if expected_ratios is None:
+            expected_ratios = {'x': 0.5, 'u': 0.3, 'v': 0.2}
+
+        for tier, expected_frac in expected_ratios.items():
+            actual_frac = self._tier_bytes.get(tier, 0) / total
+            if expected_frac > 0 and actual_frac > expected_frac * 10:
+                self._record_anomaly(-1, self.ANOMALY_ASYMMETRIC, {
+                    'tier': tier,
+                    'actual_frac': round(actual_frac, 4),
+                    'expected_frac': round(expected_frac, 4),
+                })
+                return True
+        return False
+
+    def _record_anomaly(self, step, anomaly_type, details):
+        """Record an anomaly event."""
+        self._anomalies.append({
+            'step': step,
+            'type': anomaly_type,
+            'details': details,
+        })
+        if len(self._anomalies) > self._max_anomalies:
+            self._anomalies = self._anomalies[-self._max_anomalies:]
+
+    def get_anomalies(self, last_n=50):
+        """Get recent anomalies."""
+        return self._anomalies[-last_n:]
+
+    def anomaly_count_by_type(self):
+        """Count anomalies by type."""
+        counts = {}
+        for a in self._anomalies:
+            t = a['type']
+            counts[t] = counts.get(t, 0) + 1
+        return counts
+
+    def health_score(self):
+        """0.0 (unhealthy) to 1.0 (healthy) health score."""
+        if not self._anomalies:
+            return 1.0
+        # Recent anomalies weigh more
+        recent = self._anomalies[-20:]
+        penalty = len(recent) * 0.05
+        return round(max(0.0, 1.0 - penalty), 4)
+
+    def report(self):
+        """Full anomaly report."""
+        return {
+            'health_score': self.health_score(),
+            'total_anomalies': len(self._anomalies),
+            'by_type': self.anomaly_count_by_type(),
+            'nan_count': self._nan_count,
+            'baseline_bw_gbps': (round(self._baseline_bw, 4)
+                                  if self._baseline_bw else None),
+            'bw_samples': len(self._bw_samples),
+            'lat_samples': len(self._lat_samples),
+        }
+
+
+class DeslocCommRateLimiter:
+    """Rate-limit communication to prevent network saturation.
+
+    When multiple tiers sync simultaneously (e.g., step divisible
+    by both Kx and Ku), stagger the AllReduces to avoid congestion.
+
+    Ref: NCCL enqueue.cc — async collective queuing
+    """
+
+    def __init__(self, max_concurrent_ops=2, stagger_ms=1.0):
+        self._max_concurrent = max_concurrent_ops
+        self._stagger_ms = stagger_ms
+        self._pending_count = 0
+        self._total_staggered = 0
+        self._total_passed = 0
+
+    def should_stagger(self, n_ops_this_step):
+        """Check if operations should be staggered this step."""
+        if n_ops_this_step <= self._max_concurrent:
+            self._total_passed += n_ops_this_step
+            return False
+        self._total_staggered += (n_ops_this_step - self._max_concurrent)
+        self._total_passed += self._max_concurrent
+        return True
+
+    def get_stagger_schedule(self, tiers_to_sync):
+        """Create staggered schedule for multiple tier syncs.
+
+        Returns list of (tier, delay_ms) pairs.
+        Priority: x > u > v (params first, mom2 last)
+        """
+        priority = {'x': 0, 'u': 1, 'v': 2}
+        sorted_tiers = sorted(tiers_to_sync,
+                               key=lambda t: priority.get(t, 99))
+
+        schedule = []
+        for i, tier in enumerate(sorted_tiers):
+            delay = 0.0 if i < self._max_concurrent else (
+                (i - self._max_concurrent + 1) * self._stagger_ms
+            )
+            schedule.append({'tier': tier, 'delay_ms': delay, 'order': i})
+
+        return schedule
+
+    def stats(self):
+        total = self._total_passed + self._total_staggered
+        stagger_pct = (100.0 * self._total_staggered /
+                       max(1, total))
+        return {
+            'total_ops': total,
+            'passed': self._total_passed,
+            'staggered': self._total_staggered,
+            'stagger_pct': round(stagger_pct, 2),
+        }
+
+
+# M244-TOPUP: end
+
+
+class DeslocCommWindowAnalyzer:
+    """Sliding window analysis of DES-LOC communication patterns.
+
+    Computes moving averages of bytes/latency/ops per window,
+    detects trends, and predicts future comm load.
+    """
+
+    def __init__(self, window_size=100):
+        self._window_size = window_size
+        self._bytes_window = []
+        self._lat_window = []
+        self._ops_window = []
+        self._step_window = []
+
+    def push(self, step, nbytes, latency_ms, n_ops=1):
+        """Push one step's comm data into the window."""
+        self._bytes_window.append(nbytes)
+        self._lat_window.append(latency_ms)
+        self._ops_window.append(n_ops)
+        self._step_window.append(step)
+        if len(self._bytes_window) > self._window_size:
+            self._bytes_window.pop(0)
+            self._lat_window.pop(0)
+            self._ops_window.pop(0)
+            self._step_window.pop(0)
+
+    def mean_bytes(self):
+        if not self._bytes_window:
+            return 0.0
+        return sum(self._bytes_window) / len(self._bytes_window)
+
+    def mean_latency_ms(self):
+        if not self._lat_window:
+            return 0.0
+        vals = [v for v in self._lat_window if v > 0]
+        return sum(vals) / max(1, len(vals))
+
+    def bytes_trend(self):
+        """Positive = increasing comm, negative = decreasing."""
+        n = len(self._bytes_window)
+        if n < 10:
+            return 0.0
+        first_half = sum(self._bytes_window[:n//2]) / max(1, n//2)
+        second_half = sum(self._bytes_window[n//2:]) / max(1, n - n//2)
+        if first_half <= 0:
+            return 0.0
+        return round((second_half - first_half) / first_half, 6)
+
+    def latency_percentiles(self):
+        """Compute p50, p90, p99 latency."""
+        vals = sorted(v for v in self._lat_window if v > 0)
+        if not vals:
+            return {'p50': 0.0, 'p90': 0.0, 'p99': 0.0}
+        n = len(vals)
+        return {
+            'p50': round(vals[n // 2], 4),
+            'p90': round(vals[min(n - 1, int(n * 0.9))], 4),
+            'p99': round(vals[min(n - 1, int(n * 0.99))], 4),
+        }
+
+    def predict_next_window_bytes(self):
+        """Simple linear extrapolation of comm bytes."""
+        trend = self.bytes_trend()
+        current_mean = self.mean_bytes()
+        return round(current_mean * (1.0 + trend), 2)
+
+    def comm_burstiness(self):
+        """Measure how bursty communication is.
+        Burstiness = std/mean of bytes per step.
+        DES-LOC should have periodic bursts (every Kx steps)."""
+        if len(self._bytes_window) < 5:
+            return 0.0
+        mean = self.mean_bytes()
+        if mean <= 0:
+            return 0.0
+        variance = sum((b - mean)**2 for b in self._bytes_window) / len(self._bytes_window)
+        std = variance ** 0.5
+        return round(std / mean, 6)
+
+    def detect_periodicity(self):
+        """Detect dominant communication period (should match Kx).
+        Uses simple autocorrelation on bytes_window."""
+        n = len(self._bytes_window)
+        if n < 20:
+            return {'detected_period': 0, 'confidence': 0.0}
+
+        mean = self.mean_bytes()
+        if mean <= 0:
+            return {'detected_period': 0, 'confidence': 0.0}
+
+        centered = [b - mean for b in self._bytes_window]
+        var = sum(c * c for c in centered) / n
+
+        if var <= 0:
+            return {'detected_period': 0, 'confidence': 0.0}
+
+        best_lag = 0
+        best_corr = 0.0
+
+        for lag in range(1, min(n // 2, 256)):
+            corr = sum(centered[i] * centered[i + lag]
+                       for i in range(n - lag)) / ((n - lag) * var)
+            if corr > best_corr:
+                best_corr = corr
+                best_lag = lag
+
+        return {
+            'detected_period': best_lag,
+            'confidence': round(best_corr, 6),
+        }
+
+    def full_report(self):
+        """Full sliding window report."""
+        percs = self.latency_percentiles()
+        period = self.detect_periodicity()
+        return {
+            'window_size': len(self._bytes_window),
+            'mean_bytes': round(self.mean_bytes(), 2),
+            'mean_latency_ms': round(self.mean_latency_ms(), 4),
+            'bytes_trend': self.bytes_trend(),
+            'burstiness': self.comm_burstiness(),
+            'predicted_next_bytes': self.predict_next_window_bytes(),
+            'latency_p50_ms': percs['p50'],
+            'latency_p90_ms': percs['p90'],
+            'latency_p99_ms': percs['p99'],
+            'detected_period': period['detected_period'],
+            'period_confidence': period['confidence'],
+        }
+
+
+# M244-TOPUP2: end
