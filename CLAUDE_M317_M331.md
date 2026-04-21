@@ -70,7 +70,205 @@
 最终 NKI-FA 的 `### config ### metric: value` 格式完善日志解析，
 确保 draw_plot.py 兼容所有实验输出。
 
-## M317 Changes Applied
-- REAL_GPU_BENCHMARK.py: 4 bugs fixed + MFU + NKI-FA logs + draw_plot (951→1141 lines)
+## M317 Changes Applied (Claude-22)
+- engine.py: +348 lines — Megatron-style bucket AllReduce, 3-tier momentum sync, NKI-FA logging
+- REAL_GPU_BENCHMARK.py: 4 bugs fixed + MFU + NKI-FA logs + draw_plot (873→1141 lines)
 - run_all_v2.sh: 3-phase 99-run experiment matrix for 2×A6000+H100
-- CLAUDE_M317_M331.md: this document
+
+## Rules for Claude-23 (M318-M331)
+1. MODIFY EXISTING FILES ONLY — no new standalone .py files
+2. cat FILE FIRST — always read target before modifying
+3. ast.parse AFTER — verify Python syntax after every modification
+4. ZERO numpy.random — use torch.manual_seed only
+5. Net +400 lines per M# (批判性merge: add N, delete M, net N-M≈400)
+6. Data from NKI-FA logs only — no hardcoded dummy results
+7. git clone the infra repos below, diff the EXACT file:line listed, then merge
+
+## Infra Repos to Clone (Claude-22 already surveyed these)
+```bash
+cd /home/claude/infra_repos  # or wherever you want
+git clone --depth 1 https://github.com/NVIDIA/nccl.git
+git clone --depth 1 https://github.com/NVIDIA/Megatron-LM.git
+git clone --depth 1 https://github.com/NVIDIA/TransformerEngine.git
+git clone --depth 1 https://github.com/volcengine/veScale.git
+git clone --depth 1 https://github.com/aws-neuron/neuronx-distributed.git
+git clone --depth 1 https://github.com/Dao-AILab/flash-attention.git
+git clone --depth 1 https://github.com/dylanyunlon/NKI-FA.git
+```
+
+---
+
+## M318: deepspeed/runtime/utils.py (2419→~2819, net +400)
+**DELETE** lines 1485-1600: `desloc_half_life()`, `desloc_recommend_periods()`, `desloc_psi_factor()`, `desloc_comm_reduction_ratio()` — these are math-only simulations with no real training integration.
+**DIFF FROM (cat these, adapt into utils.py):**
+
+| Repo file:line | Function/Class | What to adapt |
+|---|---|---|
+| `Megatron-LM/megatron/core/optimizer/clip_grads.py:57` | `get_grad_norm_fp32()` | → `desloc_bucket_grad_norm(bucket)` per-bucket L2 norm |
+| `Megatron-LM/megatron/core/optimizer/clip_grads.py` (search `clip_grad_by_total_norm`) | `clip_grad_by_total_norm_fp32()` | → `desloc_clip_grad_per_tier(params, max_norm, tier)` |
+| `Megatron-LM/megatron/core/optimizer/distrib_optimizer.py:62` | `class Range` | → `desloc_param_range(start, end)` for bucket offset tracking |
+| `Megatron-LM/megatron/core/optimizer/distrib_optimizer.py:118` | `_build_model_gbuf_param_range_map()` | → `desloc_build_param_range_map(model)` |
+| `neuronx-distributed/src/neuronx_distributed/optimizer/zero_redundancy_optimizer.py:96` | `_clip_grad_norm()` | → `desloc_zero1_clip_with_Kx_gate()` |
+| `TransformerEngine/examples/pytorch/comm_gemm_overlap/te_layer_with_overlap.py:175` | `_train()` | → `desloc_roofline_model(gpu_name, n_params)` |
+| `Megatron-LM/megatron/core/optimizer/emerging_optimizers.py:154` | `class TensorParallelMuon` | → `desloc_adaptive_Kx(grad_variance, loss_trend)` |
+
+---
+
+## M319: deepspeed/runtime/config.py (1085→~1485, net +400)
+**DELETE** unused desloc config stubs that just set defaults without validation.
+**DIFF FROM:**
+
+| Repo file:line | Function/Class | What to adapt |
+|---|---|---|
+| `Megatron-LM/megatron/core/distributed/distributed_data_parallel_config.py:10` | `@dataclass DistributedDataParallelConfig` | → `@dataclass DeslocDistributedConfig` with Kx/Ku/Kv + all DDP fields |
+| `Megatron-LM/megatron/core/distributed/distributed_data_parallel_config.py:16` | `overlap_grad_reduce: bool` | → `desloc_overlap_grad_reduce` |
+| `Megatron-LM/megatron/core/distributed/distributed_data_parallel_config.py:46` | `bucket_size: Optional[int]` | → `desloc_bucket_size` |
+| `Megatron-LM/megatron/core/optimizer/optimizer_config.py:139` | `@dataclass OptimizerConfig` | → `DeslocOptimizerConfig` with tier periods, half_life |
+
+---
+
+## M320: deepspeed/runtime/constants.py (713→~1113, net +400)
+**DELETE** ~100 lines of reserved slot comments and duplicate constant defs.
+**DIFF FROM:**
+
+| Repo file:line | What | What to adapt |
+|---|---|---|
+| `nccl/src/device/all_reduce.h:234` | `RunWorkColl<ncclFuncAllReduce, NCCL_ALGO_RING>`, `ALLREDUCE_CHUNKSTEPS`, `ALLREDUCE_SLICESTEPS` | → `DESLOC_ALLREDUCE_CHUNK_SIZE`, `DESLOC_RING_PROTOCOL` |
+| `nccl/src/collectives.cc:111` | `ncclAllReduce()` — `struct ncclInfo` fields | → `DESLOC_COMM_INFO_FIELDS` dict |
+| `Megatron-LM/megatron/core/distributed/distributed_data_parallel_config.py:46` | `bucket_size` | → `DESLOC_DEFAULT_BUCKET_SIZE` |
+| `Megatron-LM/megatron/core/distributed/distributed_data_parallel_config.py:51` | `pad_buckets_for_high_nccl_busbw` | → `DESLOC_BUCKET_PAD_ALIGNMENT` |
+
+---
+
+## M321: deepspeed/utils/comms_logging.py (716→~1116, net +400)
+**DELETE** `desloc_classify_op()` dummy implementation (~lines 141-165).
+**DIFF FROM:**
+
+| Repo file | What | What to adapt |
+|---|---|---|
+| `nccl/plugins/profiler/example/nccl/profiler_v3.h` | profiler event structure: startColl, stopColl | → `DeslocCommEvent` dataclass |
+| `nccl/plugins/profiler/example/event.h` | event lifecycle: init→start→stop | → `DeslocCommProfiler` class |
+| `Megatron-LM/megatron/training/dgrad_logging.py` | gradient logging patterns | → `desloc_log_comm_event()` NKI-FA format |
+| `Megatron-LM/megatron/core/config_logger.py` | `log_config_to_disk()` | → `desloc_export_comm_log()` |
+
+---
+
+## M322: deepspeed/utils/timer.py (723→~1123, net +400)
+**DELETE** empty `_desloc_phases` dict, unused timer categories (~30 lines).
+**DIFF FROM:**
+
+| Repo file:line | Function | What to adapt |
+|---|---|---|
+| `flash-attention/flash_attn/utils/benchmark.py:8` | `benchmark_forward()` | → `DeslocStepTimer` with CUDA event timing + warmup |
+| `flash-attention/flash_attn/utils/benchmark.py:30` | `benchmark_backward()` | → backward phase timing |
+| `flash-attention/flash_attn/utils/benchmark.py:258` | `benchmark_memory()` | → peak memory tracking per step |
+| `TransformerEngine/benchmarks/attention/benchmark_dot_product_attention.py:44` | `benchmark_dot_product_attention()` | → `desloc_benchmark_step()` with TFLOPS |
+| `Megatron-LM/megatron/core/transformer/cuda_graphs.py` | `is_graph_capturing()` | → `DeslocMFUCalculator` roofline from GPU specs |
+
+---
+
+## M323: deepspeed/comm/comm.py (1029→~1429, net +400)
+**DIFF FROM:**
+
+| Repo file:line | Function/Class | What to adapt |
+|---|---|---|
+| `veScale/vescale/dtensor/_collective_utils.py:66` | `mesh_scatter_ragged()` | → `desloc_gated_allreduce(tensor, Kx, step)` |
+| `nccl/src/collectives.cc:111` | `ncclAllReduce()` dispatch | → `desloc_tier_aware_reduce()` ring vs tree per tier |
+| `Megatron-LM/megatron/core/distributed/param_and_grad_buffer.py:~160` | `class _ParamAndGradBucketGroup` | → `desloc_async_bucket_reduce()` |
+| `neuronx-distributed/src/neuronx_distributed/parallel_layers/comm.py:200` | `all_reduce()` | → Trainium-compatible path |
+| `neuronx-distributed/src/neuronx_distributed/parallel_layers/comm.py:124` | `reduce_scatter()` | → `desloc_trainium_reduce_scatter()` |
+
+---
+
+## M324: deepspeed/comm/backend.py (net +400)
+**DIFF FROM:**
+
+| Repo file | What | What to adapt |
+|---|---|---|
+| `TransformerEngine/transformer_engine/pytorch/ops/fused/userbuffers_forward_linear.py` | userbuffers comm/compute overlap | → `DeslocAsyncBackend` |
+| `nccl/src/enqueue.cc` | `ncclEnqueueCheck()` async enqueue | → `desloc_enqueue_allreduce()` |
+| `Megatron-LM/megatron/core/distributed/distributed_data_parallel.py` | overlap_grad_reduce hooks in `__init__` | → `DeslocOverlapManager` |
+
+---
+
+## M325: deepspeed/comm/torch.py (net +400)
+**DIFF FROM:**
+
+| Repo file:line | Function/Class | What to adapt |
+|---|---|---|
+| `Megatron-LM/megatron/core/distributed/reduce_scatter_with_fp32_accumulation.py:9` | `class _ReduceScatterWithFP32AccumulationWorkHandle` | → `desloc_reduce_scatter_fp32()` |
+| `Megatron-LM/megatron/core/distributed/reduce_scatter_with_fp32_accumulation.py:42` | `reduce_scatter_with_fp32_accumulation()` | → FP32 accumulation for DES-LOC |
+| `neuronx-distributed/src/neuronx_distributed/parallel_layers/comm.py:163` | `all_gather()` | → `desloc_torch_tiered_allreduce()` |
+| `neuronx-distributed/src/neuronx_distributed/parallel_layers/comm.py:200` | `all_reduce()` | → torch.distributed tier-aware wrapper |
+| `veScale/vescale/dtensor/_redistribute.py:130` | `class Redistribute(torch.autograd.Function)` | → `DeslocRedistribute` autograd-safe |
+
+---
+
+## M326: deepspeed/runtime/zero/stage_1_and_2.py (3237→~3637, net +400)
+**DIFF FROM:**
+
+| Repo file:line | Function/Class | What to adapt |
+|---|---|---|
+| `Megatron-LM/megatron/core/optimizer/distrib_optimizer.py:2696` | `step_with_ready_grads()` | → ZeRO + DES-LOC hybrid step |
+| `Megatron-LM/megatron/core/optimizer/distrib_optimizer.py:62` | `class Range` | → partition range for Kx-gated reduce |
+| `Megatron-LM/megatron/core/optimizer/distrib_optimizer.py:118` | `_build_model_gbuf_param_range_map()` | → param-to-bucket mapping |
+| `neuronx-distributed/src/neuronx_distributed/optimizer/zero_redundancy_optimizer.py:59` | `_shard_parameters()` | → `desloc_zero_shard_with_Kx()` |
+| `neuronx-distributed/src/neuronx_distributed/optimizer/zero_redundancy_optimizer.py:270` | `_reduce_gradients()` (in NeuronEPZero1Optimizer) | → `desloc_zero_reduce_with_Kx()` |
+
+---
+
+## M327: deepspeed/ops/adam/fused_adam.py (244→~644, net +400)
+**DIFF FROM:**
+
+| Repo file:line | Function/Class | What to adapt |
+|---|---|---|
+| `Megatron-LM/megatron/core/optimizer/emerging_optimizers.py:154` | `class TensorParallelMuon` | → `DeslocFusedAdam` with ρ-clipping |
+| `Megatron-LM/megatron/core/optimizer/emerging_optimizers.py:179` | `scaled_orthogonalize_fn` (Newton-Schulz) | → `desloc_coordinate_clip()` |
+| `Megatron-LM/megatron/core/optimizer/emerging_optimizers.py:227` | `orthogonalize()` | → half-life tracking for Ku/Kv |
+| `TransformerEngine/transformer_engine/common/multi_tensor/adam.cu` | CUDA fused Adam kernel | → Python fallback with same semantics |
+
+---
+
+## M328: deepspeed/runtime/bf16_optimizer.py (727→~1127, net +400)
+**DIFF FROM:**
+
+| Repo file:line | Function/Class | What to adapt |
+|---|---|---|
+| `Megatron-LM/megatron/core/optimizer/grad_scaler.py:61` | `class DynamicGradScaler` | → `DeslocBF16GradScaler` aware of Kx boundaries |
+| `Megatron-LM/megatron/core/optimizer/grad_scaler.py:84` | `__init__()` with hysteresis, growth_interval | → loss scaling + Kx sync |
+| `Megatron-LM/megatron/core/optimizer/optimizer.py` | BF16 master weight management | → `desloc_bf16_sync_master_weights()` |
+
+---
+
+## M329: deepspeed/runtime/lr_schedules.py (975→~1375, net +400)
+**DIFF FROM:**
+
+| Repo file | What | What to adapt |
+|---|---|---|
+| `Megatron-LM/megatron/training/config/training_config.py` | LR schedule fields (warmup, decay, min_lr) | → `DeslocWSDSchedule` aligned with Kx |
+| `Megatron-LM/megatron/core/optimizer/optimizer.py` | LR schedule in `step()` | → `desloc_lr_at_boundary()` |
+
+---
+
+## M330: deepspeed/runtime/pipe/engine.py (1467→~1867, net +400)
+**DIFF FROM:**
+
+| Repo file:line | Function | What to adapt |
+|---|---|---|
+| `Megatron-LM/megatron/core/pipeline_parallel/schedules.py:592` | `forward_backward_no_pipelining()` | → DES-LOC Kx gating in pipe grad sync |
+| `Megatron-LM/megatron/core/pipeline_parallel/schedules.py:460` | `backward_step()` | → `desloc_pipe_backward_with_Kx()` |
+| `Megatron-LM/megatron/core/pipeline_parallel/schedules.py:804` | `get_pp_rank_microbatches()` | → hetero microbatch for A6000+H100 |
+| `Megatron-LM/megatron/core/pipeline_parallel/combined_1f1b.py` | combined 1F1B schedule | → `desloc_pipe_hetero_schedule()` |
+
+---
+
+## M331: REAL_GPU_BENCHMARK.py (1141→~1541, net +400)
+**DELETE** M315 simulation at EOF: `desloc_abl_cfgs()`, `desloc_run_mx()`, `desloc_hw_rep()` (~80 lines).
+**DIFF FROM:**
+
+| Repo file | What | What to adapt |
+|---|---|---|
+| `NKI-FA/exp_utils/draw_plot.py` (commit da964f3) | `parse_data()` regex parser, seaborn barplot with `f"{value:.1f}"` annotations | → full 7-figure pipeline |
+| `NKI-FA/hopper/benchmark_attn.py` | `time_fwd()` (Triton do_bench), `flops()` | → `desloc_compute_tflops()` |
+| `flash-attention/flash_attn/utils/benchmark.py:8` | `benchmark_forward()` CUDA event timing | → integrate into experiment runner |
+| `flash-attention/flash_attn/utils/benchmark.py:258` | `benchmark_memory()` peak memory | → per-method memory tracking |
