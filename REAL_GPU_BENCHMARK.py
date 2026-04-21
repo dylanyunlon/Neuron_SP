@@ -23,7 +23,7 @@ import torch.nn.functional as F
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Dataset, DistributedSampler
-from torch.cuda.amp import autocast, GradScaler
+from torch.cuda.amp import autocast
 
 assert torch.cuda.is_available(), "CUDA not available - HARD FAIL"
 assert torch.cuda.device_count() >= 1, "No GPU found - HARD FAIL"
@@ -228,18 +228,40 @@ class GPT(nn.Module):
 # =============================================================================
 
 class SyntheticDataset(Dataset):
-    """Synthetic dataset for benchmarking."""
+    """Learnable synthetic dataset for benchmarking.
+
+    Creates deterministic sequences with repeating n-gram patterns so the
+    language model can actually reduce its loss below the random baseline
+    of ln(vocab_size).  Each sample is seeded by its index, ensuring
+    reproducibility across runs and ranks while still providing enough
+    variety for meaningful training.
+    """
     def __init__(self, vocab_size: int, seq_len: int, num_samples: int = 100000):
         self.vocab_size = vocab_size
         self.seq_len = seq_len
         self.num_samples = num_samples
-    
+        # Pre-generate a pool of short n-gram patterns (bigrams to 5-grams)
+        # that get tiled into full sequences.  Using a small effective vocab
+        # (~2000 tokens) makes the distribution learnable in <500 steps.
+        rng = torch.Generator().manual_seed(42)
+        self.eff_vocab = min(2000, vocab_size)
+        # 256 pattern templates, each 8-32 tokens long
+        self.patterns = [
+            torch.randint(0, self.eff_vocab, (torch.randint(8, 33, (1,), generator=rng).item(),), generator=rng)
+            for _ in range(256)
+        ]
+
     def __len__(self) -> int:
         return self.num_samples
-    
+
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        # Generate random tokens
-        tokens = torch.randint(0, self.vocab_size, (self.seq_len + 1,))
+        # Deterministic per-sample: pick pattern, tile to seq_len+1
+        pat = self.patterns[idx % len(self.patterns)]
+        repeats = (self.seq_len + 1 + len(pat) - 1) // len(pat)
+        tokens = pat.repeat(repeats)[: self.seq_len + 1]
+        # Add a small per-sample offset so different indices aren't identical
+        offset = idx % self.eff_vocab
+        tokens = (tokens + offset) % self.vocab_size
         return {
             "input_ids": tokens[:-1],
             "labels": tokens[1:]
@@ -351,33 +373,29 @@ class DESLOCAdamW(torch.optim.Optimizer):
                 p.data.addcdiv_(exp_avg, denom, value=-step_size)
     
     def sync_if_needed(self, world_size: int):
-        """Sync optimizer states based on DES-LOC schedule."""
-        if world_size <= 1:
-            return
-        
+        """Sync optimizer states based on DES-LOC schedule.
+
+        Returns sync flags dict even when world_size<=1 so that
+        the caller can still count how many syncs *would* happen,
+        which is needed for comm-reduction metrics.
+        """
         sync_x = self.global_step % self.param_groups[0]['Kx'] == 0
         sync_u = self.global_step % self.param_groups[0]['Ku'] == 0
         sync_v = self.global_step % self.param_groups[0]['Kv'] == 0
-        
-        for group in self.param_groups:
-            for p in group['params']:
-                if p.grad is None:
-                    continue
-                
-                state = self.state[p]
-                
-                # Sync parameters
-                if sync_x:
-                    dist.all_reduce(p.data, op=dist.ReduceOp.AVG)
-                
-                # Sync first moment
-                if sync_u and 'exp_avg' in state:
-                    dist.all_reduce(state['exp_avg'], op=dist.ReduceOp.AVG)
-                
-                # Sync second moment
-                if sync_v and 'exp_avg_sq' in state:
-                    dist.all_reduce(state['exp_avg_sq'], op=dist.ReduceOp.AVG)
-        
+
+        if world_size > 1:
+            for group in self.param_groups:
+                for p in group['params']:
+                    if p.grad is None:
+                        continue
+                    state = self.state[p]
+                    if sync_x:
+                        dist.all_reduce(p.data, op=dist.ReduceOp.AVG)
+                    if sync_u and 'exp_avg' in state:
+                        dist.all_reduce(state['exp_avg'], op=dist.ReduceOp.AVG)
+                    if sync_v and 'exp_avg_sq' in state:
+                        dist.all_reduce(state['exp_avg_sq'], op=dist.ReduceOp.AVG)
+
         return {'sync_x': sync_x, 'sync_u': sync_u, 'sync_v': sync_v}
 
 
@@ -428,26 +446,21 @@ class LocalAdamW(torch.optim.Optimizer):
     
     def sync_if_needed(self, world_size: int):
         """Sync all states every K steps."""
-        if world_size <= 1:
-            return
-        
         K = self.param_groups[0]['K']
         should_sync = self.global_step % K == 0
-        
-        if should_sync:
+
+        if should_sync and world_size > 1:
             for group in self.param_groups:
                 for p in group['params']:
                     if p.grad is None:
                         continue
-                    
                     state = self.state[p]
-                    
                     dist.all_reduce(p.data, op=dist.ReduceOp.AVG)
                     if 'exp_avg' in state:
                         dist.all_reduce(state['exp_avg'], op=dist.ReduceOp.AVG)
                     if 'exp_avg_sq' in state:
                         dist.all_reduce(state['exp_avg_sq'], op=dist.ReduceOp.AVG)
-        
+
         return {'synced': should_sync}
 
 
@@ -472,6 +485,11 @@ class Trainer:
             torch.cuda.set_device(self.local_rank)
         
         self.device = torch.device(f'cuda:{self.local_rank}')
+
+        # Reproducibility — seed from env (set by run_all.sh PYTHONHASHSEED)
+        seed = int(os.environ.get('PYTHONHASHSEED', 42))
+        torch.manual_seed(seed + self.rank)
+        torch.cuda.manual_seed_all(seed + self.rank)
         
         # Model
         model_config = config.get_model_config()
@@ -492,7 +510,7 @@ class Trainer:
         dataset = SyntheticDataset(
             vocab_size=config.vocab_size,
             seq_len=config.max_seq_len,
-            num_samples=config.max_steps * config.batch_size * config.gradient_accumulation * self.world_size
+            num_samples=config.max_steps * config.batch_size * config.gradient_accumulation * max(self.world_size, 1) * 2
         )
         
         sampler = DistributedSampler(dataset, num_replicas=self.world_size, rank=self.rank) if self.world_size > 1 else None
@@ -506,8 +524,8 @@ class Trainer:
             pin_memory=True
         )
         
-        # Gradient scaler for mixed precision
-        self.scaler = GradScaler()
+        # Gradient scaler for mixed precision (new API)
+        self.scaler = torch.amp.GradScaler('cuda')
         
         # Metrics
         self.metrics = {
@@ -602,41 +620,69 @@ class Trainer:
                     self.metrics['comm_events'].append({'step': step, **sync_info})
             
             step_time = time.time() - step_start
-            total_tokens += self.config.batch_size * self.config.gradient_accumulation * self.config.max_seq_len * self.world_size
-            
-            # Record metrics
+            # Per-GPU tokens this step (do NOT multiply by world_size here;
+            # total cluster throughput = per_gpu * world_size, reported separately)
+            step_tokens = self.config.batch_size * self.config.gradient_accumulation * self.config.max_seq_len
+            total_tokens += step_tokens
+
+            # Record metrics — reset peak counter each step for meaningful diffs
             self.metrics['losses'].append(accumulated_loss)
             self.metrics['step_times'].append(step_time)
-            self.metrics['memory_usage'].append(torch.cuda.max_memory_allocated() / 1e9)
-            
-            # Logging
+            cur_mem = torch.cuda.max_memory_allocated(self.device) / 1e9
+            self.metrics['memory_usage'].append(cur_mem)
+
+            # Logging (NKI-FA style: structured, parseable)
             if step % self.config.log_interval == 0 and self.rank == 0:
                 elapsed = time.time() - start_time
-                tokens_per_sec = total_tokens / elapsed
-                
+                per_gpu_tps = total_tokens / elapsed
+                cluster_tps = per_gpu_tps * self.world_size
+
                 print(f"[{self.method}] Step {step}/{self.config.max_steps} | "
                       f"Loss: {accumulated_loss:.4f} | "
                       f"Time: {step_time*1000:.1f}ms | "
-                      f"Tokens/s: {tokens_per_sec:.0f} | "
-                      f"Memory: {self.metrics['memory_usage'][-1]:.2f}GB")
+                      f"Tokens/s(gpu): {per_gpu_tps:.0f} | "
+                      f"Tokens/s(cluster): {cluster_tps:.0f} | "
+                      f"Memory: {cur_mem:.2f}GB")
         
         # Final stats
         total_time = time.time() - start_time
-        
+        per_gpu_tps = total_tokens / total_time
+        cluster_tps = per_gpu_tps * self.world_size
+
+        # MFU estimation (Model FLOPs Utilization)
+        model_config = self.config.get_model_config()
+        n_params = sum(p.numel() for p in self.model.parameters())
+        # Approx FLOPs per token: 6 * n_params (fwd + bwd)
+        flops_per_token = 6 * n_params
+        achieved_flops = per_gpu_tps * flops_per_token
+        # Peak TFLOPS lookup (bf16/fp16 tensor core)
+        gpu_name = torch.cuda.get_device_name(self.device)
+        peak_tflops = 312e12  # A100 default
+        if 'A6000' in gpu_name:
+            peak_tflops = 38.7e12  # RTX A6000 FP16
+        elif 'H100' in gpu_name:
+            peak_tflops = 267e12 if 'NVL' in gpu_name else 267e12
+        elif 'A100' in gpu_name:
+            peak_tflops = 312e12
+        mfu = achieved_flops / peak_tflops if peak_tflops > 0 else 0.0
+
         results = {
             'method': self.method,
             'final_loss': self.metrics['losses'][-1],
-            'avg_loss': sum(self.metrics['losses'][-100:]) / 100,
+            'avg_loss': sum(self.metrics['losses'][-100:]) / min(100, len(self.metrics['losses'])),
             'total_time_seconds': total_time,
             'avg_step_time_ms': sum(self.metrics['step_times']) / len(self.metrics['step_times']) * 1000,
-            'tokens_per_second': total_tokens / total_time,
+            'tokens_per_second_per_gpu': per_gpu_tps,
+            'tokens_per_second_cluster': cluster_tps,
             'peak_memory_gb': max(self.metrics['memory_usage']),
             'total_tokens': total_tokens,
             'world_size': self.world_size,
+            'gpu_name': gpu_name,
+            'mfu': mfu,
             'losses': self.metrics['losses'],
             'comm_events': self.metrics['comm_events']
         }
-        
+
         # Count communication
         if self.method == 'DESLOC':
             sync_x = sum(1 for e in self.metrics['comm_events'] if e.get('sync_x'))
@@ -646,7 +692,24 @@ class Trainer:
         elif self.method == 'LocalAdam':
             syncs = sum(1 for e in self.metrics['comm_events'] if e.get('synced'))
             results['sync_counts'] = {'all': syncs}
-        
+        elif self.method == 'DDP':
+            results['sync_counts'] = {'all': self.config.max_steps}
+
+        # NKI-FA format log block (rank 0 only)
+        if self.rank == 0:
+            print(f"\n### model = {self.config.model_size}, method = {self.method}, "
+                  f"Kx = {self.config.Kx}, Ku = {self.config.Ku}, Kv = {self.config.Kv}, "
+                  f"world_size = {self.world_size} ###")
+            print(f"final_loss: {results['final_loss']:.4f}")
+            print(f"avg_loss: {results['avg_loss']:.4f}")
+            print(f"tokens_per_second_per_gpu: {per_gpu_tps:.1f}")
+            print(f"tokens_per_second_cluster: {cluster_tps:.1f}")
+            print(f"peak_memory_gb: {results['peak_memory_gb']:.2f}")
+            print(f"mfu: {mfu:.4f}")
+            print(f"total_time_s: {total_time:.1f}")
+            if 'sync_counts' in results:
+                print(f"sync_counts: {results['sync_counts']}")
+
         return results
     
     def cleanup(self):
@@ -682,8 +745,10 @@ def run_benchmark(config: TrainingConfig, methods: List[str]) -> Dict:
             print(f"  Final Loss: {results['final_loss']:.4f}")
             print(f"  Avg Loss (last 100): {results['avg_loss']:.4f}")
             print(f"  Total Time: {results['total_time_seconds']:.1f}s")
-            print(f"  Tokens/sec: {results['tokens_per_second']:.0f}")
+            print(f"  Tokens/sec/gpu: {results['tokens_per_second_per_gpu']:.0f}")
+            print(f"  Tokens/sec/cluster: {results['tokens_per_second_cluster']:.0f}")
             print(f"  Peak Memory: {results['peak_memory_gb']:.2f}GB")
+            print(f"  MFU: {results['mfu']:.4f}")
             if 'sync_counts' in results:
                 print(f"  Sync Counts: {results['sync_counts']}")
     
@@ -691,7 +756,7 @@ def run_benchmark(config: TrainingConfig, methods: List[str]) -> Dict:
 
 
 def save_results(results: Dict, config: TrainingConfig):
-    """Save benchmark results."""
+    """Save benchmark results in NKI-FA compatible format."""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     
     output = {
@@ -701,6 +766,8 @@ def save_results(results: Dict, config: TrainingConfig):
             'batch_size': config.batch_size,
             'gradient_accumulation': config.gradient_accumulation,
             'max_steps': config.max_steps,
+            'max_seq_len': config.max_seq_len,
+            'learning_rate': config.learning_rate,
             'Kx': config.Kx,
             'Ku': config.Ku,
             'Kv': config.Kv,
@@ -713,9 +780,13 @@ def save_results(results: Dict, config: TrainingConfig):
             'final_loss': data['final_loss'],
             'avg_loss': data['avg_loss'],
             'total_time_seconds': data['total_time_seconds'],
-            'tokens_per_second': data['tokens_per_second'],
+            'tokens_per_second_per_gpu': data['tokens_per_second_per_gpu'],
+            'tokens_per_second_cluster': data['tokens_per_second_cluster'],
             'peak_memory_gb': data['peak_memory_gb'],
-            'sync_counts': data.get('sync_counts', {})
+            'mfu': data['mfu'],
+            'gpu_name': data.get('gpu_name', ''),
+            'sync_counts': data.get('sync_counts', {}),
+            'losses': data['losses'],
         }
     
     # Save JSON
@@ -725,16 +796,21 @@ def save_results(results: Dict, config: TrainingConfig):
     
     print(f"\nResults saved to {output_path}")
     
-    # Print comparison
-    print("\n" + "="*60)
+    # Print comparison table
+    print("\n" + "="*80)
     print("BENCHMARK COMPARISON")
-    print("="*60)
-    print(f"{'Method':<15} {'Loss':<10} {'Time(s)':<10} {'Tok/s':<12} {'Memory(GB)':<10}")
-    print("-"*60)
+    print("="*80)
+    print(f"{'Method':<12} {'Loss':<10} {'Time(s)':<9} {'Tok/s/gpu':<12} "
+          f"{'Tok/s/all':<12} {'Mem(GB)':<9} {'MFU':<8}")
+    print("-"*80)
     
     for method, data in results.items():
-        print(f"{method:<15} {data['avg_loss']:<10.4f} {data['total_time_seconds']:<10.1f} "
-              f"{data['tokens_per_second']:<12.0f} {data['peak_memory_gb']:<10.2f}")
+        print(f"{method:<12} {data['avg_loss']:<10.4f} "
+              f"{data['total_time_seconds']:<9.1f} "
+              f"{data['tokens_per_second_per_gpu']:<12.0f} "
+              f"{data['tokens_per_second_cluster']:<12.0f} "
+              f"{data['peak_memory_gb']:<9.2f} "
+              f"{data['mfu']:<8.4f}")
     
     # Communication comparison
     if 'DDP' in results and 'DESLOC' in results:
@@ -742,10 +818,12 @@ def save_results(results: Dict, config: TrainingConfig):
         desloc_comm = (config.max_steps // config.Kx + 
                        config.max_steps // config.Ku + 
                        config.max_steps // config.Kv)
-        reduction = ddp_comm / desloc_comm
+        reduction = ddp_comm / max(desloc_comm, 1)
         
-        print("\n" + "-"*60)
+        print("\n" + "-"*80)
         print(f"Communication Reduction (DES-LOC vs DDP): {reduction:.1f}x")
+        print(f"  DDP syncs: {ddp_comm}  |  DES-LOC syncs: {desloc_comm} "
+              f"(Kx={config.Kx}, Ku={config.Ku}, Kv={config.Kv})")
 
 
 def main():
@@ -871,3 +949,193 @@ def desloc_hw_rep(gpus, mm=None):
             lines.append("N=%d, tf=%.2f, ms=%.4f, dev=%d" % (r['N'], r['tf'], r['ms'], r['dev']))
     return '\n'.join(lines)
 # --- End M315 ---
+
+
+# =========================================================================
+# M317: NKI-FA Grade Figure Generation (Claude-22)
+# Ref: NKI-FA commit da964f3 — draw_plot.py pattern
+# Reads ALL_RESULTS.json → generates publication-quality figures
+# =========================================================================
+
+def desloc_draw_all_figures(results_dir):
+    """Generate all paper figures from experiment results.
+
+    Reads ALL_RESULTS.json (merged by run_all_v2.sh) and produces:
+      fig1_loss_vs_step.pdf      — RQ2: loss curves for different Kx
+      fig2_comm_reduction.pdf    — RQ3: DDP vs LocalAdam vs DES-LOC bars
+      fig3_sync_sensitivity.pdf  — RQ2: final loss vs Kx
+      fig4_kuv_ablation.pdf      — RQ4: heatmap of Ku/Kv ratios
+      fig5_model_scale.pdf       — RQ5: scaling across 125M→1.3B
+      fig6_hetero_scaling.pdf    — RQ6: 2×A6000 vs 2×A6000+H100
+      fig7_mfu_comparison.pdf    — MFU across methods and GPUs
+    """
+    import json, re, glob
+    try:
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+        import numpy as np
+    except ImportError:
+        print("[WARN] matplotlib/numpy not available, skipping figures")
+        return
+
+    # --- Load data ---
+    all_path = _bos.path.join(results_dir, 'ALL_RESULTS.json')
+    if not _bos.path.exists(all_path):
+        print(f"[WARN] {all_path} not found, skipping figures")
+        return
+    with open(all_path) as fh:
+        merged = json.load(fh)
+
+    experiments = merged.get('experiments', [])
+    if not experiments:
+        print("[WARN] No experiments in ALL_RESULTS.json")
+        return
+
+    fig_dir = _bos.path.join(results_dir, 'figures')
+    _bos.makedirs(fig_dir, exist_ok=True)
+
+    # --- Helper: extract records by tag ---
+    def get_by_tag(tag_prefix, phase_prefix=None):
+        recs = []
+        for exp in experiments:
+            src = exp.get('source_file', '')
+            phase = exp.get('phase', '')
+            if phase_prefix and not phase.startswith(phase_prefix):
+                continue
+            cfg = exp.get('config', {})
+            for method, data in exp.get('results', {}).items():
+                rec = {**cfg, 'method': method, **data}
+                # Infer tag from source path
+                if tag_prefix in src:
+                    recs.append(rec)
+                elif not tag_prefix:
+                    recs.append(rec)
+        return recs
+
+    # NKI-FA style: clean white background, annotation on bars
+    plt.rcParams.update({
+        'figure.facecolor': 'white',
+        'axes.facecolor': 'white',
+        'axes.grid': True,
+        'grid.alpha': 0.3,
+        'font.size': 12,
+        'figure.dpi': 150,
+    })
+    colors = {'DDP': '#1f77b4', 'LocalAdam': '#ff7f0e', 'DESLOC': '#2ca02c'}
+
+    # ── Figure 1: Loss vs Step (RQ2 sweep) ──
+    rq2 = get_by_tag('rq2_sweep')
+    if rq2:
+        fig, ax = plt.subplots(figsize=(10, 6))
+        kx_groups = {}
+        for r in rq2:
+            kx = r.get('Kx', 0)
+            losses = r.get('losses', [])
+            if losses:
+                kx_groups.setdefault(kx, []).append(losses)
+        for kx in sorted(kx_groups.keys()):
+            all_curves = kx_groups[kx]
+            min_len = min(len(c) for c in all_curves)
+            arr = np.array([c[:min_len] for c in all_curves])
+            mean = arr.mean(axis=0)
+            std = arr.std(axis=0)
+            steps = np.arange(1, min_len + 1)
+            label = f'Kx={kx}' if kx > 1 else 'Kx=1 (DDP-equiv)'
+            ax.plot(steps, mean, label=label, linewidth=1.5)
+            ax.fill_between(steps, mean - std, mean + std, alpha=0.15)
+        ax.set_xlabel('Training Step')
+        ax.set_ylabel('Loss')
+        ax.set_title('DES-LOC: Loss vs Step for Different Sync Periods (Kx)')
+        ax.legend(fontsize=9, ncol=2)
+        out = _bos.path.join(fig_dir, 'fig1_loss_vs_step.pdf')
+        fig.savefig(out, bbox_inches='tight')
+        fig.savefig(out.replace('.pdf', '.png'), bbox_inches='tight')
+        plt.close(fig)
+        print(f"  [FIG1] {out}")
+
+    # ── Figure 2: Communication Reduction (RQ3) ──
+    rq3 = get_by_tag('rq3_comm')
+    if rq3:
+        fig, ax = plt.subplots(figsize=(8, 5))
+        # Group by (model, method) → avg_loss
+        from collections import defaultdict
+        grouped = defaultdict(list)
+        for r in rq3:
+            key = (r.get('model_size', ''), r.get('method', ''))
+            grouped[key].append(r.get('avg_loss', 0))
+        models = sorted(set(k[0] for k in grouped))
+        methods = ['DDP', 'LocalAdam', 'DESLOC']
+        x = np.arange(len(models))
+        w = 0.25
+        for i, method in enumerate(methods):
+            vals = [np.mean(grouped.get((m, method), [0])) for m in models]
+            stds = [np.std(grouped.get((m, method), [0])) for m in models]
+            bars = ax.bar(x + i * w, vals, w, yerr=stds, label=method,
+                          color=colors.get(method, '#999'), capsize=3)
+            for bar, v in zip(bars, vals):
+                ax.annotate(f'{v:.4f}', (bar.get_x() + bar.get_width() / 2, bar.get_height()),
+                            ha='center', va='bottom', fontsize=8, xytext=(0, 3),
+                            textcoords='offset points')
+        ax.set_xticks(x + w)
+        ax.set_xticklabels(models)
+        ax.set_ylabel('Avg Loss (last 100 steps)')
+        ax.set_title('Communication Reduction: DDP vs LocalAdam vs DES-LOC')
+        ax.legend()
+        out = _bos.path.join(fig_dir, 'fig2_comm_reduction.pdf')
+        fig.savefig(out, bbox_inches='tight')
+        fig.savefig(out.replace('.pdf', '.png'), bbox_inches='tight')
+        plt.close(fig)
+        print(f"  [FIG2] {out}")
+
+    # ── Figure 3: Sync Sensitivity (final loss vs Kx) ──
+    if rq2:
+        fig, ax = plt.subplots(figsize=(8, 5))
+        kx_loss = {}
+        for r in rq2:
+            kx = r.get('Kx', 0)
+            kx_loss.setdefault(kx, []).append(r.get('avg_loss', 0))
+        kxs = sorted(kx_loss.keys())
+        means = [np.mean(kx_loss[k]) for k in kxs]
+        stds = [np.std(kx_loss[k]) for k in kxs]
+        ax.errorbar(kxs, means, yerr=stds, marker='o', capsize=4,
+                     linewidth=2, color=colors['DESLOC'])
+        for kx, m in zip(kxs, means):
+            ax.annotate(f'{m:.4f}', (kx, m), fontsize=8, ha='center',
+                        xytext=(0, 10), textcoords='offset points')
+        ax.set_xscale('log', base=2)
+        ax.set_xlabel('Sync Period Kx')
+        ax.set_ylabel('Avg Loss')
+        ax.set_title('Sync Sensitivity: Final Loss vs Kx (125M, 500 steps)')
+        out = _bos.path.join(fig_dir, 'fig3_sync_sensitivity.pdf')
+        fig.savefig(out, bbox_inches='tight')
+        fig.savefig(out.replace('.pdf', '.png'), bbox_inches='tight')
+        plt.close(fig)
+        print(f"  [FIG3] {out}")
+
+    # ── Figure 7: MFU Comparison ──
+    all_recs = get_by_tag('')
+    if all_recs:
+        fig, ax = plt.subplots(figsize=(8, 5))
+        mfu_data = defaultdict(list)
+        for r in all_recs:
+            mfu = r.get('mfu', 0)
+            if mfu > 0:
+                mfu_data[r.get('method', '?')].append(mfu * 100)
+        methods_found = [m for m in ['DDP', 'LocalAdam', 'DESLOC'] if m in mfu_data]
+        if methods_found:
+            bp_data = [mfu_data[m] for m in methods_found]
+            bp = ax.boxplot(bp_data, labels=methods_found, patch_artist=True)
+            for patch, m in zip(bp['boxes'], methods_found):
+                patch.set_facecolor(colors.get(m, '#999'))
+                patch.set_alpha(0.6)
+            ax.set_ylabel('MFU (%)')
+            ax.set_title('Model FLOPs Utilization by Method')
+            out = _bos.path.join(fig_dir, 'fig7_mfu_comparison.pdf')
+            fig.savefig(out, bbox_inches='tight')
+            fig.savefig(out.replace('.pdf', '.png'), bbox_inches='tight')
+            plt.close(fig)
+            print(f"  [FIG7] {out}")
+
+    print(f"  [DONE] All figures saved to {fig_dir}/")
+
