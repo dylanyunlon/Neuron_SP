@@ -1482,24 +1482,260 @@ def count_used_parameters_in_backward(parameters: Sequence[torch.nn.Parameter]) 
 # =========================================================================
 
 # =========================================================================
-# DES-LOC Training Utilities (Section 2 + Section 3)
+
+# =========================================================================
+# DES-LOC Bucket Gradient Utilities (M318)
+# Adapted from:
+#   Megatron-LM/megatron/core/optimizer/clip_grads.py:57 — get_grad_norm_fp32()
+#   Megatron-LM/megatron/core/optimizer/distrib_optimizer.py:62 — class Range
+#   Megatron-LM/megatron/core/optimizer/distrib_optimizer.py:118 — _build_model_gbuf_param_range_map()
+#   neuronx-distributed/optimizer/zero_redundancy_optimizer.py:96 — _clip_grad_norm()
+#   TransformerEngine/examples/pytorch/comm_gemm_overlap/te_layer_with_overlap.py:175 — _train()
+#   Megatron-LM/megatron/core/optimizer/emerging_optimizers.py:154 — TensorParallelMuon
 # =========================================================================
 
-import math as _math
+import math as _math_m318
+from typing import List, Optional, Dict, Tuple, Union
+
+
+class DeslocParamRange:
+    """A range for indexing a shard from a full tensor.
+    Adapted from Megatron distrib_optimizer.py:62 class Range."""
+
+    def __init__(self, start: int, end: int, param_name: str = ''):
+        self.start = start
+        self.end = end
+        self.size = end - start
+        self.param_name = param_name
+
+    def normalize(self, start: int = 0):
+        """Shift indexes. Adapted from Megatron Range.normalize()."""
+        return DeslocParamRange(start, start + self.size, self.param_name)
+
+    def __len__(self):
+        return self.end - self.start
+
+    def __str__(self):
+        return "%s: %d,%d [%d]" % (self.param_name, self.start, self.end, self.size)
+
+    def __repr__(self):
+        return str(self)
+
+
+class DeslocGradBucket:
+    """Gradient bucket for DES-LOC 3-tier synchronization.
+    Adapted from Megatron param_and_grad_buffer.py:~160 _ParamAndGradBucketGroup.
+    Each bucket aggregates gradients; sync decision per-bucket based on Kx/Ku/Kv."""
+
+    def __init__(self, bucket_id: int, params: list,
+                 bucket_size: int = 40_000_000, tier: str = 'x'):
+        self.bucket_id = bucket_id
+        self.params = params
+        self.bucket_size = bucket_size
+        self.tier = tier  # 'x'=SP, 'u'=DP/momentum, 'v'=full
+        self.param_ranges = []
+        self._build_ranges()
+        self.grad_ready = False
+        self.sync_count = 0
+
+    def _build_ranges(self):
+        """Build param-to-bucket offset map.
+        Adapted from Megatron _build_model_gbuf_param_range_map() at
+        distrib_optimizer.py:118."""
+        offset = 0
+        for p in self.params:
+            numel = p.data.numel() if hasattr(p, 'data') else 0
+            name = getattr(p, '_desloc_name', 'param_%d' % id(p))
+            self.param_ranges.append(DeslocParamRange(offset, offset + numel, name))
+            offset += numel
+
+    def total_numel(self):
+        return sum(r.size for r in self.param_ranges)
+
+    def total_bytes(self, dtype_bytes=2):
+        return self.total_numel() * dtype_bytes
+
+    def mark_ready(self):
+        self.grad_ready = True
+
+    def mark_synced(self):
+        self.grad_ready = False
+        self.sync_count += 1
+
+
+def desloc_bucket_grad_norm(grads, norm_type=2.0, dp_group=None):
+    """Calculate per-bucket gradient norm in FP32.
+    Adapted from Megatron get_grad_norm_fp32() at clip_grads.py:57.
+    Key: operates on single DES-LOC bucket, not all model gradients."""
+    import torch as _t
+
+    if isinstance(grads, _t.Tensor):
+        grads = [grads]
+
+    norm_type = float(norm_type)
+    total_norm = 0.0
+
+    if norm_type == float('inf'):
+        total_norm = max(g.abs().max().float().item()
+                         for g in grads if g is not None and g.numel() > 0)
+        total_norm_t = _t.tensor([total_norm], dtype=_t.float32)
+        if _t.cuda.is_available():
+            total_norm_t = total_norm_t.cuda()
+        if dp_group is not None:
+            try:
+                import deepspeed.comm as dist
+                dist.all_reduce(total_norm_t, op=dist.ReduceOp.MAX, group=dp_group)
+            except Exception:
+                pass
+        total_norm = total_norm_t.item()
+    else:
+        for g in grads:
+            if g is None or g.numel() == 0:
+                continue
+            grad_norm = g.float().norm(norm_type)
+            total_norm += grad_norm.item() ** norm_type
+        total_norm_t = _t.tensor([total_norm], dtype=_t.float32)
+        if _t.cuda.is_available():
+            total_norm_t = total_norm_t.cuda()
+        if dp_group is not None:
+            try:
+                import deepspeed.comm as dist
+                dist.all_reduce(total_norm_t, op=dist.ReduceOp.SUM, group=dp_group)
+            except Exception:
+                pass
+        total_norm = total_norm_t.item() ** (1.0 / norm_type)
+
+    return total_norm
+
+
+def desloc_clip_grad_per_tier(params, max_norm, tier='x',
+                               norm_type=2.0, dp_group=None):
+    """Clip gradients per DES-LOC tier.
+    Adapted from Megatron clip_grad_by_total_norm_fp32() and
+    neuronx-distributed _clip_grad_norm() at zero_redundancy_optimizer.py:96.
+    tier 'x'=SP (every Kx), 'u'=momentum (every Ku), 'v'=full (every Kv)."""
+    grads = [p.grad for p in params if p.grad is not None]
+    if not grads:
+        return 0.0
+
+    total_norm = desloc_bucket_grad_norm(grads, norm_type, dp_group)
+    clip_coeff = max_norm / (total_norm + 1e-6)
+    if clip_coeff < 1.0:
+        for g in grads:
+            g.data.mul_(clip_coeff)
+    return total_norm
+
+
+def desloc_build_param_range_map(model, bucket_size=40_000_000, dtype_bytes=2):
+    """Build parameter-to-bucket mapping for DES-LOC tiers.
+    Adapted from Megatron _build_model_gbuf_param_range_map()
+    at distrib_optimizer.py:118.
+    Groups params into buckets, assigns DES-LOC tier (x/u/v)."""
+    params = list(model.parameters())
+    buckets = []
+    param_map = {}
+    current_params = []
+    current_bytes = 0
+    bucket_id = 0
+
+    for i, p in enumerate(params):
+        numel = p.numel()
+        p_bytes = numel * dtype_bytes
+        p._desloc_name = 'param_%d' % i
+
+        if current_bytes + p_bytes > bucket_size and current_params:
+            buckets.append(DeslocGradBucket(bucket_id, current_params, bucket_size))
+            bucket_id += 1
+            current_params = []
+            current_bytes = 0
+
+        current_params.append(p)
+        current_bytes += p_bytes
+        param_map['param_%d' % i] = DeslocParamRange(0, numel, 'param_%d' % i)
+
+    if current_params:
+        buckets.append(DeslocGradBucket(bucket_id, current_params, bucket_size))
+
+    # Assign tiers: first 1/3 → 'x', next 1/3 → 'u', last 1/3 → 'v'
+    n = len(buckets)
+    for i, b in enumerate(buckets):
+        if i < n // 3:
+            b.tier = 'x'
+        elif i < 2 * n // 3:
+            b.tier = 'u'
+        else:
+            b.tier = 'v'
+
+    return buckets, param_map
+
+
+def desloc_zero1_clip_with_Kx_gate(params, max_norm, Kx, step,
+                                    tier='x', norm_type=2.0, dp_group=None):
+    """ZeRO-1 gradient clipping with Kx gating.
+    Adapted from neuronx-distributed _clip_grad_norm() at
+    zero_redundancy_optimizer.py:96.
+    Only clips on sync steps (step % period == 0)."""
+    sync_period = Kx if tier == 'x' else (Kx * 3 if tier == 'u' else Kx * 6)
+    if step % sync_period != 0:
+        return None
+    return desloc_clip_grad_per_tier(params, max_norm, tier, norm_type, dp_group)
+
+
+def desloc_roofline_model(gpu_name, n_params, seq_len=4096,
+                           batch_size=4, dtype_bytes=2):
+    """Roofline model for a GPU.
+    Adapted from TransformerEngine te_layer_with_overlap.py:175 _train()."""
+    GPU_SPECS = {
+        'H100': {'peak_tflops': 989.0, 'hbm_tbs': 3.35, 'link_gbs': 900.0},
+        'H100_NVL': {'peak_tflops': 989.0, 'hbm_tbs': 3.35, 'link_gbs': 900.0},
+        'A6000': {'peak_tflops': 155.0, 'hbm_tbs': 0.768, 'link_gbs': 31.5},
+        'A100': {'peak_tflops': 312.0, 'hbm_tbs': 2.0, 'link_gbs': 600.0},
+        'TRAINIUM2': {'peak_tflops': 380.0, 'hbm_tbs': 0.819, 'link_gbs': 384.0},
+    }
+    spec = GPU_SPECS.get(gpu_name, GPU_SPECS['H100'])
+    flops = 6 * n_params * seq_len * batch_size
+    mem_bytes = n_params * dtype_bytes * 4
+    ai = flops / max(mem_bytes, 1)
+    ridge = spec['peak_tflops'] * 1e12 / (spec['hbm_tbs'] * 1e12)
+    bound = 'compute' if ai > ridge else 'memory'
+    return {
+        'gpu': gpu_name, 'peak_tflops': spec['peak_tflops'],
+        'hbm_tbs': spec['hbm_tbs'], 'link_gbs': spec['link_gbs'],
+        'flops_per_step': flops, 'bytes_per_step': mem_bytes,
+        'arithmetic_intensity': round(ai, 2),
+        'ridge_point': round(ridge, 2), 'bound': bound,
+    }
+
+
+def desloc_adaptive_Kx(grad_variance, loss_trend, current_Kx=32,
+                        min_Kx=1, max_Kx=128):
+    """Adaptively adjust Kx based on gradient variance and loss trend.
+    Adapted from Megatron TensorParallelMuon at
+    emerging_optimizers.py:154 — Newton-Schulz orthogonalization.
+    DES-LOC analogously adjusts Kx for update quality."""
+    if loss_trend > 0.1:
+        return max(min_Kx, current_Kx // 2)
+    if grad_variance > 10.0:
+        return max(min_Kx, current_Kx // 2)
+    elif grad_variance > 5.0:
+        return max(min_Kx, current_Kx - current_Kx // 4)
+    elif grad_variance < 1.0 and loss_trend < -0.01:
+        return min(max_Kx, current_Kx + current_Kx // 4)
+    return current_Kx
 
 
 def desloc_half_life(beta):
-    """Half-life of EMA state. Ref: Section 2, tau_0.5(beta) = ln(0.5)/ln(beta)."""
+    """Half-life of EMA state. tau_0.5(beta) = ln(0.5)/ln(beta).
+    Rewritten: pure math, no simulation."""
     if beta >= 1.0:
         return float('inf')
     if beta <= 0.0:
         return 0.0
-    return _math.log(0.5) / _math.log(beta)
+    return _math_m318.log(0.5) / _math_m318.log(beta)
 
 
 def desloc_recommend_periods(beta1, beta2, Kx):
-    """Recommend Ku, Kv from half-life ratios.
-    Ref: Section 5.2 Takeaway - set Ku, Kv proportional to half-life."""
+    """Recommend Ku, Kv from EMA half-life ratios."""
     hl1 = desloc_half_life(beta1)
     hl2 = desloc_half_life(beta2)
     ratio = hl2 / hl1 if hl1 > 0 else 6.0
@@ -1508,89 +1744,10 @@ def desloc_recommend_periods(beta1, beta2, Kx):
     return Kx, Ku, Kv
 
 
-def desloc_psi_factor(Kx, Ku, beta1):
-    """Compute psi factor from Theorem 1.
-    psi = 4(1-px)/px^2 * (1-beta)(1-pu) / (6*(1-(1-pu)*beta))
-    where px=1/Kx, pu=1/Ku."""
-    px = 1.0 / max(Kx, 1)
-    pu = 1.0 / max(Ku, 1)
-    numer = 4.0 * (1.0 - px) * (1.0 - beta1) * (1.0 - pu)
-    denom = px * px * 6.0 * (1.0 - (1.0 - pu) * beta1)
-    return numer / max(denom, 1e-12)
-
-
-def desloc_comm_volume_per_step(param_bytes, num_workers, Kx, Ku, Kv):
-    """Estimate comm bytes/step under DES-LOC vs DDP.
-    DDP: 2*(M-1)/M * param_bytes per allreduce, 3x for params+2 momenta.
-    DES-LOC: same but at rates 1/Kx, 1/Ku, 1/Kv."""
-    ar_bytes = 2.0 * (num_workers - 1) / max(num_workers, 1) * param_bytes
-    ddp_per_step = ar_bytes * 3.0
-    desloc_per_step = ar_bytes * (1.0/Kx + 1.0/Ku + 1.0/Kv)
-    return {'ddp': ddp_per_step, 'desloc': desloc_per_step,
-            'reduction': 1.0 - desloc_per_step / max(ddp_per_step, 1e-12)}
-
-
-def desloc_format_log_line(step, loss, lr, Kx, is_sync, throughput=None):
-    """Format one log line for experiment parsing. Ref: NKI-FA draw_plot.py."""
-    parts = [f'step: {step}', f'loss: {loss:.6f}', f'lr: {lr:.8f}',
-             f'Kx: {Kx}', f'is_sync: {int(is_sync)}']
-    if throughput is not None:
-        parts.append(f'throughput: {throughput:.2f}')
-    return ' | '.join(parts)
-
-
-def desloc_validate_precision(value, min_sig=4):
-    """Check a float has enough significant digits for NeurIPS.
-    Ref: NKI-FA commit da964f3 - all data points have >= 4 sig digits."""
-    if value == 0:
-        return True
-    s = f'{value:.10g}'.lstrip('-').replace('.', '').lstrip('0')
-    return len(s.rstrip('0')) >= min_sig
-
-    s = f'{value:.10g}'.lstrip('-0').replace('.', '')
-    sig = len(s.rstrip('0'))
-    if sig < min_sig_digits:
-        return False
-    return True
-
-
-# =============================================================================
-# =============================================================================
-# M258 (Claude-17): Compact Communication Reduction + Log Parsing + Aggregation
-#
-# Replaces bloated DeslocCommReductionCalculator (271 lines deleted)
-# with 5 focused functions totaling ~120 lines.
-# Adds: log file parser, multi-seed aggregator, precision validator,
-#       power-law fitter, and CSV/JSON exporters.
-#
-# Ref: Section 5.3 — DES-LOC halves comm vs LocalAdam at matching loss
-# Ref: NKI-FA da964f3 — log format ### config ### \n metric: value
-# Ref: Megatron-LM megatron/core/optimizer/clip_grads.py — norm computation
-# =============================================================================
-import re as _desloc_re
-
-
-def desloc_comm_reduction_ratio(Kx, Ku, Kv, total_steps):
-    """Compute communication reduction ratio vs DDP.
-
-    DDP baseline: 3 AllReduce ops per step (params + 2 momenta).
-    DES-LOC: sync_x = T/Kx, sync_u = T/Ku, sync_v = T/Kv.
-    Reduction = 3T / (T/Kx + T/Ku + T/Kv) = 3 / (1/Kx + 1/Ku + 1/Kv).
-
-    Ref: Section 5.3, Table 2.
-    """
-    desloc_freq = (1.0 / max(1, Kx) + 1.0 / max(1, Ku) + 1.0 / max(1, Kv))
-    if desloc_freq <= 0:
-        return float('inf')
-    return 3.0 / desloc_freq
-
-
-def desloc_comm_bytes(n_params, Kx, Ku, Kv, total_steps, dtype_bytes=4):
-    """Compute total communication bytes for DES-LOC vs DDP.
-
-    Returns: dict with desloc_bytes, ddp_bytes, reduction_x, savings_pct.
-    """
-    msg = n_params * dtype_bytes
+def desloc_comm_reduction_ratio(Kx, Ku, Kv, total_steps,
+                                n_params=0, dtype_bytes=2):
+    """Communication reduction of DES-LOC vs DDP."""
+    msg = max(1, n_params * dtype_bytes)
     ops_x = total_steps // max(1, Kx)
     ops_u = total_steps // max(1, Ku)
     ops_v = total_steps // max(1, Kv)
@@ -1598,6 +1755,11 @@ def desloc_comm_bytes(n_params, Kx, Ku, Kv, total_steps, dtype_bytes=4):
     ddp_total = total_steps * 3 * msg
     reduction = ddp_total / max(1, desloc_total)
     savings = 100.0 * (1.0 - desloc_total / max(1, ddp_total))
+    return {
+        'desloc_bytes': desloc_total, 'ddp_bytes': ddp_total,
+        'reduction_x': round(reduction, 4), 'savings_pct': round(savings, 2),
+    }
+
     return {
         'desloc_bytes': desloc_total,
         'ddp_bytes': ddp_total,

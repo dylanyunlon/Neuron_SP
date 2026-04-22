@@ -1027,3 +1027,247 @@ class DeslocCommTracker:
     def state_dict(self): return {'s': dict(self._s), 'k': dict(self._k), 'n': self._n}
     def load_state_dict(self, d): self._s = {int(k): v for k, v in d.get('s', {}).items()}; self._k = {int(k): v for k, v in d.get('k', {}).items()}; self._n = d.get('n', 0)
 # --- End M306 ---
+
+
+# =========================================================================
+# M332 (Claude-24): DES-LOC Scheduler + Tiered AllReduce + Profiler
+# Required by deepspeed/runtime/engine.py:2494 — desloc_init_scheduler()
+# Ref: Algorithm 1 — independent Kx/Ku/Kv sync periods
+# =========================================================================
+
+_desloc_scheduler_instance = None
+_desloc_tiered_ar_instance = None
+_desloc_profiler_instance = None
+
+
+class DeslocScheduler:
+    """Tracks per-step sync decisions for Kx (params), Ku (m1), Kv (m2).
+
+    Kx=1 reproduces standard DDP (every-step sync).
+    warmup_steps: force sync every step during warmup for stability.
+    Ref: Section 3.2 — TWARM = 512 default.
+    """
+
+    def __init__(self, Kx=1, Ku=3, Kv=6, warmup_steps=512, group=None):
+        self.Kx = max(1, Kx)
+        self.Ku = max(1, Ku)
+        self.Kv = max(1, Kv)
+        self.warmup_steps = warmup_steps
+        self.group = group
+        self.local_step = 0
+        self.total_syncs_x = 0
+        self.total_syncs_u = 0
+        self.total_syncs_v = 0
+        self.total_skips = 0
+
+    def advance(self):
+        """Call once per optimizer step."""
+        self.local_step += 1
+
+    def should_sync_x(self):
+        """Parameter sync: every Kx steps (or every step during warmup)."""
+        if self.local_step < self.warmup_steps or self.Kx <= 1:
+            return True
+        return (self.local_step % self.Kx) == 0
+
+    def should_sync_u(self):
+        """First-moment sync: every Ku steps."""
+        if self.local_step < self.warmup_steps or self.Ku <= 1:
+            return True
+        return (self.local_step % self.Ku) == 0
+
+    def should_sync_v(self):
+        """Second-moment sync: every Kv steps."""
+        if self.local_step < self.warmup_steps or self.Kv <= 1:
+            return True
+        return (self.local_step % self.Kv) == 0
+
+    def record_sync(self, tier):
+        if tier == 'x':
+            self.total_syncs_x += 1
+        elif tier == 'u':
+            self.total_syncs_u += 1
+        elif tier == 'v':
+            self.total_syncs_v += 1
+
+    def record_skip(self):
+        self.total_skips += 1
+
+    def comm_reduction_ratio(self):
+        total_ops = self.local_step * 3
+        actual = self.total_syncs_x + self.total_syncs_u + self.total_syncs_v
+        return round(total_ops / max(1, actual), 2)
+
+    def state_dict(self):
+        return {
+            'Kx': self.Kx, 'Ku': self.Ku, 'Kv': self.Kv,
+            'local_step': self.local_step,
+            'syncs': [self.total_syncs_x, self.total_syncs_u, self.total_syncs_v],
+            'skips': self.total_skips,
+        }
+
+    def load_state_dict(self, sd):
+        self.local_step = sd.get('local_step', 0)
+        s = sd.get('syncs', [0, 0, 0])
+        self.total_syncs_x, self.total_syncs_u, self.total_syncs_v = s[0], s[1], s[2]
+        self.total_skips = sd.get('skips', 0)
+
+    def __repr__(self):
+        return (f"DeslocScheduler(Kx={self.Kx}, Ku={self.Ku}, Kv={self.Kv}, "
+                f"step={self.local_step}, ratio={self.comm_reduction_ratio()}x)")
+
+
+class DeslocTieredAllReduce:
+    """Performs tiered AllReduce: only syncs parameters whose tier is due.
+
+    Tier assignment (from engine._desloc_build_param_tier_map):
+      x -> MLP/FFN weights (sync every Kx)
+      u -> attention weights (sync every Ku)
+      v -> embeddings/norms (sync every Kv)
+
+    Ref: Megatron _ParamAndGradBuffer bucket mechanism — but gated by period.
+    Ref: NCCL all_reduce.h Ring AllReduce — same kernel, fewer invocations.
+    """
+
+    def __init__(self, scheduler, group=None):
+        self.scheduler = scheduler
+        self.group = group
+        self._bytes_sent = 0
+        self._bytes_skipped = 0
+        self._op_count = 0
+
+    def maybe_allreduce(self, tensor, tier='x'):
+        """AllReduce tensor only if its tier is due for sync this step.
+
+        Returns True if sync happened, False if skipped.
+        """
+        import torch.distributed as dist
+        should = False
+        if tier == 'x':
+            should = self.scheduler.should_sync_x()
+        elif tier == 'u':
+            should = self.scheduler.should_sync_u()
+        elif tier == 'v':
+            should = self.scheduler.should_sync_v()
+
+        nbytes = tensor.numel() * tensor.element_size()
+
+        if should:
+            if dist.is_initialized():
+                dist.all_reduce(tensor, op=dist.ReduceOp.AVG, group=self.group)
+            self._bytes_sent += nbytes
+            self._op_count += 1
+            self.scheduler.record_sync(tier)
+            return True
+        else:
+            self._bytes_skipped += nbytes
+            self.scheduler.record_skip()
+            return False
+
+    def stats(self):
+        return {
+            'bytes_sent': self._bytes_sent,
+            'bytes_skipped': self._bytes_skipped,
+            'ops': self._op_count,
+            'reduction': round(
+                (self._bytes_sent + self._bytes_skipped) / max(1, self._bytes_sent), 2
+            ),
+        }
+
+
+class DeslocProfiler:
+    """Collects per-step timing and comm data for NKI-FA export.
+
+    Ref: NKI-FA draw_plot.py — parse_data() expects structured blocks.
+    Ref: flash-attention benchmark_attn.py — time_fwd()/flops() pattern.
+    """
+
+    def __init__(self):
+        self._step_data = []
+        self._comm_data = []
+        self._current_step = {}
+
+    def begin_step(self, step):
+        import time
+        self._current_step = {
+            'step': step,
+            't_start_ns': time.monotonic_ns(),
+        }
+
+    def end_step(self, loss=None, lr=None):
+        import time
+        if not self._current_step:
+            return
+        self._current_step['t_end_ns'] = time.monotonic_ns()
+        dt_ms = (self._current_step['t_end_ns'] - self._current_step['t_start_ns']) / 1e6
+        self._current_step['step_time_ms'] = round(dt_ms, 4)
+        if loss is not None:
+            self._current_step['loss'] = round(float(loss), 6)
+        if lr is not None:
+            self._current_step['lr'] = float(lr)
+        self._step_data.append(self._current_step)
+        self._current_step = {}
+
+    def record_comm(self, tier, bytes_sent, synced):
+        self._comm_data.append({
+            'step': len(self._step_data),
+            'tier': tier,
+            'bytes': bytes_sent,
+            'synced': synced,
+        })
+
+    def export_nkifa(self, path, config_str=""):
+        """Write NKI-FA format log file."""
+        import os
+        os.makedirs(os.path.dirname(path) if os.path.dirname(path) else '.', exist_ok=True)
+        with open(path, 'w') as f:
+            f.write(f"### {config_str} ###\n")
+            for sd in self._step_data:
+                f.write(f"step {sd['step']}: "
+                        f"loss={sd.get('loss', 0):.6f}, "
+                        f"time_ms={sd.get('step_time_ms', 0):.4f}, "
+                        f"lr={sd.get('lr', 0):.6e}\n")
+            f.write("\n")
+            synced = sum(1 for c in self._comm_data if c['synced'])
+            skipped = sum(1 for c in self._comm_data if not c['synced'])
+            f.write(f"total_comm_ops: {synced}\n")
+            f.write(f"skipped_comm_ops: {skipped}\n")
+            f.write(f"comm_reduction: {round((synced + skipped) / max(1, synced), 2)}\n")
+
+    def get_loss_curve(self):
+        return [sd.get('loss', 0) for sd in self._step_data]
+
+    def get_step_times(self):
+        return [sd.get('step_time_ms', 0) for sd in self._step_data]
+
+    def state_dict(self):
+        return {'steps': self._step_data, 'comms': self._comm_data}
+
+    def load_state_dict(self, sd):
+        self._step_data = sd.get('steps', [])
+        self._comm_data = sd.get('comms', [])
+
+
+def init_desloc_scheduler(Kx=1, Ku=3, Kv=6, warmup_steps=512, group=None):
+    """Initialize global DES-LOC scheduler. Called from engine.desloc_init_scheduler()."""
+    global _desloc_scheduler_instance, _desloc_tiered_ar_instance, _desloc_profiler_instance
+    _desloc_scheduler_instance = DeslocScheduler(Kx=Kx, Ku=Ku, Kv=Kv,
+                                                  warmup_steps=warmup_steps, group=group)
+    _desloc_tiered_ar_instance = DeslocTieredAllReduce(_desloc_scheduler_instance, group=group)
+    _desloc_profiler_instance = DeslocProfiler()
+
+
+def get_desloc_scheduler():
+    """Get global DES-LOC scheduler instance."""
+    return _desloc_scheduler_instance
+
+
+def get_desloc_tiered_ar():
+    """Get global tiered AllReduce instance."""
+    return _desloc_tiered_ar_instance
+
+
+def get_desloc_profiler():
+    """Get global DES-LOC profiler instance."""
+    return _desloc_profiler_instance
+# --- End M332 ---

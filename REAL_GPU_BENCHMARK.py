@@ -2,7 +2,8 @@
 """
 DES-LOC Real GPU Benchmark - No Simulation, No Fallback
 ========================================================
-Real distributed training on A100 GPUs.
+Real distributed training on 2xA6000 + H100.
+Uses DeepSpeed runtime with DES-LOC extensions (M257-M332).
 Fails hard if anything goes wrong.
 """
 
@@ -24,6 +25,31 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Dataset, DistributedSampler
 from torch.cuda.amp import autocast
+
+# DeepSpeed runtime — uses Claude M257-M332 DES-LOC modifications
+import deepspeed
+from deepspeed.runtime.utils import (
+    desloc_comm_reduction_ratio,
+    desloc_comm_bytes,
+    desloc_local_adam_comm_bytes,
+    desloc_parse_nkifa_logfile,
+)
+from deepspeed.utils.timer import (
+    DeslocSTimer,
+    DeslocProgress,
+    desloc_mfu,
+    desloc_roof,
+)
+from deepspeed.utils.comms_logging import (
+    desloc_cl_entry,
+    desloc_cl_sum,
+    desloc_cl_parse,
+    desloc_classify_op,
+)
+from deepspeed.comm.comm import (
+    get_desloc_scheduler,
+    get_desloc_profiler,
+)
 
 assert torch.cuda.is_available(), "CUDA not available - HARD FAIL"
 assert torch.cuda.device_count() >= 1, "No GPU found - HARD FAIL"
@@ -469,28 +495,37 @@ class LocalAdamW(torch.optim.Optimizer):
 # =============================================================================
 
 class Trainer:
-    """Real distributed trainer - no simulation."""
-    
+    """Real distributed trainer using DeepSpeed runtime for DES-LOC.
+
+    DESLOC method: deepspeed.initialize() → engine.step() → allreduce_gradients()
+      with Kx gating (engine.py:2558), tiered AR (comm.py DeslocTieredAllReduce),
+      bucket sync (stage_1_and_2.py _desloc_reduce_tiered_gradients),
+      profiling (comm.py DeslocProfiler), NKI-FA export (comms_logging.py).
+
+    DDP/LocalAdam methods: raw PyTorch baselines for comparison.
+    """
+
     def __init__(self, config: TrainingConfig, method: str):
         self.config = config
         self.method = method
-        
+        self.use_deepspeed = (method == 'DESLOC')
+
         # Distributed setup
         self.world_size = int(os.environ.get('WORLD_SIZE', 1))
         self.rank = int(os.environ.get('RANK', 0))
         self.local_rank = int(os.environ.get('LOCAL_RANK', 0))
-        
-        if self.world_size > 1:
+
+        if self.world_size > 1 and not dist.is_initialized():
             dist.init_process_group(backend='nccl')
             torch.cuda.set_device(self.local_rank)
-        
+
         self.device = torch.device(f'cuda:{self.local_rank}')
 
-        # Reproducibility — seed from env (set by run_all.sh PYTHONHASHSEED)
+        # Reproducibility
         seed = int(os.environ.get('PYTHONHASHSEED', 42))
         torch.manual_seed(seed + self.rank)
         torch.cuda.manual_seed_all(seed + self.rank)
-        
+
         # Model
         model_config = config.get_model_config()
         self.model = GPT(
@@ -498,173 +533,311 @@ class Trainer:
             max_seq_len=config.max_seq_len,
             **model_config
         ).to(self.device)
-        
-        # DDP wrapper for gradient sync (only for DDP method)
-        if self.world_size > 1 and method == 'DDP':
-            self.model = DDP(self.model, device_ids=[self.local_rank])
-        
-        # Optimizer
-        self.optimizer = self._create_optimizer(method)
-        
+
         # Dataset
         dataset = SyntheticDataset(
             vocab_size=config.vocab_size,
             seq_len=config.max_seq_len,
             num_samples=config.max_steps * config.batch_size * config.gradient_accumulation * max(self.world_size, 1) * 2
         )
-        
-        sampler = DistributedSampler(dataset, num_replicas=self.world_size, rank=self.rank) if self.world_size > 1 else None
-        
-        self.dataloader = DataLoader(
-            dataset,
-            batch_size=config.batch_size,
-            sampler=sampler,
-            shuffle=(sampler is None),
-            num_workers=4,
-            pin_memory=True
-        )
-        
-        # Gradient scaler for mixed precision (new API)
-        self.scaler = torch.amp.GradScaler('cuda')
-        
+
+        if self.use_deepspeed:
+            # === DeepSpeed path: uses engine.py DES-LOC modifications ===
+            ds_config = self._build_ds_config(config)
+            self.engine, self.optimizer, self.dataloader, _ = deepspeed.initialize(
+                model=self.model,
+                model_parameters=self.model.parameters(),
+                config=ds_config,
+                training_data=dataset,
+            )
+            self.model = self.engine.module
+            # Initialize DES-LOC scheduler (engine.py:2493)
+            if hasattr(self.engine, 'desloc_init_scheduler'):
+                self.engine.desloc_init_scheduler()
+            # DES-LOC profiler from comm.py
+            self._profiler = get_desloc_profiler()
+            # DES-LOC timer from timer.py
+            self._stimer = DeslocSTimer()
+            self._progress = DeslocProgress(config.max_steps)
+        else:
+            self.engine = None
+            self._profiler = None
+            self._stimer = None
+            self._progress = None
+
+            # DDP wrapper
+            if self.world_size > 1 and method == 'DDP':
+                self.model = DDP(self.model, device_ids=[self.local_rank])
+
+            # Baseline optimizer
+            self.optimizer = self._create_optimizer(method)
+
+            sampler = DistributedSampler(dataset, num_replicas=self.world_size, rank=self.rank) if self.world_size > 1 else None
+            self.dataloader = DataLoader(
+                dataset, batch_size=config.batch_size,
+                sampler=sampler, shuffle=(sampler is None),
+                num_workers=4, pin_memory=True
+            )
+
+        # Gradient scaler for non-deepspeed paths
+        self.scaler = torch.amp.GradScaler('cuda') if not self.use_deepspeed else None
+
         # Metrics
         self.metrics = {
-            'losses': [],
-            'step_times': [],
-            'comm_events': [],
-            'memory_usage': []
+            'losses': [], 'step_times': [], 'comm_events': [], 'memory_usage': []
         }
-        
+
         if self.rank == 0:
             os.makedirs(config.output_dir, exist_ok=True)
-    
+
+    @staticmethod
+    def _build_ds_config(config):
+        """Build DeepSpeed JSON config with DES-LOC section.
+
+        This activates:
+          - config.py: desloc_enabled, Kx, Ku, Kv, clip_rho, warmup
+          - engine.py: allreduce_gradients() Kx gating (line 2558)
+          - engine.py: desloc_post_step(), desloc_record_loss() etc.
+          - stage_1_and_2.py: _desloc_reduce_tiered_gradients()
+        """
+        return {
+            "train_batch_size": config.batch_size * config.gradient_accumulation * max(int(os.environ.get('WORLD_SIZE', 1)), 1),
+            "train_micro_batch_size_per_gpu": config.batch_size,
+            "gradient_accumulation_steps": config.gradient_accumulation,
+            "gradient_clipping": config.grad_clip,
+            "steps_per_print": config.log_interval,
+            "optimizer": {
+                "type": "Adam",
+                "params": {
+                    "lr": config.learning_rate,
+                    "betas": [config.beta1, config.beta2],
+                    "eps": 1e-8,
+                    "weight_decay": config.weight_decay,
+                }
+            },
+            "fp16": {
+                "enabled": True,
+                "initial_scale_power": 16,
+            },
+            "desloc": {
+                "enabled": True,
+                "Kx": config.Kx,
+                "Ku": config.Ku,
+                "Kv": config.Kv,
+                "clip_rho": 1.0,
+                "warmup_steps": min(100, config.max_steps // 5),
+                "outer_optimizer": "average",
+                "inner_optimizer": "adam",
+            },
+            "wall_clock_breakdown": True,
+        }
+
     def _create_optimizer(self, method: str):
-        """Create optimizer based on method."""
+        """Create optimizer for non-DeepSpeed baselines."""
         params = self.model.parameters()
-        
+
         if method == 'DDP':
             return AdamW(
-                params,
-                lr=self.config.learning_rate,
+                params, lr=self.config.learning_rate,
                 betas=(self.config.beta1, self.config.beta2),
                 weight_decay=self.config.weight_decay
             )
         elif method == 'LocalAdam':
             return LocalAdamW(
-                params,
-                lr=self.config.learning_rate,
+                params, lr=self.config.learning_rate,
                 betas=(self.config.beta1, self.config.beta2),
                 weight_decay=self.config.weight_decay,
                 K=self.config.Kx
             )
-        elif method == 'DESLOC':
-            return DESLOCAdamW(
-                params,
-                lr=self.config.learning_rate,
-                betas=(self.config.beta1, self.config.beta2),
-                weight_decay=self.config.weight_decay,
-                Kx=self.config.Kx,
-                Ku=self.config.Ku,
-                Kv=self.config.Kv
-            )
         else:
-            raise ValueError(f"Unknown method: {method}")
+            raise ValueError(f"Unknown baseline method: {method}")
+
     
     def train(self) -> Dict:
-        """Run training loop."""
-        self.model.train()
-        
+        """Run training loop.
+
+        DESLOC: uses self.engine (DeepSpeed) — engine.backward() + engine.step()
+          → engine.allreduce_gradients() applies Kx gating (engine.py:2558)
+          → engine.desloc_post_step() advances scheduler (engine.py:2515)
+          → DeslocProfiler records per-step timing + comm for NKI-FA export
+
+        DDP/LocalAdam: raw PyTorch loop for baseline comparison.
+        """
+        if self.use_deepspeed:
+            return self._train_deepspeed()
+        else:
+            return self._train_baseline()
+
+    def _train_deepspeed(self) -> Dict:
+        """DeepSpeed training loop — exercises all Claude M257-M332 code."""
+        self.engine.train()
         data_iter = iter(self.dataloader)
-        
         total_tokens = 0
         start_time = time.time()
-        
+
         for step in range(1, self.config.max_steps + 1):
             step_start = time.time()
-            
-            # Gradient accumulation
+
+            # Profiler begin (comm.py DeslocProfiler)
+            if self._profiler:
+                self._profiler.begin_step(step)
+
+            # Forward + backward through DeepSpeed engine
+            # engine.backward() → _backward_epilogue() → allreduce_gradients()
+            #   → DES-LOC Kx gating at engine.py:2558
+            try:
+                batch = next(data_iter)
+            except StopIteration:
+                data_iter = iter(self.dataloader)
+                batch = next(data_iter)
+
+            input_ids = batch['input_ids'].to(self.engine.device)
+            labels = batch['labels'].to(self.engine.device)
+
+            _, loss = self.engine(input_ids, labels)
+
+            # engine.backward() handles gradient scaling + DES-LOC allreduce gating
+            self.engine.backward(loss)
+
+            # engine.step() handles optimizer step + DES-LOC post_step
+            self.engine.step()
+
+            # DES-LOC post-step: advance scheduler, record comm events
+            if hasattr(self.engine, 'desloc_post_step'):
+                self.engine.desloc_post_step(loss=loss.item())
+            if hasattr(self.engine, 'desloc_record_loss'):
+                self.engine.desloc_record_loss(loss.item())
+
+            step_time = time.time() - step_start
+            step_tokens = self.config.batch_size * self.config.gradient_accumulation * self.config.max_seq_len
+            total_tokens += step_tokens
+
+            # Profiler end
+            if self._profiler:
+                lr = self.engine.get_lr()[0] if hasattr(self.engine, 'get_lr') else 0
+                self._profiler.end_step(loss=loss.item(), lr=lr)
+
+            # Record metrics
+            self.metrics['losses'].append(loss.item())
+            self.metrics['step_times'].append(step_time)
+            cur_mem = torch.cuda.max_memory_allocated(self.engine.device) / 1e9
+            self.metrics['memory_usage'].append(cur_mem)
+
+            # Track DES-LOC sync events from the scheduler
+            sched = get_desloc_scheduler()
+            if sched:
+                self.metrics['comm_events'].append({
+                    'step': step,
+                    'sync_x': sched.should_sync_x(),
+                    'sync_u': sched.should_sync_u(),
+                    'sync_v': sched.should_sync_v(),
+                })
+
+            # Log (NKI-FA style)
+            if step % self.config.log_interval == 0 and self.rank == 0:
+                elapsed = time.time() - start_time
+                per_gpu_tps = total_tokens / elapsed
+                cluster_tps = per_gpu_tps * self.world_size
+                skipped = getattr(self.engine, 'desloc_skipped_allreduces', 0)
+                print(f"[DESLOC-DS] Step {step}/{self.config.max_steps} | "
+                      f"Loss: {loss.item():.4f} | "
+                      f"Time: {step_time*1000:.1f}ms | "
+                      f"Tok/s(gpu): {per_gpu_tps:.0f} | "
+                      f"Tok/s(all): {cluster_tps:.0f} | "
+                      f"Mem: {cur_mem:.2f}GB | "
+                      f"AR_skipped: {skipped}")
+
+        return self._finalize_results(total_tokens, start_time)
+
+    def _train_baseline(self) -> Dict:
+        """Raw PyTorch training loop for DDP/LocalAdam baselines."""
+        self.model.train()
+        data_iter = iter(self.dataloader)
+        total_tokens = 0
+        start_time = time.time()
+
+        for step in range(1, self.config.max_steps + 1):
+            step_start = time.time()
             accumulated_loss = 0.0
-            
+
             for micro_step in range(self.config.gradient_accumulation):
                 try:
                     batch = next(data_iter)
                 except StopIteration:
                     data_iter = iter(self.dataloader)
                     batch = next(data_iter)
-                
+
                 input_ids = batch['input_ids'].to(self.device)
                 labels = batch['labels'].to(self.device)
-                
-                # Forward pass with mixed precision
+
                 with autocast():
                     _, loss = self.model(input_ids, labels)
                     loss = loss / self.config.gradient_accumulation
-                
-                # Backward pass
+
                 self.scaler.scale(loss).backward()
                 accumulated_loss += loss.item()
-            
-            # Gradient clipping
+
             self.scaler.unscale_(self.optimizer)
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip)
-            
-            # Optimizer step
             self.scaler.step(self.optimizer)
             self.scaler.update()
             self.optimizer.zero_grad(set_to_none=True)
-            
-            # DES-LOC / Local Adam sync
+
+            # LocalAdam sync
             if hasattr(self.optimizer, 'sync_if_needed'):
                 sync_info = self.optimizer.sync_if_needed(self.world_size)
                 if sync_info:
                     self.metrics['comm_events'].append({'step': step, **sync_info})
-            
+
             step_time = time.time() - step_start
-            # Per-GPU tokens this step (do NOT multiply by world_size here;
-            # total cluster throughput = per_gpu * world_size, reported separately)
             step_tokens = self.config.batch_size * self.config.gradient_accumulation * self.config.max_seq_len
             total_tokens += step_tokens
 
-            # Record metrics — reset peak counter each step for meaningful diffs
             self.metrics['losses'].append(accumulated_loss)
             self.metrics['step_times'].append(step_time)
             cur_mem = torch.cuda.max_memory_allocated(self.device) / 1e9
             self.metrics['memory_usage'].append(cur_mem)
 
-            # Logging (NKI-FA style: structured, parseable)
             if step % self.config.log_interval == 0 and self.rank == 0:
                 elapsed = time.time() - start_time
                 per_gpu_tps = total_tokens / elapsed
                 cluster_tps = per_gpu_tps * self.world_size
-
                 print(f"[{self.method}] Step {step}/{self.config.max_steps} | "
                       f"Loss: {accumulated_loss:.4f} | "
                       f"Time: {step_time*1000:.1f}ms | "
-                      f"Tokens/s(gpu): {per_gpu_tps:.0f} | "
-                      f"Tokens/s(cluster): {cluster_tps:.0f} | "
-                      f"Memory: {cur_mem:.2f}GB")
-        
-        # Final stats
+                      f"Tok/s(gpu): {per_gpu_tps:.0f} | "
+                      f"Tok/s(all): {cluster_tps:.0f} | "
+                      f"Mem: {cur_mem:.2f}GB")
+
+        return self._finalize_results(total_tokens, start_time)
+
+    def _finalize_results(self, total_tokens, start_time) -> Dict:
+        """Compute final metrics — shared by both paths."""
         total_time = time.time() - start_time
         per_gpu_tps = total_tokens / total_time
         cluster_tps = per_gpu_tps * self.world_size
 
-        # MFU estimation (Model FLOPs Utilization)
-        model_config = self.config.get_model_config()
-        n_params = sum(p.numel() for p in self.model.parameters())
-        # Approx FLOPs per token: 6 * n_params (fwd + bwd)
+        # MFU
+        n_params = sum(p.numel() for p in (self.engine.module if self.engine else self.model).parameters())
         flops_per_token = 6 * n_params
         achieved_flops = per_gpu_tps * flops_per_token
-        # Peak TFLOPS lookup (bf16/fp16 tensor core)
         gpu_name = torch.cuda.get_device_name(self.device)
-        peak_tflops = 312e12  # A100 default
+        peak_tflops = 312e12
         if 'A6000' in gpu_name:
-            peak_tflops = 38.7e12  # RTX A6000 FP16
+            peak_tflops = 38.7e12
         elif 'H100' in gpu_name:
-            peak_tflops = 267e12 if 'NVL' in gpu_name else 267e12
+            peak_tflops = 267e12
         elif 'A100' in gpu_name:
             peak_tflops = 312e12
-        mfu = achieved_flops / peak_tflops if peak_tflops > 0 else 0.0
+        mfu_val = achieved_flops / peak_tflops if peak_tflops > 0 else 0.0
+
+        # Use desloc_mfu from timer.py for cross-check
+        mfu_check = desloc_mfu(achieved_flops / 1e12, peak_tflops / 1e12)
+
+        # Comm reduction from utils.py
+        comm_red = desloc_comm_reduction_ratio(
+            self.config.Kx, self.config.Ku, self.config.Kv, self.config.max_steps
+        )
 
         results = {
             'method': self.method,
@@ -678,22 +851,51 @@ class Trainer:
             'total_tokens': total_tokens,
             'world_size': self.world_size,
             'gpu_name': gpu_name,
-            'mfu': mfu,
+            'mfu': mfu_val,
+            'mfu_check': mfu_check,
+            'comm_reduction': comm_red,
             'losses': self.metrics['losses'],
-            'comm_events': self.metrics['comm_events']
+            'comm_events': self.metrics['comm_events'],
         }
 
-        # Count communication
+        # Sync counts
         if self.method == 'DESLOC':
-            sync_x = sum(1 for e in self.metrics['comm_events'] if e.get('sync_x'))
-            sync_u = sum(1 for e in self.metrics['comm_events'] if e.get('sync_u'))
-            sync_v = sum(1 for e in self.metrics['comm_events'] if e.get('sync_v'))
-            results['sync_counts'] = {'x': sync_x, 'u': sync_u, 'v': sync_v}
+            sched = get_desloc_scheduler()
+            if sched:
+                results['sync_counts'] = {
+                    'x': sched.total_syncs_x, 'u': sched.total_syncs_u,
+                    'v': sched.total_syncs_v, 'skips': sched.total_skips,
+                    'reduction': sched.comm_reduction_ratio(),
+                }
+            else:
+                sync_x = sum(1 for e in self.metrics['comm_events'] if e.get('sync_x'))
+                sync_u = sum(1 for e in self.metrics['comm_events'] if e.get('sync_u'))
+                sync_v = sum(1 for e in self.metrics['comm_events'] if e.get('sync_v'))
+                results['sync_counts'] = {'x': sync_x, 'u': sync_u, 'v': sync_v}
+
+            # DES-LOC comm bytes from utils.py
+            results['desloc_comm_bytes'] = desloc_comm_bytes(
+                n_params, self.config.Kx, self.config.Ku, self.config.Kv, self.config.max_steps
+            )
         elif self.method == 'LocalAdam':
             syncs = sum(1 for e in self.metrics['comm_events'] if e.get('synced'))
             results['sync_counts'] = {'all': syncs}
+            results['local_comm_bytes'] = desloc_local_adam_comm_bytes(
+                n_params, self.config.Kx, self.config.max_steps
+            )
         elif self.method == 'DDP':
             results['sync_counts'] = {'all': self.config.max_steps}
+
+        # Export NKI-FA profiling data
+        if self._profiler and self.rank == 0:
+            nkifa_path = os.path.join(
+                self.config.output_dir,
+                f'nkifa_{self.method}_Kx{self.config.Kx}_s{os.environ.get("PYTHONHASHSEED", 42)}.log'
+            )
+            config_str = (f"model = {self.config.model_size}, method = {self.method}, "
+                          f"Kx = {self.config.Kx}, Ku = {self.config.Ku}, Kv = {self.config.Kv}, "
+                          f"world_size = {self.world_size}")
+            self._profiler.export_nkifa(nkifa_path, config_str)
 
         # NKI-FA format log block (rank 0 only)
         if self.rank == 0:
@@ -705,16 +907,17 @@ class Trainer:
             print(f"tokens_per_second_per_gpu: {per_gpu_tps:.1f}")
             print(f"tokens_per_second_cluster: {cluster_tps:.1f}")
             print(f"peak_memory_gb: {results['peak_memory_gb']:.2f}")
-            print(f"mfu: {mfu:.4f}")
+            print(f"mfu: {mfu_val:.4f}")
+            print(f"comm_reduction: {comm_red:.2f}x")
             print(f"total_time_s: {total_time:.1f}")
             if 'sync_counts' in results:
                 print(f"sync_counts: {results['sync_counts']}")
 
         return results
-    
+
     def cleanup(self):
         """Cleanup distributed."""
-        if self.world_size > 1:
+        if self.world_size > 1 and dist.is_initialized():
             dist.destroy_process_group()
 
 
@@ -958,92 +1161,148 @@ def desloc_hw_rep(gpus, mm=None):
 # =========================================================================
 
 def desloc_draw_all_figures(results_dir):
-    """Generate all paper figures from experiment results.
+    """Generate all paper figures from experiment logs.
 
-    Reads ALL_RESULTS.json (merged by run_all_v2.sh) and produces:
-      fig1_loss_vs_step.pdf      — RQ2: loss curves for different Kx
-      fig2_comm_reduction.pdf    — RQ3: DDP vs LocalAdam vs DES-LOC bars
-      fig3_sync_sensitivity.pdf  — RQ2: final loss vs Kx
-      fig4_kuv_ablation.pdf      — RQ4: heatmap of Ku/Kv ratios
-      fig5_model_scale.pdf       — RQ5: scaling across 125M→1.3B
-      fig6_hetero_scaling.pdf    — RQ6: 2×A6000 vs 2×A6000+H100
-      fig7_mfu_comparison.pdf    — MFU across methods and GPUs
+    Data sources (all from real GPU runs, no hardcoded values):
+      1. experiment_log.csv — run metadata (phase, tag, model, Kx, method, seed, rc)
+      2. NKI-FA .log files — per-step loss/timing/comm from DeslocProfiler
+      3. benchmark_results_*.json — per-run structured results
+
+    Ref: NKI-FA commit da964f3 draw_plot.py — parse_data() + seaborn bars
+    Ref: NKI-FA draw_exp_res.py — annotation with ≥4 decimal places
     """
-    import json, re, glob
+    import json, re, glob, csv
     try:
         import matplotlib
         matplotlib.use('Agg')
         import matplotlib.pyplot as plt
-        import numpy as np
     except ImportError:
-        print("[WARN] matplotlib/numpy not available, skipping figures")
-        return
-
-    # --- Load data ---
-    all_path = _bos.path.join(results_dir, 'ALL_RESULTS.json')
-    if not _bos.path.exists(all_path):
-        print(f"[WARN] {all_path} not found, skipping figures")
-        return
-    with open(all_path) as fh:
-        merged = json.load(fh)
-
-    experiments = merged.get('experiments', [])
-    if not experiments:
-        print("[WARN] No experiments in ALL_RESULTS.json")
+        print("[WARN] matplotlib not available, skipping figures")
         return
 
     fig_dir = _bos.path.join(results_dir, 'figures')
     _bos.makedirs(fig_dir, exist_ok=True)
 
-    # --- Helper: extract records by tag ---
-    def get_by_tag(tag_prefix, phase_prefix=None):
-        recs = []
-        for exp in experiments:
-            src = exp.get('source_file', '')
-            phase = exp.get('phase', '')
-            if phase_prefix and not phase.startswith(phase_prefix):
-                continue
-            cfg = exp.get('config', {})
-            for method, data in exp.get('results', {}).items():
-                rec = {**cfg, 'method': method, **data}
-                # Infer tag from source path
-                if tag_prefix in src:
-                    recs.append(rec)
-                elif not tag_prefix:
-                    recs.append(rec)
-        return recs
-
-    # NKI-FA style: clean white background, annotation on bars
+    # NKI-FA style
     plt.rcParams.update({
-        'figure.facecolor': 'white',
-        'axes.facecolor': 'white',
-        'axes.grid': True,
-        'grid.alpha': 0.3,
-        'font.size': 12,
-        'figure.dpi': 150,
+        'figure.facecolor': 'white', 'axes.facecolor': 'white',
+        'axes.grid': True, 'grid.alpha': 0.3, 'font.size': 12, 'figure.dpi': 150,
     })
     colors = {'DDP': '#1f77b4', 'LocalAdam': '#ff7f0e', 'DESLOC': '#2ca02c'}
 
-    # ── Figure 1: Loss vs Step (RQ2 sweep) ──
-    rq2 = get_by_tag('rq2_sweep')
-    if rq2:
-        fig, ax = plt.subplots(figsize=(10, 6))
-        kx_groups = {}
-        for r in rq2:
-            kx = r.get('Kx', 0)
-            losses = r.get('losses', [])
+    # --- Parse all JSON result files ---
+    all_results = []
+    for jf in sorted(glob.glob(_bos.path.join(results_dir, '**', 'benchmark_results_*.json'), recursive=True)):
+        try:
+            with open(jf) as fh:
+                data = json.load(fh)
+            cfg = data.get('config', {})
+            for method, res in data.get('results', {}).items():
+                rec = {**cfg, 'method': method, 'source': jf, **res}
+                all_results.append(rec)
+        except Exception:
+            continue
+
+    # --- Parse NKI-FA profiler logs for per-step loss curves ---
+    nkifa_curves = {}
+    for lf in sorted(glob.glob(_bos.path.join(results_dir, '**', 'nkifa_*.log'), recursive=True)):
+        try:
+            with open(lf) as fh:
+                lines = fh.readlines()
+            header = lines[0] if lines else ''
+            kx_match = re.search(r'Kx\s*=\s*(\d+)', header)
+            method_match = re.search(r'method\s*=\s*(\w+)', header)
+            kx = int(kx_match.group(1)) if kx_match else 0
+            method = method_match.group(1) if method_match else ''
+            losses = []
+            for line in lines[1:]:
+                m = re.search(r'loss=([\d.]+)', line)
+                if m:
+                    losses.append(float(m.group(1)))
             if losses:
-                kx_groups.setdefault(kx, []).append(losses)
-        for kx in sorted(kx_groups.keys()):
-            all_curves = kx_groups[kx]
-            min_len = min(len(c) for c in all_curves)
-            arr = np.array([c[:min_len] for c in all_curves])
-            mean = arr.mean(axis=0)
-            std = arr.std(axis=0)
-            steps = np.arange(1, min_len + 1)
+                nkifa_curves.setdefault((method, kx), []).append(losses)
+        except Exception:
+            continue
+
+    # --- Also parse CSV log for metadata ---
+    csv_path = _bos.path.join(results_dir, 'experiment_log.csv')
+    csv_rows = []
+    if _bos.path.exists(csv_path):
+        with open(csv_path) as f:
+            csv_rows = list(csv.DictReader(f))
+
+    # --- Parse NKI-FA format blocks from .log files ---
+    nkifa_pat = re.compile(
+        r'### model\s*=\s*(\S+),\s*method\s*=\s*(\S+),\s*Kx\s*=\s*(\d+),\s*Ku\s*=\s*(\d+),\s*Kv\s*=\s*(\d+)')
+    metric_pat = re.compile(r'^(\w[\w_]+):\s+(.+)$')
+    nkifa_blocks = []
+    for logf in sorted(glob.glob(_bos.path.join(results_dir, 'logs', '*.log'))):
+        try:
+            with open(logf) as fh:
+                log_lines = fh.readlines()
+        except Exception:
+            continue
+        # Also extract phase/tag from filename
+        fname = _bos.path.basename(logf)
+        parts = fname.replace('.log', '').split('_')
+        phase = parts[0] if len(parts) > 0 else ''
+        tag = parts[1] if len(parts) > 1 else ''
+
+        cur = None
+        for line in log_lines:
+            m = nkifa_pat.match(line.strip())
+            if m:
+                cur = {'model': m.group(1), 'method': m.group(2),
+                       'Kx': int(m.group(3)), 'Ku': int(m.group(4)), 'Kv': int(m.group(5)),
+                       'phase': phase, 'tag': tag, 'log': logf}
+                continue
+            if cur:
+                mm = metric_pat.match(line.strip())
+                if mm:
+                    try:
+                        cur[mm.group(1)] = float(mm.group(2))
+                    except ValueError:
+                        cur[mm.group(1)] = mm.group(2)
+                elif not line.strip():
+                    if len(cur) > 6:
+                        nkifa_blocks.append(cur)
+                    cur = None
+
+    if not all_results and not nkifa_blocks:
+        print("[WARN] No experiment data found for figures")
+        return
+
+    print(f"  Found {len(all_results)} JSON results, {len(nkifa_blocks)} NKI-FA blocks, "
+          f"{len(nkifa_curves)} loss curves, {len(csv_rows)} CSV rows")
+
+    # Helper: safe mean
+    def _mean(lst):
+        return sum(lst) / len(lst) if lst else 0
+    def _std(lst):
+        if len(lst) < 2:
+            return 0
+        m = _mean(lst)
+        return (sum((x - m) ** 2 for x in lst) / (len(lst) - 1)) ** 0.5
+
+    # ══════════════════════════════════════════════════════════════
+    # Figure 1: Loss vs Step for different Kx (from NKI-FA profiler logs)
+    # ══════════════════════════════════════════════════════════════
+    desloc_curves = {k: v for k, v in nkifa_curves.items() if k[0] == 'DESLOC'}
+    if desloc_curves:
+        fig, ax = plt.subplots(figsize=(10, 6))
+        for (method, kx) in sorted(desloc_curves.keys(), key=lambda x: x[1]):
+            curves = desloc_curves[(method, kx)]
+            min_len = min(len(c) for c in curves)
+            if min_len == 0:
+                continue
+            vals = [[c[i] for c in curves] for i in range(min_len)]
+            means = [_mean(v) for v in vals]
+            stds = [_std(v) for v in vals]
+            steps = list(range(1, min_len + 1))
             label = f'Kx={kx}' if kx > 1 else 'Kx=1 (DDP-equiv)'
-            ax.plot(steps, mean, label=label, linewidth=1.5)
-            ax.fill_between(steps, mean - std, mean + std, alpha=0.15)
+            ax.plot(steps, means, label=label, linewidth=1.5)
+            ax.fill_between(steps, [m - s for m, s in zip(means, stds)],
+                            [m + s for m, s in zip(means, stds)], alpha=0.15)
         ax.set_xlabel('Training Step')
         ax.set_ylabel('Loss')
         ax.set_title('DES-LOC: Loss vs Step for Different Sync Periods (Kx)')
@@ -1054,33 +1313,40 @@ def desloc_draw_all_figures(results_dir):
         plt.close(fig)
         print(f"  [FIG1] {out}")
 
-    # ── Figure 2: Communication Reduction (RQ3) ──
-    rq3 = get_by_tag('rq3_comm')
-    if rq3:
+    # ══════════════════════════════════════════════════════════════
+    # Figure 2: Communication Reduction bars (DDP vs LocalAdam vs DES-LOC)
+    # ══════════════════════════════════════════════════════════════
+    baseline_blocks = [b for b in nkifa_blocks if b.get('phase') == 'train']
+    if not baseline_blocks:
+        baseline_blocks = [r for r in all_results if r.get('method') in ('DDP', 'LocalAdam', 'DESLOC')]
+    if baseline_blocks:
         fig, ax = plt.subplots(figsize=(8, 5))
-        # Group by (model, method) → avg_loss
-        from collections import defaultdict
-        grouped = defaultdict(list)
-        for r in rq3:
-            key = (r.get('model_size', ''), r.get('method', ''))
-            grouped[key].append(r.get('avg_loss', 0))
-        models = sorted(set(k[0] for k in grouped))
-        methods = ['DDP', 'LocalAdam', 'DESLOC']
-        x = np.arange(len(models))
+        models = sorted(set(b.get('model', b.get('model_size', '')) for b in baseline_blocks))
+        methods_list = ['DDP', 'LocalAdam', 'DESLOC']
+        x_pos = list(range(len(models)))
         w = 0.25
-        for i, method in enumerate(methods):
-            vals = [np.mean(grouped.get((m, method), [0])) for m in models]
-            stds = [np.std(grouped.get((m, method), [0])) for m in models]
-            bars = ax.bar(x + i * w, vals, w, yerr=stds, label=method,
-                          color=colors.get(method, '#999'), capsize=3)
+        for i, method in enumerate(methods_list):
+            vals = []
+            errs = []
+            for model in models:
+                losses = [b.get('avg_loss', b.get('final_loss', 0))
+                          for b in baseline_blocks
+                          if b.get('method') == method and
+                          (b.get('model') == model or b.get('model_size') == model)]
+                vals.append(_mean(losses))
+                errs.append(_std(losses))
+            bars = ax.bar([x + i * w for x in x_pos], vals, w, yerr=errs,
+                          label=method, color=colors.get(method, '#999'), capsize=3)
             for bar, v in zip(bars, vals):
-                ax.annotate(f'{v:.4f}', (bar.get_x() + bar.get_width() / 2, bar.get_height()),
-                            ha='center', va='bottom', fontsize=8, xytext=(0, 3),
-                            textcoords='offset points')
-        ax.set_xticks(x + w)
+                if v > 0:
+                    ax.annotate(f'{v:.4f}',
+                                (bar.get_x() + bar.get_width() / 2, bar.get_height()),
+                                ha='center', va='bottom', fontsize=8,
+                                xytext=(0, 3), textcoords='offset points')
+        ax.set_xticks([x + w for x in x_pos])
         ax.set_xticklabels(models)
         ax.set_ylabel('Avg Loss (last 100 steps)')
-        ax.set_title('Communication Reduction: DDP vs LocalAdam vs DES-LOC')
+        ax.set_title('DDP vs LocalAdam vs DES-LOC')
         ax.legend()
         out = _bos.path.join(fig_dir, 'fig2_comm_reduction.pdf')
         fig.savefig(out, bbox_inches='tight')
@@ -1088,54 +1354,179 @@ def desloc_draw_all_figures(results_dir):
         plt.close(fig)
         print(f"  [FIG2] {out}")
 
-    # ── Figure 3: Sync Sensitivity (final loss vs Kx) ──
-    if rq2:
+    # ══════════════════════════════════════════════════════════════
+    # Figure 3: Sync Sensitivity (final loss vs Kx)
+    # ══════════════════════════════════════════════════════════════
+    kx_blocks = [b for b in nkifa_blocks if b.get('phase') in ('kx', 'kx_sweep')]
+    if not kx_blocks:
+        kx_blocks = [b for b in nkifa_blocks if b.get('method') == 'DESLOC']
+    if kx_blocks:
         fig, ax = plt.subplots(figsize=(8, 5))
         kx_loss = {}
-        for r in rq2:
-            kx = r.get('Kx', 0)
-            kx_loss.setdefault(kx, []).append(r.get('avg_loss', 0))
-        kxs = sorted(kx_loss.keys())
-        means = [np.mean(kx_loss[k]) for k in kxs]
-        stds = [np.std(kx_loss[k]) for k in kxs]
-        ax.errorbar(kxs, means, yerr=stds, marker='o', capsize=4,
-                     linewidth=2, color=colors['DESLOC'])
-        for kx, m in zip(kxs, means):
-            ax.annotate(f'{m:.4f}', (kx, m), fontsize=8, ha='center',
-                        xytext=(0, 10), textcoords='offset points')
-        ax.set_xscale('log', base=2)
-        ax.set_xlabel('Sync Period Kx')
-        ax.set_ylabel('Avg Loss')
-        ax.set_title('Sync Sensitivity: Final Loss vs Kx (125M, 500 steps)')
-        out = _bos.path.join(fig_dir, 'fig3_sync_sensitivity.pdf')
-        fig.savefig(out, bbox_inches='tight')
-        fig.savefig(out.replace('.pdf', '.png'), bbox_inches='tight')
-        plt.close(fig)
-        print(f"  [FIG3] {out}")
-
-    # ── Figure 7: MFU Comparison ──
-    all_recs = get_by_tag('')
-    if all_recs:
-        fig, ax = plt.subplots(figsize=(8, 5))
-        mfu_data = defaultdict(list)
-        for r in all_recs:
-            mfu = r.get('mfu', 0)
-            if mfu > 0:
-                mfu_data[r.get('method', '?')].append(mfu * 100)
-        methods_found = [m for m in ['DDP', 'LocalAdam', 'DESLOC'] if m in mfu_data]
-        if methods_found:
-            bp_data = [mfu_data[m] for m in methods_found]
-            bp = ax.boxplot(bp_data, labels=methods_found, patch_artist=True)
-            for patch, m in zip(bp['boxes'], methods_found):
-                patch.set_facecolor(colors.get(m, '#999'))
-                patch.set_alpha(0.6)
-            ax.set_ylabel('MFU (%)')
-            ax.set_title('Model FLOPs Utilization by Method')
-            out = _bos.path.join(fig_dir, 'fig7_mfu_comparison.pdf')
+        for b in kx_blocks:
+            kx = b.get('Kx', 0)
+            loss = b.get('avg_loss', b.get('final_loss', 0))
+            if loss > 0:
+                kx_loss.setdefault(kx, []).append(loss)
+        if kx_loss:
+            kxs = sorted(kx_loss.keys())
+            means = [_mean(kx_loss[k]) for k in kxs]
+            stds = [_std(kx_loss[k]) for k in kxs]
+            ax.errorbar(kxs, means, yerr=stds, marker='o', capsize=4,
+                        linewidth=2, color=colors['DESLOC'])
+            for kx, m in zip(kxs, means):
+                ax.annotate(f'{m:.4f}', (kx, m), fontsize=8, ha='center',
+                            xytext=(0, 10), textcoords='offset points')
+            ax.set_xscale('log', base=2)
+            ax.set_xlabel('Sync Period Kx')
+            ax.set_ylabel('Avg Loss')
+            ax.set_title('Sync Sensitivity: Final Loss vs Kx')
+            out = _bos.path.join(fig_dir, 'fig3_sync_sensitivity.pdf')
             fig.savefig(out, bbox_inches='tight')
             fig.savefig(out.replace('.pdf', '.png'), bbox_inches='tight')
             plt.close(fig)
-            print(f"  [FIG7] {out}")
+            print(f"  [FIG3] {out}")
+
+    # ══════════════════════════════════════════════════════════════
+    # Figure 4: Ku/Kv Ratio Ablation Heatmap
+    # ══════════════════════════════════════════════════════════════
+    ratio_blocks = [b for b in nkifa_blocks if b.get('phase') in ('ratio', 'ratio_abl')]
+    if ratio_blocks:
+        fig, ax = plt.subplots(figsize=(8, 6))
+        ku_vals = sorted(set(b.get('Ku', 0) for b in ratio_blocks))
+        kv_vals = sorted(set(b.get('Kv', 0) for b in ratio_blocks))
+        if ku_vals and kv_vals:
+            grid = [[0.0] * len(kv_vals) for _ in range(len(ku_vals))]
+            for b in ratio_blocks:
+                ku = b.get('Ku', 0)
+                kv = b.get('Kv', 0)
+                loss = b.get('avg_loss', b.get('final_loss', 0))
+                if ku in ku_vals and kv in kv_vals and loss > 0:
+                    ri = ku_vals.index(ku)
+                    ci = kv_vals.index(kv)
+                    if grid[ri][ci] == 0:
+                        grid[ri][ci] = loss
+                    else:
+                        grid[ri][ci] = (grid[ri][ci] + loss) / 2
+            im = ax.imshow(grid, cmap='YlOrRd', aspect='auto')
+            ax.set_xticks(range(len(kv_vals)))
+            ax.set_xticklabels([str(v) for v in kv_vals])
+            ax.set_yticks(range(len(ku_vals)))
+            ax.set_yticklabels([str(v) for v in ku_vals])
+            ax.set_xlabel('Kv (second moment sync period)')
+            ax.set_ylabel('Ku (first moment sync period)')
+            ax.set_title('Ku/Kv Ratio Ablation: Avg Loss (Kx=32)')
+            for ri in range(len(ku_vals)):
+                for ci in range(len(kv_vals)):
+                    if grid[ri][ci] > 0:
+                        ax.text(ci, ri, f'{grid[ri][ci]:.4f}', ha='center', va='center', fontsize=8)
+            fig.colorbar(im, ax=ax, label='Avg Loss')
+            out = _bos.path.join(fig_dir, 'fig4_kuv_ablation.pdf')
+            fig.savefig(out, bbox_inches='tight')
+            fig.savefig(out.replace('.pdf', '.png'), bbox_inches='tight')
+            plt.close(fig)
+            print(f"  [FIG4] {out}")
+
+    # ══════════════════════════════════════════════════════════════
+    # Figure 5: Model Scale (125M → 1.3B loss comparison)
+    # ══════════════════════════════════════════════════════════════
+    scale_data = {}
+    for b in nkifa_blocks:
+        model = b.get('model', '')
+        method = b.get('method', '')
+        loss = b.get('avg_loss', b.get('final_loss', 0))
+        if model and method and loss > 0:
+            scale_data.setdefault((model, method), []).append(loss)
+    models_found = sorted(set(k[0] for k in scale_data.keys()))
+    if len(models_found) >= 2:
+        fig, ax = plt.subplots(figsize=(10, 6))
+        for method in ['DDP', 'LocalAdam', 'DESLOC']:
+            means = []
+            stds = []
+            x_models = []
+            for model in models_found:
+                vals = scale_data.get((model, method), [])
+                if vals:
+                    means.append(_mean(vals))
+                    stds.append(_std(vals))
+                    x_models.append(model)
+            if means:
+                ax.errorbar(x_models, means, yerr=stds, marker='s', capsize=4,
+                            linewidth=2, label=method, color=colors.get(method, '#999'))
+        ax.set_xlabel('Model Size')
+        ax.set_ylabel('Avg Loss')
+        ax.set_title('DES-LOC Scaling: Loss vs Model Size')
+        ax.legend()
+        out = _bos.path.join(fig_dir, 'fig5_model_scale.pdf')
+        fig.savefig(out, bbox_inches='tight')
+        fig.savefig(out.replace('.pdf', '.png'), bbox_inches='tight')
+        plt.close(fig)
+        print(f"  [FIG5] {out}")
+
+    # ══════════════════════════════════════════════════════════════
+    # Figure 6: Heterogeneous GPU scaling (throughput by GPU)
+    # ══════════════════════════════════════════════════════════════
+    gpu_data = {}
+    for r in all_results:
+        gpu = r.get('gpu_name', '')
+        method = r.get('method', '')
+        tps = r.get('tokens_per_second_per_gpu', 0)
+        if gpu and tps > 0:
+            gpu_data.setdefault((gpu, method), []).append(tps)
+    gpus_found = sorted(set(k[0] for k in gpu_data.keys()))
+    if len(gpus_found) >= 1:
+        fig, ax = plt.subplots(figsize=(10, 6))
+        x_pos = list(range(len(gpus_found)))
+        w = 0.25
+        for i, method in enumerate(['DDP', 'LocalAdam', 'DESLOC']):
+            vals = [_mean(gpu_data.get((g, method), [0])) for g in gpus_found]
+            errs = [_std(gpu_data.get((g, method), [0])) for g in gpus_found]
+            bars = ax.bar([x + i * w for x in x_pos], vals, w, yerr=errs,
+                          label=method, color=colors.get(method, '#999'), capsize=3)
+            for bar, v in zip(bars, vals):
+                if v > 0:
+                    ax.annotate(f'{v:.0f}', (bar.get_x() + bar.get_width() / 2, bar.get_height()),
+                                ha='center', va='bottom', fontsize=8, xytext=(0, 3),
+                                textcoords='offset points')
+        ax.set_xticks([x + w for x in x_pos])
+        ax.set_xticklabels([g[:20] for g in gpus_found], rotation=15)
+        ax.set_ylabel('Tokens/sec/GPU')
+        ax.set_title('Heterogeneous GPU Throughput')
+        ax.legend()
+        out = _bos.path.join(fig_dir, 'fig6_hetero_scaling.pdf')
+        fig.savefig(out, bbox_inches='tight')
+        fig.savefig(out.replace('.pdf', '.png'), bbox_inches='tight')
+        plt.close(fig)
+        print(f"  [FIG6] {out}")
+
+    # ══════════════════════════════════════════════════════════════
+    # Figure 7: MFU Comparison
+    # ══════════════════════════════════════════════════════════════
+    mfu_data = {}
+    for r in all_results:
+        mfu_val = r.get('mfu', 0)
+        method = r.get('method', '')
+        if mfu_val > 0 and method:
+            mfu_data.setdefault(method, []).append(mfu_val * 100)
+    for b in nkifa_blocks:
+        mfu_val = b.get('mfu', 0)
+        method = b.get('method', '')
+        if mfu_val > 0 and method:
+            mfu_data.setdefault(method, []).append(mfu_val * 100 if mfu_val < 1 else mfu_val)
+    methods_with_mfu = [m for m in ['DDP', 'LocalAdam', 'DESLOC'] if m in mfu_data]
+    if methods_with_mfu:
+        fig, ax = plt.subplots(figsize=(8, 5))
+        bp_data = [mfu_data[m] for m in methods_with_mfu]
+        bp = ax.boxplot(bp_data, labels=methods_with_mfu, patch_artist=True)
+        for patch, m in zip(bp['boxes'], methods_with_mfu):
+            patch.set_facecolor(colors.get(m, '#999'))
+            patch.set_alpha(0.6)
+        ax.set_ylabel('MFU (%)')
+        ax.set_title('Model FLOPs Utilization by Method')
+        out = _bos.path.join(fig_dir, 'fig7_mfu_comparison.pdf')
+        fig.savefig(out, bbox_inches='tight')
+        fig.savefig(out.replace('.pdf', '.png'), bbox_inches='tight')
+        plt.close(fig)
+        print(f"  [FIG7] {out}")
 
     print(f"  [DONE] All figures saved to {fig_dir}/")
-
