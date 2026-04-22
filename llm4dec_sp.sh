@@ -139,7 +139,7 @@ _run_single_experiment() {
     export PYTHONHASHSEED=$SEED CUDA_VISIBLE_DEVICES=$GPUS
 
     local CMD="python3"
-    [ "$NGPU" -gt 1 ] && CMD="torchrun --nproc_per_node=$NGPU --master_port=$((29500 + RUN_ID % 200))"
+    [ "$NGPU" -gt 1 ] && CMD="/opt/conda/bin/python3 -m torch.distributed.run --nproc_per_node=$NGPU --master_port=$((29500 + RUN_ID % 200))"
 
     $CMD REAL_GPU_BENCHMARK.py \
         --model_size "$MODEL" \
@@ -184,9 +184,9 @@ run_training() {
     log_info "Model: $model, Steps: $MAX_STEPS, DES-LOC: Kx=$DEFAULT_KX"
 
     for SEED in $SEEDS; do
-        _run_single_experiment "baseline" "$model" 1 1 1 $SEED "DDP" "$CUDA_DEVICE" 1
-        _run_single_experiment "desloc"   "$model" $DEFAULT_KX $DEFAULT_KU $DEFAULT_KV $SEED "DESLOC" "$CUDA_DEVICE" 1
-        _run_single_experiment "local"    "$model" $DEFAULT_KX $DEFAULT_KX $DEFAULT_KX $SEED "LocalAdam" "$CUDA_DEVICE" 1
+        _run_single_experiment "baseline" "$model" 1 1 1 $SEED "DDP" "0,1" 2
+        _run_single_experiment "desloc"   "$model" $DEFAULT_KX $DEFAULT_KU $DEFAULT_KV $SEED "DESLOC" "0,1" 2
+        _run_single_experiment "local"    "$model" $DEFAULT_KX $DEFAULT_KX $DEFAULT_KX $SEED "LocalAdam" "0,1" 2
     done
 
     log_success "Training complete: $TOTAL_RUNS runs"
@@ -215,7 +215,7 @@ run_kx_sweep() {
     for KX in 1 2 4 8 16 32 64 128; do
         [ $KX -eq 1 ] && { KU=1; KV=1; } || { KU=$((KX*3)); KV=$((KX*6)); }
         for SEED in $SEEDS; do
-            _run_single_experiment "rq1_kx" "${1:-$MODEL_KEY}" $KX $KU $KV $SEED "DESLOC" "$CUDA_DEVICE" 1
+            _run_single_experiment "rq1_kx" "${1:-$MODEL_KEY}" $KX $KU $KV $SEED "DESLOC" "0,1" 2
         done
     done
     log_success "Kx sweep complete"; cd "$SCRIPT_DIR"
@@ -242,7 +242,7 @@ run_ratio_ablation() {
 
     for KU_R in 1 3 6; do for KV_R in 1 6 12; do
         for SEED in $SEEDS; do
-            _run_single_experiment "rq2_ratio" "${1:-$MODEL_KEY}" 32 $((32*KU_R)) $((32*KV_R)) $SEED "DESLOC" "$CUDA_DEVICE" 1
+            _run_single_experiment "rq2_ratio" "${1:-$MODEL_KEY}" 32 $((32*KU_R)) $((32*KV_R)) $SEED "DESLOC" "0,1" 2
         done
     done; done
     log_success "Ratio ablation complete"; cd "$SCRIPT_DIR"

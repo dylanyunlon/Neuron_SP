@@ -1,1 +1,2 @@
 run_id,tag,model,Kx,Ku,Kv,seed,method,exit_code,elapsed_s
+1,mgpu,125M,1,1,1,42,DDP,0,151
