@@ -1358,14 +1358,6 @@ def main():
     parser.add_argument('--output', type=str, default='./real_benchmark_results')
     parser.add_argument('--methods', nargs='+', default=['DDP', 'LocalAdam', 'DESLOC'],
                         help='Methods: DDP, LocalAdam, DESLOC, DESLOC_nesterov, DESLOC_avg')
-    parser.add_argument('--outer_optimizer', type=str, default='average', choices=['average', 'nesterov'],
-                        help='RQ5: outer optimizer for DES-LOC (Section 5.5)')
-    parser.add_argument('--outer_momentum', type=float, default=0.9,
-                        help='Nesterov momentum (Charles et al. 2025)')
-    parser.add_argument('--outer_lr', type=float, default=1.0,
-                        help='Nesterov outer learning rate')
-    parser.add_argument('--init_from_ckpt', type=str, default='',
-                        help='Path to DDP checkpoint for warm-start (RQ5 protocol)')
     
     args = parser.parse_args()
     
