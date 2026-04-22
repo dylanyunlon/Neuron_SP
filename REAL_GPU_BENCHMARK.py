@@ -84,6 +84,14 @@ class TrainingConfig:
     Kx: int = 32
     Ku: int = 96
     Kv: int = 192
+
+    # RQ5: Outer optimizer (Section 5.5)
+    outer_optimizer: str = "average"  # 'average' or 'nesterov'
+    outer_momentum: float = 0.9       # Nesterov momentum (Charles et al. 2025)
+    outer_lr: float = 1.0             # Nesterov outer learning rate
+
+    # DDP checkpoint init (Charles et al. 2025 protocol)
+    init_from_ckpt: str = ""          # path to DDP checkpoint for warm-start
     
     # Logging
     log_interval: int = 10
@@ -100,6 +108,7 @@ class TrainingConfig:
             "350M": {"n_layer": 24, "n_head": 16, "n_embd": 1024},
             "700M": {"n_layer": 36, "n_head": 20, "n_embd": 1280},
             "1.3B": {"n_layer": 24, "n_head": 16, "n_embd": 2048},
+            "1.7B": {"n_layer": 24, "n_head": 16, "n_embd": 2304},
         }
         assert self.model_size in configs, f"Unknown model size: {self.model_size}"
         return configs[self.model_size]
@@ -345,18 +354,36 @@ class AdamW(torch.optim.Optimizer):
 class DESLOCAdamW(torch.optim.Optimizer):
     """
     DES-LOC AdamW - Desynced Low Communication Adam.
-    
+
     Implements independent sync periods for:
     - x (parameters): sync every Kx steps
-    - u (first moment): sync every Ku steps  
+    - u (first moment): sync every Ku steps
     - v (second moment): sync every Kv steps
+
+    Outer optimizer (Section 5.5, RQ5):
+    - 'average': simple parameter averaging after AllReduce (default)
+    - 'nesterov': Polyak/Nesterov momentum on averaged params
+        x_new = x_avg + beta_outer * (x_avg - x_avg_prev)
+        (Charles et al. 2025, momentum=0.9, outer_lr=1.0)
     """
-    def __init__(self, params, lr: float, betas: Tuple[float, float], 
-                 weight_decay: float, Kx: int, Ku: int, Kv: int):
+    def __init__(self, params, lr: float, betas: Tuple[float, float],
+                 weight_decay: float, Kx: int, Ku: int, Kv: int,
+                 outer_optimizer: str = 'average',
+                 outer_momentum: float = 0.9, outer_lr: float = 1.0):
         defaults = dict(lr=lr, betas=betas, weight_decay=weight_decay,
                        Kx=Kx, Ku=Ku, Kv=Kv)
         super().__init__(params, defaults)
         self.global_step = 0
+        # Paper Metrics: track ||s_{t+K} - s_t||_2 / ||s_t||_2 for each state tier
+        self._state_snapshots = {}  # {param_id: {tier: snapshot_tensor}}
+        self._rate_of_change = {'x': [], 'u': [], 'v': []}  # per-sync history
+        # RQ5: Nesterov outer optimizer (Section 5.5)
+        self.outer_optimizer = outer_optimizer  # 'average' or 'nesterov'
+        self.outer_momentum = outer_momentum    # beta for Nesterov (default 0.9)
+        self.outer_lr = outer_lr                # outer learning rate (default 1.0)
+        self._prev_avg = {}  # {param_id: previous averaged params for Nesterov}
+        # Activation norm monitoring (Section 5.5: prevent exploding norms)
+        self._activation_norms = []
     
     def step(self):
         self.global_step += 1
@@ -404,11 +431,68 @@ class DESLOCAdamW(torch.optim.Optimizer):
         Returns sync flags dict even when world_size<=1 so that
         the caller can still count how many syncs *would* happen,
         which is needed for comm-reduction metrics.
+
+        Paper Metrics: measures ∥s_{t+K} - s_t∥₂ / ∥s_t∥₂ at each sync point
+        for params (x), first moment (u), second moment (v).
         """
         sync_x = self.global_step % self.param_groups[0]['Kx'] == 0
         sync_u = self.global_step % self.param_groups[0]['Ku'] == 0
         sync_v = self.global_step % self.param_groups[0]['Kv'] == 0
 
+        # Measure rate-of-change at sync boundaries (before AllReduce)
+        roc_x, roc_u, roc_v = 0.0, 0.0, 0.0
+        n_params_counted = 0
+        for group in self.param_groups:
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+                pid = id(p)
+                state = self.state[p]
+                if pid not in self._state_snapshots:
+                    self._state_snapshots[pid] = {}
+
+                # x (params) rate of change
+                if sync_x:
+                    snap = self._state_snapshots[pid].get('x')
+                    if snap is not None:
+                        diff_norm = torch.norm(p.data - snap, 2).item()
+                        base_norm = torch.norm(snap, 2).item()
+                        if base_norm > 1e-12:
+                            roc_x += diff_norm / base_norm
+                    self._state_snapshots[pid]['x'] = p.data.clone()
+
+                # u (first moment) rate of change
+                if sync_u and 'exp_avg' in state:
+                    snap = self._state_snapshots[pid].get('u')
+                    if snap is not None:
+                        diff_norm = torch.norm(state['exp_avg'] - snap, 2).item()
+                        base_norm = torch.norm(snap, 2).item()
+                        if base_norm > 1e-12:
+                            roc_u += diff_norm / base_norm
+                    self._state_snapshots[pid]['u'] = state['exp_avg'].clone()
+
+                # v (second moment) rate of change
+                if sync_v and 'exp_avg_sq' in state:
+                    snap = self._state_snapshots[pid].get('v')
+                    if snap is not None:
+                        diff_norm = torch.norm(state['exp_avg_sq'] - snap, 2).item()
+                        base_norm = torch.norm(snap, 2).item()
+                        if base_norm > 1e-12:
+                            roc_v += diff_norm / base_norm
+                    self._state_snapshots[pid]['v'] = state['exp_avg_sq'].clone()
+
+                n_params_counted += 1
+
+        # Average over parameters
+        if n_params_counted > 0:
+            if sync_x:
+                self._rate_of_change['x'].append(roc_x / n_params_counted)
+            if sync_u:
+                self._rate_of_change['u'].append(roc_u / n_params_counted)
+            if sync_v:
+                self._rate_of_change['v'].append(roc_v / n_params_counted)
+
+        # Actual AllReduce (multi-GPU only)
         if world_size > 1:
             for group in self.param_groups:
                 for p in group['params']:
@@ -421,6 +505,41 @@ class DESLOCAdamW(torch.optim.Optimizer):
                         dist.all_reduce(state['exp_avg'], op=dist.ReduceOp.AVG)
                     if sync_v and 'exp_avg_sq' in state:
                         dist.all_reduce(state['exp_avg_sq'], op=dist.ReduceOp.AVG)
+
+        # === RQ5: Nesterov outer optimizer (Section 5.5) ===
+        # After AllReduce averaging, apply Nesterov momentum:
+        #   x_new = x_avg + beta * (x_avg - x_avg_prev)
+        # This improves over simple averaging by ~0.5% PPL (Charles et al. 2025)
+        if sync_x and self.outer_optimizer == 'nesterov':
+            for group in self.param_groups:
+                for p in group['params']:
+                    if p.grad is None:
+                        continue
+                    pid = id(p)
+                    x_avg = p.data.clone()
+                    if pid in self._prev_avg:
+                        # Nesterov step: x_new = x_avg + beta * (x_avg - x_prev)
+                        momentum_term = self.outer_momentum * (x_avg - self._prev_avg[pid])
+                        p.data.add_(momentum_term, alpha=self.outer_lr)
+                    self._prev_avg[pid] = x_avg
+
+        # Activation norm monitoring (detect exploding norms, Section 5.5)
+        if sync_x:
+            total_norm = 0.0
+            count = 0
+            for group in self.param_groups:
+                for p in group['params']:
+                    if p.data is not None:
+                        total_norm += torch.norm(p.data, 2).item() ** 2
+                        count += 1
+            if count > 0:
+                rms_norm = math.sqrt(total_norm / count)
+                self._activation_norms.append(rms_norm)
+                # Warn if norm explodes (>10x initial)
+                if len(self._activation_norms) > 2:
+                    if rms_norm > 10 * self._activation_norms[0]:
+                        print(f"[WARN] Activation norm explosion: {rms_norm:.4f} "
+                              f"(initial: {self._activation_norms[0]:.4f})")
 
         return {'sync_x': sync_x, 'sync_u': sync_u, 'sync_v': sync_v}
 
@@ -508,7 +627,7 @@ class Trainer:
     def __init__(self, config: TrainingConfig, method: str):
         self.config = config
         self.method = method
-        self.use_deepspeed = (method == 'DESLOC')
+        self.use_deepspeed = method.startswith('DESLOC')
 
         # Distributed setup
         self.world_size = int(os.environ.get('WORLD_SIZE', 1))
@@ -534,6 +653,17 @@ class Trainer:
             **model_config
         ).to(self.device)
 
+        # RQ5 (Section 5.5): Initialize from DDP checkpoint
+        # Charles et al. (2025) protocol: warm-start from 2048-step DDP training
+        if config.init_from_ckpt and os.path.isfile(config.init_from_ckpt):
+            ckpt = torch.load(config.init_from_ckpt, map_location=self.device)
+            if 'model_state_dict' in ckpt:
+                self.model.load_state_dict(ckpt['model_state_dict'])
+            else:
+                self.model.load_state_dict(ckpt)
+            if self.rank == 0:
+                print(f"[INIT] Loaded DDP checkpoint: {config.init_from_ckpt}")
+
         # Dataset
         dataset = SyntheticDataset(
             vocab_size=config.vocab_size,
@@ -542,6 +672,14 @@ class Trainer:
         )
 
         if self.use_deepspeed:
+            # RQ5: Parse outer optimizer from method name
+            # DESLOC → average, DESLOC_nesterov → nesterov, DESLOC_avg → average
+            if '_nesterov' in method:
+                config.outer_optimizer = 'nesterov'
+            elif '_avg' in method:
+                config.outer_optimizer = 'average'
+            # else: keep config.outer_optimizer as-is (default 'average')
+
             # === DeepSpeed path: uses engine.py DES-LOC modifications ===
             ds_config = self._build_ds_config(config)
             self.engine, self.optimizer, self.dataloader, _ = deepspeed.initialize(
@@ -626,14 +764,23 @@ class Trainer:
                 "Kv": config.Kv,
                 "clip_rho": 1.0,
                 "warmup_steps": min(100, config.max_steps // 5),
-                "outer_optimizer": "average",
+                "outer_optimizer": config.outer_optimizer,
+                "outer_momentum": config.outer_momentum,
+                "outer_lr": config.outer_lr,
                 "inner_optimizer": "adam",
             },
             "wall_clock_breakdown": True,
         }
 
     def _create_optimizer(self, method: str):
-        """Create optimizer for non-DeepSpeed baselines."""
+        """Create optimizer for non-DeepSpeed baselines.
+
+        Methods:
+          DDP:             standard AdamW, AllReduce every step
+          LocalAdam:       LocalAdamW, sync all every Kx
+          DESLOC_avg:      DES-LOC with averaging outer optimizer
+          DESLOC_nesterov: DES-LOC with Nesterov outer optimizer (RQ5)
+        """
         params = self.model.parameters()
 
         if method == 'DDP':
@@ -648,6 +795,18 @@ class Trainer:
                 betas=(self.config.beta1, self.config.beta2),
                 weight_decay=self.config.weight_decay,
                 K=self.config.Kx
+            )
+        elif method in ('DESLOC_avg', 'DESLOC_nesterov'):
+            # RQ5: explicit outer optimizer selection
+            outer = 'nesterov' if method == 'DESLOC_nesterov' else 'average'
+            return DESLOCAdamW(
+                params, lr=self.config.learning_rate,
+                betas=(self.config.beta1, self.config.beta2),
+                weight_decay=self.config.weight_decay,
+                Kx=self.config.Kx, Ku=self.config.Ku, Kv=self.config.Kv,
+                outer_optimizer=outer,
+                outer_momentum=self.config.outer_momentum,
+                outer_lr=self.config.outer_lr
             )
         else:
             raise ValueError(f"Unknown baseline method: {method}")
@@ -812,13 +971,22 @@ class Trainer:
         return self._finalize_results(total_tokens, start_time)
 
     def _finalize_results(self, total_tokens, start_time) -> Dict:
-        """Compute final metrics — shared by both paths."""
+        """Compute final metrics -- shared by both paths.
+
+        Paper Metrics (Section 5):
+        (i)   Perplexity: exp(cross_entropy_loss)
+        (ii)  Per-worker comm cost: Ring-AllReduce 2(W-1)/W * N * sizeof(param)
+              bandwidth-optimal, scales linearly with model size
+        (iii) Rate of change: ∥s_{t+K} - s_t∥₂ / ∥s_t∥₂ per tier
+        (iv)  Wall-clock time: total seconds + per-step breakdown
+        """
         total_time = time.time() - start_time
         per_gpu_tps = total_tokens / total_time
         cluster_tps = per_gpu_tps * self.world_size
 
         # MFU
-        n_params = sum(p.numel() for p in (self.engine.module if self.engine else self.model).parameters())
+        model_ref = self.engine.module if self.engine else self.model
+        n_params = sum(p.numel() for p in model_ref.parameters())
         flops_per_token = 6 * n_params
         achieved_flops = per_gpu_tps * flops_per_token
         gpu_name = torch.cuda.get_device_name(self.device)
@@ -839,12 +1007,53 @@ class Trainer:
             self.config.Kx, self.config.Ku, self.config.Kv, self.config.max_steps
         )
 
+        # === Paper Metric (i): Perplexity ===
+        final_loss = self.metrics['losses'][-1]
+        avg_loss = sum(self.metrics['losses'][-100:]) / min(100, len(self.metrics['losses']))
+        final_ppl = math.exp(min(final_loss, 20.0))  # clamp to avoid overflow
+        avg_ppl = math.exp(min(avg_loss, 20.0))
+
+        # === Paper Metric (ii): Per-worker asymptotic comm cost ===
+        # Ring-AllReduce bandwidth-optimal: 2(W-1)/W * N * sizeof
+        # W = world_size, N = n_params, sizeof = 2 bytes (fp16/bf16)
+        W = max(self.world_size, 1)
+        sizeof_param = 2  # bf16/fp16 = 2 bytes
+        ring_factor = 2.0 * (W - 1) / W if W > 1 else 0.0
+        # DDP: every step syncs gradients (same size as params)
+        ddp_comm_bytes_per_step = ring_factor * n_params * sizeof_param
+        ddp_total_comm_bytes = ddp_comm_bytes_per_step * self.config.max_steps
+        # DES-LOC: x every Kx, u every Ku, v every Kv (each same size as params)
+        steps = self.config.max_steps
+        Kx, Ku, Kv = self.config.Kx, self.config.Ku, self.config.Kv
+        desloc_syncs_x = max(steps // Kx, 1) if Kx > 0 else steps
+        desloc_syncs_u = max(steps // Ku, 1) if Ku > 0 else steps
+        desloc_syncs_v = max(steps // Kv, 1) if Kv > 0 else steps
+        desloc_total_comm_bytes = ring_factor * n_params * sizeof_param * (
+            desloc_syncs_x + desloc_syncs_u + desloc_syncs_v
+        )
+        # LocalAdam: syncs all 3 every Kx
+        local_total_comm_bytes = ring_factor * n_params * sizeof_param * 3 * desloc_syncs_x
+
+        # === Paper Metric (iv): Wall-clock breakdown ===
+        step_times = self.metrics['step_times']
+        wall_clock = {
+            'total_s': total_time,
+            'avg_step_ms': sum(step_times) / len(step_times) * 1000,
+            'min_step_ms': min(step_times) * 1000,
+            'max_step_ms': max(step_times) * 1000,
+            'p50_step_ms': sorted(step_times)[len(step_times)//2] * 1000,
+            'p99_step_ms': sorted(step_times)[int(len(step_times)*0.99)] * 1000,
+            'step_times_ms': [t * 1000 for t in step_times],  # full timewise data
+        }
+
         results = {
             'method': self.method,
-            'final_loss': self.metrics['losses'][-1],
-            'avg_loss': sum(self.metrics['losses'][-100:]) / min(100, len(self.metrics['losses'])),
+            'final_loss': final_loss,
+            'avg_loss': avg_loss,
+            'final_ppl': final_ppl,
+            'avg_ppl': avg_ppl,
             'total_time_seconds': total_time,
-            'avg_step_time_ms': sum(self.metrics['step_times']) / len(self.metrics['step_times']) * 1000,
+            'avg_step_time_ms': wall_clock['avg_step_ms'],
             'tokens_per_second_per_gpu': per_gpu_tps,
             'tokens_per_second_cluster': cluster_tps,
             'peak_memory_gb': max(self.metrics['memory_usage']),
@@ -854,12 +1063,22 @@ class Trainer:
             'mfu': mfu_val,
             'mfu_check': mfu_check,
             'comm_reduction': comm_red,
+            'n_params': n_params,
+            'comm_bytes': {
+                'ddp_per_step': ddp_comm_bytes_per_step,
+                'ddp_total': ddp_total_comm_bytes,
+                'desloc_total': desloc_total_comm_bytes,
+                'local_total': local_total_comm_bytes,
+                'ring_factor': ring_factor,
+                'sizeof_param': sizeof_param,
+            },
+            'wall_clock': wall_clock,
             'losses': self.metrics['losses'],
             'comm_events': self.metrics['comm_events'],
         }
 
         # Sync counts
-        if self.method == 'DESLOC':
+        if self.method.startswith('DESLOC'):
             sched = get_desloc_scheduler()
             if sched:
                 results['sync_counts'] = {
@@ -877,6 +1096,12 @@ class Trainer:
             results['desloc_comm_bytes'] = desloc_comm_bytes(
                 n_params, self.config.Kx, self.config.Ku, self.config.Kv, self.config.max_steps
             )
+            # Paper Metric (iii): rate of change ∥s_{t+K}-s_t∥₂/∥s_t∥₂
+            if hasattr(self.optimizer, '_rate_of_change'):
+                results['rate_of_change'] = self.optimizer._rate_of_change
+            elif hasattr(self, '_profiler') and self._profiler:
+                # DeepSpeed path: check engine for rate_of_change
+                results['rate_of_change'] = {'x': [], 'u': [], 'v': []}
         elif self.method == 'LocalAdam':
             syncs = sum(1 for e in self.metrics['comm_events'] if e.get('synced'))
             results['sync_counts'] = {'all': syncs}
@@ -898,20 +1123,40 @@ class Trainer:
             self._profiler.export_nkifa(nkifa_path, config_str)
 
         # NKI-FA format log block (rank 0 only)
+        # Paper Metrics: perplexity, per-worker comm cost, rate of change, wall-clock
         if self.rank == 0:
             print(f"\n### model = {self.config.model_size}, method = {self.method}, "
                   f"Kx = {self.config.Kx}, Ku = {self.config.Ku}, Kv = {self.config.Kv}, "
                   f"world_size = {self.world_size} ###")
             print(f"final_loss: {results['final_loss']:.4f}")
             print(f"avg_loss: {results['avg_loss']:.4f}")
+            print(f"final_ppl: {results['final_ppl']:.4f}")
+            print(f"avg_ppl: {results['avg_ppl']:.4f}")
             print(f"tokens_per_second_per_gpu: {per_gpu_tps:.1f}")
             print(f"tokens_per_second_cluster: {cluster_tps:.1f}")
             print(f"peak_memory_gb: {results['peak_memory_gb']:.2f}")
             print(f"mfu: {mfu_val:.4f}")
+            print(f"n_params: {n_params}")
             print(f"comm_reduction: {comm_red:.2f}x")
-            print(f"total_time_s: {total_time:.1f}")
+            cb = results['comm_bytes']
+            print(f"ddp_comm_bytes_per_step: {cb['ddp_per_step']:.0f}")
+            print(f"ddp_comm_bytes_total: {cb['ddp_total']:.0f}")
+            print(f"desloc_comm_bytes_total: {cb['desloc_total']:.0f}")
+            print(f"ring_allreduce_factor: {cb['ring_factor']:.4f}")
+            wc = results['wall_clock']
+            print(f"total_time_s: {wc['total_s']:.1f}")
+            print(f"avg_step_ms: {wc['avg_step_ms']:.2f}")
+            print(f"p50_step_ms: {wc['p50_step_ms']:.2f}")
+            print(f"p99_step_ms: {wc['p99_step_ms']:.2f}")
             if 'sync_counts' in results:
                 print(f"sync_counts: {results['sync_counts']}")
+            if 'rate_of_change' in results:
+                roc = results['rate_of_change']
+                for tier in ('x', 'u', 'v'):
+                    vals = roc.get(tier, [])
+                    if vals:
+                        mean_roc = sum(vals) / len(vals)
+                        print(f"rate_of_change_{tier}: {mean_roc:.6f}")
 
         return results
 
@@ -1031,15 +1276,33 @@ def save_results(results: Dict, config: TrainingConfig):
 
 def main():
     parser = argparse.ArgumentParser(description='DES-LOC Real GPU Benchmark')
-    parser.add_argument('--model_size', type=str, default='125M', choices=['125M', '350M', '700M', '1.3B'])
+    parser.add_argument('--model_size', type=str, default='125M', choices=['125M', '350M', '700M', '1.3B', '1.7B'])
     parser.add_argument('--batch_size', type=int, default=4)
     parser.add_argument('--grad_accum', type=int, default=8)
     parser.add_argument('--max_steps', type=int, default=1000)
     parser.add_argument('--Kx', type=int, default=32)
     parser.add_argument('--Ku', type=int, default=96)
     parser.add_argument('--Kv', type=int, default=192)
+    parser.add_argument('--outer_optimizer', type=str, default='average',
+                        choices=['average', 'nesterov'],
+                        help='RQ5: outer optimizer for DES-LOC (Section 5.5)')
+    parser.add_argument('--outer_momentum', type=float, default=0.9,
+                        help='Nesterov momentum (Charles et al. 2025)')
+    parser.add_argument('--outer_lr', type=float, default=1.0,
+                        help='Nesterov outer learning rate')
+    parser.add_argument('--init_from_ckpt', type=str, default='',
+                        help='DDP checkpoint path for warm-start (Section 5.5)')
     parser.add_argument('--output', type=str, default='./real_benchmark_results')
-    parser.add_argument('--methods', nargs='+', default=['DDP', 'LocalAdam', 'DESLOC'])
+    parser.add_argument('--methods', nargs='+', default=['DDP', 'LocalAdam', 'DESLOC'],
+                        help='Methods: DDP, LocalAdam, DESLOC, DESLOC_nesterov, DESLOC_avg')
+    parser.add_argument('--outer_optimizer', type=str, default='average', choices=['average', 'nesterov'],
+                        help='RQ5: outer optimizer for DES-LOC (Section 5.5)')
+    parser.add_argument('--outer_momentum', type=float, default=0.9,
+                        help='Nesterov momentum (Charles et al. 2025)')
+    parser.add_argument('--outer_lr', type=float, default=1.0,
+                        help='Nesterov outer learning rate')
+    parser.add_argument('--init_from_ckpt', type=str, default='',
+                        help='Path to DDP checkpoint for warm-start (RQ5 protocol)')
     
     args = parser.parse_args()
     
@@ -1051,6 +1314,10 @@ def main():
         Kx=args.Kx,
         Ku=args.Ku,
         Kv=args.Kv,
+        outer_optimizer=args.outer_optimizer,
+        outer_momentum=args.outer_momentum,
+        outer_lr=args.outer_lr,
+        init_from_ckpt=args.init_from_ckpt,
         output_dir=args.output
     )
     
