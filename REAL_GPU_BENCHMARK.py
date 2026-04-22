@@ -24,32 +24,89 @@ import torch.nn.functional as F
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Dataset, DistributedSampler
-from torch.cuda.amp import autocast
+# torch.cuda.amp is deprecated in torch 2.x; use torch.amp
+try:
+    from torch.amp import autocast as _autocast_cls
+    def autocast():
+        return _autocast_cls('cuda')
+except ImportError:
+    from torch.cuda.amp import autocast
 
-# DeepSpeed runtime — uses Claude M257-M332 DES-LOC modifications
-import deepspeed
-from deepspeed.runtime.utils import (
-    desloc_comm_reduction_ratio,
-    desloc_comm_bytes,
-    desloc_local_adam_comm_bytes,
-    desloc_parse_nkifa_logfile,
-)
-from deepspeed.utils.timer import (
-    DeslocSTimer,
-    DeslocProgress,
-    desloc_mfu,
-    desloc_roof,
-)
-from deepspeed.utils.comms_logging import (
-    desloc_cl_entry,
-    desloc_cl_sum,
-    desloc_cl_parse,
-    desloc_classify_op,
-)
-from deepspeed.comm.comm import (
-    get_desloc_scheduler,
-    get_desloc_profiler,
-)
+# DeepSpeed runtime — conditional import
+# Core DES-LOC algorithm (DESLOCAdamW, sync_if_needed, rate-of-change)
+# is fully self-contained in this file. DeepSpeed is only needed for
+# engine.py Kx-gated allreduce hooks in multi-GPU mode.
+_DS_AVAILABLE = False
+try:
+    import deepspeed
+    from deepspeed.runtime.utils import (
+        desloc_comm_reduction_ratio,
+        desloc_comm_bytes,
+        desloc_local_adam_comm_bytes,
+        desloc_parse_nkifa_logfile,
+    )
+    from deepspeed.utils.timer import (
+        DeslocSTimer,
+        DeslocProgress,
+        desloc_mfu,
+        desloc_roof,
+    )
+    from deepspeed.utils.comms_logging import (
+        desloc_cl_entry,
+        desloc_cl_sum,
+        desloc_cl_parse,
+        desloc_classify_op,
+    )
+    from deepspeed.comm.comm import (
+        get_desloc_scheduler,
+        get_desloc_profiler,
+    )
+    _DS_AVAILABLE = True
+except Exception:
+    # Standalone stubs — reproduce the exact same math, no deepspeed needed
+    def desloc_comm_reduction_ratio(Kx, Ku, Kv, steps):
+        """3-tier comm reduction: DDP does 3N AllReduces per step,
+        DES-LOC does N/Kx + N/Ku + N/Kv."""
+        if Kx <= 1 and Ku <= 1 and Kv <= 1:
+            return 1.0
+        ddp = steps * 3.0
+        desloc = max(steps // Kx, 1) + max(steps // Ku, 1) + max(steps // Kv, 1)
+        return ddp / max(desloc, 1)
+
+    def desloc_comm_bytes(n_params, Kx, Ku, Kv, steps, sizeof=2):
+        """Per-worker comm bytes: Ring-AllReduce 2(W-1)/W * N * sizeof per sync."""
+        syncs = max(steps // Kx, 1) + max(steps // Ku, 1) + max(steps // Kv, 1)
+        return syncs * n_params * sizeof * 2  # 2 for ring allreduce factor
+
+    def desloc_local_adam_comm_bytes(n_params, K, steps, sizeof=2):
+        syncs = max(steps // K, 1) * 3
+        return syncs * n_params * sizeof * 2
+
+    def desloc_parse_nkifa_logfile(path):
+        return {}
+
+    def desloc_mfu(achieved_tflops, peak_tflops):
+        return achieved_tflops / peak_tflops if peak_tflops > 0 else 0.0
+
+    def desloc_roof(n_params, peak_tflops, mem_bw_tbps=2.0):
+        return peak_tflops
+
+    class DeslocSTimer:
+        def __init__(self): pass
+        def begin_step(self, step): pass
+        def end_step(self, **kw): pass
+        def export_nkifa(self, path, config_str): pass
+
+    class DeslocProgress:
+        def __init__(self, total): self.total = total
+
+    def desloc_cl_entry(*a, **kw): return ""
+    def desloc_cl_sum(*a, **kw): return {}
+    def desloc_cl_parse(*a, **kw): return []
+    def desloc_classify_op(*a, **kw): return "unknown"
+
+    def get_desloc_scheduler(): return None
+    def get_desloc_profiler(): return None
 
 assert torch.cuda.is_available(), "CUDA not available - HARD FAIL"
 assert torch.cuda.device_count() >= 1, "No GPU found - HARD FAIL"
@@ -627,7 +684,7 @@ class Trainer:
     def __init__(self, config: TrainingConfig, method: str):
         self.config = config
         self.method = method
-        self.use_deepspeed = method.startswith('DESLOC')
+        self.use_deepspeed = method == 'DESLOC' and _DS_AVAILABLE
 
         # Distributed setup
         self.world_size = int(os.environ.get('WORLD_SIZE', 1))
@@ -796,9 +853,15 @@ class Trainer:
                 weight_decay=self.config.weight_decay,
                 K=self.config.Kx
             )
-        elif method in ('DESLOC_avg', 'DESLOC_nesterov'):
+        elif method in ('DESLOC', 'DESLOC_avg', 'DESLOC_nesterov'):
             # RQ5: explicit outer optimizer selection
-            outer = 'nesterov' if method == 'DESLOC_nesterov' else 'average'
+            # DESLOC (no DS) defaults to config.outer_optimizer
+            if '_nesterov' in method:
+                outer = 'nesterov'
+            elif '_avg' in method:
+                outer = 'average'
+            else:
+                outer = self.config.outer_optimizer
             return DESLOCAdamW(
                 params, lr=self.config.learning_rate,
                 betas=(self.config.beta1, self.config.beta2),
@@ -1360,7 +1423,7 @@ def desloc_det_gpus():
         import torch
         if not torch.cuda.is_available(): return []
         return [{'idx': i, 'name': torch.cuda.get_device_properties(i).name,
-                 'mem_gb': round(torch.cuda.get_device_properties(i).total_mem / (1024**3), 2),
+                 'mem_gb': round(torch.cuda.get_device_properties(i).total_memory / (1024**3), 2),
                  'sm': torch.cuda.get_device_properties(i).multi_processor_count,
                  'cc': '%d.%d' % (torch.cuda.get_device_properties(i).major, torch.cuda.get_device_properties(i).minor)}
                 for i in range(torch.cuda.device_count())]

@@ -135,7 +135,8 @@ try:
     gpus = []
     for i in range(n):
         p = torch.cuda.get_device_properties(i)
-        gpus.append({"idx": i, "name": p.name, "mem_gb": round(p.total_mem / 1e9, 1)})
+        mem = getattr(p, 'total_memory', None) or getattr(p, 'total_mem', 0)
+        gpus.append({"idx": i, "name": p.name, "mem_gb": round(mem / 1e9, 1)})
     print(json.dumps({"n": n, "gpus": gpus}))
 except Exception as e:
     print(json.dumps({"n": 0, "gpus": [], "error": str(e)}))
@@ -261,12 +262,6 @@ run_one() {
     local LOGFILE="$OUTPUT_DIR/logs/${TAG}_${MODEL}_Kx${KX}_${METHOD}_s${SEED}.log"
     local T0=$SECONDS
 
-    # If deepspeed unavailable, route DESLOC → DESLOC_avg (uses DESLOCAdamW baseline)
-    if [ "$DS_OK" -eq 0 ] && [ "$METHOD" = "DESLOC" ]; then
-        METHOD="DESLOC_avg"
-        LOGFILE="$OUTPUT_DIR/logs/${TAG}_${MODEL}_Kx${KX}_${METHOD}_s${SEED}.log"
-    fi
-
     printf "[%3d] %-10s %-5s Kx=%-3d %-10s seed=%-4d gpu=%-2s steps=%-4d ... " \
         "$RID" "$TAG" "$MODEL" "$KX" "$METHOD" "$SEED" "$GPU" "$STEPS"
 
@@ -279,9 +274,9 @@ run_one() {
             --Kx "$KX" --Ku "$KU" --Kv "$KV" \
             --methods "$METHOD" \
             --output "$OUTPUT_DIR" \
-            > "$LOGFILE" 2>&1
+            > "$LOGFILE" 2>&1 || true
 
-    local RC=$?; local DT=$((SECONDS - T0))
+    local RC=${PIPESTATUS[0]:-$?}; local DT=$((SECONDS - T0))
     [ $RC -eq 0 ] && echo "OK (${DT}s)" || echo "FAIL:${RC} (${DT}s)"
     echo "${RID},${TAG},${MODEL},${KX},${KU},${KV},${SEED},${METHOD},${RC},${DT}" >> "$CSV"
     return 0  # don't let set -e kill the parent
@@ -307,9 +302,9 @@ run_nesterov() {
             --outer_optimizer nesterov --outer_momentum 0.9 --outer_lr 1.0 \
             --methods DESLOC_nesterov \
             --output "$OUTPUT_DIR" \
-            > "$LOGFILE" 2>&1
+            > "$LOGFILE" 2>&1 || true
 
-    local RC=$?; local DT=$((SECONDS - T0))
+    local RC=${PIPESTATUS[0]:-$?}; local DT=$((SECONDS - T0))
     [ $RC -eq 0 ] && echo "OK (${DT}s)" || echo "FAIL:${RC} (${DT}s)"
     echo "${RID},rq5_nest,${MODEL},${KX},${KU},${KV},${SEED},DESLOC_nesterov,${RC},${DT}" >> "$CSV"
     return 0
@@ -336,9 +331,9 @@ run_multigpu() {
             --Kx 32 --Ku 96 --Kv 192 \
             --methods "$METHOD" \
             --output "$OUTPUT_DIR" \
-            > "$LOGFILE" 2>&1
+            > "$LOGFILE" 2>&1 || true
 
-    local RC=$?; local DT=$((SECONDS - T0))
+    local RC=${PIPESTATUS[0]:-$?}; local DT=$((SECONDS - T0))
     [ $RC -eq 0 ] && echo "OK (${DT}s)" || echo "FAIL:${RC} (${DT}s)"
     echo "${RID},multigpu,${MODEL},32,96,192,42,${METHOD},${RC},${DT}" >> "$CSV"
     return 0

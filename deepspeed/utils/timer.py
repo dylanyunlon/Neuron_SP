@@ -636,6 +636,16 @@ def desloc_mfu(actual_tflops, peak_tflops):
         return 0.0
     return actual_tflops / peak_tflops
 
+# Hardware roofline model for MFU computation
+class DeslocRooflineModel:
+    """Simple roofline: peak_tflops, mem_bw (GB/s), interconnect_bw (GB/s)."""
+    def __init__(self, peak_tflops, mem_bw_gbs, interconnect_bw_gbs):
+        self.peak_tflops = peak_tflops
+        self.mem_bw_gbs = mem_bw_gbs
+        self.interconnect_bw_gbs = interconnect_bw_gbs
+    def mfu(self, achieved_tflops):
+        return achieved_tflops / self.peak_tflops if self.peak_tflops > 0 else 0.0
+
 # Hardware presets for common GPU configurations
 DESLOC_HW_PRESETS = {
     'H100_NVL': DeslocRooflineModel(312, 3350, 600),
