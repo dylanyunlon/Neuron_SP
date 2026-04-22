@@ -550,18 +550,65 @@ class DESLOCAdamW(torch.optim.Optimizer):
                 self._rate_of_change['v'].append(roc_v / n_params_counted)
 
         # Actual AllReduce (multi-GPU only)
+        # Megatron-style flattened buffer: concat all params into ONE tensor,
+        # do a single AllReduce, then scatter back. This avoids NCCL deadlock
+        # from per-parameter calls and reduces launch overhead from O(N_params)
+        # to O(1) NCCL calls per tier. See NCCL all_reduce.h Ring AllReduce.
         if world_size > 1:
+            # Collect ALL params (not just grad!=None) to guarantee symmetric
+            # AllReduce across ranks — prevents NCCL hang
+            all_params = []
             for group in self.param_groups:
                 for p in group['params']:
-                    if p.grad is None:
-                        continue
+                    all_params.append(p)
+
+            if sync_x and all_params:
+                flat_x = torch.cat([p.data.reshape(-1) for p in all_params])
+                dist.all_reduce(flat_x, op=dist.ReduceOp.SUM)
+                flat_x.div_(world_size)
+                offset = 0
+                for p in all_params:
+                    numel = p.data.numel()
+                    p.data.copy_(flat_x[offset:offset + numel].reshape(p.data.shape))
+                    offset += numel
+
+            if sync_u and all_params:
+                bufs_u = []
+                for p in all_params:
                     state = self.state[p]
-                    if sync_x:
-                        dist.all_reduce(p.data, op=dist.ReduceOp.AVG)
-                    if sync_u and 'exp_avg' in state:
-                        dist.all_reduce(state['exp_avg'], op=dist.ReduceOp.AVG)
-                    if sync_v and 'exp_avg_sq' in state:
-                        dist.all_reduce(state['exp_avg_sq'], op=dist.ReduceOp.AVG)
+                    if 'exp_avg' in state:
+                        bufs_u.append(state['exp_avg'].reshape(-1))
+                    else:
+                        bufs_u.append(torch.zeros(p.data.numel(), device=p.data.device, dtype=p.data.dtype))
+                flat_u = torch.cat(bufs_u)
+                dist.all_reduce(flat_u, op=dist.ReduceOp.SUM)
+                flat_u.div_(world_size)
+                offset = 0
+                for i, p in enumerate(all_params):
+                    numel = p.data.numel()
+                    state = self.state[p]
+                    if 'exp_avg' in state:
+                        state['exp_avg'].copy_(flat_u[offset:offset + numel].reshape(state['exp_avg'].shape))
+                    offset += numel
+
+            if sync_v and all_params:
+                bufs_v = []
+                for p in all_params:
+                    state = self.state[p]
+                    if 'exp_avg_sq' in state:
+                        bufs_v.append(state['exp_avg_sq'].reshape(-1))
+                    else:
+                        bufs_v.append(torch.zeros(p.data.numel(), device=p.data.device, dtype=p.data.dtype))
+                flat_v = torch.cat(bufs_v)
+                dist.all_reduce(flat_v, op=dist.ReduceOp.SUM)
+                flat_v.div_(world_size)
+                offset = 0
+                for i, p in enumerate(all_params):
+                    numel = p.data.numel()
+                    state = self.state[p]
+                    if 'exp_avg_sq' in state:
+                        state['exp_avg_sq'].copy_(flat_v[offset:offset + numel].reshape(state['exp_avg_sq'].shape))
+                    offset += numel
 
         # === RQ5: Nesterov outer optimizer (Section 5.5) ===
         # After AllReduce averaging, apply Nesterov momentum:
@@ -652,16 +699,60 @@ class LocalAdamW(torch.optim.Optimizer):
         should_sync = self.global_step % K == 0
 
         if should_sync and world_size > 1:
+            # Flattened buffer AllReduce — all params in one call per tier
+            all_params = []
             for group in self.param_groups:
                 for p in group['params']:
-                    if p.grad is None:
-                        continue
+                    all_params.append(p)
+
+            if all_params:
+                # x (params)
+                flat_x = torch.cat([p.data.reshape(-1) for p in all_params])
+                dist.all_reduce(flat_x, op=dist.ReduceOp.SUM)
+                flat_x.div_(world_size)
+                offset = 0
+                for p in all_params:
+                    numel = p.data.numel()
+                    p.data.copy_(flat_x[offset:offset + numel].reshape(p.data.shape))
+                    offset += numel
+
+                # u (first moment)
+                bufs_u = []
+                for p in all_params:
                     state = self.state[p]
-                    dist.all_reduce(p.data, op=dist.ReduceOp.AVG)
                     if 'exp_avg' in state:
-                        dist.all_reduce(state['exp_avg'], op=dist.ReduceOp.AVG)
+                        bufs_u.append(state['exp_avg'].reshape(-1))
+                    else:
+                        bufs_u.append(torch.zeros(p.data.numel(), device=p.data.device, dtype=p.data.dtype))
+                flat_u = torch.cat(bufs_u)
+                dist.all_reduce(flat_u, op=dist.ReduceOp.SUM)
+                flat_u.div_(world_size)
+                offset = 0
+                for p in all_params:
+                    numel = p.data.numel()
+                    state = self.state[p]
+                    if 'exp_avg' in state:
+                        state['exp_avg'].copy_(flat_u[offset:offset + numel].reshape(state['exp_avg'].shape))
+                    offset += numel
+
+                # v (second moment)
+                bufs_v = []
+                for p in all_params:
+                    state = self.state[p]
                     if 'exp_avg_sq' in state:
-                        dist.all_reduce(state['exp_avg_sq'], op=dist.ReduceOp.AVG)
+                        bufs_v.append(state['exp_avg_sq'].reshape(-1))
+                    else:
+                        bufs_v.append(torch.zeros(p.data.numel(), device=p.data.device, dtype=p.data.dtype))
+                flat_v = torch.cat(bufs_v)
+                dist.all_reduce(flat_v, op=dist.ReduceOp.SUM)
+                flat_v.div_(world_size)
+                offset = 0
+                for p in all_params:
+                    numel = p.data.numel()
+                    state = self.state[p]
+                    if 'exp_avg_sq' in state:
+                        state['exp_avg_sq'].copy_(flat_v[offset:offset + numel].reshape(state['exp_avg_sq'].shape))
+                    offset += numel
 
         return {'synced': should_sync}
 

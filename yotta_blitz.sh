@@ -274,10 +274,15 @@ run_one() {
             --Kx "$KX" --Ku "$KU" --Kv "$KV" \
             --methods "$METHOD" \
             --output "$OUTPUT_DIR" \
-            > "$LOGFILE" 2>&1 || true
-
-    local RC=${PIPESTATUS[0]:-$?}; local DT=$((SECONDS - T0))
-    [ $RC -eq 0 ] && echo "OK (${DT}s)" || echo "FAIL:${RC} (${DT}s)"
+            > "$LOGFILE" 2>&1
+    local RC=$?; local DT=$((SECONDS - T0))
+    if [ $RC -eq 0 ]; then
+        echo "OK (${DT}s)"
+    else
+        echo "FAIL:${RC} (${DT}s)"
+        # Show last 5 lines of error log for diagnostics
+        tail -5 "$LOGFILE" 2>/dev/null | sed 's/^/    /'
+    fi
     echo "${RID},${TAG},${MODEL},${KX},${KU},${KV},${SEED},${METHOD},${RC},${DT}" >> "$CSV"
     return 0  # don't let set -e kill the parent
 }
@@ -302,10 +307,14 @@ run_nesterov() {
             --outer_optimizer nesterov --outer_momentum 0.9 --outer_lr 1.0 \
             --methods DESLOC_nesterov \
             --output "$OUTPUT_DIR" \
-            > "$LOGFILE" 2>&1 || true
-
-    local RC=${PIPESTATUS[0]:-$?}; local DT=$((SECONDS - T0))
-    [ $RC -eq 0 ] && echo "OK (${DT}s)" || echo "FAIL:${RC} (${DT}s)"
+            > "$LOGFILE" 2>&1
+    local RC=$?; local DT=$((SECONDS - T0))
+    if [ $RC -eq 0 ]; then
+        echo "OK (${DT}s)"
+    else
+        echo "FAIL:${RC} (${DT}s)"
+        tail -5 "$LOGFILE" 2>/dev/null | sed 's/^/    /'
+    fi
     echo "${RID},rq5_nest,${MODEL},${KX},${KU},${KV},${SEED},DESLOC_nesterov,${RC},${DT}" >> "$CSV"
     return 0
 }
@@ -329,12 +338,17 @@ run_multigpu() {
             --model_size "$MODEL" \
             --batch_size 4 --grad_accum 4 --max_steps "$STEPS" \
             --Kx 32 --Ku 96 --Kv 192 \
+            --sp_size "$N_GPU" \
             --methods "$METHOD" \
             --output "$OUTPUT_DIR" \
-            > "$LOGFILE" 2>&1 || true
-
-    local RC=${PIPESTATUS[0]:-$?}; local DT=$((SECONDS - T0))
-    [ $RC -eq 0 ] && echo "OK (${DT}s)" || echo "FAIL:${RC} (${DT}s)"
+            > "$LOGFILE" 2>&1
+    local RC=$?; local DT=$((SECONDS - T0))
+    if [ $RC -eq 0 ]; then
+        echo "OK (${DT}s)"
+    else
+        echo "FAIL:${RC} (${DT}s)"
+        tail -5 "$LOGFILE" 2>/dev/null | sed 's/^/    /'
+    fi
     echo "${RID},multigpu,${MODEL},32,96,192,42,${METHOD},${RC},${DT}" >> "$CSV"
     return 0
 }
@@ -351,12 +365,133 @@ else
     log "Mode: SINGLE GPU serial (GPU $GPU_A only)"
 fi
 
-# ═══════════════════════════════════════════════════════════════════
-# PHASE 1: Core training — 125M + 350M
-# ═══════════════════════════════════════════════════════════════════
-log "═══ PHASE 1: Core training (125M + 350M) ═══"
+# --- /dev/shm check (Docker containers often have tiny /dev/shm) ---
+SHM_GB=$($PYTHON -c "import os; s=os.statvfs('/dev/shm'); print(round(s.f_bavail*s.f_frsize/1e9,1))" 2>/dev/null || echo "0")
+log "Shared memory: ${SHM_GB}GB"
+if $PYTHON -c "exit(0 if float('$SHM_GB') < 1.0 else 1)" 2>/dev/null; then
+    log "WARN: /dev/shm < 1GB — DataLoader will use num_workers=0 (auto-detected by Python)"
+fi
 
-phase1_a() {
+# ═══════════════════════════════════════════════════════════════════
+# PHASE 1: SMOKE TEST + Multi-GPU Core (THE MOST IMPORTANT PHASE)
+# This is the ONLY phase that exercises real NCCL AllReduce.
+# Paper claims (comm reduction, SP) require multi-GPU data.
+# ═══════════════════════════════════════════════════════════════════
+log "═══ PHASE 1: Smoke test + Multi-GPU core (PRIORITY) ═══"
+
+# --- Smoke test: 2-step run to catch crashes before burning budget ---
+log "Smoke test: 2-step DDP on GPU $GPU_A..."
+PYTHONHASHSEED=42 PYTHONUNBUFFERED=1 CUDA_VISIBLE_DEVICES=$GPU_A \
+    $PYTHON REAL_GPU_BENCHMARK.py \
+        --model_size 125M --batch_size 4 --grad_accum 1 --max_steps 2 \
+        --Kx 1 --Ku 1 --Kv 1 --methods DDP \
+        --output "$OUTPUT_DIR" \
+        > "$OUTPUT_DIR/logs/smoke_test.log" 2>&1
+SMOKE_RC=$?
+if [ $SMOKE_RC -ne 0 ]; then
+    log "FATAL: Smoke test failed (rc=$SMOKE_RC). Last 10 lines:"
+    tail -10 "$OUTPUT_DIR/logs/smoke_test.log" | sed 's/^/    /'
+    die "Fix REAL_GPU_BENCHMARK.py before running experiments"
+fi
+log "Smoke test passed"
+
+# --- Multi-GPU experiments (requires 2+ GPUs, exercises real NCCL) ---
+if [ "$N_GPU" -ge 2 ]; then
+    log "Multi-GPU: DDP + DESLOC + DESLOC+SP on $N_GPU GPUs"
+
+    # 125M: DDP vs DESLOC vs DESLOC+SP, 3 seeds, 300 steps
+    for SEED in 42 137 2024; do
+        budget_ok || break
+        run_multigpu_seed() {
+            local SEED=$1 MODEL=$2 STEPS=$3
+            local RID=$(next_run_id)
+            local PORT=$((29500 + RID % 200))
+            local LOGFILE="$OUTPUT_DIR/logs/mgpu_${MODEL}_DDP_s${SEED}.log"
+            local T0=$SECONDS
+            printf "[%3d] %-10s %-5s %-10s %dxGPU seed=%-4d ... " \
+                "$RID" "mgpu" "$MODEL" "DDP" "$N_GPU" "$SEED"
+            PYTHONHASHSEED=$SEED PYTHONUNBUFFERED=1 \
+                $PYTHON -m torch.distributed.run \
+                    --nproc_per_node="$N_GPU" --master_port="$PORT" \
+                REAL_GPU_BENCHMARK.py \
+                    --model_size "$MODEL" \
+                    --batch_size 4 --grad_accum 4 --max_steps "$STEPS" \
+                    --Kx 1 --Ku 1 --Kv 1 \
+                    --methods DDP \
+                    --output "$OUTPUT_DIR" \
+                    > "$LOGFILE" 2>&1
+            local RC=$?; local DT=$((SECONDS - T0))
+            [ $RC -eq 0 ] && echo "OK (${DT}s)" || { echo "FAIL:${RC} (${DT}s)"; tail -3 "$LOGFILE" 2>/dev/null | sed 's/^/    /'; }
+            echo "${RID},mgpu,${MODEL},1,1,1,${SEED},DDP,${RC},${DT}" >> "$CSV"
+        }
+        run_multigpu_seed $SEED 125M 300
+
+        RID=$(next_run_id); PORT=$((29500 + RID % 200))
+        LOGFILE="$OUTPUT_DIR/logs/mgpu_125M_DESLOC_s${SEED}.log"
+        T0=$SECONDS
+        printf "[%3d] %-10s %-5s %-10s %dxGPU seed=%-4d ... " \
+            "$RID" "mgpu" "125M" "DESLOC" "$N_GPU" "$SEED"
+        PYTHONHASHSEED=$SEED PYTHONUNBUFFERED=1 \
+            $PYTHON -m torch.distributed.run \
+                --nproc_per_node="$N_GPU" --master_port="$PORT" \
+            REAL_GPU_BENCHMARK.py \
+                --model_size 125M --batch_size 4 --grad_accum 4 --max_steps 300 \
+                --Kx 32 --Ku 96 --Kv 192 \
+                --sp_size "$N_GPU" \
+                --methods DESLOC \
+                --output "$OUTPUT_DIR" \
+                > "$LOGFILE" 2>&1
+        RC=$?; DT=$((SECONDS - T0))
+        [ $RC -eq 0 ] && echo "OK (${DT}s)" || { echo "FAIL:${RC} (${DT}s)"; tail -3 "$LOGFILE" 2>/dev/null | sed 's/^/    /'; }
+        echo "${RID},mgpu,125M,32,96,192,${SEED},DESLOC+SP,${RC},${DT}" >> "$CSV"
+
+        RID=$(next_run_id); PORT=$((29500 + RID % 200))
+        LOGFILE="$OUTPUT_DIR/logs/mgpu_125M_LocalAdam_s${SEED}.log"
+        T0=$SECONDS
+        printf "[%3d] %-10s %-5s %-10s %dxGPU seed=%-4d ... " \
+            "$RID" "mgpu" "125M" "LocalAdam" "$N_GPU" "$SEED"
+        PYTHONHASHSEED=$SEED PYTHONUNBUFFERED=1 \
+            $PYTHON -m torch.distributed.run \
+                --nproc_per_node="$N_GPU" --master_port="$PORT" \
+            REAL_GPU_BENCHMARK.py \
+                --model_size 125M --batch_size 4 --grad_accum 4 --max_steps 300 \
+                --Kx 32 --Ku 32 --Kv 32 \
+                --methods LocalAdam \
+                --output "$OUTPUT_DIR" \
+                > "$LOGFILE" 2>&1
+        RC=$?; DT=$((SECONDS - T0))
+        [ $RC -eq 0 ] && echo "OK (${DT}s)" || { echo "FAIL:${RC} (${DT}s)"; tail -3 "$LOGFILE" 2>/dev/null | sed 's/^/    /'; }
+        echo "${RID},mgpu,125M,32,32,32,${SEED},LocalAdam,${RC},${DT}" >> "$CSV"
+    done
+
+    # 350M multi-GPU: 1 seed for time efficiency
+    budget_ok && {
+        log "Multi-GPU 350M: DDP + DESLOC+SP"
+        run_multigpu 350M DDP 200
+        run_multigpu 350M DESLOC 200
+    }
+
+    # 700M multi-GPU if budget allows
+    budget_ok && {
+        log "Multi-GPU 700M: DDP + DESLOC+SP"
+        run_multigpu 700M DDP 150
+        run_multigpu 700M DESLOC 150
+    }
+
+    log "PHASE 1 (Multi-GPU) done"
+else
+    log "Single GPU — running serial baselines only (no comm reduction data)"
+fi
+
+# ═══════════════════════════════════════════════════════════════════
+# PHASE 2: Single-GPU parallel baselines (125M + 350M)
+# These measure loss convergence and wall-clock per-step time.
+# No comm reduction data (WORLD_SIZE=1), but valid for loss curves.
+# ═══════════════════════════════════════════════════════════════════
+budget_ok || { log "Skipping phase 2+"; exit 0; }
+log "═══ PHASE 2: Single-GPU baselines (125M + 350M) ═══"
+
+phase2_a() {
     for SEED in 42 137 2024; do
         run_one baseline 125M 1 1 1 $SEED DDP $GPU_A 300
         run_one desloc   125M 32 96 192 $SEED DESLOC $GPU_A 300
@@ -364,49 +499,12 @@ phase1_a() {
     done
 }
 
-phase1_b() {
+phase2_b() {
     for SEED in 42 137 2024; do
         run_one baseline 350M 1 1 1 $SEED DDP $GPU_B 300
         run_one desloc   350M 32 96 192 $SEED DESLOC $GPU_B 300
         run_one local    350M 32 32 32 $SEED LocalAdam $GPU_B 300
     done
-}
-
-if [ "$N_GPU" -ge 2 ]; then
-    phase1_a & PID_A=$!
-    phase1_b & PID_B=$!
-    wait $PID_A || log "GPU_A phase1 had failures"
-    wait $PID_B || log "GPU_B phase1 had failures"
-else
-    phase1_a
-    phase1_b
-fi
-log "PHASE 1 done"
-
-# ═══════════════════════════════════════════════════════════════════
-# PHASE 2: Ablations — Kx sweep + Ku/Kv ratio
-# ═══════════════════════════════════════════════════════════════════
-budget_ok || { log "Skipping phase 2+"; exit 0; }
-log "═══ PHASE 2: Ablations ═══"
-
-phase2_a() {
-    for KX in 1 2 4 8 16 32 64 128; do
-        [ $KX -eq 1 ] && { KU=1; KV=1; } || { KU=$((KX*3)); KV=$((KX*6)); }
-        for SEED in 42 137; do
-            budget_ok || return 0
-            run_one rq1_kx 125M $KX $KU $KV $SEED DESLOC $GPU_A 200
-        done
-    done
-}
-
-phase2_b() {
-    for KU_R in 1 3 6; do for KV_R in 1 6 12; do
-        [ $KV_R -lt $KU_R ] && continue
-        for SEED in 42 137; do
-            budget_ok || return 0
-            run_one rq2_ratio 125M 32 $((32*KU_R)) $((32*KV_R)) $SEED DESLOC $GPU_B 200
-        done
-    done; done
 }
 
 if [ "$N_GPU" -ge 2 ]; then
@@ -416,37 +514,34 @@ if [ "$N_GPU" -ge 2 ]; then
     wait $PID_B || log "GPU_B phase2 had failures"
 else
     phase2_a
-    phase2_b
+    budget_ok && phase2_b
 fi
 log "PHASE 2 done"
 
 # ═══════════════════════════════════════════════════════════════════
-# PHASE 3: Large models + RQ5 Nesterov (Section 5.5)
-# 700M: DDP + DESLOC-avg + DESLOC-nesterov (Kx=32) + DESLOC(Kx=256)
-# 1.3B + 1.7B: DDP + DESLOC
+# PHASE 3: Ablations — Kx sweep + Ku/Kv ratio
 # ═══════════════════════════════════════════════════════════════════
 budget_ok || { log "Skipping phase 3+"; exit 0; }
-log "═══ PHASE 3: Large models + RQ5 Nesterov ═══"
+log "═══ PHASE 3: Ablations ═══"
 
 phase3_a() {
-    run_one baseline 700M 1 1 1 42 DDP $GPU_A 200
-    run_one desloc   700M 32 96 192 42 DESLOC $GPU_A 200
-    run_one local    700M 32 32 32 42 LocalAdam $GPU_A 200
-    # RQ5: Nesterov outer (Section 5.5, Charles et al. 2025)
-    budget_ok || return 0
-    run_nesterov 700M 32 96 192 42 $GPU_A 200
-    # RQ5: infrequent sync Kx=256 (should show worse PPL)
-    budget_ok || return 0
-    run_one rq5_infreq 700M 256 768 1536 42 DESLOC $GPU_A 200
+    for KX in 1 4 8 16 32 64 128; do
+        [ $KX -eq 1 ] && { KU=1; KV=1; } || { KU=$((KX*3)); KV=$((KX*6)); }
+        for SEED in 42 137; do
+            budget_ok || return 0
+            run_one rq1_kx 125M $KX $KU $KV $SEED DESLOC $GPU_A 200
+        done
+    done
 }
 
 phase3_b() {
-    run_one baseline 1.3B 1 1 1 42 DDP $GPU_B 200
-    run_one desloc   1.3B 32 96 192 42 DESLOC $GPU_B 200
-    run_one local    1.3B 32 32 32 42 LocalAdam $GPU_B 200
-    budget_ok || return 0
-    run_one baseline 1.7B 1 1 1 42 DDP $GPU_B 200
-    run_one desloc   1.7B 32 96 192 42 DESLOC $GPU_B 200
+    for KU_R in 1 3 6; do for KV_R in 1 6 12; do
+        [ $KV_R -lt $KU_R ] && continue
+        for SEED in 42 137; do
+            budget_ok || return 0
+            run_one rq2_ratio 125M 32 $((32*KU_R)) $((32*KV_R)) $SEED DESLOC $GPU_B 200
+        done
+    done; done
 }
 
 if [ "$N_GPU" -ge 2 ]; then
@@ -461,22 +556,55 @@ fi
 log "PHASE 3 done"
 
 # ═══════════════════════════════════════════════════════════════════
-# PHASE 4: Multi-GPU DDP (only if 2+ GPUs)
+# PHASE 4: Large models + RQ5 Nesterov (Section 5.5)
 # ═══════════════════════════════════════════════════════════════════
+budget_ok || { log "Skipping phase 4+"; exit 0; }
+log "═══ PHASE 4: Large models + RQ5 Nesterov ═══"
+
+phase4_a() {
+    run_one baseline 700M 1 1 1 42 DDP $GPU_A 200
+    run_one desloc   700M 32 96 192 42 DESLOC $GPU_A 200
+    run_one local    700M 32 32 32 42 LocalAdam $GPU_A 200
+    budget_ok || return 0
+    run_nesterov 700M 32 96 192 42 $GPU_A 200
+    budget_ok || return 0
+    run_one rq5_infreq 700M 256 768 1536 42 DESLOC $GPU_A 200
+}
+
+phase4_b() {
+    run_one baseline 1.3B 1 1 1 42 DDP $GPU_B 200
+    run_one desloc   1.3B 32 96 192 42 DESLOC $GPU_B 200
+    run_one local    1.3B 32 32 32 42 LocalAdam $GPU_B 200
+    budget_ok || return 0
+    run_one baseline 1.7B 1 1 1 42 DDP $GPU_B 200
+    run_one desloc   1.7B 32 96 192 42 DESLOC $GPU_B 200
+}
+
 if [ "$N_GPU" -ge 2 ]; then
-    budget_ok || { log "Skipping phase 4"; exit 0; }
-    log "═══ PHASE 4: Multi-GPU ($N_GPU GPUs) ═══"
-    run_multigpu 125M DDP 200
-    run_multigpu 125M DESLOC 200
-    log "PHASE 4 done"
+    phase4_a & PID_A=$!
+    phase4_b & PID_B=$!
+    wait $PID_A || log "GPU_A phase4 had failures"
+    wait $PID_B || log "GPU_B phase4 had failures"
 else
-    log "Skipping PHASE 4 (single GPU)"
+    phase4_a
+    phase4_b
 fi
+log "PHASE 4 done"
 
 # ═══════════════════════════════════════════════════════════════════
-# PHASE 5: Eval + Report + Figures
+# PHASE 5: ICL Eval + Figures
 # ═══════════════════════════════════════════════════════════════════
-log "═══ PHASE 5: Eval + Figures ═══"
+log "═══ PHASE 5: ICL Eval + Figures ═══"
+
+# ICL eval for 1.7B if it was trained
+if [ -f "$OUTPUT_DIR/logs/"*1.7B*DESLOC*.log ]; then
+    log "Running ICL eval (HellaSwag/ARC-Easy) for 1.7B..."
+    $PYTHON -c "
+import subprocess, sys
+subprocess.call([sys.executable, '-m', 'pip', 'install', '-q', 'lm-eval'],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+" 2>/dev/null
+fi
 
 # Generate figures
 $PYTHON -c "
@@ -485,11 +613,6 @@ from REAL_GPU_BENCHMARK import desloc_draw_all_figures
 desloc_draw_all_figures('$OUTPUT_DIR')
 print('[OK] Figures generated')
 " 2>&1 || log "Figure generation had issues"
-
-# Run eval via llm4dec_sp.sh if available
-if [ -x "$SCRIPT_DIR/llm4dec_sp.sh" ]; then
-    OUTPUT_DIR="$OUTPUT_DIR" $SCRIPT_DIR/llm4dec_sp.sh eval_all_models 2>&1 | tail -50
-fi
 
 # ═══════════════════════════════════════════════════════════════════
 # FINAL: Summary + package
