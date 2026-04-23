@@ -463,11 +463,11 @@ _show_eval_summary() {
 
     # DDP: 3 AllReduces per step (params + mom1 + mom2 equivalent)
     # Actually DDP only does 1 AllReduce(grad)/step, but we compare total comm volume
-    # DES-LOC: x every Kx + u every Ku + v every Kv
+    # DES-LOC: x every Kx + u every Ku + v piggybacks on x (Claude-27 M335)
     local ddp_syncs=$((steps * 3))
     local desloc_x=$((steps / kx)); [ $desloc_x -eq 0 ] && desloc_x=1
     local desloc_u=$((steps / ku)); [ $desloc_u -eq 0 ] && desloc_u=1
-    local desloc_v=$((steps / kv)); [ $desloc_v -eq 0 ] && desloc_v=1
+    local desloc_v=$desloc_x  # v piggybacks on x (Claude-27 M335)
     local desloc_syncs=$((desloc_x + desloc_u + desloc_v))
     local comm_red="1.0"
     [ "$desloc_syncs" -gt 0 ] && comm_red=$(awk "BEGIN {printf "%.1f", $ddp_syncs / $desloc_syncs}")

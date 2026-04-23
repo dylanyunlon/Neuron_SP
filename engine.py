@@ -2481,12 +2481,20 @@ class DeepSpeedEngine(Module):
     def desloc_is_variance_sync_step(self):
         """Check if current step is a Kv sync boundary.
 
+        Claude-27 M333: v piggybacks on x-sync boundaries.
+        With β₂=0.999 (half-life ~693 steps) and Kv=192, pure Kv-schedule
+        only syncs v ~2× in 500 steps, causing workers to use divergent
+        adaptive learning rates. Now v also syncs whenever x syncs,
+        keeping the Adam denominator consistent across workers.
+
         Ref: Algorithm 1 — second momentum averages at Kv period.
-        Half-life of m2 (beta2=0.999) ≈ 693 steps, so Kv=6*Kx is safe.
         """
         if not self.desloc_enabled or self.desloc_Kv <= 1:
             return True
         if self.desloc_step < self.desloc_warmup_steps:
+            return True
+        # v piggybacks on x: sync v whenever x syncs OR on Kv's own schedule
+        if self.desloc_is_param_sync_step():
             return True
         return (self.desloc_step % self.desloc_Kv) == 0
 
@@ -2497,6 +2505,23 @@ class DeepSpeedEngine(Module):
         if self.desloc_step < self.desloc_warmup_steps:
             return 1
         return self.desloc_Kx
+
+    # Claude-27 M334: Thin wrappers for ZeRO stage_1_and_2.py compatibility.
+    # _desloc_reduce_tiered_gradients calls e.desloc_should_sync_x/u/v()
+    # which must map to the is_*_sync_step methods above.
+    def desloc_should_sync_x(self):
+        """Wrapper for stage_1_and_2.py compatibility."""
+        return self.desloc_is_param_sync_step()
+
+    def desloc_should_sync_u(self):
+        """Wrapper for stage_1_and_2.py compatibility."""
+        return self.desloc_is_momentum_sync_step()
+
+    def desloc_should_sync_v(self):
+        """Wrapper for stage_1_and_2.py compatibility.
+        Claude-27 M333 fix already applied in desloc_is_variance_sync_step:
+        v piggybacks on x (returns True when x syncs)."""
+        return self.desloc_is_variance_sync_step()
 
     # --- DES-LOC Lifecycle (M139) ---
     def desloc_init_scheduler(self):
@@ -2739,22 +2764,40 @@ class DeepSpeedEngine(Module):
     def _desloc_momentum_sync(self):
         """Sync optimizer momentum states on Ku/Kv boundaries.
 
+        Claude-27 M333: Three convergence fixes applied.
+
+        Fix #1: u is fully independent (no co-sync with x).
+        Fix #2: v piggybacks on x — syncs whenever x syncs, keeping
+          the Adam denominator consistent across workers.
+        Fix #3: After x-sync, decay first moment (exp_avg) by 0.1×
+          to remove stale directional signal that would push averaged
+          params back toward each worker's old local optimum.
+
         Ref: DES-LOC Algorithm 1 lines 11-12:
           if step % Ku == 0: avg(u) across workers
           if step % Kv == 0: avg(v) across workers
-
-        Mirrors Megatron optimizer.py reduce_gradients pattern but
-        operates on optimizer state_dict rather than gradients.
         """
         if not self.desloc_enabled:
             return
         if self.desloc_step < self.desloc_warmup_steps:
             return  # during warmup, momentum syncs every step (handled by DDP)
 
-        sync_u = (self.desloc_step % self.desloc_Ku) == 0
-        sync_v = (self.desloc_step % self.desloc_Kv) == 0
+        sync_x = self.desloc_is_param_sync_step()
+        sync_u = (self.desloc_step % self.desloc_Ku) == 0  # independent
+        sync_v = (self.desloc_step % self.desloc_Kv) == 0 or sync_x  # piggyback on x
 
         if not sync_u and not sync_v:
+            # Still need to check momentum decay on x-sync
+            if sync_x:
+                # Decay stale momentum after x-averaging (no comm needed)
+                momentum_decay_on_sync = 0.1
+                for group in self.optimizer.param_groups:
+                    for p in group['params']:
+                        if not p.requires_grad or p not in self.optimizer.state:
+                            continue
+                        state = self.optimizer.state[p]
+                        if 'exp_avg' in state:
+                            state['exp_avg'].mul_(momentum_decay_on_sync)
             return
 
         world_size = dist.get_world_size()
@@ -2791,6 +2834,20 @@ class DeepSpeedEngine(Module):
             self._desloc_tier_stats['u']['time_ms'] += elapsed_ms
         if sync_v:
             self._desloc_tier_stats['v']['time_ms'] += elapsed_ms
+
+        # Claude-27 M333: Decay stale first moment after x-sync averaging.
+        # This runs AFTER AllReduce (if sync_u happened, the averaged u is
+        # then decayed; if sync_u didn't happen, the local stale u is decayed).
+        # Either way, removing 90% of the pre-sync signal prevents oscillation.
+        if sync_x:
+            momentum_decay_on_sync = 0.1
+            for group in self.optimizer.param_groups:
+                for p in group['params']:
+                    if not p.requires_grad or p not in self.optimizer.state:
+                        continue
+                    state = self.optimizer.state[p]
+                    if 'exp_avg' in state:
+                        state['exp_avg'].mul_(momentum_decay_on_sync)
 
     def _desloc_log_nkifa(self, loss=None, lr=None):
         """Emit NKI-FA format log line.
