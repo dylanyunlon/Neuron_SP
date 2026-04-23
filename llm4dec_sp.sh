@@ -12,7 +12,24 @@ FIGURES_DIR="${FIGURES_DIR:-$PROJECT_DIR/desloc_figures}"
 HF_CACHE_DIR="${HF_HOME:-/data/jiacheng/system/cache/temp/huggingface}"
 export HF_HOME="$HF_CACHE_DIR"
 CONDA_ENV_NAME="${CONDA_ENV_NAME:-base}"
-CONDA_BASE=$(conda info --base 2>/dev/null || echo "/usr/local/lib/miniconda3")
+CONDA_BASE=$(conda info --base 2>/dev/null || echo "/data/jiacheng/anaconda3")
+
+# Auto-detect python with torch (Knuth: exhaustive probe covers Yotta, ags1, RunPod, bare metal)
+_find_python() {
+    local candidates=(
+        "$(which python3 2>/dev/null)"
+        "$CONDA_BASE/envs/$CONDA_ENV_NAME/bin/python3"
+        "$CONDA_BASE/bin/python3"
+        "/opt/conda/bin/python3"
+        "/usr/local/bin/python3"
+        "/usr/bin/python3"
+    )
+    for p in "${candidates[@]}"; do
+        [ -x "$p" ] && "$p" -c "import torch" 2>/dev/null && { echo "$p"; return 0; }
+    done
+    echo "python3"  # fallback
+}
+PYTHON_BIN="$(_find_python)"
 
 # === 模型配置 ===
 declare -A MODEL_PARAMS=(["125M"]="125000000" ["350M"]="350000000" ["700M"]="700000000" ["1.3B"]="1300000000" ["1.7B"]="1700000000" ["7B"]="7000000000")
@@ -138,8 +155,8 @@ _run_single_experiment() {
 
     export PYTHONHASHSEED=$SEED CUDA_VISIBLE_DEVICES=$GPUS
 
-    local CMD="python3"
-    [ "$NGPU" -gt 1 ] && CMD="/opt/conda/bin/python3 -m torch.distributed.run --nproc_per_node=$NGPU --master_port=$((29500 + RUN_ID % 200))"
+    local CMD="$PYTHON_BIN"
+    [ "$NGPU" -gt 1 ] && CMD="$PYTHON_BIN -m torch.distributed.run --nproc_per_node=$NGPU --master_port=$((29500 + RUN_ID % 200))"
 
     $CMD REAL_GPU_BENCHMARK.py \
         --model_size "$MODEL" \
