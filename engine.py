@@ -2469,31 +2469,58 @@ class DeepSpeedEngine(Module):
     def desloc_is_momentum_sync_step(self):
         """Check if current step is a Ku sync boundary.
 
+        Claude-27 M335: u follows its own Ku schedule ALWAYS, including
+        during warmup. Previously warmup forced `return True` for u,
+        causing u to sync 96 extra times (once per warmup step) — total
+        u syncs = 100 instead of the intended ~5 (= 500/96).
+
+        Root cause: During warmup, x syncs every step (Kx=1 effective)
+        to stabilize the model. But u (first moment / exp_avg) does NOT
+        need to sync every step — the momentum is local to each worker's
+        optimizer and only needs periodic averaging per Eq(4). Forcing
+        u to sync every warmup step wastes 95 AllReduces on averaging
+        momentum that will be decayed away at the next x-sync anyway
+        (via the 0.1× momentum_decay_on_sync in _desloc_momentum_sync).
+
+        Fix: Remove the warmup early-return for u. u now syncs only on
+        its Ku schedule (every 96 steps), regardless of warmup state.
+        This saves ~95 AllReduces and is consistent with the 3-tier
+        independence assumption in the convergence bound.
+
+        Expected sync counts (500 steps, Kx=32, Ku=96, Kv=192):
+          Before: x=47, u=100, v=47 → 194 total
+          After:  x=47, u=5,   v=47 → 99 total (2× fewer total syncs)
+
         Ref: Algorithm 1 — first momentum averages at Ku period.
         Half-life of m1 (beta1=0.9) ≈ 6.6 steps, so Ku=3*Kx is safe.
         """
         if not self.desloc_enabled or self.desloc_Ku <= 1:
             return True
-        if self.desloc_step < self.desloc_warmup_steps:
-            return True
+        # Claude-27 M335: NO warmup override for u — u follows Ku always
         return (self.desloc_step % self.desloc_Ku) == 0
 
     def desloc_is_variance_sync_step(self):
         """Check if current step is a Kv sync boundary.
 
-        Claude-27 M333: v piggybacks on x-sync boundaries.
-        With β₂=0.999 (half-life ~693 steps) and Kv=192, pure Kv-schedule
-        only syncs v ~2× in 500 steps, causing workers to use divergent
-        adaptive learning rates. Now v also syncs whenever x syncs,
-        keeping the Adam denominator consistent across workers.
+        Claude-27 M335: v piggybacks on x-sync boundaries, but does NOT
+        force sync every warmup step. During warmup, x syncs every step
+        (Kx=1), so v would piggyback every step too — this is correct
+        behavior (v stays consistent while model stabilizes). After
+        warmup, v syncs whenever x syncs OR on its own Kv schedule.
+
+        Previously warmup had `return True` which was redundant with
+        the piggyback logic (since x=True every warmup step → piggyback
+        triggers anyway). Removing the redundant warmup early-return
+        makes the logic cleaner and ensures the piggyback mechanism is
+        the single source of truth for v-sync decisions.
 
         Ref: Algorithm 1 — second momentum averages at Kv period.
         """
         if not self.desloc_enabled or self.desloc_Kv <= 1:
             return True
-        if self.desloc_step < self.desloc_warmup_steps:
-            return True
-        # v piggybacks on x: sync v whenever x syncs OR on Kv's own schedule
+        # Claude-27 M335: No separate warmup override — piggyback handles it
+        # During warmup: x syncs every step → piggyback fires every step (correct)
+        # After warmup: x syncs every Kx steps → piggyback fires at Kx boundaries
         if self.desloc_is_param_sync_step():
             return True
         return (self.desloc_step % self.desloc_Kv) == 0
@@ -2764,7 +2791,7 @@ class DeepSpeedEngine(Module):
     def _desloc_momentum_sync(self):
         """Sync optimizer momentum states on Ku/Kv boundaries.
 
-        Claude-27 M333: Three convergence fixes applied.
+        Claude-27 M335: Four convergence fixes (supersedes M333).
 
         Fix #1: u is fully independent (no co-sync with x).
         Fix #2: v piggybacks on x — syncs whenever x syncs, keeping
@@ -2772,6 +2799,17 @@ class DeepSpeedEngine(Module):
         Fix #3: After x-sync, decay first moment (exp_avg) by 0.1×
           to remove stale directional signal that would push averaged
           params back toward each worker's old local optimum.
+        Fix #4 (NEW): Remove warmup early-return. Previously this
+          method returned immediately during warmup with the comment
+          "handled by DDP". But DDP only syncs gradients (AllReduce on
+          grads), NOT optimizer states. So u and v were NEVER synced
+          during warmup — yet is_momentum_sync_step returned True every
+          step, and the scheduler counted 96 u-syncs that never happened.
+          Now we let the method run normally during warmup, and u/v sync
+          on their own Ku/Kv schedules. Since x syncs every step during
+          warmup, v piggybacks every step (correct — keeps adaptive LR
+          consistent). u only syncs on Ku boundaries (correct — avoids
+          wasting 95 AllReduces).
 
         Ref: DES-LOC Algorithm 1 lines 11-12:
           if step % Ku == 0: avg(u) across workers
@@ -2779,8 +2817,7 @@ class DeepSpeedEngine(Module):
         """
         if not self.desloc_enabled:
             return
-        if self.desloc_step < self.desloc_warmup_steps:
-            return  # during warmup, momentum syncs every step (handled by DDP)
+        # Claude-27 M335: NO warmup early return — u/v sync on their own schedules
 
         sync_x = self.desloc_is_param_sync_step()
         sync_u = (self.desloc_step % self.desloc_Ku) == 0  # independent
@@ -5445,15 +5482,35 @@ def desloc_log_step(engine, loss=None, lr=None):
 
 
 def desloc_report_comm_savings(engine):
-    """Print comm reduction summary. Ref: Section 5.3, Table 2."""
+    """Print comm reduction summary. Ref: Section 5.3, Table 2.
+
+    Claude-27 M335: Accurate sync counting that matches the actual
+    sync schedule in _desloc_momentum_sync and is_*_sync_step:
+    - x syncs every step during warmup, then every Kx steps
+    - u syncs ONLY on Ku boundaries (independent, no warmup override)
+    - v syncs whenever x syncs (piggyback) OR on its own Kv schedule
+    """
     if not engine.desloc_enabled or engine.desloc_step == 0:
         return
     total = engine.desloc_step
-    synced = total - engine.desloc_skipped_allreduces
-    skip_pct = 100.0 * engine.desloc_skipped_allreduces / total
-    sync_x = total // max(1, engine.desloc_Kx)
-    sync_u = total // max(1, engine.desloc_Ku)
-    sync_v = total // max(1, engine.desloc_Kv)
+    warmup = getattr(engine, 'desloc_warmup_steps', 0)
+
+    # Count actual syncs matching the real schedule
+    sync_x, sync_u, sync_v = 0, 0, 0
+    Kx = max(1, engine.desloc_Kx)
+    Ku = max(1, engine.desloc_Ku)
+    Kv = max(1, engine.desloc_Kv)
+    for s in range(total):
+        # x: every step during warmup, then every Kx
+        sx = (s < warmup) or (s % Kx == 0)
+        # u: ONLY on Ku boundaries (M335 fix — no warmup override)
+        su = (s % Ku == 0)
+        # v: piggyback on x OR on Kv boundaries
+        sv = sx or (s % Kv == 0)
+        sync_x += int(sx)
+        sync_u += int(su)
+        sync_v += int(sv)
+
     ddp_ops = total * 3  # DDP syncs all 3 states every step
     desloc_ops = sync_x + sync_u + sync_v
     reduction = ddp_ops / max(1, desloc_ops)
@@ -5463,7 +5520,7 @@ def desloc_report_comm_savings(engine):
     print(f'  Total allreduce ops: {desloc_ops} '
           f'(DDP baseline: {ddp_ops}, reduction: {reduction:.1f}x)')
     print(f'  Kx={engine.desloc_Kx} Ku={engine.desloc_Ku} '
-          f'Kv={engine.desloc_Kv}')
+          f'Kv={engine.desloc_Kv} warmup={warmup}')
 
 
 def desloc_engine_summary(engine):

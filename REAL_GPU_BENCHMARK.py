@@ -67,9 +67,10 @@ except Exception:
     def desloc_comm_reduction_ratio(Kx, Ku, Kv, steps):
         """3-tier comm reduction: DDP does 3N AllReduces per step,
         DES-LOC does N/Kx + N/Ku + N/Kv.
-        Claude-27 M332: v piggybacks on x (sync_v=True when sync_x=True),
-        u is fully independent (no co-sync). Momentum decay on u is free
-        (no comm cost, just local mul_). This matches sync_if_needed."""
+        Claude-27 M335: Only x follows warmup ramp (1→Kx_target).
+        u uses Ku_target always (no warmup ramp). v piggybacks on x.
+        This matches the actual sync schedule in DESLOCAdamW.sync_if_needed
+        and engine.py _desloc_momentum_sync."""
         if Kx <= 1 and Ku <= 1 and Kv <= 1:
             return 1.0
         ddp = steps * 3.0
@@ -79,13 +80,11 @@ except Exception:
             if s <= warmup:
                 frac = s / max(warmup, 1)
                 eKx = max(1, int(1 + (Kx - 1) * frac))
-                eKu = max(1, int(1 + (Ku - 1) * frac))
-                eKv = max(1, int(1 + (Kv - 1) * frac))
             else:
-                eKx, eKu, eKv = Kx, Ku, Kv
+                eKx = Kx
             sx = (s % eKx == 0)
-            su = (s % eKu == 0)          # independent (no co-sync)
-            sv = (s % eKv == 0) or sx     # v piggybacks on x
+            su = (s % Ku == 0)            # M335: always use Ku_target
+            sv = (s % Kv == 0) or sx      # v piggybacks on x
             sx_total += int(sx)
             su_total += int(su)
             sv_total += int(sv)
@@ -94,20 +93,18 @@ except Exception:
 
     def desloc_comm_bytes(n_params, Kx, Ku, Kv, steps, sizeof=2):
         """Per-worker comm bytes: Ring-AllReduce 2(W-1)/W * N * sizeof per sync.
-        Claude-27 M332: v piggybacks on x, u independent (no co-sync)."""
+        Claude-27 M335: u uses Ku_target always, v piggybacks on x."""
         warmup = min(100, Kx * 3)
         syncs = 0
         for s in range(1, steps + 1):
             if s <= warmup:
                 frac = s / max(warmup, 1)
                 eKx = max(1, int(1 + (Kx - 1) * frac))
-                eKu = max(1, int(1 + (Ku - 1) * frac))
-                eKv = max(1, int(1 + (Kv - 1) * frac))
             else:
-                eKx, eKu, eKv = Kx, Ku, Kv
+                eKx = Kx
             sx = (s % eKx == 0)
-            su = (s % eKu == 0)           # independent
-            sv = (s % eKv == 0) or sx     # v piggybacks on x
+            su = (s % Ku == 0)            # M335: always use Ku_target
+            sv = (s % Kv == 0) or sx      # v piggybacks on x
             syncs += int(sx) + int(su) + int(sv)
         return syncs * n_params * sizeof * 2  # 2 for ring allreduce factor
 
@@ -587,8 +584,13 @@ class DESLOCAdamW(torch.optim.Optimizer):
             # Linear ramp: step 1 → Kx=1, step warmup_steps → Kx=Kx_target
             frac = self.global_step / max(warmup_steps, 1)
             effective_Kx = max(1, int(1 + (Kx_target - 1) * frac))
-            effective_Ku = max(1, int(1 + (Ku_target - 1) * frac))
-            effective_Kv = max(1, int(1 + (Kv_target - 1) * frac))
+            # Claude-27 M335: u and v do NOT follow the Kx ramp.
+            # Kx ramp controls how quickly params shift from DDP→local.
+            # u (first moment) is an optimizer state that tracks gradient
+            # direction — it should sync on its own Ku schedule, not be
+            # dragged along by the param ramp. v piggybacks on x (below).
+            effective_Ku = Ku_target
+            effective_Kv = Kv_target
         else:
             effective_Kx = Kx_target
             effective_Ku = Ku_target
@@ -1400,12 +1402,13 @@ class Trainer:
         ddp_comm_bytes_per_step = ring_factor * n_params * sizeof_param
         ddp_total_comm_bytes = ddp_comm_bytes_per_step * self.config.max_steps
         # DES-LOC: x every Kx, u every Ku, v every Kv (each same size as params)
-        # Claude-26 M332: account for warmup (Kx ramps 1→Kx_target over warmup_steps)
-        # and momentum co-sync (sync_u forced True whenever sync_x is True).
+        # Claude-27 M335: u uses Ku_target always (no warmup ramp).
+        # v piggybacks on x (sync whenever x syncs) + own Kv schedule.
+        # Only x follows the warmup Kx ramp (1→Kx_target).
         steps = self.config.max_steps
         Kx, Ku, Kv = self.config.Kx, self.config.Ku, self.config.Kv
         warmup_steps = min(100, Kx * 3)
-        # Count actual syncs: warmup phase + post-warmup phase
+        # Count actual syncs matching real schedule
         desloc_syncs_x = 0
         desloc_syncs_u = 0
         desloc_syncs_v = 0
@@ -1413,13 +1416,11 @@ class Trainer:
             if s <= warmup_steps:
                 frac = s / max(warmup_steps, 1)
                 eff_Kx = max(1, int(1 + (Kx - 1) * frac))
-                eff_Ku = max(1, int(1 + (Ku - 1) * frac))
-                eff_Kv = max(1, int(1 + (Kv - 1) * frac))
             else:
-                eff_Kx, eff_Ku, eff_Kv = Kx, Ku, Kv
+                eff_Kx = Kx
             sx = (s % eff_Kx == 0)
-            su = (s % eff_Ku == 0)           # independent (Claude-27 M332)
-            sv = (s % eff_Kv == 0) or sx     # v piggybacks on x (Claude-27 M332)
+            su = (s % Ku == 0)               # M335: always use Ku_target
+            sv = (s % Kv == 0) or sx         # v piggybacks on x
             desloc_syncs_x += int(sx)
             desloc_syncs_u += int(su)
             desloc_syncs_v += int(sv)
