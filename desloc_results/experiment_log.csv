@@ -1,0 +1,7 @@
+run_id,tag,model,Kx,Ku,Kv,seed,method,exit_code,elapsed_s
+1,baseline,7B,1,1,1,42,DDP,0,1571
+2,desloc,7B,32,96,192,42,DESLOC,0,1447
+3,local,7B,32,32,32,42,LocalAdam,0,1449
+4,baseline,7B,1,1,1,137,DDP,0,1568
+5,desloc,7B,32,96,192,137,DESLOC,0,1456
+6,local,7B,32,32,32,137,LocalAdam,0,1450
