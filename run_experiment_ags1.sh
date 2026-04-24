@@ -171,6 +171,25 @@ for S in 1 2 3; do
 done
 
 # ===================================================================
+# Phase 6: 1.3B — 异构实验 (3-seed, ~180分钟)
+# Memory: 1.3B params = ~15GB → fits A6000 49GB easily
+# 使用 activation checkpointing 以留更多空间给 batch
+# ===================================================================
+echo ""
+echo "===== Phase 6: 1.3B DDP vs DESLOC (3-seed, interleaved, use_ac) ====="
+
+for S in 1 2 3; do
+    PYTHONHASHSEED=$((S * 7)) run_exp "p6_ddp_1.3B_s${S}" "1.3B" 1 "DDP" 500 2 8 "--use_ac"
+    PYTHONHASHSEED=$((S * 7)) run_exp "p6_desloc_1.3B_Kx32_s${S}" "1.3B" 32 "DESLOC" 500 2 8 "--use_ac"
+done
+
+# Phase 6b: 1.3B Kx消融
+echo "===== Phase 6b: 1.3B Kx 消融 ====="
+for KX in 16 64; do
+    PYTHONHASHSEED=7 run_exp "p6b_desloc_1.3B_Kx${KX}" "1.3B" "$KX" "DESLOC" 500 2 8 "--use_ac"
+done
+
+# ===================================================================
 # 汇总
 # ===================================================================
 echo ""
@@ -210,7 +229,7 @@ for key in sorted(results.keys()):
     print(f'{key:<32} {len(runs):>3} {ml:>7.2f}±{sl:<5.2f} {mm:>9.4f}')
 
 # DDP vs DESLOC speedup
-for model in ['125M', '700M']:
+for model in ['125M', '700M', '1.3B']:
     dk = f'DDP_{model}_Kx1'
     lk = f'DESLOC_{model}_Kx32'
     if dk in results and lk in results:

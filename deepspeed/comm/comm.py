@@ -1117,41 +1117,206 @@ class DeslocScheduler:
                 f"step={self.local_step}, ratio={self.comm_reduction_ratio()}x)")
 
 
-class DeslocTieredAllReduce:
-    """Performs tiered AllReduce: only syncs parameters whose tier is due.
+class DeslocGradBucket:
+    """Contiguous gradient buffer for batched reduction.
 
-    Tier assignment (from engine._desloc_build_param_tier_map):
-      x -> MLP/FFN weights (sync every Kx)
-      u -> attention weights (sync every Ku)
-      v -> embeddings/norms (sync every Kv)
-
-    Ref: Megatron _ParamAndGradBuffer bucket mechanism — but gated by period.
-    Ref: NCCL all_reduce.h Ring AllReduce — same kernel, fewer invocations.
+    Ref: Megatron param_and_grad_buffer.py Bucket class — parameters
+         registered into fixed-size buckets; reduced as single NCCL call.
+    Ref: NCCL all_reduce.h:22 — chunkCount sizing for Ring protocol.
     """
 
-    def __init__(self, scheduler, group=None):
+    __slots__ = ('data', 'params', 'offsets', 'ready_count', 'tier', '_fill')
+
+    def __init__(self, numel, dtype, device, tier='x'):
+        self.data = torch.zeros(numel, dtype=dtype, device=device)
+        self.params = []
+        self.offsets = []
+        self.ready_count = 0
+        self.tier = tier
+        self._fill = 0
+
+    def register(self, param):
+        off = self._fill
+        n = param.data.numel()
+        self.params.append(param)
+        self.offsets.append((off, off + n))
+        self._fill += n
+        return off
+
+    def copy_grad_in(self, idx):
+        p = self.params[idx]
+        if p.grad is None:
+            return
+        s, e = self.offsets[idx]
+        self.data[s:e].copy_(p.grad.data.view(-1))
+        self.ready_count += 1
+
+    def all_ready(self):
+        return self.ready_count >= len(self.params)
+
+    def copy_grad_out(self):
+        for i, p in enumerate(self.params):
+            if p.grad is not None:
+                s, e = self.offsets[i]
+                p.grad.data.copy_(self.data[s:e].view_as(p.grad.data))
+
+    def reset(self):
+        self.ready_count = 0
+
+
+class DeslocTieredAllReduce:
+    """Gated AllReduce with async bucket coalescing and tier routing.
+
+    Key patterns from upstream codebases:
+
+    1. Megatron start_grad_sync (param_and_grad_buffer.py:568):
+       async_op dispatch with communication stream overlap.
+    2. NCCL Ring AllReduce (all_reduce.h:22): chunkCount bucket sizing.
+    3. veScale mesh_scatter_ragged (_collective_utils.py:83):
+       async dispatch without blocking.
+    4. neuronx-distributed _get_params_and_grad_norm
+       (zero_redundancy_optimizer.py:71): per-shard grad norm.
+    """
+
+    # Megatron default: max(40M, 1M * world_size)
+    DEFAULT_BUCKET_BYTES = 40_000_000
+
+    def __init__(self, scheduler, group=None, bucket_bytes=None,
+                 overlap_comm=True, fp32_reduce=False):
         self.scheduler = scheduler
         self.group = group
+        self._bucket_cap = bucket_bytes or self.DEFAULT_BUCKET_BYTES
+        self._overlap = overlap_comm
+        self._fp32_reduce = fp32_reduce
         self._bytes_sent = 0
         self._bytes_skipped = 0
         self._op_count = 0
+        self._pending = []  # async handles — Megatron pattern
+        self._buckets = {'x': [], 'u': [], 'v': []}
+        self._param_map = {}
+        self._tier_norm_sq = {'x': 0.0, 'u': 0.0, 'v': 0.0}
+        self._comm_stream = None  # Megatron DDP communication_stream
+
+    def _get_stream(self):
+        """Lazy-init comm stream. Ref: Megatron param_and_grad_buffer.py:577."""
+        if self._comm_stream is None:
+            try:
+                self._comm_stream = torch.cuda.Stream()
+            except Exception:
+                pass
+        return self._comm_stream
+
+    def register_param(self, param, tier='x'):
+        """Assign param to a tier bucket; create new bucket when full.
+        Ref: Megatron _ParamAndGradBuffer.__init__ bucket allocation."""
+        if param in self._param_map:
+            return
+        nbytes = param.data.numel() * param.data.element_size()
+        bkts = self._buckets[tier]
+        bkt = None
+        if bkts:
+            last = bkts[-1]
+            if last._fill * last.data.element_size() + nbytes <= self._bucket_cap:
+                bkt = last
+        if bkt is None:
+            cap = max(param.data.numel(),
+                      self._bucket_cap // max(1, param.data.element_size()))
+            bkt = DeslocGradBucket(cap, param.data.dtype,
+                                   param.data.device, tier)
+            bkts.append(bkt)
+        idx = len(bkt.params)
+        bkt.register(param)
+        self._param_map[param] = (bkt, idx)
+
+    def mark_grad_ready(self, param):
+        entry = self._param_map.get(param)
+        if entry is None:
+            return
+        bkt, idx = entry
+        bkt.copy_grad_in(idx)
+
+    def _should_sync(self, tier):
+        if tier == 'x':
+            return self.scheduler.should_sync_x()
+        elif tier == 'u':
+            return self.scheduler.should_sync_u()
+        return self.scheduler.should_sync_v()
+
+    def reduce_buckets(self):
+        """Reduce ready buckets whose tier is due for sync.
+
+        Ref: Megatron param_and_grad_buffer.py:594 —
+             with stream_context, _coalescing_manager(..., async_ops=async_op)
+        """
+        import torch.distributed as tdist
+        if not tdist.is_initialized():
+            return {'x': 0, 'u': 0, 'v': 0}
+
+        reduced = {'x': 0, 'u': 0, 'v': 0}
+        stream = self._get_stream() if self._overlap else None
+
+        for tier in ('x', 'u', 'v'):
+            sync = self._should_sync(tier)
+            for bkt in self._buckets[tier]:
+                if not bkt.all_ready():
+                    continue
+                nb = bkt._fill * bkt.data.element_size()
+                buf = bkt.data[:bkt._fill]
+
+                # Per-tier grad norm — neuronx-distributed pattern
+                self._tier_norm_sq[tier] += float(buf.float().norm().item()) ** 2
+
+                if sync:
+                    if self._fp32_reduce and buf.dtype != torch.float32:
+                        fp32 = buf.float()
+                        if stream is not None:
+                            stream.wait_stream(torch.cuda.current_stream())
+                            with torch.cuda.stream(stream):
+                                h = tdist.all_reduce(fp32, op=tdist.ReduceOp.AVG,
+                                                     group=self.group, async_op=True)
+                        else:
+                            h = tdist.all_reduce(fp32, op=tdist.ReduceOp.AVG,
+                                                 group=self.group, async_op=self._overlap)
+                        self._pending.append((h, buf, fp32))
+                    else:
+                        if stream is not None:
+                            stream.wait_stream(torch.cuda.current_stream())
+                            with torch.cuda.stream(stream):
+                                h = tdist.all_reduce(buf, op=tdist.ReduceOp.AVG,
+                                                     group=self.group, async_op=True)
+                        else:
+                            h = tdist.all_reduce(buf, op=tdist.ReduceOp.AVG,
+                                                 group=self.group, async_op=self._overlap)
+                        self._pending.append((h, None, None))
+                    self._bytes_sent += nb
+                    self._op_count += 1
+                    self.scheduler.record_sync(tier)
+                    reduced[tier] += 1
+                else:
+                    self._bytes_skipped += nb
+                    self.scheduler.record_skip()
+                bkt.reset()
+        return reduced
+
+    def finish_reduces(self):
+        """Wait for async handles. Ref: Megatron finish_grad_sync pattern."""
+        for h, dst, fp32 in self._pending:
+            if h is not None:
+                h.wait()
+            if dst is not None and fp32 is not None:
+                dst.copy_(fp32)
+        self._pending.clear()
+
+    def write_grads_back(self):
+        for tier in ('x', 'u', 'v'):
+            for bkt in self._buckets[tier]:
+                bkt.copy_grad_out()
 
     def maybe_allreduce(self, tensor, tier='x'):
-        """AllReduce tensor only if its tier is due for sync this step.
-
-        Returns True if sync happened, False if skipped.
-        """
+        """Single-tensor path for backward compat."""
         import torch.distributed as dist
-        should = False
-        if tier == 'x':
-            should = self.scheduler.should_sync_x()
-        elif tier == 'u':
-            should = self.scheduler.should_sync_u()
-        elif tier == 'v':
-            should = self.scheduler.should_sync_v()
-
+        should = self._should_sync(tier)
         nbytes = tensor.numel() * tensor.element_size()
-
         if should:
             if dist.is_initialized():
                 dist.all_reduce(tensor, op=dist.ReduceOp.AVG, group=self.group)
@@ -1159,19 +1324,32 @@ class DeslocTieredAllReduce:
             self._op_count += 1
             self.scheduler.record_sync(tier)
             return True
-        else:
-            self._bytes_skipped += nbytes
-            self.scheduler.record_skip()
-            return False
+        self._bytes_skipped += nbytes
+        self.scheduler.record_skip()
+        return False
+
+    def grad_norms_per_tier(self, norm_type=2.0):
+        """Per-tier gradient norms.
+        Ref: neuronx-distributed zero_redundancy_optimizer.py:71
+        Ref: Megatron clip_grads.py:55 — get_grad_norm_fp32"""
+        import math
+        out = {}
+        for t in ('x', 'u', 'v'):
+            sq = self._tier_norm_sq[t]
+            out[t] = math.sqrt(sq) if norm_type == 2.0 else sq ** (1.0 / norm_type)
+        return out
+
+    def reset_norms(self):
+        self._tier_norm_sq = {'x': 0.0, 'u': 0.0, 'v': 0.0}
 
     def stats(self):
+        total = self._bytes_sent + self._bytes_skipped
         return {
             'bytes_sent': self._bytes_sent,
             'bytes_skipped': self._bytes_skipped,
             'ops': self._op_count,
-            'reduction': round(
-                (self._bytes_sent + self._bytes_skipped) / max(1, self._bytes_sent), 2
-            ),
+            'reduction': round(total / max(1, self._bytes_sent), 2),
+            'buckets': {t: len(bs) for t, bs in self._buckets.items()},
         }
 
 

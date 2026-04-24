@@ -203,6 +203,46 @@ for S in 1 2 3; do
 done
 
 # ===================================================================
+# Phase 9: 3B 中间模型 (2-seed, AC必须开)
+# H20 96GB: 3B + AC → ~38GB/GPU
+# ===================================================================
+echo ""
+echo "===== Phase 9: 3B scale-up (2-seed) ====="
+
+for S in 1 2; do
+    PYTHONHASHSEED=$((S * 7)) run_exp "p9_ddp_3b_s${S}" "3B" 1 "DDP" 200 1 8 "--use_ac"
+    PYTHONHASHSEED=$((S * 7)) run_exp "p9_desloc_3b_s${S}" "3B" 32 "DESLOC" 200 1 8 "--use_ac"
+done
+
+# ===================================================================
+# Phase 10: 7B 最大模型 (2-seed, AC+bs=1+grad_accum=16)
+# H20 96GB: 7B + AC → ~69GB/GPU, bs=1 fits
+# 这是NeurIPS关键数据: 证明DES-LOC在7B scale下仍然有效
+# ===================================================================
+echo ""
+echo "===== Phase 10: 7B scale-up (2-seed, AC+bs=1) ====="
+
+for S in 1 2; do
+    PYTHONHASHSEED=$((S * 7)) run_exp "p10_ddp_7b_s${S}" "7B" 1 "DDP" 100 1 16 "--use_ac"
+    PYTHONHASHSEED=$((S * 7)) run_exp "p10_desloc_7b_s${S}" "7B" 32 "DESLOC" 100 1 16 "--use_ac"
+done
+
+# Phase 10b: 7B Kx消融 (1-seed only, 最贵实验)
+PYTHONHASHSEED=7 run_exp "p10b_desloc_7b_Kx64" "7B" 64 "DESLOC" 100 1 16 "--use_ac"
+
+# ===================================================================
+# Phase 11: Long-context (seq_len=2048, 700M, AC, 2-seed)
+# 证明DES-LOC在长序列下的通信reduction依然有效
+# ===================================================================
+echo ""
+echo "===== Phase 11: Long-context seq=2048 (700M, 2-seed) ====="
+
+for S in 1 2; do
+    PYTHONHASHSEED=$((S * 7)) run_exp "p11_ddp_700m_seq2048_s${S}" "700M" 1 "DDP" 200 2 4 "--use_ac --max_seq_len 2048"
+    PYTHONHASHSEED=$((S * 7)) run_exp "p11_desloc_700m_seq2048_s${S}" "700M" 32 "DESLOC" 200 2 4 "--use_ac --max_seq_len 2048"
+done
+
+# ===================================================================
 # 汇总
 # ===================================================================
 echo ""
@@ -245,7 +285,7 @@ for key in sorted(results.keys()):
     print(f'{key:<40} {len(runs):>3} {ml:>7.2f}±{sl:<5.2f} {mm:>9.4f}')
 
 # DDP vs DESLOC speedup
-for model in ['125M', '700M', '1.3B']:
+for model in ['125M', '700M', '1.3B', '3B', '7B']:
     dk = f'DDP_{model}_Kx1'
     lk = f'DESLOC_{model}_Kx32'
     if dk in results and lk in results:

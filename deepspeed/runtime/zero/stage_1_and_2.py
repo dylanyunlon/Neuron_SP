@@ -878,18 +878,144 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                 self._desloc_bucket_sizes[t] += bn
 
     def _desloc_reduce_tiered_gradients(self):
-        if not hasattr(self, "_desloc_grad_buckets"): self._desloc_build_gradient_buckets()
+        """Reduce gradients per tier with async dispatch and FP32 accumulation.
+
+        Ref: Megatron start_grad_sync (param_and_grad_buffer.py:568):
+             async_op = self.ddp_config.overlap_grad_reduce
+             → dispatch async reduces with stream overlap.
+        Ref: Megatron reduce_scatter_with_fp32_accumulation.py:
+             all_to_all → fp32 sum → downcast. We adapt to AllReduce.
+        Ref: neuronx-distributed _get_params_and_grad_norm
+             (zero_redundancy_optimizer.py:71): accumulate per-shard norms.
+        Ref: NCCL all_reduce.h Ring: batch larger messages for efficiency.
+        """
+        if not hasattr(self, "_desloc_grad_buckets"):
+            self._desloc_build_gradient_buckets()
         e = self.desloc_engine
-        if e is None: return
-        for tier in ("x","u","v"):
-            ok = (tier=="x" and e.desloc_should_sync_x()) or (tier=="u" and e.desloc_should_sync_u()) or (tier=="v" and e.desloc_should_sync_v())
-            if not ok: continue
+        if e is None:
+            return
+
+        # Lazy-init async tracking state
+        if not hasattr(self, '_desloc_async_handles'):
+            self._desloc_async_handles = []
+        if not hasattr(self, '_desloc_tier_norm_sq'):
+            self._desloc_tier_norm_sq = {'x': 0.0, 'u': 0.0, 'v': 0.0}
+        if not hasattr(self, '_desloc_comm_stream'):
+            try:
+                self._desloc_comm_stream = torch.cuda.Stream()
+            except Exception:
+                self._desloc_comm_stream = None
+
+        use_overlap = self.overlap_comm
+        use_fp32_accum = getattr(e, 'desloc_fp32_reduce', False)
+
+        for tier in ("x", "u", "v"):
+            should_sync = (
+                (tier == "x" and e.desloc_should_sync_x()) or
+                (tier == "u" and e.desloc_should_sync_u()) or
+                (tier == "v" and e.desloc_should_sync_v())
+            )
+
             for b in self._desloc_grad_buckets[tier]:
-                if b["done"]: continue
+                if b["done"]:
+                    continue
+
+                # Collect gradients into contiguous buffer for batched reduce
+                # (Megatron bucket pattern: single NCCL kernel per bucket)
+                grad_tensors = []
                 for p in b["params"]:
                     g = self.get_gradient_for_reduction(p)
-                    if g is not None: self.reduce_ready_partitions_and_remove_grads(p, b["gid"])
+                    if g is not None:
+                        grad_tensors.append(g)
+
+                if not grad_tensors:
+                    b["done"] = True
+                    continue
+
+                # Per-tier grad norm accumulation — neuronx-distributed pattern
+                for g in grad_tensors:
+                    self._desloc_tier_norm_sq[tier] += float(
+                        g.float().norm().item()) ** 2
+
+                if should_sync:
+                    for p in b["params"]:
+                        g = self.get_gradient_for_reduction(p)
+                        if g is None:
+                            continue
+
+                        if use_fp32_accum and g.dtype != torch.float32:
+                            # FP32 accumulation — Megatron pattern:
+                            # reduce in fp32 then downcast back
+                            fp32_g = g.float()
+                            if use_overlap and self._desloc_comm_stream is not None:
+                                self._desloc_comm_stream.wait_stream(
+                                    torch.cuda.current_stream())
+                                with torch.cuda.stream(self._desloc_comm_stream):
+                                    h = dist.all_reduce(
+                                        fp32_g, op=dist.ReduceOp.AVG,
+                                        group=self.dp_process_group,
+                                        async_op=True)
+                                self._desloc_async_handles.append(
+                                    (h, g, fp32_g))
+                            else:
+                                dist.all_reduce(
+                                    fp32_g, op=dist.ReduceOp.AVG,
+                                    group=self.dp_process_group)
+                                g.copy_(fp32_g)
+                        else:
+                            # Standard reduce — Megatron start_grad_sync:594
+                            if use_overlap and self._desloc_comm_stream is not None:
+                                self._desloc_comm_stream.wait_stream(
+                                    torch.cuda.current_stream())
+                                with torch.cuda.stream(self._desloc_comm_stream):
+                                    h = dist.all_reduce(
+                                        g, op=dist.ReduceOp.AVG,
+                                        group=self.dp_process_group,
+                                        async_op=True)
+                                self._desloc_async_handles.append(
+                                    (h, None, None))
+                            else:
+                                dist.all_reduce(
+                                    g, op=dist.ReduceOp.AVG,
+                                    group=self.dp_process_group)
+
+                        self.reduce_ready_partitions_and_remove_grads(
+                            p, b["gid"])
                 b["done"] = True
+
+    def _desloc_finish_async_reduces(self):
+        """Wait for outstanding async AllReduce handles.
+        Ref: Megatron param_and_grad_buffer.py:649 — finish_grad_sync."""
+        if not hasattr(self, '_desloc_async_handles'):
+            return
+        for h, dst, fp32 in self._desloc_async_handles:
+            if h is not None:
+                h.wait()
+            if dst is not None and fp32 is not None:
+                dst.copy_(fp32)
+        self._desloc_async_handles.clear()
+
+    def _desloc_get_tier_grad_norms(self, norm_type=2.0):
+        """Return per-tier gradient norms accumulated during reduce.
+        Ref: neuronx-distributed zero_redundancy_optimizer.py:71
+        Ref: Megatron clip_grads.py:55 — get_grad_norm_fp32"""
+        import math
+        if not hasattr(self, '_desloc_tier_norm_sq'):
+            return {'x': 0.0, 'u': 0.0, 'v': 0.0}
+        out = {}
+        for t in ('x', 'u', 'v'):
+            sq = self._desloc_tier_norm_sq[t]
+            if norm_type == 2.0:
+                out[t] = math.sqrt(sq)
+            elif norm_type == float('inf'):
+                out[t] = sq
+            else:
+                out[t] = sq ** (1.0 / norm_type) if sq > 0 else 0.0
+        return out
+
+    def _desloc_reset_tier_norms(self):
+        if hasattr(self, '_desloc_tier_norm_sq'):
+            self._desloc_tier_norm_sq = {'x': 0.0, 'u': 0.0, 'v': 0.0}
 
     def _desloc_reset_buckets(self):
         if hasattr(self, "_desloc_grad_buckets"):
