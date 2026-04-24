@@ -41,6 +41,71 @@ current_passes = None
 
 param_manager: Dict[int, DSGraphParamManager] = {}
 
+# =====================================================================
+# M343 — Claude-30: DES-LOC Compile Integration
+#
+# Register DES-LOC Kx gate awareness into the compile backend so that:
+# 1. The partitioner knows AllReduce is skipped on non-Kx steps
+# 2. The AC scheduler can co-optimize with comm reduction
+# 3. The profiler can distinguish SP comms from DEC comms
+#
+# DES-LOC gate state is propagated via compile_config dict:
+#   config.desloc_enabled = True/False
+#   config.desloc_Kx = sync period for parameters
+#   config.desloc_Ku = sync period for first moment
+#   config.desloc_Kv = sync period for second moment
+#
+# This is orthogonal to AutoSP passes:
+#   AutoSP passes: shard seq dim, insert All-to-All, shard labels
+#   DES-LOC gate: skip AllReduce on non-boundary steps
+#   Both can compose — AutoSP shards within step, DES-LOC gates across steps
+# =====================================================================
+
+# DES-LOC compile-time state (set by engine.py at compile time)
+_desloc_compile_state = {
+    'enabled': False,
+    'Kx': 1,
+    'Ku': 3,
+    'Kv': 6,
+    'step': 0,
+    'sp_mode': 'none',  # 'none', 'autosp', 'ulysses'
+}
+
+
+def set_desloc_compile_state(enabled=False, Kx=1, Ku=3, Kv=6, sp_mode='none'):
+    """Called by engine.py to propagate DES-LOC config to compile backend."""
+    _desloc_compile_state['enabled'] = enabled
+    _desloc_compile_state['Kx'] = Kx
+    _desloc_compile_state['Ku'] = Ku
+    _desloc_compile_state['Kv'] = Kv
+    _desloc_compile_state['sp_mode'] = sp_mode
+
+
+def get_desloc_compile_state():
+    """Query DES-LOC state from compile passes."""
+    return dict(_desloc_compile_state)
+
+
+def desloc_should_skip_allreduce(step=None):
+    """Check if AllReduce should be skipped at current compile step.
+
+    Used by compile passes to annotate the graph with DES-LOC gate info.
+    When enabled, gradient AllReduce nodes in the compiled graph can be
+    marked as 'conditionally skip' based on Kx boundary.
+    """
+    if not _desloc_compile_state['enabled']:
+        return False
+    s = step if step is not None else _desloc_compile_state['step']
+    Kx = _desloc_compile_state['Kx']
+    if Kx <= 1:
+        return False
+    return s % Kx != 0
+
+
+def advance_desloc_compile_step():
+    """Advance the compile-time step counter (called per engine.step)."""
+    _desloc_compile_state['step'] += 1
+
 
 class GraphOrder:
 

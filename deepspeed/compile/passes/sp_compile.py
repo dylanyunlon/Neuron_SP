@@ -238,14 +238,44 @@ def apply_autosp(gm: GraphModule,
                  passes: Optional[List[Callable]] = None,
                  sp_size: int = 2,
                  dp_size: int = 1):
-    """
-    Apply AutoSP (Ulysses) transformation passes to the graph and setup either DP/SP (2D) or SP (1D) mesh.
+    """Apply AutoSP (Ulysses) transformation passes to the computation graph.
+
+    M343 — Claude-30: SP+DEC composition documentation.
+
+    This function rewrites the FX graph to shard the sequence dimension
+    across sp_size GPUs. The transformation is ORTHOGONAL to DES-LOC:
+
+    What AutoSP does (compile-time, runs ONCE):
+      1. pass_shard_seq_dim: Replace full seq_len with seq_len/sp_size
+         in all shape computations that derive from the input sequence
+      2. pass_shard_input/label/position_ids: Split input tensors along
+         seq dim so each GPU gets a contiguous chunk
+      3. pass_insert_attention_all_to_all: Insert All-to-All ops around
+         SDPA attention to redistribute QKV from [B,N,S/P,H] to
+         [B,N/P,S,H] (sequence→head split) and back for output
+      4. pass_propagate_shapes: Update fake tensor metadata
+      5. pass_canonicalize: Dead code elimination + graph lint
+
+    What DES-LOC does (runtime, runs EVERY STEP):
+      engine.allreduce_gradients() checks step % Kx == 0:
+        - If True: AllReduce gradients across DP workers (standard sync)
+        - If False: Skip AllReduce (local step, no communication)
+
+    Why they compose correctly:
+      AutoSP's All-to-All happens WITHIN each step's forward/backward.
+      It redistributes activations for attention computation.
+      DES-LOC's AllReduce skip happens BETWEEN steps.
+      It controls how often workers share gradient updates.
+      The All-to-All is always executed (needed for correct attention).
+      The AllReduce is selectively skipped (DES-LOC's contribution).
 
     Args:
         gm: GraphModule to transform
         real_inputs: Example inputs for shape propagation
         debug: If True, print graph before/after each pass
-        passes: Optional custom list of passes (default: DEFAULT_PASSES)
+        passes: Optional custom list of passes (default: AUTOSP_PASSES)
+        sp_size: Sequence parallel degree (how many GPUs share a sequence)
+        dp_size: Data parallel degree (how many SP groups exist)
     """
     assert sp_size * dp_size <= dist.get_world_size(), 'Insufficient device count for mesh size'
 

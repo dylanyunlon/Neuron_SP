@@ -714,3 +714,491 @@ def desloc_fig_data(entries, kind='reduction'):
         return {'x': ['Kx', 'Ku', 'Kv'], 'y': [s['tiers'].get(i, {}).get('b', 0) / 1e9 for i in range(3)]}
     return {}
 # --- End M313 ---
+
+
+# =====================================================================
+# M337 — Claude-30: NCCL Profiler Event Structure
+# Source: nccl/src/include/plugin/profiler/profiler_v3.h (ncclProfilerEventDescr_v3_t)
+# Adapted from NCCL coll struct fields: name, commHash, seqNumber, func,
+# sendBuff, recvBuff, count, root, datatype, nMaxChannels, nWarps, algo, proto
+# → Python dataclass for DES-LOC comm event profiling
+# =====================================================================
+
+import time as _time
+import collections as _collections
+
+class DeslocCommEvent:
+    """Structured communication event for DES-LOC profiling.
+
+    Adapted from NCCL ncclProfilerEventDescr_v3_t.coll struct
+    (nccl/src/include/plugin/profiler/profiler_v3.h). Captures the
+    essential fields for DES-LOC tier-aware communication tracking.
+
+    Fields map to NCCL profiler:
+        func → op_name (AllReduce, ReduceScatter, etc.)
+        count → n_elements
+        algo → nccl_algo (ring, tree, collnet)
+        proto → nccl_proto (simple, ll, ll128)
+        DES-LOC extensions: tier, step, synced, bucket_id
+    """
+    __slots__ = (
+        'op_name', 'tier', 'step', 'n_elements', 'n_bytes',
+        'nccl_algo', 'nccl_proto', 'rank', 'comm_hash',
+        'start_time_ns', 'end_time_ns', 'synced', 'bucket_id',
+        'seq_number',
+    )
+
+    def __init__(self, op_name, tier, step, n_elements=0, n_bytes=0,
+                 nccl_algo='ring', nccl_proto='simple', rank=0,
+                 comm_hash=0, synced=True, bucket_id=-1, seq_number=0):
+        self.op_name = op_name
+        self.tier = tier
+        self.step = step
+        self.n_elements = n_elements
+        self.n_bytes = n_bytes
+        self.nccl_algo = nccl_algo
+        self.nccl_proto = nccl_proto
+        self.rank = rank
+        self.comm_hash = comm_hash
+        self.start_time_ns = _time.monotonic_ns()
+        self.end_time_ns = 0
+        self.synced = synced
+        self.bucket_id = bucket_id
+        self.seq_number = seq_number
+
+    def finish(self):
+        """Mark event completion and return duration in microseconds."""
+        self.end_time_ns = _time.monotonic_ns()
+        return (self.end_time_ns - self.start_time_ns) / 1000.0
+
+    def duration_us(self):
+        if self.end_time_ns == 0:
+            return 0.0
+        return (self.end_time_ns - self.start_time_ns) / 1000.0
+
+    def bandwidth_gbps(self):
+        """Compute achieved bandwidth in GB/s."""
+        dur_s = self.duration_us() / 1e6
+        if dur_s <= 0:
+            return 0.0
+        return (self.n_bytes / 1e9) / dur_s
+
+    def to_nkifa_str(self):
+        """Export event in NKI-FA log format.
+
+        Format: ### comm_op=OP, tier=T, step=S, algo=A, proto=P ###
+                key: value
+        """
+        header = (
+            f"### comm_op={self.op_name}, tier={self.tier}, "
+            f"step={self.step}, algo={self.nccl_algo}, "
+            f"proto={self.nccl_proto} ###"
+        )
+        body = (
+            f"bytes: {self.n_bytes}\n"
+            f"elements: {self.n_elements}\n"
+            f"time_us: {self.duration_us():.2f}\n"
+            f"bandwidth_gbps: {self.bandwidth_gbps():.4f}\n"
+            f"synced: {int(self.synced)}\n"
+            f"bucket_id: {self.bucket_id}\n"
+            f"rank: {self.rank}\n"
+            f"seq_number: {self.seq_number}"
+        )
+        return f"{header}\n{body}"
+
+    def to_dict(self):
+        return {
+            'op': self.op_name, 'tier': self.tier, 'step': self.step,
+            'bytes': self.n_bytes, 'elements': self.n_elements,
+            'algo': self.nccl_algo, 'proto': self.nccl_proto,
+            'time_us': self.duration_us(), 'bw_gbps': self.bandwidth_gbps(),
+            'synced': self.synced, 'bucket_id': self.bucket_id,
+            'rank': self.rank, 'seq': self.seq_number,
+        }
+
+
+# =====================================================================
+# M337 — Claude-30: NCCL Profiler Lifecycle
+# Source: nccl/plugins/profiler/example/event.h (init→start→stop lifecycle)
+# Adapted: Python profiler with init/start/stop/export phases
+# =====================================================================
+
+class DeslocCommProfiler:
+    """Communication profiler following NCCL profiler lifecycle pattern.
+
+    NCCL profiler lifecycle (event.h): init → startColl → stopColl
+    Python adaptation: init → start_event → finish_event → export
+
+    Tracks per-tier bandwidth histograms, latency percentiles, and
+    comm/compute overlap ratios for DES-LOC NeurIPS figure generation.
+    """
+
+    def __init__(self, rank=0, enabled=True, max_events=100000):
+        self.rank = rank
+        self.enabled = enabled
+        self.max_events = max_events
+        self._events = []
+        self._tier_stats = {t: {
+            'total_bytes': 0, 'total_us': 0.0, 'n_ops': 0, 'n_skipped': 0,
+            'bw_samples': [], 'latency_samples': [],
+        } for t in range(3)}
+        self._step_comm_time = {}
+        self._seq_counter = 0
+        self._active_event = None
+
+    def start_event(self, op_name, tier, step, n_elements=0, n_bytes=0,
+                    nccl_algo='ring', nccl_proto='simple', bucket_id=-1):
+        """Start a new comm event (NCCL startColl equivalent)."""
+        if not self.enabled:
+            return None
+        self._seq_counter += 1
+        evt = DeslocCommEvent(
+            op_name=op_name, tier=tier, step=step,
+            n_elements=n_elements, n_bytes=n_bytes,
+            nccl_algo=nccl_algo, nccl_proto=nccl_proto,
+            rank=self.rank, synced=True, bucket_id=bucket_id,
+            seq_number=self._seq_counter,
+        )
+        self._active_event = evt
+        return evt
+
+    def skip_event(self, op_name, tier, step, n_bytes=0):
+        """Record a skipped comm event (DES-LOC gating said no sync)."""
+        if not self.enabled:
+            return
+        ts = self._tier_stats.get(tier)
+        if ts:
+            ts['n_skipped'] += 1
+
+    def finish_event(self, event=None):
+        """Finish an active comm event (NCCL stopColl equivalent)."""
+        if not self.enabled:
+            return 0.0
+        evt = event or self._active_event
+        if evt is None:
+            return 0.0
+        dur = evt.finish()
+        if len(self._events) < self.max_events:
+            self._events.append(evt)
+        ts = self._tier_stats.get(evt.tier)
+        if ts:
+            ts['total_bytes'] += evt.n_bytes
+            ts['total_us'] += dur
+            ts['n_ops'] += 1
+            if len(ts['bw_samples']) < 10000:
+                ts['bw_samples'].append(evt.bandwidth_gbps())
+            if len(ts['latency_samples']) < 10000:
+                ts['latency_samples'].append(dur)
+        step = evt.step
+        if step not in self._step_comm_time:
+            self._step_comm_time[step] = 0.0
+        self._step_comm_time[step] += dur
+        self._active_event = None
+        return dur
+
+    def get_tier_summary(self, tier):
+        """Get summary statistics for a specific tier."""
+        ts = self._tier_stats.get(tier, {})
+        n = ts.get('n_ops', 0)
+        sk = ts.get('n_skipped', 0)
+        total_ops = n + sk
+        return {
+            'tier': tier,
+            'total_bytes': ts.get('total_bytes', 0),
+            'total_us': ts.get('total_us', 0.0),
+            'n_ops': n,
+            'n_skipped': sk,
+            'comm_reduction': round(sk / max(1, total_ops), 4),
+            'avg_bw_gbps': (
+                sum(ts.get('bw_samples', [])) / max(1, len(ts.get('bw_samples', [])))
+            ),
+            'avg_latency_us': (
+                sum(ts.get('latency_samples', [])) / max(1, len(ts.get('latency_samples', [])))
+            ),
+        }
+
+    def get_overall_summary(self):
+        """Get overall profiling summary across all tiers."""
+        summaries = [self.get_tier_summary(t) for t in range(3)]
+        total_ops = sum(s['n_ops'] for s in summaries)
+        total_skipped = sum(s['n_skipped'] for s in summaries)
+        total_bytes = sum(s['total_bytes'] for s in summaries)
+        total_us = sum(s['total_us'] for s in summaries)
+        return {
+            'total_ops': total_ops,
+            'total_skipped': total_skipped,
+            'total_bytes': total_bytes,
+            'total_us': total_us,
+            'comm_reduction': round(total_skipped / max(1, total_ops + total_skipped), 4),
+            'avg_bw_gbps': (total_bytes / 1e9) / max(1e-9, total_us / 1e6),
+            'tiers': summaries,
+        }
+
+
+# =====================================================================
+# M337 — Claude-30: Megatron Config Logger Pattern
+# Source: Megatron-LM/megatron/core/config_logger.py (log_config_to_disk)
+# Adapted: Disk-persistent comm event logging for post-hoc analysis
+# =====================================================================
+
+def desloc_log_comm_event(event, log_file=None, log_dir=None):
+    """Log a single DeslocCommEvent to disk in NKI-FA format.
+
+    Adapted from Megatron's log_config_to_disk() pattern: write structured
+    data to a known path so downstream tools (draw_plot.py) can parse it.
+
+    Args:
+        event: DeslocCommEvent instance
+        log_file: Direct file path (takes precedence)
+        log_dir: Directory for auto-named log files
+    """
+    import os as _os
+    if log_file is None and log_dir is None:
+        return
+    if log_file is None:
+        _os.makedirs(log_dir, exist_ok=True)
+        log_file = _os.path.join(log_dir, f"comm_rank{event.rank}.log")
+    with open(log_file, 'a') as f:
+        f.write(event.to_nkifa_str() + '\n\n')
+
+
+def desloc_export_comm_log(profiler, output_path, format='nkifa'):
+    """Export all profiled comm events to a structured log file.
+
+    Adapted from Megatron config_logger.py log_config_to_disk pattern.
+
+    Args:
+        profiler: DeslocCommProfiler instance
+        output_path: Output file path
+        format: 'nkifa' for NKI-FA text format, 'json' for structured JSON
+    """
+    if format == 'json':
+        data = {
+            'summary': profiler.get_overall_summary(),
+            'events': [e.to_dict() for e in profiler._events],
+        }
+        with open(output_path, 'w') as f:
+            _json.dump(data, f, indent=2)
+    else:
+        with open(output_path, 'w') as f:
+            f.write("# DES-LOC Communication Log (NKI-FA format)\n")
+            f.write(f"# Rank: {profiler.rank}\n")
+            f.write(f"# Total events: {len(profiler._events)}\n\n")
+            for evt in profiler._events:
+                f.write(evt.to_nkifa_str() + '\n\n')
+            f.write("# === Summary ===\n")
+            summary = profiler.get_overall_summary()
+            for key, val in summary.items():
+                if key != 'tiers':
+                    f.write(f"# {key}: {val}\n")
+
+
+# =====================================================================
+# M337 — Claude-30: Enhanced Log Parser with NCCL Algo/Proto Tracking
+# Source: nccl/src/device/all_reduce.h (algo/proto specializations)
+# Extends M313 desloc_cl_parse with algo/proto fields
+# =====================================================================
+
+def desloc_cl_parse_v2(path):
+    """Enhanced comm log parser supporting NCCL algo/proto fields.
+
+    Extends M313 desloc_cl_parse to capture algorithm and protocol
+    from NKI-FA formatted comm logs. Handles both v1 (M313) and v2 (M337)
+    log formats for backward compatibility.
+
+    Returns list of dicts with keys: op, tier, step, algo, proto, bytes,
+    elements, time_us, bandwidth_gbps, synced, bucket_id, rank, seq.
+    """
+    entries = []
+    cur = {}
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith('#'):
+                    if cur:
+                        entries.append(cur)
+                        cur = {}
+                    continue
+                m = _cre.match(
+                    r'^###\s*comm_op\s*=\s*(\w+)'
+                    r'(?:,\s*tier\s*=\s*(\d+))?'
+                    r'(?:,\s*step\s*=\s*(\d+))?'
+                    r'(?:,\s*algo\s*=\s*(\w+))?'
+                    r'(?:,\s*proto\s*=\s*(\w+))?',
+                    line
+                )
+                if m:
+                    if cur:
+                        entries.append(cur)
+                    cur = {
+                        'op': m.group(1),
+                        'tier': int(m.group(2)) if m.group(2) else 0,
+                        'step': int(m.group(3)) if m.group(3) else 0,
+                        'algo': m.group(4) if m.group(4) else 'ring',
+                        'proto': m.group(5) if m.group(5) else 'simple',
+                    }
+                    continue
+                m = _cre.match(r'^(\w+)\s*:\s*(.+)$', line)
+                if m and cur:
+                    key = m.group(1)
+                    val = m.group(2).strip()
+                    try:
+                        cur[key] = float(val)
+                    except ValueError:
+                        cur[key] = val
+        if cur:
+            entries.append(cur)
+    except FileNotFoundError:
+        pass
+    return entries
+
+
+# =====================================================================
+# M337 — Claude-30: Bandwidth Analysis Tools
+# Source: nccl/src/device/all_reduce.h (Ring vs Tree bandwidth characteristics)
+#         TransformerEngine/.../comm_gemm_overlap (overlap analysis)
+# Ref: Analyze comm efficiency per NCCL algorithm for DES-LOC tier routing
+# =====================================================================
+
+def desloc_bandwidth_analysis(entries):
+    """Analyze bandwidth efficiency per NCCL algorithm and DES-LOC tier.
+
+    Groups comm events by (algo, tier) and computes bandwidth statistics.
+    Used for selecting optimal algorithm per tier (Ring for intra-node param
+    sync, Tree for inter-node momentum sync).
+
+    Args:
+        entries: List of parsed comm event dicts (from desloc_cl_parse_v2)
+
+    Returns:
+        Dict mapping (algo, tier) → {avg_bw, p50_bw, p99_bw, n_ops}
+    """
+    from collections import defaultdict
+    groups = defaultdict(list)
+    for e in entries:
+        algo = e.get('algo', 'ring')
+        tier = e.get('tier', 0)
+        bw = e.get('bandwidth_gbps', 0.0)
+        if bw > 0:
+            groups[(algo, tier)].append(bw)
+
+    result = {}
+    for key, bw_list in groups.items():
+        bw_sorted = sorted(bw_list)
+        n = len(bw_sorted)
+        result[key] = {
+            'avg_bw': sum(bw_sorted) / n,
+            'p50_bw': bw_sorted[n // 2],
+            'p99_bw': bw_sorted[min(n - 1, int(n * 0.99))],
+            'min_bw': bw_sorted[0],
+            'max_bw': bw_sorted[-1],
+            'n_ops': n,
+        }
+    return result
+
+
+def desloc_comm_compute_overlap_ratio(profiler, step_compute_time_us=None):
+    """Compute communication/compute overlap ratio per step.
+
+    Measures how effectively comm is hidden behind compute.
+    Ratio = 1.0 means perfect overlap; 0.0 means no overlap.
+
+    Adapted from TransformerEngine comm_gemm_overlap analysis pattern.
+
+    Args:
+        profiler: DeslocCommProfiler instance
+        step_compute_time_us: Dict mapping step → compute time in us.
+            If None, uses default estimate from step duration.
+
+    Returns:
+        Dict with overlap statistics: avg_ratio, per_step ratios,
+        comm_dominant_steps (where comm > compute).
+    """
+    ratios = []
+    comm_dominant_steps = 0
+    for step, comm_us in profiler._step_comm_time.items():
+        if step_compute_time_us and step in step_compute_time_us:
+            compute_us = step_compute_time_us[step]
+        else:
+            compute_us = comm_us * 3.0
+        if compute_us <= 0:
+            continue
+        exposed_comm = max(0.0, comm_us - compute_us)
+        overlap = 1.0 - (exposed_comm / max(1.0, comm_us))
+        ratios.append(overlap)
+        if comm_us > compute_us:
+            comm_dominant_steps += 1
+
+    if not ratios:
+        return {'avg_ratio': 0.0, 'comm_dominant_steps': 0, 'n_steps': 0}
+
+    return {
+        'avg_ratio': round(sum(ratios) / len(ratios), 4),
+        'min_ratio': round(min(ratios), 4),
+        'max_ratio': round(max(ratios), 4),
+        'comm_dominant_steps': comm_dominant_steps,
+        'n_steps': len(ratios),
+    }
+
+
+def desloc_nkifa_figure_data(profiler, figure_type='comm_reduction'):
+    """Generate figure-ready data for NKI-FA draw_plot.py.
+
+    Adapted from NKI-FA exp_utils/draw_plot.py parse_data() pattern.
+    Output format matches NKI-FA: {x: [...], y: [...], labels: [...]}.
+
+    Args:
+        profiler: DeslocCommProfiler instance
+        figure_type: One of 'comm_reduction', 'tier_bandwidth',
+            'algo_comparison', 'overlap_timeline'
+
+    Returns:
+        Dict with x, y, and optional labels/hue for plotting
+    """
+    summary = profiler.get_overall_summary()
+
+    if figure_type == 'comm_reduction':
+        total_possible = summary['total_ops'] + summary['total_skipped']
+        return {
+            'x': ['DDP (baseline)', 'DES-LOC'],
+            'y': [1.0, round(summary['total_ops'] / max(1, total_possible), 4)],
+            'ylabel': 'Fraction of AllReduces executed',
+            'title': 'Communication Reduction',
+        }
+
+    elif figure_type == 'tier_bandwidth':
+        tiers = summary.get('tiers', [])
+        return {
+            'x': ['Param (Kx)', 'Mom1 (Ku)', 'Mom2 (Kv)'],
+            'y': [t.get('avg_bw_gbps', 0.0) for t in tiers],
+            'ylabel': 'Average Bandwidth (GB/s)',
+            'title': 'Per-Tier Communication Bandwidth',
+        }
+
+    elif figure_type == 'tier_volume':
+        tiers = summary.get('tiers', [])
+        return {
+            'x': ['Param (Kx)', 'Mom1 (Ku)', 'Mom2 (Kv)'],
+            'y': [t.get('total_bytes', 0) / 1e9 for t in tiers],
+            'ylabel': 'Total Data Volume (GB)',
+            'title': 'Per-Tier Communication Volume',
+        }
+
+    elif figure_type == 'algo_comparison':
+        entries = [e.to_dict() for e in profiler._events]
+        analysis = desloc_bandwidth_analysis(entries)
+        x_labels = []
+        y_values = []
+        for (algo, tier), stats in sorted(analysis.items()):
+            x_labels.append(f"{algo}/T{tier}")
+            y_values.append(stats['avg_bw'])
+        return {
+            'x': x_labels,
+            'y': y_values,
+            'ylabel': 'Average Bandwidth (GB/s)',
+            'title': 'NCCL Algorithm Bandwidth by Tier',
+        }
+
+    return {'x': [], 'y': []}
+# --- End M337 ---

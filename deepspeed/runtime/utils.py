@@ -1746,27 +1746,33 @@ def desloc_recommend_periods(beta1, beta2, Kx):
 
 def desloc_comm_reduction_ratio(Kx, Ku, Kv, total_steps,
                                 n_params=0, dtype_bytes=2):
-    """Communication reduction of DES-LOC vs DDP."""
-    msg = max(1, n_params * dtype_bytes)
-    ops_x = total_steps // max(1, Kx)
-    ops_u = total_steps // max(1, Ku)
-    ops_v = total_steps // max(1, Kv)
-    desloc_total = (ops_x + ops_u + ops_v) * msg
-    ddp_total = total_steps * 3 * msg
-    reduction = ddp_total / max(1, desloc_total)
-    savings = 100.0 * (1.0 - desloc_total / max(1, ddp_total))
-    return {
-        'desloc_bytes': desloc_total, 'ddp_bytes': ddp_total,
-        'reduction_x': round(reduction, 4), 'savings_pct': round(savings, 2),
-    }
+    """Communication reduction ratio of DES-LOC vs DDP.
 
-    return {
-        'desloc_bytes': desloc_total,
-        'ddp_bytes': ddp_total,
-        'reduction_x': round(reduction, 4),
-        'savings_pct': round(savings, 2),
-        'ops_x': ops_x, 'ops_u': ops_u, 'ops_v': ops_v,
-    }
+    Returns float: ddp_syncs / desloc_syncs (e.g. 10.5 means 10.5× fewer).
+    Accounts for warmup ramp (Kx gradually increases from 1 to target)
+    and v piggybacking on x syncs (M335 schedule).
+
+    Called by REAL_GPU_BENCHMARK.py:1401 and formatted as f'{comm_red:.2f}x'.
+    """
+    if Kx <= 1 and Ku <= 1 and Kv <= 1:
+        return 1.0
+    ddp_syncs = total_steps * 3.0
+    warmup = min(100, Kx * 3)
+    sx_total, su_total, sv_total = 0, 0, 0
+    for s in range(1, total_steps + 1):
+        if s <= warmup:
+            frac = s / max(warmup, 1)
+            eKx = max(1, int(1 + (Kx - 1) * frac))
+        else:
+            eKx = Kx
+        sx = (eKx <= 1) or (s % eKx == 0)
+        su = (Ku <= 1) or (s % Ku == 0)
+        sv = (Kv <= 1) or (s % Kv == 0) or sx
+        sx_total += int(sx)
+        su_total += int(su)
+        sv_total += int(sv)
+    desloc_syncs = sx_total + su_total + sv_total
+    return ddp_syncs / max(desloc_syncs, 1)
 
 
 def desloc_local_adam_comm_bytes(n_params, Kx, total_steps, dtype_bytes=4):
@@ -1777,6 +1783,62 @@ def desloc_local_adam_comm_bytes(n_params, Kx, total_steps, dtype_bytes=4):
     msg = n_params * dtype_bytes
     ops = (total_steps // max(1, Kx)) * 3
     return ops * msg
+
+
+def desloc_comm_bytes(n_params, Kx, Ku, Kv, steps, sizeof=2):
+    """Per-worker communication bytes for DES-LOC training.
+
+    Computes the total bytes sent by each worker across all AllReduce ops,
+    accounting for the 3-tier sync schedule:
+      - x (gradients): sync every Kx steps, with warmup ramp
+      - u (momentum):  sync every Ku steps (no warmup ramp, M335 fix)
+      - v (variance):  sync every Kv steps, OR piggyback on x sync
+
+    Ring-AllReduce factor: each sync sends 2 * n_params * sizeof bytes
+    (bandwidth-optimal ring: 2*(W-1)/W ≈ 2 for large W).
+
+    Args:
+        n_params: total model parameter count
+        Kx: gradient sync period
+        Ku: momentum sync period
+        Kv: variance sync period
+        steps: total training steps
+        sizeof: bytes per parameter element (2 for bf16/fp16, 4 for fp32)
+
+    Returns:
+        dict with 'desloc_total', 'ddp_total', 'reduction_x', 'savings_pct',
+        'sync_count_x', 'sync_count_u', 'sync_count_v'
+    """
+    warmup = min(100, Kx * 3)
+    sync_x, sync_u, sync_v = 0, 0, 0
+    for s in range(1, steps + 1):
+        # Warmup ramp for Kx: gradually increase from 1 to Kx
+        if s <= warmup:
+            frac = s / max(warmup, 1)
+            eKx = max(1, int(1 + (Kx - 1) * frac))
+        else:
+            eKx = Kx
+        sx = (eKx <= 1) or (s % eKx == 0)
+        su = (Ku <= 1) or (s % Ku == 0)         # M335: always use Ku_target
+        sv = (Kv <= 1) or (s % Kv == 0) or sx   # v piggybacks on x
+        sync_x += int(sx)
+        sync_u += int(su)
+        sync_v += int(sv)
+    total_syncs = sync_x + sync_u + sync_v
+    bytes_per_sync = n_params * sizeof * 2  # ring allreduce factor
+    desloc_total = total_syncs * bytes_per_sync
+    ddp_total = steps * 3 * bytes_per_sync  # DDP: 3 syncs (x,u,v) every step
+    reduction = ddp_total / max(1, desloc_total)
+    savings = 100.0 * (1.0 - desloc_total / max(1, ddp_total))
+    return {
+        'desloc_total': desloc_total,
+        'ddp_total': ddp_total,
+        'reduction_x': round(reduction, 4),
+        'savings_pct': round(savings, 2),
+        'sync_count_x': sync_x,
+        'sync_count_u': sync_u,
+        'sync_count_v': sync_v,
+    }
 
 
 def desloc_parse_nkifa_logfile(filepath):
