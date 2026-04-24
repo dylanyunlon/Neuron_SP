@@ -1,0 +1,33 @@
+{
+  "timestamp": "20260422_093226",
+  "config": {
+    "model_size": "125M",
+    "batch_size": 4,
+    "gradient_accumulation": 1,
+    "max_steps": 2,
+    "max_seq_len": 1024,
+    "learning_rate": 0.0006,
+    "Kx": 1,
+    "Ku": 1,
+    "Kv": 1
+  },
+  "results": {
+    "DDP": {
+      "final_loss": 11.120534896850586,
+      "avg_loss": 11.028379440307617,
+      "total_time_seconds": 0.7390651702880859,
+      "tokens_per_second_per_gpu": 11084.272848099143,
+      "tokens_per_second_cluster": 11084.272848099143,
+      "peak_memory_gb": 9.309656064,
+      "mfu": 0.026507796367499187,
+      "gpu_name": "NVIDIA A100 80GB PCIe",
+      "sync_counts": {
+        "all": 2
+      },
+      "losses": [
+        10.936223983764648,
+        11.120534896850586
+      ]
+    }
+  }
+}

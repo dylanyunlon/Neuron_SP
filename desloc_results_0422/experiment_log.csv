@@ -1,0 +1,9 @@
+run_id,tag,model,Kx,Ku,Kv,seed,method,exit_code,elapsed_s
+1,mgpu,125M,1,1,1,42,DDP,0,151
+1,baseline,125M,1,1,1,42,DDP,0,638
+2,desloc,125M,32,96,192,42,DESLOC,0,555
+3,local,125M,32,32,32,42,LocalAdam,0,555
+4,baseline,125M,1,1,1,137,DDP,0,639
+5,desloc,125M,32,96,192,137,DESLOC,0,554
+6,local,125M,32,32,32,137,LocalAdam,0,555
+7,baseline,125M,1,1,1,2024,DDP,0,638
