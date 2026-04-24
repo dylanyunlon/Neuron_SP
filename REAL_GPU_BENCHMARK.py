@@ -30,7 +30,7 @@ from torch.utils.data import DataLoader, Dataset, DistributedSampler
 try:
     from torch.amp import autocast as _autocast_cls
     def autocast():
-        return _autocast_cls('cuda')
+        return _autocast_cls('cuda', dtype=torch.bfloat16)
 except ImportError:
     from torch.cuda.amp import autocast
 
@@ -226,6 +226,8 @@ class TrainingConfig:
             "700M": {"n_layer": 36, "n_head": 20, "n_embd": 1280},
             "1.3B": {"n_layer": 24, "n_head": 16, "n_embd": 2048},
             "1.7B": {"n_layer": 24, "n_head": 16, "n_embd": 2304},
+            "3B": {"n_layer": 32, "n_head": 32, "n_embd": 3200},
+            "7B": {"n_layer": 32, "n_head": 32, "n_embd": 4096},
         }
         assert self.model_size in configs, f"Unknown model size: {self.model_size}"
         return configs[self.model_size]
@@ -1067,6 +1069,19 @@ class Trainer:
             use_ac=config.use_activation_checkpointing,
             **model_config
         ).to(self.device)
+
+        # BF16 model parameters for memory efficiency on large models
+        # Ref: Megatron training.py:1431 — Float16Module wraps model in BF16
+        # before DDP. This halves param memory (7B: 26.6GB→13.3GB) and is
+        # required to fit 7B in 95GB H20 with Adam states.
+        # BF16 has 8 exponent bits (same as FP32) so no GradScaler needed.
+        n_params = sum(p.numel() for p in self.model.parameters())
+        if n_params > 500_000_000:  # > 500M params → use BF16
+            self.model = self.model.bfloat16()
+            if self.rank == 0:
+                print(f"[BF16] Model converted to bfloat16 ({n_params/1e6:.0f}M params, "
+                      f"saves {n_params * 2 / 1e9:.1f}GB)")
+
         if config.use_activation_checkpointing and self.rank == 0:
             print(f"[AC] Layer-wise activation checkpointing enabled "
                   f"({model_config.get('n_layer', '?')} layers)")
@@ -1202,7 +1217,13 @@ class Trainer:
                           "data-parallel DES-LOC evaluation")
 
         # Gradient scaler for non-deepspeed paths
-        self.scaler = torch.amp.GradScaler('cuda') if not self.use_deepspeed else None
+        # BF16 has same dynamic range as FP32 (8 exponent bits) → no scaling needed
+        # Ref: Megatron training.py — GradScaler only used with FP16, not BF16
+        _model_is_bf16 = next(self.model.parameters()).dtype == torch.bfloat16
+        if _model_is_bf16:
+            self.scaler = None
+        else:
+            self.scaler = torch.amp.GradScaler('cuda') if not self.use_deepspeed else None
 
         # Metrics
         self.metrics = {
@@ -1508,13 +1529,17 @@ class Trainer:
                     _, loss = self.model(input_ids, labels)
                     loss = loss / self.config.gradient_accumulation
 
-                self.scaler.scale(loss).backward()
+                self.scaler.scale(loss).backward() if self.scaler else loss.backward()
                 accumulated_loss += loss.item()
 
-            self.scaler.unscale_(self.optimizer)
+            if self.scaler:
+                self.scaler.unscale_(self.optimizer)
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip)
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
+            if self.scaler:
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+            else:
+                self.optimizer.step()
             self.optimizer.zero_grad(set_to_none=True)
 
             # DES-LOC / LocalAdam sync — the "DEC" part of SP+DEC
@@ -1909,7 +1934,7 @@ def save_results(results: Dict, config: TrainingConfig):
 
 def main():
     parser = argparse.ArgumentParser(description='DES-LOC Real GPU Benchmark')
-    parser.add_argument('--model_size', type=str, default='125M', choices=['125M', '350M', '700M', '1.3B', '1.7B'])
+    parser.add_argument('--model_size', type=str, default='125M', choices=['125M', '350M', '700M', '1.3B', '1.7B', '3B', '7B'])
     parser.add_argument('--batch_size', type=int, default=4)
     parser.add_argument('--grad_accum', type=int, default=8)
     parser.add_argument('--max_steps', type=int, default=1000)
