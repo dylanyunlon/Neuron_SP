@@ -2641,3 +2641,119 @@ def desloc_savings(Kx, Ku, Kv, steps, mp):
     pb = mp * 2; ddp = 3 * pb * steps; dl = pb * (steps / max(1, Kx) + steps / max(1, Ku) + steps / max(1, Kv))
     return {'ddp_gb': round(ddp / 1e9, 2), 'dl_gb': round(dl / 1e9, 2), 'red': round(ddp / max(1, dl), 2)}
 # --- End M305 ---
+
+import math as _m348
+
+class DeslocAdaptiveKxController:
+    def __init__(self, initial_Kx=32, Kx_min=1, Kx_max=256,
+                 loss_window=200, conv_thr=0.005, stall_patience=500,
+                 ku_ratio=3, kv_ratio=6):
+        self.Kx = initial_Kx
+        self.Kx_min = Kx_min
+        self.Kx_max = Kx_max
+        self.loss_window = loss_window
+        self.conv_thr = conv_thr
+        self.stall_patience = stall_patience
+        self.ku_ratio = ku_ratio
+        self.kv_ratio = kv_ratio
+        self._losses = []
+        self._stall_count = 0
+        self._since_stall = 0
+        self._adj_log = []
+        self._step = 0
+
+    @property
+    def Ku(self):
+        return max(self.Kx, self.Kx * self.ku_ratio)
+
+    @property
+    def Kv(self):
+        return max(self.Ku, self.Kx * self.kv_ratio)
+
+    def record_loss(self, loss):
+        if _m348.isfinite(loss):
+            self._losses.append(loss)
+            if len(self._losses) > self.loss_window * 3:
+                self._losses = self._losses[-self.loss_window * 2:]
+
+    def record_stall(self, step):
+        self._stall_count += 1
+        self._since_stall = 0
+
+    def _conv_rate(self):
+        w = self.loss_window
+        if len(self._losses) < w * 2:
+            return None
+        older = self._losses[-w * 2:-w]
+        newer = self._losses[-w:]
+        ao = sum(older) / len(older)
+        an = sum(newer) / len(newer)
+        if ao <= 0:
+            return None
+        return (ao - an) / ao
+
+    def adjust(self, step, stall_count=None):
+        self._step = step
+        self._since_stall += 1
+        if stall_count is not None and stall_count > self._stall_count:
+            self._stall_count = stall_count
+            self._since_stall = 0
+        if self.Kx > 1 and step % self.Kx != 0:
+            return {'Kx': self.Kx, 'Ku': self.Ku, 'Kv': self.Kv, 'action': 'hold'}
+        prev = self.Kx
+        cr = self._conv_rate()
+        action = 'hold'
+        if self._since_stall < self.stall_patience:
+            if self.Kx > self.Kx_min:
+                self.Kx = max(self.Kx_min, self.Kx // 2)
+                action = 'reduce_stall'
+        elif cr is not None and cr < self.conv_thr:
+            if self.Kx > self.Kx_min:
+                self.Kx = max(self.Kx_min, self.Kx // 2)
+                action = 'reduce_conv'
+        elif (cr is not None and cr > self.conv_thr * 3
+              and self._since_stall > self.stall_patience):
+            if self.Kx < self.Kx_max:
+                self.Kx = min(self.Kx_max, self.Kx * 2)
+                action = 'increase'
+        if action != 'hold':
+            self._adj_log.append({'step': step, 'act': action, 'old': prev, 'new': self.Kx})
+        return {'Kx': self.Kx, 'Ku': self.Ku, 'Kv': self.Kv, 'action': action}
+
+    def state_dict(self):
+        return {'Kx': self.Kx, 'step': self._step, 'stalls': self._stall_count,
+                'losses': self._losses[-self.loss_window:], 'log': self._adj_log[-50:]}
+
+    def load_state_dict(self, d):
+        self.Kx = d.get('Kx', self.Kx)
+        self._step = d.get('step', 0)
+        self._stall_count = d.get('stalls', 0)
+        self._losses = d.get('losses', [])
+        self._adj_log = d.get('log', [])
+
+
+def desloc_per_bucket_grad_norm_fp32(buckets, norm_type=2.0, dp_group=None):
+    import torch
+    norms = []
+    for bucket in buckets:
+        params = bucket.get('params', [])
+        grads = [p.grad.detach().float() for p in params if p.grad is not None]
+        if not grads:
+            norms.append(0.0)
+            continue
+        if norm_type == 2.0:
+            sq = sum(g.norm(2.0).item() ** 2 for g in grads)
+            norms.append(sq ** 0.5)
+        elif norm_type == float('inf'):
+            norms.append(max(g.abs().max().item() for g in grads))
+        else:
+            ps = sum(g.norm(norm_type).item() ** norm_type for g in grads)
+            norms.append(ps ** (1.0 / norm_type))
+    if dp_group is not None:
+        import torch.distributed as dist
+        dev = 'cuda' if torch.cuda.is_available() else 'cpu'
+        nt = torch.tensor(norms, dtype=torch.float32, device=dev)
+        dist.all_reduce(nt, op=dist.ReduceOp.SUM, group=dp_group)
+        nt.div_(dist.get_world_size(group=dp_group))
+        norms = nt.tolist()
+    return norms

@@ -1465,3 +1465,68 @@ def desloc_pipe_time(ns, nm, cmp, cmm, Kx=32):
     pt = (2 * ns - 2 + nm - ns + 1) * cmp; gar = cmm * 10 / max(1, Kx)
     return {'pipe': round(pt, 4), 'gar': round(gar, 4), 'tot': round(pt + gar, 4), 'bub%': round(100 * (ns - 1) / (nm + ns - 1), 2)}
 # --- End M310 ---
+
+
+class DeslocPipeKxGradSync:
+    def __init__(self, num_stages, Kx=32, warmup=5, dp_group=None):
+        self.num_stages = num_stages
+        self.Kx = max(1, Kx)
+        self.warmup = warmup
+        self.dp_group = dp_group
+        self._step = 0
+        self._dp_syncs = 0
+        self._dp_skips = 0
+
+    def should_dp_reduce(self, step=None):
+        if step is None:
+            step = self._step
+        if step < self.warmup or self.Kx <= 1:
+            return True
+        return step % self.Kx == 0
+
+    def on_backward_complete(self, gradients, step=None):
+        if step is None:
+            step = self._step
+        if not self.should_dp_reduce(step):
+            self._dp_skips += 1
+            return []
+        self._dp_syncs += 1
+        handles = []
+        import torch.distributed as _dist
+        for g in gradients:
+            if g is None:
+                continue
+            h = _dist.all_reduce(g, op=_dist.ReduceOp.SUM,
+                                group=self.dp_group, async_op=True)
+            handles.append(h)
+        return handles
+
+    def step(self):
+        self._step += 1
+
+    def get_stats(self):
+        total = self._dp_syncs + self._dp_skips
+        return {'step': self._step, 'dp_syncs': self._dp_syncs, 'dp_skips': self._dp_skips,
+                'red%': round(100.0 * self._dp_skips / max(1, total), 2)}
+
+
+def desloc_pipe_1f1b_kx_aware(ns, nm, Kx=32, step=0, warmup=5):
+    base = desloc_1f1b(ns, nm)
+    do_sync = step < warmup or Kx <= 1 or step % Kx == 0
+    for i, entry in enumerate(base):
+        is_last_b = entry['d'] == 'B' and (i == len(base) - 1 or base[i + 1]['d'] != 'B')
+        entry['dp_sync'] = do_sync and is_last_b
+    return base
+
+
+def desloc_pipe_bubble(ns, nm, Kx=32, fwd=10.0, bwd=20.0, comm=1.0):
+    compute = nm * (fwd + bwd)
+    bubble = (ns - 1) * (fwd + bwd)
+    p2p = 2 * (ns - 1) * comm * 0.1
+    dp_ar = comm / max(1, Kx)
+    actual = compute + bubble + p2p + dp_ar
+    return {'compute': round(compute, 2), 'bubble': round(bubble, 2),
+            'p2p': round(p2p, 2), 'dp_ar': round(dp_ar, 2),
+            'total': round(actual, 2),
+            'eff': round(compute / max(actual, 1e-6), 4),
+            'bub%': round(100 * bubble / max(actual, 1e-6), 2)}

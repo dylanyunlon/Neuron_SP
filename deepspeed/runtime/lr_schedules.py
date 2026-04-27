@@ -973,3 +973,68 @@ def desloc_psi_lr(lr,Kx,Ku,b1=.9,w=.1):
     px,pu=1./max(1,Kx),1./max(1,Ku);n=4*(1-px)*(1-b1)*(1-pu);d=px*px*6*(1-(1-pu)*b1)
     psi=n/d if abs(d)>1e-15 else 0;return lr/_m294.sqrt(1+w*psi)
 # M294: end
+
+
+class DeslocWSDKxAligned:
+    def __init__(self, lr_max=6e-4, warmup=512, stable=4000, decay=5000,
+                 lr_min=6e-5, Kx=32, style='cosine', restarts=0):
+        self.lr_max = lr_max
+        self.lr_min = lr_min
+        self.Kx = max(1, Kx)
+        self.style = style
+        self.restarts = restarts
+        self.warmup_end = self._align(warmup)
+        self.stable_end = self._align(warmup + stable)
+        self.total = self._align(warmup + stable + decay)
+        self.decay_len = self.total - self.stable_end
+        self._step = 0
+        self._lr = 0.0
+        self._phase = 'warmup'
+
+    def _align(self, s):
+        if self.Kx <= 1:
+            return s
+        return ((s + self.Kx - 1) // self.Kx) * self.Kx
+
+    def step(self, stability_ok=True):
+        self._step += 1
+        if self._step <= self.warmup_end:
+            self._phase = 'warmup'
+            self._lr = self.lr_max * self._step / max(1, self.warmup_end)
+        elif self._step <= self.stable_end:
+            self._phase = 'stable'
+            self._lr = self.lr_max
+        elif self._step <= self.total:
+            self._phase = 'decay'
+            p = (self._step - self.stable_end) / max(1, self.decay_len)
+            p = min(1.0, p)
+            if self.style == 'cosine':
+                if self.restarts > 0:
+                    cp = (p * (self.restarts + 1)) % 1.0
+                    self._lr = self.lr_min + (self.lr_max - self.lr_min) * (1 + _m294.cos(_m294.pi * cp)) / 2
+                else:
+                    self._lr = self.lr_min + (self.lr_max - self.lr_min) * (1 + _m294.cos(_m294.pi * p)) / 2
+            elif self.style == 'linear':
+                self._lr = self.lr_max - (self.lr_max - self.lr_min) * p
+            else:
+                self._lr = max(self.lr_min, self.lr_max * _m294.exp(-3 * p))
+        else:
+            self._phase = 'done'
+            self._lr = self.lr_min
+        return self._lr
+
+    @property
+    def lr(self):
+        return self._lr
+
+    def effective_Kx(self):
+        return 1 if self._phase == 'warmup' else self.Kx
+
+    def state_dict(self):
+        return {'step': self._step, 'lr': self._lr, 'phase': self._phase,
+                'we': self.warmup_end, 'se': self.stable_end, 'tot': self.total}
+
+    def load_state_dict(self, d):
+        self._step = d.get('step', 0)
+        self._lr = d.get('lr', 0)
+        self._phase = d.get('phase', 'warmup')

@@ -747,6 +747,70 @@ class DeslocFusedAdam(torch.optim.Optimizer):
         if clipper_state:
             self.coord_clipper.load_state_dict(clipper_state)
 
+    def adaptive_rho_clip(self, params, step=None):
+        if step is None:
+            step = self._global_step
+        rho = getattr(self, '_rho', 1.0)
+        if rho <= 0:
+            return {}
+        if not hasattr(self, '_grad_ema'):
+            self._grad_ema = {}
+        alpha = 0.05
+        stats = {0: [0, 0], 1: [0, 0], 2: [0, 0]}
+        for p in params:
+            if p.grad is None:
+                continue
+            tier = getattr(p, '_desloc_tier', 2)
+            pid = id(p)
+            g = p.grad.data
+            g_abs = g.abs()
+            if pid in self._grad_ema:
+                self._grad_ema[pid].mul_(1.0 - alpha).add_(g_abs, alpha=alpha)
+            else:
+                self._grad_ema[pid] = g_abs.clone()
+            ema_max = self._grad_ema[pid].max().clamp(min=1e-8)
+            rho_scaled = rho * (1.0 + self._grad_ema[pid] / ema_max)
+            mask = g.abs() > rho_scaled
+            n_clip = mask.sum().item()
+            if n_clip > 0:
+                g.clamp_(-rho_scaled, rho_scaled)
+            stats[tier][0] += n_clip
+            stats[tier][1] += g.numel()
+        return stats
+
+    def detect_gradient_drift(self, model, threshold=2.0):
+        if not hasattr(self, '_grad_ema'):
+            return False, 0.0
+        n_drifted, n_checked = 0, 0
+        for p in model.parameters():
+            if p.grad is None:
+                continue
+            pid = id(p)
+            if pid not in self._grad_ema:
+                continue
+            n_checked += 1
+            cur = p.grad.data.float().norm(2.0).item()
+            ema = self._grad_ema[pid].float().norm(2.0).item()
+            if ema > 0 and cur > threshold * ema:
+                n_drifted += 1
+        frac = n_drifted / max(n_checked, 1)
+        return frac > 0.05, frac
+
+    def halflife_sync_check(self):
+        import math
+        b1, b2 = 0.9, 0.999
+        for group in self.param_groups:
+            betas = group.get('betas', (0.9, 0.999))
+            b1, b2 = betas[0], betas[1]
+            break
+        hl1 = -1.0 / math.log2(b1) if 0 < b1 < 1 else float('inf')
+        hl2 = -1.0 / math.log2(b2) if 0 < b2 < 1 else float('inf')
+        safe_ku = max(1, int(hl1 / 6.6))
+        safe_kv = max(1, int(hl2 / 6.6))
+        return {'ku_safe': self.Ku <= safe_ku, 'kv_safe': self.Kv <= safe_kv,
+                'rec_Ku': safe_ku, 'rec_Kv': safe_kv,
+                'hl_m1': round(hl1, 1), 'hl_m2': round(hl2, 1)}
+
 
 class DeslocHalfLifeCalc:
     """Half-life calculator for Adam momentum/variance decay.

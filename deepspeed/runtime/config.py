@@ -1305,3 +1305,57 @@ def estimate_sp_dec_ac_memory(n_params, seq_len, n_layers, hidden_dim,
         'effective_seq_len': effective_seq,
     }
 # --- End M341 ---
+
+import math as _m349
+
+class DeslocConfigValidator:
+    def __init__(self, config=None):
+        self.config = config or {}
+        self.warnings = []
+        self.errors = []
+
+    def validate(self, beta1=0.9, beta2=0.999, gpu_mem_gb=80.0,
+                 model_params=0, world_size=1):
+        self.warnings.clear()
+        self.errors.clear()
+        Kx = self.config.get('Kx', 32)
+        Ku = self.config.get('Ku', 96)
+        Kv = self.config.get('Kv', 192)
+        warmup = self.config.get('warmup_steps', 5)
+        rho = self.config.get('clip_rho', 1.0)
+        fp32_red = self.config.get('fp32_reduce', True)
+        if not (Kx <= Ku <= Kv):
+            self.errors.append(f"Period ordering: Kx={Kx} Ku={Ku} Kv={Kv}, need Kx<=Ku<=Kv")
+        if 0 < beta1 < 1:
+            hl1 = -1.0 / _m349.log2(beta1)
+            sk = max(1, int(hl1 / 6.6))
+            if Ku > sk:
+                self.warnings.append(f"Ku={Ku} > half-life bound {sk} (β1={beta1})")
+        if 0 < beta2 < 1:
+            hl2 = -1.0 / _m349.log2(beta2)
+            sv = max(1, int(hl2 / 6.6))
+            if Kv > sv:
+                self.warnings.append(f"Kv={Kv} > half-life bound {sv} (β2={beta2})")
+        if Kx > 1 and warmup % Kx != 0:
+            aligned = ((warmup + Kx - 1) // Kx) * Kx
+            self.warnings.append(f"warmup={warmup} not Kx-aligned, recommend {aligned}")
+        if fp32_red and model_params > 0:
+            fp32_gb = model_params * 4 / 1e9
+            if fp32_gb > gpu_mem_gb * 0.15:
+                self.warnings.append(f"FP32 bufs {fp32_gb:.1f}GB > 15% GPU mem")
+        if world_size == 1 and Kx > 1:
+            self.warnings.append("Kx>1 on 1 GPU has no effect")
+        if world_size == 3:
+            self.warnings.append("3-GPU prone to NCCL ordering issues, enable fence")
+        if rho <= 0:
+            self.warnings.append("clip_rho<=0 disables per-coord clipping")
+        return {'valid': len(self.errors) == 0, 'warnings': self.warnings,
+                'errors': self.errors, 'Kx': Kx, 'Ku': Ku, 'Kv': Kv}
+
+    def to_dict(self):
+        return {'enabled': True, 'Kx': self.config.get('Kx', 32),
+                'Ku': self.config.get('Ku', 96), 'Kv': self.config.get('Kv', 192),
+                'warmup_steps': self.config.get('warmup_steps', 5),
+                'clip_rho': self.config.get('clip_rho', 1.0),
+                'fp32_reduce': self.config.get('fp32_reduce', True),
+                'adaptive_Kx': self.config.get('adaptive_Kx', False)}

@@ -5380,3 +5380,71 @@ def desloc_scl_fit(hist, mp=5):
     my = sy / n; st = sum((y - my) ** 2 for y in ll); sr = sum((ll[i] - (ic + sl * lc[i])) ** 2 for i in range(n))
     return {'a': round(math.exp(ic), 6), 'b': round(-sl, 6), 'r2': round(1 - sr / max(1e-12, st), 6)}
 # --- End M303 ---
+
+
+class DeslocAutoSPCoordinator:
+    def __init__(self, engine, sp_group=None, dp_group=None, Kx=32, Ku=96, Kv=192):
+        self.engine = engine
+        self.sp_group = sp_group
+        self.dp_group = dp_group
+        self.Kx = max(1, Kx)
+        self.Ku = max(1, Ku)
+        self.Kv = max(1, Kv)
+        self._step = 0
+        self._dp_ar_count = 0
+        self._dp_skip_count = 0
+        self._total_bytes = 0
+        self._saved_bytes = 0
+        self._overlap = False
+        self._comm_stream = None
+
+    def setup_overlap(self, device):
+        import torch
+        if device.type == 'cuda':
+            self._comm_stream = torch.cuda.Stream(device=device)
+            self._overlap = True
+
+    def post_backward(self, model, step=None):
+        import torch
+        import torch.distributed as dist
+        if step is None:
+            step = self._step
+        handles = []
+        n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        bpp = 2
+        warmup = getattr(self.engine, 'desloc_warmup_steps', 5)
+        do_sync = step < warmup or self.Kx <= 1 or step % self.Kx == 0
+        nbytes = n_params * bpp
+        if do_sync:
+            self._dp_ar_count += 1
+            self._total_bytes += nbytes
+            for p in model.parameters():
+                if p.grad is None:
+                    continue
+                if self._overlap and self._comm_stream is not None:
+                    self._comm_stream.wait_stream(torch.cuda.current_stream())
+                    with torch.cuda.stream(self._comm_stream):
+                        h = dist.all_reduce(p.grad, op=dist.ReduceOp.SUM,
+                                            group=self.dp_group, async_op=True)
+                else:
+                    h = dist.all_reduce(p.grad, op=dist.ReduceOp.SUM,
+                                        group=self.dp_group, async_op=True)
+                handles.append(h)
+        else:
+            self._dp_skip_count += 1
+            self._saved_bytes += nbytes
+        return handles
+
+    def step(self):
+        self._step += 1
+
+    def get_metrics(self):
+        total = self._dp_ar_count + self._dp_skip_count
+        return {'ar': self._dp_ar_count, 'skip': self._dp_skip_count,
+                'red%': round(100.0 * self._dp_skip_count / max(1, total), 2),
+                'comm_gb': round(self._total_bytes / 1e9, 4),
+                'saved_gb': round(self._saved_bytes / 1e9, 4)}
+
+    def state_dict(self):
+        return {'step': self._step, 'ar': self._dp_ar_count,
+                'skip': self._dp_skip_count}

@@ -807,6 +807,95 @@ class DeslocTieredAllReduceTorch:
             k: DeslocTier(v) for k, v in raw_map.items()
         }
 
+    def tiered_reduce_scatter_fp32(self, input_tensor, tier=None, step=None, async_op=False):
+        if step is None:
+            step = self._step
+        if tier is None:
+            tier = DeslocTier.GRADIENT
+        nbytes = input_tensor.nelement() * input_tensor.element_size()
+        if not self.should_sync(step, tier):
+            self._skipped_bytes += nbytes
+            ws = torch.distributed.get_world_size(group=self.group) if self.group else torch.distributed.get_world_size()
+            shard = input_tensor.narrow(0, 0, input_tensor.numel() // max(ws, 1)).clone()
+            return shard, None
+        self._sent_bytes += nbytes
+        ws = torch.distributed.get_world_size(group=self.group) if self.group else torch.distributed.get_world_size()
+        assert input_tensor.numel() % ws == 0
+        a2a_out = torch.empty_like(input_tensor)
+        work = torch.distributed.all_to_all_single(
+            output=a2a_out, input=input_tensor, group=self.group, async_op=async_op
+        )
+        shard_size = input_tensor.numel() // ws
+        out_final = torch.empty(shard_size, dtype=input_tensor.dtype, device=input_tensor.device)
+        handle = _DeslocFP32RSHandle(work, a2a_out, out_final, ws)
+        if not async_op:
+            handle.wait()
+            return out_final, None
+        self._pending_handles.append(handle)
+        return out_final, handle
+
+    def per_tier_grad_norms(self, model, norm_type=2.0):
+        tier_accum = {DeslocTier.GRADIENT: 0.0, DeslocTier.MOMENTUM: 0.0, DeslocTier.VARIANCE: 0.0}
+        for _, p in model.named_parameters():
+            if p.grad is None:
+                continue
+            t = getattr(p, '_desloc_tier', DeslocTier.VARIANCE)
+            g = p.grad.detach().float()
+            if norm_type == float('inf'):
+                tier_accum[t] = max(tier_accum[t], g.abs().max().item())
+            elif norm_type == 2.0:
+                tier_accum[t] += g.norm(2.0).item() ** 2
+            else:
+                tier_accum[t] += g.norm(norm_type).item() ** norm_type
+        result = {}
+        for tier, val in tier_accum.items():
+            if norm_type == float('inf'):
+                result[tier] = val
+            elif norm_type == 2.0:
+                result[tier] = val ** 0.5
+            else:
+                result[tier] = val ** (1.0 / norm_type)
+        return result
+
+    def ema_update_tier_norms(self, tier_norms, alpha=0.1):
+        if not hasattr(self, '_ema_tier_norms'):
+            self._ema_tier_norms = {}
+        for tier, norm in tier_norms.items():
+            prev = self._ema_tier_norms.get(tier, norm)
+            self._ema_tier_norms[tier] = (1.0 - alpha) * prev + alpha * norm
+
+    def get_ema_tier_norms(self):
+        return getattr(self, '_ema_tier_norms', {})
+
+
+class _DeslocFP32RSHandle:
+    __slots__ = ('_work', '_a2a_out', '_output', '_ws', '_done')
+
+    def __init__(self, work, a2a_output, output_tensor, world_size):
+        self._work = work
+        self._a2a_out = a2a_output
+        self._output = output_tensor
+        self._ws = world_size
+        self._done = False
+
+    def wait(self):
+        if self._done:
+            return
+        if self._work is not None:
+            self._work.wait()
+        fp32_sum = torch.sum(
+            self._a2a_out.view(self._ws, -1), dim=0, dtype=torch.float32
+        )
+        self._output.copy_(fp32_sum.to(self._output.dtype))
+        self._done = True
+
+    def is_completed(self):
+        if self._done:
+            return True
+        if self._work is not None and hasattr(self._work, 'is_completed'):
+            return self._work.is_completed()
+        return False
+
 
 class _DeslocFP32ARHandle:
     """Internal handle for FP32-upcast AllReduce with deferred downcast."""

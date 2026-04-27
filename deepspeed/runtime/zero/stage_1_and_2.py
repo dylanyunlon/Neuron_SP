@@ -1071,6 +1071,79 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         s = self._desloc_comm_reduction_stats()
         print(f"### Z12 DES-LOC step={e.desloc_step_counter} ### red={s['reduction']:.1f}x")
 
+    def _desloc_fence_all_pending(self, timeout_ms=30000):
+        if not hasattr(self, '_desloc_async_handles'):
+            return
+        import time as _t
+        stall = False
+        for h, dst, fp32 in self._desloc_async_handles:
+            if h is None:
+                if dst is not None and fp32 is not None:
+                    dst.copy_(fp32)
+                continue
+            t0 = _t.monotonic()
+            h.wait()
+            elapsed = (_t.monotonic() - t0) * 1000
+            if elapsed > timeout_ms:
+                stall = True
+                if dist.get_rank() == 0:
+                    e = self.desloc_engine
+                    step = getattr(e, 'desloc_step_counter', '?') if e else '?'
+                    print(f"[DES-LOC STALL] handle waited {elapsed:.0f}ms at step {step}")
+            if dst is not None and fp32 is not None:
+                dst.copy_(fp32)
+        self._desloc_async_handles.clear()
+        if stall:
+            if not hasattr(self, '_desloc_stall_count'):
+                self._desloc_stall_count = 0
+            self._desloc_stall_count += 1
+            e = self.desloc_engine
+            if e is not None:
+                e._desloc_stall_count = getattr(self, '_desloc_stall_count', 0)
+
+    def _desloc_hybrid_zero_step(self, grads_group):
+        e = self.desloc_engine
+        if e is None or not getattr(e, 'desloc_enabled', False):
+            return
+        step = getattr(e, 'desloc_step_counter', 0)
+        self._desloc_fence_all_pending()
+        should_reduce = step < getattr(e, 'desloc_warmup', 5) or e.desloc_should_sync_x()
+        if not should_reduce:
+            return
+        use_fp32 = getattr(e, 'desloc_fp32_reduce', False)
+        cs = getattr(self, '_desloc_comm_stream', None)
+        new_h = []
+        for grad in grads_group:
+            if grad is None:
+                continue
+            if use_fp32 and grad.dtype != torch.float32:
+                fp32_buf = grad.float()
+                if cs is not None:
+                    cs.wait_stream(torch.cuda.current_stream())
+                    with torch.cuda.stream(cs):
+                        h = dist.all_reduce(fp32_buf, op=dist.ReduceOp.SUM,
+                                            group=self.dp_process_group, async_op=True)
+                else:
+                    h = dist.all_reduce(fp32_buf, op=dist.ReduceOp.SUM,
+                                        group=self.dp_process_group, async_op=True)
+                new_h.append((h, grad, fp32_buf))
+            else:
+                if cs is not None:
+                    cs.wait_stream(torch.cuda.current_stream())
+                    with torch.cuda.stream(cs):
+                        h = dist.all_reduce(grad, op=dist.ReduceOp.SUM,
+                                            group=self.dp_process_group, async_op=True)
+                else:
+                    h = dist.all_reduce(grad, op=dist.ReduceOp.SUM,
+                                        group=self.dp_process_group, async_op=True)
+                new_h.append((h, None, None))
+        if not hasattr(self, '_desloc_async_handles'):
+            self._desloc_async_handles = []
+        self._desloc_async_handles.extend(new_h)
+
+    def _desloc_get_stall_count(self):
+        return getattr(self, '_desloc_stall_count', 0)
+
     #########################ZeRO Partition Gradients########################
     #########################################################################
 

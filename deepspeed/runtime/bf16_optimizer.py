@@ -678,6 +678,60 @@ def _get_padded_tensor(src_tensor, size):
         s=self._desloc_bf16_comm_stats()
         print(f"### BF16 DES-LOC step={e.desloc_step} ### red={s['reduction']:.1f}x params={s['params']/1e6:.1f}M")
 
+    def _desloc_bf16_preallocate_fp32(self):
+        if not hasattr(self, '_desloc_fp32_cache'):
+            self._desloc_fp32_cache = []
+            for fp in self.fp32_groups_gradient_flat_partition:
+                if fp is not None:
+                    self._desloc_fp32_cache.append(torch.zeros_like(fp, dtype=torch.float32))
+                else:
+                    self._desloc_fp32_cache.append(None)
+
+    def _desloc_bf16_kx_gated_scale(self, found_inf):
+        e = getattr(self, 'deepspeed_engine', None) or getattr(self, 'ds_engine', None)
+        if e is None or not getattr(e, 'desloc_enabled', False):
+            return False
+        step = getattr(e, 'desloc_step_counter', getattr(e, 'desloc_step', 0))
+        Kx = getattr(e, 'desloc_Kx', 32)
+        if Kx > 1 and step % Kx != 0:
+            return False
+        if not hasattr(self, '_desloc_growth_ctr'):
+            self._desloc_growth_ctr = 0
+            self._desloc_hyst_ctr = 0
+        if found_inf:
+            self._desloc_hyst_ctr += 1
+            if self._desloc_hyst_ctr >= 2:
+                old = getattr(self, 'cur_scale', 1.0)
+                if hasattr(self, 'cur_scale'):
+                    self.cur_scale = max(1.0, old * 0.5)
+                self._desloc_growth_ctr = 0
+                self._desloc_hyst_ctr = 0
+                if dist.get_rank() == 0:
+                    print(f"[DES-LOC BF16] Scale {old:.0f}→{self.cur_scale:.0f} step={step}")
+                return True
+        else:
+            self._desloc_hyst_ctr = 0
+            self._desloc_growth_ctr += 1
+            if self._desloc_growth_ctr >= 2000:
+                if hasattr(self, 'cur_scale'):
+                    self.cur_scale = min(2**16, self.cur_scale * 2.0)
+                self._desloc_growth_ctr = 0
+                return True
+        return False
+
+    def _desloc_bf16_grad_health(self):
+        health = []
+        for i, fp in enumerate(self.fp32_groups_gradient_flat_partition):
+            if fp is None:
+                health.append({'idx': i, 'norm': 0, 'inf': False, 'max': 0})
+                continue
+            g = fp.float()
+            has_inf = not torch.isfinite(g).all().item()
+            norm_v = g.norm(2.0).item() if not has_inf else float('inf')
+            max_v = g.abs().max().item() if not has_inf else float('inf')
+            health.append({'idx': i, 'norm': round(norm_v, 6), 'inf': has_inf, 'max': round(max_v, 6)})
+        return health
+
 
 # =============================================================================
 # M235 (Claude-15): BF16 vs FP32 loss comparison for Figure 1 overlay

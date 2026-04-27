@@ -2453,3 +2453,69 @@ def desloc_draw_all_figures(results_dir):
         print(f"  [FIG7] {out}")
 
     print(f"  [DONE] All figures saved to {fig_dir}/")
+
+
+def desloc_cross_model_analysis(result_dir='./desloc_results', output_dir='./desloc_analysis'):
+    import json, glob, os
+    from collections import defaultdict
+    os.makedirs(output_dir, exist_ok=True)
+    files = sorted(glob.glob(os.path.join(result_dir, 'benchmark_results_*.json')))
+    if not files:
+        return {}
+    runs = []
+    for f in files:
+        with open(f) as fh:
+            d = json.load(fh)
+        cfg = d.get('config', {})
+        model = cfg.get('model_size', '?')
+        for method, r in d.get('results', {}).items():
+            losses = r.get('losses', [])
+            runs.append({'file': os.path.basename(f), 'model': model, 'method': method,
+                         'final_loss': r.get('final_loss', 0),
+                         'tok_s_gpu': r.get('tokens_per_second_per_gpu', 0),
+                         'mfu': r.get('mfu', 0), 'gpu': r.get('gpu_name', '?'),
+                         'mem_gb': r.get('peak_memory_gb', 0), 'steps': len(losses),
+                         'losses': losses})
+    by_cfg = defaultdict(list)
+    for r in runs:
+        by_cfg[(r['model'], r['method'], r['gpu'])].append(r)
+    table = []
+    for ms in ['125M', '700M', '1.3B', '7B']:
+        ddp = [r for k, rs in by_cfg.items() for r in rs if k[0] == ms and k[1] == 'DDP']
+        des = [r for k, rs in by_cfg.items() for r in rs if k[0] == ms and k[1] == 'DESLOC']
+        if not ddp or not des:
+            continue
+        dl = sum(r['final_loss'] for r in ddp) / len(ddp)
+        dt = sum(r['tok_s_gpu'] for r in ddp) / len(ddp)
+        el = sum(r['final_loss'] for r in des) / len(des)
+        et = sum(r['tok_s_gpu'] for r in des) / len(des)
+        table.append({'model': ms, 'ddp_loss': round(dl, 4), 'des_loss': round(el, 4),
+                      'gap': round(el - dl, 4), 'ddp_toks': round(dt, 0), 'des_toks': round(et, 0),
+                      'speedup': round(et / max(1, dt), 2), 'n_ddp': len(ddp), 'n_des': len(des),
+                      'gpu': ddp[0]['gpu']})
+    stalls = []
+    for r in runs:
+        if r['method'] != 'DESLOC' or len(r['losses']) < 50:
+            continue
+        ls = r['losses']
+        spikes = []
+        for i in range(10, len(ls)):
+            wa = sum(ls[max(0, i - 10):i]) / 10
+            if ls[i] > wa * 1.05:
+                spikes.append({'step': (i + 1) * 10, 'ratio': round(ls[i] / max(1e-8, wa), 3)})
+        if spikes:
+            stalls.append({'model': r['model'], 'file': r['file'],
+                           'n_spikes': len(spikes), 'worst': max(s['ratio'] for s in spikes)})
+    issues = []
+    for e in table:
+        if e['gap'] > 0.3:
+            issues.append(f"{e['model']}: gap {e['gap']:.3f}>0.3, reduce Kx")
+        if e['speedup'] < 1.0:
+            issues.append(f"{e['model']}: DESLOC slower ({e['speedup']:.2f}x), model too small")
+    report = {'runs': len(runs), 'table': table, 'stalls': stalls, 'issues': issues}
+    rp = os.path.join(output_dir, 'cross_model_analysis.json')
+    with open(rp, 'w') as f:
+        json.dump(report, f, indent=2)
+    for e in table:
+        print(f"  {e['model']:6s}: speedup={e['speedup']:.2f}x gap={e['gap']:+.4f}")
+    return report
