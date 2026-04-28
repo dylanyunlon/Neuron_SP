@@ -497,47 +497,131 @@ class SyntheticDataset(Dataset):
 # =============================================================================
 
 class AdamW(torch.optim.Optimizer):
-    """Standard AdamW optimizer."""
+    """ZeRO Stage-1 AdamW: optimizer state partitioned across DP ranks.
+    
+    Memory per GPU: param + grad + m_shard + v_shard
+      = N*2 + N*2 + (N/W)*2 + (N/W)*2  (BF16)
+    For 7B, W=3: 13.3 + 13.3 + 4.4 + 4.4 = 35.4GB < A6000 49GB
+    
+    Ref: DeepSpeed ZeRO stage_1_and_2.py:499 partition_size
+    Ref: Megatron distrib_optimizer.py shard_buffer
+    """
     def __init__(self, params, lr: float, betas: Tuple[float, float], weight_decay: float):
         defaults = dict(lr=lr, betas=betas, weight_decay=weight_decay)
         super().__init__(params, defaults)
-    
+        self._zero_initialized = False
+
+    def _lazy_init_zero(self):
+        if self._zero_initialized:
+            return
+        self._zero_initialized = True
+        if not torch.distributed.is_initialized():
+            self._world_size = 1
+            self._rank = 0
+        else:
+            self._world_size = torch.distributed.get_world_size()
+            self._rank = torch.distributed.get_rank()
+        self._flat_params = []
+        self._param_to_flat_idx = {}
+        for group in self.param_groups:
+            flat_list = list(group['params'])
+            for i, p in enumerate(flat_list):
+                self._param_to_flat_idx[p] = len(self._flat_params)
+                self._flat_params.append(p)
+
+    def _get_partition_range(self, numel):
+        chunk = (numel + self._world_size - 1) // self._world_size
+        start = min(self._rank * chunk, numel)
+        end = min(start + chunk, numel)
+        return start, end
+
     def step(self):
+        self._lazy_init_zero()
+        if self._world_size <= 1:
+            self._step_local()
+            return
+        self._step_zero1()
+
+    def _step_local(self):
         for group in self.param_groups:
             for p in group['params']:
                 if p.grad is None:
                     continue
-                
                 grad = p.grad.data
-                if grad.is_sparse:
-                    raise RuntimeError("AdamW does not support sparse gradients")
-                
                 state = self.state[p]
-                
                 if len(state) == 0:
                     state['step'] = 0
                     state['exp_avg'] = torch.zeros_like(p.data)
                     state['exp_avg_sq'] = torch.zeros_like(p.data)
-                
                 exp_avg, exp_avg_sq = state['exp_avg'], state['exp_avg_sq']
                 beta1, beta2 = group['betas']
-                
                 state['step'] += 1
-                
-                # Decoupled weight decay
                 p.data.mul_(1 - group['lr'] * group['weight_decay'])
-                
-                # Adam update
                 exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
                 exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
-                
-                bias_correction1 = 1 - beta1 ** state['step']
-                bias_correction2 = 1 - beta2 ** state['step']
-                
-                step_size = group['lr'] / bias_correction1
-                denom = (exp_avg_sq.sqrt() / math.sqrt(bias_correction2)).add_(1e-8)
-                
+                bc1 = 1 - beta1 ** state['step']
+                bc2 = 1 - beta2 ** state['step']
+                step_size = group['lr'] / bc1
+                torch.sqrt(exp_avg_sq, out=grad)
+                denom = grad.div_(math.sqrt(bc2)).add_(1e-8)
                 p.data.addcdiv_(exp_avg, denom, value=-step_size)
+                p.grad = None
+
+    def _step_zero1(self):
+        # Phase 1: AllReduce gradients (equivalent to DDP grad sync)
+        ar_handles = []
+        for group in self.param_groups:
+            for p in group['params']:
+                if p.grad is not None:
+                    h = torch.distributed.all_reduce(
+                        p.grad.data, op=torch.distributed.ReduceOp.AVG, async_op=True)
+                    ar_handles.append(h)
+        for h in ar_handles:
+            h.wait()
+        # Phase 2: Each rank updates only its own partition of m/v/param
+        for group in self.param_groups:
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+                state = self.state[p]
+                numel = p.data.numel()
+                start, end = self._get_partition_range(numel)
+                part_size = end - start
+                if len(state) == 0:
+                    state['step'] = 0
+                    state['exp_avg'] = torch.zeros(part_size, dtype=p.data.dtype, device=p.data.device)
+                    state['exp_avg_sq'] = torch.zeros(part_size, dtype=p.data.dtype, device=p.data.device)
+                exp_avg = state['exp_avg']
+                exp_avg_sq = state['exp_avg_sq']
+                beta1, beta2 = group['betas']
+                state['step'] += 1
+                p_flat = p.data.view(-1)
+                g_flat = p.grad.data.view(-1)
+                p_flat.mul_(1 - group['lr'] * group['weight_decay'])
+                gs = g_flat[start:end]
+                exp_avg.mul_(beta1).add_(gs, alpha=1 - beta1)
+                exp_avg_sq.mul_(beta2).addcmul_(gs, gs, value=1 - beta2)
+                # Free grad memory BEFORE computing denom to reduce peak
+                p.grad = None
+                bc1 = 1 - beta1 ** state['step']
+                bc2 = 1 - beta2 ** state['step']
+                step_size = group['lr'] / bc1
+                # M351: reuse pre-allocated buffer for denom to avoid temp
+                if '_denom' not in state:
+                    state['_denom'] = torch.empty_like(exp_avg_sq)
+                torch.sqrt(exp_avg_sq, out=state['_denom'])
+                state['_denom'].div_(math.sqrt(bc2)).add_(1e-8)
+                p_flat[start:end].addcdiv_(exp_avg, state['_denom'], value=-step_size)
+        # Phase 3: Broadcast each rank's updated param shard to all
+        for p in self._flat_params:
+            numel = p.data.numel()
+            p_flat = p.data.view(-1)
+            chunk = (numel + self._world_size - 1) // self._world_size
+            for src in range(self._world_size):
+                s = min(src * chunk, numel)
+                e = min(s + chunk, numel)
+                if e > s:
+                    torch.distributed.broadcast(p_flat[s:e], src=src)
 
 
 class DESLOCAdamW(torch.optim.Optimizer):
@@ -577,11 +661,34 @@ class DESLOCAdamW(torch.optim.Optimizer):
     def step(self):
         self.global_step += 1
         
+        # Decide offload once based on total model size vs SMALLEST GPU in cluster
+        # All ranks must agree — otherwise sync steps have asymmetric PCIe traffic
+        if not hasattr(self, '_use_offload'):
+            total_param_bytes = 0
+            sample_device = None
+            for group in self.param_groups:
+                for p in group['params']:
+                    total_param_bytes += p.numel() * p.element_size()
+                    if sample_device is None and p.is_cuda:
+                        sample_device = p.device
+            if sample_device is not None and dist.is_initialized():
+                # Use min GPU memory across all ranks for symmetric behavior
+                local_mem = torch.cuda.get_device_properties(sample_device).total_memory
+                mem_tensor = torch.tensor([local_mem], dtype=torch.long, device=sample_device)
+                dist.all_reduce(mem_tensor, op=dist.ReduceOp.MIN)
+                min_gpu_mem = mem_tensor.item()
+                self._use_offload = (total_param_bytes * 4 > min_gpu_mem * 0.85)
+                if dist.get_rank() == 0:
+                    print(f"[DESLOC] offload={'ON' if self._use_offload else 'OFF'}: "
+                          f"model {total_param_bytes/1e9:.1f}GB × 4 = {total_param_bytes*4/1e9:.1f}GB, "
+                          f"min GPU = {min_gpu_mem/1e9:.1f}GB")
+            elif sample_device is not None:
+                gpu_mem = torch.cuda.get_device_properties(sample_device).total_memory
+                self._use_offload = (total_param_bytes * 4 > gpu_mem * 0.85)
+            else:
+                self._use_offload = False
+        
         for group in self.param_groups:
-            Kx = group['Kx']
-            Ku = group['Ku']
-            Kv = group['Kv']
-            
             for p in group['params']:
                 if p.grad is None:
                     continue
@@ -591,28 +698,55 @@ class DESLOCAdamW(torch.optim.Optimizer):
                 
                 if len(state) == 0:
                     state['step'] = 0
-                    state['exp_avg'] = torch.zeros_like(p.data)
-                    state['exp_avg_sq'] = torch.zeros_like(p.data)
+                    state['_offload'] = self._use_offload
+                    if self._use_offload:
+                        state['exp_avg'] = torch.zeros_like(p.data, device='cpu').pin_memory()
+                        state['exp_avg_sq'] = torch.zeros_like(p.data, device='cpu').pin_memory()
+                    else:
+                        state['exp_avg'] = torch.zeros_like(p.data)
+                        state['exp_avg_sq'] = torch.zeros_like(p.data)
                 
-                exp_avg, exp_avg_sq = state['exp_avg'], state['exp_avg_sq']
                 beta1, beta2 = group['betas']
-                
                 state['step'] += 1
                 
-                # Decoupled weight decay
+                # Decoupled weight decay (in-place, on GPU)
                 p.data.mul_(1 - group['lr'] * group['weight_decay'])
                 
-                # Local Adam update
-                exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
-                exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
-                
-                bias_correction1 = 1 - beta1 ** state['step']
-                bias_correction2 = 1 - beta2 ** state['step']
-                
-                step_size = group['lr'] / bias_correction1
-                denom = (exp_avg_sq.sqrt() / math.sqrt(bias_correction2)).add_(1e-8)
-                
-                p.data.addcdiv_(exp_avg, denom, value=-step_size)
+                if state['_offload']:
+                    # CPU offload path: stream m/v to GPU, update, stream back
+                    m_gpu = state['exp_avg'].to(p.device, non_blocking=True)
+                    v_gpu = state['exp_avg_sq'].to(p.device, non_blocking=True)
+                    torch.cuda.current_stream().synchronize()
+                    m_gpu.mul_(beta1).add_(grad, alpha=1 - beta1)
+                    v_gpu.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
+                    p.grad = None  # free grad before denom alloc
+                    bc1 = 1 - beta1 ** state['step']
+                    bc2 = 1 - beta2 ** state['step']
+                    step_size = group['lr'] / bc1
+                    # In-place sqrt into v_gpu (we already have it on GPU)
+                    denom = torch.sqrt(v_gpu)
+                    denom.div_(math.sqrt(bc2)).add_(1e-8)
+                    p.data.addcdiv_(m_gpu, denom, value=-step_size)
+                    del denom
+                    # Stream back to CPU
+                    state['exp_avg'].copy_(m_gpu, non_blocking=True)
+                    state['exp_avg_sq'].copy_(v_gpu, non_blocking=True)
+                    del m_gpu, v_gpu
+                else:
+                    # Standard GPU path: full m/v on GPU
+                    exp_avg = state['exp_avg']
+                    exp_avg_sq = state['exp_avg_sq']
+                    exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
+                    exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
+                    p.grad = None  # free grad before denom alloc
+                    bc1 = 1 - beta1 ** state['step']
+                    bc2 = 1 - beta2 ** state['step']
+                    step_size = group['lr'] / bc1
+                    if '_denom' not in state:
+                        state['_denom'] = torch.empty_like(exp_avg_sq)
+                    torch.sqrt(exp_avg_sq, out=state['_denom'])
+                    state['_denom'].div_(math.sqrt(bc2)).add_(1e-8)
+                    p.data.addcdiv_(exp_avg, state['_denom'], value=-step_size)
     
     def sync_if_needed(self, world_size: int):
         """Sync optimizer states based on DES-LOC schedule.
@@ -777,60 +911,48 @@ class DESLOCAdamW(torch.optim.Optimizer):
         # from per-parameter calls and reduces launch overhead from O(N_params)
         # to O(1) NCCL calls per tier. See NCCL all_reduce.h Ring AllReduce.
         if world_size > 1:
-            # Collect ALL params (not just grad!=None) to guarantee symmetric
-            # AllReduce across ranks — prevents NCCL hang
             all_params = []
             for group in self.param_groups:
                 for p in group['params']:
                     all_params.append(p)
 
             if sync_x and all_params:
-                flat_x = torch.cat([p.data.reshape(-1) for p in all_params])
-                dist.all_reduce(flat_x, op=dist.ReduceOp.SUM)
-                flat_x.div_(world_size)
-                offset = 0
                 for p in all_params:
-                    numel = p.data.numel()
-                    p.data.copy_(flat_x[offset:offset + numel].reshape(p.data.shape))
-                    offset += numel
+                    dist.all_reduce(p.data, op=dist.ReduceOp.SUM)
+                    p.data.div_(world_size)
 
             if sync_u and all_params:
-                bufs_u = []
                 for p in all_params:
-                    state = self.state[p]
-                    if 'exp_avg' in state:
-                        bufs_u.append(state['exp_avg'].reshape(-1))
+                    state = self.state.get(p, {})
+                    if 'exp_avg' not in state:
+                        continue
+                    m = state['exp_avg']
+                    if m.device.type == 'cpu':
+                        # CPU-offloaded: bring to GPU, sync, send back
+                        m_gpu = m.to(p.device)
+                        dist.all_reduce(m_gpu, op=dist.ReduceOp.SUM)
+                        m_gpu.div_(world_size)
+                        state['exp_avg'].copy_(m_gpu)
+                        del m_gpu
                     else:
-                        bufs_u.append(torch.zeros(p.data.numel(), device=p.data.device, dtype=p.data.dtype))
-                flat_u = torch.cat(bufs_u)
-                dist.all_reduce(flat_u, op=dist.ReduceOp.SUM)
-                flat_u.div_(world_size)
-                offset = 0
-                for i, p in enumerate(all_params):
-                    numel = p.data.numel()
-                    state = self.state[p]
-                    if 'exp_avg' in state:
-                        state['exp_avg'].copy_(flat_u[offset:offset + numel].reshape(state['exp_avg'].shape))
-                    offset += numel
+                        dist.all_reduce(m, op=dist.ReduceOp.SUM)
+                        m.div_(world_size)
 
             if sync_v and all_params:
-                bufs_v = []
                 for p in all_params:
-                    state = self.state[p]
-                    if 'exp_avg_sq' in state:
-                        bufs_v.append(state['exp_avg_sq'].reshape(-1))
+                    state = self.state.get(p, {})
+                    if 'exp_avg_sq' not in state:
+                        continue
+                    v = state['exp_avg_sq']
+                    if v.device.type == 'cpu':
+                        v_gpu = v.to(p.device)
+                        dist.all_reduce(v_gpu, op=dist.ReduceOp.SUM)
+                        v_gpu.div_(world_size)
+                        state['exp_avg_sq'].copy_(v_gpu)
+                        del v_gpu
                     else:
-                        bufs_v.append(torch.zeros(p.data.numel(), device=p.data.device, dtype=p.data.dtype))
-                flat_v = torch.cat(bufs_v)
-                dist.all_reduce(flat_v, op=dist.ReduceOp.SUM)
-                flat_v.div_(world_size)
-                offset = 0
-                for i, p in enumerate(all_params):
-                    numel = p.data.numel()
-                    state = self.state[p]
-                    if 'exp_avg_sq' in state:
-                        state['exp_avg_sq'].copy_(flat_v[offset:offset + numel].reshape(state['exp_avg_sq'].shape))
-                    offset += numel
+                        dist.all_reduce(v, op=dist.ReduceOp.SUM)
+                        v.div_(world_size)
 
         # ---------------------------------------------------------------
         # Claude-27 M332: Momentum decay after x-sync (Bug fix #3)
@@ -920,6 +1042,26 @@ class LocalAdamW(torch.optim.Optimizer):
     def step(self):
         self.global_step += 1
         
+        if not hasattr(self, '_use_offload'):
+            total_param_bytes = 0
+            sample_device = None
+            for group in self.param_groups:
+                for p in group['params']:
+                    total_param_bytes += p.numel() * p.element_size()
+                    if sample_device is None and p.is_cuda:
+                        sample_device = p.device
+            if sample_device is not None and dist.is_initialized():
+                local_mem = torch.cuda.get_device_properties(sample_device).total_memory
+                mem_tensor = torch.tensor([local_mem], dtype=torch.long, device=sample_device)
+                dist.all_reduce(mem_tensor, op=dist.ReduceOp.MIN)
+                min_gpu_mem = mem_tensor.item()
+                self._use_offload = (total_param_bytes * 4 > min_gpu_mem * 0.85)
+            elif sample_device is not None:
+                gpu_mem = torch.cuda.get_device_properties(sample_device).total_memory
+                self._use_offload = (total_param_bytes * 4 > gpu_mem * 0.85)
+            else:
+                self._use_offload = False
+        
         for group in self.param_groups:
             for p in group['params']:
                 if p.grad is None:
@@ -930,26 +1072,49 @@ class LocalAdamW(torch.optim.Optimizer):
                 
                 if len(state) == 0:
                     state['step'] = 0
-                    state['exp_avg'] = torch.zeros_like(p.data)
-                    state['exp_avg_sq'] = torch.zeros_like(p.data)
+                    state['_offload'] = self._use_offload
+                    if self._use_offload:
+                        state['exp_avg'] = torch.zeros_like(p.data, device='cpu').pin_memory()
+                        state['exp_avg_sq'] = torch.zeros_like(p.data, device='cpu').pin_memory()
+                    else:
+                        state['exp_avg'] = torch.zeros_like(p.data)
+                        state['exp_avg_sq'] = torch.zeros_like(p.data)
                 
-                exp_avg, exp_avg_sq = state['exp_avg'], state['exp_avg_sq']
                 beta1, beta2 = group['betas']
-                
                 state['step'] += 1
-                
                 p.data.mul_(1 - group['lr'] * group['weight_decay'])
                 
-                exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
-                exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
-                
-                bias_correction1 = 1 - beta1 ** state['step']
-                bias_correction2 = 1 - beta2 ** state['step']
-                
-                step_size = group['lr'] / bias_correction1
-                denom = (exp_avg_sq.sqrt() / math.sqrt(bias_correction2)).add_(1e-8)
-                
-                p.data.addcdiv_(exp_avg, denom, value=-step_size)
+                if state['_offload']:
+                    m_gpu = state['exp_avg'].to(p.device, non_blocking=True)
+                    v_gpu = state['exp_avg_sq'].to(p.device, non_blocking=True)
+                    torch.cuda.current_stream().synchronize()
+                    m_gpu.mul_(beta1).add_(grad, alpha=1 - beta1)
+                    v_gpu.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
+                    p.grad = None
+                    bc1 = 1 - beta1 ** state['step']
+                    bc2 = 1 - beta2 ** state['step']
+                    step_size = group['lr'] / bc1
+                    denom = torch.sqrt(v_gpu)
+                    denom.div_(math.sqrt(bc2)).add_(1e-8)
+                    p.data.addcdiv_(m_gpu, denom, value=-step_size)
+                    del denom
+                    state['exp_avg'].copy_(m_gpu, non_blocking=True)
+                    state['exp_avg_sq'].copy_(v_gpu, non_blocking=True)
+                    del m_gpu, v_gpu
+                else:
+                    exp_avg = state['exp_avg']
+                    exp_avg_sq = state['exp_avg_sq']
+                    exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
+                    exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
+                    p.grad = None
+                    bc1 = 1 - beta1 ** state['step']
+                    bc2 = 1 - beta2 ** state['step']
+                    step_size = group['lr'] / bc1
+                    if '_denom' not in state:
+                        state['_denom'] = torch.empty_like(exp_avg_sq)
+                    torch.sqrt(exp_avg_sq, out=state['_denom'])
+                    state['_denom'].div_(math.sqrt(bc2)).add_(1e-8)
+                    p.data.addcdiv_(exp_avg, state['_denom'], value=-step_size)
     
     def sync_if_needed(self, world_size: int):
         """Sync all states every K steps.
@@ -967,60 +1132,40 @@ class LocalAdamW(torch.optim.Optimizer):
         should_sync = (effective_K <= 1) or (self.global_step % effective_K == 0)
 
         if should_sync and world_size > 1:
-            # Flattened buffer AllReduce — all params in one call per tier
             all_params = []
             for group in self.param_groups:
                 for p in group['params']:
                     all_params.append(p)
 
             if all_params:
-                # x (params)
-                flat_x = torch.cat([p.data.reshape(-1) for p in all_params])
-                dist.all_reduce(flat_x, op=dist.ReduceOp.SUM)
-                flat_x.div_(world_size)
-                offset = 0
+                handles = []
                 for p in all_params:
-                    numel = p.data.numel()
-                    p.data.copy_(flat_x[offset:offset + numel].reshape(p.data.shape))
-                    offset += numel
+                    h = dist.all_reduce(p.data, op=dist.ReduceOp.SUM, async_op=True)
+                    handles.append(h)
+                for h in handles:
+                    h.wait()
+                for p in all_params:
+                    p.data.div_(world_size)
 
-                # u (first moment)
-                bufs_u = []
+                handles = []
                 for p in all_params:
                     state = self.state[p]
                     if 'exp_avg' in state:
-                        bufs_u.append(state['exp_avg'].reshape(-1))
-                    else:
-                        bufs_u.append(torch.zeros(p.data.numel(), device=p.data.device, dtype=p.data.dtype))
-                flat_u = torch.cat(bufs_u)
-                dist.all_reduce(flat_u, op=dist.ReduceOp.SUM)
-                flat_u.div_(world_size)
-                offset = 0
-                for p in all_params:
-                    numel = p.data.numel()
-                    state = self.state[p]
-                    if 'exp_avg' in state:
-                        state['exp_avg'].copy_(flat_u[offset:offset + numel].reshape(state['exp_avg'].shape))
-                    offset += numel
+                        h = dist.all_reduce(state['exp_avg'], op=dist.ReduceOp.SUM, async_op=True)
+                        handles.append((h, state['exp_avg']))
+                for h, buf in handles:
+                    h.wait()
+                    buf.div_(world_size)
 
-                # v (second moment)
-                bufs_v = []
+                handles = []
                 for p in all_params:
                     state = self.state[p]
                     if 'exp_avg_sq' in state:
-                        bufs_v.append(state['exp_avg_sq'].reshape(-1))
-                    else:
-                        bufs_v.append(torch.zeros(p.data.numel(), device=p.data.device, dtype=p.data.dtype))
-                flat_v = torch.cat(bufs_v)
-                dist.all_reduce(flat_v, op=dist.ReduceOp.SUM)
-                flat_v.div_(world_size)
-                offset = 0
-                for p in all_params:
-                    numel = p.data.numel()
-                    state = self.state[p]
-                    if 'exp_avg_sq' in state:
-                        state['exp_avg_sq'].copy_(flat_v[offset:offset + numel].reshape(state['exp_avg_sq'].shape))
-                    offset += numel
+                        h = dist.all_reduce(state['exp_avg_sq'], op=dist.ReduceOp.SUM, async_op=True)
+                        handles.append((h, state['exp_avg_sq']))
+                for h, buf in handles:
+                    h.wait()
+                    buf.div_(world_size)
 
         return {'synced': should_sync}
 
@@ -1142,9 +1287,11 @@ class Trainer:
             self._stimer = None
             self._progress = None
 
-            # DDP wrapper
-            if self.world_size > 1 and method == 'DDP':
-                self.model = DDP(self.model, device_ids=[self.local_rank])
+            # DDP wrapper — skip when using ZeRO-1 AdamW (handles its own grad sync)
+            # For non-DDP methods (DESLOC, LocalAdam), also no DDP wrapper needed
+            # as they have their own sync logic.
+            # if self.world_size > 1 and method == 'DDP':
+            #     self.model = DDP(self.model, device_ids=[self.local_rank])
 
             # Baseline optimizer
             self.optimizer = self._create_optimizer(method)
