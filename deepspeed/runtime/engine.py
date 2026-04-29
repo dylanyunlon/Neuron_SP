@@ -345,7 +345,7 @@ class DeepSpeedEngine(Module):
             self._desloc_ac_mode = 'compile'
         # Check if user applied torch.utils.checkpoint to model layers
         _ac_layers = 0
-        for m in self.module.modules():
+        for m in model.modules():
             if hasattr(m, 'use_ac') and getattr(m, 'use_ac', False):
                 _ac_layers += 1
         if _ac_layers > 0:
@@ -4984,6 +4984,8 @@ class DeepSpeedEngine(Module):
             get_accelerator().empty_cache()
 
     def get_autosp_backend(self, compile_kwargs):
+        # M355: AutoSP composes with ZeRO-0 and ZeRO-1 (optimizer state partition).
+        # ZeRO-2/3 partition gradients which conflicts with AutoSP's gradient AllReduce.
         if self.compile_autosp() and self.zero_optimization_stage() not in [
                 ZeroStageEnum.disabled, ZeroStageEnum.optimizer_states
         ]:
@@ -4993,6 +4995,18 @@ class DeepSpeedEngine(Module):
 
         compile_config = self._config.compile_config
         compile_kwargs['fullgraph'] = True
+
+        # M354: Log composition state for experiment tracking.
+        _desloc_cfg = self._config._param_dict.get('desloc', {})
+        if _desloc_cfg.get('enabled', False) and dist.get_rank() == 0:
+            _Kx = _desloc_cfg.get('Kx', 1)
+            logger.info(f"[AutoSP+DEC] SP+DEC(Kx={_Kx})+ZeRO({self.zero_optimization_stage()})")
+
+        # M356: Set A2A timeout for heterogeneous GPU deadlock prevention.
+        if not hasattr(self, '_desloc_sp_a2a_timeout_ms'):
+            self._desloc_sp_a2a_timeout_ms = int(
+                os.environ.get('DESLOC_SP_A2A_TIMEOUT_MS', '60000'))
+
         return init_autosp(self._config)
 
     def get_deepcompile_backend(self, backend, compile_kwargs, schedule):

@@ -16,10 +16,10 @@ set -eo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
-# Activate the ccpo conda environment
+# Activate the walking3 conda environment
 # Note: set -u is disabled because conda activate reads $PS1 which is unset in scripts
 eval "$(conda shell.bash hook)"
-conda activate ccpo
+conda activate walking3
 set -u
 
 # M340: NCCL settings for heterogeneous GPU cluster
@@ -32,7 +32,7 @@ export NCCL_TIMEOUT=1800000                # 30 min timeout (was 600s default)
 export TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=1800  # match
 export NCCL_DEBUG=WARN                     # show NCCL warnings (INFO is too verbose)
 # Reduce CUDA memory fragmentation for tight-memory 7B runs (A6000 48GB)
-# Requires PyTorch 2.4+ (ccpo env). Falls back gracefully if unsupported.
+# Requires PyTorch 2.4+ (walking3 env). Falls back gracefully if unsupported.
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 RESULTS_DIR="./desloc_results"
@@ -123,122 +123,175 @@ run_exp() {
 # done
 
 # ===================================================================
-# Phase 2: 700M 核心实验 (5-seed, ~120分钟)
-# 注意: A6000 49GB 跑 700M 需要 grad_accum>=4
-# 修改: 每个seed先跑DDP再跑DESLOC (交替), 而非全部DDP先跑完
-#       这样seed1的对比结果24分钟就出来, 不用等70分钟
+# Phase 2: 700M (5-seed)
+# base = wt(1.4)+grad(1.4)+opt(1.9/3gpu) = 4.7GB
+# bs=8 seq=2048 no-AC → act=18.1GB → 22.8GB/A6000 (48%)
+# bs=8 seq=1024 no-AC → act=9.1GB → 13.8GB/A6000 (29%) ← too low
 # ===================================================================
 # echo ""
-# echo "===== Phase 2: 700M DDP vs DESLOC (5-seed, interleaved) ====="
+# echo "===== Phase 2: 700M DDP vs DESLOC (5-seed, 48% GPU) ====="
 
 # for S in 1 2 3 4 5; do
-#     PYTHONHASHSEED=$((S * 7)) run_exp "p2_ddp_700m_s${S}" "700M" 1 "DDP" 500 4 4
-#     PYTHONHASHSEED=$((S * 7)) run_exp "p2_desloc_700m_Kx32_s${S}" "700M" 32 "DESLOC" 500 4 4
+#     PYTHONHASHSEED=$((S * 7)) run_exp "p2_ddp_700m_s${S}" "700M" 1 "DDP" 500 8 4 "--zero_stage 1 --max_seq_len 2048"
+#     PYTHONHASHSEED=$((S * 7)) run_exp "p2_desloc_700m_Kx32_s${S}" "700M" 32 "DESLOC" 500 8 4 "--zero_stage 1 --max_seq_len 2048"
 # done
 
+# # # ===================================================================
+# # # Phase 3: Kx 消融 (700M, 3-seed, ~40分钟)
+# # # ===================================================================
+# # echo ""
+# # echo "===== Phase 3: Kx 消融 (700M) ====="
+
+# # for KX in 8 16 64 128; do
+# #     for S in 1 2 3; do
+# #         PYTHONHASHSEED=$((S * 7)) run_exp "p3_desloc_700m_Kx${KX}_s${S}" "700M" "$KX" "DESLOC" 500 4 4
+# #     done
+# # done
+
+# # # ===================================================================
+# # # Phase 4: Nesterov outer optimizer (700M, 3-seed, ~20分钟)
+# # # ===================================================================
+# # echo ""
+# # echo "===== Phase 4: Nesterov vs Average ====="
+
+# # for S in 1 2 3; do
+# #     PYTHONHASHSEED=$((S * 7)) run_exp "p4_nesterov_700m_s${S}" "700M" 32 "DESLOC" 500 4 4 \
+# #         "--outer_optimizer nesterov --outer_momentum 0.9"
+# # done
+
+# # # ===================================================================
+# # # Phase 5: SP+DEC (Sequence Parallel + Desynced Communication)
+# # # 125M only — SP halves per-GPU seq_len, enabling longer contexts
+# # # or doubling effective batch size per memory unit.
+# # # 注意: SP+DEC正交 — SP沿seq维度切分, DEC沿worker维度控制通信频率
+# # # ===================================================================
+# # echo ""
+# # echo "===== Phase 5: SP+DEC (125M, Kx=32, 3-seed) ====="
+
+# # for S in 1 2 3; do
+# #     PYTHONHASHSEED=$((S * 7)) run_exp "p5_sp_desloc_125m_s${S}" "125M" 32 "DESLOC" 500 4 4 \
+# #         "--use_autosp"
+# # done
+
+# # # Phase 5b: SP+DDP baseline for comparison
+# # for S in 1 2 3; do
+# #     PYTHONHASHSEED=$((S * 7)) run_exp "p5_sp_ddp_125m_s${S}" "125M" 1 "DDP" 500 4 4 \
+# #         "--use_autosp"
+# # done
+
 # # ===================================================================
-# # Phase 3: Kx 消融 (700M, 3-seed, ~40分钟)
+# # Phase 6: 1.3B on 3-GPU heterogeneous
+# # OLD: bs=2 ga=8 AC → 27GB/A6000 (56%) — GPU idle
+# # NEW: no-AC, ZeRO-1, bigger batch
+# #   base(ZeRO-1/3gpu) = wt(2.6) + grad(2.6) + opt(3.5) = 8.7GB
+# #   bs=8 seq=2048 no-AC → act=19.3GB → 28GB/A6000 (58%)
+# #   bs=16 seq=1024 no-AC → act=19.3GB → 28GB/A6000 (58%)
 # # ===================================================================
 # echo ""
-# echo "===== Phase 3: Kx 消融 (700M) ====="
-
-# for KX in 8 16 64 128; do
-#     for S in 1 2 3; do
-#         PYTHONHASHSEED=$((S * 7)) run_exp "p3_desloc_700m_Kx${KX}_s${S}" "700M" "$KX" "DESLOC" 500 4 4
-#     done
-# done
-
-# # ===================================================================
-# # Phase 4: Nesterov outer optimizer (700M, 3-seed, ~20分钟)
-# # ===================================================================
-# echo ""
-# echo "===== Phase 4: Nesterov vs Average ====="
+# echo "===== Phase 6: 1.3B DDP vs DESLOC (3-seed, 58% GPU) ====="
 
 # for S in 1 2 3; do
-#     PYTHONHASHSEED=$((S * 7)) run_exp "p4_nesterov_700m_s${S}" "700M" 32 "DESLOC" 500 4 4 \
-#         "--outer_optimizer nesterov --outer_momentum 0.9"
+#     PYTHONHASHSEED=$((S * 7)) run_exp "p6_ddp_1.3B_s${S}" "1.3B" 1 "DDP" 500 8 4 "--zero_stage 1 --max_seq_len 2048"
+#     PYTHONHASHSEED=$((S * 7)) run_exp "p6_desloc_1.3B_Kx32_s${S}" "1.3B" 32 "DESLOC" 500 8 4 "--zero_stage 1 --max_seq_len 2048"
 # done
 
-# # ===================================================================
-# # Phase 5: SP+DEC (Sequence Parallel + Desynced Communication)
-# # 125M only — SP halves per-GPU seq_len, enabling longer contexts
-# # or doubling effective batch size per memory unit.
-# # 注意: SP+DEC正交 — SP沿seq维度切分, DEC沿worker维度控制通信频率
-# # ===================================================================
-# echo ""
-# echo "===== Phase 5: SP+DEC (125M, Kx=32, 3-seed) ====="
-
-# for S in 1 2 3; do
-#     PYTHONHASHSEED=$((S * 7)) run_exp "p5_sp_desloc_125m_s${S}" "125M" 32 "DESLOC" 500 4 4 \
-#         "--use_autosp"
-# done
-
-# # Phase 5b: SP+DDP baseline for comparison
-# for S in 1 2 3; do
-#     PYTHONHASHSEED=$((S * 7)) run_exp "p5_sp_ddp_125m_s${S}" "125M" 1 "DDP" 500 4 4 \
-#         "--use_autosp"
-# done
-
-# ===================================================================
-# Phase 6: 1.3B — 异构实验 (3-seed, ~180分钟)
-# Memory: 1.3B params = ~15GB → fits A6000 49GB easily
-# 使用 activation checkpointing 以留更多空间给 batch
-# ===================================================================
-# echo ""
-# echo "===== Phase 6: 1.3B DDP vs DESLOC (3-seed, interleaved, use_ac) ====="
-
-# for S in 1 2 3; do
-#     PYTHONHASHSEED=$((S * 7)) run_exp "p6_ddp_1.3B_s${S}" "1.3B" 1 "DDP" 500 2 8 "--use_ac"
-#     PYTHONHASHSEED=$((S * 7)) run_exp "p6_desloc_1.3B_Kx32_s${S}" "1.3B" 32 "DESLOC" 500 2 8 "--use_ac"
-# done
-
-# # Phase 6b: 1.3B Kx消融
-# echo "===== Phase 6b: 1.3B Kx 消融 ====="
+# # Phase 6b: 1.3B Kx ablation
+# echo "===== Phase 6b: 1.3B Kx ablation ====="
 # for KX in 16 64; do
-#     PYTHONHASHSEED=7 run_exp "p6b_desloc_1.3B_Kx${KX}" "1.3B" "$KX" "DESLOC" 500 2 8 "--use_ac"
+#     PYTHONHASHSEED=7 run_exp "p6b_desloc_1.3B_Kx${KX}" "1.3B" "$KX" "DESLOC" 500 8 4 "--zero_stage 1 --max_seq_len 2048"
 # done
 
-# Phase 7: 7B — 3-GPU DDP vs DESLOC (batch=1, grad_accum=16, 200 steps)
-# Memory: ~45GB/GPU with BF16+AC, fits A6000 49GB
 # ===================================================================
-# Phase 7: 7B — 异构实验 (ZeRO-1 AdamW, BF16+AC)
-# Memory: ZeRO-1 partitions m/v across 3 GPUs → 37GB/GPU, fits A6000
-# Step 1: 200-step smoke test to verify no OOM
-# Step 2: 1536-step compute-optimal (warmup=512, decay=10%)
+# Phase 7: 7B on 3-GPU heterogeneous (2×A6000 48GB + 1×H100 96GB)
+#
+# Memory strategy:
+#   CPU offload optimizer → model(14GB) + grads(14GB) = 28GB on GPU
+#   This leaves 20GB for activations on A6000 (48GB)
+#
+# Target configs (A6000 bottleneck = 48GB):
+#   bs=2 seq=2048 no-AC → 40.9GB (85%) ← maximum push
+#   bs=4 seq=1024 no-AC → 40.9GB (85%) ← same memory, higher throughput
+#   bs=2 seq=1024 no-AC → 34.4GB (72%) ← safe
+#   bs=1 seq=2048 no-AC → 34.4GB (72%) ← long context
+#
+# ZeRO-1 alone won't work: 46.7GB base > 48GB A6000
+# CPU offload is required for 7B on A6000
 # ===================================================================
-echo ""
-echo "===== Phase 7: 7B smoke test (200 steps) ====="
-# run_exp "p7_smoke_ddp_7B" "7B" 1 "DDP" 200 1 8 "--use_ac"
-run_exp "p7_smoke_desloc_7B" "7B" 32 "DESLOC" 200 1 8 "--use_ac"
- 
-sleep 5
-python3 -c "import torch; torch.cuda.empty_cache()" 2>/dev/null
+# echo ""
+# echo "===== Phase 7: 7B smoke test (50 steps) ====="
+# # DDP: use_ac to fit on A6000 (AC reduces activations, stays under 48GB)
+# run_exp "p7_smoke_ddp_7B" "7B" 1 "DDP" 50 1 8 "--use_ac"
+# # DESLOC: cpu_offload pushes optimizer to CPU → room for bigger batch
+# run_exp "p7_smoke_desloc_7B" "7B" 32 "DESLOC" 50 4 4 "--cpu_offload --zero_stage 1"
 
-echo ""
-echo "===== Phase 7: 7B DDP vs DESLOC (1536 steps, 2-seed) ====="
+# sleep 5
+
+# echo ""
+# echo "===== Phase 7a: 7B DDP vs DESLOC (2-seed) ====="
+# for S in 1 2; do
+#     # DDP: AC + bs=2 → ~29GB/A6000 (61%)
+#     PYTHONHASHSEED=$((S * 7)) run_exp "p7a_ddp_7B_s${S}" "7B" 1 "DDP" 200 2 8 "--use_ac"
+#     # DESLOC: cpu_offload + no-AC + bs=4 → ~41GB/A6000 (85%)
+#     PYTHONHASHSEED=$((S * 7)) run_exp "p7a_desloc_7B_Kx32_s${S}" "7B" 32 "DESLOC" 200 4 4 "--cpu_offload --zero_stage 1"
+# done
+
+# sleep 5
+
+# ===================================================================
+# Phase 0: AutoSP compile验证 (50步, ~3分钟)
+# 目的: 确认AutoSP在walking3(2.7.1)上能compile通过
+# 看terminal有没有 [AUTOSP-COMPILE] SUCCESS
+# ===================================================================
+# echo ""
+# echo "===== Phase 0: AutoSP compile验证 (125M, 50 steps) ====="
+# run_exp "p0_autosp_desloc_125m" "125M" 32 "DESLOC" 50 4 4 "--use_autosp"
+# run_exp "p0_autosp_ddp_125m" "125M" 1 "DDP" 50 4 4 "--use_autosp"
+ 
+# sleep 3
+ 
+# # ===================================================================
+# # Phase 5: SP+DEC 正式实验 (AutoSP + DESLOC, 125M, 3-seed)
+# # ===================================================================
+# echo ""
+# echo "===== Phase 5: SP+DEC (125M, Kx=32, 3-seed, 500 steps) ====="
+# for S in 1 2 3; do
+#     PYTHONHASHSEED=$((S * 7)) run_exp "p5_sp_desloc_125m_s${S}" "125M" 32 "DESLOC" 500 4 4 "--use_autosp"
+# done
+ 
+# # Phase 5b: SP+DDP baseline
+# for S in 1 2 3; do
+#     PYTHONHASHSEED=$((S * 7)) run_exp "p5_sp_ddp_125m_s${S}" "125M" 1 "DDP" 500 4 4 "--use_autosp"
+# done
+ 
+# sleep 3
+ 
+# ===================================================================
+# Phase 7b: 7B long context seq=2048 (2-seed)
+# ===================================================================
+echo "===== Phase 7b: 7B long context seq=2048 (2-seed) ====="
 for S in 1 2; do
-    # PYTHONHASHSEED=$((S * 7)) run_exp "p7_ddp_7B_s${S}" "7B" 1 "DDP" 1536 1 8 "--use_ac"
-    PYTHONHASHSEED=$((S * 7)) run_exp "p7_desloc_7B_Kx32_s${S}" "7B" 32 "DESLOC" 1536 1 8 "--use_ac"
+    PYTHONHASHSEED=$((S * 7)) run_exp "p7b_ddp_7B_seq2048_s${S}" "7B" 1 "DDP" 200 1 8 "--use_ac --max_seq_len 2048"
+    PYTHONHASHSEED=$((S * 7)) run_exp "p7b_sp_desloc_7B_seq2048_s${S}" "7B" 32 "DESLOC" 200 1 8 "--use_autosp --use_ac --max_seq_len 2048"
 done
+sleep 5
  
-sleep 5
-python3 -c "import torch; torch.cuda.empty_cache()" 2>/dev/null
-
-# Phase 7b: 7B Kx消融 (1 seed, 1536 steps)
-echo "===== Phase 7b: 7B Kx 消融 ====="
-for KX in 16 64 128; do
-    PYTHONHASHSEED=7 run_exp "p7b_desloc_7B_Kx${KX}" "7B" "$KX" "DESLOC" 1536 1 8 "--use_ac"
+echo ""
+echo "===== Phase 7c: 7B Kx ablation (1-seed) ====="
+for KX in 16 64; do
+    PYTHONHASHSEED=7 run_exp "p7c_desloc_7B_Kx${KX}" "7B" "$KX" "DESLOC" 200 4 4 "--cpu_offload --zero_stage 1"
 done
+sleep 5
+
+echo ""
+echo "===== Phase 7d: 7B + AC push (bs=8, 67% GPU, 1-seed) ====="
+PYTHONHASHSEED=7 run_exp "p7d_desloc_7B_ac_bs8" "7B" 32 "DESLOC" 200 8 4 "--cpu_offload --zero_stage 1 --use_ac"
 
 sleep 5
-python3 -c "import torch; torch.cuda.empty_cache()" 2>/dev/null
 
-# Phase 7c: 7B Nesterov vs DiLoCo (1 seed, 1536 steps)
-echo "===== Phase 7c: 7B Nesterov ====="
-PYTHONHASHSEED=7 run_exp "p7c_nesterov_7B" "7B" 32 "DESLOC" 1536 1 8 "--use_ac --outer_optimizer nesterov --outer_momentum 0.9"
-
-sleep 5
-python3 -c "import torch; torch.cuda.empty_cache()" 2>/dev/null
+echo ""
+echo "===== Phase 7e: 7B Nesterov vs Avg 1536 steps (85% GPU) ====="
+PYTHONHASHSEED=7 run_exp "p7e_nesterov_7B" "7B" 32 "DESLOC" 1536 4 4 "--cpu_offload --zero_stage 1 --outer_optimizer nesterov --outer_momentum 0.9"
+PYTHONHASHSEED=7 run_exp "p7e_avg_7B" "7B" 32 "DESLOC" 1536 4 4 "--cpu_offload --zero_stage 1"
  
 # ===================================================================
 # 汇总

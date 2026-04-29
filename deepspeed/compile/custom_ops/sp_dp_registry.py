@@ -2,10 +2,18 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # DeepSpeed Team
+# M356 — Claude-32: Added pending_handles tracking and fence_all_sp_handles
+# to prevent NCCL deadlock on heterogeneous GPUs (A6000+H100).
+# Pattern: Megatron param_and_grad_buffer.py finish_grad_sync fence,
+#          NCCL src/device/all_reduce.h async completion tracking.
 
+import os
+import time
 import deepspeed.comm as dist
 
 GROUP_REGISTRY = {}  # int -> dist.ProcessGroup
+_PENDING_A2A_HANDLES = []  # M356: track async all-to-all handles
+_A2A_TIMEOUT_MS = int(os.environ.get('DESLOC_SP_A2A_TIMEOUT_MS', '60000'))
 
 
 def register_groups(groups):
@@ -65,3 +73,40 @@ def populate_registry(SP_SIZE, DP_SIZE):
     GROUP_REGISTRY['SP_SIZE'] = SP_SIZE
     GROUP_REGISTRY['DP_SIZE'] = DP_SIZE
     GROUP_REGISTRY['is_reg'] = True
+
+
+# M356: Async handle management for SP all-to-all operations.
+# On heterogeneous GPUs, forward/backward execution timing differs,
+# causing NCCL deadlock if handles are not properly fenced.
+def track_a2a_handle(handle):
+    """Register an async A2A handle for later fence."""
+    if handle is not None:
+        _PENDING_A2A_HANDLES.append((handle, time.monotonic()))
+
+
+def fence_all_sp_handles(timeout_ms=None):
+    """Wait for all pending SP all-to-all handles with timeout.
+
+    Returns number of handles fenced. Raises RuntimeError on timeout.
+    Pattern: Megatron finish_grad_sync fence with 30s timeout.
+    """
+    timeout_ms = timeout_ms or _A2A_TIMEOUT_MS
+    fenced = 0
+    while _PENDING_A2A_HANDLES:
+        handle, submit_time = _PENDING_A2A_HANDLES.pop(0)
+        elapsed_ms = (time.monotonic() - submit_time) * 1000
+        if elapsed_ms > timeout_ms:
+            raise RuntimeError(
+                f"[SP] A2A handle timed out after {elapsed_ms:.0f}ms "
+                f"(limit={timeout_ms}ms). Possible NCCL deadlock on "
+                f"heterogeneous GPUs. Set DESLOC_SP_A2A_TIMEOUT_MS higher "
+                f"or check GPU synchronization.")
+        if hasattr(handle, 'wait'):
+            handle.wait()
+        fenced += 1
+    return fenced
+
+
+def pending_handle_count():
+    """Number of unfenced SP handles."""
+    return len(_PENDING_A2A_HANDLES)

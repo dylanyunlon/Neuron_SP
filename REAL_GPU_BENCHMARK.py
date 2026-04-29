@@ -203,6 +203,16 @@ class TrainingConfig:
     # Requires: SDPA attention, ZeRO stage 0, torch.compile
     use_autosp: bool = False
 
+    # ZeRO optimization stage (0=disabled, 1=optimizer state partition)
+    # ZeRO-1 with AutoSP: partitions Adam m/v across GPUs, saves ~50% opt memory
+    # Required for 7B on 2xH20 (optimizer states alone = 56GB > single GPU)
+    zero_stage: int = 0
+
+    # CPU offload: move optimizer states to CPU RAM
+    # Frees ~56GB GPU memory for 7B model (Adam m + v + fp32 master)
+    # Required for 7B on A6000 (48GB) — without offload, optimizer alone = 56GB
+    cpu_offload: bool = False
+
     # Activation Checkpointing (M341)
     # Layer-wise: torch.utils.checkpoint per TransformerBlock
     # Saves ~60% activation memory at ~33% compute overhead
@@ -1188,7 +1198,9 @@ class Trainer:
     def __init__(self, config: TrainingConfig, method: str):
         self.config = config
         self.method = method
-        self.use_deepspeed = method == 'DESLOC' and _DS_AVAILABLE
+        # Use DeepSpeed for DESLOC, or for DDP when cpu_offload/ZeRO is needed (7B on A6000)
+        _needs_ds = (config.cpu_offload or config.zero_stage > 0)
+        self.use_deepspeed = (method == 'DESLOC' or (method == 'DDP' and _needs_ds)) and _DS_AVAILABLE
 
         # Distributed setup
         self.world_size = int(os.environ.get('WORLD_SIZE', 1))
@@ -1390,7 +1402,7 @@ class Trainer:
           - engine.py: desloc_post_step(), desloc_record_loss() etc.
           - stage_1_and_2.py: _desloc_reduce_tiered_gradients()
         """
-        return {
+        ds_cfg = {
             "train_batch_size": config.batch_size * config.gradient_accumulation * max(int(os.environ.get('WORLD_SIZE', 1)), 1),
             "train_micro_batch_size_per_gpu": config.batch_size,
             "gradient_accumulation_steps": config.gradient_accumulation,
@@ -1423,9 +1435,16 @@ class Trainer:
             },
             "wall_clock_breakdown": True,
         }
-        # AutoSP: add compile passes (requires ZeRO stage 0)
+        # ZeRO optimization (supports stage 0 and 1 for all methods)
+        _zero_stage = getattr(config, 'zero_stage', 0)
+        _cpu_offload = getattr(config, 'cpu_offload', False)
+        zero_cfg = {"stage": _zero_stage}
+        if _cpu_offload:
+            zero_cfg["offload_optimizer"] = {"device": "cpu", "pin_memory": True}
+        ds_cfg["zero_optimization"] = zero_cfg
+
+        # AutoSP: add compile passes
         if config.use_autosp:
-            ds_cfg["zero_optimization"] = {"stage": 0}
             ds_cfg["compile"] = {
                 "deepcompile": True,
                 "passes": ["autosp"],
@@ -2104,6 +2123,12 @@ def main():
                         help='Enable AutoSP sequence parallelism (DeepSpeed compile pass)')
     parser.add_argument('--use_ac', action='store_true',
                         help='Enable layer-wise activation checkpointing (torch.utils.checkpoint)')
+    parser.add_argument('--zero_stage', type=int, default=0, choices=[0, 1],
+                        help='ZeRO stage (0=off, 1=optimizer state partition)')
+    parser.add_argument('--cpu_offload', action='store_true',
+                        help='Offload optimizer states to CPU (saves ~56GB for 7B)')
+    parser.add_argument('--max_seq_len', type=int, default=1024,
+                        help='Maximum sequence length (default: 1024)')
     
     args = parser.parse_args()
     
@@ -2120,6 +2145,9 @@ def main():
         outer_lr=args.outer_lr,
         init_from_ckpt=args.init_from_ckpt,
         use_autosp=args.use_autosp,
+        zero_stage=args.zero_stage,
+        cpu_offload=args.cpu_offload,
+        max_seq_len=args.max_seq_len,
         use_activation_checkpointing=args.use_ac,
         output_dir=args.output
     )

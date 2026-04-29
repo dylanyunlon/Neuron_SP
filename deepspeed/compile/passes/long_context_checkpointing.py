@@ -43,6 +43,14 @@ def should_ban_recomputation(node):
     if get_aten_target(node) in must_save_set:
         return True
 
+    # M359: Ban recomputation of AutoSP all-to-all collective.
+    # Recomputing a collective during backward deadlocks NCCL because
+    # all ranks must participate simultaneously but recomputation is
+    # triggered asynchronously per-node by the autograd engine.
+    # Pattern: torchtitan comm_ops = [all_to_all_single.default]
+    if hasattr(node.target, '__module__') and 'autosp' in str(node.target):
+        return True
+
     def heuristic(node):
         if "val" in node.meta:
             if isinstance(node.meta["val"], torch.Tensor) and node.meta["val"].dim() >= 2:
@@ -128,8 +136,12 @@ def register_long_context_checkpointing():
     lines = src.split('\n')
 
     # Locate the original should_ban_recomputation and the function after it.
-    start = next(i for i, l in enumerate(lines) if l.startswith('    def should_ban_recomputation('))
-    end = next(i for i, l in enumerate(lines) if i > start and l.startswith('    def '))
+    # M359: Guard against PyTorch versions that rename or remove this function.
+    try:
+        start = next(i for i, l in enumerate(lines) if l.startswith('    def should_ban_recomputation('))
+        end = next(i for i, l in enumerate(lines) if i > start and l.startswith('    def '))
+    except StopIteration:
+        return
 
     # Indent the replacement to the nesting level inside solve_min_cut (4 spaces).
     replacement = textwrap.indent(_CUSTOM_SHOULD_BAN, '    ')

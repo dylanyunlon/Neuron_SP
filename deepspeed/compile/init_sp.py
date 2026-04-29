@@ -6,9 +6,10 @@
 import torch
 from torch.fx import GraphModule
 from .passes.sp_compile import apply_autosp
-from .passes.long_context_checkpointing import register_long_context_checkpointing
 from .custom_ops.sp_dp_registry import extract_mesh_size
 from .custom_ops.sp_compat import _check_autosp_compatibility
+from .custom_ops import all_to_all as _force_register_a2a  # noqa: F401
+from .passes.long_context_checkpointing import register_long_context_checkpointing
 
 
 def init_autosp(config):
