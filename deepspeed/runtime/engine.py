@@ -2728,7 +2728,7 @@ class DeepSpeedEngine(Module):
         #
         # NOTE: When SP is active, we still do the SP reduce-scatter
         # (handled by DeepCompile or Ulysses), only skip the DP AllReduce.
-        if self.desloc_enabled and not self.desloc_is_param_sync_step():
+        if self.desloc_enabled and not self.desloc_is_param_sync_step() and self.zero_optimization_stage() < 1:
             self.desloc_skipped_allreduces += 1
             return
 
