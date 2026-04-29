@@ -105,6 +105,14 @@ def _all_to_all_backward(ctx, grad):
     # heterogeneous GPUs. Pattern: Megatron FP32 reduce-scatter.
     # The gradient all-to-all redistributes partial grads across SP ranks;
     # accumulation in bf16 loses ~0.3% loss accuracy at 700M scale.
+    #
+    # M361: Contiguity guard. torch 2.7.1 autograd delivers non-contiguous
+    # grads to custom_op backward in certain transpose patterns. NCCL
+    # all_to_all_single (nccl/src/device/all_reduce.h) uses directSendRecv
+    # with pointer offset arithmetic that assumes contiguous layout.
+    # Pattern: Megatron param_and_grad_buffer.py always flattens before collective.
+    if not grad.is_contiguous():
+        grad = grad.contiguous()
     use_fp32 = (_DESLOC_FP32_SP_GRAD
                 and ctx.orig_dtype in (torch.bfloat16, torch.float16)
                 and grad.dtype in (torch.bfloat16, torch.float16))

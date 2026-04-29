@@ -2730,13 +2730,20 @@ class DeepSpeedEngine(Module):
         # (handled by DeepCompile or Ulysses), only skip the DP AllReduce.
         if self.desloc_enabled and not self.desloc_is_param_sync_step():
             self.desloc_skipped_allreduces += 1
-            # SP reduce-scatter still happens even when DEC skips DP sync
-            # This is handled by the compile pass (AutoSP) or Ulysses
-            # which operate independently of this method
             return
 
+        # M361(f): Fence pending SP A2A handles before DP AllReduce.
+        # On heterogeneous GPUs, H100 finishes backward faster → enters AllReduce
+        # while A6000 still has A2A in flight → NCCL deadlock.
+        # Pattern: Megatron finish_grad_sync().wait() before starting next collective.
+        if self._desloc_sp_enabled:
+            try:
+                from deepspeed.compile.custom_ops.sp_dp_registry import fence_before_dp_sync
+                fence_before_dp_sync()
+            except ImportError:
+                pass
+
         # Skip gradient reduction when DeepCompile is enabled
-        # DeepCompile handles its own gradient reduction through compiled graph operations
         if self.is_deepcompile_active() and not self.compile_autosp():
             return
 

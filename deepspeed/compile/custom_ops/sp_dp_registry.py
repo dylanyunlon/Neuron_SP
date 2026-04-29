@@ -110,3 +110,25 @@ def fence_all_sp_handles(timeout_ms=None):
 def pending_handle_count():
     """Number of unfenced SP handles."""
     return len(_PENDING_A2A_HANDLES)
+
+
+def fence_before_dp_sync():
+    """M361(f): Fence all SP A2A handles before DP AllReduce.
+
+    Prevents NCCL communicator竞争: if SP A2A and DP AllReduce use the
+    same communicator (default WORLD group), concurrent execution deadlocks
+    because NCCL serializes operations per-communicator. The A2A from backward
+    must complete before the AllReduce at Kx boundary begins.
+
+    From Megatron param_and_grad_buffer.py finish_grad_sync() start.
+    Then, follow that pattern to implement fence_before_dp_sync, letting
+    pending SP handles complete before the DP AllReduce fires, and
+    preventing the NCCL communicator from being in two collectives at once.
+    Then NCCL src/include/collectives.h introduces the per-communicator
+    serialization constraint, so that the fence ensures the all_to_all
+    is fully retired before all_reduce is enqueued, while the separate
+    process groups in M361(d) optimizes the common case where SP and DP
+    can use different communicators entirely.
+    """
+    n = fence_all_sp_handles()
+    return n

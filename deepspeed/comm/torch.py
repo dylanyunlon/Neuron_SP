@@ -1342,19 +1342,29 @@ class DeslocSequenceParallelComm:
         """Scatter input tensor along sequence dimension.
 
         Splits the input evenly across workers in seq_group.
+        M361: Raises RuntimeError if seq_group is None (previously silent no-op).
+        M361: Validates seq_len % world_size == 0 (previously unequal chunks).
 
         Args:
-            input_tensor: [batch, seq_len, hidden] tensor
+            input_tensor: [batch, seq_len, ...] tensor
             dim: dimension to scatter (default: 1 = sequence)
 
         Returns:
-            local shard of shape [batch, seq_len // world_size, hidden]
+            local shard of shape [batch, seq_len // world_size, ...]
         """
         if self.seq_group is None:
-            return input_tensor
+            raise RuntimeError(
+                "[DeslocSP] scatter_along_seq called with seq_group=None. "
+                "Pass an explicit process group (e.g., torch.distributed.group.WORLD "
+                "or dist.new_group(ranks)) to enable sequence parallelism.")
         world_size = torch.distributed.get_world_size(group=self.seq_group)
         if world_size <= 1:
             return input_tensor
+        seq_len = input_tensor.size(dim)
+        if seq_len % world_size != 0:
+            raise RuntimeError(
+                f"[DeslocSP] seq_len={seq_len} not divisible by "
+                f"sp_group_size={world_size}. Pad input to a multiple of {world_size}.")
         rank = torch.distributed.get_rank(group=self.seq_group)
         chunks = input_tensor.chunk(world_size, dim=dim)
         return chunks[rank].contiguous()

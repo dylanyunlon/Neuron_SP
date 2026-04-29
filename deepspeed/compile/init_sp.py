@@ -63,12 +63,31 @@ def init_autosp(config):
     sp_size, dp_size = extract_mesh_size(config._param_dict)
     register_long_context_checkpointing()
 
-    # M343: Detect DES-LOC configuration for SP+DEC composition logging
+    # M361(a): Validate n_heads % sp_size == 0 before compilation.
+    # AutoSP Ulysses A2A scatters heads across ranks: [B,N,S/P,H] → [B,N/P,S,H].
+    # N/P must be integer. If not, auto-reduce sp_size to largest valid factor.
+    # Pattern: Megatron parallel_state.py validate_tp_size checks
+    # hidden_size % tp_size == 0 at initialization, not at runtime.
+    import deepspeed.comm as dist
+    # Try to detect n_heads from model config if available
+    _n_heads = config._param_dict.get('n_heads', config._param_dict.get('num_attention_heads', 0))
+    if _n_heads > 0 and sp_size > 1 and _n_heads % sp_size != 0:
+        old_sp = sp_size
+        # Find largest factor of n_heads that divides world_size
+        for cand in range(sp_size - 1, 0, -1):
+            if _n_heads % cand == 0 and dist.get_world_size() % cand == 0:
+                sp_size = cand
+                dp_size = dist.get_world_size() // cand
+                break
+        if dist.get_rank() == 0:
+            print(f"[AutoSP/M361] n_heads={_n_heads} not divisible by "
+                  f"sp_size={old_sp}. Reduced to sp_size={sp_size}, "
+                  f"dp_size={dp_size}.")
+
     _desloc_cfg = config._param_dict.get('desloc', {})
     _desloc_enabled = _desloc_cfg.get('enabled', False)
     _desloc_Kx = _desloc_cfg.get('Kx', 1)
 
-    import deepspeed.comm as dist
     if dist.get_rank() == 0:
         print(f"[AutoSP] Initializing: sp_size={sp_size}, dp_size={dp_size}")
         if _desloc_enabled:
@@ -76,11 +95,18 @@ def init_autosp(config):
             print(f"  SP: sequence sharded across {sp_size} GPUs (All-to-All)")
             print(f"  DEC: AllReduce gated with Kx={_desloc_Kx}")
             print(f"  AC: Aten-IR long-context checkpointing (attention preserved)")
-            print(f"  Each GPU processes seq_len/{sp_size} tokens per step")
-            print(f"  AllReduce happens every {_desloc_Kx} steps (not every step)")
 
     def backend_fn(gm: GraphModule, real_inputs):
         apply_autosp(gm, real_inputs, debug=False, sp_size=sp_size, dp_size=dp_size)
-        return torch._inductor.compile(gm, real_inputs)
+        # M361: Inductor fallback for torch 2.7.x where custom_op with
+        # autograd registration may not be supported by inductor.
+        # Pattern: DeepSpeed init_z1.py has similar eager fallback.
+        try:
+            return torch._inductor.compile(gm, real_inputs)
+        except Exception as e:
+            if dist.get_rank() == 0:
+                print(f"[AutoSP/M361] Inductor failed ({type(e).__name__}), "
+                      f"using eager. Graph rewrite still applied.")
+            return gm
 
     return backend_fn

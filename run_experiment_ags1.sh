@@ -270,7 +270,7 @@ run_exp() {
 # ===================================================================
 echo "===== Phase 7b: 7B long context seq=2048 (2-seed) ====="
 for S in 1 2; do
-    PYTHONHASHSEED=$((S * 7)) run_exp "p7b_ddp_7B_seq2048_s${S}" "7B" 1 "DDP" 200 1 8 "--use_ac --max_seq_len 2048"
+    # PYTHONHASHSEED=$((S * 7)) run_exp "p7b_ddp_7B_seq2048_s${S}" "7B" 1 "DDP" 200 1 8 "--use_ac --max_seq_len 2048"
     PYTHONHASHSEED=$((S * 7)) run_exp "p7b_sp_desloc_7B_seq2048_s${S}" "7B" 32 "DESLOC" 200 1 8 "--use_autosp --use_ac --max_seq_len 2048"
 done
 sleep 5

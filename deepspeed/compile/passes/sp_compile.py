@@ -349,3 +349,17 @@ def apply_autosp(gm: GraphModule,
             print(f" AFTER: {p.__name__}")
             print(f"{'='*60}\n")
             print(gm.print_readable(print_output=False))
+
+    # M361(a): Post-pass A2A collective count validation.
+    # Each SDPA node must have exactly 4 A2A ops: Q,K,V scatter + O gather.
+    # Mismatch → NCCL deadlock because ranks call different collective counts.
+    # Pattern: NCCL src/include/collectives.h — all ranks must execute
+    # identical collective sequences on the same communicator.
+    a2a_count = sum(1 for n in gm.graph.nodes
+                    if n.op == "call_function" and 'all_to_all' in str(n.target))
+    expected = _n_sdpa * 4
+    if a2a_count != expected:
+        raise RuntimeError(
+            f"[AutoSP] A2A count mismatch: got {a2a_count}, expected {expected} "
+            f"(4 × {_n_sdpa} SDPA layers). Graph rewrite corrupted — "
+            f"NCCL deadlock will occur. Check pass_insert_attention_all_to_all.")
