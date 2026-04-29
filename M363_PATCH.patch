@@ -1,0 +1,297 @@
+================================================================
+FILE: REAL_GPU_BENCHMARK.py
+================================================================
+--- REAL_GPU_BENCHMARK.py.M362	2026-04-29 17:05:21.190301849 +0000
++++ REAL_GPU_BENCHMARK.py	2026-04-29 17:12:22.000217437 +0000
+@@ -983,6 +983,8 @@
+                 for cpu_t, gpu_t in cpu_pairs:
+                     cpu_t.copy_(gpu_t, non_blocking=True)
+ 
++            _sync_start = time.monotonic()
++
+             if sync_x and all_params:
+                 _sync_tier(all_params, lambda p: p.data)
+             if sync_u and all_params:
+@@ -992,6 +994,21 @@
+                 _sync_tier(all_params,
+                     lambda p: self.state.get(p, {}).get('exp_avg_sq'))
+ 
++            # M363: Diagnostic timing for sync operations
++            if dist.get_rank() == 0:
++                _sync_ms = (time.monotonic() - _sync_start) * 1000
++                _n_tiers = int(sync_x) + int(sync_u) + int(sync_v)
++                _total_bytes = sum(p.numel() * p.element_size() for p in all_params) * _n_tiers
++                if _sync_ms > 5000:
++                    print(f"[DESLOC/M363] SLOW sync step={self.global_step}: "
++                          f"{_sync_ms:.0f}ms ({_n_tiers} tiers, "
++                          f"{_total_bytes/1e9:.1f}GB, "
++                          f"{len(all_params)} params, "
++                          f"offload={'cpu' if any(self.state.get(all_params[0],{}).get('exp_avg',torch.empty(0)).device.type=='cpu' for _ in [0]) else 'gpu'})")
++                elif sync_x:
++                    print(f"[DESLOC/M363] sync step={self.global_step}: "
++                          f"{_sync_ms:.0f}ms ({_n_tiers} tiers)")
++
+         # ---------------------------------------------------------------
+         # Claude-27 M332: Momentum decay after x-sync (Bug fix #3)
+         # ---------------------------------------------------------------
+@@ -1226,9 +1243,20 @@
+     def __init__(self, config: TrainingConfig, method: str):
+         self.config = config
+         self.method = method
+-        # Use DeepSpeed for DESLOC, or for DDP when cpu_offload/ZeRO is needed (7B on A6000)
+-        _needs_ds = (config.cpu_offload or config.zero_stage > 0)
+-        self.use_deepspeed = (method == 'DESLOC' or (method == 'DDP' and _needs_ds)) and _DS_AVAILABLE
++        # Use DeepSpeed for DESLOC only when ZeRO >= 1 is needed (engine handles
++        # partitioned optimizer). For DESLOC + ZeRO-0, use baseline DESLOCAdamW path
++        # which correctly implements Kx gating by skipping AllReduce on non-Kx steps.
++        # DeepSpeed engine's allreduce_gradients() can't skip gradient AR with ZeRO-1
++        # (each rank needs full reduced gradient for its optimizer partition), so
++        # DES-LOC provides NO communication reduction in the engine path with ZeRO-1.
++        #
++        # M363: cpu_offload alone doesn't require DeepSpeed — DESLOCAdamW has its own
++        # CPU offload at line 674 (auto-detects based on model size vs GPU memory).
++        # Only ZeRO >= 1 genuinely requires the DeepSpeed engine infrastructure.
++        _needs_ds_engine = (config.zero_stage > 0)
++        self.use_deepspeed = (_needs_ds_engine or
++                              (method == 'DDP' and (config.cpu_offload or config.zero_stage > 0))
++                             ) and _DS_AVAILABLE
+ 
+         # Distributed setup
+         self.world_size = int(os.environ.get('WORLD_SIZE', 1))
+@@ -1543,21 +1571,6 @@
+                     "weight_decay": config.weight_decay,
+                 }
+             },
+-        # M362: Use bf16 mode when model is BF16 (>500M params).
+-        # FP16 mode creates FP32 master weights + GradScaler (dynamic loss scaling).
+-        # BF16 has 8 exponent bits (same as FP32) — no scaling needed.
+-        # Using fp16 mode on BF16 model causes:
+-        #   1. Unnecessary FP32 master weight copies (26.6GB for 7B)
+-        #   2. GradScaler inf/nan checks every step (requires CUDA sync)
+-        #   3. Potential GradScaler desync across heterogeneous GPUs
+-        # Pattern: Megatron training.py — --bf16 maps to bf16.enabled
+-        _mcfg = config.get_model_config()
+-        _approx_params = _mcfg.get('d_model', 768) ** 2 * _mcfg.get('n_layer', 12) * 12
+-        _model_is_bf16 = _approx_params > 500_000_000
+-        if _model_is_bf16:
+-            ds_cfg["bf16"] = {"enabled": True}
+-        else:
+-            ds_cfg["fp16"] = {"enabled": True, "initial_scale_power": 16}
+             "desloc": {
+                 "enabled": True,
+                 "Kx": config.Kx,
+@@ -1572,6 +1585,16 @@
+             },
+             "wall_clock_breakdown": True,
+         }
++        # M362: bf16 for BF16 models (>500M), fp16 for smaller FP32 models.
++        # BF16 has same exponent range as FP32 → no GradScaler needed.
++        # fp16 mode creates FP32 master weights + GradScaler → 26.6GB overhead for 7B
++        # + CUDA sync every step for inf/nan check → causes 29s stalls at Kx boundaries.
++        _size_to_params = {'125M': 125e6, '350M': 350e6, '700M': 700e6,
++                           '1.3B': 1.3e9, '1.7B': 1.7e9, '3B': 3e9, '7B': 6.7e9}
++        if _size_to_params.get(config.model_size, 0) > 500_000_000:
++            ds_cfg["bf16"] = {"enabled": True}
++        else:
++            ds_cfg["fp16"] = {"enabled": True, "initial_scale_power": 16}
+         # ZeRO optimization (supports stage 0 and 1 for all methods)
+         _zero_stage = getattr(config, 'zero_stage', 0)
+         _cpu_offload = getattr(config, 'cpu_offload', False)
+@@ -1716,12 +1739,15 @@
+                 )
+ 
+             _, loss = self.engine(input_ids, labels)
++            _t_fwd = time.time()
+ 
+             # engine.backward() handles gradient scaling + DES-LOC allreduce gating
+             self.engine.backward(loss)
++            _t_bwd = time.time()
+ 
+             # engine.step() handles optimizer step + DES-LOC post_step
+             self.engine.step()
++            _t_step = time.time()
+ 
+             # DES-LOC post-step: advance scheduler, record comm events
+             if hasattr(self.engine, 'desloc_post_step'):
+@@ -1730,6 +1756,16 @@
+                 self.engine.desloc_record_loss(loss.item())
+ 
+             step_time = time.time() - step_start
++            # M363: Timing breakdown — log if any phase takes > 5s
++            if step_time > 5.0 and self.rank == 0:
++                _fwd_ms = (_t_fwd - step_start) * 1000
++                _bwd_ms = (_t_bwd - _t_fwd) * 1000
++                _stp_ms = (_t_step - _t_bwd) * 1000
++                _ds = getattr(self.engine, 'desloc_step', -1)
++                print(f"[M363] SLOW step {step}: {step_time*1000:.0f}ms "
++                      f"(fwd={_fwd_ms:.0f} bwd={_bwd_ms:.0f} opt={_stp_ms:.0f}) "
++                      f"desloc_step={_ds} "
++                      f"is_sync={getattr(self.engine, 'desloc_is_param_sync_step', lambda: 'N/A')()}")
+             step_tokens = self.config.batch_size * self.config.gradient_accumulation * self.config.max_seq_len
+             total_tokens += step_tokens
+ 
+@@ -1862,9 +1898,15 @@
+                 # training loop step — guarantees cross-rank consistency
+                 if hasattr(self.optimizer, 'global_step'):
+                     self.optimizer.global_step = step
++                _sync_start = time.time()
+                 sync_info = self.optimizer.sync_if_needed(self.world_size)
++                _sync_time = time.time() - _sync_start
+                 if sync_info:
+                     self.metrics['comm_events'].append({'step': step, **sync_info})
++                # M363: Log slow syncs
++                if _sync_time > 5.0 and self.rank == 0:
++                    print(f"[M363] SLOW sync_if_needed step={step}: "
++                          f"{_sync_time*1000:.0f}ms")
+ 
+             # SP+DEC: advance SP step counter (for dp_gated_allreduce)
+             if self._sp_comm is not None:
+
+================================================================
+FILE: deepspeed/runtime/engine.py
+================================================================
+--- deepspeed/runtime/engine.py.M362	2026-04-29 17:05:21.195301848 +0000
++++ deepspeed/runtime/engine.py	2026-04-29 17:07:22.791278425 +0000
+@@ -2658,7 +2658,14 @@
+ 
+     def desloc_post_step(self, loss=None):
+         if not self.desloc_enabled: return
+-        self.desloc_step += 1
++        # M363: Guard against double increment. engine._exec_schedule()
++        # already incremented desloc_step. Only increment here if it didn't.
++        # Pattern: Megatron training.py tracks iteration vs micro-iteration
++        # with separate counters; we use a flag instead.
++        if getattr(self, '_desloc_step_incremented_this_step', False):
++            self._desloc_step_incremented_this_step = False
++        else:
++            self.desloc_step += 1
+         # M279: profiler hook
+         if hasattr(self, '_desloc_step_profiler'):
+             self._desloc_step_profiler(self.desloc_step)
+@@ -2726,9 +2733,25 @@
+         # Ref: Algorithm 1 line 10 — sync when step % Kx == 0
+         # Kx=1 never skips (standard DDP behavior preserved)
+         #
+-        # NOTE: When SP is active, we still do the SP reduce-scatter
+-        # (handled by DeepCompile or Ulysses), only skip the DP AllReduce.
+-        if self.desloc_enabled and not self.desloc_is_param_sync_step():
++        # M363 CRITICAL: When ZeRO >= 1 is active, NEVER skip gradient AllReduce.
++        # ZeRO-1 partitions optimizer states across ranks. Each rank owns 1/N of
++        # Adam m/v and only updates its partition. It MUST receive the fully-reduced
++        # gradient every step. Skipping causes NCCL sequence number mismatch:
++        #   rank 0 enqueues AllReduce for its partition buckets,
++        #   rank 1,2 don't → NCCL timeout at SeqNum divergence.
++        # Crash evidence: Phase 7c Kx=64, rank0 enqueued=166 vs rank1,2 enqueued=133.
++        #
++        # DES-LOC Kx gating only applies to PARAMETER averaging (handled separately
++        # in desloc_post_step / the user's training loop), not gradient reduction.
++        # With ZeRO-0: skip gradient AR on non-Kx steps → each rank has full opt state.
++        # With ZeRO-1+: gradient AR every step → param averaging at Kx boundaries.
++        #
++        # Pattern: DeepSpeed stage_1_and_2.py reduce_gradients() — unconditional.
++        # Pattern: Megatron DDP allreduce_gradients() — always runs, orthogonal to opt.
++        import time as _time
++        _ar_start = _time.monotonic()
++        _zero_stage = self.zero_optimization_stage()
++        if self.desloc_enabled and not self.desloc_is_param_sync_step() and _zero_stage < 1:
+             self.desloc_skipped_allreduces += 1
+             return
+ 
+@@ -2755,7 +2778,7 @@
+ 
+         # Communicate only at gradient accumulation boundaries
+         elif self.is_gradient_accumulation_boundary():
+-            if self.zero_optimization_stage() == ZeroStageEnum.optimizer_states and hasattr(
++            if _zero_stage == ZeroStageEnum.optimizer_states and hasattr(
+                     self.optimizer, 'reduce_gradients'):
+                 self.optimizer.reduce_gradients(pipeline_parallel=self.pipeline_parallelism)
+             else:
+@@ -2764,6 +2787,15 @@
+         elif self.zenflow:
+             self.optimizer.reduce_gradients(pipeline_parallel=self.pipeline_parallelism)
+ 
++        # M363: Diagnostic timing — log if AllReduce takes > 5 seconds
++        if self.desloc_enabled and dist.get_rank() == 0:
++            _ar_ms = (_time.monotonic() - _ar_start) * 1000
++            if _ar_ms > 5000:
++                print(f"[DESLOC/M363] SLOW allreduce_gradients: {_ar_ms:.0f}ms "
++                      f"at desloc_step={self.desloc_step} "
++                      f"zero_stage={_zero_stage} "
++                      f"is_boundary={self.is_gradient_accumulation_boundary()}")
++
+     def _backward_prologue(self):
+         self._start_timers(self.engine_timers.backward_timers)
+ 
+@@ -3092,6 +3124,7 @@
+         # DES-LOC: advance local step counter
+         if self.desloc_enabled:
+             self.desloc_step += 1
++            self._desloc_step_incremented_this_step = True  # M363: guard double increment
+             # M342: Track SP+DEC+AC composition state per step
+             if self._desloc_sp_enabled or self._desloc_ac_enabled:
+                 self._desloc_comm_history.append((
+
+================================================================
+FILE: run_experiment_ags1.sh
+================================================================
+--- run_experiment_ags1.sh.M362	2026-04-29 17:05:21.207301846 +0000
++++ run_experiment_ags1.sh	2026-04-29 17:11:36.518226757 +0000
+@@ -31,8 +31,18 @@
+ export NCCL_TIMEOUT=1800000                # 30 min timeout (was 600s default)
+ export TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=1800  # match
+ export NCCL_DEBUG=WARN                     # show NCCL warnings (INFO is too verbose)
++# M363: Force PCI_BUS_ID ordering → nvidia-smi index = torch cuda index.
++# Without this, CUDA defaults to FASTEST_FIRST → H100 becomes cuda:0
++# even though nvidia-smi shows it as GPU 2. Verified on ags1:
++#   python3 -c "import torch; print(torch.cuda.get_device_name(0))"
++#   → "NVIDIA H100 NVL" (without PCI_BUS_ID)
++#   → "NVIDIA RTX A6000" (with PCI_BUS_ID)
++export CUDA_DEVICE_ORDER=PCI_BUS_ID
++# M363: Enable NCCL flight recorder for crash diagnostics.
++# Without this, NCCL timeout errors say "Stack trace not found,
++# FlightRecorder is disabled". Buffer size = 1MB.
++export TORCH_NCCL_TRACE_BUFFER_SIZE=1000000
+ # Reduce CUDA memory fragmentation for tight-memory 7B runs (A6000 48GB)
+-# Requires PyTorch 2.4+ (walking3 env). Falls back gracefully if unsupported.
+ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+ 
+ RESULTS_DIR="./desloc_results"
+@@ -276,10 +286,20 @@
+ sleep 5
+  
+ echo ""
+-echo "===== Phase 7c: 7B Kx ablation (1-seed) ====="
+-for KX in 16 64; do
+-    PYTHONHASHSEED=7 run_exp "p7c_desloc_7B_Kx${KX}" "7B" "$KX" "DESLOC" 200 4 4 "--cpu_offload --zero_stage 1"
++echo "===== Phase 7c: 7B Kx ablation — Figure 14 (1536 steps) ====="
++# Figure 14: DES-LOC vs DDP at different sync frequencies
++# M363: Use --cpu_offload WITHOUT --zero_stage 1.
++# With ZeRO-1, gradient AllReduce happens EVERY step (ZeRO-1 requirement),
++# so DES-LOC Kx gating provides NO communication reduction.
++# Without ZeRO-1: DESLOCAdamW baseline path → true Kx gating.
++# DESLOCAdamW auto-offloads optimizer to CPU (7B exceeds GPU memory).
++# High-frequency: Kx=16, Kx=32 (Figure 14a)
++# Low-frequency: Kx=64, Kx=128 (Figure 14b)
++for KX in 16 32 64 128; do
++    PYTHONHASHSEED=7 run_exp "p7c_desloc_7B_Kx${KX}" "7B" "$KX" "DESLOC" 1536 4 4 "--cpu_offload --use_ac"
+ done
++# DDP baseline (Kx=1) — AC required to fit 7B on A6000
++PYTHONHASHSEED=7 run_exp "p7c_ddp_7B" "7B" 1 "DDP" 1536 1 8 "--use_ac"
+ sleep 5
+ 
+ echo ""
+@@ -289,9 +309,10 @@
+ sleep 5
+ 
+ echo ""
+-echo "===== Phase 7e: 7B Nesterov vs Avg 1536 steps (85% GPU) ====="
+-PYTHONHASHSEED=7 run_exp "p7e_nesterov_7B" "7B" 32 "DESLOC" 1536 4 4 "--cpu_offload --zero_stage 1 --outer_optimizer nesterov --outer_momentum 0.9"
+-PYTHONHASHSEED=7 run_exp "p7e_avg_7B" "7B" 32 "DESLOC" 1536 4 4 "--cpu_offload --zero_stage 1"
++echo "===== Phase 7e: 7B Nesterov vs Avg 1536 steps ====="
++# M363: No --zero_stage 1, use DESLOCAdamW baseline path for true Kx gating
++PYTHONHASHSEED=7 run_exp "p7e_nesterov_7B" "7B" 32 "DESLOC" 1536 4 4 "--cpu_offload --use_ac --outer_optimizer nesterov --outer_momentum 0.9"
++PYTHONHASHSEED=7 run_exp "p7e_avg_7B" "7B" 32 "DESLOC" 1536 4 4 "--cpu_offload --use_ac"
+  
+ # ===================================================================
+ # 汇总
+

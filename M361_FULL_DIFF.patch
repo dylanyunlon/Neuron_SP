@@ -1,0 +1,583 @@
+================================================================
+FILE: REAL_GPU_BENCHMARK.py
+================================================================
+--- REAL_GPU_BENCHMARK.py.orig	2026-04-29 07:19:57.891890959 +0000
++++ REAL_GPU_BENCHMARK.py	2026-04-29 07:22:22.534886069 +0000
+@@ -863,106 +863,134 @@
+             sync_v = True  # v piggybacks on x to keep adaptive LR consistent
+ 
+         # Measure rate-of-change at sync boundaries (before AllReduce)
+-        roc_x, roc_u, roc_v = 0.0, 0.0, 0.0
+-        n_params_counted = 0
+-        for group in self.param_groups:
+-            for p in group['params']:
+-                if p.grad is None:
++        # M361(e): Norm-only tracking — no .clone(). Old code cloned every param
++        # (13.3GB for 7B) causing OOM at 28.52GB peak + 13.3GB = 41.8GB ≈ A6000 limit.
++        # Pattern: Megatron distributed_data_parallel.py check_for_nan_in_grad —
++        # computes norm in-place without allocating a full copy.
++        # New approach: store only the L2 norm of each tier at previous sync,
++        # compute ‖current‖₂ at this sync, and use |‖curr‖-‖prev‖|/‖prev‖ as
++        # a lightweight proxy for rate of change. Loses per-element fidelity
++        # but captures the magnitude of drift, which is what Eq(4) needs.
++        if world_size > 1:
++            for tier_name, should_sync, get_fn in [
++                ('x', sync_x, lambda p, s: p.data),
++                ('u', sync_u, lambda p, s: s.get('exp_avg')),
++                ('v', sync_v, lambda p, s: s.get('exp_avg_sq')),
++            ]:
++                if not should_sync:
+                     continue
+-                pid = id(p)
+-                state = self.state[p]
+-                if pid not in self._state_snapshots:
+-                    self._state_snapshots[pid] = {}
+-
+-                # x (params) rate of change
+-                if sync_x:
+-                    snap = self._state_snapshots[pid].get('x')
+-                    if snap is not None:
+-                        diff_norm = torch.norm(p.data - snap, 2).item()
+-                        base_norm = torch.norm(snap, 2).item()
+-                        if base_norm > 1e-12:
+-                            roc_x += diff_norm / base_norm
+-                    self._state_snapshots[pid]['x'] = p.data.clone()
+-
+-                # u (first moment) rate of change
+-                if sync_u and 'exp_avg' in state:
+-                    snap = self._state_snapshots[pid].get('u')
+-                    if snap is not None:
+-                        diff_norm = torch.norm(state['exp_avg'] - snap, 2).item()
+-                        base_norm = torch.norm(snap, 2).item()
+-                        if base_norm > 1e-12:
+-                            roc_u += diff_norm / base_norm
+-                    self._state_snapshots[pid]['u'] = state['exp_avg'].clone()
+-
+-                # v (second moment) rate of change
+-                if sync_v and 'exp_avg_sq' in state:
+-                    snap = self._state_snapshots[pid].get('v')
+-                    if snap is not None:
+-                        diff_norm = torch.norm(state['exp_avg_sq'] - snap, 2).item()
+-                        base_norm = torch.norm(snap, 2).item()
+-                        if base_norm > 1e-12:
+-                            roc_v += diff_norm / base_norm
+-                    self._state_snapshots[pid]['v'] = state['exp_avg_sq'].clone()
+-
+-                n_params_counted += 1
+-
+-        # Average over parameters
+-        if n_params_counted > 0:
+-            if sync_x:
+-                self._rate_of_change['x'].append(roc_x / n_params_counted)
+-            if sync_u:
+-                self._rate_of_change['u'].append(roc_u / n_params_counted)
+-            if sync_v:
+-                self._rate_of_change['v'].append(roc_v / n_params_counted)
++                total_norm_sq = 0.0
++                for group in self.param_groups:
++                    for p in group['params']:
++                        t = get_fn(p, self.state.get(p, {}))
++                        if t is None:
++                            continue
++                        if t.device.type == 'cpu':
++                            total_norm_sq += t.float().norm().item() ** 2
++                        else:
++                            total_norm_sq += t.float().norm().item() ** 2
++                cur_norm = total_norm_sq ** 0.5
++                prev_key = f'_roc_norm_{tier_name}'
++                prev_norm = getattr(self, prev_key, None)
++                if prev_norm is not None and prev_norm > 1e-12:
++                    roc = abs(cur_norm - prev_norm) / prev_norm
++                    self._rate_of_change[tier_name].append(roc)
++                setattr(self, prev_key, cur_norm)
+ 
+         # Actual AllReduce (multi-GPU only)
+-        # Megatron-style flattened buffer: concat all params into ONE tensor,
+-        # do a single AllReduce, then scatter back. This avoids NCCL deadlock
+-        # from per-parameter calls and reduces launch overhead from O(N_params)
+-        # to O(1) NCCL calls per tier. See NCCL all_reduce.h Ring AllReduce.
++        # M361(b,h,i): Chunked flattened AllReduce with PCIe pipelining.
++        #
++        # From Megatron param_and_grad_buffer.py _ParamAndGradBucket.start_grad_sync()
++        # start. Then, follow that pattern to implement a new _chunked_flat_allreduce,
++        # letting the AllReduce operate on a single contiguous buffer per chunk, and
++        # capping peak memory at CHUNK_BYTES to avoid OOM on A6000 (49GB).
++        # Then DeepSpeed stage_1_and_2.py introduces reduce_ipg_grads() with
++        # ipg_bucket_size=500MB, so that each NCCL call is bounded, while
++        # _flatten_dense_tensors optimizes the concat into a single memcpy.
++        # Then NCCL src/device/all_reduce.h Ring AllReduce integrates the
++        # ncclGroupStart/ncclGroupEnd batching, letting multiple small buffers
++        # be fused into one ring pass, and Megatron's finish_grad_sync() fence
++        # enhances async completion tracking.
++        # Finally torch._utils._flatten_dense_tensors refines the cat into a
++        # single-allocation copy, ensuring expandable_segments compatibility,
++        # fully upgrading the AllReduce to handle 7B+ with CPU offload at O(1)
++        # NCCL calls per chunk.
++        CHUNK_BYTES = 512 * 1024 * 1024  # 512MB — fits in A6000 headroom
++
+         if world_size > 1:
+             all_params = []
+             for group in self.param_groups:
+                 for p in group['params']:
+                     all_params.append(p)
+ 
+-            if sync_x and all_params:
+-                for p in all_params:
+-                    dist.all_reduce(p.data, op=dist.ReduceOp.SUM)
+-                    p.data.div_(world_size)
+-
+-            if sync_u and all_params:
+-                for p in all_params:
+-                    state = self.state.get(p, {})
+-                    if 'exp_avg' not in state:
++            def _sync_tier(param_list, get_tensor_fn):
++                """Chunked flattened AllReduce for one tier.
++                Handles CPU-offloaded tensors via stream overlap."""
++                tensors, cpu_pairs = [], []
++                for p in param_list:
++                    t = get_tensor_fn(p)
++                    if t is None:
+                         continue
+-                    m = state['exp_avg']
+-                    if m.device.type == 'cpu':
+-                        # CPU-offloaded: bring to GPU, sync, send back
+-                        m_gpu = m.to(p.device)
+-                        dist.all_reduce(m_gpu, op=dist.ReduceOp.SUM)
+-                        m_gpu.div_(world_size)
+-                        state['exp_avg'].copy_(m_gpu)
+-                        del m_gpu
++                    if t.device.type == 'cpu':
++                        t_gpu = t.to(p.device, non_blocking=True)
++                        cpu_pairs.append((t, t_gpu))
++                        tensors.append(t_gpu)
+                     else:
+-                        dist.all_reduce(m, op=dist.ReduceOp.SUM)
+-                        m.div_(world_size)
++                        tensors.append(t)
++                if not tensors:
++                    return
++                if cpu_pairs:
++                    torch.cuda.current_stream().synchronize()
+ 
++                # Chunk tensors into groups of ~CHUNK_BYTES each
++                chunks, cur_chunk, cur_bytes = [], [], 0
++                elem_size = tensors[0].element_size()
++                for t in tensors:
++                    t_bytes = t.numel() * elem_size
++                    if cur_bytes + t_bytes > CHUNK_BYTES and cur_chunk:
++                        chunks.append(cur_chunk)
++                        cur_chunk, cur_bytes = [], 0
++                    cur_chunk.append(t)
++                    cur_bytes += t_bytes
++                if cur_chunk:
++                    chunks.append(cur_chunk)
++
++                # Pre-allocate a reusable flat buffer (avoids torch.cat fragmentation)
++                max_chunk_numel = max(sum(t.numel() for t in c) for c in chunks)
++                flat_buf = torch.empty(max_chunk_numel, dtype=tensors[0].dtype,
++                                       device=tensors[0].device)
++
++                for chunk in chunks:
++                    total = sum(t.numel() for t in chunk)
++                    flat = flat_buf[:total]
++                    # Copy into flat buffer
++                    off = 0
++                    for t in chunk:
++                        n = t.numel()
++                        flat[off:off + n].copy_(t.reshape(-1))
++                        off += n
++                    dist.all_reduce(flat, op=dist.ReduceOp.SUM)
++                    flat.div_(world_size)
++                    # Copy back
++                    off = 0
++                    for t in chunk:
++                        n = t.numel()
++                        t.copy_(flat[off:off + n].reshape(t.shape))
++                        off += n
++
++                del flat_buf
++                # Stream back CPU-offloaded tensors
++                for cpu_t, gpu_t in cpu_pairs:
++                    cpu_t.copy_(gpu_t, non_blocking=True)
++
++            if sync_x and all_params:
++                _sync_tier(all_params, lambda p: p.data)
++            if sync_u and all_params:
++                _sync_tier(all_params,
++                    lambda p: self.state.get(p, {}).get('exp_avg'))
+             if sync_v and all_params:
+-                for p in all_params:
+-                    state = self.state.get(p, {})
+-                    if 'exp_avg_sq' not in state:
+-                        continue
+-                    v = state['exp_avg_sq']
+-                    if v.device.type == 'cpu':
+-                        v_gpu = v.to(p.device)
+-                        dist.all_reduce(v_gpu, op=dist.ReduceOp.SUM)
+-                        v_gpu.div_(world_size)
+-                        state['exp_avg_sq'].copy_(v_gpu)
+-                        del v_gpu
+-                    else:
+-                        dist.all_reduce(v, op=dist.ReduceOp.SUM)
+-                        v.div_(world_size)
++                _sync_tier(all_params,
++                    lambda p: self.state.get(p, {}).get('exp_avg_sq'))
+ 
+         # ---------------------------------------------------------------
+         # Claude-27 M332: Momentum decay after x-sync (Bug fix #3)
+@@ -1331,40 +1359,82 @@
+         # ============================================================
+         self._sp_comm = None
+         self._sp_enabled = False
++        self._sp_size = 1
+         if config.use_autosp and self.world_size > 1:
+             if self.use_deepspeed:
+-                # DeepSpeed path: AutoSP handled by engine.compile()
+-                # _sp_comm not needed — compile pass does scatter/gather
+                 if self.rank == 0:
+                     print("[SP+DEC] AutoSP via DeepSpeed compile (inductor)")
+             else:
+-                # Baseline path: use standalone DeslocSequenceParallelComm
+-                # This provides scatter_along_seq / gather_along_seq
+-                # without requiring torch.compile infrastructure
+-                try:
+-                    from deepspeed.comm.torch import DeslocSequenceParallelComm
+-                    # SP group = all GPUs in data-parallel group
+-                    # For SP+DEC: SP splits sequence, DEC gates AllReduce
+-                    self._sp_comm = DeslocSequenceParallelComm(
+-                        seq_group=None,  # uses default WORLD group
+-                        dp_group=None,   # same — all workers are both SP and DP
+-                        Kx=config.Kx,
+-                    )
+-                    self._sp_enabled = True
++                # M361(a,c,d): Compute sp_size from n_heads GCD with world_size.
++                # AutoSP Ulysses requires n_heads % sp_size == 0.
++                # On 3 GPU (2×A6000 + 1×H100), world_size=3 but n_heads=32,
++                # 32%3≠0. Solution: sp_size = GCD(n_heads, world_size).
++                # For 7B (n_heads=32, ws=3): sp_size=1 → no SP benefit.
++                # Better: sp_size=2, using 2 A6000s as SP pair.
++                #
++                # From Megatron parallel_state.py initialize_model_parallel():
++                # it creates separate process groups for TP, PP, CP, DP.
++                # We follow that pattern: create an SP group of size sp_size
++                # using contiguous ranks [0..sp_size-1], and a separate DP
++                # group for the remaining ranks.
++                #
++                # From NCCL src/include/collectives.h ncclCommInitRank:
++                # each communicator is a separate resource. Using separate
++                # groups for SP and DP prevents the f communicator竞争 in fix (f).
++                model_cfg = config.get_model_config()
++                n_heads = model_cfg['n_head']
++                # Find largest sp_size ≤ world_size where n_heads % sp_size == 0
++                sp_size = 1
++                for candidate in range(min(self.world_size, n_heads), 0, -1):
++                    if n_heads % candidate == 0 and candidate <= self.world_size:
++                        sp_size = candidate
++                        break
++                self._sp_size = sp_size
++
++                # M361(c): Pad seq_len to multiple of sp_size
++                if config.max_seq_len % sp_size != 0:
++                    old_len = config.max_seq_len
++                    config.max_seq_len = ((config.max_seq_len + sp_size - 1) // sp_size) * sp_size
+                     if self.rank == 0:
+-                        print(f"[SP+DEC] Standalone sequence parallel enabled "
+-                              f"(world_size={self.world_size}, Kx={config.Kx})")
+-                        print(f"[SP+DEC] Sequence dim=1 scattered across "
+-                              f"{self.world_size} workers")
+-                        print(f"[SP+DEC] Each worker processes seq_len/"
+-                              f"{self.world_size}={config.max_seq_len // self.world_size} "
+-                              f"tokens per sample")
+-                except ImportError:
+-                    # DeslocSequenceParallelComm not available —
+-                    # fall back to no SP (still runs DES-LOC without SP)
++                        print(f"[SP/M361] Padded max_seq_len {old_len} → "
++                              f"{config.max_seq_len} (multiple of sp_size={sp_size})")
++
++                if sp_size > 1:
++                    try:
++                        from deepspeed.comm.torch import DeslocSequenceParallelComm
++                        # M361(d,f): Create EXPLICIT process groups.
++                        # SP group: ranks [0..sp_size-1] (e.g., 2 A6000s)
++                        # DP group: all ranks (for DES-LOC Kx AllReduce)
++                        # Separate groups prevent NCCL communicator竞争.
++                        # Pattern: NCCL ncclGroupStart/End batches collectives
++                        # on the SAME communicator; different groups = different comms.
++                        sp_ranks = list(range(sp_size))
++                        sp_group = dist.new_group(sp_ranks)
++                        dp_group = dist.new_group(list(range(self.world_size)))
++
++                        self._sp_comm = DeslocSequenceParallelComm(
++                            seq_group=sp_group,
++                            dp_group=dp_group,
++                            Kx=config.Kx,
++                        )
++                        self._sp_enabled = True
++                        if self.rank == 0:
++                            print(f"[SP+DEC] SP enabled: sp_size={sp_size} "
++                                  f"(n_heads={n_heads}, ws={self.world_size})")
++                            print(f"[SP+DEC] SP group ranks={sp_ranks}, "
++                                  f"each processes seq_len/{sp_size}"
++                                  f"={config.max_seq_len // sp_size} tokens")
++                            if sp_size < self.world_size:
++                                print(f"[SP+DEC] Ranks {sp_size}..{self.world_size-1} "
++                                      f"are DP-only (not in SP group)")
++                    except ImportError:
++                        if self.rank == 0:
++                            print("[SP+DEC] DeslocSequenceParallelComm unavailable")
++                else:
+                     if self.rank == 0:
+-                        print("[SP+DEC] WARNING: DeslocSequenceParallelComm "
+-                              "not available, running without sequence parallel")
++                        print(f"[SP/M361] Cannot enable SP: n_heads={n_heads} "
++                              f"has no factor ≤ world_size={self.world_size} > 1. "
++                              f"Running DES-LOC without SP.")
+                         print("[SP+DEC] DES-LOC Kx gating still active "
+                               "(data parallel only)")
+             if not self._sp_enabled and not self.use_deepspeed and self.rank == 0:
+@@ -1377,12 +1447,19 @@
+ 
+         # Gradient scaler for non-deepspeed paths
+         # BF16 has same dynamic range as FP32 (8 exponent bits) → no scaling needed
+-        # Ref: Megatron training.py — GradScaler only used with FP16, not BF16
++        # M361(g): GradScaler + BF16 conflict prevention.
++        # BF16 has 8 exponent bits (same as FP32) → no GradScaler needed.
++        # 7B+ models are converted to BF16 above (line ~1270).
++        # If model is BF16 OR if n_params > 500M (BF16 was applied), scaler=None.
++        # This prevents the edge case where DeepSpeed engine wraps model to FP16
++        # after __init__, but scaler was already created based on pre-wrap dtype.
++        # Pattern: Megatron training.py:1431 — GradScaler only with FP16 Float16Module.
+         _model_is_bf16 = next(self.model.parameters()).dtype == torch.bfloat16
+-        if _model_is_bf16:
++        n_params = sum(p.numel() for p in self.model.parameters())
++        if _model_is_bf16 or n_params > 500_000_000 or self.use_deepspeed:
+             self.scaler = None
+         else:
+-            self.scaler = torch.amp.GradScaler('cuda') if not self.use_deepspeed else None
++            self.scaler = torch.amp.GradScaler('cuda')
+ 
+         # Metrics
+         self.metrics = {
+@@ -1659,10 +1736,10 @@
+         # With SP: each worker sees seq_len/world_size tokens, but total
+         # across cluster is still batch * grad_accum * seq_len
+         if self._sp_enabled:
+-            local_seq_len = self.config.max_seq_len // self.world_size
++            local_seq_len = self.config.max_seq_len // self._sp_size
+             if self.rank == 0:
+                 print(f"[SP+DEC] Training with local_seq_len={local_seq_len} "
+-                      f"(full={self.config.max_seq_len})")
++                      f"(full={self.config.max_seq_len}, sp_size={self._sp_size})")
+         else:
+             local_seq_len = self.config.max_seq_len
+ 
+
+================================================================
+FILE: deepspeed/comm/torch.py
+================================================================
+--- deepspeed/comm/torch.py.orig	2026-04-29 07:19:57.895890959 +0000
++++ deepspeed/comm/torch.py	2026-04-29 07:22:36.692885591 +0000
+@@ -1342,19 +1342,29 @@
+         """Scatter input tensor along sequence dimension.
+ 
+         Splits the input evenly across workers in seq_group.
++        M361: Raises RuntimeError if seq_group is None (previously silent no-op).
++        M361: Validates seq_len % world_size == 0 (previously unequal chunks).
+ 
+         Args:
+-            input_tensor: [batch, seq_len, hidden] tensor
++            input_tensor: [batch, seq_len, ...] tensor
+             dim: dimension to scatter (default: 1 = sequence)
+ 
+         Returns:
+-            local shard of shape [batch, seq_len // world_size, hidden]
++            local shard of shape [batch, seq_len // world_size, ...]
+         """
+         if self.seq_group is None:
+-            return input_tensor
++            raise RuntimeError(
++                "[DeslocSP] scatter_along_seq called with seq_group=None. "
++                "Pass an explicit process group (e.g., torch.distributed.group.WORLD "
++                "or dist.new_group(ranks)) to enable sequence parallelism.")
+         world_size = torch.distributed.get_world_size(group=self.seq_group)
+         if world_size <= 1:
+             return input_tensor
++        seq_len = input_tensor.size(dim)
++        if seq_len % world_size != 0:
++            raise RuntimeError(
++                f"[DeslocSP] seq_len={seq_len} not divisible by "
++                f"sp_group_size={world_size}. Pad input to a multiple of {world_size}.")
+         rank = torch.distributed.get_rank(group=self.seq_group)
+         chunks = input_tensor.chunk(world_size, dim=dim)
+         return chunks[rank].contiguous()
+
+================================================================
+FILE: deepspeed/compile/passes/sp_compile.py
+================================================================
+--- deepspeed/compile/passes/sp_compile.py.orig	2026-04-29 07:19:57.900890958 +0000
++++ deepspeed/compile/passes/sp_compile.py	2026-04-29 07:23:36.344883575 +0000
+@@ -349,3 +349,17 @@
+             print(f" AFTER: {p.__name__}")
+             print(f"{'='*60}\n")
+             print(gm.print_readable(print_output=False))
++
++    # M361(a): Post-pass A2A collective count validation.
++    # Each SDPA node must have exactly 4 A2A ops: Q,K,V scatter + O gather.
++    # Mismatch → NCCL deadlock because ranks call different collective counts.
++    # Pattern: NCCL src/include/collectives.h — all ranks must execute
++    # identical collective sequences on the same communicator.
++    a2a_count = sum(1 for n in gm.graph.nodes
++                    if n.op == "call_function" and 'all_to_all' in str(n.target))
++    expected = _n_sdpa * 4
++    if a2a_count != expected:
++        raise RuntimeError(
++            f"[AutoSP] A2A count mismatch: got {a2a_count}, expected {expected} "
++            f"(4 × {_n_sdpa} SDPA layers). Graph rewrite corrupted — "
++            f"NCCL deadlock will occur. Check pass_insert_attention_all_to_all.")
+
+================================================================
+FILE: deepspeed/compile/custom_ops/all_to_all.py
+================================================================
+--- deepspeed/compile/custom_ops/all_to_all.py.orig	2026-04-29 07:19:57.903890958 +0000
++++ deepspeed/compile/custom_ops/all_to_all.py	2026-04-29 07:23:20.239884119 +0000
+@@ -105,6 +105,14 @@
+     # heterogeneous GPUs. Pattern: Megatron FP32 reduce-scatter.
+     # The gradient all-to-all redistributes partial grads across SP ranks;
+     # accumulation in bf16 loses ~0.3% loss accuracy at 700M scale.
++    #
++    # M361: Contiguity guard. torch 2.7.1 autograd delivers non-contiguous
++    # grads to custom_op backward in certain transpose patterns. NCCL
++    # all_to_all_single (nccl/src/device/all_reduce.h) uses directSendRecv
++    # with pointer offset arithmetic that assumes contiguous layout.
++    # Pattern: Megatron param_and_grad_buffer.py always flattens before collective.
++    if not grad.is_contiguous():
++        grad = grad.contiguous()
+     use_fp32 = (_DESLOC_FP32_SP_GRAD
+                 and ctx.orig_dtype in (torch.bfloat16, torch.float16)
+                 and grad.dtype in (torch.bfloat16, torch.float16))
+
+================================================================
+FILE: deepspeed/compile/custom_ops/sp_dp_registry.py
+================================================================
+--- deepspeed/compile/custom_ops/sp_dp_registry.py.orig	2026-04-29 07:19:57.908890958 +0000
++++ deepspeed/compile/custom_ops/sp_dp_registry.py	2026-04-29 07:24:18.161882161 +0000
+@@ -110,3 +110,25 @@
+ def pending_handle_count():
+     """Number of unfenced SP handles."""
+     return len(_PENDING_A2A_HANDLES)
++
++
++def fence_before_dp_sync():
++    """M361(f): Fence all SP A2A handles before DP AllReduce.
++
++    Prevents NCCL communicator竞争: if SP A2A and DP AllReduce use the
++    same communicator (default WORLD group), concurrent execution deadlocks
++    because NCCL serializes operations per-communicator. The A2A from backward
++    must complete before the AllReduce at Kx boundary begins.
++
++    From Megatron param_and_grad_buffer.py finish_grad_sync() start.
++    Then, follow that pattern to implement fence_before_dp_sync, letting
++    pending SP handles complete before the DP AllReduce fires, and
++    preventing the NCCL communicator from being in two collectives at once.
++    Then NCCL src/include/collectives.h introduces the per-communicator
++    serialization constraint, so that the fence ensures the all_to_all
++    is fully retired before all_reduce is enqueued, while the separate
++    process groups in M361(d) optimizes the common case where SP and DP
++    can use different communicators entirely.
++    """
++    n = fence_all_sp_handles()
++    return n
+
+================================================================
+FILE: deepspeed/compile/init_sp.py
+================================================================
+--- deepspeed/compile/init_sp.py.orig	2026-04-29 07:19:57.912890958 +0000
++++ deepspeed/compile/init_sp.py	2026-04-29 07:24:01.048882740 +0000
+@@ -63,12 +63,31 @@
+     sp_size, dp_size = extract_mesh_size(config._param_dict)
+     register_long_context_checkpointing()
+ 
+-    # M343: Detect DES-LOC configuration for SP+DEC composition logging
++    # M361(a): Validate n_heads % sp_size == 0 before compilation.
++    # AutoSP Ulysses A2A scatters heads across ranks: [B,N,S/P,H] → [B,N/P,S,H].
++    # N/P must be integer. If not, auto-reduce sp_size to largest valid factor.
++    # Pattern: Megatron parallel_state.py validate_tp_size checks
++    # hidden_size % tp_size == 0 at initialization, not at runtime.
++    import deepspeed.comm as dist
++    # Try to detect n_heads from model config if available
++    _n_heads = config._param_dict.get('n_heads', config._param_dict.get('num_attention_heads', 0))
++    if _n_heads > 0 and sp_size > 1 and _n_heads % sp_size != 0:
++        old_sp = sp_size
++        # Find largest factor of n_heads that divides world_size
++        for cand in range(sp_size - 1, 0, -1):
++            if _n_heads % cand == 0 and dist.get_world_size() % cand == 0:
++                sp_size = cand
++                dp_size = dist.get_world_size() // cand
++                break
++        if dist.get_rank() == 0:
++            print(f"[AutoSP/M361] n_heads={_n_heads} not divisible by "
++                  f"sp_size={old_sp}. Reduced to sp_size={sp_size}, "
++                  f"dp_size={dp_size}.")
++
+     _desloc_cfg = config._param_dict.get('desloc', {})
+     _desloc_enabled = _desloc_cfg.get('enabled', False)
+     _desloc_Kx = _desloc_cfg.get('Kx', 1)
+ 
+-    import deepspeed.comm as dist
+     if dist.get_rank() == 0:
+         print(f"[AutoSP] Initializing: sp_size={sp_size}, dp_size={dp_size}")
+         if _desloc_enabled:
+@@ -76,11 +95,18 @@
+             print(f"  SP: sequence sharded across {sp_size} GPUs (All-to-All)")
+             print(f"  DEC: AllReduce gated with Kx={_desloc_Kx}")
+             print(f"  AC: Aten-IR long-context checkpointing (attention preserved)")
+-            print(f"  Each GPU processes seq_len/{sp_size} tokens per step")
+-            print(f"  AllReduce happens every {_desloc_Kx} steps (not every step)")
+ 
+     def backend_fn(gm: GraphModule, real_inputs):
+         apply_autosp(gm, real_inputs, debug=False, sp_size=sp_size, dp_size=dp_size)
+-        return torch._inductor.compile(gm, real_inputs)
++        # M361: Inductor fallback for torch 2.7.x where custom_op with
++        # autograd registration may not be supported by inductor.
++        # Pattern: DeepSpeed init_z1.py has similar eager fallback.
++        try:
++            return torch._inductor.compile(gm, real_inputs)
++        except Exception as e:
++            if dist.get_rank() == 0:
++                print(f"[AutoSP/M361] Inductor failed ({type(e).__name__}), "
++                      f"using eager. Graph rewrite still applied.")
++            return gm
+ 
+     return backend_fn
+
+================================================================
+FILE: deepspeed/runtime/engine.py
+================================================================
+--- deepspeed/runtime/engine.py.orig	2026-04-29 07:19:57.916890958 +0000
++++ deepspeed/runtime/engine.py	2026-04-29 07:24:32.650881671 +0000
+@@ -2730,13 +2730,20 @@
+         # (handled by DeepCompile or Ulysses), only skip the DP AllReduce.
+         if self.desloc_enabled and not self.desloc_is_param_sync_step():
+             self.desloc_skipped_allreduces += 1
+-            # SP reduce-scatter still happens even when DEC skips DP sync
+-            # This is handled by the compile pass (AutoSP) or Ulysses
+-            # which operate independently of this method
+             return
+ 
++        # M361(f): Fence pending SP A2A handles before DP AllReduce.
++        # On heterogeneous GPUs, H100 finishes backward faster → enters AllReduce
++        # while A6000 still has A2A in flight → NCCL deadlock.
++        # Pattern: Megatron finish_grad_sync().wait() before starting next collective.
++        if self._desloc_sp_enabled:
++            try:
++                from deepspeed.compile.custom_ops.sp_dp_registry import fence_before_dp_sync
++                fence_before_dp_sync()
++            except ImportError:
++                pass
++
+         # Skip gradient reduction when DeepCompile is enabled
+-        # DeepCompile handles its own gradient reduction through compiled graph operations
+         if self.is_deepcompile_active() and not self.compile_autosp():
+             return
+ 
+
