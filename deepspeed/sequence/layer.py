@@ -403,6 +403,23 @@ class DistributedAttention(torch.nn.Module):
             return pre_hook_fun
 
         self.layer_sync(query)
+        # M365 DIAG: pre-A2A tensor norms on ALL ranks
+        # Pattern: TransformerEngine attention.py per-step amax logging
+        if not hasattr(self, '_diag_step'):
+            self._diag_step = 0
+        self._diag_step += 1
+        _diag_log = (self._diag_step % 200 == 1)
+        if _diag_log:
+            _r = dist.get_rank()
+            with torch.no_grad():
+                print(f"[DS-ATTN] rank={_r} call#{self._diag_step} "
+                      f"pre-A2A Q={list(query.shape)} "
+                      f"Q_norm={query.float().norm().item():.4f} "
+                      f"K_norm={key.float().norm().item():.4f} "
+                      f"V_norm={value.float().norm().item():.4f} "
+                      f"batch_dim={batch_dim_idx} "
+                      f"scatter={self.scatter_idx} gather={self.gather_idx}")
+
         query_layer = _SeqAllToAll.apply(self.spg, query, self.scatter_idx, self.gather_idx, batch_dim_idx, None,
                                          self.overlap_handles, 'q')
         self.layer_sync(key)
@@ -413,6 +430,17 @@ class DistributedAttention(torch.nn.Module):
 
         value_layer = _SeqAllToAll.apply(self.spg, value, self.scatter_idx, self.gather_idx, batch_dim_idx, None,
                                          self.overlap_handles, 'v')
+
+        # M365 DIAG: post-A2A tensor norms — verify shape transformation and norm preservation
+        if _diag_log:
+            with torch.no_grad():
+                print(f"[DS-ATTN] rank={_r} call#{self._diag_step} "
+                      f"post-A2A Q={list(query_layer.shape)} "
+                      f"Q_norm={query_layer.float().norm().item():.4f} "
+                      f"K_norm={key_layer.float().norm().item():.4f} "
+                      f"V_norm={value_layer.float().norm().item():.4f} "
+                      f"nan_Q={torch.isnan(query_layer).any().item()} "
+                      f"nan_K={torch.isnan(key_layer).any().item()}")
 
         if self.sp_overlap_comm:
             # Register a hook to synchronize dq and dk after the all-to-all
@@ -433,8 +461,23 @@ class DistributedAttention(torch.nn.Module):
 
         context_layer = self.local_attn(query_layer, key_layer, value_layer, *args, **kwargs)
 
+        # M365 DIAG: attention output before reverse A2A
+        if _diag_log:
+            with torch.no_grad():
+                print(f"[DS-ATTN] rank={_r} call#{self._diag_step} "
+                      f"attn_out={list(context_layer.shape)} "
+                      f"out_norm={context_layer.float().norm().item():.4f} "
+                      f"out_mean={context_layer.float().mean().item():.8f}")
+
         output = _SeqAllToAll.apply(self.spg, context_layer, self.gather_idx, self.scatter_idx, batch_dim_idx,
                                     self.sp_stream, self.overlap_handles, 'o')
+
+        # M365 DIAG: reverse A2A output
+        if _diag_log:
+            with torch.no_grad():
+                print(f"[DS-ATTN] rank={_r} call#{self._diag_step} "
+                      f"final_out={list(output.shape)} "
+                      f"final_norm={output.float().norm().item():.4f}")
 
         #out e.g., [s/p::h]
         return output

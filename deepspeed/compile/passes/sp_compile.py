@@ -344,6 +344,14 @@ def apply_autosp(gm: GraphModule,
 
         p(gm, real_inputs)
 
+        # M365 DIAG: log node count after each pass on ALL ranks
+        # Pattern: Triton compiler.py logs pass statistics
+        n_nodes_post = len(list(gm.graph.nodes))
+        n_a2a_post = sum(1 for n in gm.graph.nodes
+                         if n.op == "call_function" and 'all_to_all' in str(n.target))
+        if rank == 0:
+            print(f"[AUTOSP-PASS] {p.__name__}: nodes={n_nodes_post} a2a={n_a2a_post}")
+
         if debug and rank == 0:
             print(f"\n{'='*60}")
             print(f" AFTER: {p.__name__}")

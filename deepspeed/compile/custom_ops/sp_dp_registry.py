@@ -73,9 +73,15 @@ def populate_registry(SP_SIZE, DP_SIZE):
     GROUP_REGISTRY['SP_SIZE'] = SP_SIZE
     GROUP_REGISTRY['DP_SIZE'] = DP_SIZE
     GROUP_REGISTRY['is_reg'] = True
-    if dist.get_rank() == 0:
-        print(f"[SP-REG] SP={SP_SIZE} DP={DP_SIZE} "
-              f"groups={[list(range(i*SP_SIZE,(i+1)*SP_SIZE)) for i in range(DP_SIZE)]}")
+    # M365 DIAG: log mesh setup on ALL ranks for cross-rank verification
+    # Pattern: Megatron parallel_state.py logs group assignments per rank
+    _r = dist.get_rank()
+    _ws = dist.get_world_size()
+    _gid = _r // SP_SIZE
+    _sp_rank_in_group = _r % SP_SIZE
+    print(f"[SP-REG] rank={_r}/{_ws} SP={SP_SIZE} DP={DP_SIZE} "
+          f"sp_group_id={_gid} sp_rank_in_group={_sp_rank_in_group} "
+          f"groups={[list(range(i*SP_SIZE,(i+1)*SP_SIZE)) for i in range(DP_SIZE)]}")
 
 
 # M356: Async handle management for SP all-to-all operations.

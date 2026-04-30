@@ -97,17 +97,32 @@ def init_autosp(config):
             print(f"  AC: Aten-IR long-context checkpointing (attention preserved)")
 
     def backend_fn(gm: GraphModule, real_inputs):
-        if dist.get_rank() == 0:
-            n_sdpa = len([n for n in gm.graph.nodes if 'scaled_dot_product' in str(n.target)])
-            print(f"[AUTOSP-BE] nodes={len(list(gm.graph.nodes))} sdpa={n_sdpa} sp={sp_size} dp={dp_size}")
+        # M365 DIAG: log graph structure on ALL ranks before SP rewrite
+        _r = dist.get_rank()
+        all_nodes = list(gm.graph.nodes)
+        n_sdpa = len([n for n in all_nodes if 'scaled_dot_product' in str(n.target)])
+        n_a2a = len([n for n in all_nodes if 'all_to_all' in str(n.target)])
+        n_linear = len([n for n in all_nodes if 'linear' in str(n.target).lower() or 'mm' in str(n.target)])
+        print(f"[AUTOSP-BE] rank={_r} nodes={len(all_nodes)} "
+              f"sdpa={n_sdpa} a2a_pre={n_a2a} linear={n_linear} "
+              f"sp={sp_size} dp={dp_size} "
+              f"n_inputs={len(real_inputs)} "
+              f"input_shapes={[list(x.shape) if hasattr(x, 'shape') else type(x).__name__ for x in real_inputs[:3]]}")
+
         apply_autosp(gm, real_inputs, debug=False, sp_size=sp_size, dp_size=dp_size)
-        # M361: Inductor fallback for torch 2.7.x where custom_op with
-        # autograd registration may not be supported by inductor.
-        # Pattern: DeepSpeed init_z1.py has similar eager fallback.
+
+        # M365 DIAG: post-rewrite graph analysis
+        all_nodes_post = list(gm.graph.nodes)
+        n_a2a_post = len([n for n in all_nodes_post if 'all_to_all' in str(n.target)])
+        n_sdpa_post = len([n for n in all_nodes_post if 'scaled_dot_product' in str(n.target)])
+        print(f"[AUTOSP-BE] rank={_r} POST-REWRITE nodes={len(all_nodes_post)} "
+              f"a2a_inserted={n_a2a_post - n_a2a} sdpa={n_sdpa_post}")
+
+        # M361: Inductor fallback for torch 2.7.x
         try:
             return torch._inductor.compile(gm, real_inputs)
         except Exception as e:
-            if dist.get_rank() == 0:
+            if _r == 0:
                 print(f"[AutoSP/M361] Inductor failed ({type(e).__name__}), "
                       f"using eager. Graph rewrite still applied.")
             return gm

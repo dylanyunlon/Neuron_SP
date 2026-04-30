@@ -39,6 +39,12 @@ except ImportError:
 # is fully self-contained in this file. DeepSpeed is only needed for
 # engine.py Kx-gated allreduce hooks in multi-GPU mode.
 _DS_AVAILABLE = False
+
+# M365: Centralized diagnostic toolkit
+try:
+    from deepspeed.utils.desloc_diag import diag as _diag
+except ImportError:
+    _diag = None
 try:
     import deepspeed
     from deepspeed.runtime.utils import (
@@ -345,20 +351,52 @@ class CausalSelfAttention(nn.Module):
         v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
 
         s = _SP_CTX['step']
-        if s % 100 == 1 and (dist.get_rank() if dist.is_initialized() else 0) == 0:
-            print(f"[ATTN] step={s} Q={list(q.shape)} T={T} n_head={self.n_head} "
-                  f"Q_norm={q.float().norm().item():.4f} K_norm={k.float().norm().item():.4f} "
-                  f"V_norm={v.float().norm().item():.4f} sp={_SP_CTX['on']}")
+        _r = dist.get_rank() if dist.is_initialized() else 0
+
+        # M365 DIAG: pre-A2A QKV statistics on ALL ranks (not just rank 0)
+        # This reveals whether SP ranks have divergent activations
+        if _diag and s % 50 == 1:
+            with torch.no_grad():
+                print(f"[ATTN] rank={_r} step={s} Q={list(q.shape)} T={T} n_head={self.n_head} "
+                      f"Q_norm={q.float().norm().item():.4f} K_norm={k.float().norm().item():.4f} "
+                      f"V_norm={v.float().norm().item():.4f} "
+                      f"Q_mean={q.float().mean().item():.6f} K_mean={k.float().mean().item():.6f} "
+                      f"x_hash={x.float().sum().item():.4f} sp={_SP_CTX['on']}")
 
         if _SP_CTX['on'] and _SP_CTX['grp'] is not None:
+            # M365 DIAG: capture pre-A2A Q hash to verify SP ranks have same data
+            if _diag and s % 50 == 1:
+                _diag.log_data_hash(s, _r, q, "pre-A2A-Q")
+
+            q_pre = q  # keep ref for post-check
             q = _ulysses_a2a(q, 1, 2, _SP_CTX['grp'])
             k = _ulysses_a2a(k, 1, 2, _SP_CTX['grp'])
             v = _ulysses_a2a(v, 1, 2, _SP_CTX['grp'])
-            if s % 100 == 1 and (dist.get_rank() if dist.is_initialized() else 0) == 0:
-                print(f"[ATTN-A2A] post Q={list(q.shape)} heads={q.shape[1]} seq={q.shape[2]}")
+
+            # M365 DIAG: post-A2A shape + norm verification on ALL ranks
+            if _diag and s % 50 == 1:
+                _diag.log_a2a_stats(s, _r, "Q-fwd", q_pre, q)
+                print(f"[ATTN-A2A] rank={_r} step={s} post Q={list(q.shape)} "
+                      f"heads={q.shape[1]} seq={q.shape[2]} "
+                      f"Q_norm_post={q.float().norm().item():.4f} "
+                      f"K_norm_post={k.float().norm().item():.4f} "
+                      f"V_norm_post={v.float().norm().item():.4f}")
+
             y = F.scaled_dot_product_attention(q, k, v, attn_mask=None,
                 dropout_p=self.dropout if self.training else 0.0, is_causal=True)
+
+            # M365 DIAG: attention output before reverse A2A
+            if _diag and s % 50 == 1:
+                print(f"[ATTN-SDPA] rank={_r} step={s} y_pre_reverse={list(y.shape)} "
+                      f"y_norm={y.float().norm().item():.4f} "
+                      f"y_mean={y.float().mean().item():.8f} "
+                      f"y_std={y.float().std().item():.6f}")
+
+            y_pre_rev = y
             y = _ulysses_a2a(y, 2, 1, _SP_CTX['grp'])
+
+            if _diag and s % 50 == 1:
+                _diag.log_a2a_stats(s, _r, "Y-rev", y_pre_rev, y)
         else:
             y = F.scaled_dot_product_attention(q, k, v, attn_mask=None,
                 dropout_p=self.dropout if self.training else 0.0, is_causal=True)
@@ -492,15 +530,35 @@ class GPT(nn.Module):
         pos_off = _SP_CTX['rk'] * T if _SP_CTX['on'] else 0
         pos = torch.arange(pos_off, pos_off + T, dtype=torch.long, device=idx.device)
         s = _SP_CTX['step']
-        if s % 100 == 1:
-            _r = dist.get_rank() if dist.is_initialized() else 0
+        _r = dist.get_rank() if dist.is_initialized() else 0
+
+        # M365 DIAG: input token statistics on ALL ranks
+        if _diag and s % 50 == 1:
             print(f"[FWD] rank={_r} step={s} idx=[{B},{T}] pos=[{pos_off}..{pos_off+T-1}] "
-                  f"ids[:5]={idx[0,:min(5,T)].tolist()}")
+                  f"ids[:8]={idx[0,:min(8,T)].tolist()} "
+                  f"ids_hash={idx.float().sum().item():.0f}")
+
         tok_emb = self.transformer.wte(idx)
         pos_emb = self.transformer.wpe(pos)
         x = self.transformer.drop(tok_emb + pos_emb)
+
+        # M365 DIAG: embedding output statistics
+        if _diag and s % 50 == 1:
+            print(f"[FWD-EMB] rank={_r} step={s} "
+                  f"tok_emb_norm={tok_emb.float().norm().item():.4f} "
+                  f"pos_emb_norm={pos_emb.float().norm().item():.4f} "
+                  f"x_norm={x.float().norm().item():.4f}")
+
         for block in self.transformer.h:
             x = block(x)
+
+        # M365 DIAG: post-transformer hidden state statistics
+        if _diag and s % 50 == 1:
+            print(f"[FWD-POST] rank={_r} step={s} "
+                  f"hidden_norm={x.float().norm().item():.4f} "
+                  f"hidden_mean={x.float().mean().item():.8f} "
+                  f"hidden_std={x.float().std().item():.6f}")
+
         x = self.transformer.ln_f(x)
         logits = self.lm_head(x)
         loss = None
@@ -510,10 +568,16 @@ class GPT(nn.Module):
             # but computes CE loss on its LOCAL token subset. Each rank's gradient
             # is valid for its tokens. Gradients sync via DES-LOC AllReduce.
             # Do NOT all_reduce loss here — it destroys autograd graph.
-            if s % 100 == 1:
-                _r = dist.get_rank() if dist.is_initialized() else 0
+
+            # M365 DIAG: full loss decomposition on ALL ranks
+            if _diag and s % 50 == 1:
+                _diag.log_loss_decomp(s, _r, loss, logits, targets, _SP_CTX['on'])
                 print(f"[FWD-LOSS] rank={_r} step={s} loss={loss.item():.6f} "
-                      f"logit_std={logits.float().std().item():.4f} sp={'local' if _SP_CTX['on'] else 'full'}")
+                      f"logit_norm={logits.float().norm().item():.4f} "
+                      f"logit_std={logits.float().std().item():.4f} "
+                      f"logit_mean={logits.float().mean().item():.8f} "
+                      f"sp={'local' if _SP_CTX['on'] else 'full'} "
+                      f"n_tokens={targets.numel()}")
         return logits, loss
 
 
@@ -817,6 +881,32 @@ class DESLOCAdamW(torch.optim.Optimizer):
                     torch.sqrt(exp_avg_sq, out=state['_denom'])
                     state['_denom'].div_(math.sqrt(bc2)).add_(1e-8)
                     p.data.addcdiv_(exp_avg, state['_denom'], value=-step_size)
+
+        # M365 DIAG: per-group optimizer step summary at key steps
+        # Pattern: Megatron optimizer.py log_num_zeros_in_grad
+        if self.global_step % 50 == 1:
+            _r = dist.get_rank() if dist.is_initialized() else 0
+            n_updated = 0
+            total_m_norm_sq = 0.0
+            total_v_norm_sq = 0.0
+            total_p_norm_sq = 0.0
+            for grp in self.param_groups:
+                for p in grp['params']:
+                    st = self.state.get(p, {})
+                    if 'exp_avg' not in st:
+                        continue
+                    n_updated += 1
+                    m_n = st['exp_avg'].float().norm().item() if st['exp_avg'].device.type != 'cpu' else 0.0
+                    v_n = st['exp_avg_sq'].float().norm().item() if st['exp_avg_sq'].device.type != 'cpu' else 0.0
+                    total_m_norm_sq += m_n ** 2
+                    total_v_norm_sq += v_n ** 2
+                    total_p_norm_sq += p.data.float().norm().item() ** 2
+            print(f"[DIAG/OPT-STEP] rank={_r} step={self.global_step} "
+                  f"n_updated={n_updated} "
+                  f"||m||={math.sqrt(total_m_norm_sq):.4f} "
+                  f"||v||={math.sqrt(total_v_norm_sq):.4f} "
+                  f"||p||={math.sqrt(total_p_norm_sq):.4f} "
+                  f"offload={self._use_offload}")
     
     def sync_if_needed(self, world_size: int):
         """Sync optimizer states based on DES-LOC schedule.
@@ -922,9 +1012,11 @@ class DESLOCAdamW(torch.optim.Optimizer):
         if sync_x:
             sync_v = True  # v piggybacks on x to keep adaptive LR consistent
 
-        # M364 DIAG
+        # M364 DIAG — M365 FIX: use cached grad norm from before optimizer.step()
+        # optimizer.step() does p.grad = None to free VRAM, so computing grad
+        # norm here always gives 0.0000. Use _cached_grad_norm set by training loop.
         if self.global_step % 100 == 1 or sync_x:
-            gnorm = sum(p.grad.float().norm().item()**2 for grp in self.param_groups for p in grp['params'] if p.grad is not None)**0.5
+            gnorm = getattr(self, '_cached_grad_norm', 0.0)  # M365: cached before step()
             pnorm = sum(p.data.float().norm().item()**2 for grp in self.param_groups for p in grp['params'])**0.5
             _r = dist.get_rank() if dist.is_initialized() else 0
             print(f"[SYNC] rank={_r} step={self.global_step} sync_x={sync_x} sync_u={sync_u} sync_v={sync_v} "
@@ -1436,6 +1528,7 @@ class Trainer:
         self._sp_size = 1
         self._sp_group = None
         self._sp_rank = 0
+        self._sp_ranks = None  # M365: global ranks in SP group (for data broadcast)
         if config.use_autosp and self.world_size > 1:
             if self.use_deepspeed:
                 if self.rank == 0:
@@ -1533,6 +1626,7 @@ class Trainer:
                         self._sp_size = sp_size
                         sp_group = dist.new_group(sp_ranks)
                         dp_group = dist.new_group(list(range(self.world_size)))
+                        self._sp_ranks = sp_ranks  # M365: save for data broadcast
 
                         self._sp_comm = DeslocSequenceParallelComm(
                             seq_group=sp_group,
@@ -1894,9 +1988,25 @@ class Trainer:
                 input_ids = batch['input_ids'].to(self.device)
                 labels = batch['labels'].to(self.device)
 
+                # M365 DIAG: pre-broadcast data hash on ALL ranks
+                if _diag and step % 50 == 1:
+                    _diag.log_data_hash(step, self.rank, input_ids, "pre-bcast-input")
+                    _diag.log_data_hash(step, self.rank, labels, "pre-bcast-labels")
+
+                # M365 CRITICAL FIX: Broadcast data within SP group before scatter.
+                if self._sp_enabled and self._sp_group is not None and self._sp_ranks is not None:
+                    sp_src = self._sp_ranks[0]
+                    dist.broadcast(input_ids, src=sp_src, group=self._sp_group)
+                    dist.broadcast(labels, src=sp_src, group=self._sp_group)
+
+                    # M365 DIAG: post-broadcast cross-rank hash verification
+                    if _diag and step % 50 == 1:
+                        _diag.log_data_hash_cross_rank(
+                            step, self.rank, input_ids,
+                            "post-bcast-input", self._sp_group)
+                        _diag.log_data_hash(step, self.rank, labels, "post-bcast-labels")
+
                 # M339 SP+DEC: scatter input along sequence dimension
-                # Each worker gets seq_len/world_size contiguous tokens
-                # This is the "SP" part of SP+DEC
                 if self._sp_enabled and self._sp_comm is not None:
                     input_ids = self._sp_comm.scatter_along_seq(
                         input_ids, dim=1
@@ -1904,6 +2014,10 @@ class Trainer:
                     labels = self._sp_comm.scatter_along_seq(
                         labels, dim=1
                     )
+                    # M365 DIAG: post-scatter per-rank data hash
+                    if _diag and step % 50 == 1:
+                        _diag.log_data_hash(step, self.rank, input_ids, "post-scatter-input")
+                        _diag.log_data_hash(step, self.rank, labels, "post-scatter-labels")
 
                 with autocast():
                     _, loss = self.model(input_ids, labels)
@@ -1911,6 +2025,10 @@ class Trainer:
 
                 self.scaler.scale(loss).backward() if self.scaler else loss.backward()
                 accumulated_loss += loss.item()
+
+            # M365 DIAG: post-backward gradient statistics
+            if _diag and step % 50 == 1:
+                _diag.log_grad_stats(step, self.rank, self.model)
 
             # M364 DIAG
             if step % 100 == 1:
@@ -1923,40 +2041,118 @@ class Trainer:
                     dist.all_gather(al, lt)
                     print(f"[GRAD] rank={_r} all_rank_losses={[round(x.item(),6) for x in al]}")
 
+            # M365 DIAG: snapshot parameter norms BEFORE optimizer step
+            _pre_step_pnorm = None
+            if _diag and step % 50 == 1:
+                with torch.no_grad():
+                    _pre_step_pnorm = sum(
+                        p.detach().float().norm().item()**2
+                        for p in self.model.parameters()
+                    )**0.5
+
             if self.scaler:
                 self.scaler.unscale_(self.optimizer)
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip)
+
+            # M365 FIX: Cache gradient norm HERE — after clip, before optimizer.step().
+            # optimizer.step() does p.grad = None internally to free VRAM for Adam denom,
+            # so any grad norm measured AFTER step() will be 0.0000.
+            # Pattern: Megatron training.py captures grad_norm from optimizer.step() return value.
+            _cached_grad_norm = 0.0
+            with torch.no_grad():
+                _cached_grad_norm = sum(
+                    p.grad.float().norm().item()**2
+                    for p in self.model.parameters() if p.grad is not None
+                )**0.5
+            # Store on optimizer so sync_if_needed can access it
+            if hasattr(self.optimizer, '__dict__'):
+                self.optimizer._cached_grad_norm = _cached_grad_norm
+
             if self.scaler:
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
             else:
                 self.optimizer.step()
-            self.optimizer.zero_grad(set_to_none=True)
+
+            # M365 DIAG: parameter update magnitude tracking
+            if _diag and step % 50 == 1 and _pre_step_pnorm is not None:
+                with torch.no_grad():
+                    _post_step_pnorm = sum(
+                        p.detach().float().norm().item()**2
+                        for p in self.model.parameters()
+                    )**0.5
+                    _delta = abs(_post_step_pnorm - _pre_step_pnorm)
+                    _ratio = _delta / max(_pre_step_pnorm, 1e-12)
+                    print(f"[DIAG/UPDATE] rank={self.rank} step={step} "
+                          f"||p||_before={_pre_step_pnorm:.4f} "
+                          f"||p||_after={_post_step_pnorm:.4f} "
+                          f"delta={_delta:.6f} update_ratio={_ratio:.8f}")
+
+            # M365 DIAG: optimizer state (momentum, variance)
+            if _diag and step % 50 == 1:
+                _diag.log_optimizer_state(step, self.rank, self.optimizer)
+
+            # M365 DIAG: parameter divergence across ranks
+            if _diag and step % 50 == 1:
+                _diag.log_param_divergence(step, self.rank, self.model, self.world_size)
 
             # DES-LOC / LocalAdam sync — the "DEC" part of SP+DEC
-            #
-            # M340 CRITICAL FIX: Pass training loop step counter (not
-            # optimizer internal global_step) to sync_if_needed.
-            # GradScaler may skip optimizer.step() on some ranks when
-            # NaN/Inf grads are detected, causing optimizer.global_step
-            # to diverge across ranks → different sync decisions →
-            # NCCL AllReduce deadlock (only some ranks call AllReduce).
-            #
-            # The training loop 'step' variable is always identical
-            # across all ranks because it's a for-loop counter, not
-            # dependent on optimizer state.
             if hasattr(self.optimizer, 'sync_if_needed'):
-                # Override optimizer's internal step counter with the
-                # training loop step — guarantees cross-rank consistency
                 if hasattr(self.optimizer, 'global_step'):
                     self.optimizer.global_step = step
+
+                # M365 DIAG: pre-sync param norm
+                _pre_sync_pnorm = None
+                if _diag and step % 50 == 1:
+                    with torch.no_grad():
+                        _pre_sync_pnorm = sum(
+                            p.detach().float().norm().item()**2
+                            for p in self.model.parameters()
+                        )**0.5
+
                 sync_info = self.optimizer.sync_if_needed(self.world_size)
+
+                # M365 DIAG: post-sync param norm + sync event logging
+                if _diag and step % 50 == 1 and sync_info:
+                    if sync_info.get('sync_x', False) and _pre_sync_pnorm is not None:
+                        with torch.no_grad():
+                            _post_sync_pnorm = sum(
+                                p.detach().float().norm().item()**2
+                                for p in self.model.parameters()
+                            )**0.5
+                        _diag.log_sync_event(step, self.rank, 'x',
+                                              _pre_sync_pnorm, _post_sync_pnorm,
+                                              self.world_size)
+                        # Post-sync param divergence should be ZERO across ranks
+                        _diag.log_param_divergence(step, self.rank, self.model,
+                                                    self.world_size)
+
                 if sync_info:
                     self.metrics['comm_events'].append({'step': step, **sync_info})
 
             # SP+DEC: advance SP step counter (for dp_gated_allreduce)
             if self._sp_comm is not None:
                 self._sp_comm.step()
+
+            # M365 FIX: zero_grad AFTER sync_if_needed, not before.
+            # sync_if_needed() reads grad norms for [SYNC] diagnostics.
+            # It operates on p.data and optimizer states, NOT gradients,
+            # so this reordering is functionally safe.
+            # Previously zero_grad was before sync → [SYNC] always showed grad=0.0000.
+            self.optimizer.zero_grad(set_to_none=True)
+
+            # M365 DIAG: pipeline routing (only at step 1)
+            if _diag and step == 1:
+                _diag.log_pipeline(step, self.rank,
+                    sp_enabled=self._sp_enabled,
+                    sp_size=self._sp_size,
+                    sp_ranks=str(self._sp_ranks),
+                    method=self.method,
+                    offload=getattr(self.optimizer, '_use_offload', False),
+                    use_ac=self.config.use_ac,
+                    world_size=self.world_size,
+                    Kx=self.config.Kx,
+                    scaler=self.scaler is not None)
 
             step_time = time.time() - step_start
             step_tokens = self.config.batch_size * self.config.gradient_accumulation * self.config.max_seq_len

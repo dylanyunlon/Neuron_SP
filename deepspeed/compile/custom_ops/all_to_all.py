@@ -66,10 +66,26 @@ def all_to_all(
     group = get_group(gid)
     if not hasattr(all_to_all, '_n'): all_to_all._n = 0
     all_to_all._n += 1
-    if all_to_all._n % 400 == 1 and dist.get_rank() == 0:
-        print(f"[A2A] #{all_to_all._n} {name} sc={scatter_idx} ga={gather_idx} "
-              f"in=[{B},{dim1},{dim2},{H}] sp={sp_size()}")
-    return _execute_a2a(input, scatter_idx, B, dim1, dim2, H, group)
+    # M365 DIAG: log on ALL ranks (not just rank 0) for cross-rank comparison
+    # Pattern: CUTLASS profiler.h per-kernel shape/norm logging
+    if all_to_all._n % 200 == 1:
+        _r = dist.get_rank()
+        in_norm = input.float().norm().item()
+        has_nan = torch.isnan(input).any().item()
+        print(f"[A2A-COMPILE] rank={_r} #{all_to_all._n} {name} "
+              f"sc={scatter_idx} ga={gather_idx} "
+              f"in=[{B},{dim1},{dim2},{H}] sp={sp_size()} "
+              f"norm={in_norm:.4f} nan={has_nan}")
+    output = _execute_a2a(input, scatter_idx, B, dim1, dim2, H, group)
+    # M365 DIAG: post-A2A output verification
+    if all_to_all._n % 200 == 1:
+        out_norm = output.float().norm().item()
+        out_nan = torch.isnan(output).any().item()
+        _r = dist.get_rank()
+        print(f"[A2A-COMPILE-OUT] rank={_r} #{all_to_all._n} {name} "
+              f"out={list(output.shape)} norm={out_norm:.4f} nan={out_nan} "
+              f"norm_ratio={out_norm/max(in_norm,1e-12):.4f}")
+    return output
 
 
 @torch.library.register_fake("autosp::all_to_all")

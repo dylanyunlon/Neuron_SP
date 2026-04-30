@@ -1367,9 +1367,22 @@ class DeslocSequenceParallelComm:
                 f"sp_group_size={world_size}. Pad input to a multiple of {world_size}.")
         rank = torch.distributed.get_rank(group=self.seq_group)
         chunks = input_tensor.chunk(world_size, dim=dim)
-        if self._step % 100 == 0:
-            print(f"[SP-SCATTER] rank={rank} step={self._step} "
-                  f"full={list(input_tensor.shape)} chunk={list(chunks[rank].shape)} ws={world_size}")
+
+        # M365 DIAG: scatter verification — hash of full tensor and selected chunk
+        # Pattern: veScale _redistribute.py assertion on placement integrity.
+        # If two SP ranks show different full-tensor hashes, the broadcast is broken.
+        if self._step % 50 == 0 or self._step <= 3:
+            _r = torch.distributed.get_rank()
+            with torch.no_grad():
+                full_hash = input_tensor.float().sum().item()
+                chunk_hash = chunks[rank].float().sum().item()
+                chunk_shape = list(chunks[rank].shape)
+            print(f"[SP-SCATTER] rank={_r}(sp_rk={rank}) step={self._step} "
+                  f"full={list(input_tensor.shape)} chunk_idx={rank} "
+                  f"chunk={chunk_shape} ws={world_size} "
+                  f"full_hash={full_hash:.4f} chunk_hash={chunk_hash:.4f} "
+                  f"first_tok={input_tensor.flatten()[0].item()}")
+
         return chunks[rank].contiguous()
 
     def gather_along_seq(self, input_tensor, dim=1):
@@ -1458,15 +1471,28 @@ class DeslocSequenceParallelComm:
             step = self._step
         if self.dp_group is None:
             return tensor
-        if self.Kx <= 1 or step % self.Kx == 0:
-            if self._step % 100 == 0:
-                _r = torch.distributed.get_rank()
-                print(f"[SP-DP-AR] rank={_r} step={step} FIRE Kx={self.Kx} "
-                      f"norm={tensor.float().norm().item():.4f}")
+        fire = self.Kx <= 1 or step % self.Kx == 0
+        # M365 DIAG: log gating decision and tensor stats on ALL ranks
+        if self._step % 50 == 0 or fire:
+            _r = torch.distributed.get_rank()
+            with torch.no_grad():
+                t_norm = tensor.float().norm().item()
+                t_mean = tensor.float().mean().item()
+            print(f"[SP-DP-AR] rank={_r} step={step} fire={fire} Kx={self.Kx} "
+                  f"norm={t_norm:.6f} mean={t_mean:.8f} "
+                  f"shape={list(tensor.shape)}")
+        if fire:
             torch.distributed.all_reduce(
                 tensor, op=torch.distributed.ReduceOp.SUM,
                 group=self.dp_group
             )
+            # M365 DIAG: post-allreduce stats
+            if self._step % 50 == 0:
+                _r = torch.distributed.get_rank()
+                with torch.no_grad():
+                    t_norm_post = tensor.float().norm().item()
+                print(f"[SP-DP-AR-POST] rank={_r} step={step} "
+                      f"post_norm={t_norm_post:.6f}")
         return tensor
 
     def step(self):

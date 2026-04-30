@@ -28,11 +28,32 @@ class _VocabSequenceParallelCrossEntropy(torch.autograd.Function):
         ctx.seqlen = vocab_seq_parallel_logits.size(0) * sp_world_size
         batch_size = vocab_seq_parallel_logits.size(1)
 
+        # M365 DIAG: per-SP-rank loss statistics before all_gather
+        # Pattern: Flash-Attention losses/cross_entropy.py per-chunk tracking
+        _r = dist.get_rank()
+        if not hasattr(_VocabSequenceParallelCrossEntropy, '_call_n'):
+            _VocabSequenceParallelCrossEntropy._call_n = 0
+        _VocabSequenceParallelCrossEntropy._call_n += 1
+        if _VocabSequenceParallelCrossEntropy._call_n % 200 == 1:
+            with torch.no_grad():
+                print(f"[SP-CE] rank={_r} sp_rank={sp_rank}/{sp_world_size} "
+                      f"call#{_VocabSequenceParallelCrossEntropy._call_n} "
+                      f"logits={list(vocab_seq_parallel_logits.shape)} "
+                      f"local_loss_mean={loss.mean().item():.6f} "
+                      f"local_loss_std={loss.std().item():.4f} "
+                      f"logit_norm={vocab_seq_parallel_logits.float().norm().item():.4f}")
+
         loss_all = torch.empty(ctx.seqlen,
                                batch_size,
                                dtype=vocab_seq_parallel_logits.dtype,
                                device=vocab_seq_parallel_logits.device)
         dist.all_gather_into_tensor(loss_all, loss, group=sp_group)
+
+        # M365 DIAG: post-gather full loss statistics
+        if _VocabSequenceParallelCrossEntropy._call_n % 200 == 1:
+            with torch.no_grad():
+                print(f"[SP-CE] rank={_r} full_loss={list(loss_all.shape)} "
+                      f"full_loss_mean={loss_all.mean().item():.6f}")
 
         ctx.save_for_backward(softmax, target)
 

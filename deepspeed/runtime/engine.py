@@ -2734,9 +2734,36 @@ class DeepSpeedEngine(Module):
         # (handled by DeepCompile or Ulysses), only skip the DP AllReduce.
         if self.desloc_enabled and not self.desloc_is_param_sync_step() and self.zero_optimization_stage() < 1:
             self.desloc_skipped_allreduces += 1
-            if self.desloc_step % 100 == 1 and dist.get_rank() == 0:
-                print(f"[ENGINE-AR] step={self.desloc_step} SKIP (skipped={self.desloc_skipped_allreduces} zero={self.zero_optimization_stage()})")
+            # M365 DIAG: log gating decision on ALL ranks, not just rank 0
+            # Pattern: Megatron training.py logs grad_norm on every training step
+            if self.desloc_step % 50 == 1:
+                _r = dist.get_rank()
+                # compute gradient norm to detect if gradients are healthy despite skip
+                gnorm_sq = sum(p.grad.float().norm().item()**2
+                               for p in self.module.parameters()
+                               if p.grad is not None)
+                gnorm = gnorm_sq ** 0.5
+                print(f"[ENGINE-AR] rank={_r} step={self.desloc_step} SKIP "
+                      f"(skipped={self.desloc_skipped_allreduces} "
+                      f"zero={self.zero_optimization_stage()} "
+                      f"grad_norm={gnorm:.6f} "
+                      f"sp={self._desloc_sp_enabled})")
             return
+
+        # M365 DIAG: log FIRE decisions on ALL ranks
+        if self.desloc_enabled and self.desloc_step % 50 == 1:
+            _r = dist.get_rank()
+            gnorm_sq = sum(p.grad.float().norm().item()**2
+                           for p in self.module.parameters()
+                           if p.grad is not None)
+            gnorm = gnorm_sq ** 0.5
+            pnorm_sq = sum(p.data.float().norm().item()**2
+                           for p in self.module.parameters())
+            pnorm = pnorm_sq ** 0.5
+            print(f"[ENGINE-AR] rank={_r} step={self.desloc_step} FIRE "
+                  f"grad_norm={gnorm:.6f} param_norm={pnorm:.4f} "
+                  f"sp={self._desloc_sp_enabled} "
+                  f"zero={self.zero_optimization_stage()}")
 
         # M361(f): Fence pending SP A2A handles before DP AllReduce.
         # On heterogeneous GPUs, H100 finishes backward faster → enters AllReduce
