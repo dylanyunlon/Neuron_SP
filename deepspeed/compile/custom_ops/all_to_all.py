@@ -64,6 +64,11 @@ def all_to_all(
     B, dim1, dim2, H = input.shape
     gid = dist.get_rank() // sp_size()
     group = get_group(gid)
+    if not hasattr(all_to_all, '_n'): all_to_all._n = 0
+    all_to_all._n += 1
+    if all_to_all._n % 400 == 1 and dist.get_rank() == 0:
+        print(f"[A2A] #{all_to_all._n} {name} sc={scatter_idx} ga={gather_idx} "
+              f"in=[{B},{dim1},{dim2},{H}] sp={sp_size()}")
     return _execute_a2a(input, scatter_idx, B, dim1, dim2, H, group)
 
 

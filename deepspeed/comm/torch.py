@@ -1367,6 +1367,9 @@ class DeslocSequenceParallelComm:
                 f"sp_group_size={world_size}. Pad input to a multiple of {world_size}.")
         rank = torch.distributed.get_rank(group=self.seq_group)
         chunks = input_tensor.chunk(world_size, dim=dim)
+        if self._step % 100 == 0:
+            print(f"[SP-SCATTER] rank={rank} step={self._step} "
+                  f"full={list(input_tensor.shape)} chunk={list(chunks[rank].shape)} ws={world_size}")
         return chunks[rank].contiguous()
 
     def gather_along_seq(self, input_tensor, dim=1):
@@ -1456,6 +1459,10 @@ class DeslocSequenceParallelComm:
         if self.dp_group is None:
             return tensor
         if self.Kx <= 1 or step % self.Kx == 0:
+            if self._step % 100 == 0:
+                _r = torch.distributed.get_rank()
+                print(f"[SP-DP-AR] rank={_r} step={step} FIRE Kx={self.Kx} "
+                      f"norm={tensor.float().norm().item():.4f}")
             torch.distributed.all_reduce(
                 tensor, op=torch.distributed.ReduceOp.SUM,
                 group=self.dp_group

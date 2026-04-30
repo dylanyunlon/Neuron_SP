@@ -839,6 +839,13 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         # DES-LOC M153: sync-gated
         world_size = dist.get_world_size(self.dp_process_group)
         my_rank = dist.get_rank(self.dp_process_group)
+        if my_rank == 0:
+            gn = 0.0
+            for grp in self.bit16_groups:
+                for p in grp:
+                    g = self.get_gradient_for_reduction(p)
+                    if g is not None: gn += g.float().norm().item()**2
+            print(f"[ZERO1-REDUCE] grad_norm={gn**0.5:.4f} ws={world_size}")
 
         # with PP we must create ipg buffer, since backward is handled outside zero
         if pipeline_parallel and self.contiguous_gradients:
@@ -894,6 +901,11 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         e = self.desloc_engine
         if e is None:
             return
+        # M364 DIAG
+        if dist.get_rank() == 0 and e.desloc_step % 100 == 1:
+            print(f"[TIERED-REDUCE] step={e.desloc_step} sync_x={e.desloc_should_sync_x()} "
+                  f"sync_u={e.desloc_should_sync_u()} sync_v={e.desloc_should_sync_v()} "
+                  f"sp={e._desloc_sp_enabled}")
 
         # Lazy-init async tracking state
         if not hasattr(self, '_desloc_async_handles'):

@@ -73,6 +73,9 @@ def populate_registry(SP_SIZE, DP_SIZE):
     GROUP_REGISTRY['SP_SIZE'] = SP_SIZE
     GROUP_REGISTRY['DP_SIZE'] = DP_SIZE
     GROUP_REGISTRY['is_reg'] = True
+    if dist.get_rank() == 0:
+        print(f"[SP-REG] SP={SP_SIZE} DP={DP_SIZE} "
+              f"groups={[list(range(i*SP_SIZE,(i+1)*SP_SIZE)) for i in range(DP_SIZE)]}")
 
 
 # M356: Async handle management for SP all-to-all operations.

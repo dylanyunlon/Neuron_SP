@@ -258,6 +258,50 @@ class LayerNorm(nn.Module):
         return F.layer_norm(x, self.weight.shape, self.weight, self.bias, 1e-5)
 
 
+# ── M364: SP runtime context (set by benchmark init, read by attention/forward) ──
+_SP_CTX = {'on': False, 'grp': None, 'sz': 1, 'rk': 0, 'step': 0}
+
+def _sp_ctx_set(on, grp=None, sz=1, rk=0):
+    _SP_CTX.update(on=on, grp=grp, sz=sz, rk=rk)
+
+class _UlyssesA2A(torch.autograd.Function):
+    """Autograd-compatible Ulysses all-to-all.
+    Forward:  scatter_idx=1,gather_idx=2 → [B,N,S/P,H]->[B,N/P,S,H]
+    Backward: reverses the scatter/gather indices automatically.
+    """
+    @staticmethod
+    def forward(ctx, t, scatter_idx, gather_idx, grp):
+        ctx.scatter_idx = scatter_idx
+        ctx.gather_idx = gather_idx
+        ctx.grp = grp
+        return _a2a_impl(t, scatter_idx, gather_idx, grp)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        # Reverse: swap scatter and gather indices
+        grad_input = _a2a_impl(grad_output, ctx.gather_idx, ctx.scatter_idx, ctx.grp)
+        return grad_input, None, None, None
+
+def _a2a_impl(t, scatter_idx, gather_idx, grp):
+    """Raw all-to-all without autograd."""
+    if grp is None: return t
+    ws = dist.get_world_size(group=grp)
+    if ws <= 1: return t
+    B, d1, d2, H = t.shape
+    if scatter_idx == 1:
+        t2 = t.reshape(B, ws, d1//ws, d2, H).permute(1,0,2,3,4).contiguous()
+        o = torch.empty_like(t2); dist.all_to_all_single(o, t2, group=grp)
+        return o.permute(1,2,0,3,4).contiguous().reshape(B, d1//ws, ws*d2, H)
+    else:
+        t2 = t.reshape(B, d1, ws, d2//ws, H).permute(2,0,1,3,4).contiguous()
+        o = torch.empty_like(t2); dist.all_to_all_single(o, t2, group=grp)
+        return o.permute(1,0,2,3,4).contiguous().reshape(B, ws*d1, d2//ws, H)
+
+def _ulysses_a2a(t, scatter_idx, gather_idx, grp):
+    """Differentiable Ulysses all-to-all."""
+    return _UlyssesA2A.apply(t, scatter_idx, gather_idx, grp)
+
+
 class CausalSelfAttention(nn.Module):
     """Multi-head causal self-attention.
 
@@ -294,25 +338,33 @@ class CausalSelfAttention(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, T, C = x.size()
-
         qkv = self.c_attn(x)
         q, k, v = qkv.split(self.n_embd, dim=2)
-
         q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
         k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
         v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
 
-        # F.scaled_dot_product_attention: required by AutoSP, enables FlashAttention
-        y = F.scaled_dot_product_attention(
-            q, k, v,
-            attn_mask=None,         # is_causal=True handles causal masking
-            dropout_p=self.dropout if self.training else 0.0,
-            is_causal=True,
-        )
+        s = _SP_CTX['step']
+        if s % 100 == 1 and (dist.get_rank() if dist.is_initialized() else 0) == 0:
+            print(f"[ATTN] step={s} Q={list(q.shape)} T={T} n_head={self.n_head} "
+                  f"Q_norm={q.float().norm().item():.4f} K_norm={k.float().norm().item():.4f} "
+                  f"V_norm={v.float().norm().item():.4f} sp={_SP_CTX['on']}")
+
+        if _SP_CTX['on'] and _SP_CTX['grp'] is not None:
+            q = _ulysses_a2a(q, 1, 2, _SP_CTX['grp'])
+            k = _ulysses_a2a(k, 1, 2, _SP_CTX['grp'])
+            v = _ulysses_a2a(v, 1, 2, _SP_CTX['grp'])
+            if s % 100 == 1 and (dist.get_rank() if dist.is_initialized() else 0) == 0:
+                print(f"[ATTN-A2A] post Q={list(q.shape)} heads={q.shape[1]} seq={q.shape[2]}")
+            y = F.scaled_dot_product_attention(q, k, v, attn_mask=None,
+                dropout_p=self.dropout if self.training else 0.0, is_causal=True)
+            y = _ulysses_a2a(y, 2, 1, _SP_CTX['grp'])
+        else:
+            y = F.scaled_dot_product_attention(q, k, v, attn_mask=None,
+                dropout_p=self.dropout if self.training else 0.0, is_causal=True)
 
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         y = self.resid_dropout(self.c_proj(y))
-
         return y
 
 
@@ -437,23 +489,31 @@ class GPT(nn.Module):
     def forward(self, idx: torch.Tensor, targets: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         B, T = idx.size()
         assert T <= self.max_seq_len, f"Sequence length {T} > max {self.max_seq_len}"
-        
-        pos = torch.arange(0, T, dtype=torch.long, device=idx.device)
-        
+        pos_off = _SP_CTX['rk'] * T if _SP_CTX['on'] else 0
+        pos = torch.arange(pos_off, pos_off + T, dtype=torch.long, device=idx.device)
+        s = _SP_CTX['step']
+        if s % 100 == 1:
+            _r = dist.get_rank() if dist.is_initialized() else 0
+            print(f"[FWD] rank={_r} step={s} idx=[{B},{T}] pos=[{pos_off}..{pos_off+T-1}] "
+                  f"ids[:5]={idx[0,:min(5,T)].tolist()}")
         tok_emb = self.transformer.wte(idx)
         pos_emb = self.transformer.wpe(pos)
         x = self.transformer.drop(tok_emb + pos_emb)
-        
         for block in self.transformer.h:
             x = block(x)
-        
         x = self.transformer.ln_f(x)
         logits = self.lm_head(x)
-        
         loss = None
         if targets is not None:
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
-        
+            # M364: With Ulysses A2A, each SP rank sees full sequence in attention
+            # but computes CE loss on its LOCAL token subset. Each rank's gradient
+            # is valid for its tokens. Gradients sync via DES-LOC AllReduce.
+            # Do NOT all_reduce loss here — it destroys autograd graph.
+            if s % 100 == 1:
+                _r = dist.get_rank() if dist.is_initialized() else 0
+                print(f"[FWD-LOSS] rank={_r} step={s} loss={loss.item():.6f} "
+                      f"logit_std={logits.float().std().item():.4f} sp={'local' if _SP_CTX['on'] else 'full'}")
         return logits, loss
 
 
@@ -862,6 +922,14 @@ class DESLOCAdamW(torch.optim.Optimizer):
         if sync_x:
             sync_v = True  # v piggybacks on x to keep adaptive LR consistent
 
+        # M364 DIAG
+        if self.global_step % 100 == 1 or sync_x:
+            gnorm = sum(p.grad.float().norm().item()**2 for grp in self.param_groups for p in grp['params'] if p.grad is not None)**0.5
+            pnorm = sum(p.data.float().norm().item()**2 for grp in self.param_groups for p in grp['params'])**0.5
+            _r = dist.get_rank() if dist.is_initialized() else 0
+            print(f"[SYNC] rank={_r} step={self.global_step} sync_x={sync_x} sync_u={sync_u} sync_v={sync_v} "
+                  f"Kx={effective_Kx} grad={gnorm:.4f} param={pnorm:.2f} ratio={gnorm/max(pnorm,1e-12):.8f}")
+
         # Measure rate-of-change at sync boundaries (before AllReduce)
         # M361(e): Norm-only tracking — no .clone(). Old code cloned every param
         # (13.3GB for 7B) causing OOM at 28.52GB peak + 13.3GB = 41.8GB ≈ A6000 limit.
@@ -991,6 +1059,12 @@ class DESLOCAdamW(torch.optim.Optimizer):
             if sync_v and all_params:
                 _sync_tier(all_params,
                     lambda p: self.state.get(p, {}).get('exp_avg_sq'))
+
+        # M364 DIAG: post-sync checksum
+        if sync_x and world_size > 1 and self.global_step % 100 == 1:
+            psum = sum(p.data.float().sum().item() for grp in self.param_groups for p in grp['params'])
+            _r = dist.get_rank() if dist.is_initialized() else 0
+            print(f"[SYNC-POST] rank={_r} step={self.global_step} param_checksum={psum:.4f}")
 
         # ---------------------------------------------------------------
         # Claude-27 M332: Momentum decay after x-sync (Bug fix #3)
@@ -1360,6 +1434,8 @@ class Trainer:
         self._sp_comm = None
         self._sp_enabled = False
         self._sp_size = 1
+        self._sp_group = None
+        self._sp_rank = 0
         if config.use_autosp and self.world_size > 1:
             if self.use_deepspeed:
                 if self.rank == 0:
@@ -1464,9 +1540,20 @@ class Trainer:
                             Kx=config.Kx,
                         )
                         self._sp_enabled = True
+                        self._sp_group = sp_group
+                        self._sp_rank = dist.get_rank(group=sp_group)
+                        # M364-fix: Only ranks IN the SP group should use Ulysses/pos_offset.
+                        # Rank 2 (H100) is not in sp_ranks=[0,1], so sp_rank=-1 for it.
+                        # It must stay on the standard full-seq path.
+                        if self.rank in sp_ranks:
+                            _sp_ctx_set(on=True, grp=sp_group, sz=sp_size, rk=sp_ranks.index(self.rank))
+                        else:
+                            _sp_ctx_set(on=False, grp=None, sz=1, rk=0)
+                            self._sp_enabled = False  # rank 2 does NOT scatter/gather
                         if self.rank == 0:
                             print(f"[SP+DEC] SP enabled: sp_size={sp_size} "
                                   f"(n_heads={n_heads}, ws={self.world_size})")
+                            print(f"[M364] mode=ulysses_eager pos_offset=rank*local_seq loss_reduce=AVG")
                             print(f"[SP+DEC] SP group ranks={sp_ranks} "
                                   f"(GPU: {gpu_names[sp_ranks[0]]})")
                             print(f"[SP+DEC] Each SP rank processes "
@@ -1795,6 +1882,7 @@ class Trainer:
         for step in range(1, self.config.max_steps + 1):
             step_start = time.time()
             accumulated_loss = 0.0
+            _SP_CTX['step'] = step
 
             for micro_step in range(self.config.gradient_accumulation):
                 try:
@@ -1823,6 +1911,17 @@ class Trainer:
 
                 self.scaler.scale(loss).backward() if self.scaler else loss.backward()
                 accumulated_loss += loss.item()
+
+            # M364 DIAG
+            if step % 100 == 1:
+                gnorm = sum(p.grad.float().norm().item()**2 for p in self.model.parameters() if p.grad is not None)**0.5
+                _r = dist.get_rank() if dist.is_initialized() else 0
+                print(f"[GRAD] rank={_r} step={step} grad_norm={gnorm:.4f} loss={accumulated_loss:.6f}")
+                if self.world_size > 1:
+                    lt = torch.tensor([accumulated_loss], device=self.device)
+                    al = [torch.zeros(1, device=self.device) for _ in range(self.world_size)]
+                    dist.all_gather(al, lt)
+                    print(f"[GRAD] rank={_r} all_rank_losses={[round(x.item(),6) for x in al]}")
 
             if self.scaler:
                 self.scaler.unscale_(self.optimizer)

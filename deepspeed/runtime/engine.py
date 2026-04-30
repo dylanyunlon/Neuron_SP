@@ -2659,6 +2659,10 @@ class DeepSpeedEngine(Module):
     def desloc_post_step(self, loss=None):
         if not self.desloc_enabled: return
         self.desloc_step += 1
+        if self.desloc_step % 100 == 1 and dist.get_rank() == 0:
+            pnorm = sum(p.data.float().norm().item()**2 for p in self.module.parameters())**0.5
+            print(f"[ENGINE-STEP] step={self.desloc_step} loss={loss} param_norm={pnorm:.2f} "
+                  f"skipped_AR={self.desloc_skipped_allreduces} sp={self._desloc_sp_enabled}")
         # M279: profiler hook
         if hasattr(self, '_desloc_step_profiler'):
             self._desloc_step_profiler(self.desloc_step)
@@ -2730,6 +2734,8 @@ class DeepSpeedEngine(Module):
         # (handled by DeepCompile or Ulysses), only skip the DP AllReduce.
         if self.desloc_enabled and not self.desloc_is_param_sync_step() and self.zero_optimization_stage() < 1:
             self.desloc_skipped_allreduces += 1
+            if self.desloc_step % 100 == 1 and dist.get_rank() == 0:
+                print(f"[ENGINE-AR] step={self.desloc_step} SKIP (skipped={self.desloc_skipped_allreduces} zero={self.zero_optimization_stage()})")
             return
 
         # M361(f): Fence pending SP A2A handles before DP AllReduce.

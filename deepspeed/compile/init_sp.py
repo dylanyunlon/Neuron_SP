@@ -97,6 +97,9 @@ def init_autosp(config):
             print(f"  AC: Aten-IR long-context checkpointing (attention preserved)")
 
     def backend_fn(gm: GraphModule, real_inputs):
+        if dist.get_rank() == 0:
+            n_sdpa = len([n for n in gm.graph.nodes if 'scaled_dot_product' in str(n.target)])
+            print(f"[AUTOSP-BE] nodes={len(list(gm.graph.nodes))} sdpa={n_sdpa} sp={sp_size} dp={dp_size}")
         apply_autosp(gm, real_inputs, debug=False, sp_size=sp_size, dp_size=dp_size)
         # M361: Inductor fallback for torch 2.7.x where custom_op with
         # autograd registration may not be supported by inductor.
