@@ -9,56 +9,62 @@
 
 import os
 import time
+import logging
 import deepspeed.comm as dist
 
-GROUP_REGISTRY = {}  # int -> dist.ProcessGroup
-_PENDING_A2A_HANDLES = []  # M356: track async all-to-all handles
+logger = logging.getLogger(__name__)
+
+_PROCESS_GROUPS = {}
+
+_MESH_META = {
+    "sp_size": 0,
+    "dp_size": 0,
+    "is_registered": False,
+}
+
+_PENDING_A2A_HANDLES = []
 _A2A_TIMEOUT_MS = int(os.environ.get('DESLOC_SP_A2A_TIMEOUT_MS', '60000'))
 
 
 def register_groups(groups):
-    """groups: List[List[int]], e.g. [[0,1],[2,3]]"""
     for gid, ranks in enumerate(groups):
-        if gid not in GROUP_REGISTRY:
-            GROUP_REGISTRY[gid] = dist.new_group(ranks)
+        if gid not in _PROCESS_GROUPS:
+            _PROCESS_GROUPS[gid] = dist.new_group(ranks)
 
 
 def get_group(gid: int):
-    return GROUP_REGISTRY[gid] if gid is not None else dist.get_world_group()
-
-
-def get_registry():
-    return GROUP_REGISTRY
+    if gid is None:
+        return dist.get_world_group()
+    if gid not in _PROCESS_GROUPS:
+        raise KeyError(f"No process group registered for DP-group index {gid}. "
+                       f"Available: {list(_PROCESS_GROUPS.keys())}")
+    return _PROCESS_GROUPS[gid]
 
 
 def is_setup():
-    return GROUP_REGISTRY['is_reg'] if 'is_reg' in GROUP_REGISTRY else False
+    return _MESH_META["is_registered"]
 
 
 def extract_mesh_size(param_dict):
-    sp_size = param_dict.get('sequence_parallel_size', 1)
-    assert dist.get_world_size() % sp_size == 0, 'World mesh-size should be divisible by SP_SIZE'
-    dp_size = dist.get_world_size() // sp_size
-
-    return sp_size, dp_size
+    sp = param_dict.get('sequence_parallel_size', 1)
+    assert dist.get_world_size() % sp == 0, 'World mesh-size should be divisible by SP_SIZE'
+    dp = dist.get_world_size() // sp
+    return sp, dp
 
 
 def sp_size():
-    assert 'SP_SIZE' in GROUP_REGISTRY, 'SP_SIZE not init properly.'
-
-    return GROUP_REGISTRY['SP_SIZE']
+    assert _MESH_META["is_registered"], 'SP mesh not initialised. Call populate_registry() first.'
+    return _MESH_META["sp_size"]
 
 
 def dp_size():
-    assert 'DP_SIZE' in GROUP_REGISTRY, 'DP_SIZE not init properly'
-
-    return GROUP_REGISTRY['DP_SIZE']
+    assert _MESH_META["is_registered"], 'DP mesh not initialised. Call populate_registry() first.'
+    return _MESH_META["dp_size"]
 
 
 def populate_registry(SP_SIZE, DP_SIZE):
-    """ Populate rank to SP/DP mesh index.  """
 
-    if GROUP_REGISTRY.get('is_reg', False):
+    if _MESH_META["is_registered"]:
         return
 
     group_listing = []
@@ -69,12 +75,10 @@ def populate_registry(SP_SIZE, DP_SIZE):
 
     register_groups(group_listing)
 
-    ## Extraneous metadata required for proper instatiation. ##
-    GROUP_REGISTRY['SP_SIZE'] = SP_SIZE
-    GROUP_REGISTRY['DP_SIZE'] = DP_SIZE
-    GROUP_REGISTRY['is_reg'] = True
-    # M365 DIAG: log mesh setup on ALL ranks for cross-rank verification
-    # Pattern: Megatron parallel_state.py logs group assignments per rank
+    _MESH_META["sp_size"] = SP_SIZE
+    _MESH_META["dp_size"] = DP_SIZE
+    _MESH_META["is_registered"] = True
+
     _r = dist.get_rank()
     _ws = dist.get_world_size()
     _gid = _r // SP_SIZE
@@ -84,21 +88,12 @@ def populate_registry(SP_SIZE, DP_SIZE):
           f"groups={[list(range(i*SP_SIZE,(i+1)*SP_SIZE)) for i in range(DP_SIZE)]}")
 
 
-# M356: Async handle management for SP all-to-all operations.
-# On heterogeneous GPUs, forward/backward execution timing differs,
-# causing NCCL deadlock if handles are not properly fenced.
 def track_a2a_handle(handle):
-    """Register an async A2A handle for later fence."""
     if handle is not None:
         _PENDING_A2A_HANDLES.append((handle, time.monotonic()))
 
 
 def fence_all_sp_handles(timeout_ms=None):
-    """Wait for all pending SP all-to-all handles with timeout.
-
-    Returns number of handles fenced. Raises RuntimeError on timeout.
-    Pattern: Megatron finish_grad_sync fence with 30s timeout.
-    """
     timeout_ms = timeout_ms or _A2A_TIMEOUT_MS
     fenced = 0
     while _PENDING_A2A_HANDLES:
@@ -117,27 +112,9 @@ def fence_all_sp_handles(timeout_ms=None):
 
 
 def pending_handle_count():
-    """Number of unfenced SP handles."""
     return len(_PENDING_A2A_HANDLES)
 
 
 def fence_before_dp_sync():
-    """M361(f): Fence all SP A2A handles before DP AllReduce.
-
-    Prevents NCCL communicator竞争: if SP A2A and DP AllReduce use the
-    same communicator (default WORLD group), concurrent execution deadlocks
-    because NCCL serializes operations per-communicator. The A2A from backward
-    must complete before the AllReduce at Kx boundary begins.
-
-    From Megatron param_and_grad_buffer.py finish_grad_sync() start.
-    Then, follow that pattern to implement fence_before_dp_sync, letting
-    pending SP handles complete before the DP AllReduce fires, and
-    preventing the NCCL communicator from being in two collectives at once.
-    Then NCCL src/include/collectives.h introduces the per-communicator
-    serialization constraint, so that the fence ensures the all_to_all
-    is fully retired before all_reduce is enqueued, while the separate
-    process groups in M361(d) optimizes the common case where SP and DP
-    can use different communicators entirely.
-    """
     n = fence_all_sp_handles()
     return n

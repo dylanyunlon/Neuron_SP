@@ -3,11 +3,15 @@
 
 # DeepSpeed Team
 
+import logging
 import operator
+from collections import deque
 from typing import Optional, List, Callable
 
 import torch
 import deepspeed.comm as dist
+
+logger = logging.getLogger(__name__)
 from torch._subclasses.fake_tensor import FakeTensorMode, maybe_get_fake_mode
 from torch.fx import GraphModule, Node
 from torch.fx.passes.fake_tensor_prop import FakeTensorProp
@@ -57,8 +61,6 @@ def prepare_autosp_inputs(input_id: torch.Tensor,
     torch._dynamo.decorators.mark_dynamic(label_id, seq_dim)
     if position_id is not None:
         torch._dynamo.decorators.mark_dynamic(position_id, seq_dim)
-    if attention_mask is not None:
-        torch._dynamo.decorators.mark_dynamic(attention_mask, seq_dim)
 
     input_id.tag = constants.AUTOSP_INPUT_ID_KEY
     label_id.tag = constants.AUTOSP_LABEL_ID_KEY
@@ -84,7 +86,7 @@ def pass_shard_seq_dim(gm: GraphModule, example_inputs):
 
     sym_seq_dim_node = find_node_by_name(gm, str(seq_symint))
     if sym_seq_dim_node is None:
-        print(f"WARNING: Could not find the symbolic node for the sequence dimension")
+        logger.warning("Could not find the symbolic node for the sequence dimension")
         return
 
     with gm.graph.inserting_after(sym_seq_dim_node):
@@ -101,13 +103,12 @@ def pass_shard_seq_dim(gm: GraphModule, example_inputs):
     if position_ids_node is not None:
         sharded_input_nodes.add(position_ids_node)
 
-    # find all consumers of the sharded inputs
     consumer_nodes = set()
-    worklist = list(sharded_input_nodes)
+    worklist = deque(sharded_input_nodes)
     visited = set()
 
     while worklist:
-        node = worklist.pop(0)
+        node = worklist.popleft()
         if node in visited:
             continue
         visited.add(node)
@@ -139,7 +140,7 @@ def pass_shard_label_ids(gm: GraphModule, example_inputs):
 def pass_shard_position_ids(gm: GraphModule, example_inputs):
     position_ids_node = get_position_id_node(gm)
     if position_ids_node is None:
-        print("[WARNING] position id node not found. Skipping sharding of position ids.")
+        logger.warning("position id node not found. Skipping sharding of position ids.")
         return
     shard_tensor_node(gm, position_ids_node)
 
@@ -242,15 +243,19 @@ def pass_propagate_shapes(gm: torch.fx.GraphModule, real_inputs):
             saved_sdpa_masks.append((attn_node, attn_mask))
             attn_node.update_kwarg("attn_mask", None)
 
+    meta_snapshot = {node.name: dict(node.meta) for node in gm.graph.nodes}
+
+    prop = FakeTensorProp(gm, mode=fake_mode)
     try:
-        FakeTensorProp(gm, mode=fake_mode).propagate_dont_convert_inputs(*fake_inputs)
-    except Exception as e:
-        # M353: Shape prop can fail on torch 2.9 with bf16 + heterogeneous GPUs.
-        # Graph is still valid; downstream passes use stale metadata.
-        # This is acceptable because pass_canonicalize will still lint/recompile.
-        if dist.get_rank() == 0:
-            print(f"[AutoSP] FakeTensorProp failed ({type(e).__name__}: {e}), "
-                  f"continuing with existing shape metadata")
+        if hasattr(prop, 'propagate_dont_convert_inputs'):
+            prop.propagate_dont_convert_inputs(*fake_inputs)
+        else:
+            prop.propagate(*fake_inputs)
+    except Exception:
+        for node in gm.graph.nodes:
+            if node.name in meta_snapshot:
+                node.meta = meta_snapshot[node.name]
+        raise
     finally:
         for attn_node, attn_mask in saved_sdpa_masks:
             attn_node.update_kwarg("attn_mask", attn_mask)
