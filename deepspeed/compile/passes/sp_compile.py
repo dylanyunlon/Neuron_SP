@@ -61,6 +61,8 @@ def prepare_autosp_inputs(input_id: torch.Tensor,
     torch._dynamo.decorators.mark_dynamic(label_id, seq_dim)
     if position_id is not None:
         torch._dynamo.decorators.mark_dynamic(position_id, seq_dim)
+    if attention_mask is not None:
+        torch._dynamo.decorators.mark_dynamic(attention_mask, seq_dim)
 
     input_id.tag = constants.AUTOSP_INPUT_ID_KEY
     label_id.tag = constants.AUTOSP_LABEL_ID_KEY
@@ -206,12 +208,6 @@ def pass_propagate_shapes(gm: torch.fx.GraphModule, real_inputs):
         # mode so FakeTensorProp can still run shape-only execution.
         fake_mode = FakeTensorMode(shape_env=ShapeEnv())
 
-    # M353: Normalize dtypes across heterogeneous GPUs before fake prop.
-    # On ags1 (A6000+H100 NVL), the A6000 may produce fp32 traced inputs
-    # while the H100 uses bf16, causing FakeTensorProp shape mismatch.
-    # Pattern: TransformerEngine mixed-precision dispatch.
-    # We detect the dominant dtype from placeholder metadata and cast
-    # real_inputs to match, preventing cross-rank shape divergence.
     _placeholder_dtype = None
     for node in gm.graph.nodes:
         if node.op == "placeholder":
@@ -223,7 +219,6 @@ def pass_propagate_shapes(gm: torch.fx.GraphModule, real_inputs):
     fake_inputs = []
     for t in real_inputs:
         if isinstance(t, torch.Tensor):
-            # M353: Cast float tensors to match placeholder dtype if mismatched.
             if (_placeholder_dtype is not None
                     and t.is_floating_point()
                     and t.dtype != _placeholder_dtype):
@@ -243,14 +238,13 @@ def pass_propagate_shapes(gm: torch.fx.GraphModule, real_inputs):
             saved_sdpa_masks.append((attn_node, attn_mask))
             attn_node.update_kwarg("attn_mask", None)
 
-    meta_snapshot = {node.name: dict(node.meta) for node in gm.graph.nodes}
+    _snapshot_ops = {"call_function", "call_method"}
+    meta_snapshot = {node.name: dict(node.meta) for node in gm.graph.nodes
+                     if node.op in _snapshot_ops}
 
     prop = FakeTensorProp(gm, mode=fake_mode)
     try:
-        if hasattr(prop, 'propagate_dont_convert_inputs'):
-            prop.propagate_dont_convert_inputs(*fake_inputs)
-        else:
-            prop.propagate(*fake_inputs)
+        prop.propagate_dont_convert_inputs(*fake_inputs)
     except Exception:
         for node in gm.graph.nodes:
             if node.name in meta_snapshot:
@@ -323,7 +317,6 @@ def apply_autosp(gm: GraphModule,
     passes = passes or AUTOSP_PASSES
     rank = dist.get_rank()
 
-    # M352: Validate SP+DEC compose invariants before graph rewrite.
     _n_sdpa = len(get_sdpa_nodes(gm))
     if _n_sdpa == 0:
         raise RuntimeError(
@@ -331,14 +324,17 @@ def apply_autosp(gm: GraphModule,
             "F.scaled_dot_product_attention (set _attn_implementation='sdpa').")
     if rank == 0:
         first_sdpa = get_sdpa_nodes(gm)[0]
-        q_node = first_sdpa.args[0]
-        q_meta = q_node.meta.get("val") or q_node.meta.get("example_value")
-        if q_meta is not None and hasattr(q_meta, 'shape') and len(q_meta.shape) >= 2:
-            n_heads = q_meta.shape[1]
-            if isinstance(n_heads, int) and n_heads % sp_size != 0:
-                raise RuntimeError(
-                    f"[AutoSP] n_heads={n_heads} not divisible by sp_size={sp_size}. "
-                    f"Ulysses A2A requires n_heads % sp_size == 0.")
+        for arg_idx, arg_name in [(0, "Q"), (1, "K"), (2, "V")]:
+            if arg_idx < len(first_sdpa.args):
+                node = first_sdpa.args[arg_idx]
+                meta = node.meta.get("val") or node.meta.get("example_value")
+                if meta is not None and hasattr(meta, 'shape') and len(meta.shape) >= 2:
+                    n_heads = meta.shape[1]
+                    if isinstance(n_heads, int) and n_heads % sp_size != 0:
+                        raise RuntimeError(
+                            f"[AutoSP] {arg_name} n_heads={n_heads} not divisible "
+                            f"by sp_size={sp_size}. For GQA models, "
+                            f"set sp_size to a divisor of num_kv_heads={n_heads}.")
 
     for p in passes:
         if debug and rank == 0:
@@ -349,30 +345,16 @@ def apply_autosp(gm: GraphModule,
 
         p(gm, real_inputs)
 
-        # M365 DIAG: log node count after each pass on ALL ranks
-        # Pattern: Triton compiler.py logs pass statistics
-        n_nodes_post = len(list(gm.graph.nodes))
-        n_a2a_post = sum(1 for n in gm.graph.nodes
-                         if n.op == "call_function" and 'all_to_all' in str(n.target))
-        if rank == 0:
-            print(f"[AUTOSP-PASS] {p.__name__}: nodes={n_nodes_post} a2a={n_a2a_post}")
-
         if debug and rank == 0:
             print(f"\n{'='*60}")
             print(f" AFTER: {p.__name__}")
             print(f"{'='*60}\n")
             print(gm.print_readable(print_output=False))
 
-    # M361(a): Post-pass A2A collective count validation.
-    # Each SDPA node must have exactly 4 A2A ops: Q,K,V scatter + O gather.
-    # Mismatch → NCCL deadlock because ranks call different collective counts.
-    # Pattern: NCCL src/include/collectives.h — all ranks must execute
-    # identical collective sequences on the same communicator.
     a2a_count = sum(1 for n in gm.graph.nodes
                     if n.op == "call_function" and 'all_to_all' in str(n.target))
     expected = _n_sdpa * 4
     if a2a_count != expected:
         raise RuntimeError(
             f"[AutoSP] A2A count mismatch: got {a2a_count}, expected {expected} "
-            f"(4 × {_n_sdpa} SDPA layers). Graph rewrite corrupted — "
-            f"NCCL deadlock will occur. Check pass_insert_attention_all_to_all.")
+            f"(4 x {_n_sdpa} SDPA). NCCL deadlock will occur.")

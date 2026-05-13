@@ -15,7 +15,7 @@ _TRANSFORMERS_VALIDATED_CEILING = "4.50.3"
 
 def _check_autosp_compatibility():
     torch_version = Version(torch.__version__.split("+")[0])
-    if torch_version < Version("2.7"):
+    if torch_version < Version("2.9"):
         raise RuntimeError("AutoSP requires PyTorch >= 2.9, found "
                            f"{torch.__version__}.")
 

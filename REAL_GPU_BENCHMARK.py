@@ -170,6 +170,296 @@ assert torch.cuda.device_count() >= 1, "No GPU found - HARD FAIL"
 # CONFIGURATION
 # =============================================================================
 
+# =============================================================================
+# M366: STEP RECORDER — Structured per-step diagnostics for JSON export
+# =============================================================================
+# Pattern: Megatron training.py training_log() + wandb/tensorboard scalars
+# Pattern: NCCL debug logging (NCCL_DEBUG=INFO) structured per-op stats
+# Pattern: TransformerEngine fp8_model_init() calibration history tracking
+#
+# Problem: All diagnostic data (grad norms, param norms, update magnitudes,
+# momentum/variance norms, cross-rank divergence, sync events, timing
+# breakdown) was only printed to terminal and lost after experiment.
+# The JSON only stored: losses, sync_counts, basic throughput/memory.
+#
+# Solution: StepRecorder captures a structured dict per step. At experiment
+# end, the full timeseries is serialized into the benchmark JSON alongside
+# losses. This enables post-hoc analysis, visualization, and debugging
+# without re-running the experiment.
+#
+# From Megatron's training_log as a good example: it logs grad_norm,
+# params_norm, num_zeros_in_grad, loss_scale, learning_rate, and memory
+# stats to tensorboard at every log_interval. Following that pattern,
+# we implement a new StepRecorder that lets DES-LOC capture per-step
+# optimizer state norms (||m||, ||v||, ||p||), and can record sync events
+# with pre/post norms. Then DESLOCAdamW.step() introduces per-step
+# instrumentation, so that the training loop can collect grad_norm,
+# param_norm, update_delta at every step, while StepRecorder optimizes
+# memory by only storing full snapshots at configurable intervals.
+# Then _train_baseline integrates the recorder, making every diagnostic
+# print also write to the structured log, supporting both terminal
+# display and JSON export, and enhancing the _finalize_results output.
+# Finally save_results serializes the full diagnostic_history into the
+# benchmark JSON, ensuring post-hoc analysis compatibility with
+# the existing visualization dashboard, and fully upgrading the
+# experiment data pipeline to capture all runtime observability.
+# =============================================================================
+
+class StepRecorder:
+    """Structured per-step diagnostic recorder for DES-LOC experiments.
+    
+    Captures metrics at two granularities:
+    - summary_interval (default=10): lightweight metrics (loss, grad_norm, param_norm, lr, memory)
+    - detail_interval (default=50): full diagnostics (per-layer norms, optimizer states, 
+      cross-rank divergence, update magnitudes, momentum/variance distributions)
+    
+    All data is stored in self.records: List[Dict] and can be serialized to JSON.
+    """
+    
+    def __init__(self, summary_interval: int = 10, detail_interval: int = 50):
+        self.summary_interval = summary_interval
+        self.detail_interval = detail_interval
+        self.records = []  # List[Dict] — one entry per recorded step
+        self._current = {}  # accumulator for current step
+    
+    def begin_step(self, step: int):
+        """Start recording a new step."""
+        self._current = {
+            'step': step,
+            'ts': time.time(),
+        }
+    
+    def record(self, key: str, value):
+        """Record a scalar or small dict for current step."""
+        self._current[key] = value
+    
+    def record_grad_stats(self, model, rank: int):
+        """Record gradient statistics — pattern from Megatron log_num_zeros_in_grad.
+        
+        Captures: total grad norm, num zero grads, per-layer grad norms (at detail steps),
+        max grad element (for spike detection).
+        """
+        total_norm_sq = 0.0
+        num_zeros = 0
+        num_params_with_grad = 0
+        max_grad_elem = 0.0
+        per_layer = {}
+        
+        for name, p in model.named_parameters():
+            if p.grad is None:
+                continue
+            num_params_with_grad += 1
+            g = p.grad.detach().float()
+            gnorm = g.norm().item()
+            total_norm_sq += gnorm ** 2
+            num_zeros += int((g == 0).sum().item())
+            max_grad_elem = max(max_grad_elem, g.abs().max().item())
+            
+            # Per-layer at detail intervals
+            step = self._current.get('step', 0)
+            if step % self.detail_interval == 1:
+                # Compress layer name: 'transformer.layers.5.attn.qkv.weight' -> 'L5.attn.qkv.w'
+                short = name.replace('transformer.', '').replace('layers.', 'L').replace('.weight', '.w').replace('.bias', '.b')
+                per_layer[short] = round(gnorm, 6)
+        
+        self._current['grad_norm'] = round(total_norm_sq ** 0.5, 6)
+        self._current['grad_num_zeros'] = num_zeros
+        self._current['grad_max_elem'] = round(max_grad_elem, 6)
+        self._current['grad_num_params'] = num_params_with_grad
+        
+        if per_layer:
+            self._current['grad_per_layer'] = per_layer
+    
+    def record_param_stats(self, model):
+        """Record parameter statistics — pattern from Megatron params_norm."""
+        total_norm_sq = 0.0
+        param_mean_sum = 0.0
+        param_var_sum = 0.0
+        n_params = 0
+        per_layer = {}
+        
+        with torch.no_grad():
+            for name, p in model.named_parameters():
+                pf = p.detach().float()
+                pnorm = pf.norm().item()
+                total_norm_sq += pnorm ** 2
+                param_mean_sum += pf.mean().item()
+                param_var_sum += pf.var().item()
+                n_params += 1
+                
+                step = self._current.get('step', 0)
+                if step % self.detail_interval == 1:
+                    short = name.replace('transformer.', '').replace('layers.', 'L').replace('.weight', '.w').replace('.bias', '.b')
+                    per_layer[short] = {
+                        'norm': round(pnorm, 4),
+                        'mean': round(pf.mean().item(), 6),
+                        'std': round(pf.std().item(), 6),
+                    }
+        
+        self._current['param_norm'] = round(total_norm_sq ** 0.5, 4)
+        self._current['param_mean'] = round(param_mean_sum / max(n_params, 1), 8)
+        self._current['param_var'] = round(param_var_sum / max(n_params, 1), 8)
+        
+        if per_layer:
+            self._current['param_per_layer'] = per_layer
+    
+    def record_optimizer_state(self, optimizer):
+        """Record optimizer state norms — m (momentum), v (variance).
+        
+        Pattern from Megatron optimizer.py step() which returns grad_norm.
+        DES-LOC extends this: since m and v sync independently (Eq 4),
+        tracking their norms detects drift between sync points.
+        """
+        total_m_sq = 0.0
+        total_v_sq = 0.0
+        m_max = 0.0
+        v_max = 0.0
+        n = 0
+        
+        for group in optimizer.param_groups:
+            for p in group['params']:
+                state = optimizer.state.get(p, {})
+                if 'exp_avg' not in state:
+                    continue
+                n += 1
+                m = state['exp_avg']
+                v = state['exp_avg_sq']
+                
+                if m.device.type == 'cpu':
+                    m_norm = m.float().norm().item()
+                    v_norm = v.float().norm().item()
+                else:
+                    m_norm = m.float().norm().item()
+                    v_norm = v.float().norm().item()
+                
+                total_m_sq += m_norm ** 2
+                total_v_sq += v_norm ** 2
+                m_max = max(m_max, m_norm)
+                v_max = max(v_max, v_norm)
+        
+        self._current['opt_m_norm'] = round(total_m_sq ** 0.5, 6)
+        self._current['opt_v_norm'] = round(total_v_sq ** 0.5, 6)
+        self._current['opt_m_max'] = round(m_max, 6)
+        self._current['opt_v_max'] = round(v_max, 6)
+        self._current['opt_n_states'] = n
+    
+    def record_update_delta(self, pre_norm: float, post_norm: float):
+        """Record parameter update magnitude — ||p_after - p_before|| proxy.
+        
+        Uses norm-difference as lightweight proxy (no full clone needed).
+        Pattern: DeepSpeed stage_1_and_2.py check_overflow tracks param changes.
+        """
+        delta = abs(post_norm - pre_norm)
+        ratio = delta / max(pre_norm, 1e-12)
+        self._current['update_delta'] = round(delta, 8)
+        self._current['update_ratio'] = round(ratio, 10)
+        self._current['param_norm_pre'] = round(pre_norm, 4)
+        self._current['param_norm_post'] = round(post_norm, 4)
+    
+    def record_sync_event(self, sync_x: bool, sync_u: bool, sync_v: bool,
+                          effective_Kx: int = 0, pre_sync_norm: float = 0.0,
+                          post_sync_norm: float = 0.0):
+        """Record DES-LOC sync event with pre/post param norms.
+        
+        Pattern: NCCL ncclGroupEnd() logging — records bytes, op type, timing.
+        Extended for DES-LOC 3-tier sync schedule.
+        """
+        self._current['sync'] = {
+            'x': sync_x, 'u': sync_u, 'v': sync_v,
+            'Kx_eff': effective_Kx,
+        }
+        if sync_x and pre_sync_norm > 0:
+            self._current['sync']['pre_norm'] = round(pre_sync_norm, 4)
+            self._current['sync']['post_norm'] = round(post_sync_norm, 4)
+            self._current['sync']['sync_delta'] = round(
+                abs(post_sync_norm - pre_sync_norm) / max(pre_sync_norm, 1e-12), 8)
+    
+    def record_cross_rank_divergence(self, model, world_size: int):
+        """Measure parameter divergence across ranks.
+        
+        Computes local param checksum, all-gathers, reports std across ranks.
+        Pattern: DeepSpeed engine.py _check_all_params_equal().
+        """
+        if world_size <= 1 or not dist.is_initialized():
+            return
+        
+        with torch.no_grad():
+            local_sum = sum(p.data.float().sum().item() for p in model.parameters())
+            device = next(model.parameters()).device
+            t = torch.tensor([local_sum], dtype=torch.float64, device=device)
+            gathered = [torch.zeros_like(t) for _ in range(world_size)]
+            dist.all_gather(gathered, t)
+            vals = [g.item() for g in gathered]
+            mean_val = sum(vals) / len(vals)
+            std_val = (sum((v - mean_val)**2 for v in vals) / len(vals)) ** 0.5
+            rel_div = std_val / max(abs(mean_val), 1e-12)
+        
+        self._current['cross_rank'] = {
+            'checksums': [round(v, 4) for v in vals],
+            'std': round(std_val, 6),
+            'rel_div': round(rel_div, 10),
+        }
+    
+    def record_timing(self, fwd_ms: float = 0, bwd_ms: float = 0,
+                      opt_ms: float = 0, sync_ms: float = 0, total_ms: float = 0):
+        """Record per-step timing breakdown.
+        
+        Pattern: Megatron timers for 'forward-compute', 'backward-compute',
+        'optimizer', 'all-grads-sync'.
+        """
+        self._current['timing'] = {
+            'fwd_ms': round(fwd_ms, 2),
+            'bwd_ms': round(bwd_ms, 2),
+            'opt_ms': round(opt_ms, 2),
+            'sync_ms': round(sync_ms, 2),
+            'total_ms': round(total_ms, 2),
+        }
+    
+    def record_memory(self):
+        """Record CUDA memory stats.
+        
+        Pattern: Megatron report_memory() — tracks allocated, reserved, peak.
+        """
+        if torch.cuda.is_available():
+            self._current['mem'] = {
+                'alloc_gb': round(torch.cuda.memory_allocated() / 1e9, 3),
+                'reserved_gb': round(torch.cuda.memory_reserved() / 1e9, 3),
+                'peak_gb': round(torch.cuda.max_memory_allocated() / 1e9, 3),
+            }
+    
+    def record_lr(self, lr: float):
+        """Record learning rate."""
+        self._current['lr'] = round(lr, 8)
+    
+    def record_pipeline_info(self, **kwargs):
+        """Record pipeline routing info (first step only).
+        
+        Pattern: DeepSpeed engine.py log_config() at init.
+        """
+        self._current['pipeline'] = kwargs
+    
+    def end_step(self):
+        """Finalize and store current step's record."""
+        step = self._current.get('step', 0)
+        self._current['elapsed_ms'] = round((time.time() - self._current.get('ts', time.time())) * 1000, 2)
+        
+        # Always record summary-level metrics
+        if step % self.summary_interval == 0 or step <= 10 or step % self.detail_interval == 1:
+            # Remove raw timestamp (not needed in JSON)
+            self._current.pop('ts', None)
+            self.records.append(self._current)
+        
+        self._current = {}
+    
+    def get_timeseries(self, key: str) -> list:
+        """Extract a single metric as a timeseries [(step, value), ...]."""
+        return [(r['step'], r[key]) for r in self.records if key in r]
+    
+    def export(self) -> list:
+        """Export all records for JSON serialization."""
+        return self.records
+
+
 @dataclass
 class TrainingConfig:
     """Training configuration - no defaults that allow fallback."""
@@ -1696,6 +1986,14 @@ class Trainer:
             'losses': [], 'step_times': [], 'comm_events': [], 'memory_usage': []
         }
 
+        # M366: Structured per-step diagnostic recorder
+        # summary_interval=10: lightweight metrics every 10 steps (matches log_interval)
+        # detail_interval=50: full per-layer diagnostics every 50 steps
+        self._recorder = StepRecorder(
+            summary_interval=config.log_interval,
+            detail_interval=50,
+        )
+
         if self.rank == 0:
             os.makedirs(config.output_dir, exist_ok=True)
 
@@ -1978,6 +2276,9 @@ class Trainer:
             accumulated_loss = 0.0
             _SP_CTX['step'] = step
 
+            # M366: begin step recording
+            self._recorder.begin_step(step)
+
             for micro_step in range(self.config.gradient_accumulation):
                 try:
                     batch = next(data_iter)
@@ -2030,6 +2331,13 @@ class Trainer:
             if _diag and step % 50 == 1:
                 _diag.log_grad_stats(step, self.rank, self.model)
 
+            # M366: Record gradient statistics to StepRecorder (structured)
+            # Pattern: Megatron training_log() records grad_norm, num_zeros at every log_interval
+            fwd_end = time.time()
+            if step % self._recorder.summary_interval == 0 or step <= 10 or step % self._recorder.detail_interval == 1:
+                self._recorder.record_grad_stats(self.model, self.rank)
+                self._recorder.record('loss', round(accumulated_loss, 6))
+
             # M364 DIAG
             if step % 100 == 1:
                 gnorm = sum(p.grad.float().norm().item()**2 for p in self.model.parameters() if p.grad is not None)**0.5
@@ -2068,11 +2376,35 @@ class Trainer:
             if hasattr(self.optimizer, '__dict__'):
                 self.optimizer._cached_grad_norm = _cached_grad_norm
 
+            # M366: Record param norm BEFORE optimizer step (for update delta tracking)
+            _pre_opt_pnorm = 0.0
+            opt_start = time.time()
+            if step % self._recorder.summary_interval == 0 or step <= 10:
+                with torch.no_grad():
+                    _pre_opt_pnorm = sum(
+                        p.detach().float().norm().item()**2
+                        for p in self.model.parameters()
+                    )**0.5
+
             if self.scaler:
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
             else:
                 self.optimizer.step()
+
+            opt_end = time.time()
+
+            # M366: Record update delta and optimizer state into StepRecorder
+            if step % self._recorder.summary_interval == 0 or step <= 10:
+                with torch.no_grad():
+                    _post_opt_pnorm = sum(
+                        p.detach().float().norm().item()**2
+                        for p in self.model.parameters()
+                    )**0.5
+                self._recorder.record_update_delta(_pre_opt_pnorm, _post_opt_pnorm)
+                self._recorder.record_optimizer_state(self.optimizer)
+                self._recorder.record_lr(
+                    self.optimizer.param_groups[0].get('lr', 0.0))
 
             # M365 DIAG: parameter update magnitude tracking
             if _diag and step % 50 == 1 and _pre_step_pnorm is not None:
@@ -2110,7 +2442,43 @@ class Trainer:
                             for p in self.model.parameters()
                         )**0.5
 
+                # M366: pre-sync param norm for StepRecorder (always)
+                _rec_pre_sync = 0.0
+                sync_start = time.time()
+                if step % self._recorder.summary_interval == 0 or step <= 10:
+                    with torch.no_grad():
+                        _rec_pre_sync = sum(
+                            p.detach().float().norm().item()**2
+                            for p in self.model.parameters()
+                        )**0.5
+
                 sync_info = self.optimizer.sync_if_needed(self.world_size)
+
+                sync_end = time.time()
+
+                # M366: Record sync event to StepRecorder
+                if sync_info and (step % self._recorder.summary_interval == 0 or step <= 10):
+                    _rec_post_sync = 0.0
+                    if sync_info.get('sync_x', False):
+                        with torch.no_grad():
+                            _rec_post_sync = sum(
+                                p.detach().float().norm().item()**2
+                                for p in self.model.parameters()
+                            )**0.5
+                    effective_Kx = getattr(self.optimizer, '_last_effective_Kx', self.config.Kx)
+                    self._recorder.record_sync_event(
+                        sync_x=sync_info.get('sync_x', False),
+                        sync_u=sync_info.get('sync_u', False),
+                        sync_v=sync_info.get('sync_v', False),
+                        effective_Kx=effective_Kx,
+                        pre_sync_norm=_rec_pre_sync,
+                        post_sync_norm=_rec_post_sync,
+                    )
+
+                # M366: Record cross-rank divergence at detail intervals
+                if step % self._recorder.detail_interval == 1 and sync_info and sync_info.get('sync_x', False):
+                    self._recorder.record_cross_rank_divergence(
+                        self.model, self.world_size)
 
                 # M365 DIAG: post-sync param norm + sync event logging
                 if _diag and step % 50 == 1 and sync_info:
@@ -2162,6 +2530,35 @@ class Trainer:
             self.metrics['step_times'].append(step_time)
             cur_mem = torch.cuda.max_memory_allocated(self.device) / 1e9
             self.metrics['memory_usage'].append(cur_mem)
+
+            # M366: Record timing breakdown and memory, then finalize step
+            if step % self._recorder.summary_interval == 0 or step <= 10 or step % self._recorder.detail_interval == 1:
+                bwd_end = time.time()
+                self._recorder.record_timing(
+                    fwd_ms=(fwd_end - step_start) * 1000 if 'fwd_end' in dir() else 0,
+                    bwd_ms=(opt_start - fwd_end) * 1000 if 'opt_start' in dir() and 'fwd_end' in dir() else 0,
+                    opt_ms=(opt_end - opt_start) * 1000 if 'opt_end' in dir() and 'opt_start' in dir() else 0,
+                    sync_ms=(sync_end - sync_start) * 1000 if 'sync_end' in dir() and 'sync_start' in dir() else 0,
+                    total_ms=step_time * 1000,
+                )
+                self._recorder.record_memory()
+                # Param stats at detail intervals (per-layer weight mean/std)
+                if step % self._recorder.detail_interval == 1:
+                    self._recorder.record_param_stats(self.model)
+                # Pipeline routing info at first step
+                if step == 1:
+                    self._recorder.record_pipeline_info(
+                        sp_enabled=self._sp_enabled,
+                        sp_size=self._sp_size,
+                        method=self.method,
+                        offload=getattr(self.optimizer, '_use_offload', False),
+                        use_ac=self.config.use_activation_checkpointing,
+                        world_size=self.world_size,
+                        Kx=self.config.Kx, Ku=self.config.Ku, Kv=self.config.Kv,
+                        batch_size=self.config.batch_size,
+                        grad_accum=self.config.gradient_accumulation,
+                    )
+                self._recorder.end_step()
 
             if step % self.config.log_interval == 0 and self.rank == 0:
                 elapsed = time.time() - start_time
@@ -2320,6 +2717,11 @@ class Trainer:
             'wall_clock': wall_clock,
             'losses': self.metrics['losses'],
             'comm_events': self.metrics['comm_events'],
+            # M366: Full structured diagnostic timeseries from StepRecorder
+            # Contains per-step: grad_norm, param_norm, update_delta, opt_m_norm,
+            # opt_v_norm, sync events, timing breakdown, memory, cross-rank divergence,
+            # and per-layer stats at detail intervals.
+            'diagnostic_history': self._recorder.export(),
         }
 
         # Sync counts
@@ -2480,6 +2882,8 @@ def save_results(results: Dict, config: TrainingConfig):
             'gpu_name': data.get('gpu_name', ''),
             'sync_counts': data.get('sync_counts', {}),
             'losses': data['losses'],
+            # M366: Structured per-step diagnostic timeseries
+            'diagnostic_history': data.get('diagnostic_history', []),
         }
     
     # Save JSON

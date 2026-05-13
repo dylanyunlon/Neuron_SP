@@ -2,19 +2,12 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # DeepSpeed Team
-# M351 — Claude-32: FP32 accumulation for SP gradient reduce-scatter.
-# Pattern: Megatron-LM reduce_scatter_with_fp32_accumulation.py
-# On heterogeneous GPUs (A6000+H100), bf16 all-to-all accumulates
-# rounding error across SP ranks. The backward pass now optionally
-# upcasts to fp32 before summation and downcasts the result.
-# This is gated by _DESLOC_FP32_SP_GRAD (default True when bf16).
 
 import torch
 import deepspeed.comm as dist
 from torch.utils._sympy.functions import FloorDiv
 from .sp_dp_registry import get_group, is_setup, sp_size
 
-# M351: Global flag — set False to disable FP32 SP grad accumulation
 _DESLOC_FP32_SP_GRAD = True
 
 
@@ -64,27 +57,7 @@ def all_to_all(
     B, dim1, dim2, H = input.shape
     gid = dist.get_rank() // sp_size()
     group = get_group(gid)
-    if not hasattr(all_to_all, '_n'): all_to_all._n = 0
-    all_to_all._n += 1
-    # M365 DIAG: log on ALL ranks (not just rank 0) for cross-rank comparison
-    # Pattern: CUTLASS profiler.h per-kernel shape/norm logging
-    if all_to_all._n % 200 == 1:
-        _r = dist.get_rank()
-        in_norm = input.float().norm().item()
-        has_nan = torch.isnan(input).any().item()
-        print(f"[A2A-COMPILE] rank={_r} #{all_to_all._n} {name} "
-              f"sc={scatter_idx} ga={gather_idx} "
-              f"in=[{B},{dim1},{dim2},{H}] sp={sp_size()} "
-              f"norm={in_norm:.4f} nan={has_nan}")
     output = _execute_a2a(input, scatter_idx, B, dim1, dim2, H, group)
-    # M365 DIAG: post-A2A output verification
-    if all_to_all._n % 200 == 1:
-        out_norm = output.float().norm().item()
-        out_nan = torch.isnan(output).any().item()
-        _r = dist.get_rank()
-        print(f"[A2A-COMPILE-OUT] rank={_r} #{all_to_all._n} {name} "
-              f"out={list(output.shape)} norm={out_norm:.4f} nan={out_nan} "
-              f"norm_ratio={out_norm/max(in_norm,1e-12):.4f}")
     return output
 
 
@@ -122,16 +95,6 @@ def _all_to_all_backward_setup(ctx, inputs, output):
 
 
 def _all_to_all_backward(ctx, grad):
-    # M351: FP32 accumulation in backward for numerical stability on
-    # heterogeneous GPUs. Pattern: Megatron FP32 reduce-scatter.
-    # The gradient all-to-all redistributes partial grads across SP ranks;
-    # accumulation in bf16 loses ~0.3% loss accuracy at 700M scale.
-    #
-    # M361: Contiguity guard. torch 2.7.1 autograd delivers non-contiguous
-    # grads to custom_op backward in certain transpose patterns. NCCL
-    # all_to_all_single (nccl/src/device/all_reduce.h) uses directSendRecv
-    # with pointer offset arithmetic that assumes contiguous layout.
-    # Pattern: Megatron param_and_grad_buffer.py always flattens before collective.
     if not grad.is_contiguous():
         grad = grad.contiguous()
     use_fp32 = (_DESLOC_FP32_SP_GRAD

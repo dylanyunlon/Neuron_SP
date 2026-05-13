@@ -118,3 +118,23 @@ def pending_handle_count():
 def fence_before_dp_sync():
     n = fence_all_sp_handles()
     return n
+
+
+def cleanup_sp_groups():
+    global _PROCESS_GROUPS, _PENDING_A2A_HANDLES
+    try:
+        fence_all_sp_handles(timeout_ms=5000)
+    except RuntimeError:
+        logger.warning("[SP cleanup] Timeout fencing pending A2A handles")
+
+    for gid, group in list(_PROCESS_GROUPS.items()):
+        try:
+            dist.destroy_process_group(group)
+        except Exception:
+            pass
+
+    _PROCESS_GROUPS.clear()
+    _PENDING_A2A_HANDLES.clear()
+    _MESH_META["sp_size"] = 0
+    _MESH_META["dp_size"] = 0
+    _MESH_META["is_registered"] = False

@@ -60,71 +60,38 @@ def init_autosp(config):
          DES-LOC adds temporal desyncing with zero user code changes.
     """
     _check_autosp_compatibility()
+    from .custom_ops.sp_dp_registry import cleanup_sp_groups, is_setup
+    if is_setup():
+        cleanup_sp_groups()
     sp_size, dp_size = extract_mesh_size(config._param_dict)
     register_long_context_checkpointing()
 
-    # M361(a): Validate n_heads % sp_size == 0 before compilation.
-    # AutoSP Ulysses A2A scatters heads across ranks: [B,N,S/P,H] → [B,N/P,S,H].
-    # N/P must be integer. If not, auto-reduce sp_size to largest valid factor.
-    # Pattern: Megatron parallel_state.py validate_tp_size checks
-    # hidden_size % tp_size == 0 at initialization, not at runtime.
     import deepspeed.comm as dist
-    # Try to detect n_heads from model config if available
     _n_heads = config._param_dict.get('n_heads', config._param_dict.get('num_attention_heads', 0))
-    if _n_heads > 0 and sp_size > 1 and _n_heads % sp_size != 0:
+    _n_kv_heads = config._param_dict.get('num_key_value_heads',
+                                          config._param_dict.get('n_kv_heads', _n_heads))
+    _min_heads = min(_n_heads, _n_kv_heads) if _n_kv_heads > 0 else _n_heads
+    if _min_heads > 0 and sp_size > 1 and _min_heads % sp_size != 0:
         old_sp = sp_size
-        # Find largest factor of n_heads that divides world_size
         for cand in range(sp_size - 1, 0, -1):
-            if _n_heads % cand == 0 and dist.get_world_size() % cand == 0:
+            if _min_heads % cand == 0 and dist.get_world_size() % cand == 0:
                 sp_size = cand
                 dp_size = dist.get_world_size() // cand
                 break
         if dist.get_rank() == 0:
-            print(f"[AutoSP/M361] n_heads={_n_heads} not divisible by "
-                  f"sp_size={old_sp}. Reduced to sp_size={sp_size}, "
-                  f"dp_size={dp_size}.")
+            print(f"[AutoSP] n_heads={_n_heads}, n_kv_heads={_n_kv_heads} "
+                  f"(min={_min_heads}) not divisible by sp_size={old_sp}. "
+                  f"Reduced to sp_size={sp_size}, dp_size={dp_size}.")
 
     _desloc_cfg = config._param_dict.get('desloc', {})
     _desloc_enabled = _desloc_cfg.get('enabled', False)
     _desloc_Kx = _desloc_cfg.get('Kx', 1)
 
     if dist.get_rank() == 0:
-        print(f"[AutoSP] Initializing: sp_size={sp_size}, dp_size={dp_size}")
-        if _desloc_enabled:
-            print(f"[AutoSP+DEC] SP+DEC composition active:")
-            print(f"  SP: sequence sharded across {sp_size} GPUs (All-to-All)")
-            print(f"  DEC: AllReduce gated with Kx={_desloc_Kx}")
-            print(f"  AC: Aten-IR long-context checkpointing (attention preserved)")
+        print(f"[AutoSP] sp={sp_size} dp={dp_size} desloc={_desloc_enabled} Kx={_desloc_Kx}")
 
     def backend_fn(gm: GraphModule, real_inputs):
-        # M365 DIAG: log graph structure on ALL ranks before SP rewrite
-        _r = dist.get_rank()
-        all_nodes = list(gm.graph.nodes)
-        n_sdpa = len([n for n in all_nodes if 'scaled_dot_product' in str(n.target)])
-        n_a2a = len([n for n in all_nodes if 'all_to_all' in str(n.target)])
-        n_linear = len([n for n in all_nodes if 'linear' in str(n.target).lower() or 'mm' in str(n.target)])
-        print(f"[AUTOSP-BE] rank={_r} nodes={len(all_nodes)} "
-              f"sdpa={n_sdpa} a2a_pre={n_a2a} linear={n_linear} "
-              f"sp={sp_size} dp={dp_size} "
-              f"n_inputs={len(real_inputs)} "
-              f"input_shapes={[list(x.shape) if hasattr(x, 'shape') else type(x).__name__ for x in real_inputs[:3]]}")
-
         apply_autosp(gm, real_inputs, debug=False, sp_size=sp_size, dp_size=dp_size)
-
-        # M365 DIAG: post-rewrite graph analysis
-        all_nodes_post = list(gm.graph.nodes)
-        n_a2a_post = len([n for n in all_nodes_post if 'all_to_all' in str(n.target)])
-        n_sdpa_post = len([n for n in all_nodes_post if 'scaled_dot_product' in str(n.target)])
-        print(f"[AUTOSP-BE] rank={_r} POST-REWRITE nodes={len(all_nodes_post)} "
-              f"a2a_inserted={n_a2a_post - n_a2a} sdpa={n_sdpa_post}")
-
-        # M361: Inductor fallback for torch 2.7.x
-        try:
-            return torch._inductor.compile(gm, real_inputs)
-        except Exception as e:
-            if _r == 0:
-                print(f"[AutoSP/M361] Inductor failed ({type(e).__name__}), "
-                      f"using eager. Graph rewrite still applied.")
-            return gm
+        return torch._inductor.compile(gm, real_inputs)
 
     return backend_fn
