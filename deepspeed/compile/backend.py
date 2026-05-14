@@ -48,15 +48,23 @@ _desloc_init_cfg = {
     'Kv': 6,
     'step': 0,
     'sp_mode': 'none',
+    'histogram_enabled': False,
+    'histogram_bins': 256,
+    'double_buffer_enabled': False,
 }
 
 
-def set_desloc_compile_state(enabled=False, Kx=1, Ku=3, Kv=6, sp_mode='none'):
+def set_desloc_compile_state(enabled=False, Kx=1, Ku=3, Kv=6, sp_mode='none',
+                             histogram_enabled=False, histogram_bins=256,
+                             double_buffer_enabled=False):
     _desloc_init_cfg['enabled'] = enabled
     _desloc_init_cfg['Kx'] = Kx
     _desloc_init_cfg['Ku'] = Ku
     _desloc_init_cfg['Kv'] = Kv
     _desloc_init_cfg['sp_mode'] = sp_mode
+    _desloc_init_cfg['histogram_enabled'] = histogram_enabled
+    _desloc_init_cfg['histogram_bins'] = histogram_bins
+    _desloc_init_cfg['double_buffer_enabled'] = double_buffer_enabled
 
 
 def get_desloc_compile_state():

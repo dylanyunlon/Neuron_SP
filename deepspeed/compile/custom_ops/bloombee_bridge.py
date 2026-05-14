@@ -387,3 +387,40 @@ class HeteroSyncGate:
     @property
     def effective_Kx(self) -> int:
         return self._effective_Kx
+
+
+class RemoteA2ADoubleBuffer:
+
+    def __init__(self, config: Optional[RemoteA2AConfig] = None):
+        self._config = config or RemoteA2AConfig()
+        self._proxy = RemoteA2AProxy(self._config)
+        self._selector = 0
+        self._send_buffers = [None, None]
+        self._recv_buffers = [None, None]
+
+    def allocate(self, shape, dtype):
+        import torch as _t
+        for i in range(2):
+            self._send_buffers[i] = _t.empty(shape, dtype=dtype, device='cpu')
+            self._recv_buffers[i] = _t.empty(shape, dtype=dtype, device='cpu')
+
+    def current_send(self):
+        return self._send_buffers[self._selector]
+
+    def current_recv(self):
+        return self._recv_buffers[self._selector]
+
+    def swap(self):
+        self._selector ^= 1
+
+    def compress_and_stage(self, tensor):
+        compressed, meta = self._proxy.compress_tensor(tensor)
+        return compressed, meta
+
+    def decompress_from_stage(self, data, meta, device):
+        return self._proxy.decompress_tensor(data, meta, device)
+
+    def free(self):
+        self._send_buffers = [None, None]
+        self._recv_buffers = [None, None]
+        self._selector = 0

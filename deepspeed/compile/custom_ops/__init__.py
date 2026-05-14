@@ -1,9 +1,13 @@
-# Copyright (c) Microsoft Corporation.
-# SPDX-License-Identifier: Apache-2.0
-
-# DeepSpeed Team
-
 from .all_to_all import all_to_all
 from . import sp_dp_registry
 
-__all__ = ["all_to_all", "sp_dp_registry", "sp_compat", "hetero_mesh", "bloombee_bridge"]
+__all__ = [
+    "all_to_all",
+    "sp_dp_registry",
+    "sp_compat",
+    "hetero_mesh",
+    "bloombee_bridge",
+    "sp_histogram",
+    "double_buffer_a2a",
+    "occupancy_grid",
+]

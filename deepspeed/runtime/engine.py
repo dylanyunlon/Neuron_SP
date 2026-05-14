@@ -257,7 +257,11 @@ class DeepSpeedEngine(Module):
         self._desloc_loss_window_size = 50 # EMA window
         self._desloc_baseline_losses = {}  # {config_key: [losses]} for diff
         self._desloc_fig1_configs = []     # list of (label, Kx, loss_list)
-        self._desloc_step_timer_ns = 0    # nanosecond timer for step
+        self._desloc_step_timer_ns = 0
+        self._desloc_histogram_enabled = False
+        self._desloc_double_buffer_enabled = False
+        self._desloc_histogram_kernel = None
+        self._desloc_buffer_pool = None
         self.gradient_average = True
         self.warn_unscaled_loss = True
         self.config = config
@@ -2785,6 +2789,11 @@ class DeepSpeedEngine(Module):
             try:
                 from deepspeed.compile.custom_ops.sp_dp_registry import fence_before_dp_sync
                 fence_before_dp_sync()
+                # System Issue 4 fix: enforce A2A handle high-water mark to prevent
+                # unbounded NCCL work handle accumulation during long DES-LOC Kx periods.
+                # Pattern: NCCL group.cc drains pending ops at ncclGroupEnd.
+                from deepspeed.compile.custom_ops.hetero_mesh import enforce_handle_high_water_mark
+                enforce_handle_high_water_mark()
             except ImportError:
                 pass
 

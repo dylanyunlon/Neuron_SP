@@ -1,8 +1,3 @@
-# Copyright (c) Microsoft Corporation.
-# SPDX-License-Identifier: Apache-2.0
-
-# DeepSpeed Team
-
 import torch
 from torch.fx import GraphModule
 from .passes.sp_compile import apply_autosp
@@ -13,52 +8,6 @@ from .passes.long_context_checkpointing import register_long_context_checkpointi
 
 
 def init_autosp(config):
-    """Initialize AutoSP compile backend.
-
-    M343 — Claude-30: DES-LOC aware initialization.
-
-    When DES-LOC is enabled (config has desloc section), AutoSP operates
-    in SP+DEC composition mode:
-
-      SP (this function): Rewrites the computation graph to shard sequence
-        dimension across GPUs via All-to-All in attention.
-        Runs ONCE at torch.compile time.
-
-      DEC (engine.py allreduce_gradients): Gates the data-parallel
-        AllReduce based on Kx/Ku/Kv schedule.
-        Runs EVERY training step.
-
-      AC (long_context_checkpointing): Aten-IR level activation
-        checkpointing that preserves attention activations while
-        recomputing matmuls. Different from layer-wise AC which
-        discards ALL activations in a TransformerBlock.
-        Configured ONCE at compile time.
-
-    The three are orthogonal:
-      SP: data dimension (sequence split across GPUs)
-      DEC: time dimension (AllReduce frequency across steps)
-      AC: memory dimension (activation recomputation per layer)
-
-    Addressing NeurIPS reviewer:
-      Q: "Why Ulysses not Ring Flash Attention?"
-      A: Ulysses is faster on all tested configs.
-         AutoSP 2.26× longer context than Ring (3B/8B/13B average).
-         All kernels use FlashAttention (O(T) memory, NOT quadratic).
-
-      Q: "torch.compile AC vs torch.utils.checkpoint?"
-      A: long_context_checkpointing.py operates on Aten-IR operators
-         (matmuls, sigmoids) individually, NOT on coarse TransformerBlocks.
-         It preserves attention activations (expensive to recompute due
-         to quadratic scaling) while recomputing linear ops (cheap).
-         torch.utils.checkpoint discards ALL activations in a block.
-         Aten-IR approach: larger search space → better mem/compute.
-
-      Q: "Context parallelism isn't hard?"
-      A: API-based SP (Megatron CP) requires manual SP groups and manual
-         composition with ZeRO/FSDP. AutoSP auto-discovers the optimal
-         SP+AC strategy without user intervention via torch.compile.
-         DES-LOC adds temporal desyncing with zero user code changes.
-    """
     _check_autosp_compatibility()
     from .custom_ops.sp_dp_registry import cleanup_sp_groups, is_setup
     if is_setup():
@@ -87,21 +36,25 @@ def init_autosp(config):
     _desloc_enabled = _desloc_cfg.get('enabled', False)
     _desloc_Kx = _desloc_cfg.get('Kx', 1)
 
-    # M343-C34: Heterogeneous mesh strategy selection.
-    # Pattern: Megatron initialize_model_parallel accepts an `order` param
-    # that controls how ranks are mapped to TP/CP/DP groups.
-    # We add a `mesh_strategy` param that controls SP group formation.
     _hetero_cfg = config._param_dict.get('hetero_mesh', {})
     _mesh_strategy = _hetero_cfg.get('strategy', 'contiguous')
+
+    _histogram_cfg = config._param_dict.get('sp_histogram', {})
+    _histogram_enabled = _histogram_cfg.get('enabled', False)
+    _histogram_bins = _histogram_cfg.get('num_bins', 256)
 
     if _mesh_strategy != 'contiguous':
         from .custom_ops.hetero_mesh import populate_hetero_registry
         populate_hetero_registry(sp_size, dp_size, strategy=_mesh_strategy)
-    # else: populate_registry called inside apply_autosp (standard path)
+
+    if _histogram_enabled:
+        from .custom_ops.sp_histogram import get_histogram_kernel
+        get_histogram_kernel(num_bins=_histogram_bins)
 
     if dist.get_rank() == 0:
         print(f"[AutoSP] sp={sp_size} dp={dp_size} desloc={_desloc_enabled} "
-              f"Kx={_desloc_Kx} mesh_strategy={_mesh_strategy}")
+              f"Kx={_desloc_Kx} mesh_strategy={_mesh_strategy} "
+              f"histogram={_histogram_enabled}")
 
     def backend_fn(gm: GraphModule, real_inputs):
         apply_autosp(gm, real_inputs, debug=False, sp_size=sp_size, dp_size=dp_size)

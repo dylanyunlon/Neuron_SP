@@ -209,8 +209,8 @@ def plan_hetero_mesh(
         if _is_non_contiguous:
             try:
                 nccl_ver = torch.cuda.nccl.version() if hasattr(torch.cuda, 'nccl') else (0, 0, 0)
-                nccl_ver_int = nccl_ver[0] * 1000 + nccl_ver[1] * 100 + nccl_ver[2]
-                if nccl_ver_int < 2190:
+                nccl_ver_int = nccl_ver[0] * 10000 + nccl_ver[1] * 100 + nccl_ver[2]
+                if nccl_ver_int < 21900:
                     logger.warning(
                         f"[HeteroMesh] Non-contiguous SP groups detected with "
                         f"NCCL {nccl_ver}. NCCL >= 2.19.0 recommended for "
@@ -281,8 +281,8 @@ def gather_all_tier_infos() -> Dict[int, GPUTierInfo]:
         local.rank,
         local.compute_capability[0],
         local.compute_capability[1],
-        int(local.memory_total_gb * 10),
-        int(local.memory_bandwidth_gbps * 10),
+        round(local.memory_total_gb * 10),
+        round(local.memory_bandwidth_gbps * 10),
         local.tier,
         1 if local.nvlink_available else 0,
     ], dtype=torch.long, device=_device)
@@ -362,6 +362,15 @@ def populate_hetero_registry(
         sp_dp_registry._MESH_META["is_registered"] = True
 
         _HETERO_PLAN = plan
+
+        # System Issue 3 fix: validate dtype compatibility within each SP group.
+        # bf16 requires cc>=8.0 (Ampere+), fp16 requires cc>=7.0 (Volta+).
+        # Mixed-dtype A2A will silently produce NaN on unsupported devices.
+        import torch as _torch
+        _train_dtype = _torch.bfloat16  # TODO: read from config when available
+        dtype_warnings = validate_sp_group_dtype_consistency(plan, _train_dtype)
+        for w in dtype_warnings:
+            logger.warning(w)
 
         if dist.get_rank() == 0:
             logger.info(f"[HeteroMesh] strategy={strategy} SP={sp_size} DP={dp_size}")
@@ -444,15 +453,6 @@ A2A_HANDLE_HIGH_WATER_MARK = 64
 
 
 def enforce_handle_high_water_mark():
-    """Force-fence A2A handles when the pending count exceeds the threshold.
-
-    Pattern: NCCL group.cc tracks pending async ops and flushes at
-    ncclGroupEnd. We do the same with a configurable high-water mark
-    to prevent memory leaks from accumulated NCCL work handles.
-
-    Call this from the training loop (e.g., after each backward pass)
-    to prevent handle accumulation during long DES-LOC Kx periods.
-    """
     pending = sp_dp_registry.pending_handle_count()
     if pending > A2A_HANDLE_HIGH_WATER_MARK:
         fenced = sp_dp_registry.fence_all_sp_handles()
@@ -461,4 +461,20 @@ def enforce_handle_high_water_mark():
                 f"[HeteroMesh] Force-fenced {fenced} A2A handles "
                 f"(high-water mark={A2A_HANDLE_HIGH_WATER_MARK})")
     return pending
+
+
+def compute_tier_aware_grid_sizes(
+    plan: HeteroMeshPlan,
+    seq_len: int,
+) -> Dict[int, int]:
+    from .occupancy_grid import compute_a2a_grid_for_tier, get_cached_capability
+
+    result = {}
+    for gid, ranks in enumerate(plan.sp_groups):
+        tiers = [plan.tier_infos.get(r, GPUTierInfo(rank=r)) for r in ranks]
+        min_tier = min(t.tier for t in tiers) if tiers else 1
+        cap = get_cached_capability()
+        grid = compute_a2a_grid_for_tier(seq_len, min_tier, cap)
+        result[gid] = grid
+    return result
 

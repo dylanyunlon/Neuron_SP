@@ -127,6 +127,18 @@ def cleanup_sp_groups():
     except RuntimeError:
         logger.warning("[SP cleanup] Timeout fencing pending A2A handles")
 
+    try:
+        from .double_buffer_a2a import get_buffer_pool
+        get_buffer_pool().free_all()
+    except ImportError:
+        pass
+
+    try:
+        from .sp_histogram import get_histogram_kernel
+        get_histogram_kernel().reset()
+    except ImportError:
+        pass
+
     for gid, group in list(_PROCESS_GROUPS.items()):
         try:
             dist.destroy_process_group(group)
@@ -138,3 +150,19 @@ def cleanup_sp_groups():
     _MESH_META["sp_size"] = 0
     _MESH_META["dp_size"] = 0
     _MESH_META["is_registered"] = False
+
+
+_BUFFER_LIFECYCLE = {
+    "created": 0,
+    "swapped": 0,
+    "freed": 0,
+}
+
+
+def track_buffer_event(event: str):
+    if event in _BUFFER_LIFECYCLE:
+        _BUFFER_LIFECYCLE[event] += 1
+
+
+def get_buffer_lifecycle_stats() -> dict:
+    return dict(_BUFFER_LIFECYCLE)
