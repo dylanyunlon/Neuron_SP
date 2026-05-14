@@ -1,10 +1,10 @@
 import time
-import math
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, field
 
 import torch
 import deepspeed.comm as dist
+from .sp_dp_registry import finalize_a2a_pass
 
 
 @dataclass
@@ -29,14 +29,14 @@ class HistogramAccumulator:
 
 class SPHistogramKernel:
 
-    def __init__(self, num_bins: int = 256, device: Optional[torch.device] = None):
+    def __init__(self, num_bins=256, device=None):
         self._num_bins = num_bins
         self._device = device or (torch.device(f"cuda:{torch.cuda.current_device()}")
                                   if torch.cuda.is_available() else torch.device("cpu"))
         self._accumulator = HistogramAccumulator()
         self._pass_count = 0
 
-    def compute_histogram(self, input_ids: torch.Tensor, seq_dim: int = 1) -> SequenceHistogram:
+    def invoke_histogram_only(self, input_ids, seq_dim=1):
         seq_len = input_ids.shape[seq_dim]
         bin_edges = torch.linspace(0, seq_len, self._num_bins + 1,
                                    device=self._device, dtype=torch.float32)
@@ -62,7 +62,7 @@ class SPHistogramKernel:
         self._pass_count += 1
         return result
 
-    def reduce_histograms(self, local_hist: SequenceHistogram) -> SequenceHistogram:
+    def reduce_histograms(self, local_hist):
         if not dist.is_initialized() or dist.get_world_size() <= 1:
             return local_hist
 
@@ -78,8 +78,7 @@ class SPHistogramKernel:
             rank=local_hist.rank,
         )
 
-    def compute_optimal_chunk_ratios(self, histogram: SequenceHistogram,
-                                     sp_size: int) -> List[float]:
+    def compute_optimal_chunk_ratios(self, histogram, sp_size):
         counts = histogram.bin_counts.float()
         total = counts.sum()
         if total == 0:
@@ -109,8 +108,7 @@ class SPHistogramKernel:
 
         return ratios
 
-    def extract_candidate_bins(self, histogram: SequenceHistogram,
-                               threshold_ratio: float = 0.01) -> torch.Tensor:
+    def extract_candidate_bins(self, histogram, threshold_ratio=0.01):
         counts = histogram.bin_counts.float()
         total = counts.sum()
         if total == 0:
@@ -120,13 +118,12 @@ class SPHistogramKernel:
         mask = ratios >= threshold_ratio
         return torch.where(mask)[0]
 
-    def early_stop_check(self, histogram: SequenceHistogram,
-                         sp_size: int) -> bool:
+    def early_stop_check(self, histogram, sp_size):
         counts = histogram.bin_counts
         nonzero_bins = (counts > 0).sum().item()
         return nonzero_bins <= sp_size
 
-    def accumulate(self, histogram: SequenceHistogram):
+    def accumulate(self, histogram):
         if self._accumulator.global_histogram is None:
             self._accumulator.global_histogram = histogram.bin_counts.clone()
         else:
@@ -134,7 +131,7 @@ class SPHistogramKernel:
         self._accumulator.per_rank_histograms[histogram.rank] = histogram.bin_counts.clone()
         self._accumulator.num_passes += 1
 
-    def get_accumulator(self) -> HistogramAccumulator:
+    def get_accumulator(self):
         return self._accumulator
 
     def reset(self):
@@ -142,22 +139,25 @@ class SPHistogramKernel:
         self._pass_count = 0
 
 
-_GLOBAL_HISTOGRAM_KERNEL: Optional[SPHistogramKernel] = None
+_GLOBAL_HISTOGRAM_KERNEL = None
 
 
-def get_histogram_kernel(num_bins: int = 256) -> SPHistogramKernel:
+def get_histogram_kernel(num_bins=256):
     global _GLOBAL_HISTOGRAM_KERNEL
     if _GLOBAL_HISTOGRAM_KERNEL is None:
         _GLOBAL_HISTOGRAM_KERNEL = SPHistogramKernel(num_bins=num_bins)
     return _GLOBAL_HISTOGRAM_KERNEL
 
 
-def run_first_pass_histogram(input_ids: torch.Tensor, sp_size: int,
-                             seq_dim: int = 1) -> Tuple[List[float], bool]:
+def run_first_pass_histogram(input_ids, sp_size, seq_dim=1, is_last_pass=False):
     kernel = get_histogram_kernel()
-    local_hist = kernel.compute_histogram(input_ids, seq_dim=seq_dim)
+    local_hist = kernel.invoke_histogram_only(input_ids, seq_dim=seq_dim)
     global_hist = kernel.reduce_histograms(local_hist)
-    kernel.accumulate(global_hist)
+
+    def _counter_update():
+        kernel.accumulate(global_hist)
+
+    finalize_a2a_pass(is_last_pass, _counter_update)
 
     early_stop = kernel.early_stop_check(global_hist, sp_size)
     if early_stop:

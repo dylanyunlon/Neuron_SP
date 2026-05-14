@@ -1,115 +1,93 @@
 import threading
 from typing import Optional, Tuple
-from dataclasses import dataclass
 
 import torch
+from .sp_dp_registry import track_buffer_event
 
 
-@dataclass
-class BufferSlot:
-    data: Optional[torch.Tensor] = None
-    index: Optional[torch.Tensor] = None
-    valid: bool = False
-    numel: int = 0
+class DoubleBuffer:
 
-
-class DoubleBufferA2A:
-
-    def __init__(self, max_elements: int, dtype: torch.dtype = torch.bfloat16,
-                 index_dtype: torch.dtype = torch.long,
-                 device: Optional[torch.device] = None):
-        self._max_elements = max_elements
+    def __init__(self, dtype=torch.bfloat16, index_dtype=torch.long, device=None):
         self._dtype = dtype
         self._index_dtype = index_dtype
         self._device = device or (torch.device(f"cuda:{torch.cuda.current_device()}")
                                   if torch.cuda.is_available() else torch.device("cpu"))
-        self._selector = 0
-        self._slots = [BufferSlot(), BufferSlot()]
-        self._lock = threading.Lock()
+        self.selector = 0
+        self._data = [None, None]
+        self._index = [None, None]
+        self._valid = [False, False]
         self._allocated = False
+        self._lock = threading.Lock()
 
-    def allocate(self, shape: Tuple[int, ...]):
+    def allocate(self, shape):
         with self._lock:
             if self._allocated:
-                return
+                if self._data[0] is not None and self._data[0].shape == shape:
+                    return
+                self.free()
             for i in range(2):
-                self._slots[i].data = torch.empty(shape, dtype=self._dtype, device=self._device)
-                self._slots[i].index = torch.empty(shape[0], dtype=self._index_dtype, device=self._device)
-                self._slots[i].numel = shape[0]
+                self._data[i] = torch.empty(shape, dtype=self._dtype, device=self._device)
+                self._index[i] = torch.empty(shape[0], dtype=self._index_dtype, device=self._device)
             self._allocated = True
+            track_buffer_event("created")
 
-    def current(self) -> BufferSlot:
-        return self._slots[self._selector]
+    def current(self):
+        return self._data[self.selector]
 
-    def alternate(self) -> BufferSlot:
-        return self._slots[self._selector ^ 1]
+    def alternate(self):
+        return self._data[self.selector ^ 1]
+
+    def current_index(self):
+        return self._index[self.selector]
+
+    def alternate_index(self):
+        return self._index[self.selector ^ 1]
 
     def swap(self):
         with self._lock:
-            self._selector ^= 1
+            self.selector ^= 1
+            track_buffer_event("swapped")
 
-    def current_data(self) -> Optional[torch.Tensor]:
-        return self._slots[self._selector].data
+    def mark_valid(self, slot=-1):
+        if slot < 0:
+            slot = self.selector
+        self._valid[slot] = True
 
-    def alternate_data(self) -> Optional[torch.Tensor]:
-        return self._slots[self._selector ^ 1].data
+    def is_valid(self, slot=-1):
+        if slot < 0:
+            slot = self.selector
+        return self._valid[slot]
 
-    def current_index(self) -> Optional[torch.Tensor]:
-        return self._slots[self._selector].index
-
-    def alternate_index(self) -> Optional[torch.Tensor]:
-        return self._slots[self._selector ^ 1].index
-
-    def mark_valid(self, slot_id: int = -1):
-        if slot_id < 0:
-            slot_id = self._selector
-        self._slots[slot_id].valid = True
-
-    def is_valid(self, slot_id: int = -1) -> bool:
-        if slot_id < 0:
-            slot_id = self._selector
-        return self._slots[slot_id].valid
-
-    def invalidate(self, slot_id: int = -1):
-        if slot_id < 0:
-            slot_id = self._selector
-        self._slots[slot_id].valid = False
+    def invalidate(self, slot=-1):
+        if slot < 0:
+            slot = self.selector
+        self._valid[slot] = False
 
     def free(self):
         with self._lock:
-            for s in self._slots:
-                s.data = None
-                s.index = None
-                s.valid = False
-                s.numel = 0
+            for i in range(2):
+                self._data[i] = None
+                self._index[i] = None
+                self._valid[i] = False
             self._allocated = False
-            self._selector = 0
+            self.selector = 0
+            track_buffer_event("freed")
 
     @property
-    def selector(self) -> int:
-        return self._selector
-
-    @property
-    def allocated(self) -> bool:
+    def allocated(self):
         return self._allocated
 
 
-class A2ABufferPool:
+class BufferPool:
 
     def __init__(self):
         self._buffers = {}
         self._lock = threading.Lock()
 
-    def get_or_create(self, key: str, max_elements: int,
-                      dtype: torch.dtype = torch.bfloat16,
-                      device: Optional[torch.device] = None) -> DoubleBufferA2A:
+    def get_or_create(self, key, dtype=torch.bfloat16, device=None):
         with self._lock:
             if key not in self._buffers:
-                self._buffers[key] = DoubleBufferA2A(
-                    max_elements=max_elements,
-                    dtype=dtype,
-                    device=device,
-                )
+                self._buffers[key] = DoubleBuffer(dtype=dtype, device=device)
             return self._buffers[key]
 
     def swap_all(self):
@@ -126,67 +104,57 @@ class A2ABufferPool:
     def keys(self):
         return list(self._buffers.keys())
 
-    def __contains__(self, key: str) -> bool:
+    def __contains__(self, key):
         return key in self._buffers
 
-    def __len__(self) -> int:
+    def __len__(self):
         return len(self._buffers)
 
 
-_GLOBAL_BUFFER_POOL: Optional[A2ABufferPool] = None
+_GLOBAL_POOL = None
 
 
-def get_buffer_pool() -> A2ABufferPool:
-    global _GLOBAL_BUFFER_POOL
-    if _GLOBAL_BUFFER_POOL is None:
-        _GLOBAL_BUFFER_POOL = A2ABufferPool()
-    return _GLOBAL_BUFFER_POOL
+def get_buffer_pool():
+    global _GLOBAL_POOL
+    if _GLOBAL_POOL is None:
+        _GLOBAL_POOL = BufferPool()
+    return _GLOBAL_POOL
 
 
-def execute_double_buffered_a2a(input_tensor: torch.Tensor,
-                                scatter_idx: int,
-                                gather_idx: int,
-                                sp_size: int,
-                                group,
-                                pass_index: int,
-                                pool: Optional[A2ABufferPool] = None) -> torch.Tensor:
+def execute_double_buffered_a2a(input_tensor, scatter_idx, gather_idx,
+                                 sp_size_val, group, pass_index,
+                                 is_last_pass, pool=None):
     import deepspeed.comm as comm
 
     pool = pool or get_buffer_pool()
     B, dim1, dim2, H = input_tensor.shape
 
-    buf_key = f"a2a_pass_{pass_index % 2}"
-    buf = pool.get_or_create(buf_key, max_elements=input_tensor.numel(),
-                             dtype=input_tensor.dtype)
+    buf = pool.get_or_create(f"a2a_pass_{pass_index % 2}", dtype=input_tensor.dtype)
 
-    if not buf.allocated:
-        buf.allocate(input_tensor.shape)
-
-    write_slot = buf.alternate_data()
-    if write_slot is None or write_slot.shape != input_tensor.shape:
+    if not buf.allocated or buf.current().shape != input_tensor.shape:
         buf.free()
         buf.allocate(input_tensor.shape)
-        write_slot = buf.alternate_data()
 
     if scatter_idx == 1:
         N, local_S = dim1, dim2
-        input_t = input_tensor.reshape(B, sp_size, N // sp_size, local_S, H)
+        input_t = input_tensor.reshape(B, sp_size_val, N // sp_size_val, local_S, H)
         input_t = input_t.permute(1, 0, 2, 3, 4).contiguous()
         output = torch.empty_like(input_t)
         comm.all_to_all_single(output, input_t, group=group)
         result = output.permute(1, 2, 0, 3, 4).contiguous()
-        result = result.reshape(B, N // sp_size, sp_size * local_S, H)
+        result = result.reshape(B, N // sp_size_val, sp_size_val * local_S, H)
     else:
         local_N, S = dim1, dim2
-        input_t = input_tensor.reshape(B, local_N, sp_size, S // sp_size, H)
+        input_t = input_tensor.reshape(B, local_N, sp_size_val, S // sp_size_val, H)
         input_t = input_t.permute(2, 0, 1, 3, 4).contiguous()
         output = torch.empty_like(input_t)
         comm.all_to_all_single(output, input_t, group=group)
         result = output.permute(1, 0, 2, 3, 4).contiguous()
-        result = result.reshape(B, sp_size * local_N, S // sp_size, H)
+        result = result.reshape(B, sp_size_val * local_N, S // sp_size_val, H)
 
-    write_slot.copy_(result.reshape(write_slot.shape) if write_slot.shape == result.shape
-                     else result.view(-1)[:write_slot.numel()].reshape(write_slot.shape))
+    write_slot = buf.alternate()
+    if write_slot is not None and write_slot.shape == result.shape:
+        write_slot.copy_(result)
     buf.mark_valid(buf.selector ^ 1)
     buf.swap()
 

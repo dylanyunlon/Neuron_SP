@@ -1,12 +1,3 @@
-# Copyright (c) Microsoft Corporation.
-# SPDX-License-Identifier: Apache-2.0
-
-# DeepSpeed Team
-# M356 — Claude-32: Added pending_handles tracking and fence_all_sp_handles
-# to prevent NCCL deadlock on heterogeneous GPUs (A6000+H100).
-# Pattern: Megatron param_and_grad_buffer.py finish_grad_sync fence,
-#          NCCL src/device/all_reduce.h async completion tracking.
-
 import os
 import time
 import logging
@@ -24,6 +15,7 @@ _MESH_META = {
 
 _PENDING_A2A_HANDLES = []
 _A2A_TIMEOUT_MS = int(os.environ.get('DESLOC_SP_A2A_TIMEOUT_MS', '60000'))
+_A2A_HANDLE_HIGH_WATER = 64
 
 
 def register_groups(groups):
@@ -32,12 +24,13 @@ def register_groups(groups):
             _PROCESS_GROUPS[gid] = dist.new_group(ranks)
 
 
-def get_group(gid: int):
+def get_group(gid):
     if gid is None:
         return dist.get_world_group()
     if gid not in _PROCESS_GROUPS:
-        raise KeyError(f"No process group registered for DP-group index {gid}. "
-                       f"Available: {list(_PROCESS_GROUPS.keys())}")
+        raise KeyError(
+            f"No process group registered for DP-group index {gid}. "
+            f"Available: {list(_PROCESS_GROUPS.keys())}")
     return _PROCESS_GROUPS[gid]
 
 
@@ -63,7 +56,6 @@ def dp_size():
 
 
 def populate_registry(SP_SIZE, DP_SIZE):
-
     if _MESH_META["is_registered"]:
         return
 
@@ -82,15 +74,29 @@ def populate_registry(SP_SIZE, DP_SIZE):
     _r = dist.get_rank()
     _ws = dist.get_world_size()
     _gid = _r // SP_SIZE
-    _sp_rank_in_group = _r % SP_SIZE
-    print(f"[SP-REG] rank={_r}/{_ws} SP={SP_SIZE} DP={DP_SIZE} "
-          f"sp_group_id={_gid} sp_rank_in_group={_sp_rank_in_group} "
-          f"groups={[list(range(i*SP_SIZE,(i+1)*SP_SIZE)) for i in range(DP_SIZE)]}")
+    _sp_local = _r % SP_SIZE
+    logger.info(
+        f"[SP-REG] rank={_r}/{_ws} SP={SP_SIZE} DP={DP_SIZE} "
+        f"sp_group_id={_gid} sp_rank_in_group={_sp_local} "
+        f"groups={[list(range(i*SP_SIZE,(i+1)*SP_SIZE)) for i in range(DP_SIZE)]}")
 
 
 def track_a2a_handle(handle):
     if handle is not None:
         _PENDING_A2A_HANDLES.append((handle, time.monotonic()))
+    if len(_PENDING_A2A_HANDLES) > _A2A_HANDLE_HIGH_WATER:
+        _enforce_high_water()
+
+
+def _enforce_high_water():
+    fenced = 0
+    while len(_PENDING_A2A_HANDLES) > _A2A_HANDLE_HIGH_WATER // 2:
+        handle, _ = _PENDING_A2A_HANDLES.pop(0)
+        if hasattr(handle, 'wait'):
+            handle.wait()
+        fenced += 1
+    if fenced > 0:
+        logger.debug(f"[SP] Force-fenced {fenced} A2A handles (high-water={_A2A_HANDLE_HIGH_WATER})")
 
 
 def fence_all_sp_handles(timeout_ms=None):
@@ -116,8 +122,14 @@ def pending_handle_count():
 
 
 def fence_before_dp_sync():
-    n = fence_all_sp_handles()
-    return n
+    return fence_all_sp_handles()
+
+
+def finalize_a2a_pass(is_last_pass, counter_update_fn):
+    fence_all_sp_handles()
+    counter_update_fn()
+    if not is_last_pass:
+        _PENDING_A2A_HANDLES.clear()
 
 
 def cleanup_sp_groups():
@@ -159,10 +171,10 @@ _BUFFER_LIFECYCLE = {
 }
 
 
-def track_buffer_event(event: str):
+def track_buffer_event(event):
     if event in _BUFFER_LIFECYCLE:
         _BUFFER_LIFECYCLE[event] += 1
 
 
-def get_buffer_lifecycle_stats() -> dict:
+def get_buffer_lifecycle_stats():
     return dict(_BUFFER_LIFECYCLE)
