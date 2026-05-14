@@ -41,6 +41,10 @@ def all_to_all(
     name: str,
 ) -> torch.Tensor:
     assert is_setup(), 'Incorrect initialization of SP/DP mesh.'
+    assert input.ndim == 4, (
+        f"[AutoSP] all_to_all expects 4D [B,N,S,H], got {input.ndim}D shape {input.shape}")
+    if not input.is_contiguous():
+        input = input.contiguous()
     B, dim1, dim2, H = input.shape
     _sp = sp_size()
     if scatter_idx == 1:

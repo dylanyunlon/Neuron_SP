@@ -84,7 +84,7 @@ def populate_registry(SP_SIZE, DP_SIZE):
 def track_a2a_handle(handle):
     if handle is not None:
         _PENDING_A2A_HANDLES.append((handle, time.monotonic()))
-    if len(_PENDING_A2A_HANDLES) > _A2A_HANDLE_HIGH_WATER:
+    if len(_PENDING_A2A_HANDLES) > _A2A_HANDLE_HIGH_WATER // 4:
         _enforce_high_water()
 
 
@@ -148,6 +148,12 @@ def cleanup_sp_groups():
     try:
         from .sp_histogram import get_histogram_kernel
         get_histogram_kernel().reset()
+    except ImportError:
+        pass
+
+    try:
+        from ..passes.long_context_checkpointing import restore_default_checkpointing
+        restore_default_checkpointing()
     except ImportError:
         pass
 

@@ -152,14 +152,11 @@ def get_node_shape_meta(node: Node) -> Optional[torch.Tensor]:
 
 
 def find_node_by_tag(gm: GraphModule, tag: str) -> Optional[Node]:
-    input_id_node = None
     for node in gm.graph.nodes:
-        # https://github.com/pytorch/pytorch/blob/085b71eab05cbc7d474a173884269c62d2778f77/torch/_dynamo/utils.py#L5048
         tensor_dict = node.meta.get('tensor_dict')
         if tensor_dict and tensor_dict.get('tag') == tag:
-            input_id_node = node
-            break
-    return input_id_node
+            return node
+    return None
 
 
 def replace_node_users(node: Node, replacement: Node, exclude: Optional[List[Node]] = None):

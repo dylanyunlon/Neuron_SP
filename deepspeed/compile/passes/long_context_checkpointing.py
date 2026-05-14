@@ -72,6 +72,12 @@ def should_ban_recomputation(node):
 
 _NEEDLE = '    def should_ban_recomputation('
 
+_ORIGINAL_SOLVE_MIN_CUT = _partitioners.solve_min_cut
+
+
+def restore_default_checkpointing():
+    _partitioners.solve_min_cut = _ORIGINAL_SOLVE_MIN_CUT
+
 
 def register_long_context_checkpointing():
     try:
@@ -79,6 +85,12 @@ def register_long_context_checkpointing():
     except (OSError, TypeError):
         logger.warning("AutoSP: could not retrieve source for solve_min_cut; "
                        "selective activation checkpointing disabled.")
+        return
+
+    if 'def should_ban_recomputation(' not in src:
+        logger.warning(
+            f"AutoSP: PyTorch {__import__('torch').__version__} changed "
+            f"solve_min_cut signature. Selective activation checkpointing disabled.")
         return
 
     lines = src.split('\n')

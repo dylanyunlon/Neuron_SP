@@ -1,3 +1,5 @@
+import logging
+
 import torch
 from torch.fx import GraphModule
 from .passes.sp_compile import apply_autosp
@@ -5,6 +7,8 @@ from .custom_ops.sp_dp_registry import extract_mesh_size
 from .custom_ops.sp_compat import _check_autosp_compatibility
 from .custom_ops import all_to_all as _force_register_a2a  # noqa: F401
 from .passes.long_context_checkpointing import register_long_context_checkpointing
+
+logger = logging.getLogger(__name__)
 
 
 def init_autosp(config):
@@ -27,10 +31,13 @@ def init_autosp(config):
                 sp_size = cand
                 dp_size = dist.get_world_size() // cand
                 break
-        if dist.get_rank() == 0:
-            print(f"[AutoSP] n_heads={_n_heads}, n_kv_heads={_n_kv_heads} "
-                  f"(min={_min_heads}) not divisible by sp_size={old_sp}. "
-                  f"Reduced to sp_size={sp_size}, dp_size={dp_size}.")
+        logger.warning(
+            f"[AutoSP] n_heads={_n_heads}, n_kv_heads={_n_kv_heads} "
+            f"(min={_min_heads}) not divisible by sp_size={old_sp}. "
+            f"Reduced to sp_size={sp_size}, dp_size={dp_size}.")
+
+    config._param_dict['_effective_sp_size'] = sp_size
+    config._param_dict['_effective_dp_size'] = dp_size
 
     _desloc_cfg = config._param_dict.get('desloc', {})
     _desloc_enabled = _desloc_cfg.get('enabled', False)
@@ -51,10 +58,10 @@ def init_autosp(config):
         from .custom_ops.sp_histogram import get_histogram_kernel
         get_histogram_kernel(num_bins=_histogram_bins)
 
-    if dist.get_rank() == 0:
-        print(f"[AutoSP] sp={sp_size} dp={dp_size} desloc={_desloc_enabled} "
-              f"Kx={_desloc_Kx} mesh_strategy={_mesh_strategy} "
-              f"histogram={_histogram_enabled}")
+    logger.info(
+        f"[AutoSP] sp={sp_size} dp={dp_size} desloc={_desloc_enabled} "
+        f"Kx={_desloc_Kx} mesh_strategy={_mesh_strategy} "
+        f"histogram={_histogram_enabled}")
 
     def backend_fn(gm: GraphModule, real_inputs):
         apply_autosp(gm, real_inputs, debug=False, sp_size=sp_size, dp_size=dp_size)

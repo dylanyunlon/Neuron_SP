@@ -1,7 +1,7 @@
 import logging
 import operator
 from collections import deque
-from typing import Optional, List, Callable
+from typing import Optional, List, Callable, NamedTuple
 
 import torch
 import deepspeed.comm as dist
@@ -19,11 +19,18 @@ from ..fx import find_node_by_name, get_node_shape_meta
 from ..util import get_input_id_node, get_label_id_node, get_position_id_node, shard_tensor_node, get_sdpa_nodes
 
 
+class AutoSPInputs(NamedTuple):
+    input_id: torch.Tensor
+    label_id: torch.Tensor
+    position_id: Optional[torch.Tensor]
+    attention_mask: Optional[torch.Tensor]
+
+
 def prepare_autosp_inputs(input_id: torch.Tensor,
                           label_id: torch.Tensor,
                           position_id: torch.Tensor = None,
                           attention_mask: torch.Tensor = None,
-                          seq_dim: int = 1):
+                          seq_dim: int = 1) -> AutoSPInputs:
 
     if input_id is None:
         raise ValueError("input_id is required")
@@ -54,7 +61,7 @@ def prepare_autosp_inputs(input_id: torch.Tensor,
     if position_id is not None:
         position_id.tag = constants.AUTOSP_POSITION_ID_KEY
 
-    return input_id, label_id, position_id, attention_mask
+    return AutoSPInputs(input_id, label_id, position_id, attention_mask)
 
 
 def pass_shard_seq_dim(gm: GraphModule, example_inputs):
@@ -182,21 +189,23 @@ def pass_propagate_shapes(gm: torch.fx.GraphModule, real_inputs):
     if fake_mode is None:
         fake_mode = FakeTensorMode(shape_env=ShapeEnv())
 
-    _placeholder_dtype = None
+    _placeholder_dtypes = []
     for node in gm.graph.nodes:
         if node.op == "placeholder":
             val = node.meta.get("val") or node.meta.get("example_value")
             if val is not None and isinstance(val, torch.Tensor) and val.is_floating_point():
-                _placeholder_dtype = val.dtype
-                break
+                _placeholder_dtypes.append(val.dtype)
+            else:
+                _placeholder_dtypes.append(None)
 
     fake_inputs = []
-    for t in real_inputs:
+    for idx, t in enumerate(real_inputs):
         if isinstance(t, torch.Tensor):
-            if (_placeholder_dtype is not None
+            target_dtype = _placeholder_dtypes[idx] if idx < len(_placeholder_dtypes) else None
+            if (target_dtype is not None
                     and t.is_floating_point()
-                    and t.dtype != _placeholder_dtype):
-                t = t.to(_placeholder_dtype)
+                    and t.dtype != target_dtype):
+                t = t.to(target_dtype)
             fake_inputs.append(fake_mode.from_tensor(t))
         else:
             fake_inputs.append(t)
@@ -285,7 +294,8 @@ def apply_autosp(gm: GraphModule,
             print(gm.print_readable(print_output=False))
 
     a2a_count = sum(1 for n in gm.graph.nodes
-                    if n.op == "call_function" and 'all_to_all' in str(n.target))
+                    if n.op == "call_function"
+                    and n.target is torch.ops.autosp.all_to_all.default)
     expected = _n_sdpa * 4
     if a2a_count != expected:
         raise RuntimeError(
