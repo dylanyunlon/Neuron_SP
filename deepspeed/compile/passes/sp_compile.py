@@ -104,31 +104,29 @@ def pass_shard_seq_dim(gm: GraphModule, example_inputs):
         user.replace_input_with(sym_seq_dim_node, sharded_node)
 
 
-def pass_shard_input_ids(gm: GraphModule, example_inputs):
-    shard_tensor_node(gm, get_input_id_node(gm))
+_SHARD_TARGETS = [
+    (get_input_id_node, True),
+    (get_label_id_node, True),
+    (get_position_id_node, False),
+]
 
 
-def pass_shard_label_ids(gm: GraphModule, example_inputs):
-    shard_tensor_node(gm, get_label_id_node(gm))
+def pass_shard_tagged_inputs(gm: GraphModule, example_inputs):
+    for getter, required in _SHARD_TARGETS:
+        node = getter(gm)
+        if node is None:
+            if required:
+                raise RuntimeError(f"[AutoSP] Required node not found via {getter.__name__}")
+            continue
+        shard_tensor_node(gm, node)
 
-
-def pass_shard_position_ids(gm: GraphModule, example_inputs):
-    position_ids_node = get_position_id_node(gm)
-    if position_ids_node is None:
-        logger.warning("position id node not found. Skipping sharding of position ids.")
-        return
-    shard_tensor_node(gm, position_ids_node)
-
-
-def pass_shard_attention_mask(gm: GraphModule, example_inputs):
     from ..fx import find_node_by_tag
     mask_node = find_node_by_tag(gm, constants.AUTOSP_ATTENTION_MASK_KEY)
-    if mask_node is None:
-        return
-    try:
-        shard_tensor_node(gm, mask_node)
-    except Exception as exc:
-        logger.warning(f"[AutoSP] attention_mask sharding skipped: {exc}")
+    if mask_node is not None:
+        try:
+            shard_tensor_node(gm, mask_node)
+        except (AssertionError, RuntimeError, ValueError, AttributeError) as exc:
+            logger.warning(f"[AutoSP] attention_mask sharding skipped: {exc}")
 
 
 def _insert_a2a(gm, node, scatter_idx, gather_idx, name):
@@ -285,10 +283,7 @@ _APPLY_LOCK = threading.Lock()
 
 AUTOSP_PASSES = [
     pass_shard_seq_dim,
-    pass_shard_input_ids,
-    pass_shard_label_ids,
-    pass_shard_position_ids,
-    pass_shard_attention_mask,
+    pass_shard_tagged_inputs,
     pass_insert_attention_all_to_all,
     pass_propagate_shapes,
     pass_canonicalize,
