@@ -121,13 +121,26 @@ def get_buffer_pool():
     return _GLOBAL_POOL
 
 
+def _raw_a2a(input_tensor, scatter_idx, sp_size_val, group):
+    import deepspeed.comm as comm
+    from .all_to_all import _SCATTER_HEADS, _SCATTER_SEQ
+
+    B, dim1, dim2, H = input_tensor.shape
+    plan = _SCATTER_HEADS if scatter_idx == 1 else _SCATTER_SEQ
+    P = sp_size_val
+
+    input_t = input_tensor.reshape(*plan["pre_reshape"](B, P, dim1, dim2, H))
+    input_t = input_t.permute(*plan["pre_permute"]).contiguous()
+    output = torch.empty_like(input_t)
+    comm.all_to_all_single(output, input_t, group=group)
+    output = output.permute(*plan["post_permute"]).contiguous()
+    return output.reshape(*plan["post_reshape"](B, P, dim1, dim2, H))
+
+
 def execute_double_buffered_a2a(input_tensor, scatter_idx, gather_idx,
                                  sp_size_val, group, pass_index,
                                  is_last_pass, pool=None):
-    import deepspeed.comm as comm
-
     pool = pool or get_buffer_pool()
-    B, dim1, dim2, H = input_tensor.shape
 
     buf = pool.get_or_create(f"a2a_pass_{pass_index % 2}", dtype=input_tensor.dtype)
 
@@ -135,22 +148,7 @@ def execute_double_buffered_a2a(input_tensor, scatter_idx, gather_idx,
         buf.free()
         buf.allocate(input_tensor.shape)
 
-    if scatter_idx == 1:
-        N, local_S = dim1, dim2
-        input_t = input_tensor.reshape(B, sp_size_val, N // sp_size_val, local_S, H)
-        input_t = input_t.permute(1, 0, 2, 3, 4).contiguous()
-        output = torch.empty_like(input_t)
-        comm.all_to_all_single(output, input_t, group=group)
-        result = output.permute(1, 2, 0, 3, 4).contiguous()
-        result = result.reshape(B, N // sp_size_val, sp_size_val * local_S, H)
-    else:
-        local_N, S = dim1, dim2
-        input_t = input_tensor.reshape(B, local_N, sp_size_val, S // sp_size_val, H)
-        input_t = input_t.permute(2, 0, 1, 3, 4).contiguous()
-        output = torch.empty_like(input_t)
-        comm.all_to_all_single(output, input_t, group=group)
-        result = output.permute(1, 0, 2, 3, 4).contiguous()
-        result = result.reshape(B, sp_size_val * local_N, S // sp_size_val, H)
+    result = _raw_a2a(input_tensor, scatter_idx, sp_size_val, group)
 
     write_slot = buf.alternate()
     if write_slot is not None and write_slot.shape == result.shape:
