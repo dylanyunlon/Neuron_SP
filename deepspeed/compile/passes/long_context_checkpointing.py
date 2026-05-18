@@ -85,6 +85,27 @@ def is_checkpointing_patched():
     return _PATCHED
 
 
+def _locate_ban_function(lines):
+    start = None
+    end = None
+    for i, line in enumerate(lines):
+        if line.startswith(_NEEDLE) or line.lstrip().startswith('def should_ban_recomputation('):
+            if start is None:
+                start = i
+        elif start is not None and end is None and line.startswith('    def '):
+            end = i
+    return start, end
+
+
+def _splice_source(src):
+    lines = src.split('\n')
+    start, end = _locate_ban_function(lines)
+    if start is None or end is None:
+        return None
+    replacement = textwrap.indent(_CUSTOM_SHOULD_BAN, '    ')
+    return '\n'.join(lines[:start]) + '\n' + replacement + '\n'.join(lines[end:])
+
+
 def register_long_context_checkpointing():
     global _PATCHED
     with _PATCH_LOCK:
@@ -104,26 +125,12 @@ def register_long_context_checkpointing():
                 f"solve_min_cut signature. Selective activation checkpointing disabled.")
             return
 
-        lines = src.split('\n')
-
-        start = None
-        end = None
-        for i, line in enumerate(lines):
-            if line.startswith(_NEEDLE) or line.lstrip().startswith('def should_ban_recomputation('):
-                if start is None:
-                    start = i
-            elif start is not None and end is None and line.startswith('    def '):
-                end = i
-
-        if start is None or end is None:
+        new_src = _splice_source(src)
+        if new_src is None:
             logger.warning(
                 "AutoSP: solve_min_cut structure does not match expected pattern; "
                 "selective activation checkpointing disabled.")
             return
-
-        replacement = textwrap.indent(_CUSTOM_SHOULD_BAN, '    ')
-
-        new_src = '\n'.join(lines[:start]) + '\n' + replacement + '\n'.join(lines[end:])
 
         try:
             exec(new_src, _partitioners.__dict__)
