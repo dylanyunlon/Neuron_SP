@@ -2023,9 +2023,8 @@ class Trainer:
                     "weight_decay": config.weight_decay,
                 }
             },
-            "fp16": {
+            "bf16": {
                 "enabled": True,
-                "initial_scale_power": 16,
             },
             "desloc": {
                 "enabled": True,
@@ -2044,6 +2043,8 @@ class Trainer:
         # ZeRO optimization (supports stage 0 and 1 for all methods)
         _zero_stage = getattr(config, 'zero_stage', 0)
         _cpu_offload = getattr(config, 'cpu_offload', False)
+        if _cpu_offload and _zero_stage < 1:
+            _zero_stage = 1
         zero_cfg = {"stage": _zero_stage}
         if _cpu_offload:
             zero_cfg["offload_optimizer"] = {"device": "cpu", "pin_memory": True}
