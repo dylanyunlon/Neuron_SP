@@ -168,6 +168,8 @@ def _enforce_high_water():
 
 def fence_all_sp_handles(timeout_ms=None):
     effective_timeout = timeout_ms or effective_timeout_ms()
+    aggregate_limit_ms = effective_timeout * 3
+    fence_start = time.monotonic()
 
     def on_stale(ms):
         raise RuntimeError(
@@ -176,9 +178,20 @@ def fence_all_sp_handles(timeout_ms=None):
             f"heterogeneous GPUs. Set DESLOC_SP_A2A_TIMEOUT_MS higher "
             f"or check GPU synchronization.")
 
-    return _drain_handles(
+    fenced = _drain_handles(
         stop_when=lambda: False,
         on_stale=on_stale)
+
+    aggregate_ms = (time.monotonic() - fence_start) * 1000
+    if aggregate_ms > aggregate_limit_ms:
+        logger.error(
+            f"[SP] fence_all took {aggregate_ms:.0f}ms "
+            f"({fenced} handles), limit {aggregate_limit_ms:.0f}ms")
+    elif aggregate_ms > effective_timeout and fenced > 4:
+        logger.warning(
+            f"[SP] fence_all: {fenced} handles in {aggregate_ms:.0f}ms")
+
+    return fenced
 
 
 def pending_handle_count():
@@ -219,6 +232,12 @@ def cleanup_sp_groups():
         from ..passes.long_context_checkpointing import restore_default_checkpointing
         restore_default_checkpointing()
     except ImportError:
+        pass
+
+    try:
+        if dist.is_initialized():
+            dist.barrier()
+    except Exception:
         pass
 
     for gid, group in list(_PROCESS_GROUPS.items()):
