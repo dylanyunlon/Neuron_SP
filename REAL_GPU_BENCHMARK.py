@@ -70,7 +70,10 @@ try:
         get_desloc_profiler,
     )
     _DS_AVAILABLE = True
-except Exception:
+except Exception as _ds_import_err:
+    import traceback as _tb
+    print(f"[WARNING] DeepSpeed import failed: {_ds_import_err}")
+    _tb.print_exc()
     # Standalone stubs — reproduce the exact same math, no deepspeed needed
     def desloc_comm_reduction_ratio(Kx, Ku, Kv, steps):
         """3-tier comm reduction: DDP does 3N AllReduces per step,
