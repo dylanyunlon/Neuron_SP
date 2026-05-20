@@ -2235,7 +2235,7 @@ class Trainer:
             labels = batch['labels'].to(self.engine.device)
 
             if _autosp_prepare is not None:
-                input_ids = _autosp_prepare(
+                _autosp_prepare(
                     input_id=input_ids,
                     label_id=labels,
                     seq_dim=1,
