@@ -1771,6 +1771,11 @@ class Trainer:
                 training_data=dataset,
             )
             self.model = self.engine.module
+            if self.rank == 0:
+                _opt_cls = type(self.engine.optimizer).__name__
+                _inner = getattr(self.engine.optimizer, 'optimizer', None)
+                _inner_cls = type(_inner).__name__ if _inner else "none"
+                print(f"[OPT-DIAG] optimizer={_opt_cls} inner={_inner_cls}")
             # Initialize DES-LOC scheduler (engine.py:2493)
             if hasattr(self.engine, 'desloc_init_scheduler'):
                 self.engine.desloc_init_scheduler()
@@ -2015,6 +2020,8 @@ class Trainer:
           - engine.py: desloc_post_step(), desloc_record_loss() etc.
           - stage_1_and_2.py: _desloc_reduce_tiered_gradients()
         """
+        _opt_type = "Adam"
+
         ds_cfg = {
             "train_batch_size": config.batch_size * config.gradient_accumulation * max(int(os.environ.get('WORLD_SIZE', 1)), 1),
             "train_micro_batch_size_per_gpu": config.batch_size,
@@ -2022,12 +2029,13 @@ class Trainer:
             "gradient_clipping": config.grad_clip,
             "steps_per_print": config.log_interval,
             "optimizer": {
-                "type": "Adam",
+                "type": _opt_type,
                 "params": {
                     "lr": config.learning_rate,
                     "betas": [config.beta1, config.beta2],
                     "eps": 1e-8,
                     "weight_decay": config.weight_decay,
+                    "torch_adam": False,
                 }
             },
             "bf16": {
@@ -2060,9 +2068,10 @@ class Trainer:
             if _zero_stage >= 2:
                 zero_cfg["offload_param"] = {"device": "cpu", "pin_memory": True}
         if _large_model and _zero_stage >= 2:
-            zero_cfg["reduce_bucket_size"] = 50_000_000
-            zero_cfg["allgather_bucket_size"] = 50_000_000
+            zero_cfg["reduce_bucket_size"] = 200_000_000
+            zero_cfg["allgather_bucket_size"] = 500_000_000
             zero_cfg["contiguous_gradients"] = True
+            zero_cfg["overlap_comm"] = True
         ds_cfg["zero_optimization"] = zero_cfg
 
         if config.use_autosp and _zero_stage < 2:
@@ -2266,13 +2275,17 @@ class Trainer:
                     input_ids = input_ids[:, start:start+local_seq].contiguous()
                     labels = labels[:, start:start+local_seq].contiguous()
 
+            _t_fwd = time.time()
             _, loss = self.engine(input_ids, labels)
+            _t_fwd = time.time() - _t_fwd
 
-            # engine.backward() handles gradient scaling + DES-LOC allreduce gating
+            _t_bwd = time.time()
             self.engine.backward(loss)
+            _t_bwd = time.time() - _t_bwd
 
-            # engine.step() handles optimizer step + DES-LOC post_step
+            _t_opt = time.time()
             self.engine.step()
+            _t_opt = time.time() - _t_opt
 
             # DES-LOC post-step: advance scheduler, record comm events
             if hasattr(self.engine, 'desloc_post_step'):
@@ -2311,13 +2324,33 @@ class Trainer:
                 per_gpu_tps = total_tokens / elapsed
                 cluster_tps = per_gpu_tps * self.world_size
                 skipped = getattr(self.engine, 'desloc_skipped_allreduces', 0)
+                _sp_tag = ""
+                if self._sp_enabled:
+                    _sp_tag = (f" | SP={self._sp_size}way "
+                               f"seq={input_ids.shape[1]}/{self.config.max_seq_len}")
                 print(f"[DESLOC-DS] Step {step}/{self.config.max_steps} | "
                       f"Loss: {loss.item():.4f} | "
-                      f"Time: {step_time*1000:.1f}ms | "
+                      f"Time: {step_time*1000:.1f}ms "
+                      f"(fwd={_t_fwd*1000:.0f} bwd={_t_bwd*1000:.0f} opt={_t_opt*1000:.0f}) | "
                       f"Tok/s(gpu): {per_gpu_tps:.0f} | "
                       f"Tok/s(all): {cluster_tps:.0f} | "
                       f"Mem: {cur_mem:.2f}GB | "
-                      f"AR_skipped: {skipped}")
+                      f"AR_skipped: {skipped}{_sp_tag}")
+
+            if step_time > 10.0 and self.rank == 0:
+                print(f"[SPIKE] Step {step} took {step_time*1000:.0f}ms "
+                      f"(fwd={_t_fwd*1000:.0f} bwd={_t_bwd*1000:.0f} opt={_t_opt*1000:.0f})")
+
+            if step == 1 and self.rank == 0:
+                print(f"[STEP1-DIAG] input_ids={list(input_ids.shape)} "
+                      f"sp_enabled={self._sp_enabled} "
+                      f"sp_size={getattr(self, '_sp_size', 1)} "
+                      f"sp_group={self._sp_group is not None} "
+                      f"sp_ctx_on={_SP_CTX['on']} "
+                      f"compile={getattr(self.engine, '_is_compiled', False)} "
+                      f"zero={self.engine.zero_optimization_stage()} "
+                      f"mem={torch.cuda.max_memory_allocated(self.engine.device)/1e9:.2f}GB "
+                      f"fwd={_t_fwd*1000:.0f}ms bwd={_t_bwd*1000:.0f}ms opt={_t_opt*1000:.0f}ms")
 
         return self._finalize_results(total_tokens, start_time)
 
