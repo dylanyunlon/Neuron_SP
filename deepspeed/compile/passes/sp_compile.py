@@ -141,6 +141,19 @@ def _insert_a2a(gm, node, scatter_idx, gather_idx, name):
     return a2a_node
 
 
+_A2A_QKV_PLAN = {"scatter_idx": 1, "gather_idx": 2}
+_A2A_O_PLAN   = {"scatter_idx": 2, "gather_idx": 1}
+
+
+def _wire_sdpa_a2a(gm, attn_node, idx, n_total):
+    q, k, v = attn_node.args[:3]
+    suffix = f"_{idx}" if n_total > 1 else ""
+    _insert_a2a(gm, q, **_A2A_QKV_PLAN, name=f"q{suffix}")
+    _insert_a2a(gm, k, **_A2A_QKV_PLAN, name=f"k{suffix}")
+    _insert_a2a(gm, v, **_A2A_QKV_PLAN, name=f"v{suffix}")
+    _insert_a2a(gm, attn_node, **_A2A_O_PLAN, name=f"o{suffix}")
+
+
 def pass_insert_attention_all_to_all(gm: GraphModule, real_inputs):
     attention_nodes = get_sdpa_nodes(gm)
     if len(attention_nodes) == 0:
@@ -151,12 +164,7 @@ def pass_insert_attention_all_to_all(gm: GraphModule, real_inputs):
             "for AutoSP to work as expected.")
 
     for idx, attn_node in enumerate(attention_nodes):
-        q, k, v = attn_node.args[:3]
-        suffix = f"_{idx}" if len(attention_nodes) > 1 else ""
-        _insert_a2a(gm, q, scatter_idx=1, gather_idx=2, name=f"q{suffix}")
-        _insert_a2a(gm, k, scatter_idx=1, gather_idx=2, name=f"k{suffix}")
-        _insert_a2a(gm, v, scatter_idx=1, gather_idx=2, name=f"v{suffix}")
-        _insert_a2a(gm, attn_node, scatter_idx=2, gather_idx=1, name=f"o{suffix}")
+        _wire_sdpa_a2a(gm, attn_node, idx, len(attention_nodes))
 
 
 def pass_canonicalize(gm: GraphModule, real_inputs):

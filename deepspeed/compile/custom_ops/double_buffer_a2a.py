@@ -147,19 +147,11 @@ def get_buffer_pool():
 
 
 def _raw_a2a(input_tensor, scatter_idx, sp_size_val, group):
-    import deepspeed.comm as comm
-    from .all_to_all import _SCATTER_HEADS, _SCATTER_SEQ
+    from .all_to_all import _execute_a2a, _SCATTER_HEADS, _SCATTER_SEQ
 
     B, dim1, dim2, H = input_tensor.shape
     plan = _SCATTER_HEADS if scatter_idx == 1 else _SCATTER_SEQ
-    P = sp_size_val
-
-    input_t = input_tensor.reshape(*plan["pre_reshape"](B, P, dim1, dim2, H))
-    input_t = input_t.permute(*plan["pre_permute"]).contiguous()
-    output = torch.empty_like(input_t)
-    comm.all_to_all_single(output, input_t, group=group)
-    output = output.permute(*plan["post_permute"]).contiguous()
-    return output.reshape(*plan["post_reshape"](B, P, dim1, dim2, H))
+    return _execute_a2a(input_tensor, B, dim1, dim2, H, group, plan)
 
 
 def execute_double_buffered_a2a(input_tensor, scatter_idx, gather_idx,
