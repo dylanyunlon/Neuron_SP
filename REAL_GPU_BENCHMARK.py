@@ -2144,15 +2144,9 @@ class Trainer:
         _autosp_prepare = None
         _eager_fallback = getattr(self.config, '_autosp_eager_fallback', False)
         if self.config.use_autosp and _eager_fallback:
-            try:
-                self.engine.compile(backend='inductor')
-                if self.rank == 0:
-                    print("[SP+DEC] Compiled with ZeRO-2 DeepCompile backend "
-                          "(AutoSP A2A skipped)")
-            except Exception as e:
-                if self.rank == 0:
-                    print(f"[SP+DEC] ZeRO-2 DeepCompile failed: {e}, "
-                          "proceeding without compile")
+            if self.rank == 0:
+                print("[SP+DEC] ZeRO-2 active, skipping torch.compile entirely "
+                      "(inductor backward graph OOMs on A6000 with 13B)")
             raise_eager = True
         elif self.config.use_autosp:
             raise_eager = False
