@@ -1777,7 +1777,7 @@ class Trainer:
             self._profiler = get_desloc_profiler()
             # DES-LOC timer from timer.py
             self._stimer = DeslocSTimer()
-            self._progress = DeslocProgress(config.max_steps)
+            self._progress = DeslocProgress()
         else:
             self.engine = None
             self._profiler = None
