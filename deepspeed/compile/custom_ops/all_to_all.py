@@ -39,8 +39,15 @@ def _execute_a2a(input, B, dim1, dim2, H, group, plan):
 
 def _resolve_group():
     _sp = sp_size()
-    gid = dist.get_rank() // _sp
-    return get_group(gid)
+    _rank = dist.get_rank()
+    gid = _rank // _sp
+    grp = get_group(gid)
+    if is_loc_enabled():
+        from .sp_dp_registry import get_loc_sp_group_ids
+        loc_gids = get_loc_sp_group_ids()
+        if loc_gids and gid in loc_gids:
+            grp = get_group(loc_gids[0])
+    return grp
 
 
 @torch.library.custom_op("autosp::all_to_all", mutates_args=())
@@ -52,9 +59,12 @@ def all_to_all(
 ) -> torch.Tensor:
     assert is_setup(), 'Incorrect initialization of SP/DP mesh.'
     assert input.ndim == 4, (
-        f"[AutoSP] all_to_all expects 4D [B,N,S,H], got {input.ndim}D shape {input.shape}")
+        f"[AutoSP] all_to_all expects 4D [B,N,S,H], got {input.ndim}D shape {input.shape}. "
+        f"For 13B (n_head=40) verify sp_size divides n_heads.")
     if not input.is_contiguous():
         input = input.contiguous()
+    assert input.shape[-1] > 0, (
+        f"[AutoSP] head_dim=0 in shape {input.shape}. Model config error.")
     B, dim1, dim2, H = input.shape
     _sp = sp_size()
     if scatter_idx == 1:

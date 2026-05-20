@@ -121,7 +121,18 @@ def populate_registry_with_loc(SP_SIZE, DP_SIZE, loc_peer_ranks=None):
 def _drain_threshold():
     if _MESH_META.get("is_heterogeneous", False):
         return _A2A_HANDLE_HIGH_WATER // 4
+    if _MESH_META.get("loc_enabled", False):
+        return _A2A_HANDLE_HIGH_WATER // 2
     return _A2A_HANDLE_HIGH_WATER
+
+
+def effective_timeout_ms():
+    base = _A2A_TIMEOUT_MS
+    if _MESH_META.get("is_heterogeneous", False):
+        base = int(base * 1.5)
+    if _MESH_META.get("loc_enabled", False):
+        base = int(base * 2.0)
+    return base
 
 
 def track_a2a_handle(handle):
@@ -156,7 +167,7 @@ def _enforce_high_water():
 
 
 def fence_all_sp_handles(timeout_ms=None):
-    effective_timeout = timeout_ms or _A2A_TIMEOUT_MS
+    effective_timeout = timeout_ms or effective_timeout_ms()
 
     def on_stale(ms):
         raise RuntimeError(

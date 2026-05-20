@@ -76,14 +76,18 @@ class LOCRemoteSequentialSPWrapper(nn.Module):
 
 class LOCSPGradientBridge:
 
-    def __init__(self, sp_world_size, kx=1):
+    def __init__(self, sp_world_size, kx=1, warmup_steps=512):
         self._sp_world_size = sp_world_size
         self._kx = kx
+        self._warmup_steps = warmup_steps
         self._step = 0
-        self._pending_grads = []
+        self._synced_count = 0
+        self._skipped_count = 0
 
     def should_sync(self):
-        if self._step < 512:
+        if self._kx <= 1:
+            return True
+        if self._step < self._warmup_steps:
             return True
         return (self._step % self._kx) == 0
 
@@ -94,26 +98,49 @@ class LOCSPGradientBridge:
     def post_backward_reduce(self, model):
         self._step += 1
         if not self.should_sync():
+            self._skipped_count += 1
             return False
+
+        if is_setup():
+            fence_all_sp_handles()
 
         for p in model.parameters():
             if p.grad is not None:
                 dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
 
+        self._synced_count += 1
         return True
 
     def state_dict(self):
-        return {'step': self._step, 'kx': self._kx}
+        return {
+            'step': self._step,
+            'kx': self._kx,
+            'warmup_steps': self._warmup_steps,
+            'synced': self._synced_count,
+            'skipped': self._skipped_count,
+        }
 
     def load_state_dict(self, sd):
         self._step = sd.get('step', 0)
         self._kx = sd.get('kx', self._kx)
+        self._warmup_steps = sd.get('warmup_steps', self._warmup_steps)
+        self._synced_count = sd.get('synced', 0)
+        self._skipped_count = sd.get('skipped', 0)
 
 
 def create_loc_sp_wrapper(remote_sequential, config_param_dict):
     sp = config_param_dict.get('sequence_parallel_size', 1)
     loc_cfg = config_param_dict.get('loc', {})
-    kx = config_param_dict.get('desloc', {}).get('Kx', 1)
+    desloc_cfg = config_param_dict.get('desloc', {})
+    kx = desloc_cfg.get('Kx', 1)
+    warmup = desloc_cfg.get('warmup', 512)
+
+    n_heads = config_param_dict.get('n_heads',
+                config_param_dict.get('num_attention_heads', 0))
+    if n_heads > 0 and sp > 1 and n_heads % sp != 0:
+        raise ValueError(
+            f"[LOC+SP] n_heads={n_heads} not divisible by sp_size={sp}. "
+            f"A2A scatter on head dim will produce incorrect shapes.")
 
     loc_group = None
     if is_loc_enabled():
@@ -124,11 +151,11 @@ def create_loc_sp_wrapper(remote_sequential, config_param_dict):
     wrapper = LOCRemoteSequentialSPWrapper(
         remote_sequential, sp, loc_group)
 
-    grad_bridge = LOCSPGradientBridge(sp, kx=kx)
+    grad_bridge = LOCSPGradientBridge(sp, kx=kx, warmup_steps=warmup)
 
     logger.info(
-        f"[LOC+SP] Created wrapper sp={sp} kx={kx} "
-        f"loc_enabled={is_loc_enabled()} "
-        f"model_size={loc_cfg.get('model_size', '7B')}")
+        f"[LOC+SP] wrapper sp={sp} kx={kx} warmup={warmup} "
+        f"loc={is_loc_enabled()} "
+        f"model={loc_cfg.get('model_size', '7B')} n_heads={n_heads}")
 
     return wrapper, grad_bridge

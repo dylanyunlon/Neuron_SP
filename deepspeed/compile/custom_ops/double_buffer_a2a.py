@@ -30,6 +30,18 @@ class DoubleBuffer:
                 if self._data[0] is not None and self._data[0].shape == shape:
                     return
                 self._free_unlocked()
+            numel = 1
+            for s in shape:
+                numel *= s
+            elem_bytes = torch.tensor([], dtype=self._dtype).element_size()
+            buf_bytes = numel * elem_bytes * 2
+            if torch.cuda.is_available():
+                free_mem = torch.cuda.mem_get_info(self._device)[0]
+                if buf_bytes > free_mem * 0.3:
+                    raise RuntimeError(
+                        f"[DoubleBuffer] buffer {buf_bytes/(1024**2):.0f}MB exceeds "
+                        f"30% of free GPU memory {free_mem/(1024**2):.0f}MB. "
+                        f"Reduce batch_size or enable cpu_offload.")
             for i in range(2):
                 self._data[i] = torch.empty(shape, dtype=self._dtype, device=self._device)
                 self._index[i] = torch.empty(shape[0], dtype=self._index_dtype, device=self._device)

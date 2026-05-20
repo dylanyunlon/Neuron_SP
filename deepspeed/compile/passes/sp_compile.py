@@ -280,6 +280,22 @@ def _validate_a2a_count(gm, expected_sdpa_count):
             f"(4 x {expected_sdpa_count} SDPA). NCCL deadlock will occur.")
 
 
+def pass_validate_loc_shapes(gm: GraphModule, real_inputs):
+    if not sp_dp_registry.is_loc_enabled():
+        return
+    for node in gm.graph.nodes:
+        if (node.op == "call_function"
+                and node.target is torch.ops.autosp.all_to_all.default):
+            meta = node.meta.get("val") or node.meta.get("example_value")
+            if meta is not None and hasattr(meta, 'shape'):
+                B, N, S, H = meta.shape
+                _sp = sp_dp_registry.sp_size()
+                if N > 0 and isinstance(N, int) and N % _sp != 0 and S > 0 and isinstance(S, int) and S % _sp != 0:
+                    logger.warning(
+                        f"[LOC+SP] A2A node {node.name} shape ({B},{N},{S},{H}) "
+                        f"neither N nor S divisible by sp_size={_sp}")
+
+
 _APPLY_LOCK = threading.Lock()
 
 
@@ -288,6 +304,7 @@ AUTOSP_PASSES = [
     pass_shard_tagged_inputs,
     pass_insert_attention_all_to_all,
     pass_propagate_shapes,
+    pass_validate_loc_shapes,
     pass_canonicalize,
 ]
 

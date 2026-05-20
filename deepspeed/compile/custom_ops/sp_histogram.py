@@ -38,13 +38,14 @@ class PassCounter:
 
 class SPHistogramKernel:
 
-    def __init__(self, num_bins=256, device=None):
-        self._num_bins = num_bins
+    def __init__(self, num_bins=256, device=None, model_scale=1.0):
+        self._num_bins = max(64, int(num_bins * max(1.0, model_scale)))
         self._device = device or (torch.device(f"cuda:{torch.cuda.current_device()}")
                                   if torch.cuda.is_available() else torch.device("cpu"))
         self._accumulator = HistogramAccumulator()
         self._pass_count = 0
         self._counter = PassCounter()
+        self._model_scale = model_scale
 
     def invoke_histogram_only(self, input_ids, seq_dim=1):
         seq_len = input_ids.shape[seq_dim]

@@ -4,7 +4,7 @@ import torch
 from torch.fx import GraphModule
 from .passes.sp_compile import apply_autosp
 from .custom_ops.sp_dp_registry import extract_mesh_size
-from .custom_ops.sp_compat import _check_autosp_compatibility
+from .custom_ops.sp_compat import _check_autosp_compatibility, preflight_memory_check
 from .custom_ops import all_to_all as _force_register_a2a
 from .passes.long_context_checkpointing import register_long_context_checkpointing
 
@@ -96,11 +96,30 @@ def _resolve_sp_dp(config):
     return sp_size, dp_size
 
 
+def _estimate_param_billions(param_dict):
+    model_size_str = param_dict.get('model_size', '')
+    _SIZE_MAP = {
+        '125M': 0.125, '350M': 0.35, '700M': 0.7,
+        '1.3B': 1.3, '1.7B': 1.7, '3B': 3.0,
+        '7B': 7.0, '13B': 12.6,
+    }
+    return _SIZE_MAP.get(model_size_str, 0.0)
+
+
 def init_autosp(config):
     _check_autosp_compatibility()
     _ensure_clean_state()
 
     sp_size, dp_size = _resolve_sp_dp(config)
+
+    n_params_b = _estimate_param_billions(config._param_dict)
+    loc_cfg = _parse_loc_config(config._param_dict)
+    cpu_offload = config._param_dict.get('cpu_offload', False)
+    if n_params_b > 0:
+        preflight_memory_check(n_params_b, sp_size,
+                               dist.get_world_size() if dist.is_initialized() else 1,
+                               cpu_offload=cpu_offload)
+
     register_long_context_checkpointing()
 
     desloc_cfg = _parse_desloc_config(config._param_dict)

@@ -534,6 +534,7 @@ class TrainingConfig:
             "1.7B": {"n_layer": 24, "n_head": 16, "n_embd": 2304},
             "3B": {"n_layer": 32, "n_head": 32, "n_embd": 3200},
             "7B": {"n_layer": 32, "n_head": 32, "n_embd": 4096},
+            "13B": {"n_layer": 40, "n_head": 40, "n_embd": 5120},
         }
         assert self.model_size in configs, f"Unknown model size: {self.model_size}"
         return configs[self.model_size]
@@ -2925,7 +2926,7 @@ def save_results(results: Dict, config: TrainingConfig):
 
 def main():
     parser = argparse.ArgumentParser(description='DES-LOC Real GPU Benchmark')
-    parser.add_argument('--model_size', type=str, default='125M', choices=['125M', '350M', '700M', '1.3B', '1.7B', '3B', '7B'])
+    parser.add_argument('--model_size', type=str, default='125M', choices=['125M', '350M', '700M', '1.3B', '1.7B', '3B', '7B', '13B'])
     parser.add_argument('--batch_size', type=int, default=4)
     parser.add_argument('--grad_accum', type=int, default=8)
     parser.add_argument('--max_steps', type=int, default=1000)
@@ -3480,7 +3481,7 @@ def desloc_cross_model_analysis(result_dir='./desloc_results', output_dir='./des
     for r in runs:
         by_cfg[(r['model'], r['method'], r['gpu'])].append(r)
     table = []
-    for ms in ['125M', '700M', '1.3B', '7B']:
+    for ms in ['125M', '700M', '1.3B', '7B', '13B']:
         ddp = [r for k, rs in by_cfg.items() for r in rs if k[0] == ms and k[1] == 'DDP']
         des = [r for k, rs in by_cfg.items() for r in rs if k[0] == ms and k[1] == 'DESLOC']
         if not ddp or not des:
