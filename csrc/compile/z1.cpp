@@ -50,12 +50,21 @@ public:
     {
         if (!hasKey(reduce_tasks_, scalar_type)) { return; }
 
+        flushSPReduceBucket(scalar_type);
+
+        if (!shouldSyncDP()) {
+            performCleanup(scalar_type);
+            return;
+        }
+
         blockCopyEvents(scalar_type);
         applyPreDivision(scalar_type);
 
-        // NCCL AllReduce operation
         ncclGroupStart();
         for (const ReduceTask& t : reduce_tasks_.at(scalar_type)) {
+            const DSParam& param = param_registry_->getParam(t.getDSId());
+            if (sp_comm_ != nullptr && param.getSpGroupId() >= 0) continue;
+
             ncclResult_t result = ncclAllReduce(t.getSendBuf().data_ptr(),
                                                 t.getSendBuf().data_ptr(),
                                                 t.getSendBuf().numel(),
@@ -67,7 +76,6 @@ public:
         }
         ncclGroupEnd();
 
-        // Copy results to gradient buffers
         {
             at::cuda::CUDAStreamGuard guard(rs_stream_);
             for (const ReduceTask& t : reduce_tasks_.at(scalar_type)) {
@@ -84,6 +92,12 @@ public:
         }
 
         performCleanup(scalar_type);
+    }
+
+    void endBackward() override
+    {
+        step_++;
+        CustomOpExecutor::endBackward();
     }
 
 protected:
@@ -105,6 +119,50 @@ void register_graph_z1(long graph_id, const std::vector<long>& ds_ids)
                                                                pre_div_reduce);
 }
 
+void register_graph_z1_sp(long graph_id,
+                          const std::vector<long>& ds_ids,
+                          int sp_size,
+                          int kx,
+                          int warmup_steps)
+{
+    auto executor = std::make_shared<Z1CustomOpExecutor>(process_group,
+                                                         param_registry,
+                                                         reduce_buckets,
+                                                         ds_ids,
+                                                         nccl_comm,
+                                                         rs_stream,
+                                                         copy_stream,
+                                                         pre_div_reduce);
+    executor->sp_size_ = sp_size;
+    executor->kx_ = kx;
+    executor->warmup_steps_ = warmup_steps;
+
+    if (sp_size > 1) {
+        ncclUniqueId sp_id;
+        int rank = process_group->getRank();
+        int sp_group_rank = rank % sp_size;
+
+        if (sp_group_rank == 0) {
+            ncclGetUniqueId(&sp_id);
+        }
+
+        auto vec = std::vector<uint8_t>(
+            reinterpret_cast<uint8_t*>(&sp_id),
+            reinterpret_cast<uint8_t*>(&sp_id) + NCCL_UNIQUE_ID_BYTES);
+        auto tensor = torch::from_blob(vec.data(),
+                                        {static_cast<long>(vec.size())},
+                                        torch::kUInt8).to(torch::Device(torch::kCUDA));
+        std::vector<at::Tensor> bcast_input = {tensor};
+        process_group->broadcast(bcast_input, c10d::BroadcastOptions())->wait();
+        std::memcpy(&sp_id, tensor.to(torch::Device(torch::kCPU)).data_ptr(),
+                     NCCL_UNIQUE_ID_BYTES);
+
+        ncclCommInitRank(&executor->sp_comm_, sp_size, sp_id, sp_group_rank);
+    }
+
+    executors[graph_id] = executor;
+}
+
 void register_param(long ds_id,
                     const std::vector<int64_t>& ds_shape,
                     at::Tensor ds_tensor,
@@ -112,6 +170,20 @@ void register_param(long ds_id,
                     int64_t offset)
 {
     param_registry->registerParam(ds_id, ds_shape, ds_tensor, grad_buffer, false, offset, false);
+}
+
+void register_param_sp(long ds_id,
+                       const std::vector<int64_t>& ds_shape,
+                       at::Tensor ds_tensor,
+                       at::Tensor grad_buffer,
+                       int64_t offset,
+                       int sp_group_id)
+{
+    param_registry->registerParam(ds_id, ds_shape, ds_tensor, grad_buffer, false, offset, false);
+    if (sp_group_id >= 0) {
+        auto& params = const_cast<std::unordered_map<long, DSParam>&>(param_registry->getParams());
+        params.at(ds_id).setSpGroupId(sp_group_id);
+    }
 }
 
 }  // namespace dc

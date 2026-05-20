@@ -297,6 +297,8 @@ public:
     int64_t getOffset() const { return offset_; }
     void setPersistent(bool persistent) { persistent_ = persistent; }
     bool isPersistent() const { return persistent_; }
+    void setSpGroupId(int gid) { sp_group_id_ = gid; }
+    int getSpGroupId() const { return sp_group_id_; }
 
     void offload()
     {
@@ -353,6 +355,7 @@ private:
     bool partitioned_;
     int64_t offset_;   // for Z1
     bool persistent_;  // for Z3
+    int sp_group_id_ = -1;
     mutable bool is_reloaded = false;
 
     at::cuda::CUDAStream offload_stream_;
@@ -520,8 +523,14 @@ protected:
     std::shared_ptr<DoubleBufferedReduceBucket> reduce_buckets_;
     std::vector<long> ds_ids_;
     ncclComm_t nccl_comm_;
+    ncclComm_t sp_comm_ = nullptr;
     at::cuda::CUDAStream rs_stream_;
     at::cuda::CUDAStream copy_stream_;
+
+    int sp_size_ = 1;
+    int kx_ = 1;
+    int warmup_steps_ = 512;
+    int step_ = 0;
 
     std::unordered_map<long, std::shared_ptr<at::cuda::CUDAEvent>> rs_comp_done_events_;
     std::unordered_map<long, std::shared_ptr<at::cuda::CUDAEvent>> rs_copy_done_events_;
@@ -533,6 +542,40 @@ protected:
     bool pre_div_reduce_;
 
     virtual void flushReduceBucket(at::ScalarType scalar_type) = 0;
+
+    bool shouldSyncDP() const
+    {
+        if (kx_ <= 1) return true;
+        if (step_ < warmup_steps_) return true;
+        return (step_ % kx_) == 0;
+    }
+
+    void flushSPReduceBucket(at::ScalarType scalar_type)
+    {
+        if (!hasKey(reduce_tasks_, scalar_type)) { return; }
+        if (sp_comm_ == nullptr || sp_size_ <= 1) { return; }
+
+        blockCopyEvents(scalar_type);
+        applyPreDivision(scalar_type);
+
+        ncclGroupStart();
+        for (const ReduceTask& t : reduce_tasks_.at(scalar_type)) {
+            const DSParam& param = param_registry_->getParam(t.getDSId());
+            if (param.getSpGroupId() < 0) continue;
+
+            ncclResult_t result = ncclAllReduce(t.getSendBuf().data_ptr(),
+                                                t.getSendBuf().data_ptr(),
+                                                t.getSendBuf().numel(),
+                                                get_nccl_data_type(scalar_type),
+                                                getReductionOp(),
+                                                sp_comm_,
+                                                rs_stream_);
+            if (result != ncclSuccess) {
+                throw std::runtime_error("NCCL SP AllReduce failed");
+            }
+        }
+        ncclGroupEnd();
+    }
 
     void flushAllReduceBuckets()
     {

@@ -89,9 +89,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("init", &dc::init, "Set the process group");
     m.def("cleanup", &dc::cleanup, "Cleanup the process group");
     m.def("register_param", &dc::register_param, "Register a parameter");
+    m.def("register_param_sp", &dc::register_param_sp, "Register a parameter with SP group id");
     m.def("register_graph_z1",
           &dc::register_graph_z1,
           "Register graph with a list of ds parameter ids");
+    m.def("register_graph_z1_sp",
+          &dc::register_graph_z1_sp,
+          "Register graph for Z1 with SP communicator and Kx gating");
     m.def("register_graph_z2",
           &dc::register_graph_z2,
           "Register graph with a list of ds parameter ids");
