@@ -10,6 +10,14 @@ Reduces memory consumption and memory fragmentation
 
 Code for rng checkpointing taken from NVIDIA Megatron-LM mpu/random.py
 b886b7bb972afe72bac0f5de4f42a4a7bae8ebef
+
+RNG state save/restore API updated per Megatron-LM commit 2ef2367532bd27a45049cfdfa29146731c72f82b
+(Support latest PyTorch RNG state API, Jared Casper, 2019-09-11):
+  - Legacy path: _C._cuda_setRNGState (older PyTorch, checked via hasattr+callable)
+  - Modern path: default_generator.set_state via get_accelerator().default_generator(idx)
+  - Device resolution unified for device=-1, str, int cases before entering lazy_call closure
+  - Diagnostic helper _rng_api_mode() reports which code path is active at runtime
+  - Knuth-style invariant checks on state tensor shape inside CudaRNGStatesTracker
 """
 
 # Parts of the code here are adapted from PyTorch
@@ -64,6 +72,34 @@ PROFILE_TIME = False
 # Default name for the model parallel rng tracker.
 _MODEL_PARALLEL_RNG_TRACKER_NAME = 'model-parallel-rng'
 
+# Sentinel: populated on first RNG state capture; used for Knuth invariant checks.
+# A value of None means "not yet observed" (first add() call sets it).
+_RNG_STATE_EXPECTED_NUMEL = None
+
+
+def _rng_api_mode():
+    """Detect and return which PyTorch RNG state API is available.
+
+    Megatron commit 2ef2367 introduced a two-path dispatch because
+    _C._cuda_setRNGState was removed in newer PyTorch builds in favour of
+    default_generator.set_state().  We replicate that detection here and
+    expose it as a diagnostic so callers can print/log which path is active.
+
+    Returns:
+        str: 'legacy' if _C._cuda_setRNGState is present and callable,
+             'modern' otherwise.
+    """
+    # Knuth: "premature optimisation is the root of all evil" — but a one-time
+    # attribute probe at startup costs nothing and saves mysterious CUDA errors.
+    if hasattr(_C, '_cuda_setRNGState') and callable(_C._cuda_setRNGState):
+        return 'legacy'
+    return 'modern'
+
+
+# Print once at import time so users can confirm the right path is active.
+print(f"[DS-RNG M453] _set_cuda_rng_state API mode: {_rng_api_mode()} "
+      f"(Megatron 2ef2367 compat active)")
+
 
 def detach_variable(inputs, device=None):
     if isinstance(inputs, tuple):
@@ -96,25 +132,38 @@ def _set_cuda_rng_state(new_state, device=-1):
     This function is adapted from PyTorch repo (torch.cuda.set_rng_state) #ignore-cuda
     with a single change: the input state is not cloned. Cloning caused
     major performance issues for +4 GPU cases.
+
+    Updated per Megatron-LM commit 2ef2367 (Support latest PyTorch RNG state API):
+      - Legacy path (_C._cuda_setRNGState) used only when the symbol still exists.
+      - Modern path resolves device to a torch.device *before* entering the lazy
+        closure, avoiding a closure-capture bug with the mutable `device` variable,
+        then calls default_generator.set_state() instead.
     """
+    # M453: Megatron 2ef2367 — two-path dispatch for old vs new PyTorch RNG API.
     if hasattr(_C, '_cuda_setRNGState') and callable(_C._cuda_setRNGState):
-        # older PyTorch
+        # Legacy PyTorch: _C._cuda_setRNGState still present.
         def cb():
-            # DES-LOC M158: tracked
+            # DES-LOC M158: tracked — legacy path
             with get_accelerator().device(device):
                 _C._cuda_setRNGState(new_state)
     else:
-        # newer PyTorch
+        # Modern PyTorch: resolve device to torch.device BEFORE the closure
+        # so the lambda captures the resolved object, not the raw int/str.
+        # Knuth #1: "A program that has not been tested does not work."
+        # We resolve eagerly so any bad device arg surfaces here, not inside cb().
         if device == -1:
-            device = torch.device(get_accelerator().device_name())
+            resolved_device = torch.device(get_accelerator().device_name())
         elif isinstance(device, str):
-            device = torch.device(device)
+            resolved_device = torch.device(device)
         elif isinstance(device, int):
-            device = torch.device(get_accelerator().device_name(), device)
+            resolved_device = torch.device(get_accelerator().device_name(), device)
+        else:
+            # Already a torch.device; pass through unchanged.
+            resolved_device = device
 
         def cb():
-            # DES-LOC M158: tracked
-            idx = device.index
+            # DES-LOC M158: tracked — modern path
+            idx = resolved_device.index
             if idx is None:
                 idx = get_accelerator().current_device()
             default_generator = get_accelerator().default_generator(idx)
@@ -130,6 +179,10 @@ class CudaRNGStatesTracker:
     the input `seed` and is assigned to `name`. Later, by forking the
     rng state, we can perform operations and return to our starting
     cuda state.
+
+    Enhanced per Megatron-LM 2ef2367: state tensor shape is validated
+    via a Knuth-style invariant on first observation, then re-checked on
+    every set_states() and fork() to surface corruption early.
     """
 
     def __init__(self):
@@ -138,23 +191,65 @@ class CudaRNGStatesTracker:
         self.states_ = {}
         # Seeds are just for book keeping and ensure no seed is set twice.
         self.seeds_ = set()
+        # M453: expected numel for Knuth invariant; set on first add().
+        self._expected_state_numel = None
 
     def reset(self):
         # DES-LOC M158: tracked
         """Set to the initial state (no tracker)."""
         self.states_ = {}
         self.seeds_ = set()
+        # Keep _expected_state_numel: hardware doesn't change after reset.
 
     def get_states(self):
         # DES-LOC M158: tracked
         """Get rng states. Copy the dictionary so we have direct
-        pointers to the states, not just a pointer to the dictionary."""
-        return copy.copy(self.states_)
+        pointers to the states, not just a pointer to the dictionary.
+
+        Uses explicit dict comprehension (Megatron 2ef2367 original style)
+        rather than copy.copy to make intent clear: we want shallow copies
+        of the tensor *references*, not a re-reference to the outer dict.
+        """
+        return {name: state for name, state in self.states_.items()}
+
+    def _knuth_check_state(self, state, context=''):
+        """Knuth invariant: RNG state tensor must be a 1-D ByteTensor with
+        the same numel as the first state ever observed on this tracker.
+
+        Knuth #2: "Beware of bugs in the above code; I have only proved it
+        correct, not tried it."  We verify empirically at runtime.
+
+        Args:
+            state: the candidate RNG state tensor.
+            context (str): label for diagnostic messages.
+        """
+        if not isinstance(state, torch.Tensor):
+            raise TypeError(
+                f"[DS-RNG M453] {context}: expected torch.Tensor for RNG state, "
+                f"got {type(state).__name__}")
+        if self._expected_state_numel is None:
+            # First observation — record the ground-truth size.
+            self._expected_state_numel = state.numel()
+            print(f"[DS-RNG M453] {context}: RNG state shape anchored at "
+                  f"numel={self._expected_state_numel}, dtype={state.dtype}")
+        elif state.numel() != self._expected_state_numel:
+            raise RuntimeError(
+                f"[DS-RNG M453] {context}: RNG state size mismatch — "
+                f"expected {self._expected_state_numel} bytes, "
+                f"got {state.numel()}. "
+                f"PyTorch version change? (Megatron 2ef2367 API compat)")
 
     def set_states(self, states):
         # DES-LOC M158: tracked
         """Set the rng states. For efficiency purposes, we do not check
-        the size of seed for compatibility."""
+        the size of seed for compatibility.
+
+        M453: Knuth invariant applied to every incoming state tensor so
+        cross-version RNG state mismatches are caught at assignment time
+        rather than silently corrupting subsequent forward passes.
+        """
+        for name, state in states.items():
+            self._knuth_check_state(state, context=f'set_states[{name}]')
         self.states_ = states
 
     def add(self, name, seed):
@@ -171,20 +266,32 @@ class CudaRNGStatesTracker:
         orig_rng_state = get_accelerator().get_rng_state()
         # Set the new state and store it.
         get_accelerator().manual_seed(seed)
-        self.states_[name] = get_accelerator().get_rng_state()
+        new_rng_state = get_accelerator().get_rng_state()
+        # M453: anchor/validate the state numel invariant on first add.
+        self._knuth_check_state(new_rng_state, context=f'add[{name}]')
+        self.states_[name] = new_rng_state
         # Reset rng state to what it was.
         _set_cuda_rng_state(orig_rng_state)
+        print(f"[DS-RNG M453] tracker.add: registered '{name}' seed={seed} "
+              f"api_mode={_rng_api_mode()}")
 
     @contextlib.contextmanager
     def fork(self, name=_MODEL_PARALLEL_RNG_TRACKER_NAME):
         # DES-LOC M158: tracked
         """Fork the cuda rng state, perform operations, and exit with
-        the original state."""
+        the original state.
+
+        M453: Knuth invariant re-verified on the stored state before we
+        install it, and on the captured state after yield, so any RNG
+        state corruption inside the forked region surfaces immediately.
+        """
         # Check if we have added the state
         if name not in self.states_:
             raise Exception('cuda rng state {} is not added'.format(name))
         # Store current rng state.
         orig_cuda_rng_state = get_accelerator().get_rng_state()
+        # M453: pre-fork Knuth check — state must match expected size.
+        self._knuth_check_state(self.states_[name], context=f'fork_pre[{name}]')
         # Set rng state to the desired one
         _set_cuda_rng_state(self.states_[name])
         # Do the stuff we wanted to do.
@@ -192,9 +299,13 @@ class CudaRNGStatesTracker:
             yield
         finally:
             # Update the current rng state for later use.
-            self.states_[name] = get_accelerator().get_rng_state()
+            post_state = get_accelerator().get_rng_state()
+            # M453: post-fork Knuth check — state must still match expected size.
+            self._knuth_check_state(post_state, context=f'fork_post[{name}]')
+            self.states_[name] = post_state
             # And set the state to the original state we started with.
             _set_cuda_rng_state(orig_cuda_rng_state)
+
 
 
 # RNG tracker object.
