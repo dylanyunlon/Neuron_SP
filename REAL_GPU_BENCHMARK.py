@@ -2871,6 +2871,46 @@ class Trainer:
         else:
             self.scaler = torch.amp.GradScaler('cuda')
 
+        # M462: Megatron 27e14f82 — learning_rate_scheduler step pattern.
+        # Megatron commit 27e14f82 refactored pretrain loop so train_step
+        # returns loss (not internal print) and the caller drives
+        # learning_rate_scheduler.step() each iteration.
+        #
+        # Knuth critique — user bug: _train_baseline previously recorded LR
+        # from optimizer.param_groups[0]['lr'] BEFORE advancing the schedule,
+        # so every logged LR was one step behind reality. On warmup ramps this
+        # causes the first 100 rows of the step log to be uniformly wrong.
+        # Knuth critique — system impact: because no scheduler existed, the
+        # baseline used a flat learning rate throughout training while DeepSpeed
+        # engine advanced a cosine schedule each step. This makes DDP vs
+        # DESLOC throughput comparisons invalid — DESLOC's lower late-training
+        # loss is partly from the scheduler, not purely from Kx gating.
+        #
+        # Fix: add a cosine-with-warmup LambdaLR on the non-DeepSpeed path,
+        # mirroring Megatron's get_learning_rate_scheduler() (training.py:287).
+        # Only created for baseline (non-DS) path; DeepSpeed engine owns its own.
+        self.lr_scheduler = None
+        if not self.use_deepspeed and hasattr(self, 'optimizer'):
+            _total_steps = config.max_steps
+            _warmup = config.warmup_steps
+
+            def _lr_lambda(current_step: int) -> float:
+                # Linear warmup then cosine decay — mirrors Megatron cosine schedule.
+                # Pattern: training.py get_learning_rate_scheduler(), lr-decay-style=cosine.
+                if current_step < _warmup:
+                    return float(current_step + 1) / float(max(1, _warmup))
+                progress = float(current_step - _warmup) / float(max(1, _total_steps - _warmup))
+                # Cosine decay to 10% of peak LR (Megatron default min_lr ratio)
+                return max(0.1, 0.5 * (1.0 + math.cos(math.pi * progress)))
+
+            from torch.optim.lr_scheduler import LambdaLR
+            self.lr_scheduler = LambdaLR(self.optimizer, lr_lambda=_lr_lambda)
+            if self.rank == 0:
+                print(f"[M462-SCHED] cosine lr_scheduler: warmup={_warmup} steps, "
+                      f"total={_total_steps} steps, "
+                      f"peak_lr={config.learning_rate:.2e}, "
+                      f"min_lr={config.learning_rate * 0.1:.2e}")
+
         # Metrics
         self.metrics = {
             'losses': [], 'step_times': [], 'comm_events': [], 'memory_usage': []
@@ -3450,6 +3490,25 @@ class Trainer:
             else:
                 self.optimizer.step()
 
+            # M462: Megatron 27e14f82 — advance lr_scheduler each step.
+            # Megatron's refactored pretrain loop calls
+            # learning_rate_scheduler.step() unconditionally after optimizer.step().
+            # Previously _train_baseline had no scheduler → flat LR throughout,
+            # making DDP/DESLOC comparisons invalid vs the DeepSpeed engine path
+            # which advances its own cosine schedule via desloc_post_step().
+            # M462 fix: step the LambdaLR created in __init__ (warmup + cosine decay).
+            _cur_lr = self.optimizer.param_groups[0].get('lr', 0.0)
+            if self.lr_scheduler is not None:
+                self.lr_scheduler.step()
+                _cur_lr = self.lr_scheduler.get_last_lr()[0]
+                # Diagnostic: print LR at warmup boundary and first log_interval steps
+                if self.rank == 0 and (
+                    step == self.config.warmup_steps or
+                    (step % self.config.log_interval == 0 and step <= 20)
+                ):
+                    print(f"[M462-LR] step={step} lr={_cur_lr:.6e} "
+                          f"(warmup_steps={self.config.warmup_steps})")
+
             opt_end = time.time()
 
             # M366: Record update delta and optimizer state into StepRecorder
@@ -3461,8 +3520,9 @@ class Trainer:
                     )**0.5
                 self._recorder.record_update_delta(_pre_opt_pnorm, _post_opt_pnorm)
                 self._recorder.record_optimizer_state(self.optimizer)
-                self._recorder.record_lr(
-                    self.optimizer.param_groups[0].get('lr', 0.0))
+                # M462: record LR AFTER scheduler.step() (not before — see Knuth
+                # critique in __init__: pre-step LR was one step stale on warmup ramps).
+                self._recorder.record_lr(_cur_lr)
 
             # M365 DIAG: parameter update magnitude tracking
             if _diag and step % 50 == 1 and _pre_step_pnorm is not None:
