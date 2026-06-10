@@ -237,10 +237,10 @@ class DeepSpeedEngine(Module):
         self.skipped_steps = 0
         # DES-LOC: independent sync period state — Algorithm 1
         self.desloc_enabled = False
-        self.desloc_Kx = 1       # Kx=1 = standard DDP
+        self.desloc_Kx = 1  # Kx=1 = standard DDP
         self.desloc_Ku = 3
         self.desloc_Kv = 6
-        self.desloc_step = 0     # local step counter for sync gating
+        self.desloc_step = 0  # local step counter for sync gating
         self.desloc_skipped_allreduces = 0
         self.desloc_clip_rho = 1.0
         self.desloc_warmup_steps = 512
@@ -248,15 +248,15 @@ class DeepSpeedEngine(Module):
         # M227: Figure 1 loss curve data — collected per step for plotting
         # Ref: NKI-FA da964f3 draw_plot.py — data from experiment logs
         # Ref: Section 5.4 RQ4 — loss curves across model scales
-        self._desloc_loss_history = []     # [(step, loss, lr, is_sync)]
-        self._desloc_eval_history = []     # [(step, eval_loss, eval_ppl)]
-        self._desloc_comm_history = []     # [(step, bytes_sent, ops, tier)]
+        self._desloc_loss_history = []  # [(step, loss, lr, is_sync)]
+        self._desloc_eval_history = []  # [(step, eval_loss, eval_ppl)]
+        self._desloc_comm_history = []  # [(step, bytes_sent, ops, tier)]
         self._desloc_throughput_history = []  # [(step, tokens_per_sec)]
-        self._desloc_figure_dir = None     # set via config or env
-        self._desloc_loss_window = []      # sliding window for smoothing
-        self._desloc_loss_window_size = 50 # EMA window
+        self._desloc_figure_dir = None  # set via config or env
+        self._desloc_loss_window = []  # sliding window for smoothing
+        self._desloc_loss_window_size = 50  # EMA window
         self._desloc_baseline_losses = {}  # {config_key: [losses]} for diff
-        self._desloc_fig1_configs = []     # list of (label, Kx, loss_list)
+        self._desloc_fig1_configs = []  # list of (label, Kx, loss_list)
         self._desloc_step_timer_ns = 0
         self._desloc_histogram_enabled = False
         self._desloc_double_buffer_enabled = False
@@ -364,21 +364,17 @@ class DeepSpeedEngine(Module):
             # Both require ZeRO stage 0
             _zero_stage = self.zero_optimization_stage()
             if _zero_stage != 0:
-                logger.warning(
-                    f"SP+DEC requires ZeRO stage 0, but got stage "
-                    f"{_zero_stage}. DES-LOC Kx gating may conflict "
-                    f"with ZeRO gradient partitioning."
-                )
+                logger.warning(f"SP+DEC requires ZeRO stage 0, but got stage "
+                               f"{_zero_stage}. DES-LOC Kx gating may conflict "
+                               f"with ZeRO gradient partitioning.")
 
         if dist.get_rank() == 0:
             if self.desloc_enabled or self._desloc_sp_enabled or self._desloc_ac_enabled:
-                logger.info(
-                    f"SP+DEC+AC config: "
-                    f"SP={self._desloc_sp_mode} "
-                    f"DEC={'Kx='+str(self.desloc_Kx) if self.desloc_enabled else 'off'} "
-                    f"AC={self._desloc_ac_mode}"
-                    f"{' ('+str(_ac_layers)+' layers)' if _ac_layers > 0 else ''}"
-                )
+                logger.info(f"SP+DEC+AC config: "
+                            f"SP={self._desloc_sp_mode} "
+                            f"DEC={'Kx='+str(self.desloc_Kx) if self.desloc_enabled else 'off'} "
+                            f"AC={self._desloc_ac_mode}"
+                            f"{' ('+str(_ac_layers)+' layers)' if _ac_layers > 0 else ''}")
 
         # M343-C34: Heterogeneous sync gate for mixed-cluster deployments.
         # Pattern: Megatron DistributedDataParallel tracks grad-ready
@@ -386,15 +382,14 @@ class DeepSpeedEngine(Module):
         self._hetero_sync_gate = None
         _hetero_cfg = config.get('hetero_mesh', {}) if isinstance(config, dict) else {}
         if _hetero_cfg.get('adaptive_sync', False) and self.desloc_enabled:
-            from deepspeed.compile.custom_ops.bloombee_bridge import (
-                HeteroSyncGate, HeteroSyncConfig
-            )
-            self._hetero_sync_gate = HeteroSyncGate(HeteroSyncConfig(
-                base_Kx=self.desloc_Kx,
-                adaptive_enabled=True,
-                straggler_threshold=_hetero_cfg.get('straggler_threshold', 2.0),
-                max_Kx=_hetero_cfg.get('max_Kx', 32),
-            ))
+            from deepspeed.compile.custom_ops.bloombee_bridge import (HeteroSyncGate, HeteroSyncConfig)
+            self._hetero_sync_gate = HeteroSyncGate(
+                HeteroSyncConfig(
+                    base_Kx=self.desloc_Kx,
+                    adaptive_enabled=True,
+                    straggler_threshold=_hetero_cfg.get('straggler_threshold', 2.0),
+                    max_Kx=_hetero_cfg.get('max_Kx', 32),
+                ))
         self.enable_backward_allreduce = True
         self.inside_no_sync_ctxt = False
         self.progressive_layer_drop = None
@@ -2655,13 +2650,72 @@ class DeepSpeedEngine(Module):
             return 1
         return self.desloc_Kx
 
+    def _should_defer_mxfp8_param_sync(self) -> bool:
+        """Return whether MXFP8 param sync should be deferred until chained steps finish.
+
+        Ports Megatron commit b80a8547 (ChainedOptimizer gate) into the DES-LOC engine.
+
+        The deferred-sync path is only needed when MXFP8 grad/param buffer reuse is active
+        AND the DDP-level param gather is not overlapped (the race fixed by Megatron PR #4800
+        can occur in DeepSpeed too when ZeRO stage >= 1 uses grad-buffer reuse).
+        The engine-level config flag is unreliable as a proxy for the DDP-level setting —
+        the two configs can diverge — so probe underlying ZeRO optimizers directly.
+
+        Knuth Vol.1 §1.2.1: "Premature optimization is the root of all evil." The extra
+        isinstance loop runs once per optimizer.step(), not per forward pass, so the O(N)
+        scan over constituent optimizers is negligible vs. the all-gather cost.
+        Knuth TAOCP §2.2.3 critique: chained traversal of constituent_optimizers has O(P)
+        probe cost; acceptable since it is bounded by the number of ZeRO shards, not by
+        parameter count.
+        """
+        # Fast path: buffer reuse disabled — defer never needed.
+        cfg = getattr(self, '_config', None)
+        if not getattr(cfg, 'reuse_grad_buf_for_mxfp8_param_ag', False):
+            return False
+
+        # Probe each constituent ZeRO optimizer's DDP config directly.
+        # Pattern mirrors Megatron ChainedOptimizer._should_defer_mxfp8_param_sync():
+        #   for optimizer in self.chained_optimizers:
+        #       if not isinstance(optimizer, DistributedOptimizer): continue
+        #       if not optimizer.ddp_config.overlap_param_gather: return True
+        # Here "chained" optimizers live either as self.optimizer or inside
+        # a ZeROOptimizer's constituent list; we check both paths.
+        candidates = []
+        opt = self.optimizer
+        if hasattr(opt, 'optimizer'):
+            # ZeROOptimizer wraps a basic optimizer; the DDP config is on the outer shell.
+            candidates.append(opt)
+        if hasattr(opt, 'constituent_optimizers'):
+            candidates.extend(opt.constituent_optimizers)
+
+        for sub_opt in candidates:
+            ddp_cfg = getattr(sub_opt, 'ddp_config', None)
+            if ddp_cfg is None:
+                continue
+            overlap = getattr(ddp_cfg, 'overlap_param_gather', True)
+            if not overlap:
+                # At least one shard manager runs without overlap — defer sync.
+                print(f"[MXFP8-SYNC-GATE] rank={dist.get_rank()} "
+                      f"step={self.desloc_step} defer=True "
+                      f"(sub_opt={type(sub_opt).__name__} overlap_param_gather=False)")
+                return True
+
+        # All constituent optimizers overlap param gather — no race, no deferral needed.
+        if getattr(cfg, 'reuse_grad_buf_for_mxfp8_param_ag', False) and self.desloc_step % 200 == 1:
+            print(f"[MXFP8-SYNC-GATE] rank={dist.get_rank()} "
+                  f"step={self.desloc_step} defer=False "
+                  f"(all constituents have overlap_param_gather=True or no ddp_config)")
+        return False
+
     # --- DES-LOC Lifecycle (M139) ---
     def desloc_init_scheduler(self):
         from deepspeed.comm.comm import init_desloc_scheduler, get_desloc_scheduler, get_desloc_tiered_ar, get_desloc_profiler
         dp = None
         if self.mpu:
-            try: dp = self.mpu.get_data_parallel_group()
-            except Exception: pass
+            try:
+                dp = self.mpu.get_data_parallel_group()
+            except Exception:
+                pass
         init_desloc_scheduler(Kx=self.desloc_Kx, Ku=self.desloc_Ku, Kv=self.desloc_Kv, group=dp)
         self._desloc_scheduler = get_desloc_scheduler()
         self._desloc_tiered_ar = get_desloc_tiered_ar()
@@ -2709,15 +2763,16 @@ class DeepSpeedEngine(Module):
             pid = id(p)
             if pid not in self._dnv:
                 self._dnv[pid] = p.data.new_zeros(p.data.shape)
-                self._dnp[pid] = p.data.clone(); continue
+                self._dnp[pid] = p.data.clone()
+                continue
             d = p.data.float() - self._dnp[pid].float()
-            v = self._dnv[pid]; v.mul_(momentum).add_(d)
+            v = self._dnv[pid]
+            v.mul_(momentum).add_(d)
             p.data.add_(v.to(p.dtype), alpha=momentum)
             self._dnp[pid].copy_(p.data)
 
     def desloc_checkpoint_state(self):
-        return {'v': 2, 'step': self.desloc_step, 'Kx': self.desloc_Kx,
-                'Ku': self.desloc_Ku, 'Kv': self.desloc_Kv}
+        return {'v': 2, 'step': self.desloc_step, 'Kx': self.desloc_Kx, 'Ku': self.desloc_Ku, 'Kv': self.desloc_Kv}
 
     def desloc_load_checkpoint(self, sd):
         if not sd or sd.get('v', 0) < 2: return
@@ -2768,10 +2823,8 @@ class DeepSpeedEngine(Module):
             if self.desloc_step % 50 == 1:
                 _r = dist.get_rank()
                 # compute gradient norm to detect if gradients are healthy despite skip
-                gnorm_sq = sum(p.grad.float().norm().item()**2
-                               for p in self.module.parameters()
-                               if p.grad is not None)
-                gnorm = gnorm_sq ** 0.5
+                gnorm_sq = sum(p.grad.float().norm().item()**2 for p in self.module.parameters() if p.grad is not None)
+                gnorm = gnorm_sq**0.5
                 print(f"[ENGINE-AR] rank={_r} step={self.desloc_step} SKIP "
                       f"(skipped={self.desloc_skipped_allreduces} "
                       f"zero={self.zero_optimization_stage()} "
@@ -2782,13 +2835,10 @@ class DeepSpeedEngine(Module):
         # M365 DIAG: log FIRE decisions on ALL ranks
         if self.desloc_enabled and self.desloc_step % 50 == 1:
             _r = dist.get_rank()
-            gnorm_sq = sum(p.grad.float().norm().item()**2
-                           for p in self.module.parameters()
-                           if p.grad is not None)
-            gnorm = gnorm_sq ** 0.5
-            pnorm_sq = sum(p.data.float().norm().item()**2
-                           for p in self.module.parameters())
-            pnorm = pnorm_sq ** 0.5
+            gnorm_sq = sum(p.grad.float().norm().item()**2 for p in self.module.parameters() if p.grad is not None)
+            gnorm = gnorm_sq**0.5
+            pnorm_sq = sum(p.data.float().norm().item()**2 for p in self.module.parameters())
+            pnorm = pnorm_sq**0.5
             print(f"[ENGINE-AR] rank={_r} step={self.desloc_step} FIRE "
                   f"grad_norm={gnorm:.6f} param_norm={pnorm:.4f} "
                   f"sp={self._desloc_sp_enabled} "
@@ -2806,10 +2856,7 @@ class DeepSpeedEngine(Module):
             except ImportError:
                 pass
 
-        if self.is_deepcompile_active() and (
-            not self.compile_autosp()
-            or self._desloc_sp_mode == 'z2_fallback'
-        ):
+        if self.is_deepcompile_active() and (not self.compile_autosp() or self._desloc_sp_mode == 'z2_fallback'):
             return
 
         # Pass (PP) gas boundary flag to optimizer (required for zero)
@@ -2872,9 +2919,7 @@ class DeepSpeedEngine(Module):
         # Pattern: NCCL group.cc flushes at ncclGroupEnd; we flush here.
         if self._desloc_sp_enabled:
             try:
-                from deepspeed.compile.custom_ops.hetero_mesh import (
-                    enforce_handle_high_water_mark
-                )
+                from deepspeed.compile.custom_ops.hetero_mesh import (enforce_handle_high_water_mark)
                 enforce_handle_high_water_mark()
             except ImportError:
                 pass
@@ -3117,11 +3162,21 @@ class DeepSpeedEngine(Module):
             # M470: on Kx sync steps, all-gather param shards before optimizer update
             # so every rank has the complete parameter tensor.  Mirrors Megatron
             # DistributedOptimizer._allgather_params() (commit 4feb2b0d).
-            if (self.desloc_enabled
-                    and self._desloc_dist_opt_mgr is not None
-                    and self.desloc_is_param_sync_step()):
+            if (self.desloc_enabled and self._desloc_dist_opt_mgr is not None and self.desloc_is_param_sync_step()):
                 self._desloc_dist_opt_mgr.allgather_params()
             self.optimizer.step()
+            # M475: MXFP8 defer-sync gate — mirrors Megatron b80a8547.
+            # When grad/param buffer reuse is active and DDP-level overlap_param_gather
+            # is absent on any constituent optimizer, we must flush the deferred param
+            # sync now (after all chained steps are done) to avoid the race from PR #4800.
+            # The gate probes ddp_config.overlap_param_gather on each shard manager; if
+            # any is False, trigger the flush here rather than letting the caller race.
+            if self._should_defer_mxfp8_param_sync():
+                _deferred_sync_opt = getattr(self.optimizer, 'optimizer', self.optimizer)
+                if hasattr(_deferred_sync_opt, 'finish_param_sync'):
+                    _deferred_sync_opt.finish_param_sync(model_index=0)
+                    print(f'[MXFP8-SYNC-GATE] rank={dist.get_rank()} '
+                          f'step={self.desloc_step} flushed deferred param sync')
 
         if hasattr(self.optimizer, '_global_grad_norm'):
             self._global_grad_norm = self.optimizer._global_grad_norm
@@ -3436,8 +3491,7 @@ class DeepSpeedEngine(Module):
         if self.desloc_enabled and hasattr(self, '_desloc_loss_history'):
             is_sync = self.desloc_is_param_sync_step()
             current_lr = lr[0] if isinstance(lr, (list, tuple)) and lr else 0.0
-            self._desloc_loss_history.append(
-                (self.global_steps, None, current_lr, is_sync))
+            self._desloc_loss_history.append((self.global_steps, None, current_lr, is_sync))
 
     def desloc_record_loss(self, loss_value):
         """Record training loss for Figure 1 curve.
@@ -3465,14 +3519,11 @@ class DeepSpeedEngine(Module):
         if len(self._desloc_loss_window) > self._desloc_loss_window_size:
             self._desloc_loss_window.pop(0)
         # Replace None in last entry or append new
-        if (self._desloc_loss_history and
-                self._desloc_loss_history[-1][0] == step and
-                self._desloc_loss_history[-1][1] is None):
-            self._desloc_loss_history[-1] = (
-                step, float(loss_value), lr_val, is_sync)
+        if (self._desloc_loss_history and self._desloc_loss_history[-1][0] == step
+                and self._desloc_loss_history[-1][1] is None):
+            self._desloc_loss_history[-1] = (step, float(loss_value), lr_val, is_sync)
         else:
-            self._desloc_loss_history.append(
-                (step, float(loss_value), lr_val, is_sync))
+            self._desloc_loss_history.append((step, float(loss_value), lr_val, is_sync))
 
     def desloc_record_eval(self, eval_loss, eval_ppl=None):
         """Record evaluation loss for Figure 1 overlay.
@@ -3483,9 +3534,7 @@ class DeepSpeedEngine(Module):
         if not self.desloc_enabled:
             return
         step = self.global_steps
-        self._desloc_eval_history.append(
-            (step, float(eval_loss),
-             float(eval_ppl) if eval_ppl is not None else None))
+        self._desloc_eval_history.append((step, float(eval_loss), float(eval_ppl) if eval_ppl is not None else None))
 
     def desloc_record_comm(self, bytes_sent, num_ops=1, tier='x'):
         """Record communication event for Figure 2 data.
@@ -3500,8 +3549,7 @@ class DeepSpeedEngine(Module):
         """
         if not self.desloc_enabled:
             return
-        self._desloc_comm_history.append(
-            (self.global_steps, int(bytes_sent), int(num_ops), str(tier)))
+        self._desloc_comm_history.append((self.global_steps, int(bytes_sent), int(num_ops), str(tier)))
 
     def desloc_record_throughput(self, tokens_per_sec):
         """Record throughput for Figure 5 data.
@@ -3510,8 +3558,7 @@ class DeepSpeedEngine(Module):
         """
         if not self.desloc_enabled:
             return
-        self._desloc_throughput_history.append(
-            (self.global_steps, float(tokens_per_sec)))
+        self._desloc_throughput_history.append((self.global_steps, float(tokens_per_sec)))
 
     def desloc_get_smoothed_loss(self):
         """Get EMA-smoothed loss from sliding window.
@@ -3549,8 +3596,7 @@ class DeepSpeedEngine(Module):
         Ref: Section 5.3 — DES-LOC halves communication vs Local Adam
         """
         if not self._desloc_comm_history:
-            return {'total_bytes': 0, 'ddp_equiv_bytes': 0,
-                    'reduction_ratio': 1.0, 'per_tier': {}}
+            return {'total_bytes': 0, 'ddp_equiv_bytes': 0, 'reduction_ratio': 1.0, 'per_tier': {}}
         total_bytes = sum(e[1] for e in self._desloc_comm_history)
         total_ops = sum(e[2] for e in self._desloc_comm_history)
         per_tier = {}
@@ -3597,12 +3643,10 @@ class DeepSpeedEngine(Module):
         if rank != 0:
             return
 
-        config_header = (
-            f"### model = {getattr(self, '_desloc_model_size', 'unknown')}, "
-            f"Kx = {self.desloc_Kx}, Ku = {self.desloc_Ku}, "
-            f"Kv = {self.desloc_Kv}, "
-            f"optimizer = {self.desloc_outer_opt_mode} ###"
-        )
+        config_header = (f"### model = {getattr(self, '_desloc_model_size', 'unknown')}, "
+                         f"Kx = {self.desloc_Kx}, Ku = {self.desloc_Ku}, "
+                         f"Kv = {self.desloc_Kv}, "
+                         f"optimizer = {self.desloc_outer_opt_mode} ###")
 
         # Figure 1: Loss vs Step
         fig1_path = os.path.join(output_dir, 'figure1_loss_curve.log')
@@ -3689,10 +3733,9 @@ class DeepSpeedEngine(Module):
             r'step: (\\d+) \\| loss: ([\\d.]+)'
         """
         lines = []
-        config_str = (
-            f"### Kx = {self.desloc_Kx}, Ku = {self.desloc_Ku}, "
-            f"Kv = {self.desloc_Kv}, "
-            f"outer = {self.desloc_outer_opt_mode} ###")
+        config_str = (f"### Kx = {self.desloc_Kx}, Ku = {self.desloc_Ku}, "
+                      f"Kv = {self.desloc_Kv}, "
+                      f"outer = {self.desloc_outer_opt_mode} ###")
         lines.append(config_str)
         for entry in self._desloc_loss_history:
             step, loss, lr, is_sync = entry
@@ -4014,9 +4057,7 @@ class DeepSpeedEngine(Module):
                 custom_load_fn(src=module_state_dict, dst=self.module)
             else:
                 try:
-                    self.module.load_state_dict(
-                        module_state_dict,
-                        strict=strict)
+                    self.module.load_state_dict(module_state_dict, strict=strict)
                 except RuntimeError as _ckpt_err:
                     # M455: unexpected keys / missing keys from old checkpoint
                     # format; retry with strict=False as a best-effort fallback.
@@ -4351,8 +4392,7 @@ class DeepSpeedEngine(Module):
                 print(f"[M455-COMPAT] 'global_steps' missing from checkpoint; "
                       f"defaulting to 0 (old-format ckpt). LR schedule may be wrong.")
 
-            self.global_samples = checkpoint.get('global_samples',
-                                                  self.global_steps * self.train_batch_size())
+            self.global_samples = checkpoint.get('global_samples', self.global_steps * self.train_batch_size())
 
             try:
                 self.skipped_steps = checkpoint['skipped_steps']
@@ -5166,9 +5206,7 @@ class DeepSpeedEngine(Module):
             _training_dtype = torch.float16
 
         try:
-            from deepspeed.compile.custom_ops.hetero_mesh import (
-                get_hetero_plan, validate_sp_group_dtype_consistency
-            )
+            from deepspeed.compile.custom_ops.hetero_mesh import (get_hetero_plan, validate_sp_group_dtype_consistency)
             plan = get_hetero_plan()
             if plan is not None:
                 dtype_warnings = validate_sp_group_dtype_consistency(plan, _training_dtype)
@@ -5185,8 +5223,7 @@ class DeepSpeedEngine(Module):
 
         # M356: Set A2A timeout for heterogeneous GPU deadlock prevention.
         if not hasattr(self, '_desloc_sp_a2a_timeout_ms'):
-            self._desloc_sp_a2a_timeout_ms = int(
-                os.environ.get('DESLOC_SP_A2A_TIMEOUT_MS', '60000'))
+            self._desloc_sp_a2a_timeout_ms = int(os.environ.get('DESLOC_SP_A2A_TIMEOUT_MS', '60000'))
 
         return init_autosp(self._config)
 
@@ -5236,10 +5273,9 @@ class DeepSpeedEngine(Module):
         if resolved_backend is None:
             if self.compile_autosp():
                 self._desloc_sp_mode = 'z2_fallback'
-                logger.info(
-                    "[M438] AutoSP incompatible with ZeRO-2; "
-                    "using DeepCompile ZeRO-2 reduce backend. "
-                    "SP will use eager Ulysses fallback.")
+                logger.info("[M438] AutoSP incompatible with ZeRO-2; "
+                            "using DeepCompile ZeRO-2 reduce backend. "
+                            "SP will use eager Ulysses fallback.")
             resolved_backend = self.get_deepcompile_backend(backend, compile_kwargs, schedule)
 
         return resolved_backend, schedule
@@ -5383,13 +5419,17 @@ class DeepSpeedEngine(Module):
 # DES-LOC: Minimal engine extensions (Algorithm 1, Section 4.1)
 # =========================================================================
 
+
 def desloc_state_dict(engine):
     """Checkpoint DES-LOC state. Ref: Section A.1."""
     if not engine.desloc_enabled:
         return {}
     return {
-        'Kx': engine.desloc_Kx, 'Ku': engine.desloc_Ku, 'Kv': engine.desloc_Kv,
-        'step': engine.desloc_step, 'skipped': engine.desloc_skipped_allreduces,
+        'Kx': engine.desloc_Kx,
+        'Ku': engine.desloc_Ku,
+        'Kv': engine.desloc_Kv,
+        'step': engine.desloc_step,
+        'skipped': engine.desloc_skipped_allreduces,
         'clip_rho': engine.desloc_clip_rho,
     }
 
@@ -5620,12 +5660,10 @@ class DeslocDistributedOptimizerShardManager:
 # CRITICAL: Loss annotations ≥4 decimal places (e.g., 3.2147).
 # =============================================================================
 
-
 import math as _desloc_math
 import time as _desloc_time
 import os as _desloc_os
 import json as _desloc_json
-
 
 
 # M303: Hetero engine helpers (strips 1330 lines of 9 standalone classes)
@@ -5633,10 +5671,12 @@ def desloc_coord_clip(g, rho=1.0):
     if rho <= 0: return g
     return g.clamp_(-rho, rho)
 
+
 def desloc_half_life(b, eps=1e-10):
     import math
     if b <= 0 or b >= 1: return float('inf')
     return math.log(2) / math.log(1 / max(eps, b))
+
 
 def desloc_sync_rec(b1=0.9, b2=0.999, bk=32):
     h1, h2 = desloc_half_life(b1), desloc_half_life(b2)
@@ -5644,46 +5684,63 @@ def desloc_sync_rec(b1=0.9, b2=0.999, bk=32):
     r2 = max(1, min(64, int(round(h2 / max(1, desloc_half_life(0.5))))))
     return {'Kx': bk, 'Ku': max(1, bk * r1), 'Kv': max(1, bk * r2)}
 
+
 def desloc_spike(hist, w=50, thr=2.0):
     if len(hist) < w + 1: return False
     v = [h[1] for h in hist[-w:] if len(h) > 1]
     if len(v) < w // 2: return False
-    m = sum(v) / len(v); s = (sum((x - m) ** 2 for x in v) / len(v)) ** 0.5
+    m = sum(v) / len(v)
+    s = (sum((x - m)**2 for x in v) / len(v))**0.5
     return s > 1e-8 and (hist[-1][1] - m) > thr * s if len(hist[-1]) > 1 else False
+
 
 def desloc_emerg(eng):
     if not eng.desloc_enabled: return
-    eng._dl_sk = eng.desloc_Kx; eng.desloc_Kx = 1; eng._dl_rec = 100
+    eng._dl_sk = eng.desloc_Kx
+    eng.desloc_Kx = 1
+    eng._dl_rec = 100
+
 
 def desloc_chk_rec(eng):
     if not hasattr(eng, '_dl_rec'): return
     if eng._dl_rec > 0: eng._dl_rec -= 1
-    else: eng.desloc_Kx = getattr(eng, '_dl_sk', 32); del eng._dl_rec; del eng._dl_sk
+    else:
+        eng.desloc_Kx = getattr(eng, '_dl_sk', 32)
+        del eng._dl_rec
+        del eng._dl_sk
+
 
 def desloc_ar_dec(eng, step):
     if not eng.desloc_enabled or eng.desloc_Kx <= 1: return True
     if step < eng.desloc_warmup_steps: return True
     return (step % eng.desloc_Kx) == 0
 
+
 def desloc_comm_red(eng):
-    t = eng.desloc_step; kx, ku, kv = eng.desloc_Kx, eng.desloc_Ku, eng.desloc_Kv
+    t = eng.desloc_step
+    kx, ku, kv = eng.desloc_Kx, eng.desloc_Ku, eng.desloc_Kv
     if t <= 0: return {'r': 1.0}
-    ddp = 3 * t; dl = t / max(1, kx) + t / max(1, ku) + t / max(1, kv)
+    ddp = 3 * t
+    dl = t / max(1, kx) + t / max(1, ku) + t / max(1, kv)
     sk = eng.desloc_skipped_allreduces
     return {'r': round(ddp / max(1, dl), 2), 'skip_pct': round(100 * sk / t, 2)}
 
+
 def desloc_log_s(eng, loss, lr, sync, tps=0):
-    s = eng.desloc_step; eng._desloc_loss_history.append((s, loss, lr, sync))
+    s = eng.desloc_step
+    eng._desloc_loss_history.append((s, loss, lr, sync))
     if tps > 0: eng._desloc_throughput_history.append((s, tps))
     eng._desloc_loss_window.append(loss)
     if len(eng._desloc_loss_window) > eng._desloc_loss_window_size: eng._desloc_loss_window.pop(0)
     if desloc_spike(eng._desloc_loss_history): desloc_emerg(eng)
     desloc_chk_rec(eng)
 
+
 def desloc_h_batch(eng):
     a = eng.accelerator
     if not hasattr(a, 'desloc_alloc_mb'): return {}
     return a.desloc_alloc_mb(eng.train_batch_size())
+
 
 def desloc_nkifa(eng, path):
     import os
@@ -5694,9 +5751,11 @@ def desloc_nkifa(eng, path):
         f.write("--- loss ---\n")
         for s, l, lr, sy in eng._desloc_loss_history:
             f.write("step:%d, loss:%.6f, lr:%.8f, sync:%d\n" % (s, l, lr, int(sy)))
-        c = desloc_comm_red(eng); f.write("--- comm ---\n")
+        c = desloc_comm_red(eng)
+        f.write("--- comm ---\n")
         for k, v in sorted(c.items()):
             f.write("%s: %s\n" % (k, v))
+
 
 def desloc_scl_fit(hist, mp=5):
     import math
@@ -5704,17 +5763,28 @@ def desloc_scl_fit(hist, mp=5):
     ss = [h[0] for h in hist if len(h) > 1 and h[1] > 0]
     ls = [h[1] for h in hist if len(h) > 1 and h[1] > 0]
     if len(ss) < mp: return None
-    lc = [math.log(max(1, s)) for s in ss]; ll = [math.log(l) for l in ls]; n = len(lc)
-    sx = sum(lc); sy = sum(ll); sxy = sum(lc[i] * ll[i] for i in range(n)); sxx = sum(x * x for x in lc)
+    lc = [math.log(max(1, s)) for s in ss]
+    ll = [math.log(l) for l in ls]
+    n = len(lc)
+    sx = sum(lc)
+    sy = sum(ll)
+    sxy = sum(lc[i] * ll[i] for i in range(n))
+    sxx = sum(x * x for x in lc)
     d = n * sxx - sx * sx
     if abs(d) < 1e-12: return None
-    sl = (n * sxy - sx * sy) / d; ic = (sy - sl * sx) / n
-    my = sy / n; st = sum((y - my) ** 2 for y in ll); sr = sum((ll[i] - (ic + sl * lc[i])) ** 2 for i in range(n))
+    sl = (n * sxy - sx * sy) / d
+    ic = (sy - sl * sx) / n
+    my = sy / n
+    st = sum((y - my)**2 for y in ll)
+    sr = sum((ll[i] - (ic + sl * lc[i]))**2 for i in range(n))
     return {'a': round(math.exp(ic), 6), 'b': round(-sl, 6), 'r2': round(1 - sr / max(1e-12, st), 6)}
+
+
 # --- End M303 ---
 
 
 class DeslocAutoSPCoordinator:
+
     def __init__(self, engine, sp_group=None, dp_group=None, Kx=32, Ku=96, Kv=192):
         self.engine = engine
         self.sp_group = sp_group
@@ -5756,11 +5826,9 @@ class DeslocAutoSPCoordinator:
                 if self._overlap and self._comm_stream is not None:
                     self._comm_stream.wait_stream(torch.cuda.current_stream())
                     with torch.cuda.stream(self._comm_stream):
-                        h = dist.all_reduce(p.grad, op=dist.ReduceOp.SUM,
-                                            group=self.dp_group, async_op=True)
+                        h = dist.all_reduce(p.grad, op=dist.ReduceOp.SUM, group=self.dp_group, async_op=True)
                 else:
-                    h = dist.all_reduce(p.grad, op=dist.ReduceOp.SUM,
-                                        group=self.dp_group, async_op=True)
+                    h = dist.all_reduce(p.grad, op=dist.ReduceOp.SUM, group=self.dp_group, async_op=True)
                 handles.append(h)
         else:
             self._dp_skip_count += 1
@@ -5772,11 +5840,13 @@ class DeslocAutoSPCoordinator:
 
     def get_metrics(self):
         total = self._dp_ar_count + self._dp_skip_count
-        return {'ar': self._dp_ar_count, 'skip': self._dp_skip_count,
-                'red%': round(100.0 * self._dp_skip_count / max(1, total), 2),
-                'comm_gb': round(self._total_bytes / 1e9, 4),
-                'saved_gb': round(self._saved_bytes / 1e9, 4)}
+        return {
+            'ar': self._dp_ar_count,
+            'skip': self._dp_skip_count,
+            'red%': round(100.0 * self._dp_skip_count / max(1, total), 2),
+            'comm_gb': round(self._total_bytes / 1e9, 4),
+            'saved_gb': round(self._saved_bytes / 1e9, 4)
+        }
 
     def state_dict(self):
-        return {'step': self._step, 'ar': self._dp_ar_count,
-                'skip': self._dp_skip_count}
+        return {'step': self._step, 'ar': self._dp_ar_count, 'skip': self._dp_skip_count}
