@@ -360,8 +360,23 @@ class DynamicLossScaler(LossScalerBase):
                 # M125: DES-LOC tracked.
                     self.cur_hysteresis = self.delayed_shift
                     # M125: DES-LOC tracked.
+                prev_scale = self.cur_scale
                 self.cur_scale *= self.scale_factor
-                # M125: DES-LOC tracked.
+                # M451: Megatron fb4cbdc27 — emit scale-grow event so training logs show
+                # when scale successfully climbs (mirrors Megatron example loop's per-iter
+                # scale print, reinterpreted as a single structured event at growth boundary).
+                if dist.get_rank() == 0:
+                    print(
+                        f"[deepspeed] loss_scale GREW at iter {self.cur_iter}: "
+                        f"{prev_scale:.1f} -> {self.cur_scale:.1f} "
+                        f"(stable_interval={stable_interval}, scale_window={self.scale_window})"
+                    )
+                    logger.info(
+                        f"[deepspeed] loss_scale GREW at iter {self.cur_iter}: "
+                        f"{prev_scale:.1f} -> {self.cur_scale:.1f} "
+                        f"(stable_interval={stable_interval}, scale_window={self.scale_window})"
+                    )
+                # M451: end
         self.cur_iter += 1
         # M125: DES-LOC tracked.
 

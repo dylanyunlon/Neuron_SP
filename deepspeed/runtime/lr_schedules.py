@@ -1035,6 +1035,21 @@ class DeslocWSDKxAligned:
                 'we': self.warmup_end, 'se': self.stable_end, 'tot': self.total}
 
     def load_state_dict(self, d):
-        self._step = d.get('step', 0)
-        self._lr = d.get('lr', 0)
-        self._phase = d.get('phase', 'warmup')
+        # M451: Megatron fb4cbdc27 — AnnealingLR.__init__ calls self.step(self.num_iters)
+        # to snap LR to the formula rather than trusting a serialized float.  Apply the
+        # same discipline: rewind to step 0 then replay forward to the saved step count
+        # so _lr is always formula-derived, not potentially stale from an old checkpoint.
+        saved_step = d.get('step', 0)
+        self._step = 0
+        self._lr = 0.0
+        self._phase = 'warmup'
+        # Replay schedule to reach saved_step (fast — no GPU ops, pure Python arithmetic).
+        for _ in range(saved_step):
+            self.step()
+        # M451: diagnostic — show restored state so checkpoint reloads are visible in logs.
+        print(
+            f"[DeslocWSDKxAligned] load_state_dict: replayed {saved_step} steps -> "
+            f"phase={self._phase}, lr={self._lr:.6f} "
+            f"(serialized lr was {d.get('lr', 0):.6f})"
+        )
+        # M451: end
