@@ -518,6 +518,21 @@ class TrainingConfig:
     # Enables 1.3B+ models on 49GB A6000 or longer sequences on H20
     # Orthogonal to SP and DEC: SP(data) × DEC(comm) × AC(memory)
     use_activation_checkpointing: bool = False
+
+    # M458: Megatron 691747b1 — per-layer QK scaling + fp32 softmax
+    # apply_query_key_layer_scaling: scale Q*K^T by 1/layer_number on top of 1/sqrt(d).
+    #   Deeper layers produce smaller raw logit magnitudes, preventing softmax saturation.
+    # attention_softmax_in_fp32: cast attention weights to fp32 before softmax.
+    #   Auto-enabled when apply_query_key_layer_scaling is True (Megatron args.py lines 73-74).
+    # Knuth critique #1 (user): forgetting to set attention_softmax_in_fp32=True together
+    #   with apply_query_key_layer_scaling leads to fp16 softmax at scale=1/(sqrt(d)*L);
+    #   for L=24 and d=64 the max logit is ~0.052, easily representable in fp16,
+    #   but gradients of exp() near zero suffer catastrophic cancellation.
+    # Knuth critique #2 (system): the manual baddbmm+softmax path breaks SDPA's
+    #   FlashAttention dispatch — memory cost reverts from O(T) to O(T²);
+    #   use only when numerical precision matters more than memory efficiency.
+    apply_query_key_layer_scaling: bool = False
+    attention_softmax_in_fp32: bool = False
     
     # M452: Megatron 66719e9 dataloader — replacement sampling + presplit sentences
     # Megatron configure_data.py: RandomSampler(replacement=True, num_samples=batch_size*train_iters)
@@ -656,13 +671,37 @@ class CausalSelfAttention(nn.Module):
     ensuring AutoSP is compatible with all GPU architectures,
     fully upgrading attention to support both DES-LOC and AutoSP.
     """
-    def __init__(self, n_embd: int, n_head: int, max_seq_len: int, dropout: float = 0.0):
+    def __init__(self, n_embd: int, n_head: int, max_seq_len: int, dropout: float = 0.0,
+                 layer_number: int = 1,
+                 apply_query_key_layer_scaling: bool = False,
+                 attention_softmax_in_fp32: bool = False):
         super().__init__()
         assert n_embd % n_head == 0
         self.n_head = n_head
         self.n_embd = n_embd
         self.head_dim = n_embd // n_head
         self.dropout = dropout
+
+        # M458: Megatron 691747b1 — per-layer QK scaling + fp32 softmax
+        # apply_query_key_layer_scaling multiplies Q*K^T by 1/layer_number on top of
+        # the standard 1/sqrt(head_dim), deepening numerical stability in deep stacks.
+        # If QK scaling is on, softmax must run in fp32 to avoid saturation at large depths.
+        self.layer_number = max(1, layer_number)  # guard: layer index starts at 1
+        self.apply_query_key_layer_scaling = apply_query_key_layer_scaling
+        # Knuth critique #1 (user): caller may set apply_query_key_layer_scaling=True but
+        #   forget attention_softmax_in_fp32 — we auto-enable it here, mirroring Megatron's
+        #   argument parser behaviour (commit 691747b1 lines 73-74 of arguments.py).
+        self.attention_softmax_in_fp32 = attention_softmax_in_fp32 or apply_query_key_layer_scaling
+        # Knuth critique #2 (system): SDPA's scale kwarg is float32, but when QK scaling is
+        #   combined with BF16 autocast the product 1/(sqrt(d)*L) can underflow to 0 for
+        #   L≥512 with head_dim=64; the fp32 softmax path below mitigates this by upcasting
+        #   before the exponential, matching Megatron's design intent.
+        self._qk_scale = 1.0 / (math.sqrt(self.head_dim) * self.layer_number) \
+            if apply_query_key_layer_scaling else 1.0 / math.sqrt(self.head_dim)
+        print(f"[ATTN-INIT] layer={self.layer_number} head_dim={self.head_dim} "
+              f"qk_layer_scale={apply_query_key_layer_scaling} "
+              f"softmax_fp32={self.attention_softmax_in_fp32} "
+              f"effective_scale={self._qk_scale:.6f}")
 
         self.c_attn = nn.Linear(n_embd, 3 * n_embd, bias=False)
         self.c_proj = nn.Linear(n_embd, n_embd, bias=False)
@@ -678,6 +717,14 @@ class CausalSelfAttention(nn.Module):
 
         s = _SP_CTX['step']
         _r = dist.get_rank() if dist.is_initialized() else 0
+
+        # M458: QK scale diagnostic — log effective scale once per 50 steps so we
+        # can verify per-layer attenuation is actually different across layers.
+        if _diag and s % 50 == 1:
+            with torch.no_grad():
+                print(f"[ATTN-M458] rank={_r} step={s} layer={self.layer_number} "
+                      f"qk_scale={self._qk_scale:.6f} "
+                      f"softmax_fp32={self.attention_softmax_in_fp32}")
 
         # M365 DIAG: pre-A2A QKV statistics on ALL ranks (not just rank 0)
         # This reveals whether SP ranks have divergent activations
@@ -708,10 +755,41 @@ class CausalSelfAttention(nn.Module):
                       f"K_norm_post={k.float().norm().item():.4f} "
                       f"V_norm_post={v.float().norm().item():.4f}")
 
-            y = F.scaled_dot_product_attention(q, k, v, attn_mask=None,
-                dropout_p=self.dropout if self.training else 0.0, is_causal=True)
-
-            # M365 DIAG: attention output before reverse A2A
+            # M458: pass per-layer QK scale; SDPA's scale kwarg overrides the
+            # default 1/sqrt(d_k), giving us combined 1/(sqrt(d)*layer) scaling.
+            # When attention_softmax_in_fp32 is set we upcast q/k to float32 before
+            # the dot-product so softmax numerics stay stable; v stays in original
+            # dtype and the result is cast back before the output projection.
+            if self.attention_softmax_in_fp32:
+                # Manual fp32 attention path — mirrors Megatron transformer.py
+                # SelfAttention.forward() ~lines 240-260 from commit 691747b1.
+                q_f, k_f, v_f = q.float(), k.float(), v.float()
+                attn_w = torch.baddbmm(
+                    torch.empty(B * self.n_head, q_f.size(2), k_f.size(2),
+                                dtype=torch.float32, device=q.device),
+                    q_f.reshape(B * self.n_head, q_f.size(2), self.head_dim),
+                    k_f.reshape(B * self.n_head, self.head_dim, k_f.size(2)),
+                    beta=0.0, alpha=self._qk_scale,
+                )
+                mask = torch.triu(
+                    torch.full((q_f.size(2), k_f.size(2)), float('-inf'),
+                               device=q.device, dtype=torch.float32), diagonal=1)
+                attn_w = attn_w + mask.unsqueeze(0)
+                attn_w = torch.softmax(attn_w, dim=-1, dtype=torch.float32)
+                if self.training and self.dropout > 0.0:
+                    attn_w = F.dropout(attn_w, p=self.dropout)
+                y = torch.bmm(
+                    attn_w,
+                    v_f.reshape(B * self.n_head, v_f.size(2), self.head_dim)
+                ).view(B, self.n_head, q_f.size(2), self.head_dim).to(q.dtype)
+                if _diag and s % 50 == 1:
+                    print(f"[ATTN-FP32-SP] rank={_r} step={s} layer={self.layer_number} "
+                          f"attn_w_max={attn_w.float().max().item():.4f} "
+                          f"attn_entropy={(-(attn_w*(attn_w+1e-9).log()).sum(-1).mean()).item():.4f}")
+            else:
+                y = F.scaled_dot_product_attention(q, k, v, attn_mask=None,
+                    scale=self._qk_scale,
+                    dropout_p=self.dropout if self.training else 0.0, is_causal=True)
             if _diag and s % 50 == 1:
                 print(f"[ATTN-SDPA] rank={_r} step={s} y_pre_reverse={list(y.shape)} "
                       f"y_norm={y.float().norm().item():.4f} "
@@ -724,8 +802,35 @@ class CausalSelfAttention(nn.Module):
             if _diag and s % 50 == 1:
                 _diag.log_a2a_stats(s, _r, "Y-rev", y_pre_rev, y)
         else:
-            y = F.scaled_dot_product_attention(q, k, v, attn_mask=None,
-                dropout_p=self.dropout if self.training else 0.0, is_causal=True)
+            # M458: non-SP path — same per-layer scale and optional fp32 softmax.
+            if self.attention_softmax_in_fp32:
+                q_f, k_f, v_f = q.float(), k.float(), v.float()
+                attn_w = torch.baddbmm(
+                    torch.empty(B * self.n_head, q_f.size(2), k_f.size(2),
+                                dtype=torch.float32, device=q.device),
+                    q_f.reshape(B * self.n_head, q_f.size(2), self.head_dim),
+                    k_f.reshape(B * self.n_head, self.head_dim, k_f.size(2)),
+                    beta=0.0, alpha=self._qk_scale,
+                )
+                mask = torch.triu(
+                    torch.full((q_f.size(2), k_f.size(2)), float('-inf'),
+                               device=q.device, dtype=torch.float32), diagonal=1)
+                attn_w = attn_w + mask.unsqueeze(0)
+                attn_w = torch.softmax(attn_w, dim=-1, dtype=torch.float32)
+                if self.training and self.dropout > 0.0:
+                    attn_w = F.dropout(attn_w, p=self.dropout)
+                y = torch.bmm(
+                    attn_w,
+                    v_f.reshape(B * self.n_head, v_f.size(2), self.head_dim)
+                ).view(B, self.n_head, q_f.size(2), self.head_dim).to(q.dtype)
+                if _diag and s % 50 == 1:
+                    print(f"[ATTN-FP32] rank={_r} step={s} layer={self.layer_number} "
+                          f"attn_w_max={attn_w.float().max().item():.4f} "
+                          f"attn_entropy={(-(attn_w*(attn_w+1e-9).log()).sum(-1).mean()).item():.4f}")
+            else:
+                y = F.scaled_dot_product_attention(q, k, v, attn_mask=None,
+                    scale=self._qk_scale,
+                    dropout_p=self.dropout if self.training else 0.0, is_causal=True)
 
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         y = self.resid_dropout(self.c_proj(y))
@@ -786,10 +891,17 @@ class TransformerBlock(nn.Module):
       context vs RingAttention across 3B/8B/13B models (rebuttal data)
     """
     def __init__(self, n_embd: int, n_head: int, max_seq_len: int,
-                 dropout: float = 0.0, use_ac: bool = False):
+                 dropout: float = 0.0, use_ac: bool = False,
+                 layer_number: int = 1,
+                 apply_query_key_layer_scaling: bool = False,
+                 attention_softmax_in_fp32: bool = False):
         super().__init__()
         self.ln_1 = LayerNorm(n_embd)
-        self.attn = CausalSelfAttention(n_embd, n_head, max_seq_len, dropout)
+        # M458: pass Megatron 691747b1 per-layer QK scaling + fp32 softmax flags
+        self.attn = CausalSelfAttention(n_embd, n_head, max_seq_len, dropout,
+                                        layer_number=layer_number,
+                                        apply_query_key_layer_scaling=apply_query_key_layer_scaling,
+                                        attention_softmax_in_fp32=attention_softmax_in_fp32)
         self.ln_2 = LayerNorm(n_embd)
         self.mlp = MLP(n_embd, dropout)
         self.use_ac = use_ac
@@ -816,17 +928,27 @@ class TransformerBlock(nn.Module):
 class GPT(nn.Module):
     """GPT-2 Model with optional activation checkpointing."""
     def __init__(self, vocab_size: int, max_seq_len: int, n_layer: int,
-                 n_head: int, n_embd: int, use_ac: bool = False):
+                 n_head: int, n_embd: int, use_ac: bool = False,
+                 apply_query_key_layer_scaling: bool = False,
+                 attention_softmax_in_fp32: bool = False):
         super().__init__()
         self.max_seq_len = max_seq_len
-        
+        # M458: if QK layer scaling is on, fp32 softmax is auto-implied (Megatron 691747b1)
+        _softmax_fp32 = attention_softmax_in_fp32 or apply_query_key_layer_scaling
+        print(f"[GPT-INIT] n_layer={n_layer} apply_qk_layer_scaling={apply_query_key_layer_scaling} "
+              f"attention_softmax_in_fp32={_softmax_fp32}")
+
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(vocab_size, n_embd),
             wpe = nn.Embedding(max_seq_len, n_embd),
             drop = nn.Dropout(0.0),
             h = nn.ModuleList([
-                TransformerBlock(n_embd, n_head, max_seq_len, use_ac=use_ac)
-                for _ in range(n_layer)
+                # layer_number is 1-indexed per Megatron convention so scale = 1/(sqrt(d)*i)
+                TransformerBlock(n_embd, n_head, max_seq_len, use_ac=use_ac,
+                                 layer_number=i + 1,
+                                 apply_query_key_layer_scaling=apply_query_key_layer_scaling,
+                                 attention_softmax_in_fp32=_softmax_fp32)
+                for i in range(n_layer)
             ]),
             ln_f = LayerNorm(n_embd),
         ))
@@ -2440,6 +2562,9 @@ class Trainer:
             vocab_size=config.vocab_size,
             max_seq_len=config.max_seq_len,
             use_ac=config.use_activation_checkpointing,
+            # M458: Megatron 691747b1 per-layer QK scaling + fp32 softmax
+            apply_query_key_layer_scaling=getattr(config, 'apply_query_key_layer_scaling', False),
+            attention_softmax_in_fp32=getattr(config, 'attention_softmax_in_fp32', False),
             **model_config
         )
 
@@ -3870,6 +3995,13 @@ def main():
                         help='Enable AutoSP sequence parallelism (DeepSpeed compile pass)')
     parser.add_argument('--use_ac', action='store_true',
                         help='Enable layer-wise activation checkpointing (torch.utils.checkpoint)')
+    # M458: Megatron 691747b1 — per-layer QK scaling + fp32 softmax
+    parser.add_argument('--apply_query_key_layer_scaling', action='store_true',
+                        help='M458: Scale Q*K^T by 1/layer_number (Megatron 691747b1). '
+                             'Auto-enables --attention_softmax_in_fp32.')
+    parser.add_argument('--attention_softmax_in_fp32', action='store_true',
+                        help='M458: Run attention softmax in fp32 (Megatron 691747b1). '
+                             'Automatically set when --apply_query_key_layer_scaling is used.')
     parser.add_argument('--zero_stage', type=int, default=0, choices=[0, 1, 2],
                         help='ZeRO stage (0=off, 1=optimizer state partition)')
     parser.add_argument('--cpu_offload', action='store_true',
@@ -3951,6 +4083,9 @@ def main():
         sample_builder_num_docs=args.sample_builder_num_docs,
         sample_builder_min_doc_len=args.sample_builder_min_doc_len,
         sample_builder_max_doc_len=args.sample_builder_max_doc_len,
+        # M458: Megatron 691747b1 per-layer QK scaling + fp32 softmax
+        apply_query_key_layer_scaling=args.apply_query_key_layer_scaling,
+        attention_softmax_in_fp32=args.attention_softmax_in_fp32,
     )
     
     rank = int(os.environ.get('RANK', 0))
