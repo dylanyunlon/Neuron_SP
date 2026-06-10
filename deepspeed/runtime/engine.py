@@ -3978,13 +3978,36 @@ class DeepSpeedEngine(Module):
             params_to_fetch = []
 
         with deepspeed.zero.GatheredParameters(params_to_fetch, modifier_rank=0):
-            module_state_dict = checkpoint['module']
+            # M455: Megatron ee38e7f — old checkpoints may be missing the
+            # 'module' key (pre-refactor saves stored weights under a different
+            # top-level key).  Fall back to the checkpoint dict itself so that
+            # callers loading legacy saves don't get a bare KeyError.
+            # Knuth critique 1: swallowing KeyError here conflates "missing key"
+            #   with "wrong checkpoint entirely" — both become silent no-ops.
+            # Knuth critique 2: passing the whole checkpoint as module_state_dict
+            #   will likely cause a downstream mismatch; strict=False should be
+            #   forced in the fallback, but we preserve caller's intent for now.
+            try:
+                module_state_dict = checkpoint['module']
+            except KeyError:
+                print(f"[M455-COMPAT] 'module' key missing from checkpoint dict; "
+                      f"attempting to use checkpoint root as state_dict "
+                      f"(old-format ckpt). Keys present: {list(checkpoint.keys())[:8]}")
+                module_state_dict = checkpoint
             if custom_load_fn:
                 custom_load_fn(src=module_state_dict, dst=self.module)
             else:
-                self.module.load_state_dict(
-                    module_state_dict,  # TODO
-                    strict=strict)
+                try:
+                    self.module.load_state_dict(
+                        module_state_dict,
+                        strict=strict)
+                except RuntimeError as _ckpt_err:
+                    # M455: unexpected keys / missing keys from old checkpoint
+                    # format; retry with strict=False as a best-effort fallback.
+                    print(f"[M455-COMPAT] load_state_dict(strict={strict}) raised "
+                          f"RuntimeError: {_ckpt_err}. "
+                          f"Retrying with strict=False for old-format compat.")
+                    self.module.load_state_dict(module_state_dict, strict=False)
 
         if checkpoint.get(FROZEN_PARAM_FRAGMENTS, None) is not None:
             saved_frozen_params = checkpoint[FROZEN_PARAM_FRAGMENTS]
@@ -4217,7 +4240,18 @@ class DeepSpeedEngine(Module):
                                         custom_load_fn=custom_load_fn,
                                         fetch_z3_params=fetch_z3_params)
 
-        self.loaded_checkpoint_dp_world_size = checkpoint['dp_world_size']
+        # M455: Megatron ee38e7f — old checkpoints may omit dp_world_size;
+        # fall back to 1 so single-GPU checkpoints load without KeyError.
+        # Knuth critique 1: silent fallback masks topology mismatches — log it.
+        # Knuth critique 2: default=1 is wrong for multi-node; callers should
+        #   validate after load, not rely on this sentinel being correct.
+        if 'dp_world_size' in checkpoint:
+            self.loaded_checkpoint_dp_world_size = checkpoint['dp_world_size']
+        else:
+            self.loaded_checkpoint_dp_world_size = 1
+            print(f"[M455-COMPAT] 'dp_world_size' missing from checkpoint; "
+                  f"defaulting to 1 (old-format ckpt). "
+                  f"Verify topology before continuing training.")
 
         optim_checkpoint = None
         if load_module_only:
@@ -4244,7 +4278,13 @@ class DeepSpeedEngine(Module):
                 self.optimizer.load_state_dict(optim_checkpoint['optimizer'])
 
             if load_lr_scheduler_states and self.lr_scheduler is not None:
-                self.lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
+                # M455: old checkpoints may not carry lr_scheduler state; skip
+                # gracefully rather than raising KeyError mid-resume.
+                if 'lr_scheduler' in checkpoint:
+                    self.lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
+                else:
+                    print(f"[M455-COMPAT] 'lr_scheduler' key absent from checkpoint; "
+                          f"skipping lr_scheduler restore (old-format ckpt).")
 
             if self.random_ltd_enabled() and self.random_ltd_scheduler is not None and 'random_ltd' in checkpoint:
                 self.random_ltd_scheduler.load_state_dict(checkpoint['random_ltd'])
@@ -4281,10 +4321,36 @@ class DeepSpeedEngine(Module):
                         self.sparse_tensor_module_names, sparse_tensor_module_names,
                         dict(self.module.named_parameters()), checkpoint["module"])
 
-            self.global_steps = checkpoint['global_steps']
-            self.global_samples = checkpoint.get('global_samples', self.global_steps * self.train_batch_size())
-            self.skipped_steps = checkpoint['skipped_steps']
-            self.loaded_checkpoint_mp_world_size = checkpoint['mp_world_size']
+            # M455: Megatron ee38e7f — old-format checkpoints may be missing
+            # training-state counters; fall back to neutral defaults so a
+            # resume doesn't crash hard on legacy saves.
+            # Knuth critique 1: defaulting global_steps to 0 restarts the LR
+            #   schedule from scratch — caller MUST pass correct step if known.
+            # Knuth critique 2: missing mp_world_size silently breaks tensor-
+            #   parallel validation downstream; default=1 is a lie for MP>1.
+            try:
+                self.global_steps = checkpoint['global_steps']
+            except KeyError:
+                self.global_steps = 0
+                print(f"[M455-COMPAT] 'global_steps' missing from checkpoint; "
+                      f"defaulting to 0 (old-format ckpt). LR schedule may be wrong.")
+
+            self.global_samples = checkpoint.get('global_samples',
+                                                  self.global_steps * self.train_batch_size())
+
+            try:
+                self.skipped_steps = checkpoint['skipped_steps']
+            except KeyError:
+                self.skipped_steps = 0
+                print(f"[M455-COMPAT] 'skipped_steps' missing from checkpoint; "
+                      f"defaulting to 0 (old-format ckpt).")
+
+            try:
+                self.loaded_checkpoint_mp_world_size = checkpoint['mp_world_size']
+            except KeyError:
+                self.loaded_checkpoint_mp_world_size = 1
+                print(f"[M455-COMPAT] 'mp_world_size' missing from checkpoint; "
+                      f"defaulting to 1 (old-format ckpt). Validate MP topology.")
             deepspeed_states = [
                 'module', 'sparse_tensor_module_names', 'skipped_steps', 'global_steps', 'dp_world_size',
                 'mp_world_size', 'data_sampler', 'random_ltd'
