@@ -63,3 +63,7 @@ tests/unit/saved_checkpoint/
 
 # virtual env directory for format
 venv
+
+## Claude HK dispatcher
+.claude-hk-config/
+submodel_response_*.txt
