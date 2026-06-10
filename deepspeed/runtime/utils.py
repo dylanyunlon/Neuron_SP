@@ -133,22 +133,218 @@ def ensure_directory_exists(filename):
     os.makedirs(dirname, exist_ok=True)
 
 
-def set_random_seed(seed):
+def set_random_seed(seed, mp_rank_offset=None):
     """Set the random seed for common PRNGs used during training.
 
     DES-LOC rewrite: removed numpy.random dependency.
     Uses only torch.manual_seed and Python random.
     Ref: Mandatory rule — zero numpy.random in DES-LOC code.
 
+    M464 / Megatron #17 (787c1a0bf) — mp-rank seed partitioning:
+    When running with model parallelism, each model-parallel rank receives a
+    unique seed derived by offsetting the base seed by mp_rank_offset.  This
+    replicates Megatron's ``mpu.model_parallel_cuda_manual_seed`` pattern:
+    tensor-parallel workers that hold *different shards* of the same weight
+    must produce *independent* dropout masks; giving them distinct seeds is the
+    minimal correct fix.  Without this, all TP ranks share identical masks,
+    effectively reducing regularisation strength by the TP degree.
+
+    Knuth critique (vol. 2 §3.6): seeding with a simple additive offset only
+    provides ~log2(mp_rank_offset_max) bits of seed diversity — adequate for
+    the small TP degrees used today (≤8), but fragile as TP scales.  A
+    multiplicative or hash-based derivation would be strictly better.
+
     Args:
-        seed (int): the seed to use
+        seed (int): the base seed to use
+        mp_rank_offset (int | None): if not None, shift seed by this rank so
+            model-parallel ranks get independent RNG streams.  Callers should
+            pass ``mpu.get_model_parallel_rank()`` or equivalent.
     """
     import random
-    random.seed(seed)
+    # Guard: skip if seed is not a positive integer (Megatron uses seed > 0)
+    if seed is None or seed <= 0:
+        print(f"[set_random_seed] SKIP — seed={seed} not positive, leaving RNG unchanged")
+        return
+
+    effective_seed = seed
+    if mp_rank_offset is not None and mp_rank_offset > 0:
+        # Each model-parallel rank gets a unique seed to produce independent
+        # dropout / stochastic op streams across the tensor-parallel group.
+        effective_seed = seed + mp_rank_offset
+        print(f"[set_random_seed] M464 mp-rank offset: base={seed} "
+              f"offset={mp_rank_offset} effective={effective_seed}")
+    else:
+        print(f"[set_random_seed] M464 seed={seed} (no mp-rank offset)")
+
+    random.seed(effective_seed)
     # torch.manual_seed accepts only 64-bit integers
-    torch.manual_seed(seed % (2**63))
+    torch.manual_seed(effective_seed % (2**63))
     # DES-LOC: also seed the accelerator for reproducible GPU ops
-    get_accelerator().manual_seed(seed % (2**63))
+    get_accelerator().manual_seed(effective_seed % (2**63))
+
+
+def wrap_module_for_distributed_training(module, ddp_impl, dp_group=None):
+    """Wrap a module for distributed data-parallel training.
+
+    M464 / Megatron #17 (787c1a0bf) — centralised DDP wrapper dispatch:
+    Megatron's commit moved the DDP wrapping logic that was duplicated in
+    pretrain_bert.py and pretrain_gpt2.py into a single utils function.
+    Here we apply the same pattern to DeepSpeed's module ecosystem: one place
+    decides the wrapping strategy, eliminating scattered if/elif DDP_impl
+    branches throughout user training scripts.
+
+    Knuth critique (TAOCP vol. 1 §1.3): the original scatter-in-every-script
+    design is a textbook violation of the «each algorithm once» principle; the
+    correct factoring is exactly this utility function — though the interface
+    should arguably be type-safe (an enum) rather than a plain string.
+
+    Supported strategies
+    --------------------
+    ``"torch"``
+        Use PyTorch's built-in ``DistributedDataParallel``.  Requires
+        ``dp_group`` to be set; maps gradient buckets across the data-parallel
+        group only, leaving model-parallel groups untouched.
+
+    ``"local"``
+        Use DeepSpeed's internal bucketing DDP (no redundant allreduce across
+        model-parallel ranks).  Recommended when model parallelism is active.
+
+    ``"none"`` / ``None``
+        Return the module unwrapped.  Useful for single-device runs or when
+        the caller handles communication itself.
+
+    Args:
+        module (torch.nn.Module): model to wrap.
+        ddp_impl (str | None): wrapping strategy — ``"torch"``, ``"local"``,
+            or ``"none"``/``None``.
+        dp_group: process group for data-parallel communication (required for
+            ``ddp_impl="torch"``).
+
+    Returns:
+        torch.nn.Module: wrapped (or unchanged) module.
+    """
+    from torch.nn.parallel.distributed import DistributedDataParallel as TorchDDP
+
+    impl = (ddp_impl or "none").lower()
+    print(f"[wrap_module_for_distributed_training] M464 ddp_impl={impl!r} "
+          f"module={type(module).__name__}")
+
+    if impl == "torch":
+        if dp_group is None:
+            raise ValueError(
+                "[wrap_module_for_distributed_training] dp_group must be provided "
+                "when ddp_impl='torch'")
+        device_id = get_accelerator().current_device()
+        module = TorchDDP(module, device_ids=[device_id], output_device=device_id,
+                          process_group=dp_group)
+        print(f"[wrap_module_for_distributed_training] Wrapped with TorchDDP "
+              f"device={device_id}")
+
+    elif impl == "local":
+        # DeepSpeed's local DDP keeps per-partition gradient buckets and avoids
+        # broadcasting model-parallel params across the data-parallel group.
+        try:
+            from deepspeed.runtime.dataparallel import DeepSpeedDataParallel as LocalDDP
+            module = LocalDDP(module)
+            print(f"[wrap_module_for_distributed_training] Wrapped with LocalDDP "
+                  f"(DeepSpeedDataParallel)")
+        except ImportError:
+            # Graceful fallback: DeepSpeed's own DDP shim may live elsewhere
+            print(f"[wrap_module_for_distributed_training] LocalDDP not found, "
+                  f"falling back to TorchDDP")
+            if dp_group is None:
+                raise ValueError(
+                    "[wrap_module_for_distributed_training] dp_group required for "
+                    "TorchDDP fallback from LocalDDP")
+            device_id = get_accelerator().current_device()
+            module = TorchDDP(module, device_ids=[device_id], output_device=device_id,
+                              process_group=dp_group)
+
+    elif impl in ("none", ""):
+        print(f"[wrap_module_for_distributed_training] No wrapping — returning "
+              f"module unchanged")
+
+    else:
+        raise ValueError(
+            f"[wrap_module_for_distributed_training] Unknown DDP impl: {ddp_impl!r}. "
+            f"Valid choices: 'torch', 'local', 'none'")
+
+    return module
+
+
+def initialize_distributed_comm(backend="nccl", world_size=None, rank=None,
+                                 local_rank=None, master_addr=None, master_port=None):
+    """Initialize torch.distributed with sensible defaults from environment.
+
+    M464 / Megatron #17 (787c1a0bf) — consolidated distributed init:
+    Megatron moved ``initialize_distributed`` from the per-script duplicates
+    (pretrain_bert.py, pretrain_gpt2.py) into utils.py.  We apply the same
+    principle here: one function reads MASTER_ADDR / MASTER_PORT from the
+    environment (falling back to localhost:6000 as Megatron does) and calls
+    ``torch.distributed.init_process_group``.  DeepSpeed launchers already
+    set these variables, so the defaults are almost always correct.
+
+    Knuth critique (TAOCP vol. 2 §5.4.9): Megatron's original tcp:// init
+    method string concatenation is fragile — a missing env var silently
+    produces ``tcp://localhost:6000`` which may collide across multi-job
+    workloads.  Prefer ``env://`` (reads MASTER_ADDR/PORT automatically) when
+    the torch version supports it, and only fall back to explicit tcp:// for
+    old torch builds.
+
+    Args:
+        backend (str): distributed backend, default ``"nccl"``.
+        world_size (int | None): total number of processes; if None, reads
+            from ``WORLD_SIZE`` env var, then falls back to 1.
+        rank (int | None): this process's rank; if None, reads from ``RANK``
+            env var, then falls back to 0.
+        local_rank (int | None): local device rank; if None, reads from
+            ``LOCAL_RANK`` env var.  Used to bind ``cuda.set_device``.
+        master_addr (str | None): override MASTER_ADDR env var.
+        master_port (str | int | None): override MASTER_PORT env var.
+
+    Returns:
+        bool: True if initialization was performed, False if already
+        initialised (idempotent).
+    """
+    if dist.is_initialized():
+        print(f"[initialize_distributed_comm] M464 already initialised — skipping")
+        return False
+
+    effective_rank = rank if rank is not None else int(os.environ.get("RANK", 0))
+    effective_world = (world_size if world_size is not None
+                       else int(os.environ.get("WORLD_SIZE", 1)))
+    effective_local = (local_rank if local_rank is not None
+                       else int(os.environ.get("LOCAL_RANK", effective_rank)))
+
+    # Bind device before init so NCCL sees the right GPU
+    device_count = get_accelerator().device_count()
+    device = effective_local if effective_local is not None else (effective_rank % device_count)
+    get_accelerator().set_device(device)
+
+    addr = master_addr or os.environ.get("MASTER_ADDR", "localhost")
+    port = str(master_port or os.environ.get("MASTER_PORT", "6000"))
+
+    # Prefer env:// (reads vars automatically) over manual tcp:// concatenation
+    # (Knuth critique: avoid fragile string-assembly for critical init paths)
+    if "MASTER_ADDR" in os.environ and "MASTER_PORT" in os.environ and master_addr is None:
+        init_method = "env://"
+    else:
+        init_method = f"tcp://{addr}:{port}"
+
+    print(f"[initialize_distributed_comm] M464 rank={effective_rank} "
+          f"world={effective_world} device={device} "
+          f"backend={backend} init_method={init_method}")
+
+    torch.distributed.init_process_group(
+        backend=backend,
+        world_size=effective_world,
+        rank=effective_rank,
+        init_method=init_method,
+    )
+
+    print(f"[initialize_distributed_comm] M464 init_process_group OK — "
+          f"rank={torch.distributed.get_rank()}/{torch.distributed.get_world_size()}")
+    return True
 
 
 def is_model_parallel_parameter(p) -> bool:
