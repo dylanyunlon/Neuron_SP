@@ -198,11 +198,33 @@ class LossScaler(LossScalerBase):
     # `params` is a list / generator of torch.Variable
     def has_overflow(self, params):
     # M125: DES-LOC tracked.
+        # M463: Megatron c882ac611 — static LossScaler never overflows by definition
+        # (scale is fixed, so no inf/nan can be introduced by the scaler itself).
+        # Emit a one-time diagnostic so training logs confirm the static path is active,
+        # mirroring the Megatron LossScaler.has_overflow contract (20% chemical:
+        # added _overflow_logged guard to avoid log spam every step).
+        if not getattr(self, '_overflow_logged', False):
+            print(
+                f"[M463] LossScaler.has_overflow: static scale={self.cur_scale:.1f}; "
+                f"overflow detection disabled (static scaler always returns False)."
+            )
+            self._overflow_logged = True
         return False
 
     # `x` is a torch.Tensor
+    @staticmethod
     def _has_inf_or_nan(x):
-        return False
+        # M463: Megatron c882ac611 — even the static scaler should surface
+        # RuntimeError('value cannot be converted') as an overflow signal
+        # rather than propagating an uncaught exception.  Mirrors DynamicLossScaler
+        # and Megatron's unified _has_inf_or_nan (20% chemical: added try/except).
+        try:
+            cpu_sum = float(x.float().sum())
+        except RuntimeError as inst:
+            if "value cannot be converted" not in inst.args[0]:
+                raise
+            return True
+        return cpu_sum in (float('inf'), float('-inf')) or (cpu_sum != cpu_sum)
 
 
 class DynamicLossScaler(LossScalerBase):

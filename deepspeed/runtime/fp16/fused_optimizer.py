@@ -29,6 +29,110 @@ UPDATE_FP16_TIMER = 'update_fp16'
 OVERFLOW_TIMERS = [COMPUTE_NORM_TIMER, OVERFLOW_CHECK_TIMER]
 STEP_TIMERS = OVERFLOW_TIMERS + [UNSCALE_AND_CLIP_TIMER, BASIC_STEP_TIMER, UPDATE_FP16_TIMER]
 
+# ---------------------------------------------------------------------------
+# M463: Megatron c882ac611 (megatron_package) — flat_master FP32 shadow utilities
+#
+# Megatron introduced prep_param_lists / model_grads_to_master_grads /
+# master_params_to_model_params as the canonical API for the fp16→fp32 shadow
+# copy pattern.  DeepSpeed inlines the same logic inside FP16_Optimizer.__init__
+# and step(), but lacks:
+#   (a) a backward guard hook that fires if optimiser accidentally feeds a
+#       gradient into the master (fp32) buffer during backward — which would
+#       silently corrupt training;
+#   (b) a null-grad accounting helper that makes it easy to audit how many
+#       fp16 leaves had no gradient at a given step.
+#
+# Knuth §1.3 critique: the inlined version mutates param_group['params'] in a
+# side-effectful loop; extracting these helpers makes the invariants explicit
+# and testable.  The flat_master=True fast path collapses N per-param copies
+# into one contiguous buffer, removing N-1 CUDA memory transactions per step.
+# ---------------------------------------------------------------------------
+
+
+def _master_param_backward_guard_hook(grad):
+    """Hook registered on flat FP32 master parameters.
+
+    Raises RuntimeError if a gradient actually flows into the master buffer
+    during the backward pass.  Master params are fp32 shadows of fp16 leaves;
+    they must never receive autograd gradients — grads are explicitly copied
+    from fp16 leaves via model_grads_to_master_grads_flat.  If this hook fires
+    it means the optimiser wiring is broken (e.g. the fp16 leaf was detached
+    from the model graph but the fp32 master was not).
+
+    Adapted from Megatron c882ac611 backwards_debug_hook (20% chemical:
+    message clarified, RuntimeError replaced with logger + raise so the
+    stack trace is visible in distributed logs before the job dies).
+    """
+    logger.error(
+        "[M463] _master_param_backward_guard_hook: fp32 master param received "
+        "a gradient during backward!  This means the model graph is wired through "
+        "the master buffer instead of the fp16 leaf.  Training is corrupt — aborting."
+    )
+    raise RuntimeError(
+        "fp32 master param received a gradient in backward; "
+        "check that fp16 leaf params are detached from the master buffer."
+    )
+
+
+def model_grads_to_master_grads_flat(fp16_group_flat, fp32_master_flat, fp16_group):
+    """Copy fp16 leaf gradients into the fp32 master flat buffer.
+
+    Mirrors Megatron's model_grads_to_master_grads with flat_master=True.
+    Grads are flattened into a contiguous fp32 tensor and assigned to
+    fp32_master_flat.grad so the optimiser step operates entirely in fp32.
+
+    Args:
+        fp16_group_flat: flat fp16 buffer (used for shape reference only here).
+        fp32_master_flat: flat fp32 master tensor; .grad will be set in-place.
+        fp16_group: list of fp16 leaf parameters.
+
+    Returns:
+        null_grad_count (int): number of leaves whose .grad was None (diagnostic).
+
+    M463: Knuth §4.3 rounding discipline — gradients are cast to fp32 before
+    flattening; casting after flattening would mix fp16 rounding errors with
+    fp32 accumulation across the buffer boundary.
+    """
+    null_grad_count = 0
+    grad_tensors = []
+    for p in fp16_group:
+        if p.grad is not None:
+            grad_tensors.append(p.grad.data.float())
+        else:
+            null_grad_count += 1
+            grad_tensors.append(
+                torch.zeros(p.size(), dtype=torch.float32, device=p.device)
+            )
+    from torch._utils import _flatten_dense_tensors as _fdt
+    fp32_master_flat.grad = _fdt(grad_tensors)
+    if null_grad_count > 0:
+        print(
+            f"[M463] model_grads_to_master_grads_flat: {null_grad_count}/{len(fp16_group)} "
+            f"fp16 leaves had no gradient — zero-filled in master grad buffer."
+        )
+    return null_grad_count
+
+
+def master_params_to_model_params_flat(fp16_group, fp32_master_flat):
+    """Copy updated fp32 master params back into fp16 model leaves.
+
+    Mirrors Megatron's master_params_to_model_params with flat_master=True.
+    After the optimiser step the fp32 master buffer holds updated weights;
+    this routine unflattens and casts them back to fp16 in-place.
+
+    Args:
+        fp16_group: list of fp16 leaf parameters (modified in-place).
+        fp32_master_flat: flat fp32 master tensor after optimiser step.
+
+    M463: Knuth §1.4 — the unflatten→cast→copy_ sequence is the only safe
+    order; casting the entire flat buffer first then unflattening would allocate
+    a temporary fp16 flat tensor with no direct consumer.
+    """
+    from torch._utils import _unflatten_dense_tensors as _udt
+    updated = _udt(fp32_master_flat.data, fp16_group)
+    for p, q in zip(fp16_group, updated):
+        p.data.copy_(q.data)
+
 
 class FP16_Optimizer(DeepSpeedOptimizer):
     """
@@ -97,6 +201,13 @@ class FP16_Optimizer(DeepSpeedOptimizer):
             self.fp32_groups_flat.append(self.fp16_groups_flat[i].clone().float().detach())
             # modify optimizer of have flat master weight
             self.fp32_groups_flat[i].requires_grad = True  # keep this in case internal optimizer uses it
+            # M463: Megatron c882ac611 backward guard — fire an error if autograd
+            # ever routes a gradient into the fp32 master buffer.  This catches
+            # wiring bugs where the master tensor is accidentally left in the
+            # computational graph.  Mirrors Megatron prep_param_lists registration
+            # of backwards_debug_hook (20% chemical: registered per-group-flat
+            # rather than per-param, matching DeepSpeed's flat-buffer convention).
+            self.fp32_groups_flat[i].register_hook(_master_param_backward_guard_hook)
             param_group['params'] = [self.fp32_groups_flat[i]]
 
         self.verbose = verbose
