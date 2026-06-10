@@ -528,7 +528,16 @@ class TrainingConfig:
     replacement_sampling: bool = False   # enable with-replacement RandomSampler (Megatron 66719e9)
     presplit_sentences: bool = False     # data pre-split into newline-separated sentences
 
-    # M457: Megatron 872b4a6 — multi-EOS edge case fix
+    # M459: Megatron adec01d05 training sample builder — triple-array index scheme
+    # doc_idx (shuffled document order) + sample_idx (packing boundaries) +
+    # shuffle_idx (global sample permutation). Knuth §3.4.2: two independent
+    # Fisher-Yates shuffles (doc order + sample order) with zero coupon waste.
+    # Knuth §2.2.5 critique: O(3N) precomputed index tables vs O(1) on-demand;
+    # we pay the memory cost for O(1) __getitem__ on the critical training path.
+    use_sample_builder: bool = False     # enable adec01d05 triple-array sampling
+    sample_builder_num_docs: int = 1000  # synthetic corpus document count
+    sample_builder_min_doc_len: int = 64  # minimum tokens per synthetic document
+    sample_builder_max_doc_len: int = 512  # maximum tokens per synthetic document
     # A sequence may contain multiple EOS/EOD tokens when documents are packed.
     # Knuth §2.3.1: a singly-linked scan terminates at the *first* sentinel;
     #   iterating over ALL EOD indices is O(k) not O(1) — acceptable because k≪seq_len.
@@ -1187,7 +1196,14 @@ class SyntheticDataset(Dataset):
     distributed) — the fixed stride is a synthetic approximation that
     exercises the multi-EOS code path deterministically.
 
-    Knuth §3.2.2 critique: fixed-stride EOS injection creates a perfectly
+    M459 / Megatron adec01d05: optionally uses TrainingSampleBuilder to
+    produce the triple-array (doc_idx, sample_idx, shuffle_idx) index scheme
+    for document-packing-aware sampling. When `use_sample_builder=True` the
+    dataset constructs a synthetic corpus of variable-length documents and
+    uses the builder's shuffle_idx to determine __getitem__ order, exactly
+    matching the adec01d05 sampling strategy.
+
+    Knuth §3.4.2 critique: fixed-stride EOS injection creates a perfectly
     periodic signal; a learnable model could exploit this regularity to
     predict EOD "for free".  For throughput benchmarking this is acceptable
     (we care about step/s, not convergence), but users training for real
@@ -1202,6 +1218,12 @@ class SyntheticDataset(Dataset):
         eod_mask_loss: bool = True,    # M457: mask loss on EOD positions
         reset_position_ids: bool = True,  # M457: restart pos counter after EOD
         eos_stride: int = 0,           # inject EOS every N tokens (0 = disabled)
+        # M459: adec01d05 sample builder args
+        use_sample_builder: bool = False,
+        sample_builder_num_docs: int = 1000,
+        sample_builder_min_doc_len: int = 64,
+        sample_builder_max_doc_len: int = 512,
+        seed: int = 42,
     ):
         self.vocab_size = vocab_size
         self.seq_len = seq_len
@@ -1211,6 +1233,7 @@ class SyntheticDataset(Dataset):
         self.eod_mask_loss = eod_mask_loss
         self.reset_position_ids = reset_position_ids
         self.eos_stride = eos_stride   # 0 means no injection
+        self.seed = seed
 
         # Pre-generate a pool of short n-gram patterns (bigrams to 5-grams)
         # that get tiled into full sequences.  Using a small effective vocab
@@ -1224,17 +1247,175 @@ class SyntheticDataset(Dataset):
             torch.randint(0, self.eff_vocab, (torch.randint(8, 33, (1,), generator=rng).item(),), generator=rng)
             for _ in range(256)
         ]
+
+        # ----------------------------------------------------------------
+        # M459: adec01d05 TrainingSampleBuilder integration
+        # Build a synthetic corpus of variable-length documents, then
+        # use TrainingSampleBuilder to generate doc_idx/sample_idx/shuffle_idx.
+        # __getitem__ maps through shuffle_idx → sample_idx to slice the corpus.
+        # ----------------------------------------------------------------
+        self._use_sample_builder = use_sample_builder
+        self._sample_builder = None
+        self._corpus_tokens = None  # flat token array for the entire synthetic corpus
+        self._corpus_doc_offsets = None  # start offset of each doc in _corpus_tokens
+
+        if use_sample_builder:
+            self._init_sample_builder(
+                num_docs=sample_builder_num_docs,
+                min_doc_len=sample_builder_min_doc_len,
+                max_doc_len=sample_builder_max_doc_len,
+                seed=seed,
+            )
+
         print(
             f"[M457-DATASET] SyntheticDataset init: vocab={vocab_size}, "
             f"eod_token_id={self.eod_token_id}, eos_stride={eos_stride}, "
             f"eod_mask_loss={eod_mask_loss}, reset_position_ids={reset_position_ids}, "
-            f"num_samples={num_samples}"
+            f"num_samples={num_samples}, use_sample_builder={use_sample_builder}"
         )
+
+    def _init_sample_builder(self, num_docs: int, min_doc_len: int,
+                              max_doc_len: int, seed: int) -> None:
+        """Build synthetic corpus + TrainingSampleBuilder (M459 / adec01d05).
+
+        Generates `num_docs` variable-length documents using the same n-gram
+        pattern pool as the standard path. Document lengths are drawn from
+        Uniform[min_doc_len, max_doc_len] which is a crude approximation of
+        the Poisson-distributed real-corpus lengths.
+
+        Knuth §3.2.2 critique: Uniform doc lengths differ from real Poisson
+        distributions; short documents (< seq_len) cause packing, long docs
+        span multiple samples. For throughput benchmarking this is acceptable.
+        """
+        from deepspeed.runtime.data_pipeline.data_sampling.data_sampler import TrainingSampleBuilder
+        rng = np.random.default_rng(seed + 2)
+        # Draw document lengths from Uniform[min, max]
+        doc_lengths = rng.integers(min_doc_len, max_doc_len + 1, size=num_docs)
+
+        # Build flat corpus token array (EOD tokens between documents)
+        corpus_parts = []
+        doc_offsets = [0]
+        pat_rng = np.random.default_rng(seed + 3)
+        for doc_i, doc_len in enumerate(doc_lengths):
+            pat_idx = int(pat_rng.integers(0, len(self.patterns)))
+            pat = self.patterns[pat_idx].numpy()
+            # Tile the pattern to fill doc_len tokens, offset by doc_i
+            repeats = (doc_len + len(pat) - 1) // len(pat)
+            tiled = np.tile(pat, repeats)[:doc_len]
+            tiled = (tiled + doc_i) % self.eff_vocab
+            corpus_parts.append(tiled.astype(np.int32))
+            corpus_parts.append(np.array([self.eod_token_id], dtype=np.int32))  # EOD separator
+            doc_offsets.append(doc_offsets[-1] + doc_len + 1)  # +1 for EOD
+
+        self._corpus_tokens = np.concatenate(corpus_parts)
+        self._corpus_doc_offsets = np.array(doc_offsets[:-1], dtype=np.int64)
+
+        print(
+            f"[M459-DATASET] Synthetic corpus: {num_docs} docs, "
+            f"total_tokens={len(self._corpus_tokens)}, "
+            f"doc_lengths=[{doc_lengths.min()}, {doc_lengths.max()}] "
+            f"(Uniform, Knuth §3.2.2 approximation)"
+        )
+
+        # Build TrainingSampleBuilder with corpus doc sizes
+        doc_sizes = np.array(doc_lengths, dtype=np.int64)
+        self._sample_builder = TrainingSampleBuilder(
+            num_samples=self.num_samples,
+            seq_length=self.seq_len,
+            doc_sizes=doc_sizes,
+            seed=seed,
+            eod_token_id=self.eod_token_id,
+        )
+        self._sample_builder.build()  # pre-build all three index arrays
+
+    def _getitem_sample_builder(self, idx: int) -> Dict[str, torch.Tensor]:
+        """M459: __getitem__ via adec01d05 triple-array scheme.
+
+        Retrieves sample `idx` using shuffle_idx → sample_idx → doc_idx chain,
+        then slices the synthetic corpus to produce a seq_len-token window.
+        EOD tokens between documents are handled by _m457_ltor_masks_and_position_ids.
+
+        Knuth §2.2.5: O(1) __getitem__ via precomputed tables — no linear scan.
+        Knuth §3.4.2: shuffle_idx provides uniform random order over samples.
+        """
+        _, _, _, _ = self._sample_builder.get_sample_indices(0)  # warm-up type check
+        canonical = int(self._sample_builder._shuffle_idx[idx % self.num_samples])
+        start_row = self._sample_builder._sample_idx[canonical]
+        end_row = self._sample_builder._sample_idx[canonical + 1]
+
+        # Walk corpus from start_row to end_row, collecting seq_len+1 tokens
+        # (the +1 allows us to split into input_ids and labels)
+        tokens_needed = self.seq_len + 1
+        collected = []
+
+        doc_idx_flat = self._sample_builder._doc_idx
+        start_doc_pos = int(start_row[0])
+        start_doc_off = int(start_row[1])
+
+        doc_pos = start_doc_pos
+        offset_in_doc = start_doc_off
+
+        doc_sizes = self._sample_builder.doc_sizes
+
+        while len(collected) < tokens_needed and doc_pos < len(doc_idx_flat):
+            doc_id = int(doc_idx_flat[doc_pos])
+            doc_size = int(doc_sizes[doc_id])
+            doc_global_start = int(self._corpus_doc_offsets[doc_id])
+
+            tokens_left_in_doc = doc_size - offset_in_doc
+            take = min(tokens_left_in_doc, tokens_needed - len(collected))
+
+            src_start = doc_global_start + offset_in_doc
+            chunk = self._corpus_tokens[src_start: src_start + take]
+            collected.extend(chunk.tolist())
+
+            if take == tokens_left_in_doc and len(collected) < tokens_needed:
+                # Append EOD separator between documents
+                collected.append(self.eod_token_id)
+                doc_pos += 1
+                offset_in_doc = 0
+            else:
+                offset_in_doc += take
+
+        # Pad to tokens_needed if corpus ran short (edge case)
+        while len(collected) < tokens_needed:
+            collected.append(0)
+
+        tokens = torch.tensor(collected[:tokens_needed], dtype=torch.long)
+        input_ids = tokens[:-1]
+        labels = tokens[1:]
+
+        loss_mask, position_ids = _m457_ltor_masks_and_position_ids(
+            data=input_ids,
+            eod_token=self.eod_token_id,
+            eod_mask_loss=self.eod_mask_loss,
+            reset_position_ids=self.reset_position_ids,
+        )
+
+        if idx < 3:
+            print(
+                f"[M459-GETITEM] idx={idx} canonical={canonical} "
+                f"start=({int(start_row[0])},{int(start_row[1])}) "
+                f"n_eod={int((input_ids == self.eod_token_id).sum())} "
+                f"first_8={input_ids[:8].tolist()}"
+            )
+
+        return {
+            "input_ids": input_ids,
+            "labels": labels,
+            "loss_mask": loss_mask,
+            "position_ids": position_ids,
+        }
 
     def __len__(self) -> int:
         return self.num_samples
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        # M459: route through sample builder when active
+        if self._use_sample_builder and self._sample_builder is not None:
+            return self._getitem_sample_builder(idx)
+
+        # Original path (M457)
         # Deterministic per-sample: pick pattern, tile to seq_len+1
         pat = self.patterns[idx % len(self.patterns)]
         repeats = (self.seq_len + 1 + len(pat) - 1) // len(pat)
@@ -2294,6 +2475,7 @@ class Trainer:
                 print(f"[INIT] Loaded DDP checkpoint: {config.init_from_ckpt}")
 
         # Dataset — M457: pass multi-EOS config (Megatron 872b4a6)
+        # M459: pass sample builder config (Megatron adec01d05)
         # eod_token_id=-1 resolved inside __init__ to vocab_size-1 unless overridden.
         # eos_stride=64 exercises the multi-EOS edge case: one EOS every 64 tokens
         # yields ~16 EOS per 1024-token sequence — enough to stress the loop.
@@ -2305,6 +2487,12 @@ class Trainer:
             eod_mask_loss=config.eod_mask_loss,
             reset_position_ids=config.reset_position_ids,
             eos_stride=64,
+            # M459: adec01d05 triple-array sampling
+            use_sample_builder=config.use_sample_builder,
+            sample_builder_num_docs=config.sample_builder_num_docs,
+            sample_builder_min_doc_len=config.sample_builder_min_doc_len,
+            sample_builder_max_doc_len=config.sample_builder_max_doc_len,
+            seed=config.seed,
         )
 
         if self.use_deepspeed:
@@ -3716,6 +3904,19 @@ def main():
                              'EOD to support multi-document packing. Knuth §3.6: '
                              'absolute position embeddings require this reset; '
                              'RoPE requires re-computation of sin/cos freqs.')
+    # M459: Megatron adec01d05 training sample builder
+    parser.add_argument('--use_sample_builder', action='store_true',
+                        help='M459: Use Megatron adec01d05 triple-array sample builder '
+                             '(doc_idx + sample_idx + shuffle_idx). '
+                             'Knuth §3.4.2: two independent Fisher-Yates shuffles, '
+                             'zero coupon-collector waste. '
+                             'Knuth §2.2.5 critique: O(3N) precomputed indices vs O(1) on-demand.')
+    parser.add_argument('--sample_builder_num_docs', type=int, default=1000,
+                        help='M459: number of synthetic documents in corpus (adec01d05)')
+    parser.add_argument('--sample_builder_min_doc_len', type=int, default=64,
+                        help='M459: minimum tokens per synthetic document')
+    parser.add_argument('--sample_builder_max_doc_len', type=int, default=512,
+                        help='M459: maximum tokens per synthetic document')
     
     args = parser.parse_args()
     
@@ -3745,6 +3946,11 @@ def main():
         eod_token_id=args.eod_token_id,
         eod_mask_loss=not args.no_eod_mask_loss,
         reset_position_ids=not args.no_reset_position_ids,
+        # M459: Megatron adec01d05 training sample builder
+        use_sample_builder=args.use_sample_builder,
+        sample_builder_num_docs=args.sample_builder_num_docs,
+        sample_builder_min_doc_len=args.sample_builder_min_doc_len,
+        sample_builder_max_doc_len=args.sample_builder_max_doc_len,
     )
     
     rank = int(os.environ.get('RANK', 0))
