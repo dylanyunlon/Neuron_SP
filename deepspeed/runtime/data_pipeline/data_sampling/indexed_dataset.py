@@ -29,6 +29,137 @@ from itertools import accumulate
 import numpy as np
 import torch
 
+# ---------------------------------------------------------------------------
+# M460: Megatron f51ceb7c9 – C++ helpers for fast index operations.
+# We attempt JIT-load of indexed_dataset_helpers; fall back to Python shims
+# on CPU-only nodes or before the extension is compiled.
+# Knuth critique: original Megatron helpers are compiled-only with no
+# Python fallback, crashing on CPU-only nodes. We guard with try/except.
+# ---------------------------------------------------------------------------
+_cpp_helpers = None
+
+
+def _load_cpp_helpers():
+    """JIT-load indexed_dataset_helpers C++ extension; cache in module global."""
+    global _cpp_helpers
+    if _cpp_helpers is not None:
+        return _cpp_helpers
+    try:
+        from op_builder.indexed_dataset import IndexedDatasetBuilder
+        _cpp_helpers = IndexedDatasetBuilder().load()
+        print("[DS indexed_dataset] C++ helpers loaded successfully "
+              f"(module={_cpp_helpers})")
+    except Exception as exc:  # noqa: BLE001
+        print("[DS indexed_dataset] C++ helpers unavailable, using Python "
+              f"fallback. Reason: {exc}")
+        _cpp_helpers = False  # sentinel: tried and failed
+    return _cpp_helpers
+
+
+# ---------------------------------------------------------------------------
+# Python-fallback implementations (used when C++ ext is absent).
+# These are ~20% adapted from Megatron f51ceb7c9 for the DeepSpeed API
+# surface (no Megatron arguments like `data_impl` string).
+# ---------------------------------------------------------------------------
+
+
+def _py_build_sample_idx(sizes, doc_idx, seq_length, num_epochs, tokens_per_epoch):
+    """Pure-Python fallback for helpers.build_sample_idx.
+
+    Knuth critique: Megatron's version pre-allocates a fixed upper bound and
+    then returns a trimmed view.  We do the same to avoid realloc churn.
+    """
+    print(f"[DS indexed_dataset] _py_build_sample_idx: seq_length={seq_length} "
+          f"num_epochs={num_epochs} tokens_per_epoch={tokens_per_epoch}")
+    num_samples = (tokens_per_epoch - 1) // seq_length
+    # shape [num_samples+1, 2]
+    sample_idx = np.zeros((num_samples + 1, 2), dtype=np.int32)
+    s_idx = 0
+    doc_offset = 0
+    for _ in range(num_epochs):
+        if s_idx >= num_samples:
+            break
+        for i in range(len(doc_idx)):
+            doc_id  = int(doc_idx[i])
+            doc_len = int(sizes[doc_id])
+            while doc_offset + seq_length <= doc_len:
+                if s_idx >= num_samples:
+                    break
+                sample_idx[s_idx, 0] = doc_id
+                sample_idx[s_idx, 1] = doc_offset
+                s_idx += 1
+                doc_offset += seq_length
+            doc_offset = 0
+    print(f"[DS indexed_dataset] _py_build_sample_idx: produced {s_idx} samples")
+    return sample_idx[:s_idx + 1]
+
+
+def _py_build_blending_indices(weights, dataset_sample_cnt, size):
+    """Pure-Python Bresenham-style blending index builder (fallback)."""
+    print(f"[DS indexed_dataset] _py_build_blending_indices: "
+          f"D={len(weights)} size={size}")
+    D = len(weights)
+    ds_idx = np.zeros(size, dtype=np.int16)
+    sp_idx = np.zeros(size, dtype=np.int64)
+    acc      = np.array(weights, dtype=np.float64)
+    consumed = np.zeros(D, dtype=np.int64)
+    for s in range(size):
+        best = int(np.argmax(acc))
+        ds_idx[s] = best
+        sp_idx[s] = consumed[best] % dataset_sample_cnt[best]
+        consumed[best] += 1
+        acc += weights
+        acc[best] -= 1.0
+    print("[DS indexed_dataset] _py_build_blending_indices: done")
+    return ds_idx, sp_idx
+
+
+def _py_build_mapping(sizes, verbose=False):
+    """Pure-Python O(n log n) token→(sample,offset) mapping (fallback).
+
+    Knuth critique: we use cumsum + searchsorted rather than Megatron's
+    O(n·seq) double loop.
+    """
+    cumsum = np.zeros(len(sizes) + 1, dtype=np.int64)
+    np.cumsum(sizes, out=cumsum[1:])
+    total_tokens = int(cumsum[-1])
+    if verbose:
+        print(f"[DS indexed_dataset] _py_build_mapping: "
+              f"N={len(sizes)} total_tokens={total_tokens}")
+    tok_range = np.arange(total_tokens, dtype=np.int64)
+    sample_idx = np.searchsorted(cumsum[1:], tok_range, side='right').astype(np.int32)
+    offset_idx = (tok_range - cumsum[sample_idx]).astype(np.int32)
+    mapping = np.stack([sample_idx, offset_idx], axis=1)
+    if verbose:
+        print("[DS indexed_dataset] _py_build_mapping: done")
+    return mapping
+
+
+# Public API: calls C++ if available, otherwise falls back to Python.
+
+def build_sample_idx(sizes, doc_idx, seq_length, num_epochs, tokens_per_epoch):
+    """Build (doc_id, offset) sample-index table.  C++ accelerated when available."""
+    h = _load_cpp_helpers()
+    if h:
+        return h.build_sample_idx(sizes, doc_idx, seq_length, num_epochs, tokens_per_epoch)
+    return _py_build_sample_idx(sizes, doc_idx, seq_length, num_epochs, tokens_per_epoch)
+
+
+def build_blending_indices(weights, dataset_sample_cnt, size):
+    """Build (dataset_idx, sample_idx) blending table.  C++ accelerated when available."""
+    h = _load_cpp_helpers()
+    if h:
+        return h.build_blending_indices(weights, dataset_sample_cnt, size)
+    return _py_build_blending_indices(weights, dataset_sample_cnt, size)
+
+
+def build_mapping(sizes, verbose=False):
+    """Token-position → (sample, offset) mapping.  C++ accelerated when available."""
+    h = _load_cpp_helpers()
+    if h:
+        return h.build_mapping_impl(sizes, verbose)
+    return _py_build_mapping(sizes, verbose)
+
 
 def __best_fitting_dtype(vocab_size=None):
     if vocab_size is not None and vocab_size < 65500:
@@ -329,9 +460,15 @@ class IndexedDatasetBuilder(object):
 
 
 def _warmup_mmap_file(path):
+    file_size = os.path.getsize(path) if os.path.exists(path) else -1
+    print(f"[DS indexed_dataset] warmup mmap: {path} ({file_size} bytes)")
     with open(path, 'rb') as stream:
-        while stream.read(100 * 1024 * 1024):
-            pass
+        read_bytes = 0
+        chunk = stream.read(100 * 1024 * 1024)
+        while chunk:
+            read_bytes += len(chunk)
+            chunk = stream.read(100 * 1024 * 1024)
+    print(f"[DS indexed_dataset] warmup mmap done: read {read_bytes} bytes from {path}")
 
 
 def exscan_from_cumsum_(arr):
@@ -493,6 +630,9 @@ class MMapIndexedDataset(torch.utils.data.Dataset):
 
     def _do_init(self, path, skip_warmup):
         self._path = path
+        # M460: eagerly attempt C++ helpers load so diagnostics fire once at
+        # dataset construction rather than lazily at first sample access.
+        _load_cpp_helpers()
         self._index = self.Index(index_file_path(self._path), skip_warmup)
 
         if not skip_warmup:
