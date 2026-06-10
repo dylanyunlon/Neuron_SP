@@ -262,6 +262,8 @@ class DeepSpeedEngine(Module):
         self._desloc_double_buffer_enabled = False
         self._desloc_histogram_kernel = None
         self._desloc_buffer_pool = None
+        # M470: distributed optimizer state sharding manager (init after optimizer is ready)
+        self._desloc_dist_opt_mgr = None
         self.gradient_average = True
         self.warn_unscaled_loss = True
         self.config = config
@@ -2664,6 +2666,13 @@ class DeepSpeedEngine(Module):
         self._desloc_scheduler = get_desloc_scheduler()
         self._desloc_tiered_ar = get_desloc_tiered_ar()
         self._desloc_profiler = get_desloc_profiler()
+        # M470: build distributed optimizer shard manager if models expose grad_buffers
+        # Uses Megatron 4feb2b0d public API: model.grad_buffers / .grad_buffer_param_index_map
+        models = [self.module] if hasattr(self.module, 'grad_buffers') else []
+        if models and dp is not None:
+            self._desloc_dist_opt_mgr = DeslocDistributedOptimizerShardManager(models, dp)
+            self._desloc_dist_opt_mgr.build_shard_ranges()
+            print(f"[DESLOC-DIST-OPT] shard manager ready dp_world={self._desloc_dist_opt_mgr.dp_world_size}")
 
     def _desloc_build_param_tier_map(self):
         self._desloc_param_tiers = {}
@@ -3105,6 +3114,13 @@ class DeepSpeedEngine(Module):
             self.torch_autocast_z0_gradscaler.step(self.optimizer)
             self.torch_autocast_z0_gradscaler.update()
         else:
+            # M470: on Kx sync steps, all-gather param shards before optimizer update
+            # so every rank has the complete parameter tensor.  Mirrors Megatron
+            # DistributedOptimizer._allgather_params() (commit 4feb2b0d).
+            if (self.desloc_enabled
+                    and self._desloc_dist_opt_mgr is not None
+                    and self.desloc_is_param_sync_step()):
+                self._desloc_dist_opt_mgr.allgather_params()
             self.optimizer.step()
 
         if hasattr(self.optimizer, '_global_grad_norm'):
@@ -5448,6 +5464,137 @@ def desloc_should_force_sync(engine, loss_current, loss_previous):
     if ratio > 2.0:  # loss doubled — force sync
         return True
     return False
+
+
+# =============================================================================
+# M470: DES-LOC Distributed Optimizer State Sharding
+#
+# Ref: Megatron-LM commit 4feb2b0d (Support distributed optimizer)
+# Ref: megatron/optimizer/distrib_optimizer.py — optimizer state sharding
+#
+# Design: mirrors Megatron's DistributedOptimizer pattern, adapted for DES-LOC:
+#   - Optimizer states (m1, m2, master weights) sharded across DP ranks
+#     Each rank owns states for params in indices [shard_start, shard_end)
+#     of the flattened grad buffer — same partitioning logic as Megatron.
+#   - On Kx sync steps: all-gather params from every DP rank so the full
+#     parameter tensor is reconstructed before the global AllReduce.
+#   - Public attribute names follow Megatron 4feb2b0d rename:
+#       model.grad_buffers               (was _grad_buffers)
+#       model.grad_buffer_param_index_map (was _grad_buffer_param_index_map)
+#
+# Knuth critique (Vol.3 §6.5): partitioning without accounting for padding
+# wastes one DP rank worth of memory; numel_padded alignment is deliberate.
+# Knuth critique (TAOCP §2.2.3): linked traversal of param_index_map has
+# O(P) setup cost per dtype — acceptable since it runs once at init, not
+# per step.  Hot path (all-gather) is O(N/W) per rank, W = dp_world_size.
+# =============================================================================
+
+
+class DeslocDistributedOptimizerShardManager:
+    """Shard optimizer states across data-parallel ranks, all-gather params on sync steps.
+
+    Follows Megatron DistributedOptimizer state-sharding strategy (commit 4feb2b0d).
+    Integrated into DeepSpeed engine for DES-LOC to reduce per-rank optimizer memory
+    by a factor equal to the data-parallel world size.
+
+    Usage (called from DeepSpeedEngine):
+        mgr = DeslocDistributedOptimizerShardManager(models, dp_group)
+        mgr.build_shard_ranges()          # called once at init
+        mgr.allgather_params()            # called on every Kx sync step
+    """
+
+    def __init__(self, models, dp_group):
+        # models: list of nn.Module — each must expose .grad_buffers and
+        #         .grad_buffer_param_index_map (Megatron 4feb2b0 public API).
+        self.models = models
+        self.dp_group = dp_group
+        self.dp_world_size = dist.get_world_size(group=dp_group)
+        self.dp_rank = dist.get_rank(group=dp_group)
+        # shard_ranges[model_idx][dtype] = (shard_start, shard_end) in flat grad-buffer coords
+        self.shard_ranges = []
+        # param_shard_map[model_idx][dtype][param] = local (start, end) within this rank's shard
+        self.param_shard_map = []
+        self._built = False
+
+    def build_shard_ranges(self):
+        """Compute per-rank contiguous shard boundaries over each grad buffer.
+
+        Mirrors DistributedOptimizer.build_model_gbuf_range_map() logic.
+        Uses model.grad_buffers and model.grad_buffer_param_index_map
+        (Megatron commit 4feb2b0d public rename from _grad_buffers).
+        """
+        import math as _math
+        self.shard_ranges = []
+        self.param_shard_map = []
+        for model_idx, model in enumerate(self.models):
+            # Public API: grad_buffers exposed after Megatron 4feb2b0d rename
+            grad_buffers = getattr(model, 'grad_buffers', None)
+            param_index_map = getattr(model, 'grad_buffer_param_index_map', None)
+            if grad_buffers is None or param_index_map is None:
+                # Model does not expose Megatron-style grad buffers — skip
+                self.shard_ranges.append({})
+                self.param_shard_map.append({})
+                print(f"[DESLOC-DIST-OPT] model[{model_idx}] missing grad_buffers "
+                      f"or grad_buffer_param_index_map — skipping shard build")
+                continue
+            model_ranges = {}
+            model_param_map = {}
+            for dtype, gbuf in grad_buffers.items():
+                gbuf_numel = gbuf.numel_padded if hasattr(gbuf, 'numel_padded') else gbuf.numel()
+                shard_size = int(_math.ceil(gbuf_numel / self.dp_world_size))
+                shard_start = self.dp_rank * shard_size
+                shard_end = min(shard_start + shard_size, gbuf_numel)
+                model_ranges[dtype] = (shard_start, shard_end)
+                # Map each param to its overlap with this rank's shard
+                local_param_map = {}
+                if dtype in param_index_map:
+                    for param, (p_start, p_end) in param_index_map[dtype].items():
+                        # Intersection of [p_start, p_end) with [shard_start, shard_end)
+                        lo = max(p_start, shard_start)
+                        hi = min(p_end, shard_end)
+                        if lo < hi:
+                            local_param_map[param] = (lo - shard_start, hi - shard_start)
+                model_param_map[dtype] = local_param_map
+                print(f"[DESLOC-DIST-OPT] model[{model_idx}] dtype={dtype} "
+                      f"gbuf_numel={gbuf_numel} shard=[{shard_start},{shard_end}) "
+                      f"n_params_in_shard={len(local_param_map)}")
+            self.shard_ranges.append(model_ranges)
+            self.param_shard_map.append(model_param_map)
+        self._built = True
+
+    def allgather_params(self):
+        """All-gather full parameter tensors from shards held on each DP rank.
+
+        Called on every Kx sync step so all ranks hold the complete, up-to-date
+        parameter values before the optimizer's AllReduce communication.
+        Pattern: Megatron DistributedOptimizer._allgather_params().
+        """
+        import torch
+        if not self._built:
+            return
+        for model_idx, model in enumerate(self.models):
+            grad_buffers = getattr(model, 'grad_buffers', None)
+            param_index_map = getattr(model, 'grad_buffer_param_index_map', None)
+            if grad_buffers is None or param_index_map is None:
+                continue
+            for dtype, gbuf in grad_buffers.items():
+                # Reconstruct the flat buffer from per-rank shards via all-gather
+                gbuf_data = gbuf.data if hasattr(gbuf, 'data') else gbuf
+                shard_size = (gbuf_data.numel() + self.dp_world_size - 1) // self.dp_world_size
+                # Pad to multiple of dp_world_size so all-gather shapes match
+                padded_len = shard_size * self.dp_world_size
+                if padded_len != gbuf_data.numel():
+                    padded = torch.zeros(padded_len, dtype=gbuf_data.dtype, device=gbuf_data.device)
+                    padded[:gbuf_data.numel()].copy_(gbuf_data)
+                else:
+                    padded = gbuf_data
+                shards = list(padded.chunk(self.dp_world_size))
+                dist.all_gather(shards, shards[self.dp_rank], group=self.dp_group)
+                # Copy the gathered data back into the live grad buffer
+                gathered = torch.cat(shards)[:gbuf_data.numel()]
+                gbuf_data.copy_(gathered)
+        print(f"[DESLOC-DIST-OPT] all-gather complete dp_rank={self.dp_rank} "
+              f"dp_world_size={self.dp_world_size}")
 
 
 # =============================================================================
