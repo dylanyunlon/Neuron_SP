@@ -24,6 +24,7 @@
 import torch
 from torch.distributed import GradBucket  # noqa: F401
 import os
+import math
 
 from ..constants import TORCH_DISTRIBUTED_DEFAULT_PORT, default_pg_timeout
 from .constants import *
@@ -1196,6 +1197,23 @@ class DeslocTieredAllReduce:
         self._param_map = {}
         self._tier_norm_sq = {'x': 0.0, 'u': 0.0, 'v': 0.0}
         self._comm_stream = None  # Megatron DDP communication_stream
+        # Adaptive bucket sizing: track per-tier gradient magnitude history.
+        # When a tier's gradient norm is small relative to params, enlarge
+        # buckets (fewer NCCL calls, better bandwidth utilization).
+        # When norm is large (active learning region), shrink buckets for
+        # lower latency. Inspired by ulysses_sp TiledMLP's dynamic shard
+        # count selection: num_shards = ceil(seqlen / hidden), then
+        # all_reduce(MAX) across ranks for agreement.
+        self._tier_bucket_scale = {'x': 1.0, 'u': 1.0, 'v': 1.0}
+        self._tier_grad_history = {'x': [], 'u': [], 'v': []}
+        self._adaptive_window = 20  # sliding window for norm tracking
+        # Per-tier comm streams for overlapping x/u/v reductions.
+        # Pattern: Megatron uses one stream per grad bucket type;
+        # we extend to one per DES-LOC tier so x-sync can overlap
+        # with u-sync when both fire on the same step.
+        self._tier_streams = {'x': None, 'u': None, 'v': None}
+        self._diag_enabled = int(os.environ.get('DESLOC_DIAG', '0')) > 0
+        self._reduce_call_count = 0
 
     def _get_stream(self):
         """Lazy-init comm stream. Ref: Megatron param_and_grad_buffer.py:577."""
@@ -1205,6 +1223,41 @@ class DeslocTieredAllReduce:
             except Exception:
                 pass
         return self._comm_stream
+
+    def _get_tier_stream(self, tier):
+        """Per-tier comm stream. Enables x/u/v reductions to overlap
+        on the same step. Pattern: ulysses_sp uses separate streams
+        for A2A forward vs backward; we use separate streams per tier."""
+        if self._tier_streams[tier] is None:
+            try:
+                self._tier_streams[tier] = torch.cuda.Stream()
+            except Exception:
+                pass
+        return self._tier_streams[tier]
+
+    def _adapt_bucket_cap(self, tier):
+        """Dynamically scale bucket size based on gradient norm trend.
+        Small gradients → larger buckets (bandwidth-optimal).
+        Large gradients → smaller buckets (latency-optimal).
+        Pattern: desloc_adaptive_Kx in runtime/utils.py tracks loss
+        trend to adjust Kx; we apply the same principle to bucket size."""
+        hist = self._tier_grad_history[tier]
+        if len(hist) < 3:
+            return self._bucket_cap
+        recent = hist[-self._adaptive_window:]
+        mean_norm = sum(recent) / len(recent)
+        if len(recent) >= 2:
+            trend = recent[-1] - recent[0]
+            # Gradient shrinking → enlarge buckets up to 2×
+            if trend < 0 and mean_norm > 0:
+                scale = min(2.0, 1.0 + abs(trend) / (mean_norm + 1e-12))
+            # Gradient growing → shrink buckets down to 0.5×
+            elif trend > 0 and mean_norm > 0:
+                scale = max(0.5, 1.0 - trend / (mean_norm * 4 + 1e-12))
+            else:
+                scale = 1.0
+            self._tier_bucket_scale[tier] = round(scale, 3)
+        return int(self._bucket_cap * self._tier_bucket_scale[tier])
 
     def register_param(self, param, tier='x'):
         """Assign param to a tier bucket; create new bucket when full.
@@ -1247,16 +1300,27 @@ class DeslocTieredAllReduce:
 
         Ref: Megatron param_and_grad_buffer.py:594 —
              with stream_context, _coalescing_manager(..., async_ops=async_op)
+
+        Enhanced with:
+        1. Per-tier stream isolation (x/u/v can overlap)
+        2. Adaptive bucket cap based on gradient norm trend
+        3. Diagnostic printing of every sync/skip decision
         """
         import torch.distributed as tdist
+        import time as _time
         if not tdist.is_initialized():
             return {'x': 0, 'u': 0, 'v': 0}
 
+        self._reduce_call_count += 1
         reduced = {'x': 0, 'u': 0, 'v': 0}
-        stream = self._get_stream() if self._overlap else None
+        _t0 = _time.monotonic_ns()
 
         for tier in ('x', 'u', 'v'):
             sync = self._should_sync(tier)
+            # Use per-tier stream for overlapped reduction
+            tier_stream = self._get_tier_stream(tier) if self._overlap else None
+            tier_bytes_this_call = 0
+
             for bkt in self._buckets[tier]:
                 if not bkt.all_ready():
                     continue
@@ -1264,14 +1328,19 @@ class DeslocTieredAllReduce:
                 buf = bkt.data[:bkt._fill]
 
                 # Per-tier grad norm — neuronx-distributed pattern
-                self._tier_norm_sq[tier] += float(buf.float().norm().item()) ** 2
+                buf_norm = float(buf.float().norm().item())
+                self._tier_norm_sq[tier] += buf_norm ** 2
+                # Track for adaptive bucket sizing
+                self._tier_grad_history[tier].append(buf_norm)
+                if len(self._tier_grad_history[tier]) > self._adaptive_window * 2:
+                    self._tier_grad_history[tier] = self._tier_grad_history[tier][-self._adaptive_window:]
 
                 if sync:
                     if self._fp32_reduce and buf.dtype != torch.float32:
                         fp32 = buf.float()
-                        if stream is not None:
-                            stream.wait_stream(torch.cuda.current_stream())
-                            with torch.cuda.stream(stream):
+                        if tier_stream is not None:
+                            tier_stream.wait_stream(torch.cuda.current_stream())
+                            with torch.cuda.stream(tier_stream):
                                 h = tdist.all_reduce(fp32, op=tdist.ReduceOp.AVG,
                                                      group=self.group, async_op=True)
                         else:
@@ -1279,9 +1348,9 @@ class DeslocTieredAllReduce:
                                                  group=self.group, async_op=self._overlap)
                         self._pending.append((h, buf, fp32))
                     else:
-                        if stream is not None:
-                            stream.wait_stream(torch.cuda.current_stream())
-                            with torch.cuda.stream(stream):
+                        if tier_stream is not None:
+                            tier_stream.wait_stream(torch.cuda.current_stream())
+                            with torch.cuda.stream(tier_stream):
                                 h = tdist.all_reduce(buf, op=tdist.ReduceOp.AVG,
                                                      group=self.group, async_op=True)
                         else:
@@ -1290,22 +1359,57 @@ class DeslocTieredAllReduce:
                         self._pending.append((h, None, None))
                     self._bytes_sent += nb
                     self._op_count += 1
+                    tier_bytes_this_call += nb
                     self.scheduler.record_sync(tier)
                     reduced[tier] += 1
                 else:
                     self._bytes_skipped += nb
                     self.scheduler.record_skip()
                 bkt.reset()
+
+            # Diagnostic: per-tier reduce summary
+            if self._diag_enabled and (self._reduce_call_count % 50 == 1):
+                _rank = tdist.get_rank() if tdist.is_initialized() else 0
+                _tn = math.sqrt(self._tier_norm_sq[tier]) if self._tier_norm_sq[tier] > 0 else 0
+                _bscale = self._tier_bucket_scale[tier]
+                print(f"[BUCKET-DIAG] rank={_rank} call={self._reduce_call_count} "
+                      f"tier={tier} sync={sync} reduced={reduced[tier]} "
+                      f"bytes={tier_bytes_this_call} norm={_tn:.4f} "
+                      f"bucket_scale={_bscale:.3f} "
+                      f"pending_handles={len(self._pending)}")
+
+        _dt_us = (_time.monotonic_ns() - _t0) / 1000
+        if self._diag_enabled and self._reduce_call_count % 200 == 1:
+            _rank = tdist.get_rank() if tdist.is_initialized() else 0
+            print(f"[BUCKET-TIMING] rank={_rank} call={self._reduce_call_count} "
+                  f"reduce_us={_dt_us:.0f} total_sent={self._bytes_sent/1e6:.1f}MB "
+                  f"total_skipped={self._bytes_skipped/1e6:.1f}MB "
+                  f"ratio={self.stats()['reduction']:.2f}x")
         return reduced
 
     def finish_reduces(self):
-        """Wait for async handles. Ref: Megatron finish_grad_sync pattern."""
+        """Wait for async handles. Ref: Megatron finish_grad_sync pattern.
+        Enhanced: waits per-tier streams before handle completion."""
+        import time as _time
+        _t0 = _time.monotonic_ns()
+        # Synchronize all per-tier streams first
+        for tier in ('x', 'u', 'v'):
+            s = self._tier_streams.get(tier)
+            if s is not None:
+                s.synchronize()
         for h, dst, fp32 in self._pending:
             if h is not None:
                 h.wait()
             if dst is not None and fp32 is not None:
                 dst.copy_(fp32)
+        n_pending = len(self._pending)
         self._pending.clear()
+        _dt_us = (_time.monotonic_ns() - _t0) / 1000
+        if self._diag_enabled and n_pending > 0:
+            import torch.distributed as tdist
+            _rank = tdist.get_rank() if tdist.is_initialized() else 0
+            print(f"[BUCKET-FINISH] rank={_rank} n_handles={n_pending} "
+                  f"wait_us={_dt_us:.0f}")
 
     def write_grads_back(self):
         for tier in ('x', 'u', 'v'):

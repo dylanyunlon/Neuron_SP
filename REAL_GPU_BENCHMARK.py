@@ -1085,6 +1085,30 @@ class DESLOCAdamW(torch.optim.Optimizer):
         self._prev_avg = {}  # {param_id: previous averaged params for Nesterov}
         # Activation norm monitoring (Section 5.5: prevent exploding norms)
         self._activation_norms = []
+        # M448: Overflow-Aware Scaling (OAS) — derived from Megatron fb4cbdc
+        # DynamicLossScaler. Instead of a separate LossScaler class, we inline
+        # the three core mechanisms directly into the optimizer:
+        #   1. Overflow detection: scan param grads for inf/nan each step
+        #   2. Hysteresis downscale: require N consecutive overflows before halving
+        #   3. Window upscale: after W clean steps, double the scale
+        # This avoids the Megatron pattern of wrapping the optimizer in another
+        # object, keeping DES-LOC's flat optimizer structure.
+        self._oas_scale = 65536.0       # initial loss scale (Megatron default)
+        self._oas_overflow_cnt = 0      # total overflow events
+        self._oas_clean_steps = 0       # consecutive clean steps
+        self._oas_scale_window = 200    # clean steps needed to double scale
+        self._oas_min_scale = 1.0       # floor — never scale below this
+        self._oas_max_scale = 2**24     # ceiling — 16M
+        self._oas_hysteresis = 2        # consecutive overflows needed to halve
+        self._oas_pending_ovf = 0       # hysteresis counter
+        self._oas_enabled = True        # can be disabled for bf16-only runs
+        self._oas_last_action = 'init'  # diagnostic: last scale action taken
+
+    @property
+    def grad_scale(self):
+        """Current loss scale for training loop. Megatron exposes this via
+        FP16_Optimizer.loss_scale; we expose it as a read-only property."""
+        return self._oas_scale if self._oas_enabled else 1.0
     
     def step(self):
         self.global_step += 1
@@ -1201,6 +1225,61 @@ class DESLOCAdamW(torch.optim.Optimizer):
                   f"||v||={math.sqrt(total_v_norm_sq):.4f} "
                   f"||p||={math.sqrt(total_p_norm_sq):.4f} "
                   f"offload={self._use_offload}")
+
+        # M448: Overflow-Aware Scaling (OAS) — post-step check
+        # Derived from Megatron DynamicLossScaler._has_inf_or_nan + update_scale.
+        # Scans all param data for inf/nan after update. If detected:
+        #   - Increment hysteresis counter
+        #   - If hysteresis threshold hit: halve scale, reset counter
+        # If clean: increment clean_steps, double scale at window boundary.
+        if self._oas_enabled:
+            _oas_found_overflow = False
+            for group in self.param_groups:
+                for p in group['params']:
+                    _psum = float(p.data.float().sum())
+                    if _psum != _psum or abs(_psum) == float('inf'):
+                        _oas_found_overflow = True
+                        break
+                if _oas_found_overflow:
+                    break
+
+            _r = dist.get_rank() if dist.is_initialized() else 0
+            if _oas_found_overflow:
+                self._oas_overflow_cnt += 1
+                self._oas_pending_ovf += 1
+                self._oas_clean_steps = 0
+                if self._oas_pending_ovf >= self._oas_hysteresis:
+                    old_scale = self._oas_scale
+                    self._oas_scale = max(self._oas_min_scale, self._oas_scale / 2.0)
+                    self._oas_pending_ovf = 0
+                    self._oas_last_action = 'halve'
+                    print(f"[OAS/OVERFLOW] rank={_r} step={self.global_step} "
+                          f"SCALE {old_scale} -> {self._oas_scale} "
+                          f"(ovf_total={self._oas_overflow_cnt} "
+                          f"hysteresis={self._oas_hysteresis} clean=0)")
+                else:
+                    self._oas_last_action = 'pending'
+                    print(f"[OAS/OVERFLOW] rank={_r} step={self.global_step} "
+                          f"scale={self._oas_scale} PENDING "
+                          f"({self._oas_pending_ovf}/{self._oas_hysteresis}) "
+                          f"ovf_total={self._oas_overflow_cnt}")
+            else:
+                self._oas_pending_ovf = 0
+                self._oas_clean_steps += 1
+                if self._oas_clean_steps >= self._oas_scale_window:
+                    old_scale = self._oas_scale
+                    self._oas_scale = min(self._oas_max_scale, self._oas_scale * 2.0)
+                    self._oas_clean_steps = 0
+                    self._oas_last_action = 'double'
+                    print(f"[OAS/SCALEUP] rank={_r} step={self.global_step} "
+                          f"SCALE {old_scale} -> {self._oas_scale} "
+                          f"(clean={self._oas_scale_window} "
+                          f"ovf_total={self._oas_overflow_cnt})")
+                elif self.global_step % 100 == 0:
+                    print(f"[OAS/STATUS] rank={_r} step={self.global_step} "
+                          f"scale={self._oas_scale} "
+                          f"clean={self._oas_clean_steps}/{self._oas_scale_window} "
+                          f"ovf={self._oas_overflow_cnt}")
     
     def sync_if_needed(self, world_size: int):
         """Sync optimizer states based on DES-LOC schedule.

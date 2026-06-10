@@ -2436,37 +2436,95 @@ def desloc_comm_compute_overlap_ratio(model_params, batch_tokens,
 
 
 def desloc_adaptive_Kx(current_mfu, target_mfu=0.55, current_Kx=32,
-                        min_Kx=1, max_Kx=256, step_factor=2):
-    """Adaptively adjust Kx to reach target MFU.
+                        min_Kx=1, max_Kx=256, step_factor=2,
+                        loss_history=None, ac_enabled=False,
+                        peak_mem_frac=0.0, grad_norm=0.0):
+    """Adaptively adjust Kx based on MFU, loss trend, and memory pressure.
 
-    If current MFU < target: reduce Kx (more syncs, but maybe we're
-    diverging due to stale params)
-    If current MFU > target: increase Kx (less syncs, save comm)
-
-    This is a simple multiplicative adjustment, not a control loop.
+    Extended beyond simple MFU tracking to incorporate:
+    1. Loss trend detection — if loss is rising over last N steps,
+       reduce Kx aggressively (staleness causing divergence).
+       Pattern: checkpointing.py partition_activations tracks memory
+       to decide CPU vs GPU; we track loss to decide sync frequency.
+    2. Activation checkpoint memory feedback — when AC is enabled and
+       memory pressure is high (peak_mem_frac > 0.9), prefer smaller Kx
+       to reduce the risk of OOM from accumulated stale updates that
+       cause larger gradient magnitudes.
+    3. Gradient norm spike detection — sudden grad norm increase signals
+       loss landscape curvature change; tighten Kx temporarily.
+       Pattern: ulysses_sp SequenceTiledCompute adjusts shard count
+       based on seqlen/hidden ratio; we adjust Kx based on grad/param ratio.
     """
     if current_mfu <= 0:
-        return current_Kx
+        return {
+            'new_Kx': current_Kx, 'old_Kx': current_Kx,
+            'action': 'hold_no_mfu', 'reason': 'mfu<=0',
+            'current_mfu': 0.0, 'target_mfu': round(target_mfu, 6),
+        }
 
-    if current_mfu < target_mfu * 0.9:
-        # MFU too low → might be diverging, reduce Kx
+    action = 'hold'
+    reason = 'in_band'
+    new_Kx = current_Kx
+
+    # Check 1: Loss trend (highest priority — divergence is catastrophic)
+    if loss_history and len(loss_history) >= 5:
+        recent = loss_history[-5:]
+        # Rising loss over 5 consecutive steps → emergency Kx reduction
+        rising_count = sum(1 for i in range(1, len(recent)) if recent[i] > recent[i-1])
+        if rising_count >= 4:
+            new_Kx = max(min_Kx, current_Kx // (step_factor * 2))
+            action = 'emergency_decrease'
+            reason = f'loss_rising_{rising_count}/4'
+        elif rising_count >= 3:
+            new_Kx = max(min_Kx, current_Kx // step_factor)
+            action = 'decrease_loss_trend'
+            reason = f'loss_rising_{rising_count}/4'
+
+    # Check 2: Gradient norm spike
+    if action == 'hold' and grad_norm > 0:
+        # Heuristic: grad_norm > 10 suggests steep curvature
+        if grad_norm > 10.0:
+            new_Kx = max(min_Kx, current_Kx // step_factor)
+            action = 'decrease_grad_spike'
+            reason = f'grad_norm={grad_norm:.2f}>10'
+
+    # Check 3: Memory pressure with AC
+    if action == 'hold' and ac_enabled and peak_mem_frac > 0.9:
         new_Kx = max(min_Kx, current_Kx // step_factor)
-        action = 'decrease'
-    elif current_mfu > target_mfu * 1.1:
-        # MFU already high → try increasing Kx for more savings
-        new_Kx = min(max_Kx, current_Kx * step_factor)
-        action = 'increase'
-    else:
-        new_Kx = current_Kx
-        action = 'hold'
+        action = 'decrease_mem_pressure'
+        reason = f'peak_mem={peak_mem_frac:.2f}>0.9+AC'
 
-    return {
+    # Check 4: MFU-based adjustment (lowest priority)
+    if action == 'hold':
+        if current_mfu < target_mfu * 0.9:
+            new_Kx = max(min_Kx, current_Kx // step_factor)
+            action = 'decrease'
+            reason = f'mfu={current_mfu:.4f}<{target_mfu*0.9:.4f}'
+        elif current_mfu > target_mfu * 1.1:
+            new_Kx = min(max_Kx, current_Kx * step_factor)
+            action = 'increase'
+            reason = f'mfu={current_mfu:.4f}>{target_mfu*1.1:.4f}'
+
+    result = {
         'new_Kx': new_Kx,
         'old_Kx': current_Kx,
         'action': action,
+        'reason': reason,
         'current_mfu': round(current_mfu, 6),
         'target_mfu': round(target_mfu, 6),
+        'grad_norm': round(grad_norm, 4),
+        'ac_enabled': ac_enabled,
+        'peak_mem_frac': round(peak_mem_frac, 4),
+        'loss_window': [round(l, 4) for l in (loss_history[-5:] if loss_history else [])],
     }
+
+    # Diagnostic dump — always print when Kx actually changes
+    if new_Kx != current_Kx:
+        print(f"[ADAPTIVE-Kx] {action}: Kx {current_Kx} -> {new_Kx} | "
+              f"reason={reason} mfu={current_mfu:.4f} grad={grad_norm:.4f} "
+              f"mem={peak_mem_frac:.3f} ac={ac_enabled}")
+
+    return result
 
 
 def desloc_estimate_step_time(model_params, batch_tokens,
