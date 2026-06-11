@@ -408,3 +408,22 @@ def _m36_get_samples_mapping(indexed_dataset, data_prefix, num_epochs,
     print_rank_0_fn('  total number of samples: {}'.format(samples_mapping.shape[0]))
     return samples_mapping
 # --- End M36 dataloader ---
+
+
+# ---------------------------------------------------------------------------
+# M40: Megatron 8179ebd31 — removed split dataset
+# Ported from: megatron/data/split_dataset.py (deleted in upstream commit)
+#
+# Megatron removed split_dataset.py entirely in 8179ebd31. The file provided:
+#   - get_train_valid_test_split(splits_string, size) -> splits_index list
+#   - SplitDataset(torch.utils.data.Dataset): subset wrapper via split_inds
+#   - split_ds(ds, split, shuffle) -> list of SplitDataset or None
+#
+# In the DeepSpeed/Neuron_SP codebase the equivalent train/val/test splitting
+# is handled natively by DeepSpeedDataSampler and the distributed sampler
+# paths above. No SplitDataset class existed here prior to this commit.
+# This comment records the intentional absence as a 1-to-1 mirror of the
+# upstream deletion.
+# ---------------------------------------------------------------------------
+
+print('[M40] dataloader: split_dataset removed (mirrors Megatron 8179ebd31 — SplitDataset/split_ds/get_train_valid_test_split deleted upstream)')
