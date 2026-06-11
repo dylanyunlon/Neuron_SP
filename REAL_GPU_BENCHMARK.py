@@ -942,7 +942,7 @@ NEURONSP_VOCAB_DIVISIBLE_BY: int = 128  # Megatron default make_vocab_size_divis
 # Adapted from megatron/data/helpers.cpp: const int32_t LONG_SENTENCE_LEN = 256;
 # Patterns (synthetic sentences) whose token count exceeds this threshold are
 # filtered out during SyntheticDataset.__init__ (mirrors build_mapping_impl logic).
-NEURONSP_LONG_SENTENCE_LEN: int = 256
+NEURONSP_LONG_SENTENCE_LEN: int = 512
 
 
 def _neuronsp_vocab_size_with_padding(num_tokens: int,
@@ -1429,7 +1429,7 @@ class SyntheticDataset(Dataset):
         # Filters out patterns whose token length exceeds NEURONSP_LONG_SENTENCE_LEN.
         # 20% adaptation: operates on Python pattern list instead of C++ sent sizes[];
         # uses list comprehension + counter instead of loop with bool flag.
-        # ----------------------------------------------------------------
+        # Detect patterns with long sentences.
         _long_sent_docs: int = 0
         _filtered_patterns = []
         for _pat in self.patterns:
