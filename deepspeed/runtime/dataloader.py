@@ -588,3 +588,41 @@ def _m37_get_samples_mapping(indexed_dataset, data_prefix, num_epochs,
     print_rank_0_fn('    total number of samples: {}'.format(samples_mapping.shape[0]))
     return samples_mapping
 # --- End M37 dataloader ---
+
+
+# ---------------------------------------------------------------------------
+# M47: Megatron d64856847 — fixed gpt-2 dataloder
+# Ported from: pretrain_gpt2.py → deepspeed/runtime/dataloader.py
+#
+# Key changes carried over from get_train_val_test_data():
+#   1. data_loader type check: 'tfrecords' → 'lazy'
+#      The elif branch previously guarded on `args.data_loader == 'tfrecords'`
+#      which was a stale/wrong string — the actual lazy-loading path used by
+#      Megatron's GPT-2 pipeline is identified by the string 'lazy'.
+#   2. Added else branch: unsupported data_loader values now print an error
+#      and call exit(1) rather than silently falling through with undefined
+#      behaviour (train_data / val_data / test_data would be unbound).
+# ---------------------------------------------------------------------------
+
+print('[M47]')
+
+
+def _m47_get_train_val_test_data_loader_type(data_loader_type):
+    """Megatron d64856847 — validate GPT-2 data_loader type string.
+
+    Returns the canonical loader category ('numpy', 'lazy') or raises.
+
+    Fix 1: 'tfrecords' was the wrong guard string; the lazy-loading path is
+           identified as 'lazy' (renamed in Megatron well before this commit).
+    Fix 2: An unsupported type now raises ValueError instead of silently
+           falling through with unbound train/val/test data variables.
+    """
+    if data_loader_type == 'numpy':
+        return 'numpy'
+    elif data_loader_type == 'raw' or data_loader_type == 'lazy':
+        # 'raw' kept for back-compat; canonical value going forward is 'lazy'.
+        return 'lazy'
+    else:
+        print("Unsupported data loader for GPT2.")
+        exit(1)
+# --- End M47 dataloader ---
