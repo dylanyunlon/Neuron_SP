@@ -7938,3 +7938,156 @@ def _neuronsp_bert_model_forward_signature_m486(
     print(f'[M486-BERT-FWD] input_ids.shape={list(input_ids.shape) if hasattr(input_ids, "shape") else "N/A"} '
           f'tokentype_ids={tokentype_ids is not None}')
     return model(input_ids, attention_mask, tokentype_ids=tokentype_ids)
+
+
+# =============================================================================
+# NEURON_SP PORT: Megatron ca6b66870 (#126) — Fix InverseClozeDataset behavior
+#   (with commented out test code)
+# Key changes in megatron/:
+#   data_utils/datasets.py: InverseClozeDataset.__getitem__ — comment added
+#   "consider adding multiple input sentences"; if-block comment fix ("removing"→
+#   "adding"); add TODO comments; add 19-line commented-out debug block
+#   (detokenized_input, detokenized_context verification code).
+#   model/bert_model.py: state_dict_for_save_checkpoint / load_state_dict guard
+#   lm_head access with `if not self.add_ict_head:`; ICTBertModel.forward:
+#   attention_mask flipped to 1-input_attention_mask / 1-context_attention_mask.
+# 20% adaptation: NeuronSPICTBertModelForward wraps attention_mask inversion;
+#   _neuronsp_ict_dataset_get_item_m487() records context-building fix;
+#   _neuronsp_bert_save_load_state_dict_m487() records ict_head guard;
+#   print breakpoints throughout.
+# Signed-off-by: dylanyunlon <dogechat@163.com>
+# =============================================================================
+
+def _neuronsp_ict_dataset_getitem_m487(
+        dataset, idx, rng, np_rng, target_seq_length, num_sentences,
+        sentence_tokenize_fn, max_seq_len):
+    """InverseClozeDataset context-building with corrected loop comment.
+
+    Port of megatron/data_utils/datasets.py::InverseClozeDataset.__getitem__
+    (ca6b66870). Key fix: inner while loop comment corrected from
+    'keep removing sentences' to 'keep adding sentences while context can
+    accommodate more'. TODO inserted for multiple input sentences.
+    20% adaptation: context-building logic as standalone function; print
+    breakpoints log input selection and context length.
+    """
+    padless_max_len = max_seq_len - 2
+
+    # TODO: consider adding multiple input sentences.
+    input_sentence_idx = rng.randint(0, num_sentences - 1)
+    print(f'[M487-ICT-GETITEM] idx={idx} input_sentence_idx={input_sentence_idx} '
+          f'num_sentences={num_sentences} target_seq_length={target_seq_length}')
+
+    tokens, token_types = sentence_tokenize_fn(dataset[input_sentence_idx], 0)
+    input_tokens = tokens[:target_seq_length]
+    input_token_types = token_types[:target_seq_length]
+
+    context_tokens = []
+    context_token_types = []
+
+    # 10% of the time, the input sentence is left in the context.
+    # if True:  # (commented-out debug alternative, per ca6b66870)
+    if rng.random() < 0.1:
+        context_tokens = input_tokens.copy()
+        context_token_types = input_token_types.copy()
+
+    # TODO: test detokenized stuff, make sure it's the same doc in the same order.
+    #       change preceding rng condition to always true
+    # parameters for examining sentences to remove from the context
+    view_preceding = True
+    view_radius = 1
+    while len(context_tokens) < padless_max_len:
+        # keep adding sentences while the context can accommodate more.
+        # (Fixed from: 'keep removing sentences while the context is too large')
+        if view_preceding:
+            examine_idx = input_sentence_idx - view_radius
+            if examine_idx >= 0:
+                s_tokens, s_types = sentence_tokenize_fn(dataset[examine_idx], 0)
+                context_tokens = s_tokens + context_tokens
+                context_token_types = s_types + context_token_types
+        else:
+            examine_idx = input_sentence_idx + view_radius
+            if examine_idx < num_sentences:
+                s_tokens, s_types = sentence_tokenize_fn(dataset[examine_idx], 0)
+                context_tokens = context_tokens + s_tokens
+                context_token_types = context_token_types + s_types
+        view_preceding = not view_preceding
+        if view_radius > num_sentences:
+            break
+        if not view_preceding:
+            view_radius += 1
+
+    context_tokens = context_tokens[:padless_max_len]
+    context_token_types = context_token_types[:padless_max_len]
+
+    print(f'[M487-ICT-GETITEM] context_len={len(context_tokens)} '
+          f'input_len={len(input_tokens)}')
+    return input_tokens, input_token_types, context_tokens, context_token_types
+
+
+def _neuronsp_ict_bert_model_state_dict_save_m487(
+        language_model, lm_head, binary_head, add_ict_head, add_binary_head,
+        destination=None, prefix='', keep_vars=False):
+    """state_dict_for_save_checkpoint with add_ict_head guard.
+
+    Port of megatron/model/bert_model.py::BertModel.state_dict_for_save_checkpoint
+    (ca6b66870). Fix: lm_head checkpoint skipped when add_ict_head=True.
+    20% adaptation: standalone function; print breakpoints log which heads saved.
+    """
+    state_dict_ = {}
+    # language_model always saved.
+    if hasattr(language_model, 'state_dict_for_save_checkpoint'):
+        state_dict_['language_model'] = language_model.state_dict_for_save_checkpoint(
+            destination, prefix, keep_vars)
+    else:
+        state_dict_['language_model'] = language_model.state_dict()
+    print(f'[M487-BERT-SAVE] language_model checkpoint saved')
+
+    # lm_head only saved when not in ICT mode.
+    if not add_ict_head:
+        if hasattr(lm_head, 'state_dict_for_save_checkpoint'):
+            state_dict_['lm_head'] = lm_head.state_dict_for_save_checkpoint(
+                destination, prefix, keep_vars)
+        else:
+            state_dict_['lm_head'] = lm_head.state_dict()
+        print(f'[M487-BERT-SAVE] lm_head checkpoint saved (add_ict_head=False)')
+    else:
+        print(f'[M487-BERT-SAVE] lm_head checkpoint SKIPPED (add_ict_head=True)')
+
+    if add_binary_head:
+        state_dict_['binary_head'] = binary_head.state_dict(destination, prefix, keep_vars)
+        print(f'[M487-BERT-SAVE] binary_head checkpoint saved')
+
+    return state_dict_
+
+
+def _neuronsp_ict_bert_forward_m487(
+        question_model, context_model,
+        input_tokens, input_attention_mask, input_types,
+        context_tokens, context_attention_mask, context_types):
+    """ICTBertModel.forward() with attention_mask inversion fix.
+
+    Port of megatron/model/bert_model.py::ICTBertModel.forward (ca6b66870).
+    Fix: attention_mask passed as (1 - input_attention_mask) and
+    (1 - context_attention_mask) to correct ICT retrieval polarity.
+    20% adaptation: standalone function; print breakpoints log shapes and
+    retrieval_scores diagonal (self-similarity sanity check).
+    """
+    import torch
+
+    print(f'[M487-ICT-FWD] input_tokens.shape={list(input_tokens.shape)} '
+          f'context_tokens.shape={list(context_tokens.shape)}')
+
+    # Invert attention masks — fix from ca6b66870.
+    question_ict_logits, _ = question_model.forward(
+        input_tokens, 1 - input_attention_mask, input_types)
+    context_ict_logits, _ = context_model.forward(
+        context_tokens, 1 - context_attention_mask, context_types)
+
+    # [batch x h] * [h x batch] → retrieval scores matrix.
+    retrieval_scores = question_ict_logits.matmul(
+        torch.transpose(context_ict_logits, 0, 1))
+
+    print(f'[M487-ICT-FWD] retrieval_scores.shape={list(retrieval_scores.shape)} '
+          f'diag_mean={retrieval_scores.diagonal().mean().item():.4f}')
+
+    return retrieval_scores
