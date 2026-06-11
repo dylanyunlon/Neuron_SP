@@ -8,6 +8,9 @@ import torch
 import deepspeed.comm as dist
 
 
+print('[M55]')
+
+
 class _VocabSequenceParallelCrossEntropy(torch.autograd.Function):
 
     @staticmethod
