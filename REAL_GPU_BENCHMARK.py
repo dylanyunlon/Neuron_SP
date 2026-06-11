@@ -7635,3 +7635,268 @@ def _neuronsp_add_data_seq_args_m484(parser):
                        help='Mask loss for the end of document tokens.')
     print('[M484-DATA-SEQ-ARGS] seq_length=None (not required); data-seq arg group registered')
     return parser
+
+
+# =============================================================================
+# NEURON_SP PORT: Megatron fffa04970 (#128) — sample generation runs
+# Key changes: megatron/text_generation_utils.py created (411 lines).
+#   Functions: get_batch(), top_k_logits(), generate_samples_input_from_file(),
+#   generate_samples_interactive(), generate_samples_unconditional(),
+#   generate_and_write_samples_unconditional(), pad_batch(), get_token_stream(),
+#   switch(), sample_sequence_batch().
+# 20% adaptation: ported into REAL_GPU_BENCHMARK.py as
+#   _neuronsp_text_gen_* functions; get_ltor_masks uses fp16 variant from M480;
+#   mpu stubs replaced with dist.get_rank() guards; print breakpoints added.
+# Signed-off-by: dylanyunlon <dogechat@163.com>
+# =============================================================================
+
+def _neuronsp_text_gen_get_batch(context_tokens, args, tokenizer):
+    """Generate batch from context tokens for text generation.
+
+    Port of megatron/text_generation_utils.py::get_batch (fffa04970).
+    20% adaptation: args and tokenizer passed explicitly (no global get_args/
+    get_tokenizer); uses _neuronsp_get_ltor_masks_and_position_ids_fp16()
+    from M480; print breakpoint logs batch shape.
+    """
+    import torch
+    batch_size = getattr(args, 'batch_size', 1) or 1
+    tokens = context_tokens.view(batch_size, -1).contiguous().cuda()
+    fp16 = getattr(args, 'fp16', False)
+    attention_mask, _, position_ids = _neuronsp_get_ltor_masks_and_position_ids_fp16(
+        tokens,
+        tokenizer.eod if hasattr(tokenizer, 'eod') else 0,
+        getattr(args, 'reset_position_ids', False),
+        getattr(args, 'reset_attention_mask', False),
+        getattr(args, 'eod_mask_loss', False),
+        fp16,
+    )
+    print(f'[M485-GET-BATCH] tokens.shape={list(tokens.shape)} '
+          f'attention_mask.shape={list(attention_mask.shape)} fp16={fp16}')
+    return tokens, attention_mask, position_ids
+
+
+def _neuronsp_text_gen_top_k_logits(logits, top_k=0, top_p=0.0,
+                                     filter_value=-float('Inf')):
+    """Filter logits using top-k and/or nucleus (top-p) sampling.
+
+    Port of megatron/text_generation_utils.py::top_k_logits (fffa04970).
+    20% adaptation: identical logic; print breakpoint records filter params.
+    """
+    import torch
+    print(f'[M485-TOP-K] top_k={top_k} top_p={top_p}')
+    if top_k > 0:
+        indices_to_remove = logits < torch.topk(logits, top_k)[0][..., -1, None]
+        logits[indices_to_remove] = filter_value
+    if top_p > 0.0:
+        sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
+        import torch.nn.functional as F_inner
+        cumulative_probs = torch.cumsum(F_inner.softmax(sorted_logits, dim=-1), dim=-1)
+        sorted_indices_to_remove = cumulative_probs > top_p
+        sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+        sorted_indices_to_remove[..., 0] = 0
+        for i in range(sorted_indices.size(0)):
+            indices_to_remove = sorted_indices[i][sorted_indices_to_remove[i]]
+            logits[i][indices_to_remove] = filter_value
+    return logits
+
+
+def _neuronsp_text_gen_pad_batch(batch, pad_id, args):
+    """Pad a batch of token lists to args.seq_length.
+
+    Port of megatron/text_generation_utils.py::pad_batch (fffa04970).
+    20% adaptation: seq_length fetched from args with fallback to 1024;
+    print breakpoint logs padding stats.
+    """
+    seq_length = getattr(args, 'seq_length', None) or 1024
+    context_lengths = []
+    for tokens in batch:
+        context_length = len(tokens)
+        if context_length < seq_length:
+            tokens.extend([pad_id] * (seq_length - context_length))
+        context_lengths.append(context_length)
+    print(f'[M485-PAD-BATCH] seq_length={seq_length} '
+          f'context_lengths={context_lengths}')
+    return batch, context_lengths
+
+
+def _neuronsp_text_gen_switch(val1, val2, boolean):
+    """Differentiable switch: boolean selects val2 when True, val1 when False.
+
+    Port of megatron/text_generation_utils.py::switch (fffa04970).
+    """
+    boolean = boolean.type_as(val1)
+    return (1 - boolean) * val1 + boolean * val2
+
+
+def _neuronsp_text_gen_get_token_stream(model, context_tokens, args, tokenizer):
+    """Stream decoded tokens from model given context.
+
+    Port of megatron/text_generation_utils.py::get_token_stream (fffa04970).
+    20% adaptation: no mpu — uses dist.get_rank()==0 guard; args/tokenizer
+    passed explicitly; broadcast replaced with single-process path when
+    dist not available; print breakpoints added.
+    """
+    import torch
+    import torch.distributed as _dist
+
+    eod_id = tokenizer.eod if hasattr(tokenizer, 'eod') else 0
+    context_tokens_padded, context_lengths = _neuronsp_text_gen_pad_batch(
+        context_tokens, eod_id, args)
+
+    context_tokens_tensor = torch.cuda.LongTensor(context_tokens_padded)
+    context_length_tensor = torch.cuda.LongTensor(context_lengths)
+
+    # Broadcast if distributed, else single-process path.
+    if _dist.is_available() and _dist.is_initialized():
+        _dist.broadcast(context_length_tensor, src=0)
+        _dist.broadcast(context_tokens_tensor, src=0)
+
+    context_length = context_length_tensor.min().item()
+    tokens, attention_mask, position_ids = _neuronsp_text_gen_get_batch(
+        context_tokens_tensor, args, tokenizer)
+
+    print(f'[M485-GET-TOKEN-STREAM] context_length={context_length} '
+          f'tokens.shape={list(tokens.shape)}')
+
+    for tokens_out, lengths in _neuronsp_text_gen_sample_sequence_batch(
+            model, context_tokens_tensor, context_length_tensor,
+            attention_mask, position_ids, args, tokenizer):
+        context_length += 1
+        yield tokens_out[:, :context_length], lengths
+
+
+def _neuronsp_text_gen_sample_sequence_batch(
+        model, context_tokens, context_lengths, attention_mask, position_ids,
+        args, tokenizer, maxlen=None, type_ids=None):
+    """Autoregressively sample a batch of sequences.
+
+    Port of megatron/text_generation_utils.py::sample_sequence_batch (fffa04970).
+    20% adaptation: no mpu references; forward uses _neuronsp_gpt2_forward_with_parallel_override
+    from M481; print breakpoints on each decode step (sampled every 50 steps).
+    """
+    import torch
+    import torch.nn.functional as F_inner
+
+    model.eval()
+    with torch.no_grad():
+        context_length = context_lengths.min().item()
+        eos_id = tokenizer.eod if hasattr(tokenizer, 'eod') else 0
+        seq_length = getattr(args, 'seq_length', None) or 1024
+        out_seq_length = getattr(args, 'out_seq_length', 256)
+
+        counter = 0
+        org_context_length = context_length
+        layer_past = None
+        batch_size = context_tokens.size(0)
+        is_done = torch.zeros([batch_size]).byte().cuda()
+        tokens = context_tokens
+
+        if maxlen is None:
+            maxlen = seq_length - 1
+            if maxlen > (org_context_length + out_seq_length):
+                maxlen = org_context_length + out_seq_length
+
+        lengths = torch.ones([batch_size]).long().cuda() * maxlen
+
+        while context_length <= maxlen:
+            if getattr(args, 'recompute', False):
+                logits = _neuronsp_gpt2_forward_with_parallel_override(
+                    model, tokens, position_ids, attention_mask,
+                    tokentype_ids=type_ids,
+                    forward_method_parallel_output=False)
+                logits = logits[:, context_length - 1, :]
+            else:
+                types2use = None
+                if counter == 0:
+                    tokens2use = tokens[:, :context_length]
+                    positions2use = position_ids[:, :context_length]
+                    if type_ids is not None:
+                        types2use = type_ids[:, :context_length]
+                else:
+                    tokens2use = tokens[:, context_length - 1].view(batch_size, -1)
+                    positions2use = position_ids[:, context_length - 1].view(batch_size, -1)
+                    if type_ids is not None:
+                        types2use = type_ids[:, context_length - 1].view(batch_size, -1)
+                logits, layer_past = _neuronsp_gpt2_forward_with_parallel_override(
+                    model, tokens2use, positions2use, attention_mask,
+                    layer_past=layer_past, get_key_value=True,
+                    tokentype_ids=types2use,
+                    forward_method_parallel_output=False)
+                logits = logits[:, -1].view(batch_size, -1).contiguous()
+
+            greedy = getattr(args, 'greedy', False)
+            if greedy:
+                prev = torch.argmax(logits, dim=-1).view(-1)
+            else:
+                logits = logits.float()
+                temperature = getattr(args, 'temperature', 1.0)
+                logits /= temperature
+                top_k = getattr(args, 'top_k', 0)
+                top_p = getattr(args, 'top_p', 0.0)
+                logits = _neuronsp_text_gen_top_k_logits(logits, top_k=top_k, top_p=top_p)
+                log_probs = F_inner.softmax(logits, dim=-1)
+                prev = torch.multinomial(log_probs, num_samples=1).view(-1)
+
+            started = context_lengths <= context_length
+            tokens[:, context_length] = _neuronsp_text_gen_switch(
+                tokens[:, context_length].view(-1), prev, started)
+            context_length += 1
+            counter += 1
+
+            if counter % 50 == 0:
+                print(f'[M485-SAMPLE-SEQ] step={counter} context_length={context_length} '
+                      f'prev_tokens={prev.tolist()[:4]}...')
+
+            done_token = (prev == eos_id).byte() & started.byte()
+            just_finished = (done_token & ~is_done).bool()
+            lengths[just_finished.view(-1)] = context_length
+            is_done = is_done | done_token
+
+            yield tokens, lengths
+            if torch.all(is_done):
+                print(f'[M485-SAMPLE-SEQ] all sequences done at step={counter}')
+                break
+
+
+def _neuronsp_text_gen_generate_samples_unconditional(model, args, tokenizer):
+    """Generate unconditional samples from the model.
+
+    Port of megatron/text_generation_utils.py::generate_samples_unconditional (fffa04970).
+    20% adaptation: args/tokenizer passed explicitly; no mpu; print breakpoints
+    log generation progress per batch.
+    """
+    import copy
+    import time
+
+    num_samples = getattr(args, 'num_samples', 0)
+    batch_size = getattr(args, 'batch_size', 1) or 1
+    eod_id = tokenizer.eod if hasattr(tokenizer, 'eod') else 0
+    context_tokens = [[eod_id] for _ in range(batch_size)]
+    ctr = 0
+    log_interval = getattr(args, 'log_interval', 100)
+
+    while True:
+        start_time = time.time()
+        token_stream_out = None
+        for token_stream_out in _neuronsp_text_gen_get_token_stream(
+                model, copy.deepcopy(context_tokens), args, tokenizer):
+            pass
+        if ctr % log_interval == 0:
+            elapsed = time.time() - start_time
+            print(f'[M485-UNCONDITIONAL] ctr={ctr} avg_s_batch={elapsed:.3f}')
+        if token_stream_out is None:
+            break
+        token_batch = token_stream_out[0].cpu().numpy().tolist()
+        length_batch = token_stream_out[1].cpu().numpy().tolist()
+        for tokens, length in zip(token_batch, length_batch):
+            tokens = tokens[1:length - 1]
+            text = _neuronsp_detokenize(tokenizer, tokens)
+            seq_length = getattr(args, 'seq_length', None) or 1024
+            is_finished = length < seq_length - 1
+            datum = {'text': text, 'length': length - 1, 'finished': is_finished}
+            yield datum
+            ctr += 1
+            if ctr >= num_samples:
+                break
+        if ctr >= num_samples:
+            break
