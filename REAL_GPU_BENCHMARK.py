@@ -2394,9 +2394,14 @@ class DESLOCAdamW(torch.optim.Optimizer):
                 for p in group['params']:
                     all_params.append(p)
 
-            def _sync_tier(param_list, get_tensor_fn):
+            def _sync_tier(param_list, get_tensor_fn, tier_label='?'):
                 """Chunked flattened AllReduce for one tier.
-                Handles CPU-offloaded tensors via stream overlap."""
+                Handles CPU-offloaded tensors via stream overlap.
+
+                M477: Port Megatron d6c4248b7 MemoryBuffer pattern — reuse a
+                persistent flat buffer across sync calls instead of alloc/free
+                each time. Reduces CUDA memory fragmentation on A6000 (49GB).
+                """
                 tensors, cpu_pairs = [], []
                 for p in param_list:
                     t = get_tensor_fn(p)
@@ -2413,6 +2418,16 @@ class DESLOCAdamW(torch.optim.Optimizer):
                 if cpu_pairs:
                     torch.cuda.current_stream().synchronize()
 
+                # M477 DIAG: pre-sync tier statistics
+                _r_st = dist.get_rank() if dist.is_initialized() else 0
+                _total_numel = sum(t.numel() for t in tensors)
+                _total_bytes = _total_numel * tensors[0].element_size()
+                print(f"[SYNC-TIER] rank={_r_st} step={self.global_step} "
+                      f"tier={tier_label} n_tensors={len(tensors)} "
+                      f"total={_total_bytes/1e6:.1f}MB "
+                      f"cpu_offload={len(cpu_pairs)} "
+                      f"mem_before={torch.cuda.memory_allocated(tensors[0].device)/1e9:.2f}GB")
+
                 # Chunk tensors into groups of ~CHUNK_BYTES each
                 chunks, cur_chunk, cur_bytes = [], [], 0
                 elem_size = tensors[0].element_size()
@@ -2426,11 +2441,23 @@ class DESLOCAdamW(torch.optim.Optimizer):
                 if cur_chunk:
                     chunks.append(cur_chunk)
 
-                # Pre-allocate a reusable flat buffer (avoids torch.cat fragmentation)
+                # M477: Megatron MemoryBuffer pattern — persistent flat buffer.
+                # Key insight from d6c4248b7: allocate once, reuse across calls.
+                # _start index tracks free region; reset() reclaims without dealloc.
                 max_chunk_numel = max(sum(t.numel() for t in c) for c in chunks)
-                flat_buf = torch.empty(max_chunk_numel, dtype=tensors[0].dtype,
-                                       device=tensors[0].device)
+                _buf_key = f'_sync_flat_buf_{tier_label}'
+                _existing = getattr(self, _buf_key, None)
+                if _existing is not None and _existing.numel() >= max_chunk_numel and _existing.device == tensors[0].device:
+                    flat_buf = _existing
+                else:
+                    flat_buf = torch.empty(max_chunk_numel, dtype=tensors[0].dtype,
+                                           device=tensors[0].device)
+                    setattr(self, _buf_key, flat_buf)
+                    if _r_st == 0:
+                        print(f"[MEMBUF] tier={tier_label} alloc {max_chunk_numel*elem_size/1e6:.1f}MB "
+                              f"(Megatron d6c4248 MemoryBuffer pattern)")
 
+                _checksum_pre = 0.0
                 for chunk in chunks:
                     total = sum(t.numel() for t in chunk)
                     flat = flat_buf[:total]
@@ -2449,19 +2476,26 @@ class DESLOCAdamW(torch.optim.Optimizer):
                         t.copy_(flat[off:off + n].reshape(t.shape))
                         off += n
 
-                del flat_buf
+                # M477 DIAG: post-sync checksum
+                if self.global_step % 100 == 1:
+                    _cksum = sum(t.float().sum().item() for t in tensors[:5])
+                    print(f"[SYNC-TIER-POST] rank={_r_st} step={self.global_step} "
+                          f"tier={tier_label} checksum_sample={_cksum:.4f} "
+                          f"n_chunks={len(chunks)} "
+                          f"mem_after={torch.cuda.memory_allocated(tensors[0].device)/1e9:.2f}GB")
+
                 # Stream back CPU-offloaded tensors
                 for cpu_t, gpu_t in cpu_pairs:
                     cpu_t.copy_(gpu_t, non_blocking=True)
 
             if sync_x and all_params:
-                _sync_tier(all_params, lambda p: p.data)
+                _sync_tier(all_params, lambda p: p.data, tier_label='x')
             if sync_u and all_params:
                 _sync_tier(all_params,
-                    lambda p: self.state.get(p, {}).get('exp_avg'))
+                    lambda p: self.state.get(p, {}).get('exp_avg'), tier_label='u')
             if sync_v and all_params:
                 _sync_tier(all_params,
-                    lambda p: self.state.get(p, {}).get('exp_avg_sq'))
+                    lambda p: self.state.get(p, {}).get('exp_avg_sq'), tier_label='v')
 
         # M364 DIAG: post-sync checksum
         if sync_x and world_size > 1 and self.global_step % 100 == 1:
