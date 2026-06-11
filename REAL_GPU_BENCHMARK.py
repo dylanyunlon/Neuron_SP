@@ -938,6 +938,12 @@ class TransformerBlock(nn.Module):
 # =============================================================================
 NEURONSP_VOCAB_DIVISIBLE_BY: int = 128  # Megatron default make_vocab_size_divisible_by
 
+# NEURON_SP PORT: Megatron 2c58c9b04 — added filtering based on sentence length
+# Adapted from megatron/data/helpers.cpp: const int32_t LONG_SENTENCE_LEN = 256;
+# Patterns (synthetic sentences) whose token count exceeds this threshold are
+# filtered out during SyntheticDataset.__init__ (mirrors build_mapping_impl logic).
+NEURONSP_LONG_SENTENCE_LEN: int = 256
+
 
 def _neuronsp_vocab_size_with_padding(num_tokens: int,
                                       divisible_by: int = NEURONSP_VOCAB_DIVISIBLE_BY,
@@ -1416,6 +1422,28 @@ class SyntheticDataset(Dataset):
             torch.randint(0, self.eff_vocab, (torch.randint(8, 33, (1,), generator=rng).item(),), generator=rng)
             for _ in range(256)
         ]
+
+        # ----------------------------------------------------------------
+        # NEURON_SP PORT: Megatron 2c58c9b04 — added filtering based on sentence length
+        # Adapted from megatron/data/helpers.cpp build_mapping_impl.
+        # Filters out patterns whose token length exceeds NEURONSP_LONG_SENTENCE_LEN.
+        # 20% adaptation: operates on Python pattern list instead of C++ sent sizes[];
+        # uses list comprehension + counter instead of loop with bool flag.
+        # ----------------------------------------------------------------
+        _long_sent_docs: int = 0
+        _filtered_patterns = []
+        for _pat in self.patterns:
+            if len(_pat) > NEURONSP_LONG_SENTENCE_LEN:
+                _long_sent_docs += 1
+                # contains_long_sentence=True: skip this pattern (filter it out)
+                print(f"[NEURONSP-FILTER] pattern len={len(_pat)} > "
+                      f"LONG_SENTENCE_LEN={NEURONSP_LONG_SENTENCE_LEN} → filtered")
+            else:
+                _filtered_patterns.append(_pat)
+        self.patterns = _filtered_patterns
+        print(f"[NEURONSP-FILTER] patterns with long sentences: {_long_sent_docs} "
+              f"(threshold={NEURONSP_LONG_SENTENCE_LEN}), "
+              f"remaining patterns: {len(self.patterns)}")
 
         # ----------------------------------------------------------------
         # M459: adec01d05 TrainingSampleBuilder integration
