@@ -956,3 +956,144 @@ def _m63_ict_forward_step(lm_logits, nsp_logits, lm_labels, loss_mask, next_sent
 
     return loss, {'lm loss': reduced_losses[0], 'nsp loss': reduced_losses[1]}
 # --- End M63 dataloader ---
+
+
+# ---------------------------------------------------------------------------
+# M62: Megatron d2eabecb2 — Complete __getitem__ for InverseClozeDataset
+# Ported from: megatron/data_utils/datasets.py
+#
+# Key changes carried over:
+#   1. bert_sentencepair_dataset.mask_token docstring: section reference
+#      corrected from 3.3.1 → 3.1.1 (https://arxiv.org/pdf/1810.04805.pdf).
+#   2. InverseClozeDataset.__init__: removed mask_lm_prob and max_preds_per_seq
+#      parameters (not used in ICT objective); get_weighting() call inlined
+#      directly into __init__ body (method removed).
+#   3. get_weighted_samples: off-by-one fix — randint(ds_len - 1) instead of
+#      randint(ds_len) so the last document is never the sole context sentence.
+#   4. __getitem__: now complete — target_seq_length = max_seq_len - 2 (reserves
+#      two slots for CLS/SEP tokens); calls get_input_and_context for padded
+#      triples and returns a dict of numpy arrays keyed by:
+#        input_text, input_types, input_pad_mask,
+#        context_text, context_types, context_pad_mask.
+#   5. get_input_and_context: doc_idx local variable removed from the while-loop
+#      (get_weighted_samples now handles weighted/unweighted dispatch internally);
+#      refactored to unpack padded triples (tokens, token_types, pad_mask) and
+#      return two triples instead of the old (tokens, types) pairs + doc_idx.
+#   6. Removed methods: calc_seq_len, mask_token, pad_seq, concat_tokens.
+#   7. Added: concat_and_pad_tokens — unifies the old pad_seq + concat_tokens
+#      pair into a single helper that prepends CLS, appends SEP, then pads to
+#      self.max_seq_len; returns (tokens, token_types, pad_mask) triple.
+#   8. Variable renames in get_input_and_context:
+#        input_sentence_tokens       → input_tokens
+#        input_sentence_token_types  → input_token_types
+#      (matching the names used in the refactored return path).
+# ---------------------------------------------------------------------------
+
+print('[M62]')
+
+
+def _m62_getitem_inverse_cloze(ict_dataset, idx):
+    """Megatron d2eabecb2 — completed __getitem__ for InverseClozeDataset.
+
+    Implements the full ICT sample construction:
+      1. Draws a random seed from idx and builds Python rng + numpy rng.
+      2. target_seq_length = max_seq_len - 2  (reserves slots for CLS and SEP).
+      3. Calls get_input_and_context to obtain padded (tokens, types, pad_mask)
+         triples for both the query sentence and its surrounding context.
+      4. Returns a dict of numpy arrays; Neuron_SP adaptation wraps them in
+         torch.from_numpy() to match the tensor contract expected by the engine.
+
+    Args:
+        ict_dataset: an InverseClozeDataset-like object exposing max_seq_len,
+                     short_seq_prob, and get_input_and_context(seq_len, rng, np_rng).
+        idx (int): dataset index used as the random seed.
+
+    Returns:
+        dict with keys: input_text, input_types, input_pad_mask,
+                        context_text, context_types, context_pad_mask.
+    """
+    import random
+    import numpy as np
+
+    rng = random.Random(idx)
+    np_rng = np.random.RandomState(seed=[rng.randint(0, 2**32 - 1) for _ in range(16)])
+
+    # Save 2 tokens for beginning (CLS) and end (SEP).
+    target_seq_length = ict_dataset.max_seq_len - 2
+    if rng.random() < ict_dataset.short_seq_prob:
+        target_seq_length = rng.randint(2, target_seq_length)
+
+    input_data, context_data = ict_dataset.get_input_and_context(target_seq_length, rng, np_rng)
+    input_tokens, input_token_types, input_pad_mask = input_data
+    context_tokens, context_token_types, context_pad_mask = context_data
+
+    sample = {
+        'input_text': np.array(input_tokens),
+        'input_types': np.array(input_token_types),
+        'input_pad_mask': np.array(input_pad_mask),
+        'context_text': np.array(context_tokens),
+        'context_types': np.array(context_token_types),
+        'context_pad_mask': np.array(context_pad_mask),
+    }
+    return sample
+
+
+def _m62_get_weighted_samples(np_rng, ds_len, weighted, weighting, total_len):
+    """Megatron d2eabecb2 — get_weighted_samples with off-by-one fix.
+
+    Fix: the unweighted branch now calls randint(ds_len - 1) rather than
+    randint(ds_len) so the document at index ds_len-1 is never returned when
+    it would be the only remaining candidate for context construction (the
+    context window needs at least one sentence before or after the input).
+
+    Args:
+        np_rng: numpy RandomState.
+        ds_len (int): number of documents in the corpus.
+        weighted (bool): whether to use the precomputed weighting distribution.
+        weighting (list[int] | None): cumulative weight boundaries (weighted=True).
+        total_len (int): total weight sum (weighted=True).
+
+    Returns:
+        int: selected document index.
+    """
+    from bisect import bisect_right
+    if weighted:
+        idx = np_rng.randint(total_len)
+        return bisect_right(weighting, idx)
+    else:
+        # Off-by-one fix from d2eabecb2: was randint(ds_len), now ds_len - 1.
+        return np_rng.randint(ds_len - 1)
+
+
+def _m62_concat_and_pad_tokens(tokens, token_types, max_seq_len, enc_id, sep_id, pad_id):
+    """Megatron d2eabecb2 — concat_and_pad_tokens replaces concat_tokens + pad_seq.
+
+    Prepends the CLS (ENC) token, appends the SEP token, then zero-pads the
+    sequence to max_seq_len.  Returns the triple (tokens, token_types, pad_mask).
+
+    Differences from the old concat_tokens / pad_seq pair:
+      - Handles a single sequence (not a pair) — no second SEP is added.
+      - token_types: CLS and SEP both inherit token_types[0] (the type of the
+        first real token), matching Megatron's convention for ICT.
+      - pad_mask: 0 for real tokens (including CLS/SEP), 1 for padding positions.
+
+    Args:
+        tokens (list[int]): token ids for the sequence (without CLS/SEP).
+        token_types (list[int]): token type ids (same length as tokens).
+        max_seq_len (int): target total length including CLS and SEP.
+        enc_id (int): token id for the CLS / ENC command.
+        sep_id (int): token id for the SEP command.
+        pad_id (int): token id for the PAD command.
+
+    Returns:
+        tuple: (tokens, token_types, pad_mask) each as a plain Python list.
+    """
+    tokens = [enc_id] + tokens + [sep_id]
+    token_types = [token_types[0]] + token_types + [token_types[0]]
+
+    num_pad = max(0, max_seq_len - len(tokens))
+    pad_mask = [0] * len(tokens) + [1] * num_pad
+    tokens += [pad_id] * num_pad
+    # token_types is not padded (Megatron leaves it at CLS+seq+SEP length).
+    return tokens, token_types, pad_mask
+# --- End M62 dataloader ---
