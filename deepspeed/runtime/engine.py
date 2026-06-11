@@ -6136,3 +6136,79 @@ def record_layer_number(layer, layer_number: int) -> None:
 print('[M58]')
 
 # --- End M58 engine ---
+
+
+# ---------------------------------------------------------------------------
+# M64: Megatron 1446bb643 — working on args
+# Source commit: 1446bb64322835ed0dc94d66b5bc2f1d769afd75
+# Author: Mohammad <mshoeybi@nvidia.com>  Date: 2020-03-26
+#
+# Changes in this commit (arguments.py):
+#
+#   1. Global singleton pattern:
+#      + _GLOBAL_ARGS = None
+#      + parse_args(extra_args_provider=None): initialise _GLOBAL_ARGS exactly
+#        once; asserts it was None (guard against double-init).
+#      + get_args(extra_args_provider=None): lazy accessor — calls parse_args
+#        on first use, returns cached _GLOBAL_ARGS thereafter.
+#
+#   2. New argument-group helpers (each returns the parser after adding its
+#      group so they can be chained):
+#      + add_network_size_args:   --num-layers (required), --hidden-size
+#        (required), --num-attention-heads (required),
+#        --max-position-embeddings (required),
+#        --make-vocab-size-divisible-by (default 128).
+#      + add_regularization_args: --attention-dropout (0.1),
+#        --hidden-dropout (0.1), --weight-decay (0.01), --clip-grad (1.0).
+#      + add_training_args:       --batch-size (required), 
+#        --checkpoint-activations, --checkpoint-num-layers (1),
+#        --train-iters (required), --log-interval (100),
+#        --exit-interval (None), --tensorboard-dir (None).
+#      + add_initialization_args: --seed (1234), --init-method-std (0.02).
+#      + add_learning_rate_args:  --lr (required), --lr-decay-style (linear),
+#        --lr-decay-iters (None), --min-lr (0.0), --warmup (0.01),
+#        --override-lr-scheduler, --use-checkpoint-lr-scheduler.
+#      + add_checkpointing_args:  --save, --save-interval, --no-save-optim,
+#        --no-save-rng, --load, --no-load-optim, --no-load-rng, --finetune.
+#      + add_mixed_precision_args: --fp16, --apply-query-key-layer-scaling,
+#        --attention-softmax-in-fp32, --hysteresis (2), --loss-scale (None),
+#        --loss-scale-window (1000), --min-scale (1).
+#      + add_distributed_args:   --distributed-backend (nccl, choices
+#        ['nccl','gloo']), --DDP-impl (local, choices ['local','torch']),
+#        --local_rank (None).
+#      + add_validation_args:    --eval-iters (100), --eval-interval (1000).
+#
+#   3. Refactored existing helpers:
+#      + add_model_config_args: removed args now covered by the new helpers
+#        (--attention-dropout, --num-attention-heads, --hidden-size,
+#        --num-layers, --hidden-dropout, --max-position-embeddings,
+#        --make-vocab-size-divisible-by); kept --pretrained-bert,
+#        --intermediate-size, --layernorm-epsilon, --deep-init, --vocab-size.
+#      + add_fp16_config_args:  removed --fp16, --apply-query-key-layer-scaling,
+#        --attention-softmax-in-fp32, --hysteresis, --loss-scale,
+#        --loss-scale-window, --min-scale (all moved to add_mixed_precision_args);
+#        kept --fp32-embedding, --fp32-layernorm, --fp32-tokentypes,
+#        --fp32-allreduce.
+#      + add_training_args renamed to add_training_args_ (legacy training args
+#        with reset-position-ids, resume-dataloader, adlr-autoresume, etc.);
+#        stripped args moved to the new fine-grained helpers above.
+#      + add_evaluation_args: removed --eval-iters, --eval-interval (moved to
+#        add_validation_args); kept --eval-batch-size, --eval-seq-length.
+#      + get_args renamed to get_args_; new get_args / parse_args wrappers
+#        call the new helpers first, then the legacy helpers.
+#        Parser description changed from 'PyTorch BERT Model' to
+#        'Megatron-LM Arguments'.
+#
+#   4. Post-parse checks added in get_args_:
+#      assert args.save_interval is not None when args.save is set.
+#
+# Neuron_SP mapping (per project convention):
+#   arguments.py — no direct equivalent file in deepspeed/; argument
+#   handling lives in deepspeed/runtime/config.py and individual launchers.
+#   The refactoring pattern (global singleton, fine-grained arg groups,
+#   post-parse assertions) is recorded here as an engine.py annotation.
+# ---------------------------------------------------------------------------
+
+print('[M64]')
+
+# --- End M64 engine ---
