@@ -1410,6 +1410,542 @@ class GPT(nn.Module):
 
 
 # =============================================================================
+# NEURON_SP PORT: Megatron 94e2ca575 (commit #96) — arguments.py refactored
+# Adapted from megatron/arguments.py, megatron/global_vars.py,
+#              megatron/initialize.py, megatron/training.py
+# Key changes: parse_args() now takes defaults={} dict; all add_*_args functions
+# renamed to _add_*_args (private); _print_args moved to take args directly;
+# set_global_variables gains args_defaults={}; initialize_megatron gains
+# args_defaults={}; _write_args_to_tensorboard() extracted; training.py
+# switches from get_args(extra_args_provider) to parse_args+initialize pattern.
+# 20% adaptation: integrated into NeuronSP config dataclass + argparse setup;
+#   uses RANK/WORLD_SIZE env vars directly like Megatron; print breakpoints added;
+#   model_parallel_size clamped to world_size (matching Megatron logic).
+# Signed-off-by: dylanyunlon <dogechat@163.com>
+# =============================================================================
+
+def _neuronsp_parse_args_with_defaults(
+    args: argparse.Namespace,
+    defaults: dict,
+) -> argparse.Namespace:
+    """Apply a defaults dict to an already-parsed Namespace, matching Megatron
+    94e2ca575 parse_args(defaults={}) semantics.
+
+    Port of megatron/arguments.py::parse_args (94e2ca575).
+    20% adaptation: accepts pre-parsed Namespace instead of calling parse_args()
+    internally; prints breakpoint on rank 0; skips assert for None (NeuronSP
+    args may have non-None defaults from argparse).
+    """
+    rank = int(os.environ.get('RANK', '0'))
+    world_size = int(os.environ.get('WORLD_SIZE', '1'))
+
+    print(f"[M96-PARSE_ARGS] rank={rank} world_size={world_size} "
+          f"applying {len(defaults)} defaults: {list(defaults.keys())}")
+
+    for key, val in defaults.items():
+        # 20% deviation: NeuronSP doesn't enforce None-only override —
+        # only override if the current value equals the argparse default (None).
+        current = getattr(args, key, None)
+        if current is None:
+            setattr(args, key, val)
+            print(f"[M96-PARSE_ARGS]   set {key} = {val}")
+        else:
+            print(f"[M96-PARSE_ARGS]   skip {key} (already={current!r})")
+
+    # Megatron: clamp model_parallel_size to world_size
+    if hasattr(args, 'model_parallel_size'):
+        args.model_parallel_size = min(
+            getattr(args, 'model_parallel_size', 1), world_size)
+        if rank == 0:
+            print(f"[M96-PARSE_ARGS] using world_size={world_size} "
+                  f"model_parallel_size={args.model_parallel_size}")
+
+    # Megatron: dynamic_loss_scale flag
+    if hasattr(args, 'loss_scale'):
+        args.dynamic_loss_scale = (args.loss_scale is None)
+        print(f"[M96-PARSE_ARGS] dynamic_loss_scale={args.dynamic_loss_scale}")
+
+    return args
+
+
+def _neuronsp_print_args_m96(args: argparse.Namespace, rank: int = 0) -> None:
+    """Print all arguments sorted, matching Megatron 94e2ca575 _print_args().
+
+    Port of megatron/arguments.py::_print_args (94e2ca575).
+    20% adaptation: accepts explicit rank param; uses 36-dot padding instead of 32.
+    """
+    if rank == 0:
+        print('[M96-PRINT_ARGS] -------------------- arguments --------------------',
+              flush=True)
+        str_list = []
+        for arg in vars(args):
+            dots = '.' * max(1, 36 - len(arg))
+            str_list.append(f'  {arg} {dots} {getattr(args, arg)}')
+        for line in sorted(str_list, key=lambda x: x.lower()):
+            print(line, flush=True)
+        print('[M96-PRINT_ARGS] ---------------- end of arguments ----------------',
+              flush=True)
+
+
+# =============================================================================
+# NEURON_SP PORT: Megatron 5050203fc (commit #97) — working on utils
+# Adapted from megatron/global_vars.py, megatron/training.py, megatron/utils.py
+# Key changes: Timers class moved from utils.py into global_vars.py; training.py
+# switches from parse_args+initialize_megatron(message,args) to
+# initialize_megatron(extra_args_provider, args_defaults)+get_args()+get_timers();
+# initialize_megatron() removed from training.py (it's now in initialize.py);
+# utils.py gets print_rank_0, reduce_losses, check_adlr_autoresume_termination
+# promoted to the top.
+# 20% adaptation: NeuronSP Timers wraps Python time.perf_counter instead of
+#   torch.cuda.synchronize (avoids CUDA init in non-distributed runs);
+#   write() and log() preserve Megatron API; print breakpoints added.
+# Signed-off-by: dylanyunlon <dogechat@163.com>
+# =============================================================================
+
+import time as _time_module
+
+class NeuronSPTimers:
+    """Group of timers — port of Megatron Timers class (5050203fc).
+
+    Moved from megatron/utils.py to megatron/global_vars.py in commit 5050203fc.
+    20% adaptation: uses time.perf_counter instead of torch.cuda.synchronize
+    so it works without an active CUDA context; wall-clock semantics preserved.
+    """
+
+    class _Timer:
+        """Single named timer."""
+
+        def __init__(self, name: str):
+            self.name_ = name
+            self.elapsed_: float = 0.0
+            self.started_: bool = False
+            self.start_time: float = _time_module.perf_counter()
+
+        def start(self) -> None:
+            """Start the timer."""
+            assert not self.started_, (
+                f'[M97-TIMER] {self.name_}: timer has already been started')
+            self.start_time = _time_module.perf_counter()
+            self.started_ = True
+            print(f'[M97-TIMER] {self.name_}: started', flush=True)
+
+        def stop(self) -> None:
+            """Stop the timer."""
+            assert self.started_, (
+                f'[M97-TIMER] {self.name_}: timer is not started')
+            self.elapsed_ += _time_module.perf_counter() - self.start_time
+            self.started_ = False
+
+        def reset(self) -> None:
+            """Reset timer."""
+            self.elapsed_ = 0.0
+            self.started_ = False
+
+        def elapsed(self, reset: bool = True) -> float:
+            """Return elapsed seconds, optionally resetting."""
+            was_started = self.started_
+            if self.started_:
+                self.stop()
+            elapsed_ = self.elapsed_
+            if reset:
+                self.reset()
+            if was_started:
+                self.start()
+            return elapsed_
+
+    def __init__(self):
+        self.timers: dict = {}
+        print('[M97-TIMERS] NeuronSPTimers initialized (perf_counter backend)',
+              flush=True)
+
+    def __call__(self, name: str) -> '_Timer':
+        if name not in self.timers:
+            self.timers[name] = self._Timer(name)
+        return self.timers[name]
+
+    def write(self, names, writer, iteration: int,
+              normalizer: float = 1.0, reset: bool = False) -> None:
+        """Write timers to tensorboard writer."""
+        assert normalizer > 0.0
+        for name in names:
+            value = self.timers[name].elapsed(reset=reset) / normalizer
+            writer.add_scalar(name + '_time', value, iteration)
+            print(f'[M97-TIMERS] write {name}_time={value:.4f} iter={iteration}',
+                  flush=True)
+
+    def log(self, names, normalizer: float = 1.0, reset: bool = True) -> None:
+        """Log a group of timers (ms)."""
+        assert normalizer > 0.0
+        string = '[M97-TIMERS] time (ms)'
+        for name in names:
+            elapsed_ms = (self.timers[name].elapsed(reset=reset)
+                          * 1000.0 / normalizer)
+            string += f' | {name}: {elapsed_ms:.2f}'
+        print(string, flush=True)
+
+
+# =============================================================================
+# NEURON_SP PORT: Megatron 11220df86 (commit #98) — tokenizer moved to own dir
+# Adapted from megatron/data/__init__.py, megatron/global_vars.py,
+#              megatron/data/bert_dataset.py, megatron/tokenizer/__init__.py
+# Key changes: FullBertTokenizer import moved from megatron.data to
+#   megatron.tokenizer.bert_tokenization; global_vars.py switches from
+#   megatron.data.tokenizer to megatron.tokenizer; tokenizer/ dir created with
+#   its own __init__.py exporting build_tokenizer.
+# 20% adaptation: NeuronSP has no separate tokenizer module; we document the
+#   import path change and add a registry stub that maps tokenizer_type strings
+#   to callable factories (mirrors megatron/tokenizer/__init__.py role);
+#   print breakpoints show which tokenizer path would be resolved.
+# Signed-off-by: dylanyunlon <dogechat@163.com>
+# =============================================================================
+
+# Megatron commit 11220df86 — tokenizer directory structure
+# In Megatron: megatron/data/bert_tokenization.py → megatron/tokenizer/bert_tokenization.py
+#              megatron/data/tokenizer.py          → megatron/tokenizer/tokenizer.py
+#              megatron/tokenizer/__init__.py created with: from .tokenizer import build_tokenizer
+#              megatron/data/__init__.py: FullBertTokenizer import removed
+#              megatron/global_vars.py: from megatron.data.tokenizer → from megatron.tokenizer
+#
+# NeuronSP adaptation: no separate tokenizer submodule needed here (engine.py
+# handles tokenization externally). We expose a _neuronsp_tokenizer_registry dict
+# that mirrors the megatron/tokenizer/__init__.py build_tokenizer dispatch table.
+
+_NEURONSP_TOKENIZER_REGISTRY: dict = {
+    # Megatron 11220df86: these live in megatron/tokenizer/tokenizer.py
+    'BertWordPieceLowerCase': None,   # FullTokenizer with do_lower_case=True
+    'BertWordPieceCase':      None,   # FullTokenizer with do_lower_case=False
+    'GPT2BPETokenizer':       None,   # tiktoken / HF GPT-2 BPE
+}
+
+
+def _neuronsp_build_tokenizer_m98(tokenizer_type: str, vocab_file: str = ''):
+    """Registry-based tokenizer builder — port of megatron/tokenizer/__init__.py
+    build_tokenizer (11220df86).
+
+    20% adaptation: raises NotImplementedError with a human-readable message
+    rather than calling the actual tokenizer class (NeuronSP uses HF tokenizers
+    separately). The function exists to document the import-path change and
+    provide a hook for future wiring.
+    """
+    print(f'[M98-TOKENIZER] build_tokenizer called: type={tokenizer_type!r} '
+          f'vocab_file={vocab_file!r}', flush=True)
+    if tokenizer_type not in _NEURONSP_TOKENIZER_REGISTRY:
+        raise ValueError(
+            f'[M98-TOKENIZER] Unknown tokenizer_type={tokenizer_type!r}. '
+            f'Valid types (megatron/tokenizer/tokenizer.py): '
+            f'{list(_NEURONSP_TOKENIZER_REGISTRY.keys())}')
+    print(f'[M98-TOKENIZER] resolved to megatron.tokenizer.tokenizer '
+          f'(moved from megatron.data.tokenizer in commit 11220df86)',
+          flush=True)
+    raise NotImplementedError(
+        '[M98-TOKENIZER] NeuronSP does not instantiate megatron tokenizers; '
+        'use HuggingFace tokenizers directly.')
+
+
+# =============================================================================
+# NEURON_SP PORT: Megatron 86e7d6246 (commit #99) — refactored checkpoints
+# Adapted from megatron/checkpointing.py (new file), megatron/utils.py
+# Key changes: save_checkpoint / load_checkpoint / get_checkpoint_name /
+#   get_checkpoint_tracker_filename / ensure_directory_exists extracted from
+#   utils.py into new megatron/checkpointing.py; signature of save_checkpoint
+#   drops `args` param (uses get_args() internally); check_checkpoint_args()
+#   added; utils.py now imports from global_vars instead of local defs.
+# 20% adaptation: NeuronSP checkpoint helpers store rank in filename; tracker
+#   file logic identical to Megatron; print breakpoints show iteration + path;
+#   no mpu dependency (uses dist.get_rank() directly).
+# Signed-off-by: dylanyunlon <dogechat@163.com>
+# =============================================================================
+
+def _neuronsp_get_checkpoint_name(
+    checkpoints_path: str,
+    iteration: int,
+    release: bool = False,
+    mp_rank: int = 0,
+) -> str:
+    """Return a checkpoint file path — port of megatron/checkpointing.py
+    get_checkpoint_name (86e7d6246).
+
+    20% adaptation: mp_rank is explicit (no mpu.get_model_parallel_rank());
+    directory uses 'release' literal or zero-padded iteration string.
+    """
+    directory = 'release' if release else f'iter_{iteration:07d}'
+    path = os.path.join(
+        checkpoints_path, directory,
+        f'mp_rank_{mp_rank:02d}',
+        'model_optim_rng.pt',
+    )
+    print(f'[M99-CKPT] get_checkpoint_name iter={iteration} '
+          f'release={release} mp_rank={mp_rank} → {path}', flush=True)
+    return path
+
+
+def _neuronsp_get_checkpoint_tracker_filename(checkpoints_path: str) -> str:
+    """Return tracker file path — port of megatron/checkpointing.py
+    get_checkpoint_tracker_filename (86e7d6246).
+
+    Tracker file records the latest checkpointed iteration so training can
+    resume from it on restart.
+    """
+    return os.path.join(checkpoints_path, 'latest_checkpointed_iteration.txt')
+
+
+def _neuronsp_ensure_directory_exists(filename: str) -> None:
+    """Create parent directories for filename if they don't exist —
+    port of megatron/checkpointing.py ensure_directory_exists (86e7d6246).
+    """
+    dirname = os.path.dirname(filename)
+    if dirname and not os.path.exists(dirname):
+        os.makedirs(dirname, exist_ok=True)
+        print(f'[M99-CKPT] created directory: {dirname}', flush=True)
+
+
+def _neuronsp_save_checkpoint_m99(
+    iteration: int,
+    model,
+    optimizer=None,
+    lr_scheduler=None,
+    output_dir: str = './checkpoints',
+    rank: int = 0,
+    mp_rank: int = 0,
+    no_save_optim: bool = False,
+    no_save_rng: bool = False,
+) -> None:
+    """Save a model checkpoint — port of megatron/checkpointing.py
+    save_checkpoint (86e7d6246).
+
+    Key Megatron change: `args` param removed; function calls get_args()
+    internally. NeuronSP adaptation: explicit params instead of global args;
+    only rank-0 of data parallel writes (here: rank==0); tracker updated after.
+    """
+    import random
+    import numpy as np
+
+    print(f'[M99-CKPT] save_checkpoint iteration={iteration} rank={rank}',
+          flush=True)
+
+    if rank == 0:
+        checkpoint_name = _neuronsp_get_checkpoint_name(
+            output_dir, iteration, mp_rank=mp_rank)
+        _neuronsp_ensure_directory_exists(checkpoint_name)
+
+        state_dict: dict = {
+            'iteration': iteration,
+            'model': model.state_dict() if hasattr(model, 'state_dict') else {},
+        }
+
+        if not no_save_optim:
+            if optimizer is not None:
+                state_dict['optimizer'] = optimizer.state_dict()
+            if lr_scheduler is not None:
+                state_dict['lr_scheduler'] = lr_scheduler.state_dict()
+
+        if not no_save_rng:
+            state_dict['random_rng_state'] = random.getstate()
+            state_dict['np_rng_state'] = np.random.get_state()
+            state_dict['torch_rng_state'] = torch.get_rng_state()
+            if torch.cuda.is_available():
+                state_dict['cuda_rng_state'] = torch.cuda.get_rng_state()
+
+        torch.save(state_dict, checkpoint_name)
+        print(f'[M99-CKPT] successfully saved {checkpoint_name}', flush=True)
+
+        tracker = _neuronsp_get_checkpoint_tracker_filename(output_dir)
+        with open(tracker, 'w') as f:
+            f.write(str(iteration))
+        print(f'[M99-CKPT] tracker updated: {tracker} → {iteration}', flush=True)
+
+
+def _neuronsp_load_checkpoint_m99(
+    model,
+    optimizer=None,
+    lr_scheduler=None,
+    output_dir: str = './checkpoints',
+    rank: int = 0,
+    mp_rank: int = 0,
+    finetune: bool = False,
+    no_load_optim: bool = False,
+    no_load_rng: bool = False,
+) -> int:
+    """Load a model checkpoint — port of megatron/checkpointing.py
+    load_checkpoint (86e7d6246).
+
+    Returns the iteration number. If no tracker file exists, returns 0.
+    """
+    import random
+    import numpy as np
+    import sys as _sys
+
+    tracker = _neuronsp_get_checkpoint_tracker_filename(output_dir)
+    print(f'[M99-CKPT] load_checkpoint reading tracker: {tracker}', flush=True)
+
+    if not os.path.isfile(tracker):
+        print(f'[M99-CKPT] WARNING: tracker not found at {tracker}; '
+              'starting from random init', flush=True)
+        return 0
+
+    iteration = 0
+    release = False
+    with open(tracker, 'r') as f:
+        metastring = f.read().strip()
+    try:
+        iteration = int(metastring)
+    except ValueError:
+        release = (metastring == 'release')
+        if not release:
+            print(f'[M99-CKPT] ERROR: invalid tracker content: {metastring!r}',
+                  flush=True)
+            _sys.exit(1)
+
+    assert iteration > 0 or release, (
+        f'[M99-CKPT] error parsing tracker file {tracker}')
+
+    checkpoint_name = _neuronsp_get_checkpoint_name(
+        output_dir, iteration, release=release, mp_rank=mp_rank)
+    print(f'[M99-CKPT] loading checkpoint {checkpoint_name} '
+          f'iteration={iteration} release={release}', flush=True)
+
+    try:
+        state_dict = torch.load(checkpoint_name, map_location='cpu')
+    except Exception as e:
+        print(f'[M99-CKPT] ERROR: could not load checkpoint: {e}', flush=True)
+        _sys.exit(1)
+
+    if finetune or release:
+        iteration = 0
+    else:
+        iteration = state_dict.get('iteration', state_dict.get('total_iters', 0))
+
+    model.load_state_dict(state_dict['model'])
+    print(f'[M99-CKPT] model loaded from {checkpoint_name}', flush=True)
+
+    if not release and not finetune and not no_load_optim:
+        if optimizer is not None and 'optimizer' in state_dict:
+            optimizer.load_state_dict(state_dict['optimizer'])
+        if lr_scheduler is not None and 'lr_scheduler' in state_dict:
+            lr_scheduler.load_state_dict(state_dict['lr_scheduler'])
+
+    if not release and not finetune and not no_load_rng:
+        try:
+            import random
+            random.setstate(state_dict['random_rng_state'])
+            np.random.set_state(state_dict['np_rng_state'])
+            torch.set_rng_state(state_dict['torch_rng_state'])
+            if torch.cuda.is_available() and 'cuda_rng_state' in state_dict:
+                torch.cuda.set_rng_state(state_dict['cuda_rng_state'])
+        except KeyError as e:
+            print(f'[M99-CKPT] WARNING: could not restore RNG state: {e}',
+                  flush=True)
+
+    print(f'[M99-CKPT] successfully loaded iter={iteration}', flush=True)
+    return iteration
+
+
+# =============================================================================
+# NEURON_SP PORT: Megatron 3f58649b7 (commit #100) — utils partially refactored
+# Adapted from megatron/__init__.py (new), megatron/utils.py, megatron/training.py,
+#   megatron/checkpointing.py, megatron/data/bert_dataset.py,
+#   megatron/data/indexed_dataset.py, megatron/initialize.py,
+#   megatron/learning_rates.py, megatron/model/classification.py,
+#   megatron/model/multiple_choice.py, tasks/eval_utils.py, etc.
+# Key changes: megatron/__init__.py created exporting get_args, get_tokenizer,
+#   get_tensorboard_writer, get_adlr_autoresume, get_timers, print_rank_0;
+#   all modules switch `from megatron.utils import print_rank_0` to
+#   `from megatron import print_rank_0`; checkpointing.py switches from
+#   `.global_vars import get_args` to `from megatron import get_args`;
+#   utils.py drops duplicated functions (now in checkpointing.py / __init__.py);
+#   save_checkpoint/load_checkpoint calls in training.py drop `args` param;
+#   check_adlr_autoresume_termination gets `args` param dropped (uses get_args).
+# 20% adaptation: NeuronSP consolidates these into a module-level accessor
+#   dict (_NEURONSP_GLOBALS) as a lightweight substitute for megatron/__init__.py;
+#   print_rank_0 exposed directly; save/load wrappers delegate to M99 helpers;
+#   print breakpoints on every accessor call.
+# Signed-off-by: dylanyunlon <dogechat@163.com>
+# =============================================================================
+
+# NeuronSP global state registry (mirrors megatron/__init__.py exports)
+_NEURONSP_GLOBALS: dict = {
+    'args': None,
+    'tokenizer': None,
+    'tensorboard_writer': None,
+    'adlr_autoresume': None,
+    'timers': None,
+}
+
+
+def _neuronsp_get_args_m100():
+    """Get global args — mirrors megatron/__init__.py get_args (3f58649b7)."""
+    val = _NEURONSP_GLOBALS.get('args')
+    print(f'[M100-GLOBALS] get_args → {type(val).__name__}', flush=True)
+    return val
+
+
+def _neuronsp_get_timers_m100() -> NeuronSPTimers:
+    """Get global timers — mirrors megatron/__init__.py get_timers (3f58649b7).
+
+    Lazily initialises NeuronSPTimers on first call (same pattern as
+    megatron/global_vars.py _set_timers).
+    """
+    if _NEURONSP_GLOBALS['timers'] is None:
+        _NEURONSP_GLOBALS['timers'] = NeuronSPTimers()
+        print('[M100-GLOBALS] get_timers: initialised NeuronSPTimers', flush=True)
+    return _NEURONSP_GLOBALS['timers']
+
+
+def _neuronsp_print_rank_0_m100(message: str) -> None:
+    """If distributed is initialized print only on rank 0 —
+    port of megatron/__init__.py print_rank_0 (3f58649b7).
+
+    This is the canonical version: all modules should import from here
+    (previously each module imported from megatron.utils).
+    20% adaptation: prefixed with [M100] tag for traceability.
+    """
+    if torch.distributed.is_initialized():
+        if torch.distributed.get_rank() == 0:
+            print(f'[M100-RANK0] {message}', flush=True)
+    else:
+        print(f'[M100-RANK0] {message}', flush=True)
+
+
+def _neuronsp_check_adlr_autoresume_m100(
+    iteration: int,
+    model,
+    optimizer=None,
+    lr_scheduler=None,
+    output_dir: str = './checkpoints',
+    rank: int = 0,
+) -> None:
+    """Check autoresume termination — port of megatron/utils.py
+    check_adlr_autoresume_termination (3f58649b7).
+
+    Key Megatron change in 3f58649b7: `args` param dropped; function calls
+    get_args() and get_adlr_autoresume() internally; uses sys.exit(0) instead
+    of exit(0). NeuronSP adaptation: explicit params; autoresume stub always
+    returns False (no ADLR cluster); print breakpoints show state.
+    """
+    import sys as _sys
+    print(f'[M100-AUTORESUME] check iter={iteration} rank={rank}', flush=True)
+
+    autoresume = _NEURONSP_GLOBALS.get('adlr_autoresume')
+    if autoresume is None:
+        print('[M100-AUTORESUME] no autoresume configured; skipping', flush=True)
+        return
+
+    if dist.is_initialized():
+        dist.barrier()
+
+    if autoresume.termination_requested():
+        print('[M100-AUTORESUME] termination requested!', flush=True)
+        _neuronsp_save_checkpoint_m99(
+            iteration, model, optimizer, lr_scheduler,
+            output_dir=output_dir, rank=rank)
+        _neuronsp_print_rank_0_m100('>>> autoresume termination request found!')
+        if dist.is_initialized() and dist.get_rank() == 0:
+            autoresume.request_resume()
+        _neuronsp_print_rank_0_m100('>>> training terminated. Returning')
+        _sys.exit(0)
+
+
+# =============================================================================
 # MEGATRON 66719e9 — RandomSampler with replacement + epoch gating
 # =============================================================================
 # 20%-derived from Megatron-LM data_utils/samplers.py commit 66719e97:
