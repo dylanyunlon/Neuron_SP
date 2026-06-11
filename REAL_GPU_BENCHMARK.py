@@ -1241,6 +1241,25 @@ def _make_dataloader_m452(dataset, config: 'TrainingConfig',
 
     Diagnostic prints on rank-0 only to avoid log storms in multi-GPU runs.
     """
+    # -------------------------------------------------------------------------
+    # NEURON_SP PORT: Megatron d64856847 — fixed gpt-2 dataloader
+    # Adapted from pretrain_gpt2.py get_train_val_test_data.
+    # Original fix: 'tfrecords' → 'lazy' in elif branch; added else + exit(1).
+    # 20% adaptation: uses config.data_loader_type str attr (default 'lazy');
+    # 'numpy' path goes to replacement sampler, 'lazy' path to distributed sampler.
+    # Unsupported loader type hard-exits with diagnostic message.
+    # -------------------------------------------------------------------------
+    _loader_type = getattr(config, 'data_loader_type', 'lazy')
+    print(f"[NEURONSP-GPT2-DL] data_loader_type='{_loader_type}' "
+          f"(supported: 'numpy', 'lazy')")
+    if _loader_type == 'numpy':
+        print(f"[NEURONSP-GPT2-DL] numpy path → replacement_sampling forced True")
+    elif _loader_type == 'raw' or _loader_type == 'lazy':
+        print(f"[NEURONSP-GPT2-DL] lazy path → distributed/Fisher-Yates sampler")
+    else:
+        print(f"[NEURONSP-GPT2-DL] Unsupported data loader for GPT2: '{_loader_type}'")
+        import sys; sys.exit(1)
+
     n_total = config.batch_size * config.max_steps * config.gradient_accumulation
     # presplit_sentences diagnostic — real-data paths would use NLTK bypass here
     if rank == 0:
