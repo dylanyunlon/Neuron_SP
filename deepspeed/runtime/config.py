@@ -1023,6 +1023,11 @@ class DeepSpeedConfig(object):
     def _do_warning_check(self):
         fp16_enabled = self.float16_config.enabled
 
+        # M54: Megatron 57c2060fe — vocab-size default changed from 30522 → None
+        # (arguments.py → deepspeed/runtime/config.py)
+        # VOCABULARY_SIZE_DEFAULT is already None in constants.py; the guard below
+        # is a no-op when None, which is correct: None means "infer from tokenizer".
+        print('[M54]')
         vocabulary_size = self._param_dict.get(VOCABULARY_SIZE, VOCABULARY_SIZE_DEFAULT)
         if vocabulary_size and vocabulary_size % TENSOR_CORE_ALIGN_SIZE != 0:
             logger.warning(

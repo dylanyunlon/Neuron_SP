@@ -6013,3 +6013,76 @@ def _m37_compute_train_val_test_num_samples(train_iters, eval_interval,
 print('[M43]')
 
 # --- End M43 engine ---
+
+
+# ---------------------------------------------------------------------------
+# M54: Megatron 57c2060fe — Model parallel merger
+# Source commit: 57c2060fe7a39d7982e9384c050fdaebbb23a552
+# Author: Mohammad Shoeybi <mshoeybi@nvidia.com>  Date: 2020-02-10
+#
+# Changes ported from megatron/model/* (model/* → deepspeed/runtime/engine.py):
+#
+#   megatron/model/bert_model.py — BertLMHead.__init__:
+#     After  self.bias.model_parallel = True  add:
+#       self.bias.partition_dim = 0
+#       self.bias.stride = 1
+#     These attrs let checkpoint-merge utilities reconstruct the bias shard.
+#     The bias is split along dim=0 (vocab axis) with stride=1 (contiguous).
+#
+#   megatron/model/transformer.py — ParallelTransformerLayer.__init__:
+#     Add  self.layer_number = layer_number  so that logging, debugging, and
+#     pipeline-parallel code can identify layers without an extra mapping table.
+#
+# Neuron_SP adaptation notes:
+#   • Both changes apply to Megatron model classes, not DeepSpeed engine
+#     internals; they are documented here so that Neuron_SP model definitions
+#     (in REAL_GPU_BENCHMARK.py or downstream user models) can apply the same
+#     pattern.
+#   • mark_lm_head_bias_parallel() and record_layer_number() below are
+#     standalone helpers that encode the same logic without requiring
+#     inheritance from MegatronModule.
+# ---------------------------------------------------------------------------
+
+print('[M54]')
+
+
+def mark_lm_head_bias_parallel(bias, stride: int = 1) -> None:
+    """Tag an LM-head bias with model-parallel metadata.
+
+    Megatron 57c2060fe bert_model.py BertLMHead.__init__:
+      self.bias.model_parallel = True
+      self.bias.partition_dim  = 0   ← NEW in 57c2060fe
+      self.bias.stride         = 1   ← NEW in 57c2060fe
+
+    The bias is partitioned along dimension 0 (vocab axis) with stride=1
+    (contiguous sharding, no interleaving).  Checkpoint-merge code reads
+    these attributes to reconstruct the full bias from per-rank shards.
+
+    Args:
+        bias:   nn.Parameter — the LM-head vocab bias.
+        stride: int — sharding stride; default 1 (contiguous).
+    """
+    bias.model_parallel = True
+    bias.partition_dim = 0
+    bias.stride = stride
+    print(f'[M54-ENGINE] mark_lm_head_bias_parallel: '
+          f'shape={list(bias.shape)} partition_dim=0 stride={stride}')
+
+
+def record_layer_number(layer, layer_number: int) -> None:
+    """Attach a layer-number attribute to a transformer block.
+
+    Megatron 57c2060fe transformer.py ParallelTransformerLayer.__init__:
+      self.layer_number = layer_number   ← NEW in 57c2060fe
+
+    Storing the layer index on the module itself avoids maintaining an
+    external mapping and makes debugging / pipeline-parallel code simpler.
+
+    Args:
+        layer:        nn.Module — the transformer block instance.
+        layer_number: int — 1-based layer index (Megatron convention).
+    """
+    layer.layer_number = layer_number
+    print(f'[M54-ENGINE] record_layer_number: layer_number={layer_number}')
+
+# --- End M54 engine ---
