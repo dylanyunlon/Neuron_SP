@@ -482,6 +482,10 @@ class TrainingConfig:
     weight_decay: float = 0.1
     beta1: float = 0.9
     beta2: float = 0.999   # Paper: Adam β2=0.999 (τ=693 steps). Was 0.95 (τ=13.5) — broke DES-LOC theory
+    # M504: Megatron 48269d8d8 — expose adam_eps as a top-level config arg
+    # so sweep scripts can vary numerical stability threshold independently of
+    # learning-rate and beta tuning.  Default 1e-8 matches PyTorch Adam default.
+    adam_eps: float = 1e-8
     grad_clip: float = 1.0
     
     # DES-LOC specific
@@ -1607,8 +1611,10 @@ class AdamW(torch.optim.Optimizer):
     Ref: DeepSpeed ZeRO stage_1_and_2.py:499 partition_size
     Ref: Megatron distrib_optimizer.py shard_buffer
     """
-    def __init__(self, params, lr: float, betas: Tuple[float, float], weight_decay: float):
-        defaults = dict(lr=lr, betas=betas, weight_decay=weight_decay)
+    def __init__(self, params, lr: float, betas: Tuple[float, float], weight_decay: float,
+                 eps: float = 1e-8):
+        # M504: Megatron 48269d8d8 — eps now a first-class arg (was hardcoded 1e-8)
+        defaults = dict(lr=lr, betas=betas, weight_decay=weight_decay, eps=eps)
         super().__init__(params, defaults)
         self._zero_initialized = False
 
@@ -1664,7 +1670,7 @@ class AdamW(torch.optim.Optimizer):
                 bc2 = 1 - beta2 ** state['step']
                 step_size = group['lr'] / bc1
                 torch.sqrt(exp_avg_sq, out=grad)
-                denom = grad.div_(math.sqrt(bc2)).add_(1e-8)
+                denom = grad.div_(math.sqrt(bc2)).add_(group.get('eps', 1e-8))
                 p.data.addcdiv_(exp_avg, denom, value=-step_size)
                 p.grad = None
 
@@ -1711,7 +1717,7 @@ class AdamW(torch.optim.Optimizer):
                 if '_denom' not in state:
                     state['_denom'] = torch.empty_like(exp_avg_sq)
                 torch.sqrt(exp_avg_sq, out=state['_denom'])
-                state['_denom'].div_(math.sqrt(bc2)).add_(1e-8)
+                state['_denom'].div_(math.sqrt(bc2)).add_(group.get('eps', 1e-8))
                 p_flat[start:end].addcdiv_(exp_avg, state['_denom'], value=-step_size)
         # Phase 3: Broadcast each rank's updated param shard to all
         for p in self._flat_params:
@@ -1744,13 +1750,14 @@ class DESLOCAdamW(torch.optim.Optimizer):
                  weight_decay: float, Kx: int, Ku: int, Kv: int,
                  outer_optimizer: str = 'average',
                  outer_momentum: float = 0.9, outer_lr: float = 1.0,
-                 max_norm: float = 1.0):
+                 max_norm: float = 1.0, eps: float = 1e-8):
         # M465: Megatron 4687967 — clip_grad moved from training loop into optimizer.
         # max_norm is now an optimizer-level default; individual param_groups may
         # override it via group['max_norm'].  Setting max_norm=0.0 disables clipping
         # entirely for that group (allows embedding layers to skip clip if needed).
+        # M504: Megatron 48269d8d8 — eps as first-class param (default 1e-8)
         defaults = dict(lr=lr, betas=betas, weight_decay=weight_decay,
-                       Kx=Kx, Ku=Ku, Kv=Kv, max_norm=max_norm)
+                       Kx=Kx, Ku=Ku, Kv=Kv, max_norm=max_norm, eps=eps)
         super().__init__(params, defaults)
         self.global_step = 0
         # Paper Metrics: track ||s_{t+K} - s_t||_2 / ||s_t||_2 for each state tier
@@ -2089,7 +2096,7 @@ class DESLOCAdamW(torch.optim.Optimizer):
                     step_size = group['lr'] / bc1
                     # In-place sqrt into v_gpu (we already have it on GPU)
                     denom = torch.sqrt(v_gpu)
-                    denom.div_(math.sqrt(bc2)).add_(1e-8)
+                    denom.div_(math.sqrt(bc2)).add_(group.get('eps', 1e-8))
                     p.data.addcdiv_(m_gpu, denom, value=-step_size)
                     del denom
                     # Stream back to CPU
@@ -2109,7 +2116,7 @@ class DESLOCAdamW(torch.optim.Optimizer):
                     if '_denom' not in state:
                         state['_denom'] = torch.empty_like(exp_avg_sq)
                     torch.sqrt(exp_avg_sq, out=state['_denom'])
-                    state['_denom'].div_(math.sqrt(bc2)).add_(1e-8)
+                    state['_denom'].div_(math.sqrt(bc2)).add_(group.get('eps', 1e-8))
                     p.data.addcdiv_(exp_avg, state['_denom'], value=-step_size)
 
         # M365 DIAG: per-group optimizer step summary at key steps
@@ -2670,7 +2677,7 @@ class LocalAdamW(torch.optim.Optimizer):
                     bc2 = 1 - beta2 ** state['step']
                     step_size = group['lr'] / bc1
                     denom = torch.sqrt(v_gpu)
-                    denom.div_(math.sqrt(bc2)).add_(1e-8)
+                    denom.div_(math.sqrt(bc2)).add_(group.get('eps', 1e-8))
                     p.data.addcdiv_(m_gpu, denom, value=-step_size)
                     del denom
                     state['exp_avg'].copy_(m_gpu, non_blocking=True)
@@ -2688,7 +2695,7 @@ class LocalAdamW(torch.optim.Optimizer):
                     if '_denom' not in state:
                         state['_denom'] = torch.empty_like(exp_avg_sq)
                     torch.sqrt(exp_avg_sq, out=state['_denom'])
-                    state['_denom'].div_(math.sqrt(bc2)).add_(1e-8)
+                    state['_denom'].div_(math.sqrt(bc2)).add_(group.get('eps', 1e-8))
                     p.data.addcdiv_(exp_avg, state['_denom'], value=-step_size)
     
     def sync_if_needed(self, world_size: int):
@@ -3226,12 +3233,16 @@ class Trainer:
           DESLOC_nesterov: DES-LOC with Nesterov outer optimizer (RQ5)
         """
         params = self.model.parameters()
+        _r = dist.get_rank() if dist.is_initialized() else 0
+        print(f"[M504/ADAM-ARGS] rank={_r} beta1={self.config.beta1} beta2={self.config.beta2} "
+              f"eps={self.config.adam_eps} method={method}")
 
         if method == 'DDP':
             return AdamW(
                 params, lr=self.config.learning_rate,
                 betas=(self.config.beta1, self.config.beta2),
-                weight_decay=self.config.weight_decay
+                weight_decay=self.config.weight_decay,
+                eps=self.config.adam_eps,
             )
         elif method == 'LocalAdam':
             return LocalAdamW(
@@ -3258,6 +3269,7 @@ class Trainer:
                 outer_momentum=self.config.outer_momentum,
                 outer_lr=self.config.outer_lr,
                 max_norm=self.config.grad_clip,  # M465: per-group clip inside step()
+                eps=self.config.adam_eps,        # M504: Megatron 48269d8d8
             )
         else:
             raise ValueError(f"Unknown baseline method: {method}")
