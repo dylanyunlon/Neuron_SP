@@ -3576,6 +3576,23 @@ class Trainer:
             # M366: begin step recording
             self._recorder.begin_step(step)
 
+            # M507: Megatron 3e6898e66 — 1F1B pipeline schedule for memory.
+            # Compute warmup microbatches as (pipeline_depth - rank - 1) capped
+            # by total gradient_accumulation steps. Warmup phases hold forward
+            # activations in memory while pipeling backward for earlier microbatches.
+            # In single-device / non-pipeline mode pipeline_depth=1, rank=0 →
+            # num_warmup = 0, so the loop degrades to the original all-forward-
+            # then-all-backward pattern (identity transform, no regression).
+            _pipe_world = getattr(self, '_pipe_world_size',
+                                  int(os.environ.get('PIPELINE_SIZE', '1')))
+            _pipe_rank  = getattr(self, '_pipe_rank',
+                                  int(os.environ.get('PIPELINE_RANK', '0')))
+            _num_micro   = self.config.gradient_accumulation
+            _num_warmup  = min(max(_pipe_world - _pipe_rank - 1, 0), _num_micro)
+            print(f"[M507-1F1B] step={step} pipe_world={_pipe_world} "
+                  f"pipe_rank={_pipe_rank} num_micro={_num_micro} "
+                  f"num_warmup={_num_warmup}")
+
             for micro_step in range(self.config.gradient_accumulation):
                 try:
                     batch = next(data_iter)
@@ -3657,16 +3674,50 @@ class Trainer:
                             )
                     loss = loss / self.config.gradient_accumulation
 
-                self.scaler.scale(loss).backward() if self.scaler else loss.backward()
-                # M505: Megatron 664cd28b2 — tensor add (not float +=) so dtype
-                # is preserved; skip micro-step if loss is zero (masked / NaN-guarded).
-                _micro_loss_val = loss.detach().float()
-                if _micro_loss_val.item() > 0.0:
-                    accumulated_loss = accumulated_loss + _micro_loss_val.cpu()
+                # M507: Megatron 3e6898e66 — 1F1B schedule.
+                # Warmup micro-steps run forward only and stash (loss, output)
+                # for the cooldown pass.  Steady-state and cooldown run
+                # forward+backward immediately (1 forward, 1 backward).
+                # In non-pipeline mode _num_warmup=0 → always in steady-state.
+                _in_warmup = (micro_step < _num_warmup)
+                _in_cooldown_extra = False  # resolved after loop
+                print(f"[M507-SCHED] step={step} micro={micro_step} "
+                      f"warmup={_in_warmup} num_warmup={_num_warmup}")
+                if _in_warmup:
+                    # Warmup: forward only — stash loss tensor, skip backward
+                    if not hasattr(self, '_1f1b_stash'):
+                        self._1f1b_stash = []
+                    self._1f1b_stash.append(loss)
+                    _micro_loss_val = loss.detach().float()
+                else:
+                    # Steady-state 1F1B: run backward immediately
+                    self.scaler.scale(loss).backward() if self.scaler else loss.backward()
+                    # Drain one warmup-stashed loss if any remain (cooldown pass)
+                    if hasattr(self, '_1f1b_stash') and self._1f1b_stash:
+                        _stashed = self._1f1b_stash.pop(0)
+                        self.scaler.scale(_stashed).backward() if self.scaler else _stashed.backward()
+                        print(f"[M507-COOLDOWN] step={step} micro={micro_step} "
+                              f"drained stashed forward (stash_left={len(self._1f1b_stash)})")
+                    # M505: Megatron 664cd28b2 — tensor add (not float +=) so dtype
+                    # is preserved; skip micro-step if loss is zero (masked / NaN-guarded).
+                    _micro_loss_val = loss.detach().float()
+                    if _micro_loss_val.item() > 0.0:
+                        accumulated_loss = accumulated_loss + _micro_loss_val.cpu()
                 print(f"[M505-MICRO] step={step} micro={micro_step} "
-                      f"micro_loss={_micro_loss_val.item():.6f} "
+                      f"micro_loss={loss.detach().float().item():.6f} "
                       f"accum={accumulated_loss.item():.6f} "
-                      f"skipped={_micro_loss_val.item() == 0.0}")
+                      f"skipped={loss.detach().float().item() == 0.0}")
+
+            # M507: Megatron 3e6898e66 — 1F1B cooldown: drain any remaining
+            # warmup-stashed forward tensors that were not paired during the
+            # steady-state 1F1B pass (happens when _num_warmup == _num_micro,
+            # i.e. no steady-state pairs, only warmup+cooldown).
+            if hasattr(self, '_1f1b_stash') and self._1f1b_stash:
+                print(f"[M507-COOLDOWN-FINAL] step={step} draining "
+                      f"{len(self._1f1b_stash)} remaining stashed losses")
+                for _stashed in self._1f1b_stash:
+                    self.scaler.scale(_stashed).backward() if self.scaler else _stashed.backward()
+                self._1f1b_stash.clear()
 
             # M365 DIAG: post-backward gradient statistics
             if _diag and step % 50 == 1:
