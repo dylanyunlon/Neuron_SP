@@ -1019,6 +1019,79 @@ NEURONSP_VOCAB_DIVISIBLE_BY: int = 128  # Megatron default make_vocab_size_divis
 NEURONSP_LONG_SENTENCE_LEN: int = 512
 
 
+# =============================================================================
+# NEURON_SP PORT: Megatron 57064fd6f — memory optimization in mpu cross entropy
+# Adapted from megatron/mpu/cross_entropy.py _VocabParallelCrossEntropy.forward.
+#
+# Key sequence from 57064fd6f:
+#   1. Remove the full logits.clone() at the top — operate directly on the
+#      input tensor (the caller must not reuse it after this call).
+#   2. Compute max in-place: logits_max = vocab_parallel_logits.max(dim=-1)
+#   3. Subtract in-place:   vocab_parallel_logits.sub_(logits_max.unsqueeze(-1))
+#   4. Extract predicted logit BEFORE exp: predicted_logits_1d.clone().contiguous()
+#      — advanced-index returns a view sharing storage; in-place exp below would
+#        corrupt the slice without the clone. (57064fd critical note)
+#   5. In-place exp that REUSES logits storage: torch.exp(logits, out=exp_logits)
+#   6. sum_exp -> log -> loss = log(sum_exp) - predicted_logit
+#
+# Memory savings: eliminates one O(B*T*V) clone at the top (the largest tensor
+# in the forward pass for large vocab models). The only extra allocation is the
+# O(B*T) predicted_logits_1d.clone() which is negligible by comparison.
+#
+# 20% adaptation: standalone function instead of autograd.Function class;
+# no distributed all_reduce (single-GPU benchmark); added print breakpoints;
+# uses integer target tensor directly without masked_target subtraction.
+# =============================================================================
+
+def _neuronsp_cross_entropy_memory_opt(
+    logits: torch.Tensor,          # [B*T, V] — MODIFIED IN-PLACE, do not reuse
+    targets: torch.Tensor,         # [B*T]    — integer target indices
+    step: int = 0,
+    rank: int = 0,
+) -> torch.Tensor:
+    """Memory-optimised cross-entropy loss (port of Megatron 57064fd6f).
+
+    Eliminates the O(B*T*V) clone at the top of the standard CE computation
+    by operating in-place on the logits tensor.  The caller must NOT use
+    `logits` after this call — its values are overwritten during the exp step.
+
+    Returns:
+        loss -- scalar float32 tensor (mean over B*T tokens).
+    """
+    # Step 1: max in-place — 57064fd: no clone, use vocab_parallel_logits directly
+    logits_max = torch.max(logits, dim=-1)[0]    # [B*T]
+    # Step 2: subtract max in-place to stabilise exp (numerically stable softmax trick)
+    logits.sub_(logits_max.unsqueeze(dim=-1))     # 57064fd key line — in-place
+
+    # Step 3: extract predicted logit BEFORE exp
+    # Advanced indexing returns a view sharing storage with logits.
+    # The .clone().contiguous() is CRITICAL: without it, torch.exp(logits, out=logits)
+    # below would corrupt the slice as it writes exp values back into the same buffer.
+    arange_1d = torch.arange(logits.size(0), device=logits.device)
+    predicted_logits_1d = logits[arange_1d, targets]
+    predicted_logits_1d = predicted_logits_1d.clone().contiguous()   # 57064fd safeguard
+
+    # Step 4: in-place exp — reuses logits storage, O(0) extra allocation
+    # 57064fd: torch.exp(vocab_parallel_logits, out=exp_logits)
+    #   where exp_logits IS vocab_parallel_logits (aliased assignment)
+    torch.exp(logits, out=logits)                 # logits is now exp_logits
+    sum_exp_logits = logits.sum(dim=-1)           # [B*T]
+
+    # Step 5: loss = log(sum_exp) - predicted_logit (numerically stable CE)
+    loss = torch.log(sum_exp_logits) - predicted_logits_1d    # [B*T]
+    mean_loss = loss.mean()
+
+    # Print breakpoint — fires every 50 steps so the opt is visible in logs
+    if step % 50 == 1:
+        print(f"[CE-57064fd-OPT] rank={rank} step={step} "
+              f"loss={mean_loss.item():.6f} "
+              f"sum_exp_mean={sum_exp_logits.float().mean().item():.4f} "
+              f"pred_logit_mean={predicted_logits_1d.float().mean().item():.6f} "
+              f"B_T={logits.size(0)} V={logits.size(-1)} "
+              f"opt=no_clone+inplace_exp (57064fd6f)")
+    return mean_loss
+
+
 def _neuronsp_vocab_size_with_padding(num_tokens: int,
                                       divisible_by: int = NEURONSP_VOCAB_DIVISIBLE_BY,
                                       world_size: int = 1) -> int:
