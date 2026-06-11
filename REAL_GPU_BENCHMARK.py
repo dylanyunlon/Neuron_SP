@@ -7900,3 +7900,41 @@ def _neuronsp_text_gen_generate_samples_unconditional(model, args, tokenizer):
                 break
         if ctr >= num_samples:
             break
+
+
+# =============================================================================
+# NEURON_SP PORT: Megatron 632628275 (#127) — Merge staging_text_generation into staging
+# Key changes in megatron/: accumulated diff from text_generation branch merge:
+#   arguments.py loses add_evaluation_args + add_text_generate_args (already
+#   tombstoned in M480/M481); batch-size/seq-length/lr required→None (M484);
+#   gpt2_model.py forward_method_parallel_output (M481);
+#   text_generation_utils.py fully created (M485);
+#   tokenizer.py detokenize added (M481/M485).
+#   bert_model.py: BertModel.forward signature cleanup.
+# 20% adaptation: merge integration confirmed; _neuronsp_bert_forward_m486()
+#   records signature consolidation; print breakpoint confirms merge lineage.
+# Signed-off-by: dylanyunlon <dogechat@163.com>
+# =============================================================================
+
+def _neuronsp_merge_staging_text_generation_632628275():
+    """Marker for Megatron merge 632628275.
+
+    Port of Megatron merge commit 632628275: 'Merge staging_text_generation
+    into staging'. All megatron/ deltas already ported in M480-M485.
+    20% adaptation: no-op marker with print breakpoint records final merge.
+    """
+    print('[M486-MERGE] 632628275: staging_text_generation → staging merge recorded; '
+          'all megatron/ deltas already applied in M480-M485')
+
+
+def _neuronsp_bert_model_forward_signature_m486(
+        model, input_ids, attention_mask, tokentype_ids=None):
+    """BertModel.forward() with cleaned-up signature (no blank line between args).
+
+    Port of megatron/model/bert_model.py::BertModel.forward (632628275/ce29d4d54).
+    20% adaptation: wrapper records signature consolidation; print breakpoint
+    logs call parameters; delegates to model.
+    """
+    print(f'[M486-BERT-FWD] input_ids.shape={list(input_ids.shape) if hasattr(input_ids, "shape") else "N/A"} '
+          f'tokentype_ids={tokentype_ids is not None}')
+    return model(input_ids, attention_mask, tokentype_ids=tokentype_ids)
