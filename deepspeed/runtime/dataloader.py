@@ -815,3 +815,144 @@ def _m59_bert_sentencepair_get_target_seq_length(rng, max_seq_len, short_seq_pro
         target_seq_length = rng.randint(2, target_seq_length)
     return target_seq_length
 # --- End M59 dataloader ---
+
+# M63: Megatron 21a916b12 — Correct some args and create pretrain_bert_ict.py
+# Ported from: configure_data.py + megatron/data_utils/datasets.py +
+#              pretrain_bert_ict.py (new)
+#   → deepspeed/runtime/dataloader.py
+#
+# Key changes carried over:
+#   1. configure_data.py make_data_loader: removed redundant local variable
+#      `shuffle = args.shuffle`; now uses `if args.shuffle:` directly.
+#   2. InverseClozeDataset docstring corrected: "target sentence" → "input
+#      sentence", "sentence pairs" → "input sentences"; removed
+#      max_preds_per_seq parameter from __init__ signature (unused for ICT).
+#   3. InverseClozeDataset.__init__: added `# this is wrong` comment on the
+#      fallback dataset_size = ds_len * (ds_len - 1) line.
+#   4. pretrain_bert_ict.py created: new entry point for BERT ICT pretraining,
+#      with model_provider, get_batch (keys: text/types/is_random/mask/
+#      mask_labels/pad_mask), forward_step (lm_loss + nsp_loss), and
+#      get_train_val_test_data using the old raw/lazy/tfrecords BERT loader
+#      path (distinct from the ALBERT/SOP path in M56).
+# ---------------------------------------------------------------------------
+
+print('[M63]')
+
+
+def _m63_make_data_loader_shuffle(dataset, batch_size, args, random_sampler_cls,
+                                   sequential_sampler_cls, data_loader_cls):
+    """Megatron 21a916b12 — make_data_loader with redundant shuffle variable removed.
+
+    Before this commit configure_data.py had:
+        shuffle = args.shuffle
+        if shuffle:
+
+    After this commit the intermediate variable is gone:
+        if args.shuffle:
+
+    The sampler selection logic is otherwise identical:
+        - args.shuffle=True  → RandomSampler(replacement=True,
+                               num_samples=batch_size * args.train_iters)
+        - args.shuffle=False → SequentialSampler
+
+    Args:
+        dataset: the dataset to wrap
+        batch_size (int): per-step batch size
+        args: argument namespace with .shuffle and .train_iters
+        random_sampler_cls: RandomSampler constructor (injectable for testing)
+        sequential_sampler_cls: SequentialSampler constructor
+        data_loader_cls: DataLoader constructor
+
+    Returns:
+        A DataLoader instance.
+    """
+    if args.shuffle:
+        sampler = random_sampler_cls(dataset, replacement=True,
+                                     num_samples=batch_size * args.train_iters)
+    else:
+        sampler = sequential_sampler_cls(dataset)
+    return data_loader_cls(dataset, batch_size=batch_size, sampler=sampler)
+
+
+def _m63_inverse_cloze_dataset_init_args():
+    """Megatron 21a916b12 — InverseClozeDataset.__init__ signature after fix.
+
+    max_preds_per_seq parameter was removed because it is not used anywhere
+    inside InverseClozeDataset; its presence was misleading.
+
+    Returns the corrected parameter list (excluding self and ds).
+    """
+    return ['max_seq_len', 'short_seq_prob', 'dataset_size', 'presplit_sentences']
+
+
+def _m63_inverse_cloze_dataset_size(ds_len, dataset_size):
+    """Megatron 21a916b12 — dataset_size fallback for InverseClozeDataset.
+
+    When dataset_size is None the original code sets:
+        self.dataset_size = self.ds_len * (self.ds_len - 1)
+    The upstream comment marks this as wrong; the correct value for ICT is
+    simply ds_len (one query sentence per document block).
+
+    Args:
+        ds_len (int): number of document blocks in the corpus
+        dataset_size (int or None): caller-specified size, or None
+
+    Returns:
+        Effective dataset size (int).
+    """
+    if dataset_size is not None:
+        return dataset_size
+    # this is wrong
+    return ds_len * (ds_len - 1)
+
+
+def _m63_get_ict_batch_keys():
+    """Megatron 21a916b12 — batch key names for pretrain_bert_ict.py.
+
+    pretrain_bert_ict.py uses the original BERT-style key names (not the
+    ALBERT/SOP renames introduced in M56):
+        'text', 'types', 'is_random', 'mask', 'mask_labels', 'pad_mask'
+
+    Returns the ordered key list used by the ICT get_batch() function.
+    """
+    return ['text', 'types', 'is_random', 'mask', 'mask_labels', 'pad_mask']
+
+
+def _m63_ict_forward_step(lm_logits, nsp_logits, lm_labels, loss_mask, next_sentence,
+                           vocab_parallel_cross_entropy_fn, reduce_losses_fn,
+                           padding_mask):
+    """Megatron 21a916b12 — forward_step for BERT ICT pretraining.
+
+    Distinct from M56's _m56_forward_step_sop in two ways:
+      - Uses the original NSP head (nsp_logits / next_sentence / 'nsp loss')
+        rather than the SOP head introduced in M56.
+      - Model is called with 1 - padding_mask (inverted) matching the old
+        pretrain_bert.py convention; M56 removed this inversion for ALBERT.
+
+    Loss:
+        lm_loss  = mean masked-LM cross-entropy (weighted by loss_mask)
+        nsp_loss = cross-entropy on next-sentence prediction
+        total    = lm_loss + nsp_loss
+
+    Returns (loss, {'lm loss': reduced_lm, 'nsp loss': reduced_nsp}).
+    """
+    import torch
+    import torch.nn.functional as F
+
+    nsp_loss = F.cross_entropy(
+        nsp_logits.view(-1, 2).contiguous().float(),
+        next_sentence.view(-1).contiguous(),
+        ignore_index=-1,
+    )
+
+    lm_loss_ = vocab_parallel_cross_entropy_fn(
+        lm_logits.contiguous().float(),
+        lm_labels.contiguous(),
+    )
+    lm_loss = torch.sum(lm_loss_.view(-1) * loss_mask.reshape(-1)) / loss_mask.sum()
+
+    loss = lm_loss + nsp_loss
+    reduced_losses = reduce_losses_fn([lm_loss, nsp_loss])
+
+    return loss, {'lm loss': reduced_losses[0], 'nsp loss': reduced_losses[1]}
+# --- End M63 dataloader ---
