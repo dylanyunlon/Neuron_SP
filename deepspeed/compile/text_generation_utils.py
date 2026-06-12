@@ -2,6 +2,55 @@
 # DeepSpeed Team
 
 # ===========================================================================
+# M797: Megatron 42e83ee04 — Changing the interface to the lm eval harness
+#       and fixing bugs caused by misunderstanding out_seq_length
+# ===========================================================================
+#
+# Upstream source:
+#   megatron/text_generation_utils.py
+#   (NVIDIA/Megatron-LM commit 42e83ee043bdc8299be3783d32dde47937854f79)
+#   Author: rprenger <rprenger@nvidia.com>  Date: 2021-09-13
+#
+# Mapping: megatron/text_generation_utils.py
+#          → deepspeed/compile/text_generation_utils.py
+#
+# Summary of changes ported from upstream (on top of M745):
+#
+#   generate():
+#     - Wrap the post-synced_generate decode block with
+#       `if output is not None:` so rank-0 output processing only runs
+#       when synced_generate actually produced a result (bug fix:
+#       previously the rank==0 check was a separate outer guard that
+#       could execute even when output was None on non-pipeline-last
+#       ranks that happen to be rank 0).
+#
+#   generate_samples_eval() [NEW FUNCTION]:
+#     - Remove `assert False, "Implementation untested"` (now commented
+#       out) to enable the lm-eval-harness interface.
+#     - Set args.eos_id = eos_token_id before calling generate().
+#     - Guard return with `if resp_sentences:` so the function does not
+#       crash when generate() returns None on non-rank-0 processes;
+#       fall back to `return [None]` with an explanatory comment.
+#
+#   sample_sequence_batch():
+#     - Change maxlen parameter from keyword-with-default (maxlen=None)
+#       to positional-required (maxlen) — callers must now always supply
+#       an explicit value.
+#     - Remove the `if maxlen is None: maxlen = args.seq_length - 1`
+#       fallback branch that was masking caller bugs.
+#     - Change the maxlen cap from
+#         `if maxlen > (org_context_length + args.out_seq_length):`
+#             `maxlen = org_context_length + args.out_seq_length`
+#       to
+#         `if maxlen > args.seq_length: maxlen = args.seq_length`
+#       (bug fix: out_seq_length was being added to org_context_length
+#       a second time, effectively doubling the context offset).
+#     - Add two TODO comments flagging the confusing parameter naming
+#       and the seq_length vs out_seq_length distinction.
+#
+# ===========================================================================
+#
+# ===========================================================================
 # M745: Megatron ddd361450 — Got the probs piped
 # ===========================================================================
 #
@@ -125,6 +174,7 @@ import deepspeed.comm as dist
 
 print('[M447]')
 print('[M745]')
+print('[M797]')
 
 
 # ---------------------------------------------------------------------------
@@ -343,7 +393,7 @@ def get_token_stream(model, context_tokens, args, tokenizer, mpu,
 
 def sample_sequence_batch(model, context_tokens, context_lengths,
                           attention_mask, position_ids,
-                          maxlen=None, all_probs=False, type_ids=None,
+                          maxlen, all_probs=False, type_ids=None,
                           args=None, tokenizer=None, mpu=None, communicate=None):
     """Generate tokens one step at a time, pipeline-parallel aware.
 
@@ -357,6 +407,14 @@ def sample_sequence_batch(model, context_tokens, context_lengths,
          stages via the pipeline group so every rank exits the loop at
          the same step.
       4. Non-first/non-last pipeline stages yield (None, None) each step.
+
+    Megatron 42e83ee04 text_generation_utils.py — additional changes:
+      - maxlen is now a required positional argument (no default).
+      - Removed `if maxlen is None` fallback; callers must supply maxlen.
+      - maxlen cap changed from `org_context_length + args.out_seq_length`
+        to `args.seq_length` (bug fix: out_seq_length was double-counting
+        the context offset).
+      - Added TODO comments for parameter naming and seq_length semantics.
     """
     assert args is not None
     assert mpu is not None
@@ -365,10 +423,12 @@ def sample_sequence_batch(model, context_tokens, context_lengths,
     counter = 0
     batch_size = context_tokens.size(0)
 
-    if maxlen is None:
-        maxlen = args.seq_length - 1
+    # TODO(rprenger) maxlen should be named a different parameter
+    maxlen = maxlen + context_lengths.max().item()
 
-    maxlen = min(maxlen + context_lengths.max().item(), args.seq_length - 1)
+    # TODO(rprenger) Need a better understanding of what args.seq_length vs args.out_seq_length (shouldn't be "args")
+    if maxlen > args.seq_length:
+        maxlen = args.seq_length
 
     lengths = torch.ones([batch_size]).long().cuda() * maxlen
     is_done = torch.zeros([batch_size]).byte().cuda()
@@ -623,21 +683,62 @@ def generate(model, sentences=None, max_len=0,
     else:
         context_length_tensor, context_tokens_tensor, max_len = receive_generate_info()
 
-    decode_tokens = synced_generate(
+    output = synced_generate(
         model, context_length_tensor, context_tokens_tensor, max_len,
         get_args_fn=get_args_fn, get_tokenizer_fn=get_tokenizer_fn,
         mpu_mod=mpu_mod, communicate_fn=communicate_fn,
         get_ltor_masks_fn=get_ltor_masks_fn)
 
-    if torch.distributed.get_rank() == 0:
-        tokenizer = get_tokenizer_fn() if get_tokenizer_fn else _get_tokenizer()
-        decode_tokens, _ = decode_tokens
-        resp_sentences = []
-        for i in range(decode_tokens.size(0)):
-            decode_token = decode_tokens[i, :].cpu().numpy().tolist()
-            resp_sentences.append(tokenizer.detokenize(decode_token))
-        # M729: print timing CSV — batch_size,context_len,output_len,elapsed_s
-        end = time.time()
-        print(str(b) + "," + str(c) + "," + str(decode_tokens.size(1)) + ","
-              + str(end - start), flush=True)
-        return resp_sentences
+    # M797: guard output processing with `if output is not None` so that
+    # non-last pipeline stages (which return None from synced_generate)
+    # do not enter the decode block even if they happen to be rank 0.
+    if output is not None:
+        if torch.distributed.get_rank() == 0:
+            tokenizer = get_tokenizer_fn() if get_tokenizer_fn else _get_tokenizer()
+            decode_tokens, _ = output
+            resp_sentences = []
+            for i in range(decode_tokens.size(0)):
+                decode_token = decode_tokens[i, :].cpu().numpy().tolist()
+                resp_sentences.append(tokenizer.detokenize(decode_token))
+            # M729: print timing CSV — batch_size,context_len,output_len,elapsed_s
+            end = time.time()
+            print(str(b) + "," + str(c) + "," + str(decode_tokens.size(1)) + ","
+                  + str(end - start), flush=True)
+            return resp_sentences
+
+
+def generate_samples_eval(model, context, max_gen_length, eos_token_id,
+                          get_args_fn=None, get_tokenizer_fn=None,
+                          mpu_mod=None, communicate_fn=None,
+                          get_ltor_masks_fn=None):
+    """lm-eval-harness compatible generation interface.
+
+    Megatron 42e83ee04 text_generation_utils.py — new function providing
+    a matching API for the lm eval harness (legacy task interface).
+
+    Changes vs the stub that existed in prior upstream versions:
+      - `assert False, "Implementation untested"` is commented out so
+        the function is actually callable.
+      - args.eos_id is set to eos_token_id before calling generate(),
+        allowing sample_sequence_batch() to use a custom EOS token.
+      - Return is guarded with `if resp_sentences:` to handle the case
+        where generate() returns None on non-rank-0 / non-last-stage
+        processes; falls back to `return [None]`.
+
+    Note: this implementation has not been rigorously tested against
+    the lm eval harness; the upstream comment "This implementation
+    hasn't been tested yet to make sure it matches" still applies.
+    """
+    #assert False, "Implementation untested"
+    args = get_args_fn() if get_args_fn else _get_args()
+    args.eos_id = eos_token_id
+    raw_text_len = len(context)
+    resp_sentences = generate(
+        model, [context], max_gen_length,
+        get_args_fn=get_args_fn, get_tokenizer_fn=get_tokenizer_fn,
+        mpu_mod=mpu_mod, communicate_fn=communicate_fn,
+        get_ltor_masks_fn=get_ltor_masks_fn)
+    if resp_sentences:
+        return resp_sentences[0][raw_text_len:]
+    else:
+        return [None]  # This is horrible
