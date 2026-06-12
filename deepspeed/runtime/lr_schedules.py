@@ -1425,3 +1425,46 @@ class DeslocWSDKxAligned:
             f"(serialized lr was {d.get('lr', 0):.6f})"
         )
         # M451: end
+
+
+# ---------------------------------------------------------------------------
+# M642: Megatron caa9dca52 — Add pipelining to GLUE and RACE tasks
+# Source commit: caa9dca52981edc30b8c4930b7f2ace95a531f36
+# Author: Jared Casper <jcasper@nvidia.com>  Date: 2020-11-30
+#
+# Changes ported from megatron/learning_rates.py → deepspeed/runtime/lr_schedules.py:
+#
+#   AnnealingLR._check_and_set() error message upgraded from concatenated
+#   string to f-string so the actual cls_value / sd_value are printed in
+#   the assertion error, making checkpoint-mismatch bugs trivially debuggable.
+#
+#   Before: 'AnnealingLR: class input value' 'and checkpoint values for {} do not match'
+#   After:  f'AnnealingLR: class input value {cls_value} and checkpoint'
+#           f'value {sd_value} for {name} do not match'
+#
+# Neuron_SP mapping:
+#   megatron/learning_rates.py → deepspeed/runtime/lr_schedules.py
+# ---------------------------------------------------------------------------
+
+def _m642_annealing_lr_check_and_set_error_msg(name: str, cls_value, sd_value) -> str:
+    """M642: Improved error message for AnnealingLR._check_and_set mismatch.
+
+    Returns the formatted assertion message string so callers can raise it.
+
+    Args:
+        name:      the parameter name being checked (e.g. 'decay_style').
+        cls_value: the value from the class constructor.
+        sd_value:  the value loaded from the state dict / checkpoint.
+
+    Returns:
+        str: formatted mismatch description ready for use in assert/raise.
+    """
+    msg = (
+        f'AnnealingLR: class input value {cls_value!r} and checkpoint '
+        f'value {sd_value!r} for {name} do not match'
+    )
+    print(f'[M642] lr_check_and_set mismatch detected — {msg}')
+    return msg
+
+
+# --- End M642 lr_schedules ---

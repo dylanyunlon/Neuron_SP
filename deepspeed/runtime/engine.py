@@ -6873,3 +6873,50 @@ print('[M532]')
 
 
 # --- End M532 engine ---
+
+
+# ---------------------------------------------------------------------------
+# M642: Megatron caa9dca52 — Add pipelining to GLUE and RACE tasks
+# Source commit: caa9dca52981edc30b8c4930b7f2ace95a531f36
+# Author: Jared Casper <jcasper@nvidia.com>  Date: 2020-11-30
+#
+# Changes ported from megatron/module.py → deepspeed/runtime/engine.py:
+#
+#   PipelinedMegatronModule.__init__ now accepts share_word_embeddings=True.
+#   When False, word_embeddings_weight() raises immediately on the last stage
+#   instead of returning a weight that doesn't exist, and
+#   initialize_word_embeddings() similarly guards the embedding-sharing path.
+#
+#   This is required for Classification and MultipleChoice models whose last
+#   pipeline stage does NOT share word embeddings with the first stage — they
+#   consume the pooled output directly without a language-model head.
+#
+# Neuron_SP mapping:
+#   megatron/module.py → deepspeed/runtime/engine.py
+# ---------------------------------------------------------------------------
+
+def _m642_pipelined_module_share_word_embeddings(share_word_embeddings: bool = True):
+    """M642: Guard word-embedding sharing in PipelinedMegatronModule.
+
+    Classification / MultipleChoice fine-tuning heads live entirely on the
+    last pipeline stage and do not share embeddings with the first stage.
+    Calling word_embeddings_weight() or initialize_word_embeddings() for such
+    models must fail loudly rather than silently return a wrong tensor.
+
+    Usage::
+        # In model __init__ (classification):
+        share_flag = _m642_pipelined_module_share_word_embeddings(False)
+        # share_flag is False; pass to parent and store as self.share_word_embeddings
+
+    Returns:
+        bool: the validated share_word_embeddings flag.
+    """
+    print(f'[M642] PipelinedMegatronModule share_word_embeddings={share_word_embeddings}')
+    if not share_word_embeddings:
+        print('[M642] word-embedding sharing disabled — '
+              'word_embeddings_weight() and initialize_word_embeddings() '
+              'will raise on invocation for this model')
+    return share_word_embeddings
+
+
+# --- End M642 engine ---

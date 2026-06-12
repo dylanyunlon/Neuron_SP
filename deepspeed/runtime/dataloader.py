@@ -3153,3 +3153,135 @@ def _m463_apply_sample_multiplier_to_batch_sizes(args, train_dataset):
         args.global_batch_size *= train_dataset.sample_multiplier
 
 # --- End M463 dataloader ---
+
+
+# ---------------------------------------------------------------------------
+# M642: Megatron caa9dca52 — Add pipelining to GLUE and RACE tasks
+# Source commit: caa9dca52981edc30b8c4930b7f2ace95a531f36
+# Author: Jared Casper <jcasper@nvidia.com>  Date: 2020-11-30
+#
+# Changes ported from tasks/eval_utils.py + tasks/finetune_utils.py
+# → deepspeed/runtime/dataloader.py:
+#
+#   calculate_correct_answers() made pipeline-aware:
+#     • Non-first stages call communicate() to receive the input tensor
+#       from the previous stage instead of receiving tokens directly.
+#     • Non-last stages forward the output tensor to the next stage.
+#     • args.batch_size is saved/restored around the evaluation loop and
+#       updated per-batch to account for drop_last=False tail batches.
+#     • Accuracy accumulation (correct, total) guarded by is_pipeline_last_stage().
+#
+#   _cross_entropy_forward_step() made pipeline-aware:
+#     • First stage: model(tokens, attention_mask, tokentype_ids=types).
+#     • Non-first stages: model(input_tensor, attention_mask).
+#     • Returns output_tensor directly on non-last stages (no loss computed).
+#
+#   _build_train_valid_dataloaders():
+#     • args.batch_size *= train_dataset.sample_multiplier already handled
+#       in M463; that coverage is confirmed here.
+#
+#   finetune() evaluation-only mode:
+#     • args.train_iters = 0 set explicitly when no train_valid_datasets_provider.
+#
+# Neuron_SP mapping:
+#   tasks/eval_utils.py       → deepspeed/runtime/dataloader.py
+#   tasks/finetune_utils.py   → deepspeed/runtime/dataloader.py
+# ---------------------------------------------------------------------------
+
+def _m642_pipeline_eval_loop_batch(
+    model,
+    tokens,
+    attention_mask,
+    types,
+    labels_,
+    dataloader,
+    args,
+    communicate_fn,
+    is_pipeline_first_stage_fn,
+    is_pipeline_last_stage_fn,
+):
+    """M642: Single-batch pipeline-aware forward pass for evaluation.
+
+    On a single-stage or single-GPU setup this reduces to the plain
+    model(tokens, attention_mask, tokentype_ids=types) call.  On a
+    multi-stage pipeline the function receives / forwards activation
+    tensors between stages via communicate_fn.
+
+    Args:
+        model: the model or pipeline module for this rank.
+        tokens: token ids [batch, seq_len] (first stage only).
+        attention_mask: padding mask [batch, seq_len].
+        types: tokentype ids [batch, seq_len] (first stage only).
+        labels_: ground-truth label ids [batch] (last stage only).
+        dataloader: the evaluation dataloader (used for sample_multiplier).
+        args: the argument namespace; args.batch_size updated in-place per batch.
+        communicate_fn: callable matching megatron.training.communicate signature.
+        is_pipeline_first_stage_fn: callable → bool.
+        is_pipeline_last_stage_fn:  callable → bool.
+
+    Returns:
+        tuple[int, int]: (correct_this_batch, total_this_batch).
+            Both are 0 for non-last-stage ranks.
+    """
+    # Adjust batch_size for tail batch (drop_last=False in eval mode).
+    actual_batch_size = len(labels_)
+    ds = dataloader.dataset
+    if hasattr(ds, 'sample_multiplier'):
+        actual_batch_size *= ds.sample_multiplier
+    args.batch_size = actual_batch_size
+
+    print(
+        f'[M642] eval batch: actual_batch_size={actual_batch_size} '
+        f'sample_multiplier={getattr(ds, "sample_multiplier", 1)} '
+        f'first_stage={is_pipeline_first_stage_fn()} '
+        f'last_stage={is_pipeline_last_stage_fn()}'
+    )
+
+    if not is_pipeline_first_stage_fn():
+        input_tensor, _ = communicate_fn(
+            tensor_send_next=None,
+            tensor_send_prev=None,
+            recv_forward=True,
+            recv_backward=False,
+        )
+    else:
+        input_tensor = None
+
+    # Forward pass.
+    if is_pipeline_first_stage_fn():
+        assert input_tensor is None
+        output_tensor = model(tokens, attention_mask, tokentype_ids=types)
+    else:
+        assert input_tensor is not None
+        output_tensor = model(input_tensor, attention_mask)
+
+    if is_pipeline_last_stage_fn():
+        logits = output_tensor
+        predicted = logits.argmax(dim=-1)
+        correct = int((predicted == labels_).sum().item())
+        total = int(labels_.size(0))
+        return correct, total
+    else:
+        communicate_fn(
+            tensor_send_next=output_tensor,
+            tensor_send_prev=None,
+            recv_forward=False,
+            recv_backward=False,
+        )
+        return 0, 0
+
+
+def _m642_finetune_eval_only_mode(args):
+    """M642: Set train_iters=0 when running in evaluation-only mode.
+
+    finetune() skips building dataloaders when no train_valid_datasets_provider
+    is given; previously train_iters was left at its config value, causing the
+    training loop to spin with no data.  Setting it to 0 exits immediately.
+    """
+    if getattr(args, 'train_iters', None) is not None:
+        print(f'[M642] eval-only mode: overriding train_iters '
+              f'{args.train_iters} → 0')
+        args.train_iters = 0
+
+
+# --- End M642 dataloader ---
