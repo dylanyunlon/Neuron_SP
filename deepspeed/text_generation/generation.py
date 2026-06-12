@@ -28,12 +28,11 @@ from .communication import (
 from .forward_step import ForwardStep
 from .sampling import sample
 
-MAX_TOKENS_TO_OOM = 12000  # (rprenger) Perfect value depends on hardware and network
-
 print('[M1055]')
 print('[M1166]')
 print('[M1215]')
 print('[M1230]')
+print('[M1278]')
 
 def score_and_return_on_first_stage(model, tokens, lengths):
     """Function for just scoring.
@@ -56,8 +55,8 @@ def score_and_return_on_first_stage(model, tokens, lengths):
     if max_prompt_length > args.max_position_embeddings:
         raise ValueError("Length of prompt + tokens_to_generate longer than allowed")
     
-    if max_prompt_length * batch_size >= MAX_TOKENS_TO_OOM:
-        raise ValueError("Too many tokens.  " + str(max_prompt_length*batch_size)+ " is greater than "+str(MAX_TOKENS_TO_OOM))
+    if max_prompt_length * batch_size > args.max_tokens_to_oom:
+        raise ValueError("Too many tokens.  " + str(max_prompt_length*batch_size)+ " is greater than "+str(args.max_tokens_to_oom))
 
     # forward step.
     forward_step = ForwardStep(model, batch_size, max_prompt_length)
@@ -149,8 +148,8 @@ def generate_tokens_probs_and_return_on_first_stage(
     if max_sequence_length > args.max_position_embeddings:
         raise ValueError("Length of prompt + tokens_to_generate longer than allowed")
 
-    if max_sequence_length * batch_size >= MAX_TOKENS_TO_OOM:
-        raise ValueError("Too many tokens.  " + str(max_sequence_length*batch_size)+ " is greater than "+str(MAX_TOKENS_TO_OOM))
+    if max_sequence_length * batch_size > args.max_tokens_to_oom:
+        raise ValueError("Too many tokens.  " + str(max_sequence_length*batch_size)+ " is greater than "+str(args.max_tokens_to_oom))
 
     # forward step.
     forward_step = ForwardStep(model, batch_size, max_sequence_length)

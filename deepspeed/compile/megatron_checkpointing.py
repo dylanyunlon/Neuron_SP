@@ -502,3 +502,60 @@ def save_checkpoint_distributed_optimizer(
             print_rank_0(f'[M1204]   saved combined → {model_checkpoint_name}')
 
     print_rank_0(f'[M1204] checkpoint save complete at iteration {iteration:7d}')
+
+# ---------------------------------------------------------------------------
+# M1278: Megatron d48d95ab8 — Open sourcing lm detoxification code
+# Source: megatron/checkpointing.py (NVIDIA/Megatron-LM commit d48d95ab8)
+# Author: Boxin Wang <boxinw@nvidia.com>  Date: 2022-11-23
+#
+# Mapping: megatron/checkpointing.py load_checkpoint()
+#        → deepspeed/compile/megatron_checkpointing.py
+#
+# Changes ported from checkpointing.py (load_checkpoint, ~lines 532-580):
+#
+#   1. Guard args-check with `not args.finetune`:
+#        Before:  if 'args' in model_state_dict:
+#        After:   if 'args' in model_state_dict and not args.finetune:
+#      When fine-tuning we skip consumed_train/valid_samples and
+#      check_checkpoint_args so the pretrained config does not override
+#      the new fine-tuning config.
+#
+#   2. New else-branch for the optimizer load block:
+#        else:
+#            if args.fp16 and optimizer is not None:
+#                optimizer.reload_model_params()
+#      After a successful optimizer state load we need to sync the fp16
+#      master weights with the loaded model params.
+#
+# Adaptation note: Neuron_SP's megatron_checkpointing.py provides helper
+# functions (load_checkpoint_safe, get_checkpoint_names, …) rather than a
+# full load_checkpoint() port.  The upstream intent is recorded here as a
+# marker; when a full load_checkpoint() is ported these two changes MUST be
+# included.
+# ---------------------------------------------------------------------------
+
+def _load_checkpoint_finetune_notes():
+    """Marker for M1278 load_checkpoint finetune changes (not callable).
+
+    Upstream diff (megatron/checkpointing.py load_checkpoint):
+
+        # 1. skip arg-check during fine-tune
+        - if 'args' in model_state_dict:
+        + if 'args' in model_state_dict and not args.finetune:
+              checkpoint_args = model_state_dict['args']
+              check_checkpoint_args(checkpoint_args)
+              ...
+
+        # 2. reload fp16 master weights when optimizer IS loaded
+          try:
+              optimizer.load_state_dict(...)
+          except:
+              ...
+              sys.exit()
+        + else:
+        +     if args.fp16 and optimizer is not None:
+        +         optimizer.reload_model_params()
+    """
+    pass  # documentation-only function
+
+print('[M1278]')

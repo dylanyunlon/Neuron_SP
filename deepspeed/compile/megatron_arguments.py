@@ -1179,3 +1179,45 @@ def add_standalone_embedding_arg(parser):
 # ---------------------------------------------------------------------------
 
 print('[M1245]')
+
+# ---------------------------------------------------------------------------
+# M1278: Megatron d48d95ab8 — Open sourcing lm detoxification code
+# Source: megatron/arguments.py (NVIDIA/Megatron-LM commit d48d95ab8)
+# Author: Boxin Wang <boxinw@nvidia.com>  Date: 2022-11-23
+#
+# Mapping: megatron/arguments.py _add_inference_args()
+#        → deepspeed/compile/megatron_arguments.py add_max_tokens_to_oom_arg()
+#
+# Changes ported from arguments.py (_add_inference_args, ~line 363-370):
+#
+#   New argument added to inference group:
+#     --max-tokens-to-oom  (int, default 12000)
+#     Replaces the module-level MAX_TOKENS_TO_OOM constant in
+#     text_generation/generation.py so that the threshold is configurable
+#     at launch time rather than hard-coded.
+#
+# Adaptation note: Neuron_SP surfaces inference args as standalone helper
+# functions.  The new function add_max_tokens_to_oom_arg() follows the same
+# pattern as existing helpers in this file.
+# ---------------------------------------------------------------------------
+
+def add_max_tokens_to_oom_arg(parser):
+    """Add --max-tokens-to-oom argument (Megatron d48d95ab8).
+
+    Registers the inference-time OOM guard threshold that replaced the
+    hard-coded ``MAX_TOKENS_TO_OOM = 12000`` constant in
+    ``deepspeed/text_generation/generation.py``.
+    """
+    group = parser.add_argument_group(title='M1278 inference OOM guard')
+    group.add_argument(
+        '--max-tokens-to-oom',
+        type=int,
+        default=12000,
+        help='Maximum number of tokens during inference; '
+             'tokens here is # in prompt + # to generate. '
+             'Allows us to throw an error before OOM crashes server.',
+    )
+    print('[M1278] add_max_tokens_to_oom_arg: --max-tokens-to-oom registered')
+    return parser
+
+print('[M1278]')
