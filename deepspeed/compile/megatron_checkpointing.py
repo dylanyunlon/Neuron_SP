@@ -267,3 +267,115 @@ def load_virtual_pipeline_state_dict(model_list, state_dict, strict=True):
             set_virtual_pipeline_model_parallel_rank(i)
             model_module.load_state_dict(state_dict['model%d' % i], strict=strict)
     print(f'[M556] load_virtual_pipeline_state_dict: {len(model_list)} stage(s)')
+
+
+# ===========================================================================
+# M1204: Megatron b178e6fc5 — error fixes & tested
+# ===========================================================================
+#
+# Upstream source: megatron/checkpointing.py → deepspeed/compile/megatron_checkpointing.py
+#
+# Changes ported from save_checkpoint():
+#
+#   1. Rename local variable: state_dict → model_state_dict (model/RNG block)
+#      and state_dict → optim_state_dict (optimizer block).
+#      Previously a single state_dict was reused for both blocks; now they are
+#      kept as independent dicts so that model and optimizer can be saved to
+#      separate files when use_distributed_optimizer is active.
+#
+#   2. Introduce save phase with use_distributed_optimizer branch:
+#        if args.use_distributed_optimizer:
+#            # Save model separate from optimizer.
+#            if model_state_dict:
+#                ensure_directory_exists(model_checkpoint_name)
+#                torch.save(model_state_dict, model_checkpoint_name)
+#            if optim_state_dict:
+#                ensure_directory_exists(optim_checkpoint_name)
+#                torch.save(optim_state_dict, optim_checkpoint_name)
+#        else:
+#            # Save model and optimizer together.
+#            state_dict = {**model_state_dict, **optim_state_dict}
+#            if state_dict:
+#                ensure_directory_exists(model_checkpoint_name)
+#                torch.save(state_dict, model_checkpoint_name)
+#
+#   3. Comment rewording: "Save args, model, RNG." → "Collect args, model, RNG."
+#      and "Save optimizer state." → "Collect optimizer state."
+#
+# 20% adaptation: the split-save logic is expressed in
+# save_checkpoint_distributed_optimizer() below, which extends the existing
+# save_checkpoint_safe() callback pattern rather than modifying it in-place.
+# Adds print('[M1204]').
+# ===========================================================================
+
+print('[M1204]')
+
+
+def save_checkpoint_distributed_optimizer(
+    iteration,
+    save_path,
+    model_state_dict,
+    optim_state_dict,
+    model_checkpoint_name,
+    optim_checkpoint_name,
+    ensure_directory_exists_fn,
+    use_distributed_optimizer=False,
+):
+    """Save model and optimizer checkpoints, splitting files when use_distributed_optimizer.
+
+    Megatron b178e6fc5 checkpointing.py save_checkpoint() save phase:
+
+        if args.use_distributed_optimizer:
+            # Save model separate from optimizer.
+            if model_state_dict:
+                ensure_directory_exists(model_checkpoint_name)
+                torch.save(model_state_dict, model_checkpoint_name)
+            if optim_state_dict:
+                ensure_directory_exists(optim_checkpoint_name)
+                torch.save(optim_state_dict, optim_checkpoint_name)
+        else:
+            # Save model and optimizer together.
+            state_dict = {**model_state_dict, **optim_state_dict}
+            if state_dict:  # only saves if populated
+                ensure_directory_exists(model_checkpoint_name)
+                torch.save(state_dict, model_checkpoint_name)
+
+    Args:
+        iteration: training iteration (for logging only).
+        save_path: checkpoint directory (for logging only).
+        model_state_dict: dict containing model/RNG/args entries (may be empty
+            when this rank does not own data-parallel rank 0).
+        optim_state_dict: dict containing optimizer/scheduler entries (may be
+            empty when no_save_optim is set or rank is excluded).
+        model_checkpoint_name: full path for the model checkpoint file.
+        optim_checkpoint_name: full path for the optimizer checkpoint file
+            (only used when use_distributed_optimizer=True).
+        ensure_directory_exists_fn: callable(filename) — creates parent dirs.
+        use_distributed_optimizer: when True, save model and optimizer to
+            separate files; when False, merge them into model_checkpoint_name.
+    """
+    print_rank_0(
+        f'[M1204] saving checkpoint at iteration {iteration:7d} to {save_path} '
+        f'(use_distributed_optimizer={use_distributed_optimizer})'
+    )
+
+    if use_distributed_optimizer:
+        # Collect args, model, RNG → model file.
+        # Collect optimizer state → optim file.
+        if model_state_dict:
+            ensure_directory_exists_fn(model_checkpoint_name)
+            torch.save(model_state_dict, model_checkpoint_name)
+            print_rank_0(f'[M1204]   saved model  → {model_checkpoint_name}')
+        if optim_state_dict:
+            ensure_directory_exists_fn(optim_checkpoint_name)
+            torch.save(optim_state_dict, optim_checkpoint_name)
+            print_rank_0(f'[M1204]   saved optim  → {optim_checkpoint_name}')
+    else:
+        # Save model and optimizer together into model_checkpoint_name.
+        state_dict = {**model_state_dict, **optim_state_dict}
+        if state_dict:  # only saves if populated (inherits conditions above)
+            ensure_directory_exists_fn(model_checkpoint_name)
+            torch.save(state_dict, model_checkpoint_name)
+            print_rank_0(f'[M1204]   saved combined → {model_checkpoint_name}')
+
+    print_rank_0(f'[M1204] checkpoint save complete at iteration {iteration:7d}')
