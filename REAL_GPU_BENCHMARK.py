@@ -4675,6 +4675,10 @@ class Trainer:
                     if not hasattr(self, '_1f1b_stash'):
                         self._1f1b_stash = []
                     self._1f1b_stash.append(loss)
+                    # M973: Megatron 7f1c59177 — handle output_tensor == None
+                    if loss is None:
+                        print('[M973]')
+                        continue
                     # M957: free output tensor data after stashing if flag set
                     if getattr(args, 'deallocate_pipeline_outputs', False) and isinstance(loss, torch.Tensor):
                         loss.data = torch.tensor(float('nan'))
