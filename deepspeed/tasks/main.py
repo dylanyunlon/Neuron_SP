@@ -91,9 +91,9 @@ def get_tasks_args(parser):
                        'each line is an input.')
     group.add_argument("--sample-output-file", type=str, default=None,
                        help='Output file got from --sample-input-file')
-    group.add_argument('--prompt-file', type=str, default="",
+    group.add_argument('--prompt-file', type=str, default=None,
                        help='prompting file')
-    group.add_argument('--prompt-type', type=str, default="",
+    group.add_argument('--prompt-type', type=str, default=None,
                        help='prompt type (knowledge or response)')
     group.add_argument('--num-prompt-examples', type=int, default=10,
                        help='number of prompt examples')
@@ -101,14 +101,19 @@ def get_tasks_args(parser):
                        help='using different prompts for different test samples')
     group.add_argument('--module', type=str, default="",
                        help='either knowledge generation (knowledge) or response generation (response)')
-    group.add_argument('--guess-file', type=str, default="",
+    group.add_argument('--guess-file', type=str, default=None,
                        help='datapath for generated sentences')
-    group.add_argument('--answer-file', type=str, default="",
+    group.add_argument('--answer-file', type=str, default=None,
                        help='datapath for golden sentences')
     group.add_argument('--spec-toks', type=str, default=None,
                        help='additional special tokens')
     group.add_argument('--out-seq-length', type=int, default=100,
                        help='output sequence length')
+    group.add_argument('--api-prompt', default=False, action="store_true",
+                       help='setup model api for prompting')
+    group.add_argument('--megatron-api-url', type=str, default=None,
+                       help='url of the megatron api')
+    print('[M928]')
 
     return parser
 
