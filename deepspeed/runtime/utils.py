@@ -1805,20 +1805,35 @@ def desloc_bucket_grad_norm(grads, norm_type=2.0, dp_group=None):
 
 
 def desloc_clip_grad_per_tier(params, max_norm, tier='x',
-                               norm_type=2.0, dp_group=None):
+                               norm_type=2.0, dp_group=None, mpu=None):
     """Clip gradients per DES-LOC tier.
     Adapted from Megatron clip_grad_by_total_norm_fp32() and
     neuronx-distributed _clip_grad_norm() at zero_redundancy_optimizer.py:96.
-    tier 'x'=SP (every Kx), 'u'=momentum (every Ku), 'v'=full (every Kv)."""
-    grads = [p.grad for p in params if p.grad is not None]
-    if not grads:
+    tier 'x'=SP (every Kx), 'u'=momentum (every Ku), 'v'=full (every Kv).
+    M200: fixed bug — separate parameters_with_grads (for clipping) from
+    parameters_for_norm (model-parallel aware, for norm calculation),
+    matching Megatron fb5b2b362 l2_grad_clipper fix."""
+    print('[M200]')
+    # Make sure we have an iterable.
+    if isinstance(params, torch.Tensor):
+        params = [params]
+    # Filter parameters with gradients.
+    parameters_with_grads = list(filter(
+        lambda p: p.grad is not None, params))
+    if not parameters_with_grads:
         return 0.0
-
-    total_norm = desloc_bucket_grad_norm(grads, norm_type, dp_group)
-    clip_coeff = max_norm / (total_norm + 1e-6)
+    # Filter parameters for norm calculations (model-parallel aware).
+    mp_rank_is_zero = (mpu is None) or (mpu.get_model_parallel_rank() == 0)
+    parameters_for_norm = list(filter(
+        lambda p: is_model_parallel_parameter(p) or mp_rank_is_zero,
+        parameters_with_grads))
+    grads_for_norm = [p.grad for p in parameters_for_norm]
+    total_norm = desloc_bucket_grad_norm(grads_for_norm, norm_type, dp_group)
+    # Scale to get max_norm.
+    clip_coeff = float(max_norm) / (total_norm + 1.0e-6)
     if clip_coeff < 1.0:
-        for g in grads:
-            g.data.mul_(clip_coeff)
+        for p in parameters_with_grads:
+            p.grad.data.mul_(clip_coeff)
     return total_norm
 
 

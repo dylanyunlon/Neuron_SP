@@ -1174,19 +1174,35 @@ def desloc_grad_norm_fp32(grads, norm_type=2.0):
         total += gf.norm(norm_type) ** norm_type
     return total.item() ** (1.0 / norm_type)
 
-def desloc_clip_grad_per_tier(params, max_norm, tier, total_norm=None):
+def desloc_clip_grad_per_tier(params, max_norm, tier, total_norm=None, mpu=None):
     """Per-tier gradient clipping (adapted from Megatron clip_grad_by_total_norm_fp32).
 
     Each tier has its own max_norm threshold from DESLOC_TIER_CLIP_MAX_NORM.
+    M200: fixed bug — separate parameters_with_grads (for clipping) from
+    parameters_for_norm (model-parallel aware, for norm calculation),
+    matching Megatron fb5b2b362 l2_grad_clipper fix.
     """
+    print('[M200]')
     import torch as _torch
+    # Make sure we have an iterable.
+    if isinstance(params, _torch.Tensor):
+        params = [params]
+    # Filter parameters with gradients.
+    parameters_with_grads = list(filter(lambda p: p.grad is not None, params))
+    if not parameters_with_grads:
+        return 0.0
     tier_max = DESLOC_TIER_CLIP_MAX_NORM.get(tier, max_norm)
     if total_norm is None:
-        grads = [p.grad for p in params if p.grad is not None]
-        total_norm = desloc_grad_norm_fp32(grads) if grads else 0.0
-    clip_coeff = tier_max / (total_norm + DESLOC_GRAD_NORM_CLIP_EPS)
+        # Filter parameters for norm calculations (model-parallel aware).
+        mp_rank_is_zero = (mpu is None) or (mpu.get_model_parallel_rank() == 0)
+        parameters_for_norm = list(filter(
+            lambda p: getattr(p, 'model_parallel', False) or mp_rank_is_zero,
+            parameters_with_grads))
+        grads_for_norm = [p.grad for p in parameters_for_norm]
+        total_norm = desloc_grad_norm_fp32(grads_for_norm) if grads_for_norm else 0.0
+    # Scale to get max_norm.
+    clip_coeff = float(tier_max) / (total_norm + 1.0e-6)
     if clip_coeff < 1.0:
-        for p in params:
-            if p.grad is not None:
-                p.grad.mul_(clip_coeff)
+        for p in parameters_with_grads:
+            p.grad.mul_(clip_coeff)
     return total_norm
