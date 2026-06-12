@@ -1,5 +1,6 @@
 #! /bin/bash
 echo '[M423]'
+echo '[M1184]'
 
 # Runs the "345M" parameter model
 
@@ -20,6 +21,7 @@ python -m torch.distributed.launch $DISTRIBUTED_ARGS \
        pretrain_gpt2.py \
        --tensor-model-parallel-size 2 \
        --pipeline-model-parallel-size 2 \
+       --sequence-parallel \
        --num-layers 24 \
        --hidden-size 1024 \
        --num-attention-heads 16 \
