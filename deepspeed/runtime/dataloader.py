@@ -2265,9 +2265,13 @@ def _m189_pretrain_ict_dataset_provider(args):
               data_path, data_impl, split, seq_length, mask_prob,
               short_seq_prob, seed, mmap_warmup.
 
-    Returns a (build_kwargs, ict_dataset=True) pair for documentation purposes.
+    Returns a (build_kwargs, dataset_type='ict') pair for documentation purposes.
     (Actual dataset construction requires the build_train_valid_test_datasets
     function from bert_dataset.py which is not duplicated here.)
+
+    M214 update (Megatron f7f730e1d): ict_dataset=True kwarg replaced by
+    dataset_type='ict' — build_train_valid_test_datasets now uses a string
+    discriminator instead of a boolean flag.
     """
     build_kwargs = dict(
         data_prefix=args.data_path,
@@ -2278,7 +2282,7 @@ def _m189_pretrain_ict_dataset_provider(args):
         short_seq_prob=args.short_seq_prob,
         seed=args.seed,
         skip_warmup=(not args.mmap_warmup),
-        ict_dataset=True,
+        dataset_type='ict',
     )
     return build_kwargs
 
@@ -2301,3 +2305,126 @@ def _m189_get_batch_keys():
                 'block_tokens', 'block_types', 'block_pad_mask']
     return old_keys, new_keys
 # --- End M189 dataloader ---
+
+
+# ---------------------------------------------------------------------------
+# M214: Megatron f7f730e1d — Write pretrain_realm.py and misc dataset_type
+#       left from earlier
+# ---------------------------------------------------------------------------
+# Changes in this commit (Megatron f7f730e1d, 2020-04-23):
+#
+#   1. pretrain_bert_ict.py — dataset kwarg rename
+#      build_train_valid_test_datasets(..., ict_dataset=True)
+#      → build_train_valid_test_datasets(..., dataset_type='ict')
+#      Applied above in _m189_pretrain_ict_dataset_provider (M214 update note).
+#
+#   2. pretrain_realm.py — full rewrite / cleanup:
+#      - Remove torchDDP import; remove manual checkpoint-loading boilerplate.
+#      - Import HashedIndex, load_ict_checkpoint, get_ict_dataset from
+#        hashed_index module.
+#      - model_provider() now uses load_ict_checkpoint() / REALMRetriever /
+#        REALMBertModel instead of get_model(ict_model_provider).
+#      - get_batch() keys: ['query_tokens','query_types','query_pad_mask']
+#        → ['tokens','labels','loss_mask','pad_mask'].
+#      - forward_step() replaced retrieval-score / top-k accuracy logic with
+#        P(y|x)=sum_z[P(y|z,x)*P(z|x)] marginalisation + vocab_parallel_cross_entropy.
+#      - train_valid_test_datasets_provider() passes dataset_type='realm'.
+# ---------------------------------------------------------------------------
+
+print('[M214]')
+
+
+def _m214_pretrain_realm_model_provider():
+    """M214: Megatron f7f730e1d — model_provider() for pretrain_realm.py.
+
+    Previous version used get_model(ict_model_provider) + manual torch.load
+    checkpoint restoration.  This revision delegates checkpoint loading to
+    load_ict_checkpoint() from the hashed_index module and composes the full
+    REALM model from REALMRetriever + REALMBertModel.
+
+    Imports required by the real pretrain_realm.py (not duplicated here):
+        from hashed_index import HashedIndex, load_ict_checkpoint, get_ict_dataset
+        from megatron.model import REALMBertModel, REALMRetriever
+
+    Equivalent logic (pseudo-code):
+        def model_provider():
+            args = get_args()
+            print_rank_0('building REALM models ...')
+            ict_model    = load_ict_checkpoint()
+            ict_dataset  = get_ict_dataset()
+            hashed_index = HashedIndex.load_from_file('block_hash_data.pkl')
+            retriever    = REALMRetriever(ict_model, ict_dataset, hashed_index)
+            model        = REALMBertModel(retriever)
+            return model
+    """
+    pass
+
+
+def _m214_pretrain_realm_get_batch_keys():
+    """M214: Megatron f7f730e1d — get_batch() key list for pretrain_realm.py.
+
+    Old keys (pre-M214):
+        ['query_tokens', 'query_types', 'query_pad_mask']
+
+    New keys (M214):
+        ['tokens', 'labels', 'loss_mask', 'pad_mask']
+
+    The rename reflects the shift from a retrieval-scoring task (query vs
+    block pairs) to a masked-LM task (tokens + labels + loss_mask).
+    """
+    old_keys = ['query_tokens', 'query_types', 'query_pad_mask']
+    new_keys = ['tokens', 'labels', 'loss_mask', 'pad_mask']
+    return old_keys, new_keys
+
+
+def _m214_pretrain_realm_forward_step_logic():
+    """M214: Megatron f7f730e1d — forward_step() logic for pretrain_realm.py.
+
+    Previous implementation computed retrieval accuracy (top-1 / top-5) via a
+    dot-product similarity matrix between query and block logits.
+
+    New implementation marginalises over retrieved blocks:
+        lm_logits, block_probs = model(tokens, pad_mask)
+        # P(y|x) = sum_z( P(y|z,x) * P(z|x) )
+        lm_logits = torch.sum(lm_logits * block_probs, dim=1)
+        lm_loss_  = mpu.vocab_parallel_cross_entropy(
+                        lm_logits.contiguous().float(),
+                        labels.contiguous())
+        lm_loss   = torch.sum(lm_loss_.view(-1) * loss_mask.reshape(-1)) \
+                    / loss_mask.sum()
+        reduced_loss = reduce_losses([lm_loss])
+        return lm_loss, {'lm_loss': reduced_loss[0]}
+
+    Removed output keys: 'retrieval loss', 'top1_acc', 'top5_acc'.
+    New output key:      'lm_loss'.
+    """
+    pass
+
+
+def _m214_pretrain_realm_dataset_provider():
+    """M214: Megatron f7f730e1d — train_valid_test_datasets_provider for REALM.
+
+    Mirrors _m189_pretrain_ict_dataset_provider but passes dataset_type='realm'
+    to build_train_valid_test_datasets().
+
+    Equivalent kwargs:
+        build_kwargs = dict(
+            data_prefix=args.data_path,
+            data_impl=args.data_impl,
+            splits_string=args.split,
+            max_seq_length=args.seq_length,
+            masked_lm_prob=args.mask_prob,
+            short_seq_prob=args.short_seq_prob,
+            seed=args.seed,
+            skip_warmup=(not args.mmap_warmup),
+            dataset_type='realm',
+        )
+
+    Entry point:
+        if __name__ == '__main__':
+            pretrain(train_valid_test_datasets_provider, model_provider,
+                     forward_step,
+                     args_defaults={'tokenizer_type': 'BertWordPieceLowerCase'})
+    """
+    pass
+# --- End M214 dataloader ---
