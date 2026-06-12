@@ -1677,3 +1677,100 @@ def desloc_interleaved_kx_warmup(ns, nm, num_model_chunks=1,
         f"fwd_issued={fwd_k} bwd_issued={bwd_k} do_kx_sync={do_kx_sync}"
     )
     return sc
+
+
+# ---------------------------------------------------------------------------
+# M592: Megatron 08ddde0c3 — Fix deadlock when get_num_microbatches() < pipeline-parallel size
+# Ported from: megatron/schedules.py
+# Key change: compute measure_pipeline_stall flag once before warmup loop,
+# gate both barrier calls on it to avoid deadlock when
+# get_num_microbatches() < pipeline_parallel_world_size.
+# ---------------------------------------------------------------------------
+
+def m592_forward_backward_pipelining_without_interleaving(
+        forward_step_func, data_iterator, model, optimizer, timers, forward_only):
+    """Non-interleaved 1F1B schedule with pipeline-stall measurement guarded
+    by measure_pipeline_stall so we never deadlock when the number of
+    microbatches is smaller than the pipeline-parallel world size."""
+    print('[M592]')
+    import torch
+    from megatron import get_num_microbatches, get_timers, mpu, p2p_communication
+    timers = get_timers()
+
+    assert len(model) == 1
+    model = model[0]
+
+    num_microbatches = get_num_microbatches()
+    num_warmup_microbatches = (
+        mpu.get_pipeline_model_parallel_world_size() -
+        mpu.get_pipeline_model_parallel_rank() - 1)
+    num_warmup_microbatches = min(num_warmup_microbatches, num_microbatches)
+    num_microbatches_remaining = num_microbatches - num_warmup_microbatches
+
+    # Measure pipeline stall only if there are enough microbatches
+    # to have every worker in a warmup and steady state phase.
+    measure_pipeline_stall = (
+        get_num_microbatches() >= mpu.get_pipeline_model_parallel_world_size())
+
+    input_tensors = []
+    output_tensors = []
+    losses_reduced = []
+
+    for i in range(num_warmup_microbatches):
+        input_tensor = p2p_communication.recv_forward(timers)
+        output_tensor = forward_step(
+            forward_step_func, data_iterator, model, input_tensor, losses_reduced)
+        # Barrier before first receive to measure forward stall.
+        if i == (num_warmup_microbatches - 1) and measure_pipeline_stall:
+            timers('forward-pipeline-stall').start()
+            torch.distributed.barrier(group=mpu.get_pipeline_model_parallel_group())
+            timers('forward-pipeline-stall').stop()
+        p2p_communication.send_forward(output_tensor, timers)
+        input_tensors.append(input_tensor)
+        output_tensors.append(output_tensor)
+
+    # Barrier before first receive to measure forward stall.
+    if num_warmup_microbatches == 0 and measure_pipeline_stall:
+        timers('forward-pipeline-stall').start()
+        torch.distributed.barrier(group=mpu.get_pipeline_model_parallel_group())
+        timers('forward-pipeline-stall').stop()
+
+    if num_microbatches_remaining > 0:
+        input_tensor = p2p_communication.recv_forward(timers)
+
+    for i in range(num_microbatches_remaining):
+        last_iteration = (i == (num_microbatches_remaining - 1))
+        output_tensor = forward_step(
+            forward_step_func, data_iterator, model, input_tensor, losses_reduced)
+        if forward_only:
+            p2p_communication.send_forward(output_tensor, timers)
+        else:
+            output_tensor_grad = p2p_communication.send_forward_recv_backward(
+                output_tensor, timers)
+        input_tensors.append(input_tensor)
+        output_tensors.append(output_tensor)
+        if forward_only:
+            if not last_iteration:
+                input_tensor = p2p_communication.recv_forward(timers)
+        else:
+            input_tensor, output_tensor = input_tensors.pop(0), output_tensors.pop(0)
+            input_tensor_grad = backward_step(
+                optimizer, input_tensor, output_tensor, output_tensor_grad)
+            if last_iteration:
+                input_tensor = None
+                p2p_communication.send_backward(input_tensor_grad, timers)
+            else:
+                input_tensor = p2p_communication.send_backward_recv_forward(
+                    input_tensor_grad, timers)
+
+    if not forward_only:
+        for i in range(num_warmup_microbatches):
+            input_tensor = input_tensors.pop(0)
+            output_tensor = output_tensors.pop(0)
+            output_tensor_grad = p2p_communication.recv_backward(timers)
+            input_tensor_grad = backward_step(
+                optimizer, input_tensor, output_tensor, output_tensor_grad)
+            p2p_communication.send_backward(input_tensor_grad, timers)
+
+    return losses_reduced
+# --- End M592 ---
