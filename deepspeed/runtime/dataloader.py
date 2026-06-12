@@ -2463,6 +2463,7 @@ def _m212_pretrain_realm_dataset_provider(args):
 # --- End M212 dataloader ---
 
 # ---------------------------------------------------------------------------
+
 # M214: Megatron f7f730e1d — Write pretrain_realm.py and misc dataset_type
 #       left from earlier
 # ---------------------------------------------------------------------------
@@ -2583,3 +2584,198 @@ def _m214_pretrain_realm_dataset_provider():
     """
     pass
 # --- End M214 dataloader ---
+
+
+# ---------------------------------------------------------------------------
+# M211: Megatron cf0100cf6 — Restructure BertDataset to help with RealmDataset
+# Ported from:
+#   megatron/data/bert_dataset.py   → deepspeed/runtime/dataloader.py
+#   megatron/data/dataset_utils.py  → deepspeed/runtime/dataloader.py
+#   megatron/data/realm_dataset.py  → deepspeed/runtime/dataloader.py
+#
+# Key changes carried over:
+#   1. bert_dataset.py / BertDataset.__init__:
+#      - Added `self.build_sample_fn = build_training_sample` so subclasses
+#        (e.g. RealmDataset) can override the sample-building function
+#        without overriding __getitem__.
+#   2. bert_dataset.py / BertDataset.__getitem__:
+#      - Variable names `start_index, end_index` renamed to `start_idx, end_idx`
+#        for consistency with downstream code.
+#      - Loop `for index in range(...): sample.append(...)` replaced with
+#        list comprehension `[self.indexed_dataset[i] for i in range(...)]`.
+#      - Call site changed from `build_training_sample(...)` (bare function) to
+#        `self.build_sample_fn(...)` (instance-dispatch), enabling subclass override.
+#   3. dataset_utils.py:
+#      - `build_simple_training_sample` removed (moved to realm_dataset.py).
+#      - `create_single_tokens_and_tokentypes` removed (moved to realm_dataset.py).
+#   4. realm_dataset.py / RealmDataset:
+#      - Changed from standalone `Dataset` subclass to `BertDataset` subclass.
+#      - `__init__` now calls `super().__init__(...)` then overrides
+#        `self.build_sample_fn = build_simple_training_sample`.
+#      - Removed duplicated `__len__`, `__getitem__`, and `__init__` body
+#        (all inherited from BertDataset via build_sample_fn dispatch).
+#      - `build_simple_training_sample` and `create_single_tokens_and_tokentypes`
+#        moved from dataset_utils.py into realm_dataset.py.
+#      - train_sample dict keys updated: 'text' → 'tokens', 'padding_mask' → 'pad_mask'.
+#      - `loss_mask_np` extended: concatenate a ones-array for REALM's double-length
+#        sequence (true seq length is 2x but none predicted with LM outside first half).
+# ---------------------------------------------------------------------------
+
+print('[M211]')
+
+
+def _m211_build_sample_fn_attr():
+    """M211: Megatron cf0100cf6 — BertDataset gains self.build_sample_fn attribute.
+
+    In BertDataset.__init__, after setting up vocab/tokenizer fields, add:
+
+        self.build_sample_fn = build_training_sample
+
+    This allows subclasses to override sample construction by simply setting
+    self.build_sample_fn = <other_fn> in their own __init__, rather than
+    having to override __getitem__ entirely.
+    """
+    # Documentation stub — actual BertDataset lives in megatron/data/bert_dataset.py;
+    # the DeepSpeed port of BertDataset is recorded across M36/M37.
+    return 'build_training_sample'
+
+
+def _m211_getitem_refactor(samples_mapping, indexed_dataset, seed, idx,
+                            build_sample_fn, max_seq_length,
+                            vocab_id_list, vocab_id_to_token_dict,
+                            cls_id, sep_id, mask_id, pad_id, masked_lm_prob):
+    """M211: Megatron cf0100cf6 — BertDataset.__getitem__ with build_sample_fn dispatch.
+
+    Before (pre-cf0100cf6):
+        start_index, end_index, seq_length = self.samples_mapping[idx]
+        sample = []
+        for index in range(start_index, end_index):
+            sample.append(self.indexed_dataset[index])
+        ...
+        return build_training_sample(sample, seq_length, ...)
+
+    After (cf0100cf6):
+        start_idx, end_idx, seq_length = self.samples_mapping[idx]
+        sample = [self.indexed_dataset[i] for i in range(start_idx, end_idx)]
+        ...
+        return self.build_sample_fn(sample, seq_length, ...)
+
+    Changes:
+      - Variable rename: start_index/end_index → start_idx/end_idx
+      - Loop → list comprehension
+      - build_training_sample() → self.build_sample_fn() (enables subclass override)
+    """
+    import numpy as np
+    start_idx, end_idx, seq_length = samples_mapping[idx]
+    sample = [indexed_dataset[i] for i in range(start_idx, end_idx)]
+    np_rng = np.random.RandomState(seed=(seed + idx))
+    return build_sample_fn(
+        sample, seq_length,
+        max_seq_length,           # needed for padding
+        vocab_id_list,
+        vocab_id_to_token_dict,
+        cls_id, sep_id,
+        mask_id, pad_id,
+        masked_lm_prob, np_rng,
+    )
+
+
+def _m211_build_simple_training_sample(sample, target_seq_length, max_seq_length,
+                                        vocab_id_list, vocab_id_to_token_dict,
+                                        cls_id, sep_id, mask_id, pad_id,
+                                        masked_lm_prob, np_rng):
+    """M211: Megatron cf0100cf6 — build_simple_training_sample moved from
+    dataset_utils.py into realm_dataset.py (ported here for DeepSpeed).
+
+    Constructs a single-segment (no NSP) masked-LM training sample for REALM.
+    The output dict uses 'tokens'/'pad_mask' keys (updated from 'text'/'padding_mask').
+    Also concatenates a ones loss_mask for the second half of REALM's double-length
+    sequence (the second half is never predicted by LM, hence all-ones = no loss there).
+
+    Called via RealmDataset.build_sample_fn (set in RealmDataset.__init__).
+    """
+    import itertools
+    import numpy as np
+
+    tokens = list(itertools.chain(*sample))[:max_seq_length - 2]
+    tokens, tokentypes = _m211_create_single_tokens_and_tokentypes(tokens, cls_id, sep_id)
+
+    max_predictions_per_seq = masked_lm_prob * max_seq_length
+    # create_masked_lm_predictions lives in megatron/data/dataset_utils.py
+    # (not removed by this commit — only build_simple/create_single were moved)
+    from megatron.data.dataset_utils import (create_masked_lm_predictions,
+                                              pad_and_convert_to_numpy)
+    (tokens, masked_positions, masked_labels, _) = create_masked_lm_predictions(
+        tokens, vocab_id_list, vocab_id_to_token_dict, masked_lm_prob,
+        cls_id, sep_id, mask_id, max_predictions_per_seq, np_rng)
+
+    tokens_np, tokentypes_np, labels_np, padding_mask_np, loss_mask_np = \
+        pad_and_convert_to_numpy(tokens, tokentypes, masked_positions,
+                                 masked_labels, pad_id, max_seq_length)
+
+    # REALM true sequence length is twice as long but none of that is to be
+    # predicted with LM — extend loss_mask with ones for the second half.
+    loss_mask_np = np.concatenate((loss_mask_np, np.ones(loss_mask_np.shape)), -1)
+
+    train_sample = {
+        'tokens': tokens_np,       # key: 'text' → 'tokens'  (M211)
+        'labels': labels_np,
+        'loss_mask': loss_mask_np,
+        'pad_mask': padding_mask_np,  # key: 'padding_mask' → 'pad_mask'  (M211)
+    }
+    return train_sample
+
+
+def _m211_create_single_tokens_and_tokentypes(_tokens, cls_id, sep_id):
+    """M211: Megatron cf0100cf6 — create_single_tokens_and_tokentypes moved from
+    dataset_utils.py into realm_dataset.py (ported here for DeepSpeed).
+
+    Wraps a flat token list with [CLS] ... [SEP] and assigns all token-types = 0
+    (single-segment, no NSP distinction).
+
+    Signature change vs dataset_utils.py version:
+      Before: create_single_tokens_and_tokentypes(_tokens)   — no cls_id/sep_id args
+      After:  create_single_tokens_and_tokentypes(_tokens, cls_id, sep_id)  — explicit
+    """
+    tokens = [cls_id] + list(_tokens) + [sep_id]
+    tokentypes = [0] * len(tokens)
+    return tokens, tokentypes
+
+# Alias for internal use
+_m211_create_single_tokens_and_tokentypes = _m211_create_single_tokens_and_tokentypes
+
+
+class _M211RealmDataset:
+    """M211: Megatron cf0100cf6 — RealmDataset restructured as BertDataset subclass.
+
+    Before (pre-cf0100cf6):
+        class RealmDataset(Dataset):
+            def __init__(self, ...):
+                # full duplicate of BertDataset.__init__ body
+                self.name = name; self.seed = seed; ...
+                self.samples_mapping = get_samples_mapping_(...)
+                tokenizer = get_tokenizer(); self.vocab_id_list = ...
+            def __len__(self): ...
+            def __getitem__(self, idx): ... build_simple_training_sample(...)
+
+    After (cf0100cf6):
+        class RealmDataset(BertDataset):
+            def __init__(self, ...):
+                super().__init__(...)
+                self.build_sample_fn = build_simple_training_sample
+
+    All duplicated __init__ body, __len__, and __getitem__ are removed.
+    BertDataset's __getitem__ now dispatches through self.build_sample_fn,
+    so RealmDataset only needs to override that one attribute.
+
+    DeepSpeed note: this class is a documentation mirror.  Actual instantiation
+    should go through megatron.data.realm_dataset.RealmDataset or a DeepSpeed
+    wrapper that sets build_sample_fn = _m211_build_simple_training_sample.
+    """
+
+    def __init__(self, bert_dataset_instance):
+        """Set build_sample_fn on an existing BertDataset instance to convert it
+        into REALM-style single-segment masked-LM training."""
+        bert_dataset_instance.build_sample_fn = _m211_build_simple_training_sample
+
+# --- End M211 dataloader ---
