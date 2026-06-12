@@ -34,12 +34,52 @@
 # instead of the original mpu group helpers; adds print markers.
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# M343: Megatron 0403b8081 — added gpu initialization and option to avoid
+#       master values
+# Source: megatron/mpu/layers.py (NVIDIA/Megatron-LM commit 0403b8081)
+# Author: Mohammad Shoeybi <mshoeybi@nvidia.com>  Date: 2020-08-03
+#
+# Changes ported from mpu/layers.py:
+#   1. _USE_CPU_INITIALIZATION module-level flag added (default False).
+#
+#   2. _initialize_affine_weight() split into two functions:
+#        _initialize_affine_weight_gpu(weight, init_method, partition_dim,
+#                                       stride=1)
+#          — sets model_parallel/partition_dim/partition_stride attrs,
+#            then calls init_method(weight) inside get_cuda_rng_tracker().fork()
+#        _initialize_affine_weight_cpu(weight, output_size, input_size,
+#                                       per_partition_size, partition_dim,
+#                                       init_method, stride=1,
+#                                       return_master_weight=False)
+#          — builds full master weight in float32, converts to params_dtype,
+#            scatters to per-rank shard; sets partition_stride (not stride).
+#
+#   3. weight.stride renamed to weight.partition_stride throughout
+#      (_initialize_affine_weight_cpu and mark_weight_parallel).
+#
+#   4. ParallelEmbedding class removed (also removed from mpu/__init__.py).
+#
+# 20% adaptation: GPU path uses get_cuda_rng_tracker from mpu_initialize;
+# CPU path calls get_args() from megatron_arguments for params_dtype;
+# mark_weight_parallel updated to use partition_stride; print('[M343]') added.
+# ---------------------------------------------------------------------------
+
 import torch
 import torch.nn as nn
 
 from .mpu_initialize import get_model_parallel_world_size
 
 print('[M54]')
+print('[M343]')
+
+# ---------------------------------------------------------------------------
+# M343: _USE_CPU_INITIALIZATION
+# Megatron 0403b8081 mpu/layers.py — module-level flag controlling whether
+# weight initialisation uses the CPU master-weight scatter path (True) or
+# the direct GPU init path (False, default).
+# ---------------------------------------------------------------------------
+_USE_CPU_INITIALIZATION = False
 
 
 def mark_weight_parallel(weight: nn.Parameter,
@@ -48,9 +88,9 @@ def mark_weight_parallel(weight: nn.Parameter,
     """Tag a weight Parameter with model-parallel shard metadata.
 
     Megatron 57c2060fe mpu/layers.py _initialize_affine_weight:
-      weight.model_parallel = True
-      weight.partition_dim  = partition_dim
-      weight.stride         = stride
+      weight.model_parallel   = True
+      weight.partition_dim    = partition_dim
+      weight.partition_stride = stride   (renamed from .stride in M343 / 0403b8081)
 
     These three attributes let checkpoint-merge utilities (merge_mp_partitions)
     reconstruct the full weight from per-rank shards without extra config files.
@@ -60,7 +100,7 @@ def mark_weight_parallel(weight: nn.Parameter,
     """
     weight.model_parallel = True
     weight.partition_dim = partition_dim
-    weight.stride = stride
+    weight.partition_stride = stride  # M343: renamed from .stride → .partition_stride
     print(f'[M54-LAYERS] mark_weight_parallel: '
           f'shape={list(weight.shape)} '
           f'partition_dim={partition_dim} stride={stride}')
@@ -204,3 +244,112 @@ class VocabParallelEmbedding(torch.nn.Module):
         from .mpu_initialize import reduce_from_model_parallel_region
         output = reduce_from_model_parallel_region(output_parallel)
         return output
+
+
+# ---------------------------------------------------------------------------
+# M343: GPU/CPU weight initialisation helpers
+# Megatron 0403b8081 mpu/layers.py — replaces single _initialize_affine_weight
+# with two specialised functions to support direct GPU init (no master weight)
+# and CPU master-weight scatter path (with optional return_master_weight).
+# ---------------------------------------------------------------------------
+
+def _initialize_affine_weight_gpu(weight, init_method, partition_dim, stride=1):
+    """Initialize affine weight for model parallel on GPU.
+
+    Megatron 0403b8081 mpu/layers.py _initialize_affine_weight_gpu:
+      weight.model_parallel   = True
+      weight.partition_dim    = partition_dim
+      weight.partition_stride = stride
+      with get_cuda_rng_tracker().fork():
+          init_method(weight)
+
+    Direct GPU init avoids building a full float32 master weight on CPU,
+    which is the "option to avoid master values" in the commit title.
+    """
+    weight.model_parallel = True
+    weight.partition_dim = partition_dim
+    weight.partition_stride = stride
+
+    try:
+        from .mpu_initialize import get_cuda_rng_tracker
+        with get_cuda_rng_tracker().fork():
+            init_method(weight)
+    except (ImportError, AttributeError):
+        # Fallback: no RNG tracker available (e.g. unit tests without CUDA)
+        init_method(weight)
+
+    print(f'[M343-LAYERS] _initialize_affine_weight_gpu: '
+          f'shape={list(weight.shape)} partition_dim={partition_dim}')
+
+
+def _initialize_affine_weight_cpu(weight, output_size, input_size,
+                                   per_partition_size, partition_dim,
+                                   init_method, stride=1,
+                                   return_master_weight=False):
+    """Initialize affine weight for model parallel (CPU master-weight path).
+
+    Megatron 0403b8081 mpu/layers.py _initialize_affine_weight_cpu:
+      Builds full (output_size × input_size) master weight in torch.float on
+      all ranks, calls init_method, then casts to args.params_dtype and
+      scatters the per-rank shard into weight.
+
+    Key changes vs. the original _initialize_affine_weight (M54/57c2060fe):
+      • master_weight dtype is torch.float (not weight.dtype) — float32 for
+        numerically stable init regardless of training dtype.
+      • master_weight cast to args.params_dtype before scatter.
+      • weight.stride renamed to weight.partition_stride.
+
+    Returns master_weight when return_master_weight=True (used by
+    ColumnParallelLinear / RowParallelLinear keep_master_weight_for_test).
+    """
+    weight.model_parallel = True
+    weight.partition_dim = partition_dim
+    weight.partition_stride = stride  # M343: renamed from .stride
+
+    world_size = get_model_parallel_world_size()
+    if world_size == 1:
+        init_method(weight)
+        if return_master_weight:
+            return weight
+        return None
+
+    # Build master weight in float32 for stable initialisation.
+    master_weight = torch.empty(output_size, input_size,
+                                dtype=torch.float,
+                                requires_grad=False)
+    init_method(master_weight)
+
+    # M343: cast master weight to training dtype (params_dtype) before scatter.
+    try:
+        from .megatron_arguments import get_args
+        args = get_args()
+        if args is not None and hasattr(args, 'params_dtype'):
+            master_weight = master_weight.to(dtype=args.params_dtype)
+    except ImportError:
+        pass
+
+    # Compute per-partition size per stride element.
+    per_partition_per_stride_size = per_partition_size // stride
+
+    # Get model parallel rank for selecting the correct partition.
+    try:
+        from .mpu_initialize import get_model_parallel_rank
+        rank = get_model_parallel_rank()
+    except (ImportError, AttributeError):
+        rank = 0
+
+    # Scatter: copy the appropriate slice into weight.
+    weight_list = torch.split(master_weight, per_partition_per_stride_size,
+                               dim=partition_dim)
+    # Interleaved stride: gather every stride-th chunk for this rank.
+    my_weight_list = weight_list[rank::world_size]
+    with torch.no_grad():
+        torch.cat(my_weight_list, dim=partition_dim, out=weight)
+
+    print(f'[M343-LAYERS] _initialize_affine_weight_cpu: '
+          f'shape={list(weight.shape)} partition_dim={partition_dim} '
+          f'rank={rank}/{world_size}')
+
+    if return_master_weight:
+        return master_weight
+    return None
