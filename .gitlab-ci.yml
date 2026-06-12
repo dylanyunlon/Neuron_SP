@@ -1,5 +1,6 @@
 # M1257: Megatron 56934a2da — Adding some basic unit tests
 # M1328: Megatron d7d7591d9 — Add rules for unit tests
+# M1330: Megatron d86299b0d — Print result logs directory if Pytest fails
 image: gitlab-master.nvidia.com/dl/dgx/pytorch:21.12-py3-devel
 
 [runners.docker]
@@ -12,6 +13,8 @@ test:
     - python3 -c "print('[M1328]')"
     - nvidia-smi
     - torchrun --nproc_per_node=2  -m pytest --cov-report=term --cov-report=html --cov=megatron/core tests/
+    - if [ $? -ne 0 ]; then echo "Pytest failed. See ${SELENE_ADLR_CI_PATH}/${CI_PIPELINE_ID}/${CI_JOB_NAME}/results directory for result logs."; fi
+    - echo '[M1330]'
   artifacts:
     paths:
       - coverage
