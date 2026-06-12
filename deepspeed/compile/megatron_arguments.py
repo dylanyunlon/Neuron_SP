@@ -1282,3 +1282,53 @@ def add_rotary_position_args(parser):
 
 
 print('[M1333]')
+
+# ---------------------------------------------------------------------------
+# M1359: Megatron 05b808ef7 — Expand on apply-layernorm-1p description a bit.
+# Source: megatron/arguments.py (NVIDIA/Megatron-LM commit 05b808ef7)
+# Author: Jared Casper <jcasper@nvidia.com>  Date: 2023-04-05
+#
+# Mapping: megatron/arguments.py → deepspeed/compile/megatron_arguments.py
+#
+# Change ported from arguments.py _add_network_size_args():
+#   Before:
+#     group.add_argument('--apply-layernorm-1p', action='store_true',
+#                        help='Weight adjustment centered around zero.')
+#   After:
+#     group.add_argument('--apply-layernorm-1p', action='store_true',
+#                        help='Adjust LayerNorm weights such that they are centered '
+#                        'around zero. This improves numerical stability.')
+#
+# The help string is expanded from a terse single phrase to a two-sentence
+# description clarifying both the mechanism (weights centered around zero)
+# and the motivation (improved numerical stability).
+#
+# DeepSpeed adaptation: surfaced as add_network_size_args_1p(parser) that
+# registers --apply-layernorm-1p with the expanded help text, following
+# the existing add_* convention in this file.
+# ---------------------------------------------------------------------------
+
+print('[M1359]')
+
+
+def add_network_size_args_1p(parser):
+    """Register --apply-layernorm-1p with expanded help text.
+
+    Megatron 05b808ef7 _add_network_size_args():
+      group.add_argument('--apply-layernorm-1p', action='store_true',
+                         help='Adjust LayerNorm weights such that they are centered '
+                         'around zero. This improves numerical stability.')
+
+    The prior help string ('Weight adjustment centered around zero.') is
+    replaced with the expanded two-part description that makes the
+    numerical-stability motivation explicit.
+    """
+    group = parser.add_argument_group(title='M1359 network size — layernorm 1p')
+    group.add_argument(
+        '--apply-layernorm-1p',
+        action='store_true',
+        help='Adjust LayerNorm weights such that they are centered '
+             'around zero. This improves numerical stability.',
+    )
+    print('[M1359] add_network_size_args_1p: --apply-layernorm-1p registered')
+    return parser
