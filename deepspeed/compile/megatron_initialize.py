@@ -355,3 +355,56 @@ def _compile_dependencies():
                   time.time() - start_time), flush=True)
 
     print('[M610] _compile_dependencies: done.')
+
+
+# ---------------------------------------------------------------------------
+# M1233: Megatron 2e6a46e45 — Start Megatron-Core with vocab parallel cross entropy
+# Source: megatron/initialize.py (NVIDIA/Megatron-LM commit 2e6a46e45)
+# Author: Jared Casper <jcasper@nvidia.com>  Date: 2022-09-22
+#
+# Mapping: megatron/initialize.py → deepspeed/compile/megatron_initialize.py
+#
+# Changes ported from initialize.py (_initialize_distributed):
+#   1. Add `from megatron import core` import.
+#   2. After mpu.initialize_model_parallel(), also call
+#      core.initialize_model_parallel() with identical args — initialises the
+#      new megatron.core parallel state alongside the legacy mpu state.
+#   3. Move the rank-0 tensor/pipeline size print from inside
+#      initialize_model_parallel() to here (after both initialisations),
+#      using core.get_tensor_model_parallel_world_size() /
+#      core.get_pipeline_model_parallel_world_size() for the values.
+#
+# 20% adaptation: calls core_initialize_model_parallel() (our mapping of
+# core.initialize_model_parallel) from deepspeed.compile.core_parallel_state;
+# prints use the same format as upstream; adds print('[M1233]') marker.
+# ---------------------------------------------------------------------------
+
+print('[M1233]')
+
+
+def core_initialize_model_parallel(tensor_model_parallel_size,
+                                   pipeline_model_parallel_size,
+                                   virtual_pipeline_model_parallel_size=None,
+                                   pipeline_model_parallel_split_rank=None):
+    """Initialise megatron-core parallel state alongside legacy mpu state.
+
+    M1233: megatron/initialize.py — after mpu.initialize_model_parallel(),
+    also call core.initialize_model_parallel() so that megatron-core modules
+    (e.g. vocab_parallel_cross_entropy) can access parallel group state.
+    """
+    from deepspeed.compile.core_parallel_state import (
+        initialize_model_parallel as _core_init_mp,
+        get_tensor_model_parallel_world_size,
+        get_pipeline_model_parallel_world_size,
+    )
+    _core_init_mp(
+        tensor_model_parallel_size,
+        pipeline_model_parallel_size,
+        virtual_pipeline_model_parallel_size,
+        pipeline_model_parallel_split_rank,
+    )
+    print(f'> initialized tensor model parallel with size '
+          f'{get_tensor_model_parallel_world_size()}')
+    print(f'> initialized pipeline model parallel with size '
+          f'{get_pipeline_model_parallel_world_size()}')
+    print('[M1233] core_initialize_model_parallel: done.')
