@@ -6825,10 +6825,10 @@ def _m503_write_validation_tensorboard(writer, key, loss_value, ppl, iteration, 
     """M503: Megatron 5b74f7643 — write validation scalars with correct keys.
 
     Writes four tensorboard scalars for a single validation loss key:
-      - '{key} value-validation'          (x = iteration)
-      - '{key} ppl-validation'            (x = iteration)
-      - '{key} value-validation vs samples' (x = consumed_train_samples)
-      - '{key} ppl-validation vs samples'   (x = consumed_train_samples)
+      - '{key} validation'                (x = iteration)
+      - '{key} validation ppl'            (x = iteration)
+      - '{key} validation vs samples'     (x = consumed_train_samples)
+      - '{key} validation ppl vs samples' (x = consumed_train_samples)
 
     Should only be called from is_last_rank() (not rank 0) to ensure the
     rank that holds the final pipeline-parallel loss value is the one
@@ -6843,10 +6843,33 @@ def _m503_write_validation_tensorboard(writer, key, loss_value, ppl, iteration, 
         consumed_train_samples (int): total samples consumed, used as
             secondary x-axis for batch-size-normalised comparison.
     """
-    writer.add_scalar('{} value-validation'.format(key), loss_value, iteration)
-    writer.add_scalar('{} ppl-validation'.format(key), ppl, iteration)
-    writer.add_scalar('{} value-validation vs samples'.format(key), loss_value, consumed_train_samples)
-    writer.add_scalar('{} ppl-validation vs samples'.format(key), ppl, consumed_train_samples)
+    writer.add_scalar('{} validation'.format(key), loss_value, iteration)
+    writer.add_scalar('{} validation ppl'.format(key), ppl, iteration)
+    writer.add_scalar('{} validation vs samples'.format(key), loss_value, consumed_train_samples)
+    writer.add_scalar('{} validation ppl vs samples'.format(key), ppl, consumed_train_samples)
 
 
-# --- End M503 engine ---
+# ---------------------------------------------------------------------------
+# M532: Megatron 792a468d8 — changed validation loss name
+# Source commit: 792a468d8a2303164001859b83a16231397688fe
+# Author: mohammad <mshoeybi@nvidia.com>  Date: 2021-01-28
+#
+# Changes in this commit (megatron/training.py,
+#                          evaluate_and_print_results()):
+#
+#   Tensorboard scalar keys renamed (removing the 'value-' / 'ppl-' prefixes
+#   introduced in M503):
+#     Before:  '{key} value-validation'          → '{key} validation'
+#     Before:  '{key} value-validation vs samples' → '{key} validation vs samples'
+#     Before:  '{key} ppl-validation'            → '{key} validation ppl'
+#     Before:  '{key} ppl-validation vs samples' → '{key} validation ppl vs samples'
+#
+# Neuron_SP mapping:
+#   megatron/training.py → deepspeed/runtime/engine.py
+#   Updated _m503_write_validation_tensorboard() scalar keys accordingly.
+# ---------------------------------------------------------------------------
+
+print('[M532]')
+
+
+# --- End M532 engine ---
