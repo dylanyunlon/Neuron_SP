@@ -1,4 +1,5 @@
 # M1257: Megatron 56934a2da — Adding some basic unit tests
+# M1328: Megatron d7d7591d9 — Add rules for unit tests
 image: gitlab-master.nvidia.com/dl/dgx/pytorch:21.12-py3-devel
 
 [runners.docker]
@@ -8,9 +9,12 @@ test:
   tags:
     - docker
   script:
+    - python3 -c "print('[M1328]')"
     - nvidia-smi
     - torchrun --nproc_per_node=2  -m pytest --cov-report=term --cov-report=html --cov=megatron/core tests/
   artifacts:
     paths:
       - coverage
     expire_in: 30 days
+  only:
+    - merge_requests
