@@ -2,6 +2,42 @@
 # DeepSpeed Team
 
 # ---------------------------------------------------------------------------
+# M1062: Megatron c13c0a3e8 — debugging; localized issue to gather_params()
+# Source: megatron/optimizer/optimizer.py (NVIDIA/Megatron-LM commit c13c0a3e8)
+# Author: Lawrence McAfee <lmcafee@nvidia.com>  Date: 2022-02-22
+#
+# Mapping: megatron/optimizer/optimizer.py → deepspeed/compile/megatron_optimizer.py
+#
+# Changes ported from optimizer.py (diff vs parent c13c0a3e8):
+#   1. BaseFloat16Optimizer._unscale_main_grads_and_check_for_nan():
+#      all_reduce changed to use no explicit group (was get_model_parallel_group());
+#      old group= form commented out with >>> / <<< markers.
+#   2. BaseFloat16Optimizer.step(): signature changed to step(self, ITERATION).
+#      _copy_model_grads_to_main_grads() and _copy_main_params_to_model_params()
+#      now receive ITERATION.  found_inf_flag branch activates pax(0, {...}).
+#      Post-copy-back commented pax block added.
+#   3. Float16DistributedOptimizer.__init__(): _copy_model_params_to_main_params()
+#      moved to after optimizer.load_state_dict() (was before).
+#   4. Float16DistributedOptimizer: added has_nan_debug(), get_local_model_param_views(),
+#      get_local_model_grad_views(), get_world_model_params(), get_main_params(),
+#      get_main_grads(); get_main_param() refactored to call get_main_params()[].
+#   5. Float16DistributedOptimizer._collect_main_grad_data_for_unscaling():
+#      simplified to use get_main_grads().
+#   6. Float16DistributedOptimizer._copy_model_grads_to_main_grads(ITERATION):
+#      NaN detection block added (has_nan_debug → raise Exception on main NaN).
+#   7. Float16DistributedOptimizer._copy_main_params_to_model_params(ITERATION):
+#      isnan → not isfinite; post-copy commented pax block added.
+#   8. gather_params(): active pax() call added inside _gather_params
+#      (training.py changes tracked in megatron_training.py M1062 section).
+#
+# DeepSpeed adaptation: Float16DistributedOptimizer does not exist in this file;
+# changes for BaseFloat16Optimizer / Float16OptimizerWithFloat16Params applied
+# to the analogous Float16OptimizerWithFloat16Params class herein.
+# ---------------------------------------------------------------------------
+
+print('[M1062]')
+
+# ---------------------------------------------------------------------------
 # M1013: Megatron 7dc8c4759 — feb 9 alpha
 # Source: megatron/optimizer/optimizer.py + megatron/optimizer/grad_scaler.py
 #         (NVIDIA/Megatron-LM commit 7dc8c4759)
@@ -28,6 +64,7 @@
 # ---------------------------------------------------------------------------
 
 print('[M1013]')
+
 
 from abc import ABC
 from abc import abstractmethod
@@ -426,7 +463,25 @@ class Float16OptimizerWithFloat16Params(MegatronOptimizer):
             return self._scale_one
         return self.grad_scaler.scale
 
-    def _copy_model_grads_to_main_grads(self):
+    def get_main_params(self):
+        return [ p for g in self.fp32_from_float16_groups for p in g ] + \
+               [ p for g in self.fp32_from_fp32_groups for p in g ]
+    def get_main_grads(self):
+        return [ p.grad for p in self.get_main_params() ]
+
+    def _copy_model_grads_to_main_grads(self, ITERATION):
+        # >>>
+        main_grads = [ p.grad for g in self.fp32_from_float16_groups for p in g
+                       if p.grad is not None ]
+        if main_grads:
+            import torch as _t
+            main_has_nan = any(
+                (not _t.all(_t.isfinite(g)).item()) for g in main_grads
+            )
+            if main_has_nan:
+                raise Exception("hi.")
+        # <<<
+
         # This only needs to be done for the float16 group.
         for model_group, main_group in zip(self.float16_groups, self.fp32_from_float16_groups):
             for model_param, main_param in zip(model_group, main_group):
@@ -466,9 +521,14 @@ class Float16OptimizerWithFloat16Params(MegatronOptimizer):
         self.found_inf.fill_(0.0)
         torch._amp_foreach_non_finite_check_and_unscale_(main_grads, self.found_inf,
                                                          self.grad_scaler.inv_scale)
+        # >>>
+        # torch.distributed.all_reduce(self.found_inf,
+        #                              op=torch.distributed.ReduceOp.MAX,
+        #                              group=mpu.get_model_parallel_group())
+        # +++
         torch.distributed.all_reduce(self.found_inf,
-                                     op=torch.distributed.ReduceOp.MAX,
-                                     group=mpu.get_model_parallel_group())
+                                     op=torch.distributed.ReduceOp.MAX)
+        # <<<
 
         found_inf_flag = (self.found_inf.item() > 0)
         return found_inf_flag
@@ -482,11 +542,21 @@ class Float16OptimizerWithFloat16Params(MegatronOptimizer):
                 main_data.append(main_param.data)
         return model_data, main_data
 
-    def _copy_main_params_to_model_params(self):
+    def _copy_main_params_to_model_params(self, ITERATION):
         # Only needed for the float16 params.
         model_data, main_data = self._get_model_and_main_params_data_float16()
         _multi_tensor_copy_this_to_that(this=main_data, that=model_data,
                                         overflow_buf=self._dummy_overflow_buf)
+        # >>>
+        import torch as _t
+        for param_data in model_data:
+            is_nan = not _t.all(_t.isfinite(param_data)).item()
+            if is_nan:
+                pax({
+                    "param" : param_data,
+                    "is_nan" : is_nan,
+                })
+        # <<<
 
     def _copy_model_params_to_main_params(self):
         # Only needed for the float16 params.
@@ -498,12 +568,12 @@ class Float16OptimizerWithFloat16Params(MegatronOptimizer):
         self._copy_model_params_to_main_params()
 
     @torch.no_grad()
-    def step(self):
+    def step(self, ITERATION):
 
         timers = get_timers()
 
         timers('optimizer-copy-to-main-grad').start()
-        self._copy_model_grads_to_main_grads()
+        self._copy_model_grads_to_main_grads(ITERATION)
         timers('optimizer-copy-to-main-grad').stop()
 
         if self.grad_scaler:
@@ -514,7 +584,13 @@ class Float16OptimizerWithFloat16Params(MegatronOptimizer):
 
             self.grad_scaler.update(found_inf_flag)
 
+            # If we found inf/nan, skip the update.
             if found_inf_flag:
+                pax(0, {
+                    "main params" : self.get_main_params(),
+                    "main grads" : self.get_main_grads(),
+                    "found_inf_flag" : found_inf_flag,
+                })
                 return False, None, None
 
         timers('optimizer-clip-main-grad').start()
@@ -530,18 +606,22 @@ class Float16OptimizerWithFloat16Params(MegatronOptimizer):
         self.optimizer.step()
 
         # >>>
-        # from lutil import pax, tp
         # pax(0, {
-        #     "optimizer / state" :
-        #     { hash(k):tp(v) for k,v in self.optimizer.state.items() },
-        #     "optimizer / state / len" : len(self.optimizer.state),
-        #     "optimizer / state / 0" : list(self.optimizer.state.values())[0],
+        #     "main params" : self.get_main_params(),
+        #     "main grads" : self.get_main_grads(),
         # })
         # <<<
 
         timers('optimizer-copy-main-to-model-params').start()
-        self._copy_main_params_to_model_params()
+        self._copy_main_params_to_model_params(ITERATION)
         timers('optimizer-copy-main-to-model-params').stop()
+
+        # >>>
+        # pax(1, {
+        #     "ITERATION" : ITERATION,
+        #     "model_params" : [ p for p in self.get_parameters() ],
+        # })
+        # <<<
 
         return True, grad_norm, num_zeros_in_grad
 

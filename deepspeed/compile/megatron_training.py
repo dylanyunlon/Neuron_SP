@@ -180,3 +180,50 @@ def _m749_maybe_empty_cache(args, level_threshold):
 
 
 print('[M749]')
+
+# ---------------------------------------------------------------------------
+# M1062: Megatron c13c0a3e8 — debugging; localized issue to gather_params()
+# Source: megatron/training.py (NVIDIA/Megatron-LM commit c13c0a3e8)
+# Author: Lawrence McAfee <lmcafee@nvidia.com>  Date: 2022-02-22
+#
+# Mapping: megatron/training.py → deepspeed/compile/megatron_training.py
+#
+# Changes ported from training.py (diff vs parent c13c0a3e8):
+#   1. train_step(): signature gains ITERATION kwarg.
+#   2. train_step(): optimizer.step(ITERATION) instead of optimizer.step().
+#   3. train(): main loop passes ITERATION=iteration to train_step().
+#
+# DeepSpeed adaptation: train_step / train live in runtime/engine.py;
+# documented here via _m1062_train_step_call_site() reference helper.
+# ---------------------------------------------------------------------------
+
+print('[M1062]')
+
+
+def _m1062_train_step_call_site(forward_step_func, data_iterator,
+                                 model, optimizer, opt_param_scheduler,
+                                 ITERATION):
+    """Reference implementation of M1062 train_step() changes.
+
+    Megatron c13c0a3e8 adds ITERATION to the call chain so that debug helpers
+    inside the optimizer (has_nan_debug, pax blocks) can log the training step.
+
+    Canonical usage inside the training loop::
+
+        loss_dict, skipped_iter, grad_norm, num_zeros_in_grad = (
+            _m1062_train_step_call_site(
+                forward_step_func, data_iterator,
+                model, optimizer, opt_param_scheduler,
+                ITERATION=iteration,
+            )
+        )
+        iteration += 1
+
+    When wired into DeepSpeed engine.py the ITERATION value is passed to
+    optimizer.step() via the engine's existing iteration counter, surfaced
+    through ds_engine.global_steps at the call site.
+    """
+    # >>>
+    update_successful, grad_norm, num_zeros_in_grad = optimizer.step(ITERATION)
+    # <<<
+    return update_successful, grad_norm, num_zeros_in_grad
