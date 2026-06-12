@@ -144,3 +144,136 @@ def _reduce_scatter_along_first_dim(input_, get_tensor_model_parallel_world_size
     torch.distributed._reduce_scatter_base(output, input_.contiguous(),
                                            group=get_tensor_model_parallel_group())
     return output
+
+
+# ---------------------------------------------------------------------------
+# M1157: Megatron 86e1df4e2 — parallel MOE support
+# Source: megatron/mpu/mappings.py (NVIDIA/Megatron-LM commit 86e1df4e2)
+# Author: Vijay Korthikanti <vkorthikanti@nvidia.com>  Date: 2022-03-30
+#
+# Mapping: megatron/mpu/mappings.py → deepspeed/compile/mpu_mappings.py
+#          (project convention: mpu/* → deepspeed/compile/)
+#
+# Changes ported from upstream (mpu/mappings.py):
+#
+#   1. _gather_along_first_dim_moe() [new function]:
+#      All-gather along first dimension using the global process group
+#      (torch.distributed.get_world_size() / _all_gather_base), NOT the
+#      tensor-model-parallel group.  Used to gather hidden states across
+#      data-parallel ranks before MOE expert dispatch so each rank sees
+#      all tokens.
+#
+#   2. _reduce_scatter_along_first_dim_moe() [new function]:
+#      Reduce-scatter along first dimension using the global process group.
+#      Inverse of _gather_along_first_dim_moe; used after MOE expert
+#      computation to scatter results back to data-parallel ranks.
+#
+#   3. _GatherFromSequenceParallelRegionToMOE [new autograd.Function]:
+#      forward  → _gather_along_first_dim_moe
+#      backward → _reduce_scatter_along_first_dim_moe
+#      Includes symbolic() for torch.jit / ONNX tracing.
+#
+#   4. _ReduceScatterToSequenceParallelRegionFromMOE [new autograd.Function]:
+#      forward  → _reduce_scatter_along_first_dim_moe
+#      backward → _gather_along_first_dim_moe
+#      Inverse of class 3.
+#
+#   5. gather_from_sequence_parallel_region_to_moe() [new public function]:
+#      Thin wrapper: _GatherFromSequenceParallelRegionToMOE.apply(input_)
+#
+#   6. reduce_scatter_to_sequence_parallel_region_from_moe() [new public function]:
+#      Thin wrapper: _ReduceScatterToSequenceParallelRegionFromMOE.apply(input_)
+#
+# Key design note: these MOE collectives use the *global* distributed group
+# (not the tensor-model-parallel group) because MOE expert parallelism is
+# orthogonal to tensor parallelism — experts are partitioned across
+# data-parallel ranks, not tensor-parallel ranks.
+#
+# Exported from megatron/mpu/__init__.py (also M1157):
+#   from .mappings import gather_from_sequence_parallel_region_to_moe
+#   from .mappings import reduce_scatter_to_sequence_parallel_region_from_moe
+# ---------------------------------------------------------------------------
+
+print('[M1157]')
+
+
+def _gather_along_first_dim_moe(input_):
+    """Gather tensors and concatinate along the first dimension.
+
+    M1157 (86e1df4e2): uses global dist group, not tensor-model-parallel group,
+    so that hidden states are gathered across data-parallel ranks for MOE dispatch.
+    """
+    world_size = torch.distributed.get_world_size()
+    # Bypass the function if we are using only 1 GPU.
+    if world_size == 1:
+        return input_
+
+    dim_size = list(input_.size())
+    dim_size[0] = dim_size[0] * world_size
+
+    output = torch.empty(dim_size, dtype=input_.dtype,
+                         device=torch.cuda.current_device())
+    torch.distributed._all_gather_base(output, input_.contiguous())
+
+    return output
+
+
+def _reduce_scatter_along_first_dim_moe(input_):
+    """Reduce-scatter the input tensor across model parallel group.
+
+    M1157 (86e1df4e2): inverse of _gather_along_first_dim_moe; uses global
+    dist group to scatter MOE expert outputs back to data-parallel ranks.
+    """
+    world_size = torch.distributed.get_world_size()
+    # Bypass the function if we are using only 1 GPU.
+    if world_size == 1:
+        return input_
+
+    dim_size = list(input_.size())
+    assert dim_size[0] % world_size == 0
+    dim_size[0] = dim_size[0] // world_size
+
+    output = torch.empty(dim_size, dtype=input_.dtype,
+                         device=torch.cuda.current_device())
+    torch.distributed._reduce_scatter_base(output, input_.contiguous())
+    return output
+
+
+class _GatherFromSequenceParallelRegionToMOE(torch.autograd.Function):
+    """Gather the input from model parallel region and concatinate."""  # TODO
+
+    @staticmethod
+    def symbolic(graph, input_):
+        return _gather_along_first_dim_moe(input_)
+
+    @staticmethod
+    def forward(ctx, input_):
+        return _gather_along_first_dim_moe(input_)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return _reduce_scatter_along_first_dim_moe(grad_output)
+
+
+class _ReduceScatterToSequenceParallelRegionFromMOE(torch.autograd.Function):
+    """Reduce scatter the input from the model parallel region."""
+
+    @staticmethod
+    def symbolic(graph, input_):
+        return _reduce_scatter_along_first_dim_moe(input_)
+
+    @staticmethod
+    def forward(ctx, input_):
+        return _reduce_scatter_along_first_dim_moe(input_)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return _gather_along_first_dim_moe(grad_output)
+
+
+def gather_from_sequence_parallel_region_to_moe(input_):
+    return _GatherFromSequenceParallelRegionToMOE.apply(input_)
+
+
+def reduce_scatter_to_sequence_parallel_region_from_moe(input_):
+    return _ReduceScatterToSequenceParallelRegionFromMOE.apply(input_)

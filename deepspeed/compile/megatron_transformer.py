@@ -163,3 +163,189 @@ print('[M1082]')
 #                                                   ← blank line added
 #     if self.model_parallel_memory_opt:
 #         hidden_states = mpu.gather_from_sequence_parallel_region(hidden_states)
+
+# ---------------------------------------------------------------------------
+# M1157: Megatron 86e1df4e2 — parallel MOE support
+# Source: megatron/model/transformer.py (NVIDIA/Megatron-LM commit 86e1df4e2)
+# Author: Vijay Korthikanti <vkorthikanti@nvidia.com>  Date: 2022-03-30
+#
+# Mapping: megatron/model/transformer.py → deepspeed/compile/megatron_transformer.py
+#          (project convention: megatron/model/ → deepspeed/compile/)
+#
+# Changes ported from upstream (transformer.py):
+#
+#   1. ParallelMLP.__init__() [line ~74]:
+#      Add is_expert=False parameter; pass through to both
+#      ColumnParallelLinear (dense_h_to_4h) and RowParallelLinear (dense_4h_to_h):
+#        def __init__(self, init_method, output_layer_init_method, is_expert=False):
+#        self.dense_h_to_4h = ColumnParallelLinear(..., is_expert=is_expert)
+#        self.dense_4h_to_h = RowParallelLinear(..., is_expert=is_expert)
+#
+#   2. SwitchMLP.__init__() — expert parallelism refactor [line ~129]:
+#      BEFORE: creates self.experts (all num_experts on every rank)
+#      AFTER:  partitions experts across data-parallel ranks:
+#        assert args.num_experts % mpu.get_data_parallel_world_size() == 0
+#        self.num_local_experts = args.num_experts // mpu.get_data_parallel_world_size()
+#        local_expert_indices_offset = mpu.get_data_parallel_rank() * self.num_local_experts
+#        self.local_expert_indices = [local_expert_indices_offset + i
+#                                     for i in range(self.num_local_experts)]
+#        self.local_experts = torch.nn.ModuleList(
+#            [ParallelMLP(init_method, output_layer_init_method, is_expert=True)
+#             for _ in range(self.num_local_experts)])
+#
+#   3. SwitchMLP.gather_indices() [new method]:
+#      All-gather local_indices across world_size ranks:
+#        def gather_indices(self, local_indices):
+#            world_size = torch.distributed.get_world_size()
+#            if world_size == 1: return local_indices
+#            dim_size = list(local_indices.size())
+#            dim_size[0] = dim_size[0] * world_size
+#            output = torch.empty(dim_size, dtype=local_indices.dtype,
+#                                 device=torch.cuda.current_device())
+#            torch.distributed._all_gather_base(output, local_indices.contiguous())
+#            return output
+#
+#   4. SwitchMLP.forward() — parallel dispatch [line ~163]:
+#      a. Dimension convention changed: hidden_states is [s, b, h] (not [b, s, h]).
+#         s = hidden_states.size(0), b = hidden_states.size(1)
+#         Comments updated: [b*s h] → [s*b h], [b s 1] → [s b 1], etc.
+#
+#      b. After reshaping hidden_states / max_prob / max_ind to [s*b, …]:
+#           global_hidden_states = mpu.gather_from_sequence_parallel_region_to_moe(hidden_states)
+#           global_indices = self.gather_indices(max_ind)
+#
+#      c. output_total / output_bias_total initialised with torch.zeros_like
+#         (was torch.empty_like) on global_hidden_states.
+#
+#      d. Expert loop iterates over self.local_experts (not self.experts);
+#         uses global_indices / global_hidden_states for dispatch:
+#           for expert_num, expert in enumerate(self.local_experts):
+#               local_indices = (global_indices == expert_num).nonzero()
+#               hidden = global_hidden_states[local_indices, :]
+#               output, output_bias = expert(hidden)
+#               output_bias = output_bias.expand_as(output)
+#               output_total[local_indices, :] = output
+#               output_bias_total[local_indices, :] = output_bias
+#
+#      e. After the loop, reduce-scatter results back:
+#           output_total = mpu.reduce_scatter_to_sequence_parallel_region_from_moe(output_total)
+#           output_bias_total = mpu.reduce_scatter_to_sequence_parallel_region_from_moe(output_bias_total)
+#           # bias is duplicated across TP ranks; divide by TP world size:
+#           output_bias_total = output_bias_total / mpu.get_tensor_model_parallel_world_size()
+#
+#      f. Final reshape uses (s, b, h) instead of (b, s, h):
+#           output_total = output_total.view(s, b, h)
+#           output_bias_total = output_bias_total.view(s, b, h)
+#
+# Summary: SwitchMLP is now truly parallel — each data-parallel rank owns
+# a subset of experts (num_experts / dp_world_size).  Tokens are gathered
+# globally before dispatch and scattered back afterwards, avoiding the
+# previous serial-expert-per-rank bottleneck.
+# ---------------------------------------------------------------------------
+
+print('[M1157]')
+
+# Change 1 reference — ParallelMLP.__init__ delta:
+#
+# BEFORE:
+#   def __init__(self, init_method, output_layer_init_method):
+#       ...
+#       self.dense_h_to_4h = ColumnParallelLinear(..., skip_bias_add=True)
+#       ...
+#       self.dense_4h_to_h = RowParallelLinear(..., skip_bias_add=True)
+#
+# AFTER:
+#   def __init__(self, init_method, output_layer_init_method, is_expert=False):
+#       ...
+#       self.dense_h_to_4h = ColumnParallelLinear(..., skip_bias_add=True,
+#                                                 is_expert=is_expert)
+#       ...
+#       self.dense_4h_to_h = RowParallelLinear(..., skip_bias_add=True,
+#                                              is_expert=is_expert)
+
+# Change 2 reference — SwitchMLP.__init__ full replacement:
+#
+# BEFORE:
+#   self.experts = torch.nn.ModuleList()
+#   for i in range(args.num_experts):
+#       self.experts.append(ParallelMLP(init_method, output_layer_init_method))
+#
+# AFTER:
+#   assert args.num_experts % mpu.get_data_parallel_world_size() == 0
+#   self.num_local_experts = args.num_experts // mpu.get_data_parallel_world_size()
+#   local_expert_indices_offset = mpu.get_data_parallel_rank() * self.num_local_experts
+#   self.local_expert_indices = [local_expert_indices_offset + i
+#                                for i in range(self.num_local_experts)]
+#   self.local_experts = torch.nn.ModuleList()
+#   for i in range(self.num_local_experts):
+#       self.local_experts.append(
+#           ParallelMLP(init_method, output_layer_init_method, is_expert=True))
+
+# Change 4 reference — SwitchMLP.forward full replacement:
+#
+# BEFORE:
+#   def forward(self, hidden_states):
+#       # hidden_states: [b, s, h]
+#       b = hidden_states.size(0)
+#       s = hidden_states.size(1)
+#       h = hidden_states.size(2)
+#       route = self.router(hidden_states)
+#       route = torch.nn.functional.softmax(route, dim=2)
+#       max_prob, max_ind = torch.max(route, dim=2)
+#       max_prob = torch.unsqueeze(max_prob, 2) # [b s 1]
+#       # Converting [b, s, h] to [b*s, h].
+#       hidden_states = hidden_states.view(-1, hidden_states.size(2)) # [b*s h]
+#       max_prob = max_prob.view(-1, max_prob.size(2)) # [b*s 1]
+#       max_ind = max_ind.view(-1) # [b*s]
+#       output_total = torch.empty_like(hidden_states)
+#       output_bias_total = torch.empty_like(hidden_states)
+#       for expert_num, expert in enumerate(self.experts):
+#           local_indices = (max_ind == expert_num).nonzero()
+#           hidden = hidden_states[local_indices,:]
+#           output, output_bias = expert(hidden)
+#           output_bias = output_bias.expand_as(output)
+#           output_total[local_indices,:] = output
+#           output_bias_total[local_indices,:] = output_bias
+#       output_total = output_total*max_prob
+#       output_bias_total = output_bias_total*max_prob
+#       output_total = output_total.view(b, s, h)
+#       output_bias_total = output_bias_total.view(b, s, h)
+#       return output_total, output_bias_total
+#
+# AFTER (M1157 / 86e1df4e2):
+#   def forward(self, hidden_states):
+#       # hidden_states: [s, b, h]  ← dimension order changed
+#       s = hidden_states.size(0)
+#       b = hidden_states.size(1)
+#       h = hidden_states.size(2)
+#       route = self.router(hidden_states)
+#       route = torch.nn.functional.softmax(route, dim=2)
+#       max_prob, max_ind = torch.max(route, dim=2)
+#       max_prob = torch.unsqueeze(max_prob, 2)  # [s b 1]
+#       # Converting [s, b, h] to [s*b, h].
+#       hidden_states = hidden_states.view(-1, hidden_states.size(2))  # [s*b h]
+#       max_prob = max_prob.view(-1, max_prob.size(2))  # [s*b 1]
+#       max_ind = max_ind.view(-1)  # [s*b]
+#       global_hidden_states = \
+#           mpu.gather_from_sequence_parallel_region_to_moe(hidden_states)
+#       global_indices = self.gather_indices(max_ind)
+#       output_total = torch.zeros_like(global_hidden_states)
+#       output_bias_total = torch.zeros_like(global_hidden_states)
+#       for expert_num, expert in enumerate(self.local_experts):
+#           local_indices = (global_indices == expert_num).nonzero()
+#           hidden = global_hidden_states[local_indices, :]
+#           output, output_bias = expert(hidden)
+#           output_bias = output_bias.expand_as(output)
+#           output_total[local_indices, :] = output
+#           output_bias_total[local_indices, :] = output_bias
+#       output_total = \
+#           mpu.reduce_scatter_to_sequence_parallel_region_from_moe(output_total)
+#       output_bias_total = \
+#           mpu.reduce_scatter_to_sequence_parallel_region_from_moe(output_bias_total)
+#       # bias duplicated across TP ranks; reduce scatter reduces bias across TP ranks
+#       output_bias_total = output_bias_total / mpu.get_tensor_model_parallel_world_size()
+#       output_total = output_total * max_prob
+#       output_bias_total = output_bias_total * max_prob
+#       output_total = output_total.view(s, b, h)
+#       output_bias_total = output_bias_total.view(s, b, h)
+#       return output_total, output_bias_total

@@ -423,3 +423,108 @@ print('[M1082]')
 #             # Always initialize bias to zero.
 #             with torch.no_grad():
 #                 self.bias.zero_()
+
+# ---------------------------------------------------------------------------
+# M1157: Megatron 86e1df4e2 — parallel MOE support
+# Source: megatron/mpu/layers.py (NVIDIA/Megatron-LM commit 86e1df4e2)
+# Author: Vijay Korthikanti <vkorthikanti@nvidia.com>  Date: 2022-03-30
+#
+# Mapping: megatron/mpu/layers.py → deepspeed/compile/mpu_layers.py
+#          (project convention: mpu/* → deepspeed/compile/)
+#
+# Changes ported from upstream (mpu/layers.py):
+#
+#   1. ColumnParallelLinear.__init__() [line ~340]:
+#      Add is_expert=False parameter:
+#        def __init__(self, ..., skip_bias_add=False, is_expert=False):
+#      Store: self.is_expert = is_expert
+#      Gate model_parallel_memory_opt on not is_expert:
+#        self.model_parallel_memory_opt = (
+#            args.model_parallel_memory_opt and
+#            not self.is_expert and          ← M1157: new guard
+#            world_size > 1)
+#      Rationale: expert columns must NOT use sequence-parallel allreduce;
+#      each expert shard is dispatched per-token by SwitchMLP, so the
+#      tensor-parallel gather/scatter pattern is replaced by MOE all-gather.
+#      Enabling model_parallel_memory_opt on an expert column would trigger
+#      reduce_scatter_to_sequence_parallel_region inside RowParallelLinear,
+#      corrupting the output before MOE reduce-scatter runs.
+#
+#   2. RowParallelLinear.__init__() [line ~462]:
+#      Add is_expert=False parameter:
+#        def __init__(self, ..., skip_bias_add=False, is_expert=False):
+#      Store: self.is_expert = is_expert
+#
+#   3. RowParallelLinear.forward() [line ~523-531]:
+#      In the model_parallel_memory_opt branch, gate the reduce-scatter:
+#        if self.model_parallel_memory_opt:
+#            if not self.is_expert:                         ← M1157
+#                output_ = reduce_scatter_to_sequence_parallel_region(output_parallel)
+#            else:
+#                output_ = output_parallel                  ← bypass for experts
+#        else:
+#            output_ = reduce_from_tensor_model_parallel_region(output_parallel)
+#      Rationale: MOE experts handle their own all-reduce/reduce-scatter via
+#      reduce_scatter_to_sequence_parallel_region_from_moe in SwitchMLP.forward();
+#      the per-layer reduce_scatter inside RowParallelLinear must be skipped to
+#      avoid a double reduction.
+#
+# When ColumnParallelLinear and RowParallelLinear are fully ported into this
+# file, all three changes above must be applied verbatim.
+# ---------------------------------------------------------------------------
+
+print('[M1157]')
+
+# Change 1 reference — ColumnParallelLinear.__init__ signature delta:
+#
+# BEFORE (M1082 / dd96d402a):
+#   def __init__(self, input_size, output_size, bias=True, gather_output=True,
+#                init_method=init.xavier_normal_, stride=1,
+#                keep_master_weight_for_test=False,
+#                skip_bias_add=False):
+#       ...
+#       self.model_parallel_memory_opt = (
+#           args.model_parallel_memory_opt and
+#           world_size > 1)
+#
+# AFTER (M1157 / 86e1df4e2):
+#   def __init__(self, input_size, output_size, bias=True, gather_output=True,
+#                init_method=init.xavier_normal_, stride=1,
+#                keep_master_weight_for_test=False,
+#                skip_bias_add=False,
+#                is_expert=False):                          ← added
+#       ...
+#       self.is_expert = is_expert                         ← added
+#       ...
+#       self.model_parallel_memory_opt = (
+#           args.model_parallel_memory_opt and
+#           not self.is_expert and                         ← added guard
+#           world_size > 1)
+
+# Change 2 reference — RowParallelLinear.__init__ signature delta:
+#
+# BEFORE:
+#   def __init__(self, ..., skip_bias_add=False):
+#       ...
+#
+# AFTER:
+#   def __init__(self, ..., skip_bias_add=False, is_expert=False):  ← added
+#       ...
+#       self.is_expert = is_expert                                   ← added
+
+# Change 3 reference — RowParallelLinear.forward reduce-scatter guard:
+#
+# BEFORE:
+#   if self.model_parallel_memory_opt:
+#       output_ = reduce_scatter_to_sequence_parallel_region(output_parallel)
+#   else:
+#       output_ = reduce_from_tensor_model_parallel_region(output_parallel)
+#
+# AFTER:
+#   if self.model_parallel_memory_opt:
+#       if not self.is_expert:                             ← M1157: bypass for experts
+#           output_ = reduce_scatter_to_sequence_parallel_region(output_parallel)
+#       else:
+#           output_ = output_parallel
+#   else:
+#       output_ = reduce_from_tensor_model_parallel_region(output_parallel)
