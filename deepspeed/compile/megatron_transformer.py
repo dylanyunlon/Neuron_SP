@@ -349,3 +349,185 @@ print('[M1157]')
 #       output_total = output_total.view(s, b, h)
 #       output_bias_total = output_bias_total.view(s, b, h)
 #       return output_total, output_bias_total
+
+# ---------------------------------------------------------------------------
+# M1313: Megatron 016965acc — use transformer config for args
+# Source: megatron/core/transformer/parallel_attention.py
+#         (NVIDIA/Megatron-LM commit 016965accd3d4bf29ff79d1cfd118d580e3b5879)
+# Author: eharper <eharper@nvidia.com>  Date: 2023-02-14
+#
+# Mapping: megatron/core/transformer/parallel_attention.py
+#          → deepspeed/compile/megatron_transformer.py
+#          (project convention: megatron/core/transformer/ → deepspeed/compile/)
+#
+# Changes ported from upstream (parallel_attention.py):
+#
+#   1. ParallelAttention.__init__() — remove explicit self.xxx attribute copies:
+#      BEFORE: stored each config field as a local instance attribute
+#        self.hidden_size = config.hidden_size
+#        self.kv_channels = config.kv_channels
+#        self.num_attention_heads = config.num_attention_heads
+#        self.init_method = config.init_method
+#        self.output_layer_init_method = config.output_layer_init_method
+#        self.params_dtype = config.params_dtype
+#        self.async_tensor_model_parallel_allreduce = config.async_tensor_model_parallel_allreduce
+#        self.recompute_granularity = config.recompute_granularity
+#        self.use_cpu_initialization = config.use_cpu_initialization
+#        self.perform_initialization = config.perform_initialization
+#        self.gradient_accumulation_fusion = config.gradient_accumulation_fusion
+#        self.sequence_parallel_enabled = config.sequence_parallel_enabled
+#      AFTER: all of the above lines removed; access via self.config.xxx directly.
+#
+#   2. self.layer_number assignment:
+#      BEFORE: self.layer_number = max(1, layer_number)
+#      AFTER:  self.layer_number = layer_number
+#      (clamping removed; callers are responsible for passing valid layer_number)
+#
+#   3. All usages of self.xxx replaced with self.config.xxx throughout __init__:
+#      e.g.  self.hidden_size       → self.config.hidden_size
+#            self.init_method       → self.config.init_method
+#            self.params_dtype      → self.config.params_dtype
+#            self.use_cpu_initialization  → self.config.use_cpu_initialization
+#            self.perform_initialization  → self.config.perform_initialization
+#            self.gradient_accumulation_fusion → self.config.gradient_accumulation_fusion
+#            self.sequence_parallel_enabled    → self.config.sequence_parallel_enabled
+#            self.async_tensor_model_parallel_allreduce
+#                                    → self.config.async_tensor_model_parallel_allreduce
+#            self.recompute_granularity → self.config.recompute_granularity
+#            self.output_layer_init_method → self.config.output_layer_init_method
+#            self.kv_channels       → self.config.kv_channels
+#            self.num_attention_heads → self.config.num_attention_heads
+#
+#   4. cross_attn branch — add comment:
+#      BEFORE: (no comment)
+#              assert attention_type == AttnType.cross_attn
+#      AFTER:  # TODO: supporting T5
+#              assert attention_type == AttnType.cross_attn
+#
+# Rationale: reduces attribute redundancy; TransformerConfig is the single
+# source of truth for all hyperparameter access inside ParallelAttention.
+# Eliminates ~12 lines of __init__ boilerplate and makes the class consistent
+# with the broader "access config directly" convention introduced in the
+# megatron.core refactor.
+# ---------------------------------------------------------------------------
+
+print('[M1313]')
+
+# Change 2 reference — layer_number assignment delta:
+#
+# BEFORE:
+#   self.layer_number = max(1, layer_number)
+#
+# AFTER:
+#   self.layer_number = layer_number
+
+# Change 1+3 reference — ParallelAttention.__init__ delta (self_attn branch):
+#
+# BEFORE:
+#   self.hidden_size = config.hidden_size
+#   self.kv_channels = config.kv_channels
+#   self.num_attention_heads = config.num_attention_heads
+#   self.init_method = config.init_method
+#   self.output_layer_init_method = config.output_layer_init_method
+#   self.params_dtype = config.params_dtype
+#   self.layer_number = max(1, layer_number)
+#   self.attention_type = attention_type
+#   self.attn_mask_type = attn_mask_type
+#   self.async_tensor_model_parallel_allreduce = config.async_tensor_model_parallel_allreduce
+#   self.recompute_granularity = config.recompute_granularity
+#   self.use_cpu_initialization = config.use_cpu_initialization
+#   self.perform_initialization = config.perform_initialization
+#   self.gradient_accumulation_fusion = config.gradient_accumulation_fusion
+#   self.sequence_parallel_enabled = config.sequence_parallel_enabled
+#
+#   projection_size = self.kv_channels * self.num_attention_heads
+#   ...
+#   self.hidden_size_per_attention_head = divide(projection_size, self.num_attention_heads)
+#   self.num_attention_heads_per_partition = divide(self.num_attention_heads, world_size)
+#
+#   self.query_key_value = tensor_parallel.ColumnParallelLinear(
+#       self.hidden_size,
+#       3 * projection_size,
+#       gather_output=False,
+#       init_method=self.init_method,
+#       async_tensor_model_parallel_allreduce=config.async_tensor_model_parallel_allreduce,
+#       params_dtype=self.params_dtype,
+#       use_cpu_initialization=self.use_cpu_initialization,
+#       perform_initialization=self.perform_initialization,
+#       gradient_accumulation_fusion=self.gradient_accumulation_fusion,
+#       sequence_parallel_enabled=self.sequence_parallel_enabled,
+#   )
+#   ...
+#   self.checkpoint_core_attention = self.recompute_granularity == 'selective'
+#   self.dense = tensor_parallel.RowParallelLinear(
+#       projection_size,
+#       self.hidden_size,
+#       input_is_parallel=True,
+#       init_method=self.output_layer_init_method,
+#       skip_bias_add=True,
+#       params_dtype=self.params_dtype,
+#       use_cpu_initialization=self.use_cpu_initialization,
+#       perform_initialization=self.perform_initialization,
+#       gradient_accumulation_fusion=self.gradient_accumulation_fusion,
+#       sequence_parallel_enabled=self.sequence_parallel_enabled,
+#   )
+#
+# AFTER (016965acc):
+#   self.layer_number = layer_number
+#   self.attention_type = attention_type
+#   self.attn_mask_type = attn_mask_type
+#
+#   projection_size = self.config.kv_channels * self.config.num_attention_heads
+#   ...
+#   self.hidden_size_per_attention_head = divide(projection_size, self.config.num_attention_heads)
+#   self.num_attention_heads_per_partition = divide(self.config.num_attention_heads, world_size)
+#
+#   self.query_key_value = tensor_parallel.ColumnParallelLinear(
+#       self.config.hidden_size,
+#       3 * projection_size,
+#       gather_output=False,
+#       init_method=self.config.init_method,
+#       async_tensor_model_parallel_allreduce=config.async_tensor_model_parallel_allreduce,
+#       params_dtype=self.config.params_dtype,
+#       use_cpu_initialization=self.config.use_cpu_initialization,
+#       perform_initialization=self.config.perform_initialization,
+#       gradient_accumulation_fusion=self.config.gradient_accumulation_fusion,
+#       sequence_parallel_enabled=self.config.sequence_parallel_enabled,
+#   )
+#
+#   # TODO: supporting T5   ← new comment in cross_attn branch
+#   assert attention_type == AttnType.cross_attn
+#   self.query = tensor_parallel.ColumnParallelLinear(
+#       self.config.hidden_size, ...
+#       init_method=self.config.init_method,
+#       params_dtype=self.config.params_dtype,
+#       use_cpu_initialization=self.config.use_cpu_initialization,
+#       perform_initialization=self.config.perform_initialization,
+#       gradient_accumulation_fusion=self.config.gradient_accumulation_fusion,
+#       sequence_parallel_enabled=self.config.sequence_parallel_enabled,
+#   )
+#   self.key_value = tensor_parallel.ColumnParallelLinear(
+#       self.config.hidden_size,
+#       2 * projection_size, ...
+#       init_method=self.config.init_method,
+#       async_tensor_model_parallel_allreduce=self.config.async_tensor_model_parallel_allreduce,
+#       params_dtype=self.config.params_dtype,
+#       use_cpu_initialization=self.config.use_cpu_initialization,
+#       perform_initialization=self.config.perform_initialization,
+#       gradient_accumulation_fusion=self.config.gradient_accumulation_fusion,
+#       sequence_parallel_enabled=self.config.sequence_parallel_enabled,
+#   )
+#   ...
+#   self.checkpoint_core_attention = self.config.recompute_granularity == 'selective'
+#   self.dense = tensor_parallel.RowParallelLinear(
+#       projection_size,
+#       self.config.hidden_size,
+#       input_is_parallel=True,
+#       init_method=self.config.output_layer_init_method,
+#       skip_bias_add=True,
+#       params_dtype=self.config.params_dtype,
+#       use_cpu_initialization=self.config.use_cpu_initialization,
+#       perform_initialization=self.config.perform_initialization,
+#       gradient_accumulation_fusion=self.config.gradient_accumulation_fusion,
+#       sequence_parallel_enabled=self.config.sequence_parallel_enabled,
+#   )
