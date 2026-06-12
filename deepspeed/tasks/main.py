@@ -23,7 +23,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__),
 from megatron import get_args
 from megatron.initialize import initialize_megatron
 
-print('[M893]')
+print('[M911]')
 
 def get_tasks_args(parser):
     """Provide extra arguments required for tasks."""
@@ -135,8 +135,6 @@ if __name__ == '__main__':
         from orqa.supervised.finetune import main
     elif args.task == 'KNWL-DIALO-PROMPT':
         from knwl_dialo.prompt import main
-    elif args.task in ['KNWL-DIALO-FINETUNE', 'KNWL-DIALO-GEN']:
-        from knwl_dialo.finetune import main
     elif args.task == 'KNWL-DIALO-EVAL-F1':
         from knwl_dialo.evaluate import main
     else:
