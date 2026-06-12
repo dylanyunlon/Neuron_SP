@@ -528,3 +528,53 @@ print('[M1157]')
 #           output_ = output_parallel
 #   else:
 #       output_ = reduce_from_tensor_model_parallel_region(output_parallel)
+
+# ---------------------------------------------------------------------------
+# M1245: Megatron 07916bf24 — Support gradient accumulation fusion in fp16.
+# Source: megatron/core/tensor_parallel/layers.py (NVIDIA/Megatron-LM commit 07916bf24)
+# Author: Jared Casper <jcasper@nvidia.com>  Date: 2022-09-27
+#
+# Mapping: megatron/core/tensor_parallel/layers.py → deepspeed/compile/mpu_layers.py
+#          (project convention: core/tensor_parallel/* → deepspeed/compile/)
+#
+# Changes ported from upstream (core/tensor_parallel/layers.py):
+#
+#   LinearWithGradAccumulationAndAsyncCommunication.backward() [line ~302]:
+#   Extend gradient_accumulation_fusion dispatch to support fp16 main_grad
+#   in addition to the existing fp32 path.  Previously only fp32 was handled:
+#
+#     BEFORE (single-path, fp32 only):
+#       if ctx.gradient_accumulation_fusion:
+#           fused_weight_gradient_mlp_cuda.wgrad_gemm_accum_fp32(
+#               total_input, grad_output, weight.main_grad)
+#           grad_weight = None
+#       else:
+#           grad_weight = grad_output.t().matmul(total_input)
+#
+#     AFTER (dtype-dispatched, fp16 + fp32):
+#       if ctx.gradient_accumulation_fusion:
+#           if weight.main_grad.dtype == torch.float32:
+#               fused_weight_gradient_mlp_cuda.wgrad_gemm_accum_fp32(
+#                   total_input, grad_output, weight.main_grad)
+#           elif weight.main_grad.dtype == torch.float16:
+#               fused_weight_gradient_mlp_cuda.wgrad_gemm_accum_fp16(
+#                   total_input, grad_output, weight.main_grad)
+#           else:
+#               raise RuntimeError(
+#                   "Unsupported gradient type for gradient accumulation fusion")
+#           grad_weight = None
+#       else:
+#           grad_weight = grad_output.t().matmul(total_input)
+#
+#   Rationale: wgrad_gemm_accum_fp16 was added to fused_weight_gradient_mlp_cuda
+#   to accumulate weight gradients directly in fp16, enabling
+#   gradient_accumulation_fusion without requiring fp32 grad buffers.  The
+#   RuntimeError guard ensures unsupported dtypes (e.g. bf16) fail explicitly
+#   rather than silently falling through.
+#
+# Note: LinearWithGradAccumulationAndAsyncCommunication is not yet fully ported
+#   into deepspeed/compile/mpu_layers.py.  When the full port is done, apply
+#   the AFTER pattern above verbatim inside backward().
+# ---------------------------------------------------------------------------
+
+print('[M1245]')

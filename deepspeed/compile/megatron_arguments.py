@@ -1143,3 +1143,39 @@ def add_standalone_embedding_arg(parser):
     )
     print('[M1038] add_standalone_embedding_arg: --standalone-embedding-stage registered')
     return parser
+
+# ---------------------------------------------------------------------------
+# M1245: Megatron 07916bf24 — Support gradient accumulation fusion in fp16.
+# Source: megatron/arguments.py (NVIDIA/Megatron-LM commit 07916bf24)
+# Author: Jared Casper <jcasper@nvidia.com>  Date: 2022-09-27
+#
+# Mapping: megatron/arguments.py → deepspeed/compile/megatron_arguments.py
+#          (project convention: megatron top-level → deepspeed/compile/)
+#
+# Changes ported from arguments.py (validate_args, lines 168-175):
+#
+#   Remove the else-branch that disabled gradient_accumulation_fusion when
+#   accumulate_allreduce_grads_in_fp32 was False.  Previously the code was:
+#
+#     if args.accumulate_allreduce_grads_in_fp32:
+#         assert args.DDP_impl == 'local'
+#         assert args.use_contiguous_buffers_in_local_ddp
+#     else:
+#         if args.gradient_accumulation_fusion:
+#             args.gradient_accumulation_fusion = False
+#             if args.rank == 0:
+#                 print('Gradient accumulation fusion to linear layer weight '
+#                       'gradient computation is supported only with fp32 '
+#                       'gradient accumulation. Setting gradient_accumulation_fusion '
+#                       'to False', flush=True)
+#
+#   The else-branch (lines 171-178) is deleted entirely so that
+#   gradient_accumulation_fusion can remain enabled in fp16 mode now that
+#   wgrad_gemm_accum_fp16 is available (see M1245 in mpu_layers.py).
+#
+# Adaptation note: megatron_arguments.py does not contain a full validate_args
+# implementation; this marker records the upstream intent.  When validate_args
+# is ported, the else-branch above must NOT be included.
+# ---------------------------------------------------------------------------
+
+print('[M1245]')
