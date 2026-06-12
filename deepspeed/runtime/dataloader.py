@@ -2966,3 +2966,58 @@ def _m236_pretrain_scripts_import_update():
     pass
 
 # --- End M236 dataloader ---
+
+
+# ---------------------------------------------------------------------------
+# M328: Megatron 5247f24c5 — Fix gpt2_dataset import error
+# Ported from:
+#   megatron/data/gpt2_dataset.py  → deepspeed/runtime/dataloader.py
+#
+# Key change carried over:
+#   gpt2_dataset.py line 25:
+#     Before: from megatron.data.bert_dataset import get_train_valid_test_split_
+#     After:  from megatron.data.dataset_utils import get_train_valid_test_split_
+#
+#   get_train_valid_test_split_ was originally defined in bert_dataset.py and
+#   used by gpt2_dataset.py via a cross-module import.  This commit corrects
+#   the import to point at dataset_utils, the canonical home of the function
+#   (as also reflected in M236 / Megatron 16a64c41b).
+#
+# Neuron_SP adaptation:
+#   Neuron_SP does not maintain a standalone gpt2_dataset.py; all GPT-2
+#   dataset logic is hosted in deepspeed/runtime/dataloader.py.  The
+#   equivalent of the corrected import is already present here: the
+#   _m119_build_train_valid_test_datasets() factory accepts
+#   get_train_valid_test_split_fn as an injected callable, and callers are
+#   expected to source that callable from megatron.data.dataset_utils (not
+#   bert_dataset).  This section makes that expectation explicit and
+#   documents the upstream fix for traceability.
+# ---------------------------------------------------------------------------
+
+print('[M328]')
+
+
+def _m328_gpt2_get_train_valid_test_split_import_source():
+    """M328: Megatron 5247f24c5 — correct import source for GPT-2 split helper.
+
+    Documents the upstream fix: gpt2_dataset.py previously imported
+    get_train_valid_test_split_ from megatron.data.bert_dataset; the commit
+    corrects this to megatron.data.dataset_utils.
+
+    In Neuron_SP the function is injected as get_train_valid_test_split_fn
+    into _m119_build_train_valid_test_datasets(); callers must supply it from
+    megatron.data.dataset_utils, not bert_dataset.
+
+    Returns the callable sourced from the correct module so it can be passed
+    directly to _m119_build_train_valid_test_datasets().
+
+    Before (gpt2_dataset.py):
+        from megatron.data.bert_dataset import get_train_valid_test_split_
+
+    After (gpt2_dataset.py):
+        from megatron.data.dataset_utils import get_train_valid_test_split_
+    """
+    from megatron.data.dataset_utils import get_train_valid_test_split_
+    return get_train_valid_test_split_
+
+# --- End M328 dataloader ---
