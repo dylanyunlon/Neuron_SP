@@ -92,6 +92,10 @@ class CoreAttention(DominoModule):
 
         projection_size = config.kv_channels * config.num_attention_heads
 
+        # M1283: Megatron 9200e43ae — Remove FA's check for headdim <= 128.
+        # No headdim <= 128 guard is imposed; FlashAttention supports arbitrary head dims.
+        print('[M1283]')
+
         # Per attention head and per partition values.
         assert projection_size % tp_world_size == 0, f"projection size {projection_size} should be multiple of TP world size {tp_world_size}"
         self.hidden_size_per_partition = projection_size // tp_world_size
