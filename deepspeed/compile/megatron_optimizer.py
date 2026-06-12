@@ -74,6 +74,41 @@ print('[M1098]')
 print('[M1062]')
 
 # ---------------------------------------------------------------------------
+# M1110: Megatron efa3cbcf0 — partially cleaned optimizer.py.
+# Source: megatron/optimizer/optimizer.py (NVIDIA/Megatron-LM commit efa3cbcf0)
+# Author: Lawrence McAfee <lmcafee@nvidia.com>  Date: 2022-03-14
+#
+# Mapping: megatron/optimizer/optimizer.py → deepspeed/compile/megatron_optimizer.py
+#
+# Changes ported from optimizer.py (diff vs parent):
+#   1. Removed top-level debug imports: `from lutil import pax, tp` and
+#      `DEBUG_ITERATION = 1`.
+#   2. clip_grad_norm(self, clip_grad, ITERATION) → clip_grad_norm(self, clip_grad).
+#   3. gather_model_params(self, args, timers, ITERATION) →
+#      gather_model_params(self, args, timers).
+#   4. Removed commented-out `# return` in allreduce_embedding_grads.
+#   5. Added blank line after `self.grad_scaler = grad_scaler`; added inline
+#      comment `# None grad scaler is only supported for bf16.`.
+#   6. Removed `# pax(1, {"main_grads": ...})` comment in
+#      _unscale_main_grads_and_check_for_nan.
+#   7. Removed large commented pax block after found_inf_flag check.
+#   8. step(self, args, timers, ITERATION) → step(self, args, timers).
+#   9. _copy_model_grads_to_main_grads(self, ITERATION) →
+#      _copy_model_grads_to_main_grads(self); removed NaN debug block.
+#  10. _copy_main_params_to_model_params(self, ITERATION) →
+#      _copy_main_params_to_model_params(self); removed isnan check block.
+#  11. Removed debug() closure and all >>> / <<< commented debug blocks in
+#      __init__ (pax introspection, optimizer state dumps).
+#  12. Removed active `pax(0, {"param": param})` in fp32 branch of __init__.
+#  13. Removed class rename comments for BaseFloat16Optimizer /
+#      Float16OptimizerWithFloat16Params.
+#  14. FP32Optimizer.step(self, args, timers, ITERATION) →
+#      step(self, args, timers); removed ITERATION from clip_grad_norm call.
+# ---------------------------------------------------------------------------
+
+print('[M1110]')
+
+# ---------------------------------------------------------------------------
 # M1013: Megatron 7dc8c4759 — feb 9 alpha
 # Source: megatron/optimizer/optimizer.py + megatron/optimizer/grad_scaler.py
 #         (NVIDIA/Megatron-LM commit 7dc8c4759)
@@ -393,6 +428,8 @@ class Float16OptimizerWithFloat16Params(MegatronOptimizer):
 
         self.bf16 = bf16
         self.grad_scaler = grad_scaler
+
+        # None grad scaler is only supported for bf16.
         if self.grad_scaler is None:
             assert self.bf16, 'fp16 expects a grad scaler.'
 
@@ -431,40 +468,10 @@ class Float16OptimizerWithFloat16Params(MegatronOptimizer):
                         mpu.copy_tensor_model_parallel_attributes(main_param, param)
                         if hasattr(param, 'shared'):
                             main_param.shared = param.shared
-                        # Replace the optimizer params with the new fp32 copy.
-                        param_group['params'][i] = main_param
-                        # >>>
-                        def debug():
-                            from lutil import pax, tp
-                            pax(0, {
-                                "optimizer": optimizer,
-                                # "optimizer / state" : optimizer.state,
-                                "optimizer / pg / 0": optimizer.param_groups[0]["params"],
-                                "optimizer / pg / 1": optimizer.param_groups[1]["params"],
-                                "param": tp(param),
-                                "param / hash": hash(param),
-                                "main_param": tp(main_param),
-                                "main_param / hash": hash(main_param),
-                            })
-                        # <<<
-                        # >>>
-                        # debug()
-                        # <<<
-                        fp32_from_float16_params_this_group.append(main_param)
-                        # Reset existing state dict key to the new main param.
-                        if param in self.optimizer.state:
-                            self.optimizer.state[main_param] \
-                                = self.optimizer.state.pop(param)
-                        # >>>
-                        # debug()
-                        # <<<
+<
 
                     # fp32 params.
                     elif param.type() == 'torch.cuda.FloatTensor':
-                        # >>>
-                        from lutil import pax
-                        pax(0, {"param": param})
-                        # <<<
                         fp32_params_this_group.append(param)
                         param_group['params'][i] = param
 
@@ -482,29 +489,6 @@ class Float16OptimizerWithFloat16Params(MegatronOptimizer):
         # Leverage state_dict() and load_state_dict() to
         # recast preexisting per-param state tensors
         self.optimizer.load_state_dict(self.optimizer.state_dict())
-
-        # >>>
-        # from lutil import pax
-        # pax(0, {
-        #     # "float16_groups / len" : [ len(g) for g in self.float16_groups ],
-        #     # "fp32_from_float16_groups / len" :
-        #     # [ len(g) for g in self.fp32_from_float16_groups ],
-        #     # "float16_groups / 0" : self.float16_groups[0],
-        #     # "float16_groups / 1" : self.float16_groups[1],
-        #     # "fp32_from_float16_groups / 0" : self.fp32_from_float16_groups[0],
-        #     # "fp32_from_float16_groups / 1" : self.fp32_from_float16_groups[1],
-        #     # "fp32_from_float32_groups" : self.fp32_from_fp32_groups,
-        #     "optimizer" : self.optimizer,
-        #     # "optimizer / sd" : self.optimizer.state_dict(),
-        #     # "optimizer / state" : self.optimizer.state_dict()["state"],
-        #     # "optimizer / pg" : self.optimizer.state_dict()["param_groups"],
-        #     # "optimizer / pg / 0" : self.optimizer.state_dict()["param_groups"][0],
-        #     # "optimizer / pg / 1" : self.optimizer.state_dict()["param_groups"][1],
-        #     "optimizer -> pg" : optimizer.param_groups,
-        #     "optimizer -> pg / 0" : optimizer.param_groups[0]["params"],
-        #     "optimizer -> pg / 1" : optimizer.param_groups[1]["params"],
-        # })
-        # <<<
 
     def zero_grad(self, set_to_none=True):
         """We only need to zero the model related parameters, i.e.,
@@ -530,19 +514,7 @@ class Float16OptimizerWithFloat16Params(MegatronOptimizer):
     def get_main_grads(self):
         return [ p.grad for p in self.get_main_params() ]
 
-    def _copy_model_grads_to_main_grads(self, ITERATION):
-        # >>>
-        main_grads = [ p.grad for g in self.fp32_from_float16_groups for p in g
-                       if p.grad is not None ]
-        if main_grads:
-            import torch as _t
-            main_has_nan = any(
-                (not _t.all(_t.isfinite(g)).item()) for g in main_grads
-            )
-            if main_has_nan:
-                raise Exception("hi.")
-        # <<<
-
+    def _copy_model_grads_to_main_grads(self):
         # This only needs to be done for the float16 group.
         for model_group, main_group in zip(self.float16_groups, self.fp32_from_float16_groups):
             for model_param, main_param in zip(model_group, main_group):
@@ -603,21 +575,11 @@ class Float16OptimizerWithFloat16Params(MegatronOptimizer):
                 main_data.append(main_param.data)
         return model_data, main_data
 
-    def _copy_main_params_to_model_params(self, ITERATION):
+    def _copy_main_params_to_model_params(self):
         # Only needed for the float16 params.
         model_data, main_data = self._get_model_and_main_params_data_float16()
         _multi_tensor_copy_this_to_that(this=main_data, that=model_data,
                                         overflow_buf=self._dummy_overflow_buf)
-        # >>>
-        import torch as _t
-        for param_data in model_data:
-            is_nan = not _t.all(_t.isfinite(param_data)).item()
-            if is_nan:
-                pax({
-                    "param" : param_data,
-                    "is_nan" : is_nan,
-                })
-        # <<<
 
     def _copy_model_params_to_main_params(self):
         # Only needed for the float16 params.
@@ -629,12 +591,10 @@ class Float16OptimizerWithFloat16Params(MegatronOptimizer):
         self._copy_model_params_to_main_params()
 
     @torch.no_grad()
-    def step(self, ITERATION):
-
-        timers = get_timers()
+    def step(self, args, timers):
 
         timers('optimizer-copy-to-main-grad').start()
-        self._copy_model_grads_to_main_grads(ITERATION)
+        self._copy_model_grads_to_main_grads()
         timers('optimizer-copy-to-main-grad').stop()
 
         if self.grad_scaler:
@@ -647,11 +607,6 @@ class Float16OptimizerWithFloat16Params(MegatronOptimizer):
 
             # If we found inf/nan, skip the update.
             if found_inf_flag:
-                pax(0, {
-                    "main params" : self.get_main_params(),
-                    "main grads" : self.get_main_grads(),
-                    "found_inf_flag" : found_inf_flag,
-                })
                 return False, None, None
 
         timers('optimizer-clip-main-grad').start()
@@ -666,24 +621,11 @@ class Float16OptimizerWithFloat16Params(MegatronOptimizer):
         # Step the optimizer.
         self.optimizer.step()
 
-        # >>>
-        # pax(0, {
-        #     "main params" : self.get_main_params(),
-        #     "main grads" : self.get_main_grads(),
-        # })
-        # <<<
-
         timers('optimizer-copy-main-to-model-params').start()
-        self._copy_main_params_to_model_params(ITERATION)
+        self._copy_main_params_to_model_params()
         timers('optimizer-copy-main-to-model-params').stop()
 
-        # >>>
-        # pax(1, {
-        #     "ITERATION" : ITERATION,
-        #     "model_params" : [ p for p in self.get_parameters() ],
-        # })
-        # <<<
-
+        # Successful update.
         return True, grad_norm, num_zeros_in_grad
 
     def state_dict(self):
