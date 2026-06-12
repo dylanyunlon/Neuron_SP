@@ -24,6 +24,7 @@ from megatron import get_args
 from megatron.text_generation import generate_and_post_process
 
 print('[M852]')
+print('[M1215]')
 
 GENERATE_NUM = 0
 lock = threading.Lock()
@@ -146,7 +147,7 @@ class MegatronGenerate(Resource):
                         stop_on_double_eol=stop_on_double_eol,
                         stop_on_eol=stop_on_eol)
             except ValueError as ve:
-                return "Length of prompt + tokens_to_generate longer than allowed"
+                return ve.args[0]
             print("end time: ", datetime.datetime.now())
         
         return jsonify({"text": response,
