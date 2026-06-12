@@ -2,6 +2,23 @@
 # DeepSpeed Team
 
 # ---------------------------------------------------------------------------
+# M1173: Megatron 36dc5768f — added distrib opt documentation.
+# Source: docs/distrib_optimizer.md (NVIDIA/Megatron-LM commit 36dc5768f)
+# Author: Lawrence McAfee <lmcafee@nvidia.com>  Date: 2022-05-16
+#
+# Mapping: docs/distrib_optimizer.md → deepspeed/docs/distrib_optimizer.md
+#          docs/images/distrib_optimizer/*.png → deepspeed/docs/images/distrib_optimizer/
+#
+# This commit adds documentation for the distributed optimizer, covering:
+#   - Memory savings table (float16/fp32 param+grad combinations, vs data parallel size d)
+#   - Grad buffer lifecycle (5 states: grads, main-grad copy, main-param copy, params, zeros)
+#   - reduce-scatter / all-gather data flow and sharding scheme diagrams
+#   - Key step walkthrough (fp16 grad path, 4-element per-rank example)
+#
+# No Python changes in upstream commit; print marker placed in this file per project convention.
+print('[M1173]')
+
+# ---------------------------------------------------------------------------
 # M1148: Megatron be8de1b36 — fixed shared weight attribute for fp32.
 # Source: megatron/optimizer/distrib_optimizer.py (NVIDIA/Megatron-LM commit be8de1b36)
 # Author: Lawrence McAfee <lmcafee@nvidia.com>  Date: 2022-03-29
