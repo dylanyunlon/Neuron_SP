@@ -908,3 +908,52 @@ def add_empty_unused_memory_arg(parser):
 
 
 print('[M749]')
+
+# ---------------------------------------------------------------------------
+# M771: Megatron cb5e611d7 — tested
+# Source: megatron/arguments.py (NVIDIA/Megatron-LM commit cb5e611d7)
+# Author: Mohammad Shoeybi <mshoeybi@nvidia.com>  Date: 2021-08-22
+#
+# Mapping: megatron/arguments.py → deepspeed/compile/megatron_arguments.py
+#
+# Change ported from arguments.py parse_args(), inside the
+# distribute-checkpointed-activations block:
+#   assert args.activations_checkpoint_method is not None, \
+#       'for distribute-checkpointed-activations to work you '
+#       'need to use a activation-checkpoint method '
+#   + assert args.num_layers_per_virtual_pipeline_stage is None, \
+#   +     'currently distrobuted checkpoint activations only supported for ' \
+#   +     'nointerleaved pipeline parallelism'
+#
+# DeepSpeed adaptation: surfaced as validate_distributed_checkpointing(args)
+# callable after pipeline and activation-checkpoint args are resolved.
+# ---------------------------------------------------------------------------
+
+print('[M771]')
+
+
+def validate_distributed_checkpointing(args):
+    """Assert distribute-checkpointed-activations prereqs are met.
+
+    Megatron cb5e611d7 arguments.py parse_args():
+      assert args.activations_checkpoint_method is not None, \\
+          'for distribute-checkpointed-activations to work you ' \\
+          'need to use a activation-checkpoint method '
+      assert args.num_layers_per_virtual_pipeline_stage is None, \\
+          'currently distrobuted checkpoint activations only supported for ' \\
+          'nointerleaved pipeline parallelism'
+
+    Call after distribute_saved_activations,
+    activations_checkpoint_method, and
+    num_layers_per_virtual_pipeline_stage are resolved.
+    Safe to call when distribute_saved_activations is False or absent.
+    """
+    if not getattr(args, 'distribute_saved_activations', False):
+        return
+    assert getattr(args, 'activations_checkpoint_method', None) is not None, \
+        'for distribute-checkpointed-activations to work you ' \
+        'need to use a activation-checkpoint method '
+    assert getattr(args, 'num_layers_per_virtual_pipeline_stage', None) is None, \
+        'currently distrobuted checkpoint activations only supported for ' \
+        'nointerleaved pipeline parallelism'
+    print('[M771] validate_distributed_checkpointing: passed')
