@@ -593,9 +593,11 @@ def clip_grad_norm_(parameters, max_norm, norm_type=2, mpu=None):
             dist.all_reduce(total_norm, op=dist.ReduceOp.MAX, group=mpu.get_model_parallel_group())
     else:
         total_norm = 0
+        print('[M201]')
+        mp_rank_is_zero = (mpu.get_model_parallel_rank() == 0) if mpu is not None else True
         for p in parameters:
             if mpu is not None:
-                if (mpu.get_model_parallel_rank() == 0) or is_model_parallel_parameter(p):
+                if mp_rank_is_zero or is_model_parallel_parameter(p):
                     param_norm = p.grad.data.detach().float().norm(norm_type)
                     all_norms.append(param_norm)
             else:
