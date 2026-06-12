@@ -43,11 +43,35 @@ print('[M1062]')
 #         (NVIDIA/Megatron-LM commit 7dc8c4759)
 # Author: Lawrence McAfee <lmcafee@nvidia.com>  Date: 2022-02-09
 #
+# M1061: Megatron 9b7854e4b — more cleanup of main params/grads
+# Source: megatron/optimizer/optimizer.py
+#         (NVIDIA/Megatron-LM commit 9b7854e4b)
+# Author: Lawrence McAfee <lmcafee@nvidia.com>  Date: 2022-02-22
+#
 # Mapping: megatron/optimizer/optimizer.py → deepspeed/compile/megatron_optimizer.py
 #          megatron/optimizer/grad_scaler.py → (inlined here)
 #          (project convention: megatron top-level → deepspeed/compile/)
 #
-# Changes ported from optimizer.py (diff vs parent):
+# M1061 Changes (Float16DistributedOptimizer, first migration of this class):
+#   1. Added get_main_param(group_index) and get_main_grad(group_index) helper
+#      methods to Float16DistributedOptimizer (after optimizer.load_state_dict()).
+#   2. _collect_main_grad_data_for_unscaling(): replaced direct
+#      main_param_shards list access with get_main_grad(gi) call.
+#   3. _copy_model_params_to_main_params(): replaced direct
+#      optimizer.param_groups[group_index] access with get_main_param(group_index);
+#      commented out pax(0,...) debug call.
+#   4. _copy_model_grads_to_main_grads(): replaced main_param_shards[group_index].grad
+#      with get_main_grad(group_index).
+#   5. _copy_main_params_to_model_params(): replaced main_param_shards[group_index]
+#      with get_main_param(group_index).
+#
+# Also adds (as prerequisites not previously in this file):
+#   - import math, from megatron import get_args
+#   - Shard helper class
+#   - BaseFloat16Optimizer base class
+#   - Float16DistributedOptimizer full class
+#
+# M1013 Changes ported from optimizer.py (diff vs parent):
 #   1. Float16OptimizerWithFloat16Params.__init__(): after setting
 #      param_group['params'][i] = main_param, added debug() closure with
 #      lutil pax introspection of optimizer param_groups and param hashes,
@@ -64,6 +88,7 @@ print('[M1062]')
 # ---------------------------------------------------------------------------
 
 print('[M1013]')
+print('[M1061]')
 
 
 from abc import ABC
@@ -715,3 +740,507 @@ class FP32Optimizer(MegatronOptimizer):
 
     def load_state_dict(self, state_dict):
         self.optimizer.load_state_dict(state_dict)
+
+
+# ---------------------------------------------------------------------------
+# M1061 additions: import math, get_args, Shard, BaseFloat16Optimizer,
+#                  Float16DistributedOptimizer
+# ---------------------------------------------------------------------------
+
+import math
+
+from megatron import get_args
+
+
+# class ShardIndex:
+class Shard:
+    def __init__(self, start, end):
+        self.start = start
+        self.end = end
+        self.size = end - start
+    def normalize(self, start=0):
+        return Shard(start, start + self.size)
+    def __str__(self):
+        return "%d,%d [%d]" % (self.start, self.end, self.size)
+
+
+class BaseFloat16Optimizer(MegatronOptimizer):
+
+    def __init__(self, optimizer, clip_grad, log_num_zeros_in_grad,
+                 params_have_main_grad, use_contiguous_buffers_in_local_ddp,
+                 bf16, grad_scaler,
+                 models):
+
+        super().__init__(
+            optimizer, clip_grad, log_num_zeros_in_grad,
+            params_have_main_grad, use_contiguous_buffers_in_local_ddp)
+
+        # >>>
+        self.models = models
+        # <<<
+        self.bf16 = bf16
+        self.grad_scaler = grad_scaler
+        # None grad scaler is only supported for bf16.
+        if self.grad_scaler is None:
+            assert self.bf16, 'fp16 expects a grad scaler.'
+
+        # Tensor used to determine if a nan/if has happend.
+        # Any non-zero value indicates inf/nan.
+        # Note that we keep this for the cases that grad scaler is none.
+        # We still record nan/inf if we have a bfloat16 with a grad scaler.
+        if self.grad_scaler:
+            self.found_inf = torch.cuda.FloatTensor([0.0])
+
+        # Dummy tensor needed for apex multi-apply tensor.
+        # For bfloat, we don't have multi-tensor apply and for now
+        # we set it to none so the multi-tensor apply gets ignored.
+        if bf16:
+            self._dummy_overflow_buf = None
+        else:
+            self._dummy_overflow_buf = torch.cuda.IntTensor([0])
+
+        # In case grad scaler is not passed, define the unity scale.
+        if self.grad_scaler is None:
+            self._scale_one = torch.cuda.FloatTensor([1.0])
+
+    def get_loss_scale(self):
+        if self.grad_scaler is None:
+            return self._scale_one
+        return self.grad_scaler.scale
+
+    def reload_model_params(self):
+        self._copy_model_params_to_main_params()
+
+    def _unscale_main_grads_and_check_for_nan(self):
+
+        # Collect main grads.
+        main_grads = self._collect_main_grad_data_for_unscaling()
+
+        # Reset found inf.
+        self.found_inf.fill_(0.0)
+
+        # Unscale and set found inf/nan
+        torch._amp_foreach_non_finite_check_and_unscale_(
+            main_grads, self.found_inf, self.grad_scaler.inv_scale)
+
+        # Update across all model parallel instances.
+        torch.distributed.all_reduce(self.found_inf,
+                                     op=torch.distributed.ReduceOp.MAX,
+                                     group=mpu.get_model_parallel_group())
+
+        # Check for nan.
+        found_inf_flag = (self.found_inf.item() > 0)
+
+        return found_inf_flag
+
+    @torch.no_grad()
+    def step(self):
+
+        timers = get_timers()
+
+        # Copy gradients from model params to main params.
+        timers('optimizer-copy-to-main-grad').start()
+        self._copy_model_grads_to_main_grads()
+        timers('optimizer-copy-to-main-grad').stop()
+
+        # Do unscale, check for inf, and update grad scaler only for
+        # the case that grad scaler is provided.
+        if self.grad_scaler:
+
+            # Unscale and check for inf/nan.
+            timers('optimizer-unscale-and-check-inf').start()
+            found_inf_flag = self._unscale_main_grads_and_check_for_nan()
+            timers('optimizer-unscale-and-check-inf').stop()
+
+            # We are done with scaling gradients
+            # so we can update the loss scale.
+            self.grad_scaler.update(found_inf_flag)
+
+            # If we found inf/nan, skip the update.
+            if found_inf_flag:
+                return False, None, None
+
+        # Clip the main gradients.
+        timers('optimizer-clip-main-grad').start()
+        grad_norm = None
+        if self.clip_grad > 0.0:
+            grad_norm = self.clip_grad_norm(self.clip_grad)
+        timers('optimizer-clip-main-grad').stop()
+
+        # count the zeros in the grads
+        num_zeros_in_grad = self.count_zeros() if \
+                            self.log_num_zeros_in_grad else None
+
+        # Step the optimizer.
+        self.optimizer.step()
+
+        # Update params from main params.
+        timers('optimizer-copy-main-to-model-params').start()
+        self._copy_main_params_to_model_params()
+        timers('optimizer-copy-main-to-model-params').stop()
+
+        # Successful update.
+        return True, grad_norm, num_zeros_in_grad
+
+
+# class Float16DistributedOptimizer(Float16OptimizerWithFloat16Params):
+# class Float16DistributedOptimizer(MegatronOptimizer):
+class Float16DistributedOptimizer(BaseFloat16Optimizer):
+
+    @classmethod
+    def get_model_gbuf_param_shard_map(cls, model, dtype, gbuf_world_shard):
+
+        # Param shard map.
+        param_world_index_map = model._grad_buffer_param_index_map[dtype]
+        param_shard_map = {}
+        for param, param_world_indexes in param_world_index_map.items():
+
+            # Shard range.
+            param_world_start, param_world_end = param_world_indexes
+            param_local_start = max(
+                0,
+                param_world_start - gbuf_world_shard.start)
+            param_local_end = min(
+                gbuf_world_shard.size,
+                param_world_end - gbuf_world_shard.start)
+
+            # Add shard, if within range.
+            if param_local_end > param_local_start:
+                param_local_shard = Shard(param_local_start, param_local_end)
+                param_world_shard = param_local_shard.normalize(param_world_start)
+                sub_param_start = max(0, gbuf_world_shard.start - param_world_start)
+                sub_param_shard = param_local_shard.normalize(sub_param_start)
+                param_shard_map[param] = {
+                    "gbuf_world": param_world_shard,
+                    "gbuf_local": param_local_shard,
+                    "param": sub_param_shard,
+                }
+
+        return param_shard_map
+
+    @classmethod
+    def get_model_gbuf_shard(cls, model, dtype):
+
+        data_parallel_rank = mpu.get_data_parallel_rank()
+        data_parallel_world_size = mpu.get_data_parallel_world_size()
+
+        # Grad buffer shard.
+        grad_buffer = model._grad_buffers[dtype]
+        gbuf_size = grad_buffer.numel
+        max_gbuf_shard_size = int(math.ceil(gbuf_size / data_parallel_world_size))
+
+        gbuf_world_all_shards = []
+        for r in range(data_parallel_world_size):
+            gbuf_world_start = r * max_gbuf_shard_size
+            gbuf_world_end = min(gbuf_size, gbuf_world_start + max_gbuf_shard_size)
+            gbuf_world_shard = Shard(gbuf_world_start, gbuf_world_end)
+            gbuf_world_all_shards.append(gbuf_world_shard)
+        gbuf_world_shard = gbuf_world_all_shards[data_parallel_rank]
+
+        # Param shards.
+        param_shard_map = cls.get_model_gbuf_param_shard_map(model,
+                                                              dtype,
+                                                              gbuf_world_shard)
+
+        # Altogether.
+        data = {
+            "local": gbuf_world_shard.normalize(),
+            "world": gbuf_world_shard,
+            "world_all": gbuf_world_all_shards,
+            "param_map": param_shard_map,
+        }
+
+        return data
+
+    @classmethod
+    def get_model_gbuf_shard_map(cls, model):
+        return {
+            dtype: cls.get_model_gbuf_shard(model, dtype)
+            for dtype in model._grad_buffers
+        }
+
+    @classmethod
+    def get_param_gbuf_map(cls, model_gbuf_shards):
+
+        param_gbuf_map = {}
+        for model_index, model_gbuf_shard_map in enumerate(model_gbuf_shards):
+            for dtype, gbuf_shard_map in model_gbuf_shard_map.items():
+                for param, param_shard_map in gbuf_shard_map["param_map"].items():
+                    param_gbuf_map[param] = (model_index, dtype)
+
+        return param_gbuf_map
+
+    @classmethod
+    def get_optimizer_group_shards(cls, param_groups, model_gbuf_shards):
+
+        num_groups = len(param_groups)
+
+        # Param group map.
+        param_group_map = {}
+        for group_index, group in enumerate(param_groups):
+            for param in group["params"]:
+                assert param.requires_grad
+                param_group_map[param] = group_index
+
+        # Optimizer group shards.
+        group_shards = [{"size": 0, "param_map": {}} for _ in param_groups]
+        for model_gbuf_shard_map in model_gbuf_shards:
+            for dtype, gbuf_shard_map in model_gbuf_shard_map.items():
+                for param in gbuf_shard_map["param_map"]:
+
+                    group_index = param_group_map[param]
+                    group_shard = group_shards[group_index]
+                    param_size = gbuf_shard_map["param_map"][param]["param"].size
+
+                    param_group_start = group_shard["size"]
+                    param_group_end = param_group_start + param_size
+                    param_group_shard = Shard(param_group_start, param_group_end)
+
+                    group_shard["size"] += param_size
+                    group_shard["param_map"][param] = param_group_shard
+
+        # Squeeze zero-size group shards.
+        for group_index, group_shard in enumerate(group_shards):
+            group_shard["orig_group"] = param_groups[group_index]
+        group_shards = [g for g in group_shards if g["size"] > 0]
+
+        return group_shards
+
+    @classmethod
+    def allocate_main_param_shards(cls, opt_group_shards):
+
+        allocate_shard = lambda shard_size, dtype: torch.empty(
+            (shard_size,),
+            dtype=dtype,
+            device=torch.cuda.current_device(),
+            requires_grad=True)
+
+        # main_param_shards = []
+        for group_index, group_shard in enumerate(opt_group_shards):
+
+            group_size = group_shard["size"]
+            assert group_size != 0, "temporary check ... remove me."
+
+            main_param = allocate_shard(group_size, torch.float)
+            main_param.grad = allocate_shard(group_size, torch.float)
+            mpu.set_tensor_model_parallel_attributes(main_param, True, 0, 1)
+
+            # main_param_shards.append(main_param)
+            group_shard["orig_group"]["params"] = [main_param]
+
+        # return main_param_shards
+
+    def __init__(self, optimizer, clip_grad, log_num_zeros_in_grad,
+                 params_have_main_grad, use_contiguous_buffers_in_local_ddp,
+                 bf16, grad_scaler, models):
+
+        super().__init__(
+            optimizer, clip_grad, log_num_zeros_in_grad,
+            params_have_main_grad, use_contiguous_buffers_in_local_ddp,
+            bf16, grad_scaler, models)
+
+        # >>>
+        args = get_args()
+        assert args.use_contiguous_buffers_in_local_ddp  # already checked in args
+        # <<<
+
+        # Model grad buffer shards.
+        self.model_gbuf_shards = []
+        for model_index, model in enumerate(self.models):
+            self.model_gbuf_shards.append(self.get_model_gbuf_shard_map(model))
+        self.param_gbuf_map = self.get_param_gbuf_map(self.model_gbuf_shards)
+
+        # Optimizer shards.
+        self.opt_group_shards = self.get_optimizer_group_shards(
+            self.optimizer.param_groups,
+            self.model_gbuf_shards)
+
+        # Allocate main param shards.
+        # self.main_param_shards = \
+        #     self.allocate_main_param_shards(self.opt_group_shards)
+        self.allocate_main_param_shards(self.opt_group_shards)
+
+        # Initialize main params.
+        self._copy_model_params_to_main_params()
+
+        # Update optimizer groups.
+        # - Also, leverage state_dict() and load_state_dict() to
+        #   recast preexisting per-param state tensors.
+        self.optimizer.param_groups = \
+            [g["orig_group"] for g in self.opt_group_shards]
+        self.optimizer.load_state_dict(self.optimizer.state_dict())
+
+    # M1061: added get_main_param / get_main_grad helpers
+    def get_main_param(self, group_index):
+        return self.optimizer.param_groups[group_index]["params"][0]
+    def get_main_grad(self, group_index):
+        return self.get_main_param(group_index).grad
+
+    def load_state_dict(self):
+        raise Exception("hi.")
+    def reload_model_params(self):
+        raise Exception("hi.")
+    def state_dict(self):
+        raise Exception("hi.")
+
+    def zero_grad(self, set_to_none=True):
+
+        model_params = []
+        for model in self.models:
+            for dtype, param_map in model._grad_buffer_param_index_map.items():
+                model_params.extend(param_map.keys())
+
+        _zero_grad_group_helper(model_params, set_to_none)
+
+    def get_model_grad_buffer_dp_views(self):
+
+        # >>>
+        # ** only contiguous grad buffer supported, for now [ TEMPORARY ] **
+        args = get_args()
+        assert args.use_contiguous_buffers_in_local_ddp
+        # <<<
+
+        # Grad buffer views.
+        gbuf_view_items = []
+        for model_index, model in enumerate(self.models):
+            for dtype, gbuf_shard in self.model_gbuf_shards[model_index].items():
+                world_shards = gbuf_shard["world_all"]
+
+                gbuf = model._grad_buffers[dtype]
+                gbuf_views = []
+                for shard in world_shards:
+                    gbuf_views.append(gbuf.data[shard.start:shard.end])
+
+                gbuf_view_items.append((model_index, dtype, gbuf_views))
+
+        return gbuf_view_items
+
+    def reduce_gradients(self, model):
+
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # Sync word embedding params.
+        # ... todo ...
+
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # Sync T5 position embedding params.
+        # ... todo ...
+
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # Reduce-scatter.
+        data_parallel_rank = mpu.get_data_parallel_rank()
+        data_parallel_group = mpu.get_data_parallel_group()
+
+        gbuf_view_items = self.get_model_grad_buffer_dp_views()
+
+        for model_index, dtype, gbuf_views in gbuf_view_items:
+            torch.distributed.reduce_scatter(
+                gbuf_views[data_parallel_rank],
+                gbuf_views,
+                group=data_parallel_group,
+            )
+
+    def gather_params(self):
+
+        data_parallel_rank = mpu.get_data_parallel_rank()
+        data_parallel_group = mpu.get_data_parallel_group()
+
+        gbuf_view_items = self.get_model_grad_buffer_dp_views()
+
+        # All-gather updated main params.
+        for model_index, dtype, gbuf_views in gbuf_view_items:
+            torch.distributed.all_gather(
+                gbuf_views,
+                gbuf_views[data_parallel_rank],
+                group=data_parallel_group,
+            )
+
+        # Each model param now contains its updated values in it's
+        # '.main_grad' field.
+        for param in self.param_gbuf_map:
+            param.detach().copy_(param.main_grad)
+
+    # M1061: replaced `main_param_shards` access with get_main_grad()
+    def _collect_main_grad_data_for_unscaling(self):
+        # return [ p.grad.data for p in self.main_param_shards ]
+        # return [ p.grad.data for p in self.main_param_shards if p is not None ]
+        return [self.get_main_grad(gi).data
+                for gi in range(len(self.opt_group_shards))]
+
+    # M1061: replaced direct param_groups access and pax() with get_main_param()
+    def _copy_model_params_to_main_params(self):
+
+        for group_index, group_shard in enumerate(self.opt_group_shards):
+            # main_param = self.main_param_shards[group_index]
+            # main_param = self.optimizer.param_groups[group_index]["params"][0]
+            main_param = self.get_main_param(group_index)
+            # if group_index > 0:
+            #     pax({"main_param": tp(main_param)})
+            for model_param, main_shard in group_shard["param_map"].items():
+
+                # Model shard.
+                model_index, dtype = self.param_gbuf_map[model_param]
+                model_shard = self.model_gbuf_shards \
+                    [model_index][dtype]["param_map"][model_param]["param"]
+
+                assert main_shard.size == model_shard.size
+
+                # Copy shard data.
+                main_view = main_param[main_shard.start:main_shard.end]
+                model_view = model_param.view(-1)[model_shard.start:model_shard.end]
+                main_view.detach().copy_(model_view)
+
+    def _copy_model_grads_to_main_grads(self):
+
+        for group_index, group_shard in enumerate(self.opt_group_shards):
+            for model_param, main_shard in group_shard["param_map"].items():
+
+                model_index, dtype = self.param_gbuf_map[model_param]
+                model_shard = self.model_gbuf_shards \
+                    [model_index][dtype]["param_map"][model_param]["gbuf_world"]
+
+                assert main_shard.size == model_shard.size
+
+                # Copy from DDP's contiguous buffer to main shard's grad.
+                model_grad = self.models[model_index]._grad_buffers[dtype].data
+                # main_grad = self.main_param_shards[group_index].grad
+                # M1061: use get_main_grad()
+                main_grad = self.get_main_grad(group_index)
+
+                # Copy sub-range within tensor.
+                model_view = model_grad[model_shard.start:model_shard.end]
+                main_view = main_grad[main_shard.start:main_shard.end]
+
+                main_view.detach().copy_(model_view)
+
+    # M1061: replaced main_param_shards[group_index] with get_main_param()
+    def _copy_main_params_to_model_params(self):
+
+        for group_index, group_shard in enumerate(self.opt_group_shards):
+            for model_param, main_shard in group_shard["param_map"].items():
+
+                model_index, dtype = self.param_gbuf_map[model_param]
+                model_shard = self.model_gbuf_shards \
+                    [model_index][dtype]["param_map"][model_param]["gbuf_world"]
+
+                assert main_shard.size == model_shard.size
+
+                # Use DDP's contiguous buffer to temporarily hold params.
+                model_param = self.models[model_index]._grad_buffers[dtype].data
+                # main_param = self.main_param_shards[group_index]
+                main_param = self.get_main_param(group_index)
+
+                # Copy sub-range within tensor.
+                model_view = model_param[model_shard.start:model_shard.end]
+                main_view = main_param[main_shard.start:main_shard.end]
+
+                model_view.detach().copy_(main_view)
+
+        # >>>
+        for param in self.param_gbuf_map:
+            is_nan = torch.any(torch.isnan(param)).item()
+            if is_nan:
+                pax({
+                    "param": tp(param),
+                    "is_nan": is_nan,
+                })
+        # <<<
