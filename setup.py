@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # DeepSpeed Team
-print('[M275]')
+print('[M291]')
 """
 DeepSpeed library
 
@@ -59,7 +59,7 @@ def abort(msg):
 
 
 def fetch_requirements(path):
-    print('[M271]')
+    print('[M291]')
     with open(path, 'r') as fd:
         return [r.strip() for r in fd.readlines()]
 
