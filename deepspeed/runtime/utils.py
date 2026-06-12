@@ -582,7 +582,21 @@ def clip_grad_norm_(parameters, max_norm, norm_type=2, mpu=None):
     """
     if isinstance(parameters, torch.Tensor):
         parameters = [parameters]
-    parameters = list(filter(lambda p: p.grad is not None, parameters))
+
+    # M472: Megatron 468796744 — filter parameters based on:
+    #   - grad should not be None
+    #   - parameter should not be shared (avoids double-counting tied embeddings)
+    #   - should not be a TP-duplicate (only count rank-0 non-parallel params)
+    print('[M472]')
+    filtered_parameters = []
+    for param in parameters:
+        grad_not_none = param.grad is not None
+        is_not_shared = not hasattr(param, 'shared') or not param.shared
+        if grad_not_none and is_not_shared:
+            filtered_parameters.append(param)
+    parameters = filtered_parameters
+    # --- End M472 filter ---
+
     norm_type = float(norm_type)
     all_norms = []
     if norm_type == inf:

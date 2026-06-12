@@ -274,6 +274,21 @@ class FP16_Optimizer(DeepSpeedOptimizer):
 
         return
 
+    def clip_grad_norm_optimizer(self, clip_grad):
+        # M472: Megatron 468796744 — clip_grad_norm moved to optimizer.
+        # Mirrors MegatronOptimizer.clip_grad_norm: collects all params from
+        # param_groups and delegates to clip_grad_norm_.
+        # Uses fp16_groups (live model params whose grads are populated at
+        # clip time) rather than the flat fp32 master buffer.
+        print('[M472]')
+        params = []
+        for group in self.fp16_groups:
+            for param in group:
+                params.append(param)
+        from deepspeed.runtime.utils import clip_grad_norm_
+        clip_grad_norm_(params, clip_grad, mpu=self.mpu)
+    # --- End M472 clip_grad_norm_optimizer ---
+
     def zero_grad(self, set_to_none=True):
         # DES-LOC M159: tracked
         """

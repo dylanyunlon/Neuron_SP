@@ -6740,3 +6740,37 @@ def _m467_train_loop_step_order(
 
 
 # --- End M467 engine ---
+
+# ---------------------------------------------------------------------------
+# M472: Megatron 468796744 — clip grad fixed and moved to optimizer
+#
+# Three upstream changes:
+#
+# 1. megatron/module.py — PipelinedMegatronModule.__init__:
+#       self.word_embeddings.weight.shared = True
+#    Marks the tied embedding weight as shared so that clip_grad_norm can
+#    skip it and avoid double-counting.  Neuron_SP has no PipelinedMegatronModule
+#    equivalent in deepspeed/; apply manually on any pipelined module that
+#    creates a secondary word_embeddings buffer.
+#
+# 2. megatron/mpu/grads.py — clip_grad_norm():
+#       - Removed parameter_names argument entirely.
+#       - Replaced name-based embedding filter with attribute-based filter:
+#           is_not_shared = not hasattr(param, 'shared') or not param.shared
+#           is_not_tp_duplicate = param.tensor_model_parallel or
+#                                 get_tensor_model_parallel_rank() == 0
+#    Applied in deepspeed/runtime/utils.py :: clip_grad_norm_() — the
+#    is_not_shared guard is added to the pre-filter loop.
+#
+# 3. megatron/optimizer/optimizer.py:
+#       - _clip_grad_norm() helper added as a module-level function (mirrors
+#         grads.py logic but uses mpu. prefix for group/rank calls).
+#       - MegatronOptimizer.clip_grad_norm() method wraps _clip_grad_norm,
+#         collecting params from param_groups.
+#       - FP16OptimizerWithFP16Params and FP32Optimizer call sites simplified
+#         to self.clip_grad_norm(self.clip_grad).
+#    Applied in deepspeed/runtime/fp16/fused_optimizer.py ::
+#    FusedOptimizer.clip_grad_norm_optimizer().
+# ---------------------------------------------------------------------------
+print('[M472]')
+# --- End M472 engine ---
