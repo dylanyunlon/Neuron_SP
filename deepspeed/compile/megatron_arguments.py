@@ -1046,3 +1046,100 @@ def validate_distributed_checkpointing(args):
 # ---------------------------------------------------------------------------
 
 print('[M1005]')
+
+# ---------------------------------------------------------------------------
+# M1038: Megatron 1cd3650dc — more minor fixes
+# Source: megatron/arguments.py (NVIDIA/Megatron-LM commit 1cd3650dc)
+# Author: Vijay Korthikanti <vkorthikanti@nvidia.com>  Date: 2022-02-01
+#
+# Mapping: megatron/arguments.py → deepspeed/compile/megatron_arguments.py
+#
+# Changes ported from arguments.py parse_args():
+#   After args.pipeline_model_parallel_size = min(...), add:
+#     args.transformer_pipeline_model_parallel_size = (
+#         args.pipeline_model_parallel_size - 1
+#         if args.standalone_embedding_stage else
+#         args.pipeline_model_parallel_size
+#     )
+#   virtual_pipeline_model_parallel_size derivation now uses
+#     args.transformer_pipeline_model_parallel_size instead of
+#     args.pipeline_model_parallel_size.
+#
+#   _add_distributed_args():
+#     REMOVED: --deallocate-pipeline-outputs
+#     ADDED:   --standalone-embedding-stage (action='store_true', default=False)
+#       "If set, *input* embedding layer is placed on its own pipeline stage,
+#        without any transformer layers. (For T5, this flag currently only
+#        affects the encoder embedding.)"
+#
+# DS adaptation:
+#   Surfaced as set_standalone_embedding_args(args) + add_standalone_embedding_arg(parser)
+#   callable from compile/initialize, matching the existing patch_* / add_* convention.
+# ---------------------------------------------------------------------------
+
+print('[M1038]')
+
+
+def set_standalone_embedding_args(args):
+    """Compute transformer_pipeline_model_parallel_size from standalone_embedding_stage.
+
+    Megatron 1cd3650dc arguments.py parse_args():
+      args.transformer_pipeline_model_parallel_size = (
+          args.pipeline_model_parallel_size - 1
+          if args.standalone_embedding_stage else
+          args.pipeline_model_parallel_size
+      )
+
+    Must be called after pipeline_model_parallel_size is resolved.
+    Sets both transformer_pipeline_model_parallel_size and updates
+    virtual_pipeline_model_parallel_size if num_layers_per_virtual_pipeline_stage
+    is set (replicating the updated derivation).
+    """
+    pp_size = getattr(args, 'pipeline_model_parallel_size', 1)
+    standalone = getattr(args, 'standalone_embedding_stage', False)
+    args.transformer_pipeline_model_parallel_size = (
+        pp_size - 1 if standalone else pp_size
+    )
+    # Re-derive virtual_pipeline_model_parallel_size if applicable
+    # (M565 logic updated: uses transformer_pipeline_model_parallel_size)
+    num_layers_per_stage = getattr(args, 'num_layers_per_virtual_pipeline_stage', None)
+    if num_layers_per_stage is not None:
+        num_layers = getattr(args, 'num_layers', None)
+        t_pp_size = args.transformer_pipeline_model_parallel_size
+        if num_layers is not None and t_pp_size > 0:
+            assert num_layers % num_layers_per_stage == 0, \
+                'number of layers is not divisible by number of layers per virtual pipeline stage'
+            args.virtual_pipeline_model_parallel_size = (
+                (num_layers // t_pp_size) // num_layers_per_stage
+            )
+    print('[M1038] set_standalone_embedding_args: '
+          f'pipeline_model_parallel_size={pp_size}, '
+          f'standalone_embedding_stage={standalone}, '
+          f'transformer_pipeline_model_parallel_size='
+          f'{args.transformer_pipeline_model_parallel_size}')
+    return args
+
+
+def add_standalone_embedding_arg(parser):
+    """Register --standalone-embedding-stage argument.
+
+    Megatron 1cd3650dc _add_distributed_args() — replaces
+    --deallocate-pipeline-outputs:
+      group.add_argument('--standalone-embedding-stage', action='store_true',
+                         default=False,
+                         help='If set, *input* embedding layer is placed on
+                         its own pipeline stage, without any transformer layers.
+                         (For T5, this flag currently only affects the encoder
+                         embedding.)')
+    """
+    group = parser.add_argument_group(title='M1038 standalone embedding stage')
+    group.add_argument(
+        '--standalone-embedding-stage',
+        action='store_true',
+        default=False,
+        help='If set, *input* embedding layer is placed on its own pipeline '
+             'stage, without any transformer layers. (For T5, this flag '
+             'currently only affects the encoder embedding.)',
+    )
+    print('[M1038] add_standalone_embedding_arg: --standalone-embedding-stage registered')
+    return parser

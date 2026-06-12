@@ -58,6 +58,82 @@ print('[M967]')
 # None of these files exist in Neuron_SP/deepspeed; no-op here.
 print('[M1004]')
 
+# M1038: Megatron 1cd3650dc — more minor fixes
+# This commit bundles the same vision-file changes as 3f1a728af (already handled
+# by M1004 above) PLUS additional changes in the following upstream files:
+#
+# megatron/arguments.py:
+#   - parse_args(): add transformer_pipeline_model_parallel_size derived from
+#     pipeline_model_parallel_size and standalone_embedding_stage flag.
+#   - virtual_pipeline_model_parallel_size derivation updated to use
+#     transformer_pipeline_model_parallel_size.
+#   - _add_distributed_args(): remove --deallocate-pipeline-outputs;
+#     add --standalone-embedding-stage.
+#   → ported as set_standalone_embedding_args() / add_standalone_embedding_arg()
+#     in deepspeed/compile/megatron_arguments.py.
+#
+# megatron/model/transformer.py:
+#   - NoopTransformerLayer: new class for zero-layer pipeline stages when
+#     standalone_embedding_stage is active.
+#   - ParallelTransformer: num_layers==0 path assigns NoopTransformerLayer;
+#     make_viewless_tensor applied to hidden_states in forward(); indent fix
+#     on encoder_output; trailing whitespace removed.
+#   - DropPath exported (imported by esvit_swin_backbone per M1004).
+#   → no equivalent in Neuron_SP/deepspeed; no-op here.
+#
+# megatron/mpu/random.py:
+#   - _kernel_make_viewless_tensor(), MakeViewlessTensor autograd Function,
+#     make_viewless_tensor(), safely_set_viewless_tensor_data() added.
+#   - CheckpointFunction: two direct .data assignments replaced with
+#     safely_set_viewless_tensor_data() calls.
+#   → make_viewless_tensor, safely_set_viewless_tensor_data ported to
+#     deepspeed/compile/mpu_initialize.py.
+#
+# megatron/mpu/__init__.py:
+#   - Exports make_viewless_tensor, assert_viewless_tensor,
+#     safely_set_viewless_tensor_data from mpu namespace.
+#   → both already accessible via deepspeed/compile/mpu_initialize.py.
+#
+# megatron/mpu/initialize.py get_num_layers():
+#   - standalone_embedding_stage support: num_layers = 0 when pipeline rank == 0.
+#   - transformer_pipeline_model_parallel_size used for divisibility checks.
+#   → standalone logic documented; mpu_initialize.py get_num_layers not ported
+#     (only helper stubs exist).
+#
+# megatron/mpu/layers.py ColumnParallelLinear docstring:
+#   - Typo fix: "all-gether" → "all-gather".
+#   → documented; mpu_layers.py ColumnParallelLinear not ported verbatim.
+#
+# megatron/p2p_communication.py _communicate():
+#   - After scatter_gather, wrap tensor_recv_prev / tensor_recv_next in
+#     mpu.make_viewless_tensor(requires_grad=True, keep_graph=False).
+#   → documented; megatron_p2p_communication.py _communicate() not
+#     currently duplicated here (DS p2p path handled separately).
+#
+# megatron/schedules.py:
+#   - backward_step(): remove args.deallocate_pipeline_outputs guard;
+#     unconditionally call custom_backward().
+#   - get_forward_backward_func(): improve error message for microbatch count.
+#   - deallocate_output_tensor() call sites already match M971 state.
+#   → megatron_schedules.py already in clean post-M971/M972 state; no-op.
+#
+# megatron/text_generation/api.py, generation.py, text_generation_server.py:
+#   - New stop_on_double_eol, stop_on_eol, random_seed, no_log params.
+#   - ValueError guard for over-length context.
+#   - no_log flag to suppress request logging.
+#   → DS text-generation path (deepspeed/compile/megatron_generation.py)
+#     differs; no equivalent to port.
+#
+# megatron/training.py: remove blank line before dl_type assert (cosmetic).
+#   → deepspeed/compile/megatron_training.py: no equivalent.
+#
+# megatron/static/index.html: new web-UI file; no equivalent in DS.
+#
+# README.md: prose improvements; "pre-training of" typo fix; TP/PP column note.
+# examples/msdp/prep_resp_gen.sh: --knowledge_gen_file → --knwl_gen_file.
+#   Both are documentation-only; no-op here.
+print('[M1038]')
+
 from deepspeed.compile.megatron_initialize import get_tokenizer
 
 

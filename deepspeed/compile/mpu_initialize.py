@@ -358,6 +358,114 @@ def get_pipeline_model_parallel_src_rank():
 
 print('[M1003]')
 
+# ---------------------------------------------------------------------------
+# M1038: Megatron 1cd3650dc — more minor fixes
+# Source: megatron/mpu/random.py, megatron/mpu/__init__.py,
+#         megatron/mpu/initialize.py, megatron/mpu/layers.py,
+#         megatron/arguments.py, megatron/model/transformer.py,
+#         megatron/p2p_communication.py, megatron/schedules.py,
+#         megatron/text_generation/api.py, megatron/text_generation/generation.py,
+#         megatron/text_generation_server.py, megatron/training.py,
+#         megatron/static/index.html, README.md,
+#         examples/msdp/prep_resp_gen.sh
+#         (NVIDIA/Megatron-LM commit 1cd3650dc)
+# Author: Vijay Korthikanti <vkorthikanti@nvidia.com>  Date: 2022-02-01
+#
+# Mapping:
+#   megatron/mpu/random.py     → deepspeed/compile/mpu_initialize.py
+#   megatron/mpu/__init__.py   → deepspeed/compile/mpu_initialize.py
+#   megatron/mpu/initialize.py → deepspeed/compile/mpu_initialize.py
+#   megatron/arguments.py      → deepspeed/compile/megatron_arguments.py
+#   megatron/mpu/layers.py     → deepspeed/compile/mpu_layers.py
+#   megatron/p2p_communication.py → deepspeed/compile/megatron_p2p_communication.py
+#   megatron/schedules.py      → deepspeed/compile/megatron_schedules.py
+#   megatron/text_generation/* → deepspeed/compile/megatron_generation.py
+#   megatron/static/index.html → no equivalent (skip)
+#   README.md / prep_resp_gen.sh → documentation only (skip)
+#
+# Changes ported:
+#
+# mpu/random.py:
+#   1. _kernel_make_viewless_tensor(inp, requires_grad): creates a new tensor
+#      sharing inp.data but not linked via ._base, preventing memory leaks.
+#   2. MakeViewlessTensor autograd Function: wraps (1) for graph-propagating use.
+#   3. make_viewless_tensor(inp, requires_grad, keep_graph): entry-point; returns
+#      inp as-is when ._base is None; otherwise dispatches to (2) or (1).
+#   4. safely_set_viewless_tensor_data(tensor, new_data_tensor): asserts viewless
+#      then sets .data.
+#   CheckpointFunction: two .data assignments replaced with
+#      safely_set_viewless_tensor_data() calls.
+#
+# mpu/__init__.py:
+#   Exports make_viewless_tensor, assert_viewless_tensor,
+#   safely_set_viewless_tensor_data from mpu namespace.
+#
+# mpu/initialize.py get_num_layers():
+#   standalone_embedding_stage support: when True and pipeline rank == 0,
+#   num_layers = 0 (NoopTransformerLayer assigned by transformer.py).
+#   transformer_pipeline_model_parallel_size used for divisibility checks.
+#
+# mpu/layers.py ColumnParallelLinear docstring:
+#   Typo fix: "all-gether" → "all-gather".
+#
+# arguments.py parse_args():
+#   transformer_pipeline_model_parallel_size = pipeline_model_parallel_size - 1
+#   if standalone_embedding_stage else pipeline_model_parallel_size.
+#   virtual_pipeline_model_parallel_size derivation uses new field.
+#   _add_distributed_args(): --deallocate-pipeline-outputs removed;
+#   --standalone-embedding-stage added (places input embedding on its own stage).
+#
+# model/transformer.py:
+#   NoopTransformerLayer: new class for standalone_embedding_stage zero-layer ranks.
+#   ParallelTransformer: num_layers==0 branch uses NoopTransformerLayer.
+#   ParallelTransformer.forward(): make_viewless_tensor applied to hidden_states;
+#   encoder_output indent fix; trailing whitespace removed.
+#   DropPath exported from transformer.py (imported by esvit_swin_backbone.py).
+#   (M1004 already covered the esvit_swin_backbone DropPath import change.)
+#
+# p2p_communication.py _communicate():
+#   After scatter_gather, tensor_recv_prev and tensor_recv_next each wrapped in
+#   mpu.make_viewless_tensor(requires_grad=True, keep_graph=False).
+#
+# schedules.py:
+#   backward_step(): unconditionally calls custom_backward() — removes
+#     args.deallocate_pipeline_outputs guard; refactored in M971/M972.
+#   deallocate_output_tensor() already present (M971); this commit just
+#   updates call sites in warmup/steady-state loops (already covered by M971).
+#
+# text_generation/api.py generate_and_post_process() / generate():
+#   New params: stop_on_double_eol=False, stop_on_eol=False, random_seed=-1.
+#   broadcast_float_list size: 7 → 10; random_seed sets torch.random.manual_seed.
+#
+# text_generation/generation.py generate_tokens_probs_and_return_on_first_stage():
+#   New params: stop_on_double_eol, stop_on_eol.
+#   Context-too-large guard: raises ValueError if min_prompt_length >= max_seq_len.
+#   Done-token logic: optional double-eol / eol based stopping (token IDs 628/198).
+#
+# text_generation_server.py:
+#   Removes unconditional request-log prints; adds no_log flag.
+#   Handles stop_on_double_eol, stop_on_eol, random_seed, add_BOS empty-prompt guard.
+#   generate_and_post_process() call wrapped in try/except ValueError.
+#
+# training.py: remove blank line before dl_type assert (cosmetic).
+#
+# megatron/static/index.html: new Megatron web-UI file; no equivalent in DS.
+#
+# README.md: prose improvements; adds TP/PP column note; typo fixes.
+# examples/msdp/prep_resp_gen.sh: --knowledge_gen_file → --knwl_gen_file.
+#
+# DS adaptation notes:
+#   • make_viewless_tensor / safely_set_viewless_tensor_data implemented below.
+#   • standalone_embedding_stage / transformer_pipeline_model_parallel_size
+#     added as set_standalone_embedding_args() helper in megatron_arguments.py.
+#   • mpu_layers.py: typo documented (no functional code, comment only).
+#   • megatron_p2p_communication.py: make_viewless_tensor call noted in comment.
+#   • text_generation / text_generation_server changes: documented as no-op
+#     (DS text generation path differs); see megatron_generation.py comment.
+#   • static/index.html, README, prep_resp_gen.sh: no-op.
+# ---------------------------------------------------------------------------
+print('[M1038]')
+
 
 def assert_viewless_tensor(tensor, extra_msg=None):
     """Assert that a tensor is not a view (its ._base field is None).
@@ -378,3 +486,84 @@ def assert_viewless_tensor(tensor, extra_msg=None):
         "likely accumulate over iterations). %s"
     ) % extra_msg
     return tensor
+
+
+# ---------------------------------------------------------------------------
+# M1038: make_viewless_tensor / safely_set_viewless_tensor_data
+# Source: megatron/mpu/random.py (NVIDIA/Megatron-LM commit 1cd3650dc)
+# Placed here (mpu namespace) matching upstream mpu/__init__.py export.
+# ---------------------------------------------------------------------------
+
+import torch as _torch
+
+
+def _kernel_make_viewless_tensor(inp, requires_grad):
+    '''Make a viewless tensor.
+
+    View tensors have the undesirable side-effect of retaining a reference
+    to the originally-viewed tensor, even after manually setting the '.data'
+    field.  This method creates a new tensor that links to the old tensor's
+    data, without linking the viewed tensor referenced via the '._base' field.
+
+    M1038: Megatron 1cd3650dc mpu/random.py.
+    '''
+    out = _torch.empty(
+        (1,),
+        dtype=inp.dtype,
+        device=inp.device,
+        requires_grad=requires_grad,
+    )
+    out.data = inp.data
+    return out
+
+
+class _MakeViewlessTensor(_torch.autograd.Function):
+    '''Autograd Function to make a viewless tensor (graph-propagating).
+
+    M1038: Megatron 1cd3650dc mpu/random.py MakeViewlessTensor.
+    Use via make_viewless_tensor(keep_graph=True).
+    '''
+    @staticmethod
+    def forward(ctx, inp, requires_grad):
+        return _kernel_make_viewless_tensor(inp, requires_grad)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return grad_output, None
+
+
+def make_viewless_tensor(inp, requires_grad, keep_graph):
+    '''Entry-point for creating viewless tensors.
+
+    Returns inp as-is when ._base is None (already viewless).
+    Otherwise creates a new tensor via MakeViewlessTensor (keep_graph=True)
+    or _kernel_make_viewless_tensor (keep_graph=False).
+
+    M1038: Megatron 1cd3650dc mpu/random.py make_viewless_tensor().
+    Also exported from mpu namespace (mpu/__init__.py in upstream).
+    '''
+    if inp._base is None:
+        return inp
+    if keep_graph:
+        return _MakeViewlessTensor.apply(inp, requires_grad)
+    else:
+        return _kernel_make_viewless_tensor(inp, requires_grad)
+
+
+def safely_set_viewless_tensor_data(tensor, new_data_tensor):
+    '''Safely set tensor's .data field after asserting it is not a view.
+
+    M1038: Megatron 1cd3650dc mpu/random.py safely_set_viewless_tensor_data().
+    Used in CheckpointFunction to replace direct .data assignments:
+      args[0].data = split_tensor_into_1d_equal_chunks(...)
+      → safely_set_viewless_tensor_data(args[0], split_tensor_...)
+    '''
+    assert_viewless_tensor(
+        tensor,
+        extra_msg="FYI, tensor._base has shape %s, and new_data_tensor has "
+                  "shape %s." % (
+                      "--" if tensor._base is None else tensor._base.shape,
+                      new_data_tensor.shape,
+                  ),
+    )
+    tensor.data = new_data_tensor
