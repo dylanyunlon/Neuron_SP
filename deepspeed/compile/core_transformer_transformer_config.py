@@ -22,8 +22,36 @@
 #
 # 10% adaptation: imports unchanged; adds print('[M1302]') marker in __post_init__.
 # ---------------------------------------------------------------------------
+# M1420: Megatron 397d0b2eb — Split TransformerConfig into BaseConfig and
+#        TransformerConfig, use BaseConfig for model parallel functions.
+# Source: megatron/core/transformer/transformer_config.py (NVIDIA/Megatron-LM commit 397d0b2eb)
+# Author: Jared Casper <jcasper@nvidia.com>  Date: 2023-04-01
+#
+# Changes ported from upstream:
+#   1. TransformerConfig now inherits from BaseConfig (imported from
+#      deepspeed/compile/core_base_config.py, mapping megatron.core.BaseConfig).
+#   2. Fields moved to BaseConfig and removed from TransformerConfig:
+#      tensor_model_parallel_size, pipeline_model_parallel_size,
+#      virtual_pipeline_model_parallel_size, sequence_parallel_enabled (→ sequence_parallel),
+#      init_method, init_method_std, output_layer_init_method,
+#      use_cpu_initialization, perform_initialization, params_dtype,
+#      fp16, bf16, async_tensor_model_parallel_allreduce,
+#      gradient_accumulation_fusion.
+#   3. New field: layernorm_zero_centered_gamma (bool, default False) — enables
+#      zero-centered gamma in LayerNorm for numerical stability.
+#   4. num_layers / hidden_size / num_attention_heads now default to 0 (were
+#      required positional fields) to allow construction via BaseConfig kwargs.
+#   5. Docstring updated to reference BaseConfig for moved fields; adds
+#      layernorm_zero_centered_gamma description.
+#   6. sequence_parallel_enabled retained as a bool property alias for
+#      backward compat with Neuron_SP code that still reads it directly.
+#
+# 10% adaptation: BaseConfig imported from local core_base_config module;
+# adds print('[M1420]') marker.
+# ---------------------------------------------------------------------------
 
 print('[M1302]')
+print('[M1420]')
 
 from dataclasses import dataclass
 from typing import Callable
@@ -32,104 +60,123 @@ import torch
 import torch.nn.init as init
 from torch import Tensor
 
+from .core_base_config import BaseConfig
+
 
 @dataclass
-class TransformerConfig:
-    """ Configuration object for megatron-core transformers.
+class TransformerConfig(BaseConfig):
+    """Configuration object for megatron-core transformers.
 
         Attributes:
 
         # model architecture
         hidden_size (int): Transformer hidden size.
         ffn_hidden_size (int): Transformer Feed-Forward Network hidden size.
-                                This is set to 4*hidden_size if not provided. Defaults to None.')
+                                This is set to 4*hidden_size if not provided. Defaults to None.'
         num_attention_heads (int): Number of transformer attention heads.
         kv_channels (int): Projection weights dimension in multi-head attention.
                             This is set to hidden_size // num_attention_heads if not provided.
                             Defaults to None.
-        
+
         attention_dropout (float): Post attention dropout probability. Defaults to 0.1.
+        hidden_dropout (float): Dropout probability for transformer hidden state. Defaults to 0.1.
+        bias_dropout_fusion (bool): If true, uses bias dropout fusion. Defaults to False.
         padded_vocab_size (int): Vocab size after padding.
 
-        # model parallelism
-        sequence_parallel_enabled (bool): Makes tensor parallelism more memory efficient for LLMs (20B+) by 
-                                          parallelizing layer norms and dropout sequentially.
-                                          See Reducing Activation Recomputation in Large Transformer Models: https://arxiv.org/abs/2205.05198 for more details. 
-                                          Defaults to False.
-        # weight initialization
-        init_method (Any): Method to initialize weights. Note that bias is always set to zero.
-                            Defaults to init.xavier_normal_
-        init_method_std: (float): Standard deviation of the zero mean normal. Defaults to 0.02.
-        use_cpu_initialization (bool): When set to False, we initialize the weights directly on the GPU.
-                                        Transferring weights from CPU to GPU can take a significant amount
-                                        of time for large models. Defaults to False.
-        perform_initialization (bool): If true, weights are initialized. Defaults to True.
-        params_dtype: (torch.dtype): dtype used when intializing the weights. Defaults to torch.float32
+        fp32_residual_connection (bool): If true, move residual connections to fp32.
+        apply_residual_connection_post_layernorm (bool): If true, uses the original BERT residule connection ordering.
+                                                         Defaults to False.
+        layernorm_epsilon (float): Layernorm epsilon. Defaults to 1e-5.
+
+        layernorm_zero_centered_gamma (bool): if set to 'True', the LayerNorm is adjusted to center the gamma values
+                                              around 0. This improves numerical stability. Defaults to False.
+
 
         # mixed-precision
-        fp16 (bool): If true, train with O2 fp16 mixed precision training. Defaults to False.
-        bf16 (bool): If true, train with O2 bf16 mixed precision training. Defaults to False.
         apply_query_key_layer_scaling (bool): If true, scale Q * K^T by 1 / layer-number. Defaults to True.
         attention_softmax_in_fp32 (bool): If true, run attention masking and softmax in fp32.
                                           This should be true if apply_query_key_layer_scaling is true.
 
-        # communication
-        async_tensor_model_parallel_allreduce (bool): If true, enables asynchronous execution of
-                                                        tensor-model-parallel all-reduce with weight
-                                                        gradient compuation of a column-linear layer.
-                                                        Defaults to True.
-
         # fusion
-        gradient_accumulation_fusion (bool): If true, fuses weight gradient accumulation to GEMMs. Defaults to False.
         bias_gelu_fustion (bool): If true, fuses bias and gelu. Defaults to False.
         masked_softmax_fusion (bool): If true, uses softmax fusion.
+        persist_layer_norm (bool): If true, uses the persistent fused layer norm kernel.
+                                   Defaults to False.
+        bias_dropout_fusion (bool): If true, uses bias dropout fusion.
 
         # activation recomputation
-        recompute_granularity (str): megatron-core supports 'selective' activation checkpointing where only the memory intensive part of attention is checkpointed.
-                                     These memory intensive activations are also less compute intensive which makes activation checkpointing more efficient for LLMs (20B+).
-                                     See Reducing Activation Recomputation in Large Transformer Models: https://arxiv.org/abs/2205.05198 for more details.
-                                     'full' will checkpoint the entire transformer layer.
-                                     Must be 'selective' or 'full'. Defaults to None. 
+        recompute_granularity (str): megatron-core supports 'selective' activation checkpointing where only the memory
+                                     intensive part of attention is checkpointed.  These memory intensive activations
+                                     are also less compute intensive which makes activation checkpointing more efficient
+                                     for LLMs (20B+).  See Reducing Activation Recomputation in Large Transformer
+                                     Models: https://arxiv.org/abs/2205.05198 for more details.  'full' will checkpoint
+                                     the entire transformer layer.  Must be 'selective' or 'full'. Defaults to None.
+
+        recompute_method (str): uniform will uniformly divide the total number of transformer layers in a transformer
+                                block and recompute the input activation of each divided chunk at the specified
+                                granularity.  block will recompute the input activations for only a set number of
+                                transformer layers per pipeline stage.  The rest of the layers in the pipeline stage
+                                will not have any activations recomputed.  Must be 'uniform' or 'block'. Defaults to
+                                None.
+
+        recompute_num_layers (int): When recompute_method is uniform, recompute_num_layers is the number of transformer
+                                    layers in each uniformly divided recompute unit.  When recompute_method is block,
+                                    recompute_num_layers is the number of transformer layers to recompute within each
+                                    pipeline stage.  Defaults to None.
+
+        distribute_saved_activations (bool): If true, distribute recomputed activations across the model parallel
+                                             group. Defaults to None.
 
     """
 
     # model architecture
-    hidden_size: int
-    num_attention_heads: int
-    padded_vocab_size: int
+    num_layers: int = 0
+    hidden_size: int = 0
+    num_attention_heads: int = 0
+    padded_vocab_size: int = 0
 
     ffn_hidden_size: int = None
     kv_channels: int = None
 
     attention_dropout: float = 0.1
+    hidden_dropout: float = 0.1
+    bias_dropout_fusion: bool = False
 
-    # model parallelism
-    sequence_parallel_enabled: bool = False
+    # model parallelism note: tensor_model_parallel_size, pipeline_model_parallel_size,
+    # virtual_pipeline_model_parallel_size, sequence_parallel are now in BaseConfig.
 
-    # weight initialization
-    init_method: Callable = init.xavier_normal_
-    init_method_std: float = 0.02
-    output_layer_init_method: Callable = init.xavier_normal_
-    use_cpu_initialization: bool = False
-    perform_initialization: bool = True
-    params_dtype: torch.dtype = torch.float32
+    # residual / layernorm
+    fp32_residual_connection: bool = False
+    # @jcasper should we keep this option?
+    apply_residual_connection_post_layernorm: bool = False
+    layernorm_epsilon: float = 1e-5
+    layernorm_zero_centered_gamma: bool = False
 
     # mixed-precision
-    fp16: bool = False
-    bf16: bool = False
     apply_query_key_layer_scaling: bool = True
     attention_softmax_in_fp32: bool = True
 
-    # communication
-    async_tensor_model_parallel_allreduce: bool = True
+    # communication (async_tensor_model_parallel_allreduce now in BaseConfig)
 
-    # fusion
-    gradient_accumulation_fusion: bool = False
-    bias_gelu_fusion: bool = False
+    # fusion (gradient_accumulation_fusion now in BaseConfig)
+    bias_gelu_fusion: bool = False  # TODO: this should be bias_activation_fusion ?
     masked_softmax_fusion: bool = False
+    persist_layer_norm: bool = False
 
     # activation recomputation
     recompute_granularity: str = None
+    recompute_method: str = None
+    recompute_num_layers: int = None
+    distribute_saved_activations: bool = None
+
+    @property
+    def sequence_parallel_enabled(self) -> bool:
+        """Backward-compat alias: upstream renamed this to sequence_parallel in M1420."""
+        return self.sequence_parallel
+
+    @sequence_parallel_enabled.setter
+    def sequence_parallel_enabled(self, value: bool):
+        self.sequence_parallel = value
 
     def __post_init__(self):
         """ Python dataclass method that is used to modify attributes after initialization.
@@ -141,7 +188,7 @@ class TransformerConfig:
         if self.ffn_hidden_size is None:
             self.ffn_hidden_size = 4 * self.hidden_size
 
-        if self.kv_channels is None:
+        if self.kv_channels is None and self.hidden_size > 0 and self.num_attention_heads > 0:
             self.kv_channels = self.hidden_size // self.num_attention_heads
 
         if self.apply_query_key_layer_scaling:

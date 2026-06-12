@@ -21,8 +21,22 @@
 # 10% adaptation: imports from deepspeed.compile.* where megatron.core.* would
 # be used; adds print('[M1302]') marker.
 # ---------------------------------------------------------------------------
+# M1420: Megatron 397d0b2eb — Split TransformerConfig into BaseConfig and
+#        TransformerConfig, use BaseConfig for model parallel functions.
+# Source: megatron/core/transformer/core_attention.py (NVIDIA/Megatron-LM commit 397d0b2eb)
+# Author: Jared Casper <jcasper@nvidia.com>  Date: 2023-04-01
+#
+# Changes ported:
+#   CoreAttention.__init__: config.sequence_parallel_enabled → config.sequence_parallel
+#     (field was renamed to sequence_parallel in BaseConfig; TransformerConfig now
+#      exposes sequence_parallel_enabled as a backward-compat property alias but
+#      forward code should use the canonical name).
+#
+# 10% adaptation: adds print('[M1420]') marker.
+# ---------------------------------------------------------------------------
 
 print('[M1302]')
+print('[M1420]')
 
 import math
 
@@ -60,7 +74,7 @@ class CoreAttention(MegatronModule):
         self.bf16 = config.bf16
         self.apply_query_key_layer_scaling = config.apply_query_key_layer_scaling
         self.attention_softmax_in_fp32 = config.attention_softmax_in_fp32
-        self.sequence_parallel = config.sequence_parallel_enabled
+        self.sequence_parallel = config.sequence_parallel  # M1420: renamed from sequence_parallel_enabled
         self.masked_softmax_fusion = config.masked_softmax_fusion
         self.attention_dropout = config.attention_dropout
 

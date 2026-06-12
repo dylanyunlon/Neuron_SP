@@ -20,8 +20,25 @@
 # 10% adaptation: imports from megatron.core.* (upstream convention retained
 # for reference); adds print('[M1302]') marker.
 # ---------------------------------------------------------------------------
+# M1420: Megatron 397d0b2eb — Split TransformerConfig into BaseConfig and
+#        TransformerConfig, use BaseConfig for model parallel functions.
+# Source: megatron/core/transformer/mlp.py (NVIDIA/Megatron-LM commit 397d0b2eb)
+# Author: Jared Casper <jcasper@nvidia.com>  Date: 2023-04-01
+#
+# Changes ported:
+#   ParallelMLP.__init__:
+#     self.sequence_parallel_enabled = config.sequence_parallel_enabled
+#       → self.sequence_parallel = config.sequence_parallel  (field renamed in BaseConfig)
+#     ColumnParallelLinear / RowParallelLinear kwarg:
+#       sequence_parallel_enabled=self.sequence_parallel_enabled
+#       → sequence_parallel_enabled=self.sequence_parallel  (kwarg name unchanged in
+#         mpu_layers; only the config attribute was renamed)
+#
+# 10% adaptation: adds print('[M1420]') marker.
+# ---------------------------------------------------------------------------
 
 print('[M1302]')
+print('[M1420]')
 
 import torch.nn.functional as F
 
@@ -56,7 +73,7 @@ class ParallelMLP(MegatronModule):
         self.perform_initialization = config.perform_initialization
         self.bias_gelu_fusion = config.bias_gelu_fusion
         self.gradient_accumulation_fusion = config.gradient_accumulation_fusion
-        self.sequence_parallel_enabled = config.sequence_parallel_enabled
+        self.sequence_parallel = config.sequence_parallel  # M1420: renamed from sequence_parallel_enabled
         self.params_dtype = config.params_dtype
         self.async_tensor_model_parallel_allreduce = config.async_tensor_model_parallel_allreduce
 
@@ -73,7 +90,7 @@ class ParallelMLP(MegatronModule):
             use_cpu_initialization=self.use_cpu_initialization,
             perform_initialization=self.perform_initialization,
             gradient_accumulation_fusion=self.gradient_accumulation_fusion,
-            sequence_parallel_enabled=self.sequence_parallel_enabled,
+            sequence_parallel_enabled=self.sequence_parallel,  # M1420: was self.sequence_parallel_enabled
         )
 
         self.activation_func = F.gelu
@@ -97,7 +114,7 @@ class ParallelMLP(MegatronModule):
             use_cpu_initialization=self.use_cpu_initialization,
             perform_initialization=self.perform_initialization,
             gradient_accumulation_fusion=self.gradient_accumulation_fusion,
-            sequence_parallel_enabled=self.sequence_parallel_enabled,
+            sequence_parallel_enabled=self.sequence_parallel,  # M1420: was self.sequence_parallel_enabled
         )
 
     def forward(self, hidden_states):

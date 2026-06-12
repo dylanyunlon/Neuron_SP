@@ -25,8 +25,24 @@
 # 10% adaptation: imports from megatron.core.* (upstream convention retained
 # for reference); adds print('[M1302]') marker.
 # ---------------------------------------------------------------------------
+# M1420: Megatron 397d0b2eb — Split TransformerConfig into BaseConfig and
+#        TransformerConfig, use BaseConfig for model parallel functions.
+# Source: megatron/core/transformer/attention.py (NVIDIA/Megatron-LM commit 397d0b2eb)
+# Author: Jared Casper <jcasper@nvidia.com>  Date: 2023-04-01
+#
+# Changes ported:
+#   ParallelAttention.__init__:
+#     self.sequence_parallel_enabled = config.sequence_parallel_enabled
+#       → self.sequence_parallel = config.sequence_parallel  (field renamed in BaseConfig)
+#     All ColumnParallelLinear / RowParallelLinear calls:
+#       sequence_parallel_enabled=self.sequence_parallel_enabled
+#       → sequence_parallel_enabled=self.sequence_parallel
+#
+# 10% adaptation: adds print('[M1420]') marker.
+# ---------------------------------------------------------------------------
 
 print('[M1302]')
+print('[M1420]')
 
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
@@ -72,7 +88,7 @@ class ParallelAttention(MegatronModule):
         self.use_cpu_initialization = config.use_cpu_initialization
         self.perform_initialization = config.perform_initialization
         self.gradient_accumulation_fusion = config.gradient_accumulation_fusion
-        self.sequence_parallel_enabled = config.sequence_parallel_enabled
+        self.sequence_parallel = config.sequence_parallel  # M1420: renamed from sequence_parallel_enabled
 
         projection_size = self.kv_channels * self.num_attention_heads
 
@@ -93,7 +109,7 @@ class ParallelAttention(MegatronModule):
                 use_cpu_initialization=self.use_cpu_initialization,
                 perform_initialization=self.perform_initialization,
                 gradient_accumulation_fusion=self.gradient_accumulation_fusion,
-                sequence_parallel_enabled=self.sequence_parallel_enabled,
+                sequence_parallel_enabled=self.sequence_parallel,  # M1420: was sequence_parallel_enabled
             )
         else:
             assert attention_type == AttnType.cross_attn
@@ -107,7 +123,7 @@ class ParallelAttention(MegatronModule):
                 use_cpu_initialization=self.use_cpu_initialization,
                 perform_initialization=self.perform_initialization,
                 gradient_accumulation_fusion=self.gradient_accumulation_fusion,
-                sequence_parallel_enabled=self.sequence_parallel_enabled,
+                sequence_parallel_enabled=self.sequence_parallel,  # M1420: was sequence_parallel_enabled
             )
 
             self.key_value = tensor_parallel.ColumnParallelLinear(
@@ -120,7 +136,7 @@ class ParallelAttention(MegatronModule):
                 use_cpu_initialization=self.use_cpu_initialization,
                 perform_initialization=self.perform_initialization,
                 gradient_accumulation_fusion=self.gradient_accumulation_fusion,
-                sequence_parallel_enabled=self.sequence_parallel_enabled,
+                sequence_parallel_enabled=self.sequence_parallel,  # M1420: was sequence_parallel_enabled
             )
 
         self.core_attention = CoreAttention(
@@ -139,7 +155,7 @@ class ParallelAttention(MegatronModule):
             use_cpu_initialization=self.use_cpu_initialization,
             perform_initialization=self.perform_initialization,
             gradient_accumulation_fusion=self.gradient_accumulation_fusion,
-            sequence_parallel_enabled=self.sequence_parallel_enabled,
+            sequence_parallel_enabled=self.sequence_parallel,  # M1420: was sequence_parallel_enabled
         )
 
     def _checkpointed_attention_forward(self, query_layer, key_layer, value_layer, attention_mask):

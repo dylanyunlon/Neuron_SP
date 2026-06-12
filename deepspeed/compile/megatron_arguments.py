@@ -1400,3 +1400,57 @@ def validate_checkpoint_activations_arg(args):
     print('[M1379]')
 
 print('[M1379]')
+
+# ---------------------------------------------------------------------------
+# M1420: Megatron 397d0b2eb — Split TransformerConfig into BaseConfig and
+#        TransformerConfig, use BaseConfig for model parallel functions.
+# Source: megatron/arguments.py (NVIDIA/Megatron-LM commit 397d0b2eb)
+# Author: Jared Casper <jcasper@nvidia.com>  Date: 2023-04-01
+#
+# Mapping: megatron/arguments.py core_config_from_args()
+#        → deepspeed/compile/megatron_arguments.py core_config_from_args()
+#
+# New function introduced by this commit.  Translates a parsed argument
+# namespace (args) into a TransformerConfig by:
+#   1. Iterating over all dataclass fields of TransformerConfig.
+#   2. Copying any field whose name exists as an attribute on args.
+#   3. Applying three manual translations that differ between args and config:
+#        persist_layer_norm   ← not args.no_persist_layer_norm
+#        layernorm_zero_centered_gamma ← args.apply_layernorm_1p
+#        deallocate_pipeline_outputs   ← True  (always on)
+#
+# The upstream version imports dataclasses and TransformerConfig at module
+# top level; here we import inside the function to avoid circular imports
+# with deepspeed/compile/__init__.py.
+#
+# 10% adaptation: TransformerConfig imported from local module; adds
+# print('[M1420]') marker at call time.
+# ---------------------------------------------------------------------------
+
+
+def core_config_from_args(args):
+    """Translate a parsed argument namespace to a TransformerConfig.
+
+    Mirrors megatron/arguments.py core_config_from_args() introduced in
+    NVIDIA/Megatron-LM commit 397d0b2eb (M1420).
+
+    Args:
+        args: Parsed argument namespace (from parse_args() or equivalent).
+
+    Returns:
+        TransformerConfig populated from args.
+    """
+    import dataclasses
+    from deepspeed.compile.core_transformer_transformer_config import TransformerConfig
+
+    kw_args = {}
+    for f in dataclasses.fields(TransformerConfig):
+        if hasattr(args, f.name):
+            kw_args[f.name] = getattr(args, f.name)
+    kw_args['persist_layer_norm'] = not args.no_persist_layer_norm
+    kw_args['layernorm_zero_centered_gamma'] = args.apply_layernorm_1p
+    kw_args['deallocate_pipeline_outputs'] = True
+    print('[M1420]')
+    return TransformerConfig(**kw_args)
+
+print('[M1420]')
