@@ -44,6 +44,19 @@ print('[M936]')
 # megatron/model/vision/classification.py: remove unused mit_backbone and trunc_normal_ imports
 # None of these three files exist in Neuron_SP/deepspeed; no-op here.
 print('[M967]')
+# M1004: Megatron 3f1a728af — more minor fixes
+# megatron/data/vit_dataset.py DinoTransform.__init__: args.local_crops_number -> args.dino_local_crops_number,
+#   args.local_img_size -> args.dino_local_img_size; DinoTransform.__call__: remove street_data crop branch;
+#   build_train_valid_datasets: remove unused train_transform/val_transform locals.
+# megatron/model/vision/dino.py: remove unused imports (print_tensor_min_max_norm, av_cam_trunk).
+# megatron/model/vision/esvit_swin_backbone.py: split DropPath import from utils -> megatron.model.transformer;
+#   args.swin_type -> args.swin_backbone_type in get_swin().
+# megatron/model/vision/vit_backbone.py VitBackbone.__init__: add drop_path_rate=0.0 param,
+#   store self.drop_path_rate, pass drop_path_rate to transformer.
+# pretrain_vision_dino.py: add ModelType import, fix contrastive->dino import, pass ModelType.encoder_or_decoder.
+# pretrain_vision_inpaint.py: add ModelType import, pass ModelType.encoder_or_decoder to pretrain().
+# None of these files exist in Neuron_SP/deepspeed; no-op here.
+print('[M1004]')
 
 from deepspeed.compile.megatron_initialize import get_tokenizer
 
