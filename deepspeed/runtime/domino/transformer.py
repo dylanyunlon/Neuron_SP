@@ -436,12 +436,18 @@ class DominoTransformer(DominoModule):
             dist.init_distributed()
             assert dist.is_initialized(), "deepspeed.comm failed to initialize!"
 
+        # M249: Number of layers and parameter-sharing style (Megatron 80f90dcdc).
         self.num_layers = config.num_layers
+        self.num_unique_layers = getattr(config, 'num_unique_layers', None)
+        if self.num_unique_layers is None:
+            self.num_unique_layers = self.num_layers
+        assert self.num_layers % self.num_unique_layers == 0,             'number of layers should be divisible by number of unique layers'
+        self.param_sharing_style = getattr(config, 'param_sharing_style', 'grouped')
+        assert self.param_sharing_style in ('grouped', 'spaced')
 
         self.drop_path_rates = [rate.item() for rate in torch.linspace(0, self.drop_path_rate, config.num_layers)]
 
         def build_layer(layer_number):
-
             current_layer_type = layer_type
             return DominoTransformerLayer(config,
                                           mpu,
@@ -451,14 +457,34 @@ class DominoTransformer(DominoModule):
                                           self_attn_mask_type=self_attn_mask_type,
                                           drop_path_rate=self.drop_path_rates[layer_number - 1])
 
-        self.layers = torch.nn.ModuleList([build_layer(i + 1) for i in range(self.num_layers)])
+        self.layers = torch.nn.ModuleList([build_layer(i + 1) for i in range(self.num_unique_layers)])
+
+        # Print layer ordering when param sharing is active.
+        if self.num_layers != self.num_unique_layers:
+            print('[M249] will be using the following layer ordering:')
+            for i in range(self.num_layers):
+                print('   layer: {:3d} --> unique layer: {:3d}'.format(
+                    i, self._get_layer_index(i)))
 
         if self.post_process and self.post_layer_norm:
             self.final_layernorm = torch.nn.LayerNorm(config.hidden_size, eps=config.layernorm_epsilon)
 
+        print('[M249]')
         self._forward_impl = self.inter_layer_overlap_forward
         if config.domino_intra_layer_overlap:
             self._forward_impl = self.intra_layer_overlap_forward
+
+    def _get_layer_index(self, layer_number: int) -> int:
+        """Map absolute layer index to unique-layer index (M249: Megatron 80f90dcdc)."""
+        if self.param_sharing_style == 'grouped':
+            return layer_number % self.num_unique_layers
+        if self.param_sharing_style == 'spaced':
+            return layer_number // (self.num_layers // self.num_unique_layers)
+        assert False, 'should not be here'
+
+    def _get_layer(self, layer_number: int):
+        """Return the (possibly shared) layer for the given absolute index."""
+        return self.layers[self._get_layer_index(layer_number)]
 
     def forward(self, hidden_states, attention_mask, rotary_pos_emb=None):
 
@@ -593,7 +619,7 @@ class DominoTransformer(DominoModule):
         hidden_states = torch.chunk(hidden_states, chunks=2, dim=1)
 
         for index in range(self.num_layers):
-            layer = self.layers[index]
+            layer = self._get_layer(index)
             hidden_states = layer(hidden_states, attention_mask, rotary_pos_emb)
 
         hidden_states0, hidden_states1 = hidden_states

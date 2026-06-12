@@ -215,6 +215,16 @@ def _neuronsp_add_network_size_args(parser):
     group = parser.add_argument_group(title='network size')
     group.add_argument('--num_layers', type=int, default=12,
                        help='Number of transformer layers.')
+    group.add_argument('--num_unique_layers', type=int, default=None,
+                       help='Number of unique transformer layers. '
+                       '`num_layers` should be divisible by this value.')
+    group.add_argument('--param_sharing_style', default='grouped',
+                       choices=['grouped', 'spaced'],
+                       help='Ordering of the shared parameters. For example, '
+                       'for a `num_layers`=4 and `--num_unique_layers`=2, '
+                       'we will have the following ordering for two unique '
+                       'layers 1 and 2: '
+                       '    grouped: [1, 2, 1, 2] and spaced: [1, 1, 2, 2].')
     group.add_argument('--hidden_size', type=int, default=768,
                        help='Transformer hidden size.')
     group.add_argument('--num_attention_heads', type=int, default=12,
@@ -1257,13 +1267,26 @@ class GPT(nn.Module):
     def __init__(self, vocab_size: int, max_seq_len: int, n_layer: int,
                  n_head: int, n_embd: int, use_ac: bool = False,
                  apply_query_key_layer_scaling: bool = False,
-                 attention_softmax_in_fp32: bool = False):
+                 attention_softmax_in_fp32: bool = False,
+                 num_unique_layers: int = None,
+                 param_sharing_style: str = 'grouped'):
         super().__init__()
         self.max_seq_len = max_seq_len
         # M458: if QK layer scaling is on, fp32 softmax is auto-implied (Megatron 691747b1)
         _softmax_fp32 = attention_softmax_in_fp32 or apply_query_key_layer_scaling
+        print('[M249]')
         print(f"[GPT-INIT] n_layer={n_layer} apply_qk_layer_scaling={apply_query_key_layer_scaling} "
               f"attention_softmax_in_fp32={_softmax_fp32}")
+
+        # M249: parameter sharing — track num_unique_layers and sharing style
+        # Port of Megatron 80f90dcdc (added parameters sharing).
+        self.n_layer = n_layer
+        self.num_unique_layers = num_unique_layers if num_unique_layers is not None else n_layer
+        if n_layer % self.num_unique_layers != 0:
+            raise ValueError(
+                f'num_layers ({n_layer}) must be divisible by num_unique_layers ({self.num_unique_layers})')
+        assert param_sharing_style in ('grouped', 'spaced'),             f'param_sharing_style must be grouped or spaced, got {param_sharing_style}'
+        self.param_sharing_style = param_sharing_style
 
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(vocab_size, n_embd),
@@ -1275,11 +1298,18 @@ class GPT(nn.Module):
                                  layer_number=i + 1,
                                  apply_query_key_layer_scaling=apply_query_key_layer_scaling,
                                  attention_softmax_in_fp32=_softmax_fp32)
-                for i in range(n_layer)
+                for i in range(self.num_unique_layers)
             ]),
             ln_f = LayerNorm(n_embd),
         ))
         self.lm_head = nn.Linear(n_embd, vocab_size, bias=False)
+
+        # Print layer ordering when param sharing is active.
+        if self.n_layer != self.num_unique_layers:
+            print('[M249] will be using the following layer ordering:')
+            for i in range(self.n_layer):
+                print('   layer: {:3d} --> unique layer: {:3d}'.format(
+                    i, self._get_layer_index(i)))
         
         # Weight tying
         self.transformer.wte.weight = self.lm_head.weight
@@ -1303,6 +1333,18 @@ class GPT(nn.Module):
         n_params = sum(p.numel() for p in self.parameters())
         print(f"Model parameters: {n_params/1e6:.2f}M")
     
+    def _get_layer_index(self, layer_number: int) -> int:
+        """Map absolute layer index to unique-layer index (M249: Megatron 80f90dcdc)."""
+        if self.param_sharing_style == 'grouped':
+            return layer_number % self.num_unique_layers
+        if self.param_sharing_style == 'spaced':
+            return layer_number // (self.n_layer // self.num_unique_layers)
+        raise AssertionError('should not be here')
+
+    def _get_layer(self, layer_number: int):
+        """Return the (possibly shared) layer for the given absolute index."""
+        return self.transformer.h[self._get_layer_index(layer_number)]
+
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
@@ -1336,7 +1378,8 @@ class GPT(nn.Module):
                   f"pos_emb_norm={pos_emb.float().norm().item():.4f} "
                   f"x_norm={x.float().norm().item():.4f}")
 
-        for block in self.transformer.h:
+        for index in range(self.n_layer):
+            block = self._get_layer(index)
             x = block(x)
 
         # M365 DIAG: post-transformer hidden state statistics
