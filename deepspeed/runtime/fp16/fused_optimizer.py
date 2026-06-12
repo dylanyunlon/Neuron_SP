@@ -95,7 +95,16 @@ def model_grads_to_master_grads_flat(fp16_group_flat, fp32_master_flat, fp16_gro
     M463: Knuth §4.3 rounding discipline — gradients are cast to fp32 before
     flattening; casting after flattening would mix fp16 rounding errors with
     fp32 accumulation across the buffer boundary.
+
+    M163: Megatron a4489ffb8 (addressed jareds comment) — in the non-flat path
+    Megatron removed the redundant per-param master.grad.data.copy_(model.grad.data)
+    that preceded multi_tensor_scale.  In the flat path used here the equivalent
+    redundancy would be a per-param copy_ into a pre-allocated master grad slice;
+    we never did that, but we make the invariant explicit: null-grad leaves
+    contribute a zero-tensor to the flat buffer (no copy_), and non-null leaves
+    are cast-and-appended once before the single _flatten call.
     """
+    print('[M163]')
     null_grad_count = 0
     grad_tensors = []
     for p in fp16_group:
@@ -103,6 +112,9 @@ def model_grads_to_master_grads_flat(fp16_group_flat, fp32_master_flat, fp16_gro
             grad_tensors.append(p.grad.data.float())
         else:
             null_grad_count += 1
+            # M163: do not copy_ into master grad per-param; zero-tensor
+            # placeholder matches Megatron's removal of the redundant
+            # master.grad.data.copy_(model.grad.data) in the non-flat path.
             grad_tensors.append(
                 torch.zeros(p.size(), dtype=torch.float32, device=p.device)
             )
