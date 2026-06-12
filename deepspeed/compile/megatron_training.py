@@ -4,6 +4,25 @@
 # DeepSpeed Team
 
 # ---------------------------------------------------------------------------
+# M1098: Megatron 862d70fce — small fixes.
+# Source: megatron/training.py (NVIDIA/Megatron-LM commit 862d70fce)
+# Author: Lawrence McAfee <lmcafee@nvidia.com>  Date: 2022-03-10
+#
+# Mapping: megatron/training.py → deepspeed/compile/megatron_training.py
+#
+# Changes ported from training.py (diff vs parent):
+#   1. train_step(): debug_model call before reduce_grads: arg changed from
+#      "before reduce grads.", 0  →  "before reduce grads.", 1  (still commented).
+#   2. train_step(): debug_model call "after gather params." uncommented (active).
+#
+# DeepSpeed adaptation:
+#   Neither debug_model() nor the specific train_step() call sites from
+#   Megatron training.py exist in this file; changes documented here only.
+# ---------------------------------------------------------------------------
+
+print('[M1098]')
+
+# ---------------------------------------------------------------------------
 # M573: Megatron 816fb8902 — fixed a minor bug
 # Source: megatron/training.py (NVIDIA/Megatron-LM commit 816fb8902)
 # Author: Mostofa Patwary <mostofa.patwary@gmail.com>  Date: 2021-02-17

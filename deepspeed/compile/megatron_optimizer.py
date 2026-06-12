@@ -2,6 +2,42 @@
 # DeepSpeed Team
 
 # ---------------------------------------------------------------------------
+# M1098: Megatron 862d70fce — small fixes.
+# Source: megatron/optimizer/optimizer.py + megatron/model/distributed.py +
+#         megatron/training.py (NVIDIA/Megatron-LM commit 862d70fce)
+# Author: Lawrence McAfee <lmcafee@nvidia.com>  Date: 2022-03-10
+#
+# Mapping: megatron/optimizer/optimizer.py → deepspeed/compile/megatron_optimizer.py
+#          megatron/model/distributed.py   → (no equivalent in this repo)
+#          megatron/training.py            → deepspeed/compile/megatron_training.py
+#
+# Changes in upstream 862d70fce:
+#   optimizer.py:
+#     1. DEBUG_ITERATION: 2 → 1
+#     2. MixedPrecisionOptimizer.allreduce_embedding_grads(): added commented-out
+#        `# return # ** .. TEMPORARY .. **` block (>>> / <<<).
+#     3. MixedPrecisionOptimizer.debug_base/debug_model/debug_main(): uncommented
+#        from block comment; debug_base prefix changed from "            + " to "".
+#     4. MixedPrecisionOptimizer.step(): added commented-out debug_model/debug_main
+#        calls after _copy_main_params_to_model_params() (>>> / <<<).
+#   model/distributed.py:
+#     1. Removed commented-out `from collections import defaultdict` and
+#        `_grad_buffer_param_offsets` lines.
+#   training.py:
+#     1. In train_step(): debug_model call before reduce_grads changed from
+#        "before reduce grads.", 0 → "before reduce grads.", 1 (still commented).
+#     2. In train_step(): debug_model call "after gather params." uncommented.
+#
+# DeepSpeed adaptation:
+#   MixedPrecisionOptimizer, DEBUG_ITERATION, allreduce_embedding_grads,
+#   debug_base/debug_model/debug_main, and the training.py call sites do not
+#   exist in this file or megatron_training.py; changes documented here only.
+#   model/distributed.py has no equivalent; skipped.
+# ---------------------------------------------------------------------------
+
+print('[M1098]')
+
+# ---------------------------------------------------------------------------
 # M1062: Megatron c13c0a3e8 — debugging; localized issue to gather_params()
 # Source: megatron/optimizer/optimizer.py (NVIDIA/Megatron-LM commit c13c0a3e8)
 # Author: Lawrence McAfee <lmcafee@nvidia.com>  Date: 2022-02-22
