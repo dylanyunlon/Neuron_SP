@@ -294,6 +294,8 @@ def _neuronsp_add_distributed_args(parser):
     group.add_argument('--deallocate-pipeline-outputs', action='store_true',
                        default=False, help='If set, pipeline output tensors '
                        'are deallocated during the forward pass.')
+
+    print('[M1391]')
     print('[M957]')
     print('[NEURONSP-ARGS] _neuronsp_add_distributed_args: group registered')
     return parser
