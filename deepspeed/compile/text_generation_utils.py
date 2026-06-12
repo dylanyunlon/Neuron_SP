@@ -729,7 +729,7 @@ def generate_samples_eval(model, context, max_gen_length, eos_token_id,
     the lm eval harness; the upstream comment "This implementation
     hasn't been tested yet to make sure it matches" still applies.
     """
-    #assert False, "Implementation untested"
+    print('[M853]')
     args = get_args_fn() if get_args_fn else _get_args()
     args.eos_id = eos_token_id
     raw_text_len = len(context)
