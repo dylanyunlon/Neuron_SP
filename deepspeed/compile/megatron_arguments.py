@@ -1332,3 +1332,71 @@ def add_network_size_args_1p(parser):
     )
     print('[M1359] add_network_size_args_1p: --apply-layernorm-1p registered')
     return parser
+# M1379: Megatron 3e71ad9c6 — Exit on usage of --checkpoint-activations
+#        because it defaults to full recomputation which is slow.
+# Source: megatron/arguments.py (NVIDIA/Megatron-LM commit 3e71ad9c6)
+# Author: Jared Casper <jcasper@nvidia.com>  Date: 2023-04-26
+#
+# Mapping: megatron/arguments.py validate_args()
+#        → deepspeed/compile/megatron_arguments.py validate_checkpoint_activations_arg()
+#
+# Changes ported from validate_args() (lines 102-108):
+#
+#   Before this commit, passing --checkpoint-activations silently fell back to
+#   full recomputation by setting:
+#     args.recompute_granularity = 'full'
+#     args.recompute_method = 'uniform'
+#   and printing a deprecation notice.
+#
+#   After this commit the silent fallback is removed entirely.  The function
+#   now prints a clear error message telling users to switch to
+#   --recompute-activations or the explicit --recompute-granularity /
+#   --recompute-method flags, then calls exit() so training never proceeds
+#   with the slow full-recompute default by accident.
+#
+#   Diff summary (megatron/arguments.py):
+#     -        args.recompute_granularity = 'full'
+#     -        args.recompute_method = 'uniform'
+#              if args.rank == 0:
+#     -            print('--checkpoint-activations is no longer valid, '
+#     -                  'use --recompute-granularity and --recompute-method  instead. '
+#     -                  'Defaulting to recompute-granularity=full and recompute-method=uniform.')
+#     +            print('--checkpoint-activations is no longer valid, use --recompute-activations, '
+#     +                  'or, for more control, --recompute-granularity and --recompute-method.')
+#     +        exit()
+#
+# Adaptation note: Neuron_SP surfaces validate_args logic as standalone
+# helper functions.  validate_checkpoint_activations_arg() should be called
+# immediately after argument parsing, before any training setup, so that
+# misconfigured runs fail fast with a clear message rather than silently
+# degrading to slow full recomputation.
+# ---------------------------------------------------------------------------
+
+
+def validate_checkpoint_activations_arg(args):
+    """Exit if the deprecated --checkpoint-activations flag is present.
+
+    ``--checkpoint-activations`` used to silently default to full activation
+    recomputation (the slowest possible setting).  This function reproduces
+    the post-3e71ad9c6 behaviour: print an actionable error message and call
+    ``exit()`` so that jobs never accidentally run with full recomputation.
+
+    Users should migrate to one of:
+
+    * ``--recompute-activations``  (selective recompute, recommended)
+    * ``--recompute-granularity`` + ``--recompute-method``  (explicit control)
+
+    Args:
+        args: parsed argument namespace (from ``parse_args()`` or equivalent).
+    """
+    if args.checkpoint_activations:
+        if args.rank == 0:
+            print(
+                '--checkpoint-activations is no longer valid, use --recompute-activations, '
+                'or, for more control, --recompute-granularity and --recompute-method.'
+            )
+        exit()
+    del args.checkpoint_activations
+    print('[M1379]')
+
+print('[M1379]')
