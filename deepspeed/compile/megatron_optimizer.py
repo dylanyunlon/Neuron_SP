@@ -2,6 +2,28 @@
 # DeepSpeed Team
 
 # ---------------------------------------------------------------------------
+# M1141: Megatron 91f3579ef — cleanup.
+# Source: megatron/optimizer/distrib_optimizer.py (NVIDIA/Megatron-LM commit 91f3579ef)
+# Author: Lawrence McAfee <lmcafee@nvidia.com>  Date: 2022-03-24
+#
+# Mapping: megatron/optimizer/distrib_optimizer.py → deepspeed/compile/megatron_optimizer.py
+#
+# Changes ported from distrib_optimizer.py (diff vs parent):
+#   1. __init__(): removed >>> / <<< markers around
+#      assert use_contiguous_buffers_in_local_ddp; inlined from args.
+#   2. _collect_main_grad_data_for_unscaling(): simplified to iterate
+#      optimizer.param_groups directly; removed old get_main_grad() helper path.
+#   3. Added _get_model_and_main_params_data_float16() to
+#      Float16DistributedOptimizer (upstream adds it to DistributedOptimizer;
+#      maps identically here).
+#   (Other upstream changes — removing commented-out class declarations,
+#   pax/print_seq blocks, dead >>> / <<< wrappers — were already clean in
+#   this file from prior migrations.)
+# ---------------------------------------------------------------------------
+
+print('[M1141]')
+
+# ---------------------------------------------------------------------------
 # M1111: Megatron 2c1660e76 — cleaned distrib_optimizer.py.
 # Source: megatron/optimizer/distrib_optimizer.py (NVIDIA/Megatron-LM commit 2c1660e76)
 # Author: Lawrence McAfee <lmcafee@nvidia.com>  Date: 2022-03-14
@@ -1044,10 +1066,7 @@ class Float16DistributedOptimizer(BaseFloat16Optimizer):
             params_have_main_grad, use_contiguous_buffers_in_local_ddp,
             bf16, grad_scaler, models)
 
-        # >>>
-        args = get_args()
-        assert args.use_contiguous_buffers_in_local_ddp  # already checked in args
-        # <<<
+        assert use_contiguous_buffers_in_local_ddp
 
         # Model grad buffer shards.
         self.model_gbuf_shards = []
@@ -1190,12 +1209,24 @@ class Float16DistributedOptimizer(BaseFloat16Optimizer):
         for param in self.param_gbuf_map:
             param.detach().copy_(param.main_grad)
 
-    # M1061: replaced `main_param_shards` access with get_main_grad()
     def _collect_main_grad_data_for_unscaling(self):
-        # return [ p.grad.data for p in self.main_param_shards ]
-        # return [ p.grad.data for p in self.main_param_shards if p is not None ]
-        return [self.get_main_grad(gi).data
-                for gi in range(len(self.opt_group_shards))]
+        return [
+            param.grad.data
+            for group in self.optimizer.param_groups
+            for param in group["params"]
+        ]
+
+
+    def _get_model_and_main_params_data_float16(self):
+        model_data = []
+        main_data = []
+        for model_group, main_group in zip(self.shard_float16_groups,
+                                           self.shard_fp32_from_float16_groups):
+            for model_param, main_param in zip(model_group, main_group):
+                model_data.append(model_param.data)
+                main_data.append(main_param.data)
+        return model_data, main_data
+
 
     # M1061: replaced direct param_groups access and pax() with get_main_param()
     def _copy_model_params_to_main_params(self):
