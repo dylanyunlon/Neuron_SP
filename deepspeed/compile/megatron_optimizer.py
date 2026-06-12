@@ -2,6 +2,23 @@
 # DeepSpeed Team
 
 # ---------------------------------------------------------------------------
+# M1148: Megatron be8de1b36 — fixed shared weight attribute for fp32.
+# Source: megatron/optimizer/distrib_optimizer.py (NVIDIA/Megatron-LM commit be8de1b36)
+# Author: Lawrence McAfee <lmcafee@nvidia.com>  Date: 2022-03-29
+#
+# Mapping: megatron/optimizer/distrib_optimizer.py → deepspeed/compile/megatron_optimizer.py
+#
+# Upstream change: In DistributedOptimizer.allocate_main_param_shards(), after
+#   mpu.copy_tensor_model_parallel_attributes(shard_model_param, model_param)
+#   in the fp32 branch, add:
+#     if hasattr(model_param, 'shared'):
+#         shard_model_param.shared = model_param.shared
+#
+# Neuron_SP adaptation: Float16Optimizer (this file) uses fp32 params directly
+#   without sharding/copying, so 'shared' is already present on the param object.
+#   No propagation code needed; comment added at fp32 branch for traceability.
+# ---------------------------------------------------------------------------
+
 # M1141: Megatron 91f3579ef — cleanup.
 # Source: megatron/optimizer/distrib_optimizer.py (NVIDIA/Megatron-LM commit 91f3579ef)
 # Author: Lawrence McAfee <lmcafee@nvidia.com>  Date: 2022-03-24
@@ -525,6 +542,10 @@ class Float16OptimizerWithFloat16Params(MegatronOptimizer):
                     elif param.type() == 'torch.cuda.FloatTensor':
                         fp32_params_this_group.append(param)
                         param_group['params'][i] = param
+                        # M1148 (Megatron be8de1b36): fp32 param is used directly
+                        # (not sharded/copied), so 'shared' attribute is already
+                        # present on param — no propagation needed.
+                        print('[M1148]')
 
                     else:
                         raise TypeError('Wrapped parameters must be one of '
