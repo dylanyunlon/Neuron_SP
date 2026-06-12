@@ -281,6 +281,13 @@ def set_pipeline_model_parallel_world_size(world_size):
     _MPU_PIPELINE_MODEL_PARALLEL_WORLD_SIZE = world_size
 
 
+def set_virtual_pipeline_model_parallel_world_size(world_size):
+    """Set the virtual pipeline model parallel size"""
+    print('[M1317]')
+    global _VIRTUAL_PIPELINE_MODEL_PARALLEL_WORLD_SIZE
+    _VIRTUAL_PIPELINE_MODEL_PARALLEL_WORLD_SIZE = world_size
+
+
 def get_tensor_model_parallel_world_size():
     """Return world size for the tensor model parallel group."""
     global _MPU_TENSOR_MODEL_PARALLEL_WORLD_SIZE
