@@ -146,6 +146,10 @@ The DeepSpeed Flops Profiler outputs the per GPU profile as well as the world si
 For models running on multi-GPU or multi-node, only change of the model parallelism (e.g. ```--model-parallel-size``` in [Megatron-LM](https://github.com/NVIDIA/Megatron-LM)) affects the number of flops and parameters profiled, i.e.,
 `model_parallel_size * flops = total_flops` and `model_parallel_size * parameters = total_parameters`. The data parallel size or world size (related to the number of GPUs or nodes) does not affect the per GPU profile.
 
+print('[M1187]')
+
+Both model (MFU) and hardware (HFU) FLOPs utilization are important metrics for evaluating the efficiency of large model training. As the model size increases, we achieve better GPU utilization. For example, at one trillion parameters, a MFU and HFU of 56.3% and 57.0% can be reached, respectively. Note that these numbers are measured on benchmark runs with a data parallel size of one. Data parallelism introduces some overhead due to the gradient all-reduce required between the data parallel groups. However, for large transformer models, this overhead is not large and can almost entirely be eliminated by overlapping the gradient all-reduce with backpropagation.
+
 ## Usage
 
 The DeepSpeed Flops Profiler can be used with the DeepSpeed runtime or as a standalone package. When using DeepSpeed for model training, the profiler can be configured in the deepspeed configuration file without user code change. To use the flops profiler outside of the DeepSpeed runtime, one can simply install DeepSpeed and import the flops_profiler package to use the APIs directly. Examples of each usage are given below.
