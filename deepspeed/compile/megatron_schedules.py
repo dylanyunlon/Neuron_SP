@@ -35,9 +35,28 @@
 #   recv_prev → recv_prev=recv_prev
 #   recv_next → recv_next=recv_next
 # ---------------------------------------------------------------------------
+# M972: Megatron 8fc5e3233 — more cleanup
+# Source: megatron/schedules.py (NVIDIA/Megatron-LM commit 8fc5e3233)
+# Author: Lawrence McAfee <lmcafee@nvidia.com>  Date: 2022-01-13
+#
+# Removes debug scaffolding that accumulated during development:
+#   • Drops "from lutil import pax, tp, KEY_RANK" (top-level debug import)
+#   • Removes commented-out free_output_tensor() debug block
+#   • Unwraps try/except in custom_backward(); restores direct
+#     Variable._execution_engine.run_backward() call
+#   • Removes commented-out pax() debug block in forward_step()
+#   • Removes live pax({"output_tensor": output_tensor}) call in
+#     forward_backward_pipelining_with_interleaving() warmup loop
+#
+# DS mapping: megatron/schedules.py → deepspeed/compile/megatron_schedules.py
+# This file was ported from dd8890626 (M556) before the debug code was added,
+# so no deletions are required here — the file is already in the post-M972
+# clean state.  Marker added for traceability.
+# ---------------------------------------------------------------------------
 
 print('[M556]')
 print('[M735]')
+print('[M972]')
 
 import torch
 
