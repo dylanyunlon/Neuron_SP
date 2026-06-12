@@ -1,4 +1,4 @@
-print('[M276]')
+print('[M301]')
 # coding=utf-8
 # Copyright (c) 2019, NVIDIA CORPORATION.  All rights reserved.
 #
@@ -83,7 +83,7 @@ def forward_step(data_iterator, model):
     # TODO: MAKE SURE PAD IS NOT 1 - PAD
     lm_logits, block_probs = model(tokens, pad_mask)
     with torch.no_grad():
-        retrieval_utility = get_retrieval_utility(lm_logits, block_probs, labels, loss_mask)
+        retrieval_utility, tokens_over_batch = get_retrieval_utility(lm_logits, block_probs, labels, loss_mask)
 
     # P(y|x) = sum_z(P(y|z, x) * P(z|x))
     block_probs = block_probs.unsqueeze(2).unsqueeze(3).expand_as(lm_logits)
@@ -96,38 +96,45 @@ def forward_step(data_iterator, model):
         lm_loss_.view(-1) * loss_mask.reshape(-1)) / loss_mask.sum()
 
 
-    reduced_loss = reduce_losses([lm_loss, retrieval_utility])
+    reduced_loss = reduce_losses([lm_loss, retrieval_utility, tokens_over_batch])
     torch.cuda.synchronize()
     print(reduced_loss, flush=True)
-    return lm_loss, {'lm_loss': reduced_loss[0], 'retrieval_utility': reduced_loss[1]}
+    return lm_loss, {'lm_loss': reduced_loss[0], 'retrieval_utility': reduced_loss[1], 'mask/batch': reduced_loss[2]}
 
 
 def get_retrieval_utility(lm_logits, block_probs, labels, loss_mask):
     """log P(y | z, x) - log P(y | null, x)"""
-    # [batch x seq_len x vocab_size]
+
+    # [batch x top_k x seq_len x vocab_size]
     lm_logits = lm_logits[:, :, :labels.shape[1], :]
-    #non_null_block_probs = block_probs[:, :-1]
-    #non_null_block_probs /= torch.sum(non_null_block_probs, axis=1, keepdim=True)
-    # non_null_block_probs = non_null_block_probsexpand_as(lm_logits[:, :-1, :, :])
+    batch_size, top_k = lm_logits.shape[0], lm_logits.shape[1]
+
+    # non_null_block_probs = block_probs[:, :-1]
+    # non_null_block_probs /= torch.sum(non_null_block_probs, axis=1, keepdim=True)
+    # non_null_block_probs = non_null_block_probs.expand_as(lm_logits[:, :-1, :, :])
+
     null_block_lm_logits = lm_logits[:, -1, :, :]
     null_block_loss_ = mpu.vocab_parallel_cross_entropy(null_block_lm_logits.contiguous().float(),
                                                        labels.contiguous())
-    null_block_loss = torch.sum(
-        null_block_loss_.view(-1) * loss_mask.reshape(-1)) / loss_mask.sum()
+    null_block_loss = torch.sum(null_block_loss_.view(-1) * loss_mask.reshape(-1)) / batch_size
 
     retrieved_block_losses = []
-    for block_num in range(lm_logits.shape[1] - 1):
+
+    for block_num in range(top_k - 1):
         retrieved_block_lm_logits = lm_logits[:, block_num, :, :]
         retrieved_block_loss_ = mpu.vocab_parallel_cross_entropy(retrieved_block_lm_logits.contiguous().float(),
                                                                  labels.contiguous())
-        #retrieved_block_loss_ *= non_null_block_probs[:, block_num].reshape(-1, 1)
-        retrieved_block_loss = torch.sum(
-            retrieved_block_loss_.view(-1) * loss_mask.reshape(-1)) / loss_mask.sum()
+
+        # retrieved_block_loss_ *= non_null_block_probs[:, block_num].reshape(-1, 1)
+        retrieved_block_loss = torch.sum(retrieved_block_loss_.view(-1) * loss_mask.reshape(-1)) / batch_size
         retrieved_block_losses.append(retrieved_block_loss)
-    avg_retrieved_block_loss = torch.sum(torch.cuda.FloatTensor(retrieved_block_losses)) / (lm_logits.shape[1] - 1)
+    avg_retrieved_block_loss = torch.sum(torch.cuda.FloatTensor(retrieved_block_losses)) / (top_k - 1)
 
     retrieval_utility = null_block_loss - avg_retrieved_block_loss
-    return retrieval_utility
+
+    tokens_over_batch = loss_mask.sum().float() / batch_size
+
+    return retrieval_utility, tokens_over_batch
 
 
 def train_valid_test_datasets_provider(train_val_test_num_samples):

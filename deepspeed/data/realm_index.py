@@ -1,4 +1,4 @@
-print('[M276]')
+print('[M301]')
 from collections import defaultdict
 import os
 import pickle
@@ -17,9 +17,11 @@ def detach(tensor):
 
 class BlockData(object):
     def __init__(self):
+        args = get_args()
         self.embed_data = dict()
         self.meta_data = dict()
-        self.temp_dir_name = 'temp_block_data'
+        block_data_path = os.path.splitext(args.block_data_path)[0]
+        self.temp_dir_name = block_data_path + '_tmp'
 
     def state(self):
         return {

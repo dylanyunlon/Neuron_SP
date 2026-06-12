@@ -84,12 +84,34 @@ def salient_span_mask(tokens, mask_id):
     for id_idx in masked_positions:
         labels.append(tokens[id_idx])
         output_tokens[id_idx] = mask_id
-    #print("-" * 100 + '\n',
-    #      "TOKEN STR\n", tokens_str + '\n',
-    #      "SELECTED ENTITY\n", selected_entity.text + '\n',
-    #      "OUTPUT\n", join_str_list(tokenizer.tokenizer.convert_ids_to_tokens(output_tokens)), flush=True)
+    # print("-" * 100 + '\n',
+    #       "TOKEN STR\n", tokens_str + '\n',
+    #       "SELECTED ENTITY\n", selected_entity.text + '\n',
+    #       "OUTPUT\n", join_str_list(tokenizer.tokenizer.convert_ids_to_tokens(output_tokens)), flush=True)
 
     return output_tokens, masked_positions, labels
+
+
+def get_arrays_using_ner_mask(tokens, block_ner_mask, mask_id):
+    tokenizer = get_tokenizer()
+    tokens_str = join_str_list(tokenizer.tokenizer.convert_ids_to_tokens(tokens))
+
+    masked_tokens = tokens.copy()
+    masked_positions = []
+    masked_labels = []
+
+
+    for i in range(len(tokens)):
+        if block_ner_mask[i] == 1:
+            masked_positions.append(i)
+            masked_labels.append(tokens[i])
+            masked_tokens[i] = mask_id
+
+    # print("-" * 100 + '\n',
+    #       "TOKEN STR\n", tokens_str + '\n',
+    #       "OUTPUT\n", join_str_list(tokenizer.tokenizer.convert_ids_to_tokens(masked_tokens)), flush=True)
+
+    return masked_tokens, masked_positions, masked_labels
 
 
 class RealmDataset(BertDataset):
