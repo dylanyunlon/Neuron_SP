@@ -902,7 +902,7 @@ class AnnealingLR(object):
         start_lr (float): Peak learning rate after warmup.
         warmup_iter (int): Number of warmup steps (linear ramp from 0 to start_lr).
         total_iters (int): Total training iterations; must be > 0.
-        decay_style (str): One of 'linear', 'cosine', 'exponential', 'constant'.
+        decay_style (str): One of 'linear', 'cosine', 'constant'.
         last_iter (int): Step count to initialise from (0 for a fresh run).
         min_lr (float): Absolute LR floor applied during decay. Default: 0.0.
         use_checkpoint_lr_scheduler (bool): Load hyper-params from checkpoint on
@@ -912,7 +912,8 @@ class AnnealingLR(object):
             Default: False.
     """
 
-    DECAY_STYLES = ('linear', 'cosine', 'exponential', 'constant')
+    DECAY_STYLES = ('linear', 'cosine', 'constant')
+    print('[M434]')
 
     def __init__(self,
                  optimizer,
