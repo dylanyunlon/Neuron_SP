@@ -81,6 +81,22 @@
 print('[M519]')
 print('[M373]')
 print('[M345]')
+# M556: Megatron dd8890626 — Interleaved pipeline execution and code refactoring
+# Source: megatron/initialize.py (NVIDIA/Megatron-LM commit dd8890626)
+# Author: Deepak Narayanan <dnarayanan@nvidia.com>  Date: 2020-12-12
+#
+# Mapping: megatron/initialize.py → deepspeed/compile/megatron_initialize.py
+#
+# Changes ported:
+#   1. _initialize_distributed(): pass virtual_pipeline_model_parallel_size_
+#      from args to initialize_model_parallel() as third positional arg.
+#      In DeepSpeed mapping: read args.virtual_pipeline_model_parallel_size
+#      inside ddp_init() and call init_virtual_pipeline_model_parallel()
+#      from mpu_initialize when set.
+#
+# 20% adaptation: uses deepspeed.comm / mpu_initialize; lazy_mpu_init path
+# left unchanged; adds print('[M556]').
+print('[M556]')
 
 import deepspeed.comm as dist
 from deepspeed.compile.mpu_initialize import (
@@ -169,6 +185,15 @@ def initialize_megatron(extra_args_provider=None,
             set_model_parallel_world_size(model_parallel_size)
             set_model_parallel_rank(dist.get_rank() % model_parallel_size
                                     if dist.is_initialized() else 0)
+            # M556: initialise virtual pipeline parallel if configured.
+            virtual_pipeline_size = getattr(
+                args, 'virtual_pipeline_model_parallel_size', None)
+            if virtual_pipeline_size is not None:
+                from deepspeed.compile.mpu_initialize import (
+                    init_virtual_pipeline_model_parallel)
+                init_virtual_pipeline_model_parallel(virtual_pipeline_size)
+                print(f'[M556] ddp_init: virtual_pipeline_model_parallel_size='
+                      f'{virtual_pipeline_size}')
 
         # M519: call makefile every run so we recompile if the code has changed.
         import torch

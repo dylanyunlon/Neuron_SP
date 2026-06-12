@@ -275,6 +275,43 @@ def patch_distributed_args(parser):
     return parser
 
 
+# ---------------------------------------------------------------------------
+# M556: Megatron dd8890626 — Interleaved pipeline execution and code refactoring
+# Source: megatron/arguments.py (NVIDIA/Megatron-LM commit dd8890626)
+# Author: Deepak Narayanan <dnarayanan@nvidia.com>  Date: 2020-12-12
+#
+# Mapping: megatron/arguments.py → deepspeed/compile/megatron_arguments.py
+#          (project convention: megatron top-level → deepspeed/compile/)
+#
+# Changes ported from arguments.py _add_distributed_args():
+#   1. Add --virtual-pipeline-model-parallel-size argument (int, default=None):
+#        Number of virtual pipeline stages in physical stage.
+#      Inserted after --model-parallel-size deprecated stub.
+#
+# 20% adaptation: added as a standalone patch_virtual_pipeline_args() helper
+# that callers invoke alongside other distributed arg patches; uses the same
+# add_argument_group pattern as existing M512 helpers; adds print('[M556]').
+# ---------------------------------------------------------------------------
+
+print('[M556]')
+
+
+def patch_virtual_pipeline_args(parser):
+    """Register --virtual-pipeline-model-parallel-size argument.
+
+    Megatron dd8890626 _add_distributed_args():
+      group.add_argument('--virtual-pipeline-model-parallel-size', type=int,
+                         default=None,
+                         help='Number of virtual pipeline stages in physical stage.')
+    """
+    group = parser.add_argument_group(title='M556 virtual pipeline patches')
+    group.add_argument('--virtual-pipeline-model-parallel-size', type=int,
+                       default=None,
+                       help='Number of virtual pipeline stages in physical stage.')
+    print('[M556] patch_virtual_pipeline_args: --virtual-pipeline-model-parallel-size registered')
+    return parser
+
+
 def set_input_defaults_early(args, defaults):
     """Apply defaults dict BEFORE micro_batch_size and other assertions.
 

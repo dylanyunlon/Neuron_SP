@@ -181,3 +181,89 @@ def load_checkpoint_safe(load_path, checkpoint_name,
     print_rank_0(f'  successfully loaded checkpoint from {load_path}')
 
     return state_dict.get('iteration', 0)
+
+
+# ===========================================================================
+# M556: Megatron dd8890626 — Interleaved pipeline execution and code refactoring
+# ===========================================================================
+#
+# Upstream source: megatron/checkpointing.py → deepspeed/compile/megatron_checkpointing.py
+#
+# Changes ported:
+#
+#   save_checkpoint():
+#     1. Unwrap model list (torchDDP → .module) per element rather than once.
+#     2. If len(model) == 1: state_dict['model'] = model[0].state_dict_for_save_checkpoint()
+#        Else: for i, set mpu.set_virtual_pipeline_model_parallel_rank(i),
+#              state_dict['model%d' % i] = model[i].state_dict_for_save_checkpoint()
+#
+#   load_checkpoint():
+#     1. Same per-element DDP unwrap.
+#     2. If len(model) == 1: model[0].load_state_dict(state_dict['model'])
+#        Else: for i, set_virtual_pipeline_model_parallel_rank(i),
+#              model[i].load_state_dict(state_dict['model%d' % i])
+#
+# 20% adaptation: existing save/load_checkpoint_safe() use callbacks; the
+# virtual-pipeline logic is factored into two new helpers —
+# build_virtual_pipeline_state_dict() and load_virtual_pipeline_state_dict()
+# — that callers invoke as part of their state_dict_fn / model_load_fn.
+# Adds print('[M556]').
+# ===========================================================================
+
+print('[M556]')
+
+
+def build_virtual_pipeline_state_dict(model_list):
+    """Build state_dict entries for a list of model modules.
+
+    Megatron dd8890626 checkpointing.py save_checkpoint():
+      if len(model) == 1:
+          state_dict['model'] = model[0].state_dict_for_save_checkpoint()
+      else:
+          for i in range(len(model)):
+              mpu.set_virtual_pipeline_model_parallel_rank(i)
+              state_dict['model%d' % i] = model[i].state_dict_for_save_checkpoint()
+
+    Args:
+        model_list: list of model modules (each unwrapped from DDP/FP16 wrappers).
+
+    Returns:
+        dict mapping 'model' (single stage) or 'model0', 'model1', … (multi-stage)
+        to the corresponding state_dict_for_save_checkpoint() results.
+    """
+    from deepspeed.compile.mpu_initialize import set_virtual_pipeline_model_parallel_rank
+    result = {}
+    if len(model_list) == 1:
+        result['model'] = model_list[0].state_dict_for_save_checkpoint()
+    else:
+        for i, model_module in enumerate(model_list):
+            set_virtual_pipeline_model_parallel_rank(i)
+            result['model%d' % i] = model_module.state_dict_for_save_checkpoint()
+    print(f'[M556] build_virtual_pipeline_state_dict: {len(model_list)} stage(s)')
+    return result
+
+
+def load_virtual_pipeline_state_dict(model_list, state_dict, strict=True):
+    """Load state_dict entries into a list of model modules.
+
+    Megatron dd8890626 checkpointing.py load_checkpoint():
+      if len(model) == 1:
+          model[0].load_state_dict(state_dict['model'], strict=strict)
+      else:
+          for i in range(len(model)):
+              mpu.set_virtual_pipeline_model_parallel_rank(i)
+              model[i].load_state_dict(state_dict['model%d' % i], strict=strict)
+
+    Args:
+        model_list: list of model modules (each unwrapped from DDP/FP16 wrappers).
+        state_dict: checkpoint state dict as loaded from disk.
+        strict: passed through to load_state_dict().
+    """
+    from deepspeed.compile.mpu_initialize import set_virtual_pipeline_model_parallel_rank
+    if len(model_list) == 1:
+        model_list[0].load_state_dict(state_dict['model'], strict=strict)
+    else:
+        for i, model_module in enumerate(model_list):
+            set_virtual_pipeline_model_parallel_rank(i)
+            model_module.load_state_dict(state_dict['model%d' % i], strict=strict)
+    print(f'[M556] load_virtual_pipeline_state_dict: {len(model_list)} stage(s)')

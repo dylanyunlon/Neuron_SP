@@ -150,6 +150,129 @@ print('[M447]')
 
 _PIPELINE_GLOBAL_RANKS = None
 
+# ===========================================================================
+# M556: Megatron dd8890626 — Interleaved pipeline execution and code refactoring
+# ===========================================================================
+#
+# Upstream source: megatron/mpu/initialize.py  → deepspeed/compile/mpu_initialize.py
+#
+# Changes ported:
+#
+#   1. Add module-level globals:
+#        _VIRTUAL_PIPELINE_MODEL_PARALLEL_RANK = None
+#        _VIRTUAL_PIPELINE_MODEL_PARALLEL_WORLD_SIZE = None
+#
+#   2. initialize_model_parallel(): accept virtual_pipeline_model_parallel_size_
+#      parameter; when not None, set the two new globals to 0 and the given size.
+#
+#   3. is_pipeline_first_stage(ignore_virtual=False):
+#        When ignore_virtual is False and WORLD_SIZE is set and RANK != 0:
+#        return False before checking physical rank.
+#
+#   4. is_pipeline_last_stage(ignore_virtual=False):
+#        When ignore_virtual is False and WORLD_SIZE is set and RANK != last:
+#        return False before checking physical rank.
+#
+#   5. Add get_virtual_pipeline_model_parallel_rank(): returns the global.
+#   6. Add set_virtual_pipeline_model_parallel_rank(rank): sets the global.
+#
+#   mpu/__init__.py:
+#     from .initialize import get_virtual_pipeline_model_parallel_rank, \
+#                             set_virtual_pipeline_model_parallel_rank
+#
+# 20% adaptation: DeepSpeed does not replicate full process-group init here;
+# virtual rank management is standalone (no NCCL group construction).
+# is_pipeline_first/last_stage stubs refer to the same physical-rank checks
+# already present via get_pipeline_model_parallel_rank() / world_size.
+# Adds print('[M556]').
+# ===========================================================================
+
+print('[M556]')
+
+_VIRTUAL_PIPELINE_MODEL_PARALLEL_RANK = None
+_VIRTUAL_PIPELINE_MODEL_PARALLEL_WORLD_SIZE = None
+
+
+def init_virtual_pipeline_model_parallel(virtual_pipeline_model_parallel_size):
+    """Initialise virtual pipeline parallel globals.
+
+    Megatron dd8890626 mpu/initialize.py — called inside
+    initialize_model_parallel() when virtual_pipeline_model_parallel_size_ is
+    not None; sets RANK to 0 and WORLD_SIZE to the given value.
+    """
+    global _VIRTUAL_PIPELINE_MODEL_PARALLEL_RANK
+    global _VIRTUAL_PIPELINE_MODEL_PARALLEL_WORLD_SIZE
+    _VIRTUAL_PIPELINE_MODEL_PARALLEL_RANK = 0
+    _VIRTUAL_PIPELINE_MODEL_PARALLEL_WORLD_SIZE = virtual_pipeline_model_parallel_size
+    print(f'[M556] init_virtual_pipeline_model_parallel: '
+          f'world_size={virtual_pipeline_model_parallel_size}')
+
+
+def get_virtual_pipeline_model_parallel_rank():
+    """Return the virtual pipeline-parallel rank.
+
+    Megatron dd8890626 mpu/initialize.py — getter for
+    _VIRTUAL_PIPELINE_MODEL_PARALLEL_RANK; returns None when virtual
+    pipelining is not enabled.
+    """
+    global _VIRTUAL_PIPELINE_MODEL_PARALLEL_RANK
+    return _VIRTUAL_PIPELINE_MODEL_PARALLEL_RANK
+
+
+def set_virtual_pipeline_model_parallel_rank(rank):
+    """Set the virtual pipeline-parallel rank.
+
+    Megatron dd8890626 mpu/initialize.py — called by the schedule helpers
+    (schedules.py) before each virtual-stage forward/backward pass so that
+    is_pipeline_first_stage() / is_pipeline_last_stage() return the correct
+    answer for the current virtual chunk.
+    """
+    global _VIRTUAL_PIPELINE_MODEL_PARALLEL_RANK
+    _VIRTUAL_PIPELINE_MODEL_PARALLEL_RANK = rank
+
+
+def is_pipeline_first_stage(ignore_virtual=False):
+    """Return True if in the first pipeline model-parallel stage.
+
+    Megatron dd8890626 mpu/initialize.py — extended with ignore_virtual:
+      When ignore_virtual is False and virtual pipelining is active,
+      also check that VIRTUAL_RANK == 0; otherwise return False early.
+    """
+    if not ignore_virtual:
+        global _VIRTUAL_PIPELINE_MODEL_PARALLEL_RANK
+        global _VIRTUAL_PIPELINE_MODEL_PARALLEL_WORLD_SIZE
+        if _VIRTUAL_PIPELINE_MODEL_PARALLEL_WORLD_SIZE is not None and \
+                _VIRTUAL_PIPELINE_MODEL_PARALLEL_RANK != 0:
+            return False
+    # Physical-rank check (DeepSpeed: use dist.get_rank() as proxy).
+    if dist.is_initialized():
+        from deepspeed.compile.mpu_initialize import get_model_parallel_rank
+        return get_model_parallel_rank() == 0
+    return True
+
+
+def is_pipeline_last_stage(ignore_virtual=False):
+    """Return True if in the last pipeline model-parallel stage.
+
+    Megatron dd8890626 mpu/initialize.py — extended with ignore_virtual:
+      When ignore_virtual is False and virtual pipelining is active,
+      also check that VIRTUAL_RANK == (WORLD_SIZE - 1); otherwise return
+      False early.
+    """
+    if not ignore_virtual:
+        global _VIRTUAL_PIPELINE_MODEL_PARALLEL_RANK
+        global _VIRTUAL_PIPELINE_MODEL_PARALLEL_WORLD_SIZE
+        if _VIRTUAL_PIPELINE_MODEL_PARALLEL_WORLD_SIZE is not None and \
+                _VIRTUAL_PIPELINE_MODEL_PARALLEL_RANK != (
+                    _VIRTUAL_PIPELINE_MODEL_PARALLEL_WORLD_SIZE - 1):
+            return False
+    # Physical-rank check.
+    if dist.is_initialized():
+        from deepspeed.compile.mpu_initialize import (
+            get_model_parallel_rank, get_model_parallel_world_size)
+        return get_model_parallel_rank() == (get_model_parallel_world_size() - 1)
+    return True
+
 
 def set_pipeline_global_ranks(ranks):
     """Store the ordered pipeline-group global rank list for this process.
