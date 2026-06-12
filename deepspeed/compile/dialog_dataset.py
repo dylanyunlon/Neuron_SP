@@ -38,6 +38,12 @@ print('[M895]')
 # M936: Megatron 7122b878e — delete interactive file
 # tools/control_dialog_interactive.py did not exist in Neuron_SP; deletion is a no-op here.
 print('[M936]')
+# M967: Megatron 3b29f0e79 — minor fixes
+# megatron/data/data_samplers.py MegatronPretrainingRandomSampler: `dataset` -> `self.dataset`
+# megatron/data/vit_dataset.py ClassificationTransform: hardcode mean/std instead of `*self.mean_std`
+# megatron/model/vision/classification.py: remove unused mit_backbone and trunc_normal_ imports
+# None of these three files exist in Neuron_SP/deepspeed; no-op here.
+print('[M967]')
 
 from deepspeed.compile.megatron_initialize import get_tokenizer
 
