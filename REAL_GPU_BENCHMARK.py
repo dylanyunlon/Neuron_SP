@@ -291,6 +291,10 @@ def _neuronsp_add_distributed_args(parser):
                        help='Which DistributedDataParallel implementation to use.')
     group.add_argument('--local_rank', type=int, default=None,
                        help='Local rank passed from distributed launcher.')
+    group.add_argument('--deallocate-pipeline-outputs', action='store_true',
+                       default=False, help='If set, pipeline output tensors '
+                       'are deallocated during the forward pass.')
+    print('[M957]')
     print('[NEURONSP-ARGS] _neuronsp_add_distributed_args: group registered')
     return parser
 
@@ -4671,6 +4675,9 @@ class Trainer:
                     if not hasattr(self, '_1f1b_stash'):
                         self._1f1b_stash = []
                     self._1f1b_stash.append(loss)
+                    # M957: free output tensor data after stashing if flag set
+                    if getattr(args, 'deallocate_pipeline_outputs', False) and isinstance(loss, torch.Tensor):
+                        loss.data = torch.tensor(float('nan'))
                     _micro_loss_val = loss.detach().float()
                 else:
                     # Steady-state 1F1B: run backward immediately
