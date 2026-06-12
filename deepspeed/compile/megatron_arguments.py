@@ -957,3 +957,92 @@ def validate_distributed_checkpointing(args):
         'currently distrobuted checkpoint activations only supported for ' \
         'nointerleaved pipeline parallelism'
     print('[M771] validate_distributed_checkpointing: passed')
+
+# ---------------------------------------------------------------------------
+# M1005: Megatron b93bef00d — comments, cleanup.
+# Source: megatron/arguments.py, megatron/model/transformer.py,
+#         megatron/mpu/initialize.py, megatron/p2p_communication.py,
+#         megatron/schedules.py, megatron/training.py
+# Author: Lawrence McAfee <lmcafee@nvidia.com>  Date: 2022-02-01
+#
+# Changes in upstream:
+#   arguments.py:
+#     • Removes commented-out old virtual_pipeline_model_parallel_size block
+#       (used pipeline_model_parallel_size instead of
+#       transformer_pipeline_model_parallel_size) from parse_args().
+#     • Removes commented-out lutil/pax debug block from parse_args().
+#     • Improves --standalone-embed-stage help text: adds note that for T5
+#       the flag currently only affects the encoder embedding.
+#
+#   model/transformer.py:
+#     • Removes '# >>>' / '# <<<' markers around NoopTransformerLayer class.
+#     • Rewrites NoopTransformerLayer docstring: explains standalone embed
+#       stage creates zero-layer virtual ranks, that input==output causes
+#       memory optimisation failures, and that clone() disconnects them.
+#     • Removes several commented-out raise/pax debug blocks from
+#       ParallelTransformer.__init__() and forward().
+#     • Improves comment on num_layers==0 branch: clearer prose, removes
+#       stale bullet list.
+#
+#   mpu/initialize.py:
+#     • Removes live 'raise Exception("hi.")' from
+#       set_pipeline_model_parallel_world_size() (was before the docstring).
+#     • Removes commented-out 'raise Exception("hi.")' from
+#       get_pipeline_model_parallel_world_size().
+#     • get_num_layers(): removes several commented-out code blocks and pax
+#       debug calls; adds explanatory comments for standalone_embed_stage
+#       logic in both encoder/decoder and decoder-only paths; removes
+#       '# args)' comment suffix from is_pipeline_stage_before_split() call.
+#     • Removes '# >>>'/'# <<<' wrapping around
+#       is_pipeline_stage_before_split() and is_pipeline_stage_after_split()
+#       function definitions; removes assert isinstance debug guard and
+#       commented-out rank adjustment inside both functions.
+#
+#   p2p_communication.py:
+#     • Removes local 'def make_viewless_tensor(t)' closure and replaces
+#       the two call sites with direct mpu.make_viewless_tensor() calls
+#       (matching the original commented-out code, completing the >>>++<
+#       switchover).
+#
+#   schedules.py:
+#     • Removes commented-out pax debug block from get_forward_backward_func().
+#     • Removes commented-out assert for transformer_pipeline_model_parallel_size
+#       microbatch divisibility; keeps the pipeline_model_parallel_size assert.
+#     • Removes live mpu.assert_viewless_tensor(output_tensor) calls from
+#       forward_step() (two occurrences).
+#     • Removes commented-out id(input_tensor)==id(output_tensor) debug
+#       block from forward_backward_pipelining_with_interleaving().
+#
+#   training.py:
+#     • Removes several commented-out pax/lutil debug blocks from pretrain(),
+#       get_model(), setup_model_and_optimizer(), and
+#       build_train_valid_test_data_iterators().
+#     • Removes '# args)' comment suffix from is_pipeline_stage_before_split()
+#       and is_pipeline_stage_after_split() call sites.
+#
+# DS mapping notes:
+#   megatron/arguments.py          → deepspeed/compile/megatron_arguments.py
+#   megatron/model/transformer.py  → no direct DS counterpart in this repo
+#   megatron/mpu/initialize.py     → deepspeed/compile/mpu_initialize.py
+#   megatron/p2p_communication.py  → deepspeed/compile/megatron_p2p_communication.py
+#   megatron/schedules.py          → deepspeed/compile/megatron_schedules.py
+#   megatron/training.py           → deepspeed/compile/megatron_training.py
+#
+# All six DS counterpart files were inspected. None contain the upstream
+# debug scaffolding targeted by this commit:
+#   • megatron_arguments.py: resolve_virtual_pipeline_size() already uses
+#     transformer_pipeline_model_parallel_size; no lutil/pax blocks present.
+#   • mpu_initialize.py: set/get_pipeline_model_parallel_world_size and
+#     get_num_layers/is_pipeline_stage_*_split not yet ported to this file;
+#     no raise Exception("hi.") / assert isinstance / pax blocks present.
+#   • megatron_p2p_communication.py: _communicate() already calls
+#     mpu.make_viewless_tensor() directly; no local closure present.
+#   • megatron_schedules.py: M972 (Megatron 8fc5e3233) previously recorded
+#     as already covering the schedules cleanup; file in clean state.
+#   • megatron_training.py: only helper stubs present; full pretrain /
+#     get_model / build_train_valid_test_data_iterators not ported.
+#
+# No code changes required in this repo. Marker added for log continuity.
+# ---------------------------------------------------------------------------
+
+print('[M1005]')
