@@ -103,13 +103,19 @@ class CoreAttention(DominoModule):
         self.hidden_size_per_partition = projection_size // tp_world_size
         self.attention_dropout_rate = config.attention_dropout
 
+        # M1365: Megatron a7cce3205 — dropout variable.
+        # Store dropout rate as self.dropout_p so forward can reference the variable
+        # rather than a hardcoded literal (mirrors upstream FlashSelfAttention fix).
+        self.dropout_p = self.attention_dropout_rate
+        print('[M1365]')
+
     def forward(self, query_layer, key_layer, value_layer, attention_mask):
 
         context_layer = torch.nn.functional.scaled_dot_product_attention(query_layer,
                                                                          key_layer,
                                                                          value_layer,
                                                                          attn_mask=None,
-                                                                         dropout_p=self.attention_dropout_rate,
+                                                                         dropout_p=self.dropout_p,
                                                                          is_causal=True,
                                                                          scale=None)
 
