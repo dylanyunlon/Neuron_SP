@@ -653,6 +653,8 @@ print('[M1333]')
 # M1443: Megatron 5428592c3 — Add retro attr to ParallelTransformer
 # Source: megatron/model/transformer.py
 #         (NVIDIA/Megatron-LM commit 5428592c36d97d8c2a94eb459c3cbbd37428474a)
+# M1444: Megatron 233cd4f34 — Add RoPE support with TE
+# Source: megatron/model/transformer.py (NVIDIA/Megatron-LM commit 233cd4f34)
 # Author: Kirthi Shankar Sivamani <smkirthishankar@gmail.com>  Date: 2023-05-26
 #
 # Mapping: megatron/model/transformer.py → deepspeed/compile/megatron_transformer.py
@@ -677,3 +679,45 @@ print('[M1333]')
 # ---------------------------------------------------------------------------
 
 print('[M1443]')
+# Changes ported from upstream (transformer.py):
+#
+# ParallelTransformer.forward() — forward_kwargs dict [line ~1598]:
+#
+#   BEFORE (pre-233cd4f34):
+#     forward_kwargs = {
+#         'encoder_output': encoder_output,
+#         'enc_dec_attn_mask': enc_dec_attn_mask,
+#         'inference_params': inference_params,
+#     }
+#     if self.transformer_impl == 'transformer_engine':
+#         forward_kwargs['is_first_microbatch'] = is_first_microbatch
+#         forward_kwargs['checkpoint_core_attention'] = self.checkpoint_core_attention
+#     else:
+#         forward_kwargs['rotary_pos_emb'] = rotary_pos_emb
+#         forward_kwargs['retriever_input'] = retriever_input
+#         forward_kwargs['retriever_output'] = retriever_output
+#         forward_kwargs['retriever_attn_mask'] = retriever_attn_mask
+#
+#   AFTER (233cd4f34):
+#     forward_kwargs = {
+#         'encoder_output': encoder_output,
+#         'enc_dec_attn_mask': enc_dec_attn_mask,
+#         'inference_params': inference_params,
+#         'rotary_pos_emb': rotary_pos_emb,        ← moved here (common to both TE and non-TE)
+#     }
+#     if self.transformer_impl == 'transformer_engine':
+#         forward_kwargs['is_first_microbatch'] = is_first_microbatch
+#         forward_kwargs['checkpoint_core_attention'] = self.checkpoint_core_attention
+#     else:
+#         # rotary_pos_emb removed from else branch — now in common dict above
+#         forward_kwargs['retriever_input'] = retriever_input
+#         forward_kwargs['retriever_output'] = retriever_output
+#         forward_kwargs['retriever_attn_mask'] = retriever_attn_mask
+#
+#   Rationale: rotary_pos_emb was previously only passed to non-TE layers;
+#   this commit ensures transformer_engine layers also receive rotary_pos_emb,
+#   enabling RoPE to work correctly when transformer_impl == 'transformer_engine'.
+#
+# ---------------------------------------------------------------------------
+
+print('[M1444]')
