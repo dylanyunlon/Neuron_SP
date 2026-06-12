@@ -49,9 +49,29 @@
 #   _get_comm_args()  — added scatter_gather_tensors_in_pipeline default (False)
 #   imports           — added functools.reduce and operator
 # ---------------------------------------------------------------------------
+# M1161: Megatron 13b3dca6d — make interleaving work with optimizations
+# Source: megatron/schedules.py (NVIDIA/Megatron-LM commit 13b3dca6d)
+# Author: Vijay Korthikanti <vkorthikanti@nvidia.com>  Date: 2022-04-25
+#
+# Mapping: megatron/schedules.py → deepspeed/compile/megatron_p2p_communication.py
+#
+# Upstream patch: in forward_backward_pipelining_with_interleaving(), the
+# tensor_shape default computation now respects args.model_parallel_memory_opt:
+#   if args.model_parallel_memory_opt:
+#       seq_length = args.seq_length // mpu.get_tensor_model_parallel_world_size()
+#   else:
+#       seq_length = args.seq_length
+#   tensor_shape = (seq_length, args.micro_batch_size, args.hidden_size)
+#
+# DS mapping: tensor_shape default is computed in _communicate() (line ~180)
+# rather than at the call site, so the fix is applied there instead:
+#   _communicate(): tensor_shape=None default now applies the same
+#   model_parallel_memory_opt-aware seq_length split.
+# ---------------------------------------------------------------------------
 
 print('[M556]')
 print('[M734]')
+print('[M1161]')
 
 import operator
 from functools import reduce
@@ -177,7 +197,13 @@ def _communicate(tensor_send_next, tensor_send_prev, recv_prev, recv_next,
     tensor_recv_prev = None
     tensor_recv_next = None
     if tensor_shape is None:
-        tensor_shape = (args.seq_length, args.micro_batch_size, args.hidden_size)
+        # M1161: Megatron 13b3dca6d — respect model_parallel_memory_opt when
+        # computing the default tensor_shape for interleaved pipeline schedules.
+        if getattr(args, 'model_parallel_memory_opt', False):
+            seq_length = args.seq_length // _get_tensor_model_parallel_world_size()
+        else:
+            seq_length = args.seq_length
+        tensor_shape = (seq_length, args.micro_batch_size, args.hidden_size)
     if not override_scatter_gather_tensors_in_pipeline and \
             args.scatter_gather_tensors_in_pipeline:
         tensor_chunk_shape = reduce(operator.mul, tensor_shape, 1) // \
