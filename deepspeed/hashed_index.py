@@ -1,8 +1,9 @@
+print('[M341]')
 print('[M284]')
 print('[M233]')
 print('[M276]')
 import torch
-from torch.nn.parallel.distributed import DistributedDataParallel as torchDDP
+from torch.nn.parallel import DistributedDataParallel as torchDDP
 
 from megatron import get_args
 from megatron import mpu
