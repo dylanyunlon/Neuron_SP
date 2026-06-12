@@ -1054,3 +1054,12 @@ class DeslocGradAccumulator:
         self.Kx = d.get('Kx', self.Kx)
         self._local_step = d.get('local_step', 0)
 # --- End M327 ---
+
+# --- M1078: Megatron 4f2356dc7 — deleted old distributed_fused_adam ---
+# Megatron removed megatron/optimizer/distributed_fused_adam.py (96 lines,
+# prototype DistributedFusedAdam with lutil/pax debug imports). The
+# corresponding deepspeed/optimizer/distributed_fused_adam.py does not exist
+# in Neuron_SP, so no file deletion is required. Marker placed here as the
+# nearest fused-adam counterpart.
+print('[M1078]')
+# --- End M1078 ---
