@@ -25,8 +25,19 @@
 #   • p2p_communication imports resolve to megatron_p2p_communication.
 #   • Adds print('[M556]') marker.
 # ---------------------------------------------------------------------------
+# M735: Megatron e727de99d — Use timers kwargs correctly to prevent bug with
+#         new p2p_communication API
+# Source: megatron/schedules.py (NVIDIA/Megatron-LM commit e727de99d)
+# Author: Deepak Narayanan <dnarayanan@nvidia.com>  Date: 2021-07-29
+#
+# All p2p_communication calls updated to pass positional args as kwargs:
+#   timers → timers=timers
+#   recv_prev → recv_prev=recv_prev
+#   recv_next → recv_next=recv_next
+# ---------------------------------------------------------------------------
 
 print('[M556]')
+print('[M735]')
 
 import torch
 
@@ -228,7 +239,7 @@ def forward_backward_pipelining_with_interleaving(
 
     # Warmup forward passes.
     _set_virtual_pipeline_rank(0)
-    input_tensors[0].append(recv_forward(timers, use_ring_exchange=True))
+    input_tensors[0].append(recv_forward(timers=timers, use_ring_exchange=True))
     for k in range(num_warmup_microbatches):
         output_tensor = forward_step_helper(k)
         next_forward_model_chunk_id = get_model_chunk_id(k + 1, forward=True)
@@ -253,7 +264,7 @@ def forward_backward_pipelining_with_interleaving(
                     timers=timers)
             output_tensor_grads[num_model_chunks - 1].append(output_tensor_grad)
         else:
-            input_tensor = send_forward_recv_forward(output_tensor, recv_prev, timers)
+            input_tensor = send_forward_recv_forward(output_tensor, recv_prev=recv_prev, timers=timers)
         input_tensors[next_forward_model_chunk_id].append(input_tensor)
 
     # Steady-state 1F1B.
@@ -312,7 +323,7 @@ def forward_backward_pipelining_with_interleaving(
     if not forward_only:
         if all_warmup_microbatches:
             output_tensor_grads[num_model_chunks - 1].append(
-                recv_backward(timers, use_ring_exchange=True))
+                recv_backward(timers=timers, use_ring_exchange=True))
         for k in range(num_microbatches_remaining, num_microbatches):
             input_tensor_grad = backward_step_helper(k)
             next_backward_model_chunk_id = get_model_chunk_id(k + 1, forward=False)
@@ -323,7 +334,7 @@ def forward_backward_pipelining_with_interleaving(
             if k == (num_microbatches - 1):
                 recv_next = False
             output_tensor_grads[next_backward_model_chunk_id].append(
-                send_backward_recv_backward(input_tensor_grad, recv_next, timers))
+                send_backward_recv_backward(input_tensor_grad, recv_next=recv_next, timers=timers))
 
     return losses_reduced
 
@@ -351,15 +362,15 @@ def forward_backward_pipelining(forward_step_func, data_iterator, model,
 
     # Warmup forward passes.
     for _ in range(num_warmup_microbatches):
-        input_tensor = recv_forward(timers)
+        input_tensor = recv_forward(timers=timers)
         output_tensor = forward_step(forward_step_func, data_iterator, model,
                                      input_tensor, losses_reduced)
-        send_forward(output_tensor, timers)
+        send_forward(output_tensor, timers=timers)
         input_tensors.append(input_tensor)
         output_tensors.append(output_tensor)
 
     if num_microbatches_remaining > 0:
-        input_tensor = recv_forward(timers)
+        input_tensor = recv_forward(timers=timers)
 
     # Steady-state 1F1B.
     for i in range(num_microbatches_remaining):
@@ -367,34 +378,34 @@ def forward_backward_pipelining(forward_step_func, data_iterator, model,
         output_tensor = forward_step(forward_step_func, data_iterator, model,
                                      input_tensor, losses_reduced)
         if forward_only:
-            send_forward(output_tensor, timers)
+            send_forward(output_tensor, timers=timers)
         else:
-            output_tensor_grad = send_forward_recv_backward(output_tensor, timers)
+            output_tensor_grad = send_forward_recv_backward(output_tensor, timers=timers)
 
         input_tensors.append(input_tensor)
         output_tensors.append(output_tensor)
 
         if forward_only:
             if not last_iteration:
-                input_tensor = recv_forward(timers)
+                input_tensor = recv_forward(timers=timers)
         else:
             input_tensor, output_tensor = input_tensors.pop(0), output_tensors.pop(0)
             input_tensor_grad = backward_step(
                 optimizer, input_tensor, output_tensor, output_tensor_grad)
             if last_iteration:
                 input_tensor = None
-                send_backward(input_tensor_grad, timers)
+                send_backward(input_tensor_grad, timers=timers)
             else:
-                input_tensor = send_backward_recv_forward(input_tensor_grad, timers)
+                input_tensor = send_backward_recv_forward(input_tensor_grad, timers=timers)
 
     # Cooldown backward passes.
     if not forward_only:
         for _ in range(num_warmup_microbatches):
             input_tensor = input_tensors.pop(0)
             output_tensor = output_tensors.pop(0)
-            output_tensor_grad = recv_backward(timers)
+            output_tensor_grad = recv_backward(timers=timers)
             input_tensor_grad = backward_step(
                 optimizer, input_tensor, output_tensor, output_tensor_grad)
-            send_backward(input_tensor_grad, timers)
+            send_backward(input_tensor_grad, timers=timers)
 
     return losses_reduced
