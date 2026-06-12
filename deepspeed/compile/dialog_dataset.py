@@ -177,3 +177,28 @@ def build_train_valid_test_datasets(data_folder, dataset_name, train_module, max
     test_dataset = ControlDialogDataset(test_data_list, max_seq_len, tokenizer.pad_id, tokenizer.eod_id)
 
     return (train_dataset, valid_dataset, test_dataset)
+# M1039: Megatron 488f8c02a — adress review comments
+# LICENSE: update attribution text to include Facebook Dino and Microsoft Swin-Transformer;
+#   add MIT License for Microsoft Swin-Transformer; add NVIDIA Source Code License for SegFormer.
+# megatron/arguments.py _add_vision_args(): add --vision-pretraining flag (store_true).
+# megatron/model/vision/classification.py: replace `from megatron.model.vision.utils import trunc_normal_`
+#   with `from torch.nn.init import trunc_normal_`.
+# megatron/model/vision/dino.py: same trunc_normal_ import swap.
+# megatron/model/vision/esvit_swin_backbone.py: same trunc_normal_ import swap.
+# megatron/model/vision/mit_backbone.py: same trunc_normal_ import swap; add LICENSE comment line.
+# megatron/model/vision/inpainting.py: replace Apache license header with BSD license note;
+#   replace `from megatron.model.vision.utils import resize, trunc_normal_`
+#   with `from megatron.model.vision.utils import resize_`.
+# megatron/model/vision/utils.py: remove _no_grad_trunc_normal_() and trunc_normal_() — now using
+#   torch.nn.init.trunc_normal_ directly; remove unused imports (math, itertools.repeat, torch.nn).
+# megatron/model/vision/knn_monitor.py: add module-level _FEATURE_BANK = None;
+#   compute_feature_bank() now stores result in _FEATURE_BANK instead of returning it;
+#   add get_feature_bank() accessor.
+# megatron/training.py: guard all three `args.vision_pretraining_type == "dino"` checks with
+#   `args.vision_pretraining and`; compute_feature_bank() call no longer assigned to args.knn_features.
+# pretrain_vision_classify.py / pretrain_vision_dino.py / pretrain_vision_inpaint.py:
+#   add 'vision_pretraining': True to args_defaults.
+# pretrain_vision_dino.py: import get_feature_bank from knn_monitor; use get_feature_bank()
+#   instead of args.knn_features; remove print_rank_0("building VIT model ...").
+# None of these files exist in Neuron_SP/deepspeed; no-op here.
+print('[M1039]')
