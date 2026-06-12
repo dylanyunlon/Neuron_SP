@@ -320,7 +320,8 @@ def load_virtual_pipeline_state_dict(model_list, state_dict, strict=True):
 print('[M1203]')
 
 
-def get_checkpoint_names(checkpoints_path, iteration, use_distributed_optimizer,
+def get_checkpoint_names(checkpoints_path, iteration,
+                         no_load_optim, use_distributed_optimizer,
                          release=False):
     """Return (model_name, optim_name) for the checkpoint at *iteration*.
 
@@ -334,9 +335,33 @@ def get_checkpoint_names(checkpoints_path, iteration, use_distributed_optimizer,
       ``model_optim_rng.pt`` (combining the previous separate ``model_rng.pt``
       and ``optim.pt`` into a single file).
 
+    M1377 (Megatron a5c60087b): added `no_load_optim` parameter and
+      file-existence-aware branching to handle the special case where a model
+      is pretrained with the standard optimizer and fine-tuned with the
+      distributed optimizer (without loading the pretraining optimizer state).
+
+        unified_name       = .../model_optim_rng.pt
+        distrib_model_name = .../model_rng.pt
+        distrib_optim_name = ..._%03d/optim.pt
+
+        if os.path.exists(unified_name):
+            assert not os.path.exists(distrib_model_name)
+            if use_distributed_optimizer:
+                assert no_load_optim
+            model_name = optim_name = unified_name
+        elif os.path.exists(distrib_model_name):
+            assert use_distributed_optimizer
+            model_name = distrib_model_name; optim_name = distrib_optim_name
+        elif use_distributed_optimizer:
+            model_name = distrib_model_name; optim_name = distrib_optim_name
+        else:
+            model_name = optim_name = unified_name
+
     Args:
         checkpoints_path: root directory that contains iteration sub-dirs.
         iteration: training iteration number (ignored when release=True).
+        no_load_optim: if True, optimizer state will not be loaded (used when
+            switching from standard to distributed optimizer at fine-tune time).
         use_distributed_optimizer: if True, optimizer state is stored in a
             separate per-data-parallel-rank file.
         release: if True, uses the ``release`` sub-directory instead of an
@@ -381,16 +406,33 @@ def get_checkpoint_names(checkpoints_path, iteration, use_distributed_optimizer,
                                        mpu.get_tensor_model_parallel_rank(),
                                        mpu.get_pipeline_model_parallel_rank()))
 
-    # If using the distributed optimizer the optimizer's path must additionally
-    # include the data parallel rank.
-    if use_distributed_optimizer:
-        model_name = os.path.join(common_path, 'model_rng.pt')
-        optim_name = os.path.join(
-            common_path + '_%03d' % mpu.get_data_parallel_rank(),
-            'optim.pt')
+    # M1377: Set model/optimizer names based on use of the distributed
+    # optimizer.  We additionally handle the special case where a model is
+    # pretrained using the standard optimizer, and finetuned using the
+    # distributed optimizer that's used without loading the pretraining
+    # optimizer.
+    unified_name = os.path.join(common_path, 'model_optim_rng.pt')
+    distrib_model_name = os.path.join(common_path, 'model_rng.pt')
+    distrib_optim_name = os.path.join(
+        common_path + '_%03d' % mpu.get_data_parallel_rank(),
+        'optim.pt')
+    if os.path.exists(unified_name):
+        assert not os.path.exists(distrib_model_name)
+        if use_distributed_optimizer:
+            assert no_load_optim  # or finetune?
+        model_name = optim_name = unified_name
+    elif os.path.exists(distrib_model_name):
+        assert use_distributed_optimizer
+        assert not os.path.exists(unified_name)
+        model_name = distrib_model_name
+        optim_name = distrib_optim_name
+    elif use_distributed_optimizer:
+        model_name = distrib_model_name
+        optim_name = distrib_optim_name
     else:
-        model_name = optim_name = os.path.join(common_path, 'model_optim_rng.pt')
+        model_name = optim_name = unified_name
 
+    print('[M1377]')
     return model_name, optim_name
 
 # M1204: Megatron b178e6fc5 — error fixes & tested
@@ -561,6 +603,83 @@ def _load_checkpoint_finetune_notes():
 print('[M1278]')
 
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# M1377: Megatron a5c60087b — made compatible.
+# Source: megatron/checkpointing.py + megatron/optimizer/distrib_optimizer.py
+#         + tools/bert_embedding/embed.py
+#         (NVIDIA/Megatron-LM commit a5c60087b)
+# Author: Lawrence McAfee <lmcafee@nvidia.com>  Date: 2023-04-21
+#
+# Mapping:
+#   megatron/checkpointing.py           → deepspeed/compile/megatron_checkpointing.py
+#   megatron/optimizer/distrib_optimizer.py → deepspeed/compile/megatron_optimizer.py
+#   tools/bert_embedding/embed.py       → (no equivalent; see note)
+#
+# ── megatron/checkpointing.py changes ──
+#
+#   1. get_checkpoint_names(): added `no_load_optim` parameter (2nd positional).
+#      New file-existence-aware branching logic replaces the old binary
+#      use_distributed_optimizer branch:
+#
+#        unified_name       = .../model_optim_rng.pt
+#        distrib_model_name = .../model_rng.pt
+#        distrib_optim_name = ..._%03d/optim.pt
+#
+#        if os.path.exists(unified_name):
+#            assert not os.path.exists(distrib_model_name)
+#            if use_distributed_optimizer:
+#                assert no_load_optim
+#            model_name = optim_name = unified_name
+#        elif os.path.exists(distrib_model_name):
+#            assert use_distributed_optimizer
+#            model_name = distrib_model_name; optim_name = distrib_optim_name
+#        elif use_distributed_optimizer:
+#            model_name = distrib_model_name; optim_name = distrib_optim_name
+#        else:
+#            model_name = optim_name = unified_name
+#
+#   2. find_checkpoint_rank_0(): added `no_load_optim` parameter; forwards to
+#      get_checkpoint_names().
+#
+#   3. _load_base_checkpoint(): added `no_load_optim` parameter; forwards to
+#      find_checkpoint_rank_0() / get_checkpoint_names().
+#
+#   4. save_checkpoint(): passes args.no_load_optim to get_checkpoint_names().
+#
+#   5. load_args_from_checkpoint(), load_checkpoint(): pass
+#      no_load_optim=args.no_load_optim to _load_base_checkpoint().
+#
+#   6. load_biencoder_checkpoint(): passes args.no_load_optim to
+#      get_checkpoint_names().
+#
+# ── megatron/optimizer/distrib_optimizer.py changes ──
+#
+#   DistributedOptimizer.__init__(): PyTorch API compatibility for
+#   storage()._untyped() (deprecated) → storage().untyped() (current):
+#
+#       try:
+#           storage = grad_buffer.data.storage()._untyped()
+#       except:
+#           storage = grad_buffer.data.storage().untyped()
+#       param_buffer = torch.tensor(storage, dtype=params_dtype, device=...)
+#
+#   In Neuron_SP Float16DistributedOptimizer the `param_buffer` construction
+#   from grad_buffer storage does not exist; the untyped() compatibility shim
+#   is provided as get_storage_untyped() in megatron_optimizer.py instead.
+#
+# ── tools/bert_embedding/embed.py changes ──
+#
+#   Import path change (no equivalent file in Neuron_SP):
+#     - from megatron.schedules import get_forward_backward_func
+#     + from megatron.core.pipeline_parallel import get_forward_backward_func
+#
+# 20% adaptation: get_checkpoint_names() below updated in-place with the
+# no_load_optim param and file-existence branching; helpers that take
+# no_load_optim are updated accordingly. Adds print('[M1377]').
+# ---------------------------------------------------------------------------
+
+print('[M1377]')
+
 # M1378: Megatron 268cb0c87 — consolidated conditions.
 # Source: megatron/checkpointing.py (NVIDIA/Megatron-LM commit 268cb0c87)
 # Author: Lawrence McAfee <lmcafee@nvidia.com>  Date: 2023-04-21

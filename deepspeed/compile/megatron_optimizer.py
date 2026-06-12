@@ -19,6 +19,36 @@
 print('[M1173]')
 
 # ---------------------------------------------------------------------------
+# M1377: Megatron a5c60087b — made compatible.
+# Source: megatron/optimizer/distrib_optimizer.py
+#         (NVIDIA/Megatron-LM commit a5c60087b)
+# Author: Lawrence McAfee <lmcafee@nvidia.com>  Date: 2023-04-21
+#
+# Mapping: megatron/optimizer/distrib_optimizer.py → deepspeed/compile/megatron_optimizer.py
+#
+# Upstream change in DistributedOptimizer.__init__():
+#   For each model's grad_buffer, a param_buffer is constructed from the
+#   storage of the grad_buffer's data tensor.  The older PyTorch API uses
+#   storage()._untyped() (now deprecated); newer PyTorch uses storage().untyped().
+#   The fix wraps the call in a try/except for cross-version compatibility:
+#
+#       try:
+#           storage = grad_buffer.data.storage()._untyped()
+#       except:
+#           storage = grad_buffer.data.storage().untyped()
+#       param_buffer = torch.tensor(storage, dtype=params_dtype, device=...)
+#
+# Neuron_SP adaptation:
+#   Float16DistributedOptimizer in this file does not construct a param_buffer
+#   from grad_buffer storage directly (uses a different shard-based approach).
+#   The compatibility logic is provided as get_storage_untyped() below for use
+#   by any future code that needs cross-version storage access.
+#   Adds print('[M1377]').
+# ---------------------------------------------------------------------------
+
+print('[M1377]')
+
+# ---------------------------------------------------------------------------
 # M1148: Megatron be8de1b36 — fixed shared weight attribute for fp32.
 # Source: megatron/optimizer/distrib_optimizer.py (NVIDIA/Megatron-LM commit be8de1b36)
 # Author: Lawrence McAfee <lmcafee@nvidia.com>  Date: 2022-03-29
@@ -260,6 +290,29 @@ from megatron import mpu
 from megatron import print_rank_0
 
 from .clip_grads import clip_grad_norm_fp32, count_zeros_fp32
+
+
+# ---------------------------------------------------------------------------
+# M1377: PyTorch storage API compatibility helper
+# ---------------------------------------------------------------------------
+
+def get_storage_untyped(tensor):
+    """Return the untyped storage backing *tensor*, compatible with both old
+    and new PyTorch versions.
+
+    Megatron a5c60087b distrib_optimizer.py:
+        try:
+            storage = grad_buffer.data.storage()._untyped()
+        except:
+            storage = grad_buffer.data.storage().untyped()
+
+    This helper centralises the try/except so callers can write:
+        storage = get_storage_untyped(grad_buffer.data)
+    """
+    try:
+        return tensor.storage()._untyped()
+    except Exception:
+        return tensor.storage().untyped()
 
 
 # ---------------------------------------------------------------------------
