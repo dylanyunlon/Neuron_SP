@@ -35,6 +35,16 @@
 #   recv_prev → recv_prev=recv_prev
 #   recv_next → recv_next=recv_next
 # ---------------------------------------------------------------------------
+# M971: Megatron c1e4526bb — renamed 'free' -> 'deallocate'
+# Source: megatron/schedules.py (NVIDIA/Megatron-LM commit c1e4526bb)
+# Author: Lawrence McAfee <lmcafee@nvidia.com>  Date: 2022-01-13
+#
+# Renamed free_output_tensor -> deallocate_output_tensor.
+# New signature: deallocate_output_tensor(out) — takes a single tensor (not list).
+# custom_backward docstring updated to reference new name.
+# Old free_output_tensor commented out upstream; here it was never present.
+# Adds deallocate_output_tensor() after torch import.
+# ---------------------------------------------------------------------------
 # M972: Megatron 8fc5e3233 — more cleanup
 # Source: megatron/schedules.py (NVIDIA/Megatron-LM commit 8fc5e3233)
 # Author: Lawrence McAfee <lmcafee@nvidia.com>  Date: 2022-01-13
@@ -56,9 +66,32 @@
 
 print('[M556]')
 print('[M735]')
+print('[M971]')
 print('[M972]')
 
 import torch
+
+
+def deallocate_output_tensor(out):
+    '''Pseudo-deallocate (i.e., set to scalar) the output tensor's '.data' field.
+
+    This method should be called right after the output tensor has been
+    sent to the next pipeline stage. At this point, the output tensor is
+    only useful for its '.grad_fn' field, and not its '.data'.
+
+    M971: Megatron c1e4526bb — renamed from free_output_tensor.
+    New simpler signature: single tensor (not list), no flag argument.
+    '''
+    print('[M971]')
+    assert isinstance(out, torch.Tensor), \
+        "expected Tensor, found %s." % type(out).__name__
+    assert out._base is None, \
+        "counter-productive to free a view of another tensor."
+    out.data = torch.empty(
+        (1,),
+        device=out.device,
+        dtype=out.dtype,
+    )
 
 
 def _get_args():
