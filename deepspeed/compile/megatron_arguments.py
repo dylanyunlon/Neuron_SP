@@ -672,3 +672,52 @@ def add_tasks_retriever_args(parser):
 
 
 print('[M611]')
+
+# ---------------------------------------------------------------------------
+# M616: Megatron 182841f7d — Make sure pipeline-model-parallel size is
+#       greater than 2 for interleaved schedule
+# Source: megatron/arguments.py (NVIDIA/Megatron-LM commit 182841f7df79410)
+# Author: Deepak Narayanan <dnarayanan@nvidia.com>  Date: 2021-03-20
+#
+# Mapping: megatron/arguments.py → deepspeed/compile/megatron_arguments.py
+#
+# Change ported from arguments.py parse_args():
+#   if args.num_layers_per_virtual_pipeline_stage is not None:
+#       assert args.pipeline_model_parallel_size > 2, \           ← NEW
+#           'pipeline-model-parallel size should be greater than 2 with ' \
+#           'interleaved schedule'
+#       assert args.num_layers % args.num_layers_per_virtual_pipeline_stage == 0
+#       ...
+#
+# DeepSpeed adaptation: the new assertion is added to the existing
+# validate_pipeline_mp_size_interleaved() helper so it can be called from
+# compile/initialize after pipeline_model_parallel_size is resolved;
+# resolve_virtual_pipeline_size() is unmodified (it contains the layers
+# divisibility assertion but not the pp-size > 2 guard).
+# ---------------------------------------------------------------------------
+
+print('[M616]')
+
+
+def validate_pipeline_mp_size_interleaved(args):
+    """Assert pipeline_model_parallel_size > 2 when interleaved schedule is active.
+
+    Megatron 182841f7d arguments.py parse_args():
+      if args.num_layers_per_virtual_pipeline_stage is not None:
+          assert args.pipeline_model_parallel_size > 2, \\
+              'pipeline-model-parallel size should be greater than 2 with ' \\
+              'interleaved schedule'
+
+    Call after pipeline_model_parallel_size and
+    num_layers_per_virtual_pipeline_stage are resolved; safe to call when
+    the attribute is absent (treated as None, no assertion executed).
+    """
+    num_layers_per_stage = getattr(args, 'num_layers_per_virtual_pipeline_stage', None)
+    if num_layers_per_stage is not None:
+        pipeline_mp_size = getattr(args, 'pipeline_model_parallel_size', 1)
+        assert pipeline_mp_size > 2, \
+            'pipeline-model-parallel size should be greater than 2 with ' \
+            'interleaved schedule'
+    print('[M616] validate_pipeline_mp_size_interleaved: '
+          f'num_layers_per_virtual_pipeline_stage={num_layers_per_stage}, '
+          f'pipeline_model_parallel_size={getattr(args, "pipeline_model_parallel_size", 1)}')
