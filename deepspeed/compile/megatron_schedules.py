@@ -63,11 +63,25 @@
 # so no deletions are required here — the file is already in the post-M972
 # clean state.  Marker added for traceability.
 # ---------------------------------------------------------------------------
+# M1003: Megatron bea16fa33 — found root source of t5 issue (fast layer norm)
+# Source: megatron/schedules.py (NVIDIA/Megatron-LM commit bea16fa33)
+# Author: Lawrence McAfee <lmcafee@nvidia.com>  Date: 2022-02-01
+#
+# Mapping: megatron/schedules.py → deepspeed/compile/megatron_schedules.py
+#
+# Changes ported from upstream:
+#   • forward_step(): add assert_viewless_tensor(output_tensor) after
+#     forward_step_func call (guards against view tensors causing memory leak).
+#   • forward_step(): add assert_viewless_tensor(output_tensor) before
+#     return (mirrors upstream second assert after timers stop).
+#   Both calls wrapped in # >>> / # <<< debug markers matching upstream style.
+# ---------------------------------------------------------------------------
 
 print('[M556]')
 print('[M735]')
 print('[M971]')
 print('[M972]')
+print('[M1003]')
 
 import torch
 
@@ -170,11 +184,18 @@ def forward_step(forward_step_func, data_iterator, model, input_tensor, losses_r
       On last stage, unpacks (loss, loss_reduced), normalises by num_microbatches,
       and appends loss_reduced to losses_reduced.
     """
+    from deepspeed.compile.mpu_initialize import assert_viewless_tensor
     output_tensor = forward_step_func(data_iterator, model, input_tensor)
+    # >>>
+    assert_viewless_tensor(output_tensor)
+    # <<<
     if _is_pipeline_last_stage():
         loss, loss_reduced = output_tensor
         output_tensor = loss / _get_num_microbatches()
         losses_reduced.append(loss_reduced)
+    # >>>
+    assert_viewless_tensor(output_tensor)
+    # <<<
     return output_tensor
 
 

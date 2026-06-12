@@ -341,3 +341,40 @@ def get_pipeline_model_parallel_src_rank():
         local_world_size = get_model_parallel_world_size()
         return global_rank % (global_world_size // local_world_size)
     return 0
+
+
+# ---------------------------------------------------------------------------
+# M1003: Megatron bea16fa33 — found root source of t5 issue (fast layer norm)
+# Source: megatron/mpu/random.py (NVIDIA/Megatron-LM commit bea16fa33)
+# Author: Lawrence McAfee <lmcafee@nvidia.com>  Date: 2022-02-01
+#
+# Mapping: megatron/mpu/random.py → deepspeed/compile/mpu_initialize.py
+#
+# assert_viewless_tensor() is called from megatron/schedules.py in this
+# commit to guard that forward_step output tensors are not views.
+# The implementation lives in mpu/random.py upstream; we place it here
+# since this file is the DS equivalent of the mpu package namespace.
+# ---------------------------------------------------------------------------
+
+print('[M1003]')
+
+
+def assert_viewless_tensor(tensor, extra_msg=None):
+    """Assert that a tensor is not a view (its ._base field is None).
+
+    Megatron bea16fa33 mpu/random.py — raised by forward_step to catch
+    memory leaks where a tensor view is stored to a buffer, preventing GC.
+    Accepts lists (recurses) and non-Tensor objects (no-op).
+    """
+    import torch
+    if isinstance(tensor, list):
+        [assert_viewless_tensor(t) for t in tensor]
+        return tensor
+    if not isinstance(tensor, torch.Tensor):
+        return tensor
+    assert tensor._base is None, (
+        "Ensure tensor._base is None before setting tensor.data or storing "
+        "tensor to memory buffer. Otherwise, a memory leak will occur (and "
+        "likely accumulate over iterations). %s"
+    ) % extra_msg
+    return tensor
