@@ -809,3 +809,44 @@ def validate_pipeline_mp_size_interleaved(args):
 # ---------------------------------------------------------------------------
 
 print('[M612]')
+
+
+# ---------------------------------------------------------------------------
+# M702: Megatron 6f72a2851 — add dialog dataset and special tokens in tokenizer
+# Source: megatron/arguments.py (NVIDIA/Megatron-LM commit 6f72a2851)
+# Author: zihanl <zihanl@nvidia.com>  Date: 2021-06-28
+#
+# Mapping: megatron/arguments.py _add_dialog_ctrl_args()
+#          → deepspeed/compile/megatron_arguments.py add_dialog_ctrl_args()
+#
+# Changes ported:
+#   1. New argument group "dialog control" with five arguments:
+#      --train-module, --data-folder, --dataset-name, --max-seq-len,
+#      --spec_toks (comma-separated special tokens for GPT2BPE tokenizer).
+#
+# DeepSpeed adaptation:
+#   - Function renamed add_dialog_ctrl_args (public, no leading underscore)
+#     to match the existing add_* naming convention in this file.
+#   - No other logic changes; all defaults match upstream exactly.
+# ---------------------------------------------------------------------------
+
+
+def add_dialog_ctrl_args(parser):
+    """Add dialog control arguments (M702: Megatron 6f72a2851)."""
+    group = parser.add_argument_group(title='dialog control')
+
+    group.add_argument('--train-module', type=str, default='',
+                       help='either control module or dialogue model (control or dialog)')
+    group.add_argument('--data-folder', type=str, default='',
+                       help='data folder (path of the data folder)')
+    group.add_argument('--dataset-name', type=str, default='',
+                       help='dataset name (e.g., wizard_of_wikipedia)')
+    group.add_argument('--max-seq-len', type=int, default=1024,
+                       help='maximum sequence length')
+    group.add_argument('--spec_toks', type=str, default='[SEP],[CTRL],[PAD]',
+                       help='additional special tokens')
+
+    return parser
+
+
+print('[M702]')

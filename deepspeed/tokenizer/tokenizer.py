@@ -151,3 +151,81 @@ class _BertWordPieceTokenizer(AbstractTokenizer):
     @property
     def pad(self):
         return self.pad_id
+
+
+# ---------------------------------------------------------------------------
+# M702: Megatron 6f72a2851 — add dialog dataset and special tokens in tokenizer
+# Source: megatron/tokenizer/tokenizer.py (NVIDIA/Megatron-LM commit 6f72a2851)
+# Author: zihanl <zihanl@nvidia.com>  Date: 2021-06-28
+#
+# Mapping: megatron/tokenizer/tokenizer.py
+#          → deepspeed/tokenizer/tokenizer.py
+#
+# Changes ported:
+#   1. build_tokenizer(): added GPT2BPETokenizer branch; passes spec_toks
+#      (from args.spec_toks) as special_tokens kwarg.
+#   2. _GPT2BPETokenizer: new class wrapping GPT2Tokenizer with optional
+#      special_tokens; sets pad_id / sep_id / ctrl_id when present.
+#
+# DeepSpeed adaptation:
+#   - GPT2Tokenizer imported from deepspeed.runtime.utils (already present
+#     in this codebase) rather than megatron.tokenizer.gpt2_tokenization.
+#   - getattr(args, 'spec_toks', None) guards against args objects that
+#     pre-date M702 and do not carry the new attribute.
+#   - No other logic changes.
+# ---------------------------------------------------------------------------
+
+
+from deepspeed.runtime.utils import GPT2Tokenizer as _RawGPT2Tokenizer
+
+
+def _build_gpt2bpe_tokenizer(args):
+    """Build a GPT2BPETokenizer (M702 helper)."""
+    assert args.merge_file is not None, '--merge-file required for GPT2BPETokenizer'
+    spec_toks = getattr(args, 'spec_toks', None)
+    return _GPT2BPETokenizer(args.vocab_file, args.merge_file, special_tokens=spec_toks)
+
+
+class _GPT2BPETokenizer(AbstractTokenizer):
+    """Original GPT2 BPE tokenizer (M702: Megatron 6f72a2851)."""
+
+    def __init__(self, vocab_file, merge_file, special_tokens=None):
+        name = 'GPT2 BPE'
+        super().__init__(name)
+
+        # Parse comma-separated special tokens string into a list.
+        if special_tokens is not None:
+            special_tokens = special_tokens.split(',')
+        else:
+            special_tokens = []
+
+        self.tokenizer = _RawGPT2Tokenizer(vocab_file, merge_file,
+                                            errors='replace',
+                                            special_tokens=special_tokens,
+                                            max_len=None)
+        self.eod_id = self.tokenizer.encoder['<|endoftext|>']
+
+        if len(special_tokens) > 0:
+            if '[PAD]' in special_tokens:
+                self.pad_id = self.tokenizer.encoder['[PAD]']
+            if '[SEP]' in special_tokens:
+                self.sep_id = self.tokenizer.encoder['[SEP]']
+            if '[CTRL]' in special_tokens:
+                self.ctrl_id = self.tokenizer.encoder['[CTRL]']
+
+    @property
+    def vocab_size(self):
+        return len(self.tokenizer.encoder)
+
+    def tokenize(self, text):
+        return self.tokenizer.encode(text)
+
+    def detokenize(self, token_ids):
+        return self.tokenizer.decode(token_ids)
+
+    @property
+    def eod(self):
+        return self.eod_id
+
+
+print('[M702]')
