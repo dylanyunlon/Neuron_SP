@@ -1360,3 +1360,47 @@ def _m97_select_input_sentence_idx(rng, num_sentences):
     """
     return rng.randint(0, num_sentences - 1)
 # --- End M97 dataloader ---
+# ---------------------------------------------------------------------------
+# M102: Megatron ba2264abb — verified zeroshot tasks works
+# Ported from: tasks/zeroshot_gpt2/datasets.py + tasks/run_gpt2_eval.py
+#   → deepspeed/runtime/dataloader.py
+#
+# Key changes carried over:
+#
+# datasets.py: args.valid_data was passed as a list to _LambadaDataset and
+#   open(); must index [0] because valid_data is a list of paths, not a
+#   single path.
+#
+#   Before (3 sites):
+#     _LambadaDataset(args.valid_data, ...)
+#     with open(args.valid_data, "rb") as reader:
+#     get_detokenizer(args.valid_data)(entire_data)
+#
+#   After:
+#     _LambadaDataset(args.valid_data[0], ...)
+#     with open(args.valid_data[0], "rb") as reader:
+#     get_detokenizer(args.valid_data[0])(entire_data)
+#
+# run_gpt2_eval.py: renamed to tasks/run_gpt2_eval.py; removed obsolete
+#   --webtext-eval, --eval-iters, --load-openai, --cache-dir,
+#   --make-vocab-size-divisible-by, --text-key CLI args; changed
+#   --eval-batch-size to --batch-size; LAMBADA now uses main.py + --task
+#   flag instead of evaluate_gpt2.py + --cloze-eval.
+# ---------------------------------------------------------------------------
+
+
+def _m102_valid_data_path(args_valid_data):
+    """M102: Megatron ba2264abb — valid_data is a list; callers must index [0].
+
+    Before: passed args.valid_data (list) directly to open() / dataset ctor.
+    After:  pass args.valid_data[0] (str) — the first (and only) path element.
+
+    Downstream dataset builders should use this helper instead of indexing
+    inline so that the intent is explicit and auditable.
+    """
+    # valid_data is always a list of paths; zeroshot tasks assert len == 1
+    return args_valid_data[0]
+
+
+print('[M102]')
+# --- End M102 dataloader ---

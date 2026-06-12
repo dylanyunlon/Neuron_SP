@@ -6413,3 +6413,53 @@ def _m76_get_build_tokenizer_from_engine():
     from deepspeed.tokenizer import build_tokenizer
     return build_tokenizer
 # --- End M76 engine ---
+# ---------------------------------------------------------------------------
+# M102: Megatron ba2264abb — verified zeroshot tasks works
+# Ported from: tasks/zeroshot_gpt2/evaluate.py
+#   → deepspeed/runtime/engine.py
+#
+# Key changes carried over:
+#
+# evaluate.py:
+#   1. Import typo fix: was importing from '.dataset' (missing trailing 's');
+#      corrected to '.datasets'.
+#
+#      Before: from .dataset import build_dataset
+#      After:  from .datasets import build_dataset
+#
+#   2. process_batch(): get_ltor_masks_and_position_ids() call now passes
+#      args.fp16 as an additional argument so the mask/position computation
+#      can respect fp16 mode.
+#
+#      Before: get_ltor_masks_and_position_ids(
+#                  ..., args.eod_mask_loss)
+#      After:  get_ltor_masks_and_position_ids(
+#                  ..., args.eod_mask_loss,
+#                  args.fp16)
+# ---------------------------------------------------------------------------
+
+
+def _m102_get_ltor_masks_and_position_ids(get_ltor_fn, tokens, eod_token, reset_position_ids,
+                                          reset_attention_mask, eod_mask_loss, fp16):
+    """M102: Megatron ba2264abb — pass fp16 flag to get_ltor_masks_and_position_ids.
+
+    Wraps the upstream helper to forward fp16 so mask/position computation
+    respects mixed-precision mode during zeroshot evaluation.
+
+    Args:
+        get_ltor_fn: the get_ltor_masks_and_position_ids callable.
+        tokens: input token tensor.
+        eod_token: end-of-document token id.
+        reset_position_ids (bool): reset position ids at eod boundaries.
+        reset_attention_mask (bool): reset attention mask at eod boundaries.
+        eod_mask_loss (bool): mask loss at eod tokens.
+        fp16 (bool): whether fp16 mode is active.
+
+    Returns:
+        tuple: (tokens, labels, attention_mask, position_ids, loss_mask)
+    """
+    return get_ltor_fn(tokens, eod_token, reset_position_ids, reset_attention_mask, eod_mask_loss, fp16)
+
+
+print('[M102]')
+# --- End M102 engine ---

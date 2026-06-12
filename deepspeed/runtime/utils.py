@@ -3354,3 +3354,45 @@ class GPT2Tokenizer(object):
         return vocab_file, merge_file, special_tokens_file
 
 # --- End M83 ---
+# ---------------------------------------------------------------------------
+# M102: Megatron ba2264abb — verified zeroshot tasks works
+# Ported from: tasks/zeroshot_gpt2/detokenizer.py
+#   → deepspeed/runtime/utils.py
+#
+# Key changes carried over:
+#
+# detokenizer.py:
+#   1. Bug fix: get_detokenizer() referenced undefined name DETOKENIZERS;
+#      corrected to _DETOKENIZERS (the private dict defined earlier in file).
+#
+#      Before: for key in DETOKENIZERS.keys():
+#      After:  for key in _DETOKENIZERS.keys():
+#
+#   2. Indent fix in ptb_detokenizer(): first line used spaces instead of
+#      a tab, making it inconsistent with the rest of the function.
+# ---------------------------------------------------------------------------
+
+
+def _m102_get_detokenizer(path, detokenizers_map):
+    """M102: Megatron ba2264abb — correct dict name in get_detokenizer.
+
+    The original code referenced undefined 'DETOKENIZERS'; the correct
+    private dict is '_DETOKENIZERS'.  Callers pass the map explicitly
+    so this helper remains testable without global state.
+
+    Args:
+        path (str): file path used to select the right detokenizer.
+        detokenizers_map (dict): the _DETOKENIZERS mapping.
+
+    Returns:
+        callable: the detokenizer function for the given path, or
+                  identity function if no key matches.
+    """
+    for key in detokenizers_map.keys():
+        if key in path:
+            return detokenizers_map[key]
+    return lambda x: x
+
+
+print('[M102]')
+# --- End M102 utils ---
