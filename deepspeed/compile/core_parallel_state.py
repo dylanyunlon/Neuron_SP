@@ -4,6 +4,13 @@
 # DeepSpeed Team
 
 # ---------------------------------------------------------------------------
+# M1345: Megatron 96f4c5d26 — Undo parallel state changes
+# Source: megatron/core/parallel_state.py (NVIDIA/Megatron-LM commit 96f4c5d26)
+# Author: MaximumEntropy <sandeep.subramanian.1@umontreal.ca>  Date: 2023-04-03
+#
+# Mapping: megatron/core/parallel_state.py → deepspeed/compile/core_parallel_state.py
+#          (project convention: megatron/core/* → deepspeed/compile/core_*)
+#
 # M1233: Megatron 2e6a46e45 — Start Megatron-Core with vocab parallel cross entropy
 # Source: megatron/core/parallel_state.py (NVIDIA/Megatron-LM commit 2e6a46e45)
 # Author: Jared Casper <jcasper@nvidia.com>  Date: 2022-09-22
@@ -11,6 +18,19 @@
 # Mapping: megatron/core/parallel_state.py → deepspeed/compile/core_parallel_state.py
 #          (project convention: megatron/core/* → deepspeed/compile/core_*)
 #
+# This commit (M1345) undoes parallel state changes introduced in a prior commit:
+#   1. Remove `untie_embeddings_and_output_weights: bool = False` param from
+#      initialize_model_parallel() signature.
+#   2. Remove corresponding docstring entry.
+#   3. Revert embedding_ranks logic: always [ranks[0], ranks[-1]]; remove
+#      untie_embeddings_and_output_weights branches.
+#   4. Add pipeline_model_parallel_split_rank handling for embedding_ranks and
+#      position_embedding_ranks.
+#   5. Adjust _EMBEDDING_GLOBAL_RANKS / _POSITION_EMBEDDING_GLOBAL_RANKS assignment
+#      to bind under `if rank in ranks` (pipeline group membership) rather than
+#      under `if rank in embedding_ranks`.
+#
+# Prior M1233 commit notes (kept for history):
 # This commit renames megatron/mpu/initialize.py → megatron/core/parallel_state.py
 # and refactors it:
 #   1. Add `from typing import Optional` — type-annotate initialize_model_parallel().
@@ -29,7 +49,7 @@
 # where torch.distributed would be used; adds print('[M1233]') marker.
 # ---------------------------------------------------------------------------
 
-print('[M1233]')
+print('[M1345]')
 
 import torch
 from typing import Optional
@@ -196,20 +216,31 @@ def initialize_model_parallel(
         if rank in ranks:
             _PIPELINE_MODEL_PARALLEL_GROUP = group
             _PIPELINE_GLOBAL_RANKS = list(ranks)
-        # Setup embedding group (first and last rank in each pipeline group).
+        # Setup embedding group (to exchange gradients between
+        # first and last stages).
         if len(ranks) > 1:
             embedding_ranks = [ranks[0], ranks[-1]]
             position_embedding_ranks = [ranks[0]]
+            if pipeline_model_parallel_split_rank is not None:
+                if ranks[pipeline_model_parallel_split_rank] not in embedding_ranks:
+                    embedding_ranks = [ranks[0],
+                                    ranks[pipeline_model_parallel_split_rank],
+                                    ranks[-1]]
+                if ranks[pipeline_model_parallel_split_rank] not in position_embedding_ranks:
+                    position_embedding_ranks = [ranks[0],
+                                       ranks[pipeline_model_parallel_split_rank]]
         else:
             embedding_ranks = list(ranks)
             position_embedding_ranks = list(ranks)
         group = torch.distributed.new_group(embedding_ranks)
         if rank in embedding_ranks:
             _EMBEDDING_GROUP = group
+        if rank in ranks:
             _EMBEDDING_GLOBAL_RANKS = embedding_ranks
         group = torch.distributed.new_group(position_embedding_ranks)
         if rank in position_embedding_ranks:
             _POSITION_EMBEDDING_GROUP = group
+        if rank in ranks:
             _POSITION_EMBEDDING_GLOBAL_RANKS = position_embedding_ranks
 
 
