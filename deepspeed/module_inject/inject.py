@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # DeepSpeed Team
+print('[M187]')
 
 import copy
 import torch
@@ -86,7 +87,7 @@ def test_hi():
         "attention_probs_dropout_prob": 0.1,
         "hidden_dropout_prob": 0.1,
         "attention_probs_dropout_prob": 0.1,
-        "max_position_embeddings": 512,
+        "max_position_embeddings": 1024,
         "type_vocab_size": 2,
         "initializer_range": 0.02
     }
