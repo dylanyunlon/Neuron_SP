@@ -638,7 +638,7 @@ def _m47_get_train_val_test_data_loader_type(data_loader_type):
 #   1. pretrain_albert.py deleted upstream; its logic was merged into
 #      pretrain_bert.py so BERT pretraining now supports the ALBERT-style
 #      SOP (sentence-order prediction) objective in addition to NSP.
-#   2. DistributedBatchSampler (from megatron.data_utils.samplers) is now
+#   2. DistributedBatchSampler (from megatron.deprecated_data_utils.samplers) is now
 #      used in pretrain_bert.py's make_data_loader_ factory to replace the
 #      old configure_data / raw / lazy / tfrecords dispatch.
 #   3. Batch key names updated: 'mask' → 'loss_mask', 'mask_labels' → 'labels',
@@ -663,7 +663,7 @@ def _m56_make_data_loader(dataset, global_batch_size, data_parallel_rank,
     """Megatron 3e4e1ab29 — make_data_loader_ factory ported from pretrain_bert.py.
 
     Replaces the old configure_data raw/lazy/tfrecords dispatch in BERT pretraining.
-    Uses SequentialSampler + DistributedBatchSampler (from data_utils/samplers) so
+    Uses SequentialSampler + DistributedBatchSampler (from deprecated_data_utils/samplers) so
     that each data-parallel rank receives a non-overlapping slice of the global batch.
 
     The DistributedBatchSampler contract:
@@ -752,7 +752,7 @@ def _m56_forward_step_sop(lm_logits, sop_logits, lm_labels, loss_mask, sentence_
 
 # ---------------------------------------------------------------------------
 # M59: Megatron 57f4a8a9b — Remove unused code
-# Ported from: megatron/data_utils/datasets.py
+# Ported from: megatron/deprecated_data_utils/datasets.py
 #
 # Key changes carried over:
 #   1. json_dataset.__init__: removed binarize_sent parameter and the
@@ -817,7 +817,7 @@ def _m59_bert_sentencepair_get_target_seq_length(rng, max_seq_len, short_seq_pro
 # --- End M59 dataloader ---
 
 # M63: Megatron 21a916b12 — Correct some args and create pretrain_bert_ict.py
-# Ported from: configure_data.py + megatron/data_utils/datasets.py +
+# Ported from: configure_data.py + megatron/deprecated_data_utils/datasets.py +
 #              pretrain_bert_ict.py (new)
 #   → deepspeed/runtime/dataloader.py
 #
@@ -960,7 +960,7 @@ def _m63_ict_forward_step(lm_logits, nsp_logits, lm_labels, loss_mask, next_sent
 
 # ---------------------------------------------------------------------------
 # M62: Megatron d2eabecb2 — Complete __getitem__ for InverseClozeDataset
-# Ported from: megatron/data_utils/datasets.py
+# Ported from: megatron/deprecated_data_utils/datasets.py
 #
 # Key changes carried over:
 #   1. bert_sentencepair_dataset.mask_token docstring: section reference
@@ -1292,3 +1292,21 @@ def _m76_get_build_tokenizer():
     from deepspeed.tokenizer import build_tokenizer
     return build_tokenizer
 # --- End M76 dataloader ---
+# M93: Megatron 8600642e5 — deprecated data_utils
+# Ported from: megatron/deprecated_data_utils/ (renamed from megatron/data_utils/)
+#   → deepspeed/runtime/dataloader.py
+#
+# Key changes carried over:
+#   megatron/data_utils/ directory renamed to megatron/deprecated_data_utils/.
+#   Affected modules (all pure renames, no content changes):
+#     __init__.py, corpora.py, datasets.py, file_utils.py, lazy_loader.py,
+#     samplers.py, tf_dl.py, tokenization.py, tokenization_gpt2.py, wordpiece.py
+#
+#   All comment references to megatron/data_utils/ in this file have been
+#   updated to megatron/deprecated_data_utils/ to reflect the upstream rename.
+#   No functional code changes — this commit is a pure directory rename marking
+#   the data_utils package as deprecated in favour of the newer data pipeline.
+# ---------------------------------------------------------------------------
+
+print('[M93]')
+# --- End M93 dataloader ---
