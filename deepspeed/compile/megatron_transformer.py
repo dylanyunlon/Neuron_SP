@@ -531,3 +531,120 @@ print('[M1313]')
 #       gradient_accumulation_fusion=self.config.gradient_accumulation_fusion,
 #       sequence_parallel_enabled=self.config.sequence_parallel_enabled,
 #   )
+# M1333: Megatron 1e0e555c4 — merging rope to main
+# Source: megatron/model/language_model.py + megatron/model/transformer.py
+#         (NVIDIA/Megatron-LM commit 1e0e555c4)
+# Author: Mostofa Patwary <mostofa.patwary@gmail.com>  Date: 2023-03-31
+#
+# Mapping: megatron/model/language_model.py  → deepspeed/compile/megatron_transformer.py
+#          megatron/model/transformer.py      → deepspeed/compile/megatron_transformer.py
+#          (project convention: megatron/model/ → deepspeed/compile/)
+#
+# ── language_model.py changes ──────────────────────────────────────────────
+#
+# Embedding.__init__():
+#   BEFORE: always construct self.position_embeddings = torch.nn.Embedding(...)
+#   AFTER:  gate on args.add_position_embedding (new flag from --no-position-embedding)
+#     self.add_position_embedding = args.add_position_embedding
+#     if self.add_position_embedding:
+#         self.position_embeddings = torch.nn.Embedding(max_sequence_length, self.hidden_size)
+#         self._position_embeddings_key = 'position_embeddings'
+#         if args.perform_initialization:
+#             self.init_method(self.position_embeddings.weight)
+#
+# Embedding.zero_parameters():
+#   BEFORE: always zero self.position_embeddings.weight
+#   AFTER:  guard with if self.add_position_embedding
+#
+# Embedding.forward():
+#   BEFORE: always add position_embeddings to words_embeddings
+#   AFTER:
+#     if self.add_position_embedding:
+#         position_embeddings = self.position_embeddings(position_ids)
+#         embeddings = words_embeddings + position_embeddings
+#     else:
+#         embeddings = words_embeddings
+#
+# Embedding.state_dict_for_save_checkpoint():
+#   BEFORE: always include self._position_embeddings_key
+#   AFTER:  guard with if self.add_position_embedding
+#
+# Embedding.load_state_dict():
+#   BEFORE: always load position_embeddings from state_dict
+#   AFTER:  guard entire position-embedding load block with
+#           if self.add_position_embedding
+#
+# TransformerLanguageModel.__init__():
+#   New RoPE construction block after embedding init:
+#     self.use_rotary_position_embeddings = False
+#     if args.use_rotary_position_embeddings:
+#         self.seq_length = args.seq_length
+#         rotary_dim = (args.hidden_size // args.num_attention_heads
+#                       if args.kv_channels is None else args.kv_channels)
+#         if args.rotary_percent < 1.0:
+#             rotary_dim = int(rotary_dim * args.rotary_percent)
+#         self.rotary_pos_emb = RotaryEmbedding(rotary_dim)
+#         self.use_rotary_position_embeddings = args.use_rotary_position_embeddings
+#   Import added at top of upstream file:
+#     from .rotary_pos_embedding import apply_rotary_pos_emb, RotaryEmbedding
+#
+# TransformerLanguageModel.forward():
+#   New rotary_pos_emb local variable computed before encoder run:
+#     rotary_pos_emb = None
+#     if self.use_rotary_position_embeddings:
+#         if inference_params is not None:
+#             rotary_pos_emb = self.rotary_pos_emb(inference_params.max_sequence_len)
+#         else:
+#             rotary_pos_emb = self.rotary_pos_emb(self.seq_length)
+#   encoder() and decoder() calls gain: rotary_pos_emb=rotary_pos_emb kwarg
+#
+# ── transformer.py changes ─────────────────────────────────────────────────
+#
+# Import added:
+#   from megatron.model.rotary_pos_embedding import apply_rotary_pos_emb
+#
+# ParallelAttention._checkpointed_attention_forward():
+#   Signature gains: rotary_pos_emb=None
+#   custom_forward inner function receives q_pos_emb / k_pos_emb as extra inputs
+#   (unpacked from rotary_pos_emb tuple before the checkpoint call)
+#
+# ParallelAttention.forward():
+#   Signature gains: rotary_pos_emb=None
+#
+#   Duplicate-for-self-attention block (after kv allocation):
+#     if rotary_pos_emb is not None:
+#         rotary_pos_emb = rotary_pos_emb if isinstance(rotary_pos_emb, tuple)
+#                          else ((rotary_pos_emb,) * 2)
+#
+#   Inference path — adjust key rotary embeddings for each step:
+#     if rotary_pos_emb is not None:
+#         q_pos_emb, k_pos_emb = rotary_pos_emb
+#         if not is_first_step:
+#             q_pos_emb = q_pos_emb[sequence_end - 1 : sequence_end]
+#         else:
+#             q_pos_emb = q_pos_emb[:sequence_end, :, :, :]
+#         k_pos_emb = k_pos_emb[:sequence_end, :, :, :]
+#         rotary_pos_emb = (q_pos_emb, k_pos_emb)
+#
+#   Core attention path — apply RoPE before attention:
+#     if rotary_pos_emb is not None:
+#         q_pos_emb, k_pos_emb = rotary_pos_emb
+#         query_layer = apply_rotary_pos_emb(query_layer, q_pos_emb)
+#         key_layer   = apply_rotary_pos_emb(key_layer,   k_pos_emb)
+#
+# ParallelTransformerLayer.forward():
+#   Signature gains: rotary_pos_emb=None
+#   self_attention() call gains: rotary_pos_emb=self_attention_pos_emb
+#
+# ParallelTransformer._checkpointed_forward():
+#   Signature gains: rotary_pos_emb
+#   All tensor_parallel.checkpoint() and custom() calls gain rotary_pos_emb arg
+#
+# ParallelTransformer.forward():
+#   Signature gains: rotary_pos_emb=None
+#   _checkpointed_forward() call gains: rotary_pos_emb
+#   forward_kwargs dict gains: 'rotary_pos_emb': rotary_pos_emb
+#
+# ---------------------------------------------------------------------------
+
+print('[M1333]')

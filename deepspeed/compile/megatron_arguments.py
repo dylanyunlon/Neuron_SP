@@ -1221,3 +1221,64 @@ def add_max_tokens_to_oom_arg(parser):
     return parser
 
 print('[M1278]')
+
+# ---------------------------------------------------------------------------
+# M1333: Megatron 1e0e555c4 — merging rope to main
+# Source: megatron/arguments.py (NVIDIA/Megatron-LM commit 1e0e555c4)
+# Author: Mostofa Patwary <mostofa.patwary@gmail.com>  Date: 2023-03-31
+#
+# Mapping: megatron/arguments.py _add_network_size_args()
+#        → deepspeed/compile/megatron_arguments.py add_rotary_position_args()
+#
+# Changes ported from _add_network_size_args() (~line 509):
+#
+#   Three new arguments added after --max-position-embeddings:
+#     --use-rotary-position-embeddings  (store_true)
+#       Enable rotary positional embeddings (RoPE).
+#     --rotary-percent  (float, default 1.0)
+#       Fraction of head dimension to apply rotary encoding; < 1.0 gives
+#       partial RoPE (Wang & Komatsuzaki et al. mesh-transformer-jax).
+#     --no-position-embedding  (store_false → dest add_position_embedding)
+#       Disable learned absolute position embedding so models can rely on
+#       RoPE alone.
+#
+# Adaptation note: Neuron_SP surfaces argument groups as standalone helper
+# functions.  add_rotary_position_args() follows the same pattern as
+# add_max_tokens_to_oom_arg() introduced in M1278.
+# ---------------------------------------------------------------------------
+
+
+def add_rotary_position_args(parser):
+    """Add RoPE-related arguments (Megatron 1e0e555c4).
+
+    Registers three arguments introduced when rotary position embeddings were
+    merged to Megatron main:
+
+    * ``--use-rotary-position-embeddings`` — toggle RoPE on/off.
+    * ``--rotary-percent`` — partial RoPE fraction (default 100 %).
+    * ``--no-position-embedding`` — disables the learned absolute position
+      embedding so the model can rely purely on RoPE.
+    """
+    group = parser.add_argument_group(title='M1333 rotary position embedding')
+    group.add_argument(
+        '--use-rotary-position-embeddings',
+        action='store_true',
+        help='Use rotary positional embeddings or not',
+    )
+    group.add_argument(
+        '--rotary-percent',
+        type=float,
+        default=1.0,
+        help='Percent of rotary dimension to use, default 100%%',
+    )
+    group.add_argument(
+        '--no-position-embedding',
+        action='store_false',
+        dest='add_position_embedding',
+        help='Disable position embedding.',
+    )
+    print('[M1333] add_rotary_position_args: RoPE args registered')
+    return parser
+
+
+print('[M1333]')
