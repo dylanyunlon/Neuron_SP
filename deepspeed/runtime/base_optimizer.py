@@ -15,7 +15,13 @@ from deepspeed.runtime.utils import maybe_loss_for_backward
 
 
 class DeepSpeedOptimizer(object):
-    pass
+
+    def reload_model_params(self):
+        # M487: Megatron 160ba6800 — base no-op; fp16 subclasses override.
+        # Called after loading a pretrained checkpoint for finetuning to sync
+        # fp32 master params with the freshly loaded model weights.
+        print('[M487]')
+        pass
 
 
 class BackwardHookStateManager:

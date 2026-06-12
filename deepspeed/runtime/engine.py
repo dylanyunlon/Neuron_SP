@@ -4355,8 +4355,11 @@ class DeepSpeedEngine(Module):
         optim_checkpoint = None
         if load_module_only:
             deepspeed_states = ['module']
-            if self.optimizer is not None and hasattr(self.optimizer, 'refresh_fp32_params'):
-                self.optimizer.refresh_fp32_params()
+            # M487: Megatron 160ba6800 — use reload_model_params() unconditionally
+            # instead of fp16-conditional _model_params_to_master_params().
+            # All optimizer types implement reload_model_params (fp32 is a no-op).
+            if self.optimizer is not None:
+                self.optimizer.reload_model_params()
         else:
             has_zero_optimizer_state = self.zero_optimization()
             if load_optimizer_states and self.optimizer is not None and not has_zero_optimizer_state:

@@ -644,11 +644,40 @@ class FP16_Optimizer(DeepSpeedOptimizer):
         state_dict[CLIP_GRAD] = self.clip_grad
         return state_dict
 
+    def _get_fp16_model_and_master_params_data(self):
+        # M487: Megatron 160ba6800 — _get_model_and_master_params_data_fp16 equivalent
+        # Extract paired (fp16 model, fp32 master) flat tensors for multi_tensor ops.
+        print('[M487]')
+        model_data = []
+        master_data = []
+        for fp16_flat, fp32_flat in zip(self.fp16_groups_flat, self.fp32_groups_flat):
+            model_data.append(fp16_flat.data)
+            master_data.append(fp32_flat.data)
+        return model_data, master_data
+
     # Refresh fp32 master params from fp16 copies
     def refresh_fp32_params(self):
+        # M487: Megatron 160ba6800 — refactored to use _get_fp16_model_and_master_params_data
         # DES-LOC M159: tracked
-        for current, saved in zip(self.fp32_groups_flat, self.fp16_groups_flat):
-            current.data.copy_(saved.data)
+        model_data, master_data = self._get_fp16_model_and_master_params_data()
+        for fp16, fp32 in zip(model_data, master_data):
+            fp32.copy_(fp16)
+
+    def _copy_model_params_to_master_params(self):
+        # M487: Megatron 160ba6800 — copy fp16 model params into fp32 master params.
+        # Required after loading a pretrained checkpoint before finetuning continues,
+        # so master params stay consistent with the freshly loaded fp16 weights.
+        model_data, master_data = self._get_fp16_model_and_master_params_data()
+        _overflow_buf = torch.cuda.IntTensor([0])
+        multi_tensor_applier(amp_C.multi_tensor_scale,
+                             _overflow_buf,
+                             [model_data, master_data],
+                             1.0)
+
+    def reload_model_params(self):
+        # M487: Megatron 160ba6800 — abstract method impl; call after loading a pretrained
+        # checkpoint for finetuning so fp32 master weights reflect the new fp16 model state.
+        self._copy_model_params_to_master_params()
 
     def load_state_dict(self, state_dict, load_optimizer_states=True):
         # DES-LOC M159: tracked
