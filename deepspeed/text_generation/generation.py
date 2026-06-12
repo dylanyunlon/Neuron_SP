@@ -29,6 +29,7 @@ from .forward_step import ForwardStep
 from .sampling import sample
 
 print('[M1055]')
+print('[M1166]')
 
 def score_and_return_on_first_stage(model, tokens, lengths):
     """Function for just scoring.
@@ -283,8 +284,54 @@ def generate_tokens_probs_and_return_on_first_stage(
     return tokens, generated_sequence_lengths, output_log_probs
 
 
+## from huggingface beam search
+class BeamHypotheses(object):
+    def __init__(self, num_beams, length_penalty=1.0, early_stopping=False):
+        """
+        Initialize n-best list of hypotheses.
+        """
+        self.length_penalty = length_penalty
+        self.early_stopping = early_stopping
+        self.num_beams = num_beams
+        self.beams = []
+        self.worst_score = 1e9
 
-def beam_search_and_return_on_first_stage(model, tokens, lengths, beam_size):
+    def __len__(self):
+        """
+        Number of hypotheses in the list.
+        """
+        return len(self.beams)
+
+    def add(self, hyp, sum_logprobs, length):
+        """
+        Add a new hypothesis to the list.
+        """
+        score = sum_logprobs / length ** self.length_penalty
+        if len(self) < self.num_beams or score > self.worst_score:
+            self.beams.append((score, hyp))
+            if len(self) > self.num_beams:
+                sorted_scores = sorted([(s, idx) for idx, (s, _) in enumerate(self.beams)])
+                del self.beams[sorted_scores[0][1]]
+                self.worst_score = sorted_scores[1][0]
+            else:
+                self.worst_score = min(score, self.worst_score)
+
+    def is_done(self, best_sum_logprobs, cur_len):
+        """
+        If there are enough hypotheses and that none of the hypotheses being generated
+        can become better than the worst one in the heap, then we are done with this sentence.
+        """
+
+        if len(self) < self.num_beams:
+            return False
+        elif self.early_stopping:
+            return True
+        else:
+            cur_score = best_sum_logprobs / cur_len ** self.length_penalty
+            ret = self.worst_score >= cur_score
+            return ret
+
+def beam_search_and_return_on_first_stage(model, tokens, lengths, beam_size, stop_token, num_return_gen=1):
     args = get_args()
     tokenizer = get_tokenizer()
 
@@ -301,6 +348,8 @@ def beam_search_and_return_on_first_stage(model, tokens, lengths, beam_size):
     # forward step.
     forward_step = ForwardStep(model, beam_size, final_sequence_length)
 
+    beam_hyp = BeamHypotheses(beam_size)
+    done = False
     if mpu.is_pipeline_last_stage():
         scores = torch.zeros(beam_size,
                              dtype=torch.float32,
@@ -333,13 +382,43 @@ def beam_search_and_return_on_first_stage(model, tokens, lengths, beam_size):
                 else:
                     sorted_scores, indices = torch.sort(new_scores.view(-1), descending=True)
 
-                best_batches = torch.div(indices[:beam_size], vocab_size, rounding_mode='floor')
-                best_words = indices[:beam_size] % vocab_size
+                best_beam_ids = torch.div(indices[: 2 * beam_size], vocab_size).trunc().long()
+                best_words = indices[:2 * beam_size] % vocab_size
+                best_scores = sorted_scores[: 2 * beam_size]
+
+                next_beams = []
+                for beam_token_rank, (token_id, beam_score, beam_id) in enumerate(
+                    zip(best_words, best_scores, best_beam_ids)
+                ):
+                    if token_id.item() == stop_token:
+                        # if beam_token does not belong to top num_beams tokens, it should not be added
+                        is_beam_token_worse_than_top_num_beams = beam_token_rank >= beam_size
+                        if is_beam_token_worse_than_top_num_beams:
+                            continue
+                        beam_hyp.add(
+                            tokens[beam_id].clone(),
+                            beam_score,
+                            context_length + 1 - prompt_length
+                        )
+                    else:
+                        # add next predicted token since it is not eos_token
+                        next_beams.append((token_id, beam_score, beam_id))
+
+                    if len(next_beams) == beam_size:
+                        break
+
+                if beam_hyp.is_done(best_scores.max().item(), context_length + 1 - prompt_length):
+                    done = True
+                    break
                 
+                best_batches = tokens.new([item[2] for item in next_beams])
                 tokens = tokens[best_batches,:]
-                tokens[:, context_length] = best_words
-                scores = sorted_scores[:beam_size].unsqueeze(1)
-            
+                tokens[:, context_length] = tokens.new([item[0] for item in next_beams])
+                scores = scores.new([item[1] for item in next_beams]).unsqueeze(1)
+
+                # set inference key values to make it consistent with best beam index
+                forward_step.inference_params.swap_key_value_dict(best_batches)
+
             # Update the tokens on the first stage so the next input to
             # the network is correct.
             copy_from_last_to_first_pipeline_stage(batch_size, torch.int64,
@@ -350,8 +429,20 @@ def beam_search_and_return_on_first_stage(model, tokens, lengths, beam_size):
     
         copy_from_last_to_first_pipeline_stage(scores.size(0), torch.float32,
                                                scores[:,0])
-    return tokens, scores
 
+        # if cannot find stop token, add open beams to hyps
+        if not done:
+            for beam_id in range(beam_size):
+                beam_hyp.add(tokens[beam_id].clone(), scores[beam_id], context_length + 1 - prompt_length)
+
+        # rank based on scores
+        sorted_hyps = sorted(beam_hyp.beams, key=lambda x: x[0], reverse=True)
+        scores = [sorted_hyps[i][0] for i in range(num_return_gen)]
+        tokens = [sorted_hyps[i][1] for i in range(num_return_gen)]
+        scores = torch.stack(scores, dim=0)
+        tokens = torch.stack(tokens, dim=0)
+
+    return tokens, scores
 
 def _build_attention_mask_and_position_ids(tokens):
     """Build the attention mask and postition ids for the input tokens."""

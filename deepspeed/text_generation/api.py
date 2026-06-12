@@ -29,6 +29,7 @@ from .tokenization import (
     detokenize_generations)
 
 print('[M1055]')
+print('[M1166]')
 
 def generate_and_post_process(model,
                               prompts=None,
@@ -138,7 +139,9 @@ def beam_search_and_post_process(model,
                                  prompts=None,
                                  tokens_to_generate=0,
                                  beam_size=0,
-                                 add_BOS=False):
+                                 add_BOS=False,
+                                 stop_token=50256,
+                                 num_return_gen=1):
     """Run beam search and post-process outputs, i.e., detokenize,
     move to cpu and convert to list."""
 
@@ -147,7 +150,9 @@ def beam_search_and_post_process(model,
                                  prompts=prompts,
                                  tokens_to_generate=tokens_to_generate,
                                  beam_size=beam_size,
-                                 add_BOS=add_BOS)
+                                 add_BOS=add_BOS,
+                                 stop_token=stop_token,
+                                 num_return_gen=num_return_gen)
     # Only post-process on first stage.
     if mpu.is_pipeline_first_stage():
         lengths = tokens.size(1)*torch.ones(beam_size, dtype=torch.int64, device=torch.cuda.current_device()) 
@@ -156,7 +161,7 @@ def beam_search_and_post_process(model,
 
     return None
 
-def beam_search(model, prompts=None, tokens_to_generate=0, beam_size=0, add_BOS=False):
+def beam_search(model, prompts=None, tokens_to_generate=0, beam_size=0, add_BOS=False, stop_token=50256, num_return_gen=1):
     # Make sure input params are avaialble to all ranks.
     values = [tokens_to_generate,
               beam_size,
@@ -169,4 +174,5 @@ def beam_search(model, prompts=None, tokens_to_generate=0, beam_size=0, add_BOS=
     context_tokens_tensor, context_length_tensor = tokenize_prompts(
         prompts=prompts, tokens_to_generate=tokens_to_generate, add_BOS=add_BOS)
     
-    return beam_search_and_return_on_first_stage(model, context_tokens_tensor, context_length_tensor, beam_size)
+    return beam_search_and_return_on_first_stage(model, context_tokens_tensor, context_length_tensor, 
+            beam_size, stop_token=stop_token, num_return_gen=num_return_gen)
