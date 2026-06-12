@@ -624,9 +624,14 @@ def clip_grad_norm_(parameters, max_norm, norm_type=2, mpu=None):
         else:
             total_norm = get_accelerator().FloatTensor([0.0])
         total_norm = total_norm.to(get_accelerator().current_device_name())
-        # Sum across all model parallel GPUs.
+        # M1066: Megatron a58653dc5 — clip grad reduce across world, not just model group.
+        # >>>
+        # dist.all_reduce(total_norm, op=dist.ReduceOp.SUM, group=mpu.get_model_parallel_group())
+        # +++
+        print('[M1066]')
         if mpu is not None:
-            dist.all_reduce(total_norm, op=dist.ReduceOp.SUM, group=mpu.get_model_parallel_group())
+            dist.all_reduce(total_norm, op=dist.ReduceOp.SUM)
+        # <<<
         total_norm = total_norm.pow(1. / norm_type)
 
     # Need to average total_norm across different GPUs due to the presence of moe params
