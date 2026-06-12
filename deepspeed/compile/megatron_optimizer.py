@@ -2,6 +2,35 @@
 # DeepSpeed Team
 
 # ---------------------------------------------------------------------------
+# M1111: Megatron 2c1660e76 — cleaned distrib_optimizer.py.
+# Source: megatron/optimizer/distrib_optimizer.py (NVIDIA/Megatron-LM commit 2c1660e76)
+# Author: Lawrence McAfee <lmcafee@nvidia.com>  Date: 2022-03-14
+#
+# Mapping: megatron/optimizer/distrib_optimizer.py → deepspeed/compile/megatron_optimizer.py
+#
+# Changes ported from distrib_optimizer.py (diff vs parent):
+#   1. Removed `from lutil import pax, tp` / DEBUG_ITERATION debug block at top.
+#   2. Removed commented-out class declarations above DistributedOptimizer.
+#   3. allocate_main_param_shards(): removed >>> / <<< markers and commented
+#      torch.zeros alternative.
+#   4. state_dict(): removed commented-out pax block; removed commented
+#      params key; kept state_dict['groups'] line.
+#   5. load_state_dict(): removed pax debug blocks; simplified copy loop.
+#   6. zero_grad(): added "# Collect model params." comment; changed comment
+#      from `** using contiguous buffer; don't set_to_none **` to
+#      `Distributed optimizer requires contiguous buffer; don't set to None.`;
+#      force set_to_none=False; removed commented alternative call.
+#   7. gather_model_params(): removed ITERATION parameter.
+#   8. _copy_model_grads_to_main_grads(): removed ITERATION parameter.
+#   9. _copy_main_params_to_model_params(): removed ITERATION parameter;
+#      removed post-copy isnan/pax debug block.
+#   (In this file Float16DistributedOptimizer maps to DistributedOptimizer;
+#   stub raise-Exception methods replaced with real state_dict/load_state_dict.)
+# ---------------------------------------------------------------------------
+
+print('[M1111]')
+
+# ---------------------------------------------------------------------------
 # M1098: Megatron 862d70fce — small fixes.
 # Source: megatron/optimizer/optimizer.py + megatron/model/distributed.py +
 #         megatron/training.py (NVIDIA/Megatron-LM commit 862d70fce)
@@ -861,8 +890,6 @@ class BaseFloat16Optimizer(MegatronOptimizer):
         return True, grad_norm, num_zeros_in_grad
 
 
-# class Float16DistributedOptimizer(Float16OptimizerWithFloat16Params):
-# class Float16DistributedOptimizer(MegatronOptimizer):
 class Float16DistributedOptimizer(BaseFloat16Optimizer):
 
     @classmethod
@@ -1054,21 +1081,47 @@ class Float16DistributedOptimizer(BaseFloat16Optimizer):
     def get_main_grad(self, group_index):
         return self.get_main_param(group_index).grad
 
-    def load_state_dict(self):
-        raise Exception("hi.")
-    def reload_model_params(self):
-        raise Exception("hi.")
     def state_dict(self):
-        raise Exception("hi.")
+        state_dict = {}
+        state_dict['optimizer'] = self.optimizer.state_dict()
+        if self.grad_scaler:
+            state_dict['grad_scaler'] = self.grad_scaler.state_dict()
+        state_dict['groups'] = [g['params'] for g in self.optimizer.param_groups]
+        return state_dict
+
+    def load_state_dict(self, state_dict):
+        optimizer_key = 'optimizer'
+        if optimizer_key not in state_dict:
+            optimizer_key = 'optimizer_state_dict'
+            print_rank_0('***WARNING*** loading optimizer from '
+                         'an old checkpoint ...')
+        self.optimizer.load_state_dict(state_dict[optimizer_key])
+
+        # Grad scaler.
+        if 'grad_scaler' not in state_dict:
+            print_rank_0('***WARNING*** found an old checkpoint, will not '
+                         'load grad scaler ...')
+        else:
+            if self.grad_scaler:
+                self.grad_scaler.load_state_dict(state_dict['grad_scaler'])
+
+        # Copy data for the main params.
+        current_groups = [g["params"] for g in self.optimizer.param_groups]
+        assert "groups" in state_dict, "key 'groups' not in state_dict."
+        for current_group, saved_group in zip(current_groups, state_dict["groups"]):
+            for current_param, saved_param in zip(current_group, saved_group):
+                current_param.data.copy_(saved_param.data)
 
     def zero_grad(self, set_to_none=True):
 
+        # Collect model params.
         model_params = []
         for model in self.models:
             for dtype, param_map in model._grad_buffer_param_index_map.items():
                 model_params.extend(param_map.keys())
 
-        _zero_grad_group_helper(model_params, set_to_none)
+        # Distributed optimizer requires contiguous buffer; don't set to None.
+        _zero_grad_group_helper(model_params, set_to_none = False)
 
     def get_model_grad_buffer_dp_views(self):
 
@@ -1212,13 +1265,3 @@ class Float16DistributedOptimizer(BaseFloat16Optimizer):
                 main_view = main_param[main_shard.start:main_shard.end]
 
                 model_view.detach().copy_(main_view)
-
-        # >>>
-        for param in self.param_gbuf_map:
-            is_nan = torch.any(torch.isnan(param)).item()
-            if is_nan:
-                pax({
-                    "param": tp(param),
-                    "is_nan": is_nan,
-                })
-        # <<<
