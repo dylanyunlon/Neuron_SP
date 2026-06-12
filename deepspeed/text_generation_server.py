@@ -120,6 +120,12 @@ class MegatronGenerate(Resource):
         if str(request.remote_addr) == "10.14.68.146":
             return "Too many tokens requested from this IP address.  Contact Ryan Prenger rprenger@nvidia.com"
 
+        beam_search = False
+        if "beam_search" in request.get_json():
+            beam_search = request.get_json()["beam_search"]
+            if not isinstance(no_log, bool):
+                return "beam_search must be a boolean value"
+        
         with lock:  # Need to get lock to keep multiple threads from hitting code
             print("request IP: " + str(request.remote_addr))
             print(json.dumps(request.get_json()),flush=True)

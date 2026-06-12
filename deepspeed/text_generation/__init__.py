@@ -13,4 +13,4 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .api import generate_and_post_process, generate
+from .api import generate_and_post_process, generate, beam_search_and_post_process, beam_search
