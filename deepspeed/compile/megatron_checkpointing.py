@@ -269,7 +269,130 @@ def load_virtual_pipeline_state_dict(model_list, state_dict, strict=True):
     print(f'[M556] load_virtual_pipeline_state_dict: {len(model_list)} stage(s)')
 
 
+
 # ===========================================================================
+# M1203: Megatron 977efdfb9 — added backwards compatibility to checkpointing.py
+# ===========================================================================
+#
+# Upstream source: megatron/checkpointing.py → deepspeed/compile/megatron_checkpointing.py
+#
+# Changes ported from get_checkpoint_names():
+#
+#   BEFORE: always built common_path with both tensor and pipeline MP ranks:
+#       common_path = os.path.join(
+#           checkpoints_path, directory,
+#           "mp_rank_%02d_%03d" % (
+#               mpu.get_tensor_model_parallel_rank(),
+#               mpu.get_pipeline_model_parallel_rank()))
+#       model_name = os.path.join(common_path, "model_rng.pt")
+#       if use_distributed_optimizer:
+#           optim_name = os.path.join(
+#               common_path + "_%03d" % mpu.get_data_parallel_rank(), "optim.pt")
+#       else:
+#           optim_name = os.path.join(common_path, "optim.pt")
+#
+#   AFTER: when pipeline world size == 1, omit the pipeline rank suffix
+#       (backward-compatible with checkpoints saved without pipeline parallelism);
+#       also unified model/optim naming: non-distributed-optimizer now uses
+#       "model_optim_rng.pt" for both names instead of separate files.
+#
+#       if mpu.get_pipeline_model_parallel_world_size() == 1:
+#           common_path = os.path.join(checkpoints_path, directory,
+#                                      'mp_rank_{:02d}'.format(
+#                                          mpu.get_tensor_model_parallel_rank()))
+#       else:
+#           common_path = os.path.join(checkpoints_path, directory,
+#                                      'mp_rank_{:02d}_{:03d}'.format(
+#                                          mpu.get_tensor_model_parallel_rank(),
+#                                          mpu.get_pipeline_model_parallel_rank()))
+#       if use_distributed_optimizer:
+#           model_name = os.path.join(common_path, "model_rng.pt")
+#           optim_name = os.path.join(
+#               common_path + "_%03d" % mpu.get_data_parallel_rank(), "optim.pt")
+#       else:
+#           model_name = optim_name = os.path.join(common_path, "model_optim_rng.pt")
+#
+# 20% adaptation: mpu calls are forwarded to deepspeed.compile.mpu_initialize
+# equivalents; function is self-contained and usable independently of the
+# Megatron global state machinery.  Adds print('[M1203]').
+# ===========================================================================
+
+print('[M1203]')
+
+
+def get_checkpoint_names(checkpoints_path, iteration, use_distributed_optimizer,
+                         release=False):
+    """Return (model_name, optim_name) for the checkpoint at *iteration*.
+
+    Megatron 977efdfb9 checkpointing.py get_checkpoint_names():
+      Adds backwards-compatible path construction: when pipeline-model-parallel
+      world size is 1, the directory name uses only the tensor-parallel rank
+      (``mp_rank_XX``) instead of ``mp_rank_XX_YYY``, matching checkpoints
+      saved by older code that predates pipeline parallelism support.
+
+      Also unifies the non-distributed-optimizer file name to
+      ``model_optim_rng.pt`` (combining the previous separate ``model_rng.pt``
+      and ``optim.pt`` into a single file).
+
+    Args:
+        checkpoints_path: root directory that contains iteration sub-dirs.
+        iteration: training iteration number (ignored when release=True).
+        use_distributed_optimizer: if True, optimizer state is stored in a
+            separate per-data-parallel-rank file.
+        release: if True, uses the ``release`` sub-directory instead of an
+            iteration-numbered one.
+
+    Returns:
+        (model_name, optim_name): absolute paths to the model and optimizer
+        checkpoint files.
+    """
+    import os
+    try:
+        from deepspeed.compile import mpu_initialize as mpu
+    except ImportError:
+        # Fall back to a bare-minimum shim so the function is importable even
+        # when the full mpu stack is not yet initialised.
+        class _mpu_shim:
+            @staticmethod
+            def get_pipeline_model_parallel_world_size(): return 1
+            @staticmethod
+            def get_tensor_model_parallel_rank(): return 0
+            @staticmethod
+            def get_pipeline_model_parallel_rank(): return 0
+            @staticmethod
+            def get_data_parallel_rank(): return 0
+        mpu = _mpu_shim()
+
+    if release:
+        directory = 'release'
+    else:
+        directory = 'iter_{:07d}'.format(iteration)
+
+    # Use both the tensor and pipeline MP rank.  If the pipeline world size is
+    # 1 (no pipeline parallelism), omit the pipeline rank suffix for backwards
+    # compatibility with checkpoints created by older Megatron versions.
+    if mpu.get_pipeline_model_parallel_world_size() == 1:
+        common_path = os.path.join(checkpoints_path, directory,
+                                   'mp_rank_{:02d}'.format(
+                                       mpu.get_tensor_model_parallel_rank()))
+    else:
+        common_path = os.path.join(checkpoints_path, directory,
+                                   'mp_rank_{:02d}_{:03d}'.format(
+                                       mpu.get_tensor_model_parallel_rank(),
+                                       mpu.get_pipeline_model_parallel_rank()))
+
+    # If using the distributed optimizer the optimizer's path must additionally
+    # include the data parallel rank.
+    if use_distributed_optimizer:
+        model_name = os.path.join(common_path, 'model_rng.pt')
+        optim_name = os.path.join(
+            common_path + '_%03d' % mpu.get_data_parallel_rank(),
+            'optim.pt')
+    else:
+        model_name = optim_name = os.path.join(common_path, 'model_optim_rng.pt')
+
+    return model_name, optim_name
+
 # M1204: Megatron b178e6fc5 — error fixes & tested
 # ===========================================================================
 #
