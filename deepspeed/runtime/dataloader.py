@@ -3082,3 +3082,71 @@ def _m408_build_train_valid_test_data_iterators_global_batch_size(args,
     return global_batch_size
 
 # --- End M408 dataloader ---
+
+
+# ===========================================================================
+# M463: Megatron 6e83649f6 — Quick fix for pipeline tasks to get learning
+#       rate correct
+# ===========================================================================
+#
+# Upstream source:
+#   tasks/finetune_utils.py  → deepspeed/runtime/dataloader.py
+#
+# Key change carried over:
+#   _build_train_valid_dataloaders(), after micro_batch_size is scaled by
+#   sample_multiplier, also scale global_batch_size by the same factor.
+#
+#   Before:
+#     if hasattr(train_dataset, 'sample_multiplier'):
+#         args.micro_batch_size *= train_dataset.sample_multiplier
+#
+#   After:
+#     if hasattr(train_dataset, 'sample_multiplier'):
+#         args.micro_batch_size *= train_dataset.sample_multiplier
+#         args.global_batch_size *= train_dataset.sample_multiplier   # NEW
+#
+#   Without the global_batch_size update, pipeline stages computed the
+#   wrong tensor-transfer size and the LR schedule (based on samples seen)
+#   used an incorrect denominator, causing learning-rate to be too low
+#   during fine-tuning on datasets whose samples expand via sample_multiplier
+#   (e.g. RACE, where each question carries multiple answer options).
+#
+# Neuron_SP adaptation:
+#   Logic is exposed as _m463_apply_sample_multiplier_to_batch_sizes() so
+#   callers can invoke it after dataloader construction.
+#
+
+print('[M463]')
+
+
+def _m463_apply_sample_multiplier_to_batch_sizes(args, train_dataset):
+    """M463: Megatron 6e83649f6 — scale both batch-size args by sample_multiplier.
+
+    Some fine-tuning datasets (e.g. RACE) pack several logical samples into
+    each dataset item via a ``sample_multiplier`` attribute.  Before this fix
+    only ``args.micro_batch_size`` was scaled, leaving
+    ``args.global_batch_size`` at the original value.  Two problems followed:
+
+    1. **Pipeline transfers** — inter-stage activation tensors are sized by
+       micro_batch_size, but the scheduler expected global_batch_size to match;
+       the mismatch caused shape errors or silently wrong activations.
+
+    2. **LR schedule** — the schedule advances by counting samples consumed,
+       which is derived from global_batch_size.  With the old (unscaled) value
+       the schedule moved too slowly, effectively reducing the learning rate
+       for the whole fine-tuning run.
+
+    Args:
+        args: parsed argument namespace; must expose ``.micro_batch_size``
+              and ``.global_batch_size``.
+        train_dataset: dataset object; if it has a ``sample_multiplier``
+                       attribute both batch-size fields are multiplied by it.
+
+    Returns:
+        None.  ``args`` is mutated in-place.
+    """
+    if hasattr(train_dataset, 'sample_multiplier'):
+        args.micro_batch_size *= train_dataset.sample_multiplier
+        args.global_batch_size *= train_dataset.sample_multiplier
+
+# --- End M463 dataloader ---
