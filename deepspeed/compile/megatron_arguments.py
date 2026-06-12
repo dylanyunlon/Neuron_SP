@@ -565,6 +565,39 @@ def add_virtual_pipeline_arg(parser):
     return parser
 
 # ---------------------------------------------------------------------------
+# M598: Megatron 0aff3629e — Update argument names and fix merge error
+# Source: megatron/arguments.py (NVIDIA/Megatron-LM commit 0aff3629e)
+# Author: Rewon Child <rchild@nvidia.com>  Date: 2021-03-04
+#
+# Mapping: megatron/arguments.py → deepspeed/compile/megatron_arguments.py
+#
+# Change ported from arguments.py _add_logging_args():
+#   Before: group.add_argument('--log-zeros', action='store_true',
+#               help='If set, calculate and log the number of zeros in gradient.')
+#   After:  group.add_argument('--log-num-zeros-in-grad', action='store_true',
+#               help='If set, calculate and log the number of zeros in gradient.')
+#
+# Companion renames in optimizer/__init__.py and optimizer/optimizer.py:
+#   args.log_zeros → args.log_num_zeros_in_grad
+#   self.log_zeros → self.log_num_zeros_in_grad
+#   num_zeros      → num_zeros_in_grad  (local variable + return value)
+#
+# Also fixes a merge conflict in training.py train_step():
+#   <<<<<<< HEAD:  update_successfull, grad_norm, num_zeros = optimizer.step()
+#   >>>>>>> main:  update_successful, grad_norm = optimizer.step()
+#   Resolved to:   update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
+#
+# DeepSpeed adaptation (documentation only — no functional code change):
+#   DeepSpeed's engine does not currently use `log_zeros` / `log_num_zeros_in_grad`
+#   as a direct argument; gradient-zero counting is handled internally in
+#   deepspeed/runtime/zero/ and deepspeed/runtime/engine.py.
+#   This block documents the upstream rename so future argument bridging
+#   (args → DeepSpeed config) uses the correct canonical name.
+# ---------------------------------------------------------------------------
+
+print('[M598]')
+
+# ---------------------------------------------------------------------------
 # M610: Megatron 0d5188c15 — refactored the fused kernels build
 # Source: megatron/arguments.py (NVIDIA/Megatron-LM commit 0d5188c15)
 # Author: Mohammad Shoeybi <mshoeybi@nvidia.com>  Date: 2021-03-17
