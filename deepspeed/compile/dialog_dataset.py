@@ -35,6 +35,9 @@ print('[M702]')
 # M895: Megatron b3eea9d8b — Delete commands.sh
 # tasks/knwl_dialo/scripts/commands.sh did not exist in Neuron_SP; deletion is a no-op here.
 print('[M895]')
+# M936: Megatron 7122b878e — delete interactive file
+# tools/control_dialog_interactive.py did not exist in Neuron_SP; deletion is a no-op here.
+print('[M936]')
 
 from deepspeed.compile.megatron_initialize import get_tokenizer
 
