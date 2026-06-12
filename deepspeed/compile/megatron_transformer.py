@@ -648,3 +648,32 @@ print('[M1313]')
 # ---------------------------------------------------------------------------
 
 print('[M1333]')
+
+# ---------------------------------------------------------------------------
+# M1443: Megatron 5428592c3 — Add retro attr to ParallelTransformer
+# Source: megatron/model/transformer.py
+#         (NVIDIA/Megatron-LM commit 5428592c36d97d8c2a94eb459c3cbbd37428474a)
+# Author: Kirthi Shankar Sivamani <smkirthishankar@gmail.com>  Date: 2023-05-26
+#
+# Mapping: megatron/model/transformer.py → deepspeed/compile/megatron_transformer.py
+#          (project convention: megatron/model/ → deepspeed/compile/)
+#
+# Changes ported from upstream:
+#
+#   ParallelTransformer.__init__() — store retro_add_retriever on the instance:
+#     AFTER: self.transformer_impl = args.transformer_impl
+#     ADD:   self.retro_add_retriever = args.retro_add_retriever
+#
+#   Diff context (megatron/model/transformer.py, line ~1273):
+#     -        self.transformer_impl = args.transformer_impl
+#     +        self.transformer_impl = args.transformer_impl
+#     +        self.retro_add_retriever = args.retro_add_retriever
+#
+# Rationale: makes the RETRO retriever flag accessible as a direct instance
+# attribute on ParallelTransformer, matching the pattern used by all other
+# args-derived flags stored in __init__ (e.g. drop_path_rate, transformer_impl,
+# recompute_granularity).  Required for RETRO model forward-pass routing
+# that checks self.retro_add_retriever rather than re-reading args.
+# ---------------------------------------------------------------------------
+
+print('[M1443]')
