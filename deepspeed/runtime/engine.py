@@ -6777,3 +6777,76 @@ def _m467_train_loop_step_order(
 # ---------------------------------------------------------------------------
 print('[M472]')
 # --- End M472 engine ---
+# ---------------------------------------------------------------------------
+# M503: Megatron 5b74f7643 — fixed validation loss reporting in tensorboard
+# Source commit: 5b74f76434cb8e9177b82fd67ac6c60450a3aca9
+# Author: mohammad <mshoeybi@nvidia.com>  Date: 2021-01-11
+#
+# Changes in this commit (megatron/training.py,
+#                          evaluate_and_print_results()):
+#
+#   1. Added `args = get_args()` at the top of the function so that
+#      consumed_train_samples is accessible for x-axis labelling.
+#
+#   2. Rank guard changed from `torch.distributed.get_rank() == 0` to
+#      `is_last_rank()`.  Rationale: in pipeline-parallel setups the last
+#      pipeline stage (not rank 0) is responsible for the final loss value,
+#      so writing tensorboard scalars from rank 0 silently produced zeros or
+#      stale data.
+#
+#   3. Tensorboard scalar keys renamed to include a "-validation" suffix:
+#        Before:  '{key} value'        → After: '{key} value-validation'
+#        Before:  '{key} ppl'          → After: '{key} ppl-validation'
+#      This prevents training and validation scalars from sharing the same
+#      key and overwriting each other in the tensorboard dashboard.
+#
+#   4. Two new "vs samples" scalars added per loss key, using
+#      args.consumed_train_samples as the x-axis instead of `iteration`:
+#        writer.add_scalar('{key} value-validation vs samples',
+#                          loss_value, args.consumed_train_samples)
+#        writer.add_scalar('{key} ppl-validation vs samples',
+#                          ppl, args.consumed_train_samples)
+#      Rationale: iteration-indexed curves are hard to compare across runs
+#      with different global batch sizes; samples-indexed curves normalise
+#      for batch size and give an apples-to-apples view of data efficiency.
+#
+# Neuron_SP mapping:
+#   megatron/training.py → deepspeed/runtime/engine.py (training loop /
+#   validation reporting logic).  DeepSpeed uses its own monitor/tensorboard
+#   infrastructure, but the fix pattern (is_last_rank guard, -validation
+#   suffix, dual x-axis scalars) should be applied wherever DeepSpeed
+#   validation losses are written to tensorboard.
+# ---------------------------------------------------------------------------
+
+print('[M503]')
+
+
+def _m503_write_validation_tensorboard(writer, key, loss_value, ppl, iteration, consumed_train_samples):
+    """M503: Megatron 5b74f7643 — write validation scalars with correct keys.
+
+    Writes four tensorboard scalars for a single validation loss key:
+      - '{key} value-validation'          (x = iteration)
+      - '{key} ppl-validation'            (x = iteration)
+      - '{key} value-validation vs samples' (x = consumed_train_samples)
+      - '{key} ppl-validation vs samples'   (x = consumed_train_samples)
+
+    Should only be called from is_last_rank() (not rank 0) to ensure the
+    rank that holds the final pipeline-parallel loss value is the one
+    writing to tensorboard.
+
+    Args:
+        writer: tensorboard SummaryWriter instance (must be non-None).
+        key (str): loss key name (e.g. 'lm loss').
+        loss_value (float): scalar loss value for this key.
+        ppl (float): perplexity derived from loss_value.
+        iteration (int): current training iteration used as x-axis.
+        consumed_train_samples (int): total samples consumed, used as
+            secondary x-axis for batch-size-normalised comparison.
+    """
+    writer.add_scalar('{} value-validation'.format(key), loss_value, iteration)
+    writer.add_scalar('{} ppl-validation'.format(key), ppl, iteration)
+    writer.add_scalar('{} value-validation vs samples'.format(key), loss_value, consumed_train_samples)
+    writer.add_scalar('{} ppl-validation vs samples'.format(key), ppl, consumed_train_samples)
+
+
+# --- End M503 engine ---
