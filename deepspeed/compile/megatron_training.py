@@ -246,3 +246,81 @@ def _m1062_train_step_call_site(forward_step_func, data_iterator,
     update_successful, grad_norm, num_zeros_in_grad = optimizer.step(ITERATION)
     # <<<
     return update_successful, grad_norm, num_zeros_in_grad
+
+# ---------------------------------------------------------------------------
+# M1297: Megatron 8f72cd413 — {"command": "./run.sh"}
+# Source: run.sh + run_maps_357m.sh (NVIDIA/Megatron-LM commit 8f72cd413)
+# Author: rprenger <rprenger@nvidia.com>  Date: 2023-03-10
+#
+# Mapping: run.sh + run_maps_357m.sh → deepspeed/compile/megatron_training.py
+#          (project convention: megatron top-level launch scripts →
+#           deepspeed/compile/ as reference config helpers)
+#
+# Changes ported from run_maps_357m.sh:
+#   1. MAPS_357M_TRAINING_CONFIG dict captures the 357M GPT model
+#      hyperparameters (tensor/pipeline parallel-size 1, 24 layers,
+#      hidden 1024, 16 heads, seq 2048, micro-batch 4, global-batch 256,
+#      train-samples 192M, cosine LR schedule 3e-4→3e-5, bf16, DDP local,
+#      checkpoint-activations).
+#   2. _m1297_sbatch_launch_cmd() documents the sbatch entry point from
+#      run.sh: `sbatch $TRAIN_ENV --job-name=... run_maps_357m.sh maps_357m`.
+#
+# DeepSpeed adaptation: sbatch/srun/container env does not apply directly;
+# config dict extracted for use by DeepSpeed argument parsers and experiment
+# schedulers.  Container image noted as nvcr.io/nvidia/pytorch:22.04-py3.
+# ---------------------------------------------------------------------------
+
+print('[M1297]')
+
+MAPS_357M_TRAINING_CONFIG = {
+    'tensor_model_parallel_size': 1,
+    'pipeline_model_parallel_size': 1,
+    'num_layers': 24,
+    'hidden_size': 1024,
+    'num_attention_heads': 16,
+    'seq_length': 2048,
+    'max_position_embeddings': 2048,
+    'micro_batch_size': 4,
+    'global_batch_size': 256,
+    'train_samples': 192_000_000,
+    'lr_decay_samples': 166_400_000,
+    'lr_warmup_samples': 162_761,
+    'lr': 3.0e-4,
+    'min_lr': 3.0e-5,
+    'lr_decay_style': 'cosine',
+    'log_interval': 100,
+    'eval_iters': 50,
+    'eval_interval': 2000,
+    'split': '98,2,0',
+    'clip_grad': 1.0,
+    'weight_decay': 0.1,
+    'adam_beta1': 0.9,
+    'adam_beta2': 0.95,
+    'init_method_std': 0.02,
+    'DDP_impl': 'local',
+    'bf16': True,
+    'checkpoint_activations': True,
+    'exit_duration_in_mins': 230,
+}
+
+
+def _m1297_sbatch_launch_cmd(train_env, job_name='rprenger:adlr-nlp-largelm:maps_357m',
+                              script='run_maps_357m.sh', name='maps_357m'):
+    """Reconstruct the sbatch launch command from run.sh (M1297).
+
+    Megatron 8f72cd413 adds run.sh which wraps run_maps_357m.sh in a single
+    sbatch call, forwarding $TRAIN_ENV for cluster-specific flags::
+
+        sbatch $TRAIN_ENV --job-name=rprenger:adlr-nlp-largelm:maps_357m \\
+            run_maps_357m.sh maps_357m
+
+    Args:
+        train_env (str): value of $TRAIN_ENV (cluster partition / constraint flags).
+        job_name  (str): slurm --job-name value.
+        script    (str): training script filename.
+        name      (str): positional $NAME argument forwarded to the script.
+
+    Returns:
+        str: full sbatch command string.
+    """
+    return f'sbatch {train_env} --job-name={job_name} {script} {name}'
