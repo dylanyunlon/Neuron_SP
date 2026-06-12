@@ -559,3 +559,178 @@ def _load_checkpoint_finetune_notes():
     pass  # documentation-only function
 
 print('[M1278]')
+
+# ---------------------------------------------------------------------------
+# M1378: Megatron 268cb0c87 — consolidated conditions.
+# Source: megatron/checkpointing.py (NVIDIA/Megatron-LM commit 268cb0c87)
+# Author: Lawrence McAfee <lmcafee@nvidia.com>  Date: 2023-04-21
+#
+# Mapping: megatron/checkpointing.py get_checkpoint_names()
+#        → deepspeed/compile/megatron_checkpointing.py get_checkpoint_names_v2()
+#
+# Changes ported from checkpointing.py get_checkpoint_names():
+#
+#   BEFORE (prior to 268cb0c87, four-way if/elif/elif/else):
+#
+#       if os.path.exists(unified_name):
+#           assert not os.path.exists(distrib_model_name)
+#           if use_distributed_optimizer:
+#               assert no_load_optim
+#           model_name = optim_name = unified_name
+#       elif os.path.exists(distrib_model_name):
+#           assert use_distributed_optimizer
+#           assert not os.path.exists(unified_name)
+#           model_name = distrib_model_name
+#           optim_name = distrib_optim_name
+#       elif use_distributed_optimizer:
+#           model_name = distrib_model_name
+#           optim_name = distrib_optim_name
+#       else:
+#           model_name = optim_name = unified_name
+#
+#   AFTER (268cb0c87, consolidated to three-way if/elif/else):
+#
+#       if os.path.exists(unified_name) or not use_distributed_optimizer:
+#           assert not os.path.exists(distrib_model_name)
+#           if use_distributed_optimizer:
+#               assert no_load_optim  # or args.finetune?
+#           model_name = optim_name = unified_name
+#       elif os.path.exists(distrib_model_name) or use_distributed_optimizer:
+#           assert use_distributed_optimizer
+#           assert not os.path.exists(unified_name)
+#           model_name = distrib_model_name
+#           optim_name = distrib_optim_name
+#       else:
+#           raise Exception("Handle case of unified exists (%d), distrib exists (%d), "
+#                           "and use_distributed_optimizer (%d)." % (...))
+#
+#   The consolidation eliminates the separate `elif use_distributed_optimizer`
+#   and `else: model_name = optim_name = unified_name` branches by merging
+#   them into the two leading conditions.  The final `else` now raises an
+#   Exception instead of silently falling back to unified_name, making
+#   unexpected combinations explicit rather than hidden.
+#
+#   This commit also adds optional tensor_rank, pipeline_rank, and
+#   pipeline_parallel overrides to the function signature, allowing callers
+#   to supply explicit ranks instead of querying mpu.
+#
+# 20% adaptation: exposed as get_checkpoint_names_v2() to sit alongside the
+# existing get_checkpoint_names() (M1203) without breaking callers.  The
+# no_load_optim parameter is added as required by the new first branch.
+# Adds print('[M1378]').
+# ---------------------------------------------------------------------------
+
+print('[M1378]')
+
+
+def get_checkpoint_names_v2(checkpoints_path, iteration,
+                             no_load_optim, use_distributed_optimizer,
+                             release=False,
+                             pipeline_parallel=None,
+                             tensor_rank=None,
+                             pipeline_rank=None):
+    """Return (model_name, optim_name) with consolidated existence+flag conditions.
+
+    Megatron 268cb0c87 checkpointing.py get_checkpoint_names():
+      Consolidates four-way if/elif/elif/else into three-way if/elif/else by
+      merging the ``elif use_distributed_optimizer`` fallback into the second
+      branch (``elif os.path.exists(distrib_model_name) or
+      use_distributed_optimizer``), and the ``else: model_name = unified_name``
+      fallback into the first branch (``if os.path.exists(unified_name) or
+      not use_distributed_optimizer``).  The final else now raises an Exception
+      for any remaining unhandled combination, surfacing bugs instead of
+      silently returning an incorrect name.
+
+    Args:
+        checkpoints_path: root directory containing iteration sub-dirs.
+        iteration: training iteration number (ignored when release=True).
+        no_load_optim: if True, optimizer will not be loaded; used to assert
+            that we are allowed to use a unified checkpoint even when
+            use_distributed_optimizer is set.
+        use_distributed_optimizer: if True, optimizer state is stored in a
+            separate per-data-parallel-rank file.
+        release: if True, uses the ``release`` sub-directory.
+        pipeline_parallel: override for pipeline-parallel flag; if None,
+            derived from mpu.get_pipeline_model_parallel_world_size() > 1.
+        tensor_rank: override tensor-parallel rank; if None, from mpu.
+        pipeline_rank: override pipeline-parallel rank; if None, from mpu.
+
+    Returns:
+        (model_name, optim_name): absolute paths to the model and optimizer
+        checkpoint files.
+
+    Raises:
+        Exception: if neither unified nor distributed checkpoint files exist
+            and neither condition unambiguously determines the file layout.
+    """
+    import os
+    try:
+        from deepspeed.compile import mpu_initialize as mpu
+    except ImportError:
+        class _mpu_shim:
+            @staticmethod
+            def get_pipeline_model_parallel_world_size(): return 1
+            @staticmethod
+            def get_tensor_model_parallel_rank(): return 0
+            @staticmethod
+            def get_pipeline_model_parallel_rank(): return 0
+            @staticmethod
+            def get_data_parallel_rank(): return 0
+        mpu = _mpu_shim()
+
+    if release:
+        directory = 'release'
+    else:
+        directory = 'iter_{:07d}'.format(iteration)
+
+    # Resolve rank overrides (268cb0c87 adds optional explicit rank args).
+    if pipeline_parallel is None:
+        pipeline_parallel = (mpu.get_pipeline_model_parallel_world_size() > 1)
+    if tensor_rank is None:
+        tensor_rank = mpu.get_tensor_model_parallel_rank()
+    if pipeline_rank is None:
+        pipeline_rank = mpu.get_pipeline_model_parallel_rank()
+
+    if not pipeline_parallel:
+        common_path = os.path.join(checkpoints_path, directory,
+                                   f'mp_rank_{tensor_rank:02d}')
+    else:
+        common_path = os.path.join(checkpoints_path, directory,
+                                   f'mp_rank_{tensor_rank:02d}_{pipeline_rank:03d}')
+
+    # Build candidate file names.
+    unified_name = os.path.join(common_path, "model_optim_rng.pt")
+    distrib_model_name = os.path.join(common_path, "model_rng.pt")
+    distrib_optim_name = os.path.join(
+        common_path + "_%03d" % mpu.get_data_parallel_rank(),
+        "optim.pt")
+
+    # 268cb0c87: consolidated four-way branch into three-way.
+    #
+    # Branch 1: unified file exists OR we are not using the distributed
+    #   optimizer (i.e. either the checkpoint is on disk as unified, or the
+    #   caller wants unified regardless of what's on disk).
+    if os.path.exists(unified_name) or not use_distributed_optimizer:
+        assert not os.path.exists(distrib_model_name)
+        if use_distributed_optimizer:
+            assert no_load_optim  # or args.finetune?
+        model_name = optim_name = unified_name
+    # Branch 2: distributed model file exists OR use_distributed_optimizer is
+    #   set (covers the case where neither file exists yet and we want distrib).
+    elif os.path.exists(distrib_model_name) or use_distributed_optimizer:
+        assert use_distributed_optimizer
+        assert not os.path.exists(unified_name)
+        model_name = distrib_model_name
+        optim_name = distrib_optim_name
+    # Branch 3 (268cb0c87): previously a silent fallback to unified_name;
+    #   now an explicit Exception to surface unexpected combinations.
+    else:
+        raise Exception(
+            "Handle case of unified exists (%d), distrib exists (%d), "
+            "and use_distributed_optimizer (%d)." % (
+                os.path.exists(unified_name),
+                os.path.exists(distrib_model_name),
+                use_distributed_optimizer))
+
+    print(f'[M1378] get_checkpoint_names_v2: model={model_name}')
+    return model_name, optim_name
