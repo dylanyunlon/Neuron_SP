@@ -1,4 +1,4 @@
-print('[M233]')
+print('[M276]')
 import itertools
 import os
 import random
@@ -14,6 +14,81 @@ from megatron.data.bert_dataset import BertDataset
 from megatron.data.dataset_utils import create_masked_lm_predictions, pad_and_convert_to_numpy
 
 qa_nlp = spacy.load('en_core_web_lg')
+SPACY_NER = spacy.load('en_core_web_lg')
+
+
+def join_str_list(str_list):
+    """Join a list of strings, handling spaces appropriately"""
+    result = ""
+    for s in str_list:
+        if s.startswith("##"):
+            result += s[2:]
+        else:
+            result += " " + s
+    return result
+
+
+def id_to_str_pos_map(token_ids, tokenizer):
+    """Given a list of ids, return a list of integers which correspond to the starting index
+    of the corresponding token in the original string (with spaces, without artifacts e.g. ##)"""
+    token_strs = tokenizer.tokenizer.convert_ids_to_tokens(token_ids)
+    pos_map = [0]
+    for i in range(len(token_strs) - 1):
+        len_prev = len(token_strs[i])
+        # do not add the length of the "##"
+        if token_strs[i].startswith("##"):
+            len_prev -= 2
+
+        # add the length of the space if needed
+        if token_strs[i + 1].startswith("##"):
+            pos_map.append(pos_map[-1] + len_prev)
+        else:
+            pos_map.append(pos_map[-1] + len_prev + 1)
+
+    # make sure total size is correct
+    offset = -2 if token_strs[-1].startswith("##") else 0
+    total_len = pos_map[-1] + len(token_strs[-1]) + offset
+    assert total_len == len(join_str_list(token_strs)) - 1, (total_len, len(join_str_list(token_strs)))
+
+    return pos_map
+
+
+def salient_span_mask(tokens, mask_id):
+    """Creates the predictions for the masked LM objective.
+    Note: Tokens here are vocab ids and not text tokens."""
+    tokenizer = get_tokenizer()
+    tokens_str = join_str_list(tokenizer.tokenizer.convert_ids_to_tokens(tokens))
+
+    # need to get all named entities
+    entities = SPACY_NER(tokens_str).ents
+    entities = [e for e in entities if e.text != "CLS"]
+    if len(entities) == 0:
+        return None
+    entity_idx = np.random.randint(0, len(entities))
+    selected_entity = entities[entity_idx]
+
+    token_pos_map = id_to_str_pos_map(tokens, tokenizer)
+    mask_start = mask_end = 0
+    set_mask_start = False
+    while mask_end < len(token_pos_map) and token_pos_map[mask_end] < selected_entity.end_char:
+        if token_pos_map[mask_start] > selected_entity.start_char:
+            set_mask_start = True
+        if not set_mask_start:
+            mask_start += 1
+        mask_end += 1
+    masked_positions = list(range(mask_start - 1, mask_end))
+
+    labels = []
+    output_tokens = tokens.copy()
+    for id_idx in masked_positions:
+        labels.append(tokens[id_idx])
+        output_tokens[id_idx] = mask_id
+    #print("-" * 100 + '\n',
+    #      "TOKEN STR\n", tokens_str + '\n',
+    #      "SELECTED ENTITY\n", selected_entity.text + '\n',
+    #      "OUTPUT\n", join_str_list(tokenizer.tokenizer.convert_ids_to_tokens(output_tokens)), flush=True)
+
+    return output_tokens, masked_positions, labels
 
 
 class RealmDataset(BertDataset):
