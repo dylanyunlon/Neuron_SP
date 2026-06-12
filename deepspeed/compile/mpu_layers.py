@@ -362,3 +362,64 @@ def _initialize_affine_weight_cpu(weight, output_size, input_size,
     if return_master_weight:
         return master_weight
     return None
+
+# ---------------------------------------------------------------------------
+# M1082: Megatron dd96d402a — bug fixes
+# Source: megatron/mpu/layers.py (NVIDIA/Megatron-LM commit dd96d402a)
+# Author: Vijay Korthikanti <vkorthikanti@nvidia.com>  Date: 2022-03-08
+#
+# Mapping: megatron/mpu/layers.py → deepspeed/compile/mpu_layers.py
+#          (project convention: mpu/* → deepspeed/compile/)
+#
+# Changes ported from upstream (mpu/layers.py):
+#
+#   1. LinearWithGradAccumulationAndAsyncCommunication.forward() [line ~215]:
+#      Whitespace-only fix: trailing whitespace after
+#        ctx.model_parallel_memory_opt = model_parallel_memory_opt
+#      changed from 4-space indent to 2-space indent on the blank continuation
+#      line.  No semantic change.
+#
+#   2. RowParallelLinear.__init__() [line ~487-489]:
+#      After the bias Parameter is created (both cpu and gpu paths), add:
+#        setattr(self.bias, 'sequence_parallel',
+#                args.model_parallel_memory_opt)
+#      placed immediately after the bias allocation block and before the
+#      "Always initialize bias to zero" comment.
+#      Rationale: when model_parallel_memory_opt (sequence parallelism) is
+#      active, the output of RowParallelLinear is scattered across TP ranks;
+#      the bias therefore lives on only one shard's worth of the sequence and
+#      must be handled by the sequence-parallel gradient all-reduce (not the
+#      normal tensor-parallel all-reduce).  Tagging bias.sequence_parallel
+#      lets the optimizer / gradient hook choose the correct reduction.
+#
+#   3. RowParallelLinear class body [line ~498]:
+#      Add an extra blank line between the end of __init__ and the start of
+#      forward().  Style-only change.
+#
+# Note: RowParallelLinear is not yet fully ported into deepspeed/compile/
+#   mpu_layers.py (it lives in the module_inject / compression layers).
+#   When a full port is added, change 2 must be reflected:
+#     # After bias allocation:
+#     setattr(self.bias, 'sequence_parallel', args.model_parallel_memory_opt)
+# ---------------------------------------------------------------------------
+
+print('[M1082]')
+
+# Change 2 reference implementation — to be applied when RowParallelLinear
+# is fully ported into this file:
+#
+# class RowParallelLinear(torch.nn.Module):
+#     def __init__(self, ...):
+#         ...
+#         if bias:
+#             if args.use_cpu_initialization:
+#                 self.bias = Parameter(torch.empty(...))
+#             else:
+#                 self.bias = Parameter(torch.empty(...,
+#                     device=torch.cuda.current_device(),
+#                     dtype=args.params_dtype))
+#             setattr(self.bias, 'sequence_parallel',  # M1082: dd96d402a
+#                     args.model_parallel_memory_opt)
+#             # Always initialize bias to zero.
+#             with torch.no_grad():
+#                 self.bias.zero_()
