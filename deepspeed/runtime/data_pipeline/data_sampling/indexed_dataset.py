@@ -423,6 +423,7 @@ class IndexedDatasetBuilder(object):
         self.doc_idx.append(len(self.sizes))
 
     def merge_file_(self, another_file):
+        print('[M1171]')
         index = IndexedDataset(another_file)
         assert index.dtype == self.dtype
 
@@ -757,6 +758,7 @@ class MMapIndexedDatasetBuilder(object):
         self._doc_idx.append(np.int64(len(self._sizes)))
 
     def merge_file_(self, another_file):
+        print('[M1171]')
         # Concatenate index
         index = MMapIndexedDataset.Index(index_file_path(another_file))
         assert index.dtype == self._dtype
