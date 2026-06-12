@@ -751,6 +751,14 @@ class MMapIndexedDatasetBuilder(object):
         self._data_file.write(np_array.tobytes(order='C'))
         self._sizes.append(np_array.size)
 
+    def add_batched_item(self, np_array):
+        print('[M1392]')
+        self._data_file.write(np_array.tobytes(order='C'))
+        cur_doc_sizes = len(self._sizes)
+        self._doc_idx.extend([i for i in range(cur_doc_sizes + 1,
+                                               cur_doc_sizes + np_array.shape[0] + 1)])
+        self._sizes.extend([np_array.shape[1]] * np_array.shape[0])
+
     def end_document(self):
         # M161: Megatron 662dc9820 — ensure doc index entries are stored as
         # int64 to prevent dtype mismatch when writing the index file
