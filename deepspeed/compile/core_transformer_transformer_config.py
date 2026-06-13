@@ -50,8 +50,28 @@
 # adds print('[M1420]') marker.
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# M1544: Megatron 62a1db8e2 — Add fp8 params to transformer config
+# Source: megatron/core/transformer/transformer_config.py (NVIDIA/Megatron-LM commit 62a1db8e2)
+# Author: jcasper <jcasper@nvidia.com>
+#
+# Mapping: megatron/core/transformer/transformer_config.py
+#       -> deepspeed/compile/core_transformer_transformer_config.py
+#
+# Changes ported from upstream (transformer_config.py only, 62 lines, 2 files):
+#   1. Fields: add fp8-related dataclass fields after distribute_saved_activations:
+#      fp8, fp8_e4m3, fp8_hybrid, fp8_margin, fp8_interval,
+#      fp8_amax_history_len, fp8_amax_compute_algo.
+#   2. (transformer_block.py changes NOT ported here — separate compile file.)
+#
+# 20% adaptation (鲁迅笔法): 懒得迁移 transformer_engine 那堆进口，
+# 只把配置字段塞进来，fp8_context 的事留给 block 文件去伤脑筋。
+# fp8 default 改成 False — 没装 transformer_engine 的机器别乱 True。
+# Adds print('[M1544]') diagnostic marker.
+# ---------------------------------------------------------------------------
 print('[M1302]')
 print('[M1420]')
+print('[M1544]')
 
 from dataclasses import dataclass
 from typing import Callable
@@ -168,6 +188,17 @@ class TransformerConfig(BaseConfig):
     recompute_method: str = None
     recompute_num_layers: int = None
     distribute_saved_activations: bool = None
+
+    # fp8 related (M1544: Megatron 62a1db8e2)
+    # NOTE: fp8 defaulted to False here (upstream uses True) — 鲁迅曰:
+    # "不装 transformer_engine 而设 True，犹以卵击石，自取灭亡。"
+    fp8: bool = False
+    fp8_e4m3: bool = False
+    fp8_hybrid: bool = True
+    fp8_margin: int = 0
+    fp8_interval: int = 1
+    fp8_amax_history_len: int = 1
+    fp8_amax_compute_algo: str = "most_recent"
 
     @property
     def sequence_parallel_enabled(self) -> bool:
