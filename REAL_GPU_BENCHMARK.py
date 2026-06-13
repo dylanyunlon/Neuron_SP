@@ -726,6 +726,12 @@ class TrainingConfig:
     # Orthogonal to SP and DEC: SP(data) × DEC(comm) × AC(memory)
     use_activation_checkpointing: bool = False
 
+    # M1500: Megatron e16f73ed3 — SwiGLU activation for MLP
+    # SwiGLU provides ~1% perplexity improvement over GELU at similar param count.
+    # Used by LLaMA, PaLM, Mistral. Default False to maintain backward compatibility.
+    use_swiglu: bool = False
+    add_bias_linear: bool = False
+
     # M1445: Megatron 13c96dc08 — Partial Activation Checkpointing
     # Instead of checkpointing ALL micro-batches uniformly, checkpoint only
     # a subset within each pipeline window. Micro-batches with IDs below this
@@ -1202,18 +1208,56 @@ class CausalSelfAttention(nn.Module):
 
 
 class MLP(nn.Module):
-    """Feed-forward network."""
-    def __init__(self, n_embd: int, dropout: float = 0.0):
+    """Feed-forward network with SwiGLU / GELU activation.
+
+    M1500: Megatron e16f73ed3 — SwiGLU and add_bias_linear support.
+    SwiGLU (Shazeer 2020): gate(x) = Swish(xW_gate) ⊙ (xW_up), then project down.
+    Used by LLaMA, PaLM, and most modern LLMs for ~1% perplexity improvement
+    over GELU at the same parameter count (the gate+up split means 8/3*d
+    intermediate instead of 4*d, but total params are similar).
+
+    DES-LOC 20% adaptation: track activation magnitude per-tier. When SwiGLU
+    gate values collapse toward 0 (dead gate), log a warning — this indicates
+    the model may need a different Kx schedule (too many local steps cause
+    gate drift between workers).
+    """
+    def __init__(self, n_embd: int, dropout: float = 0.0,
+                 use_swiglu: bool = False, add_bias: bool = False):
         super().__init__()
-        self.c_fc = nn.Linear(n_embd, 4 * n_embd, bias=False)
-        self.gelu = nn.GELU()
-        self.c_proj = nn.Linear(4 * n_embd, n_embd, bias=False)
+        self.use_swiglu = use_swiglu
+        if use_swiglu:
+            # SwiGLU: two parallel projections (gate + up), then down
+            # Intermediate size = 8/3 * n_embd (rounded to multiple of 256)
+            intermediate = int(8 * n_embd / 3)
+            intermediate = ((intermediate + 255) // 256) * 256
+            self.w_gate = nn.Linear(n_embd, intermediate, bias=add_bias)
+            self.w_up = nn.Linear(n_embd, intermediate, bias=add_bias)
+            self.c_proj = nn.Linear(intermediate, n_embd, bias=add_bias)
+        else:
+            self.c_fc = nn.Linear(n_embd, 4 * n_embd, bias=add_bias)
+            self.gelu = nn.GELU()
+            self.c_proj = nn.Linear(4 * n_embd, n_embd, bias=add_bias)
         self.dropout = nn.Dropout(dropout)
-    
+        self._forward_count = 0
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.c_fc(x)
-        x = self.gelu(x)
-        x = self.c_proj(x)
+        if self.use_swiglu:
+            gate = F.silu(self.w_gate(x))  # Swish activation
+            up = self.w_up(x)
+            x = gate * up
+            # DES-LOC diagnostic: detect dead gates (gate collapse)
+            self._forward_count += 1
+            if self._forward_count % 500 == 1:
+                gate_alive = (gate.abs() > 1e-6).float().mean().item()
+                print(f"[M1500-SWIGLU] fwd={self._forward_count} "
+                      f"gate_alive={gate_alive:.4f} "
+                      f"gate_mean={gate.mean().item():.6f} "
+                      f"gate_std={gate.std().item():.6f}")
+            x = self.c_proj(x)
+        else:
+            x = self.c_fc(x)
+            x = self.gelu(x)
+            x = self.c_proj(x)
         x = self.dropout(x)
         return x
 
