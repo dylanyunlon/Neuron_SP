@@ -546,3 +546,21 @@ def destroy_model_parallel():
     _MPU_TENSOR_MODEL_PARALLEL_RANK = None
     global _MPU_PIPELINE_MODEL_PARALLEL_RANK
     _MPU_PIPELINE_MODEL_PARALLEL_RANK = None
+
+
+# ---------------------------------------------------------------------------
+# M2050: Megatron 40fb590e4 — Context parallel state accessors (stubs)
+# Added to support get_batch_on_this_cp_rank in core_utils.py.
+# 20% adaptation: single-GPU safe defaults (world_size=1, rank=0).
+# ---------------------------------------------------------------------------
+
+def get_context_parallel_world_size():
+    """Return context parallel world size; defaults to 1 (no CP)."""
+    print('[M2050] get_context_parallel_world_size: returning 1 (stub)')
+    return 1
+
+
+def get_context_parallel_rank():
+    """Return context parallel rank; defaults to 0 (no CP)."""
+    print('[M2050] get_context_parallel_rank: returning 0 (stub)')
+    return 0

@@ -283,3 +283,35 @@ git log --oneline | grep "M15" | tail -5
 - `deepspeed/compile/core_base_config.py` — tp_comm_bootstrap_backend 字段
 - `deepspeed/compile/megatron_arguments.py` — patch_tp_comm_bootstrap_backend_args()
 - `deepspeed/compile/megatron_initialize.py` — initialize_tp_communicators_m2030()
+
+## M2050 — Megatron-LM commit 40fb590e4: Move get_batch_on_this_cp_rank to mcore utils
+
+**日期**: 2026-06-13  
+**来源**: NVIDIA/Megatron-LM@40fb590e4
+
+### 修改要点
+1. **`core_utils.py`** — 新增 `get_batch_on_this_cp_rank(batch)`:
+   - 从 `megatron/training/utils.py` 迁入 `megatron/core/utils.py`（项目映射：`deepspeed/compile/core_utils.py`）
+   - 旧版依赖 `get_args().context_parallel_size` + `mpu.get_context_parallel_rank()`
+   - 新版改用 `parallel_state.get_context_parallel_world_size()` + `parallel_state.get_context_parallel_rank()`
+   - 使 mcore 模块自洽，不再仰赖 training 层
+
+2. **`core_parallel_state.py`** — 新增 CP state 存根:
+   - `get_context_parallel_world_size()` → 返回 1（单 GPU safe）
+   - `get_context_parallel_rank()` → 返回 0（单 GPU safe）
+
+### 鲁迅式评注（20% 适配注记）
+> 鲁迅云：「从来如此，便对么？」旧函数久居 training/utils，依赖 get_args() 与 mpu，如寄人篱下；  
+> 今迁 mcore utils，改用 parallel_state API，方为正途。  
+> get_args() 与 mpu 之依赖尽除，使 mcore 模块自洽，不必仰赖 training 层之鼻息。
+
+### 诊断 print 标记
+- `[M2050] get_context_parallel_world_size: returning 1 (stub)` — CP state 存根调用
+- `[M2050] get_context_parallel_rank: returning 0 (stub)` — CP state 存根调用
+- `[M2050] get_batch_on_this_cp_rank: cp_size=... keys=[...]` — 入口
+- `[M2050] get_batch_on_this_cp_rank: cp_rank=..., slicing sequence dim` — CP>1 时切片路径
+
+### 存档文件
+- `deepspeed/compile/core_utils.py` — 新增 get_batch_on_this_cp_rank()
+- `deepspeed/compile/core_parallel_state.py` — 新增 get_context_parallel_{world_size,rank}() 存根
+- `archive/patches/M2050_Megatron_40fb590e4_cp_rank_to_mcore_utils.patch` — 原始 Megatron diff

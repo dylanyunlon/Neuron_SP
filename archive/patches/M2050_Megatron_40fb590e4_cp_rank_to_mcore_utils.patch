@@ -1,0 +1,77 @@
+diff --git a/megatron/core/models/multimodal/llava_model.py b/megatron/core/models/multimodal/llava_model.py
+index 576cb2acc..5e3e357e8 100644
+--- a/megatron/core/models/multimodal/llava_model.py
++++ b/megatron/core/models/multimodal/llava_model.py
+@@ -16,7 +16,7 @@ from megatron.core.parallel_state import get_context_parallel_group, get_context
+ from megatron.core.transformer import MegatronModule
+ from megatron.core.transformer.spec_utils import ModuleSpec
+ from megatron.core.transformer.transformer_config import TransformerConfig
+-from megatron.core.utils import log_single_rank
++from megatron.core.utils import get_batch_on_this_cp_rank, log_single_rank
+ 
+ try:
+     import transformer_engine  # pylint: disable=unused-import
+@@ -636,8 +636,6 @@ class LLaVAModel(MegatronModule):
+ 
+         if self.context_parallel_lm > 1:
+             # Distribute sequence across CP ranks
+-            from megatron.training.utils import get_batch_on_this_cp_rank
+-
+             batch = get_batch_on_this_cp_rank(
+                 {
+                     "combined_embeddings": combined_embeddings,
+diff --git a/megatron/core/utils.py b/megatron/core/utils.py
+index 6b46f292d..3bb28042b 100644
+--- a/megatron/core/utils.py
++++ b/megatron/core/utils.py
+@@ -1413,3 +1413,41 @@ except (ImportError, ModuleNotFoundError):
+ def is_float8tensor(tensor: torch.Tensor) -> bool:
+     """Check if a tensor is a Transformer Engine Float8Tensor"""
+     return HAVE_TE_FLOAT8TENSOR and isinstance(tensor, Float8Tensor)
++
++
++########################
++### context parallel ###
++########################
++
++
++def get_batch_on_this_cp_rank(batch: Dict[str, Any]):
++    """Slice batch input along sequence dimension into multiple chunks,
++    which are parallelized across GPUs in a context parallel group.
++    """
++    cp_size = parallel_state.get_context_parallel_world_size()
++    if cp_size > 1:
++        cp_rank = parallel_state.get_context_parallel_rank()
++        for key, val in batch.items():
++            if val is not None:
++                seq_dim = 1 if key != 'attention_mask' else 2
++                val = val.view(
++                    *val.shape[0:seq_dim],
++                    2 * cp_size,
++                    val.shape[seq_dim] // (2 * cp_size),
++                    *val.shape[(seq_dim + 1) :],
++                )
++                index = torch.tensor(
++                    [cp_rank, (2 * cp_size - cp_rank - 1)], device="cpu", pin_memory=True
++                ).cuda(non_blocking=True)
++                val = val.index_select(seq_dim, index)
++                val = val.view(*val.shape[0:seq_dim], -1, *val.shape[(seq_dim + 2) :])
++                batch[key] = val
++
++    return batch
+diff --git a/megatron/training/utils.py b/megatron/training/utils.py
+index 4b3f2b683..540400c0b 100644
+--- a/megatron/training/utils.py
++++ b/megatron/training/utils.py
+@@ -36,7 +36,11 @@ from megatron.core import DistributedDataParallel as DDP
+ from megatron.core import mpu
+ from megatron.core.datasets.utils import get_blend_from_list
+ from megatron.core.tensor_parallel import param_is_not_tensor_parallel_duplicate
+-from megatron.core.utils import get_data_parallel_group_if_dtensor, to_local_if_dtensor
++from megatron.core.utils import (
++    get_batch_on_this_cp_rank,
++    get_data_parallel_group_if_dtensor,
++    to_local_if_dtensor,
++)
+ from megatron.legacy.model import Float16Module
+ from megatron.legacy.model.module import param_is_not_shared
