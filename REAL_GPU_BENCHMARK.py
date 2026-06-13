@@ -969,6 +969,32 @@ class TrainingConfig:
     # is_cg_capturable一标，方令熵函数知收敛之道，不再于图中横生枝节。
     cuda_graph_scope: str = 'none'  # 'none' | 'full_iteration' — M2140 CG capture scope
 
+    # M2150: Megatron 71395182c — Fix CUDA graph when VPP is used
+    # Upstream: CudaGraphManager.__init__ now takes vp_stage: Optional[int]=None.
+    # When virtual_pipeline_model_parallel_size is set, vp_stage must be passed
+    # explicitly (asserted); when VPP is absent, vp_stage=0.
+    #
+    # Root cause: parallel_state.get_virtual_pipeline_model_parallel_rank() returns
+    # None during CUDA graph capture (before VPP rank is set), causing fwd_mempools
+    # to index with None → wrong mempool bucket, graph corruption.
+    # Fix: pass vp_stage (chunk index) from TransformerLayer.__init__ call site
+    # instead of reading it dynamically at capture time.
+    #
+    # Companion fix: _determine_if_first_last_layer_of_this_vp_chunk now reads
+    # base_module.config.virtual_pipeline_model_parallel_size instead of calling
+    # parallel_state.get_virtual_pipeline_model_parallel_world_size() so it works
+    # before the parallel state is fully initialized.
+    #
+    # 鲁迅曰：动态读取之法，看似灵活，实为取祸之道——
+    # rank未就位，graph先开录，世上最快的崩溃，莫过于此。
+    # 今以vp_stage静传，令构造时即知其位，则录图之际，安如磐石。
+    #
+    # DES-LOC 20% adaptation: Neuron_SP has no CudaGraphManager but the
+    # vp_stage concept maps to pipeline chunk index in DES-LOC schedules.
+    # We surface virtual_pipeline_model_parallel_size at TrainingConfig level
+    # and add a diagnostic stub that mirrors the assert logic from upstream.
+    virtual_pipeline_model_parallel_size: int = None   # M2150: VPP chunks per PP stage (None = VPP off)
+
     def get_pipeline_config(self) -> Dict:
         """Extract pipeline-parallel configuration (Megatron 31d133bba pattern).
 
@@ -1046,6 +1072,12 @@ class TrainingConfig:
         print(f"[M2130-XFMR] original_max_position_embeddings="
               f"{self.original_max_position_embeddings} "
               f"(YaRN base; max_position_embeddings={getattr(self, 'max_seq_len', '?')} seq-limit)")
+        # M2150: Megatron 71395182c — expose virtual_pipeline_model_parallel_size
+        # so CudaGraphManager (and DES-LOC schedule) can assert vp_stage at construction time.
+        xformer_cfg['virtual_pipeline_model_parallel_size'] = self.virtual_pipeline_model_parallel_size
+        print(f"[M2150-XFMR] virtual_pipeline_model_parallel_size="
+              f"{self.virtual_pipeline_model_parallel_size} "
+              f"(M2150: None=VPP-off, int=VPP-on; vp_stage must be passed to CudaGraphManager when set)")
         return xformer_cfg
 
     def get_model_config(self) -> Dict:
@@ -1847,6 +1879,55 @@ def moe_topk_router_forward(logits, topk, score_function='sigmoid',
               f"(Llama4 path); probs reset to 1.0, hidden dtype={original_dtype}")
 
     return probs, top_indices, hidden_states
+
+
+def cudagraph_manager_init_vp_stage(
+    virtual_pipeline_model_parallel_size,
+    vp_stage,
+    layer_number=None,
+):
+    """M2150: Megatron 71395182c — validate vp_stage at CudaGraphManager construction.
+
+    Upstream: CudaGraphManager.__init__ now accepts vp_stage: Optional[int]=None.
+    When virtual_pipeline_model_parallel_size is not None (VPP is enabled),
+    the caller MUST pass vp_stage; failure triggers an AssertionError at build time
+    rather than a silent wrong-mempool lookup at graph capture time.
+
+    The companion _determine_if_first_last_layer_of_this_vp_chunk patch reads
+    base_module.config.virtual_pipeline_model_parallel_size instead of calling
+    parallel_state.get_virtual_pipeline_model_parallel_world_size(), so it is safe
+    to call before the parallel state is fully initialised.
+
+    Root cause of the original bug: get_virtual_pipeline_model_parallel_rank() returns
+    None during CUDA graph capture (VPP rank not yet set in thread-local state) →
+    fwd_mempools[None] → KeyError / wrong-bucket graph replay → silent corruption.
+
+    20% DES-LOC adaptation: Neuron_SP has no CudaGraphManager; this stub replicates
+    the assert logic so the DES-LOC schedule can call it when constructing per-chunk
+    pipeline stages, catching mis-configuration early rather than at runtime.
+
+    鲁迅曰：早死不如晚死，晚死不如不死——然错误亦同：
+    早错（构造时assert）胜于晚错（capture时None-key崩溃），
+    晚错胜于永错（静默用错mempool，训出垃圾而浑然不觉）。
+    """
+    if virtual_pipeline_model_parallel_size is not None:
+        # VPP is enabled — caller must supply the chunk index
+        assert vp_stage is not None, (
+            "[M2150] vp_stage must be passed if virtual pipeline is enabled "
+            f"(virtual_pipeline_model_parallel_size={virtual_pipeline_model_parallel_size}). "
+            "Pass chunk index from TransformerLayer constructor call site, "
+            "do NOT read it dynamically from parallel_state at capture time."
+        )
+        vpp_rank = vp_stage
+        print(f"[M2150-CUDAGRAPH] VPP ON: vp_stage={vp_stage} "
+              f"vpp_size={virtual_pipeline_model_parallel_size} "
+              f"layer={layer_number} → vpp_rank={vpp_rank} (static, safe for graph capture)")
+    else:
+        # VPP is disabled — use rank 0 unconditionally (no dynamic lookup)
+        vpp_rank = 0
+        print(f"[M2150-CUDAGRAPH] VPP OFF: vpp_rank=0 (static) "
+              f"layer={layer_number} — no parallel_state query needed")
+    return vpp_rank
 
 
 class TransformerBlock(nn.Module):
