@@ -1,0 +1,27 @@
+# M2090 — Megatron-LM commit e6d56d682: Fix MoE aux_loss accumulating twice with activation checkpointing
+# Source: NVIDIA/Megatron-LM@e6d56d682
+# Date: 2026-06-13
+#
+# Megatron diff adds torch.is_grad_enabled() guard to:
+#   1. TopKRouter._routing_func() switch mode  (router.py:177)
+#   2. TopKRouter._routing_func() sequence mode (router.py:209)
+#   3. TopKRouter.apply_z_loss()               (router.py:262)
+#
+# Root cause: During activation checkpointing, the forward pass is re-run
+# under torch.no_grad(). Without the guard, aux_loss is accumulated TWICE
+# per step — once in the original forward, once in the checkpoint re-computation.
+#
+# NSP adaptation (20% DES-LOC / 鲁迅式):
+#   - deepspeed/moe/sharded_moe.py
+#     top1gating(): l_aux zeroed when not torch.is_grad_enabled()
+#     top2gating(): l_aux zeroed when not torch.is_grad_enabled()
+#     topkgating(): l_aux zeroed when not torch.is_grad_enabled()
+#     + [M2090-DIAG] print diagnostics at each gate
+#
+# NSP does not have Megatron's parallel_state / MoEAuxLossAutoScaler, so
+# the fix is applied at the gating function level rather than the router level.
+#
+# 鲁迅注:
+#   从来如此，便对么？——checkpointing重算时梯度已灭，l_aux不可重累，此乃正道。
+#   哀其不幸，怒其不争——双专家门控亦守此门，梯度无则l_aux清零。
+#   猛士，勇往直前——topk门控三番重算，唯梯度在时方可留痕。

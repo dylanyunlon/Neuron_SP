@@ -229,11 +229,16 @@ def top1gating(logits: Tensor,
         capacity = min(new_capacity, torch.tensor(mask1.size(0)).to(new_capacity.device))
 
     # Compute l_aux
+    # [M2090] Megatron e6d56d682: Skip aux_loss when no_grad (activation checkpointing re-entry).
+    # 鲁迅曰: 从来如此，便对么？checkpointing重算时梯度已灭，l_aux不可重累。
     me = torch.mean(gates, dim=0)
     ce = torch.mean(mask1.float(), dim=0)
-    l_aux = torch.sum(me * ce) * num_experts
-
-    # Random Token Selection
+    if torch.is_grad_enabled():
+        l_aux = torch.sum(me * ce) * num_experts
+        print(f"[M2090-DIAG] top1gating: grad_enabled=True, l_aux={l_aux.item():.6f} (will accumulate)")
+    else:
+        l_aux = torch.tensor(0.0, device=logits.device, dtype=logits.dtype)
+        print(f"[M2090-DIAG] top1gating: grad_enabled=False (checkpointing re-entry), l_aux zeroed")
     if use_rts:
         uniform = exp_selection_uniform_map.get(logits.device)
         if uniform is None:
@@ -325,11 +330,16 @@ def top2gating(logits: Tensor,
     locations2 += torch.sum(mask1, dim=0, keepdim=True)
 
     # Compute l_aux
+    # [M2090] Megatron e6d56d682: Skip aux_loss on checkpointing re-entry (no_grad context).
+    # 鲁迅曰: 哀其不幸，怒其不争 —— 双专家门控亦守此门，梯度无则l_aux清零。
     me = torch.mean(gates, dim=0)
     ce = torch.mean(mask1.float(), dim=0)
-    l_aux = torch.mean(me * ce) * num_experts * num_experts
-
-    # gating decisions
+    if torch.is_grad_enabled():
+        l_aux = torch.mean(me * ce) * num_experts * num_experts
+        print(f"[M2090-DIAG] top2gating: grad_enabled=True, l_aux={l_aux.item():.6f}")
+    else:
+        l_aux = torch.tensor(0.0, device=logits.device, dtype=logits.dtype)
+        print(f"[M2090-DIAG] top2gating: grad_enabled=False, l_aux zeroed")
     exp_counts = torch.sum(mask1 + mask2, dim=0).detach().to(logits.device)
 
     if drop_tokens:
@@ -403,10 +413,16 @@ def topkgating(
     exp_counts = torch.sum(mask, dim=0).detach().to(logits.device)
 
     # Compute l_aux
+    # [M2090] Megatron e6d56d682: topk gate also skips aux_loss when no_grad.
+    # 鲁迅曰: 猛士勇往直前 —— topk门控三番重算，唯梯度在时方可留痕。
     me = torch.mean(gates, dim=0)
     ce = torch.mean(mask.float(), dim=0)
-    l_aux = torch.mean(me * ce) * num_experts * num_experts / k
-    locations = None
+    if torch.is_grad_enabled():
+        l_aux = torch.mean(me * ce) * num_experts * num_experts / k
+        print(f"[M2090-DIAG] topkgating(k={k}): grad_enabled=True, l_aux={l_aux.item():.6f}")
+    else:
+        l_aux = torch.tensor(0.0, device=logits.device, dtype=logits.dtype)
+        print(f"[M2090-DIAG] topkgating(k={k}): grad_enabled=False, l_aux zeroed")
     if drop_tokens:
         # Calculate configured capacity and remove locations outside capacity from mask
         capacity = _capacity(gates, torch.tensor(capacity_factor * k), torch.tensor(min_capacity))
