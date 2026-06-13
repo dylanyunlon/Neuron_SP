@@ -619,6 +619,54 @@ class StepRecorder:
 
 
 @dataclass
+class DESLOCPipelineConfig:
+    """Pipeline configuration for DES-LOC — adapted from Megatron 98550bf32.
+
+    Megatron's PipelineConfig holds pipeline-parallel communication fields
+    (dtype, tensor shape, p2p settings, activation checkpointing thresholds).
+    DES-LOC adaptation adds sync schedule fields and memory pressure thresholds
+    since DES-LOC's Kx-gated AllReduce operates at pipeline boundaries.
+
+    Key differences from upstream Megatron PipelineConfig:
+    - Adds Kx/Ku/Kv sync schedule (DES-LOC-specific)
+    - Adds memory_pressure_threshold for adaptive partial AC
+    - Removes grad_scaler/timers (handled by DESLOCAdamW directly)
+    - Adds drift_monitoring flag for per-layer momentum decay diagnostics
+    """
+    pipeline_dtype: torch.dtype = torch.bfloat16
+    tensor_shape: tuple = None  # (seq_len, batch, hidden)
+    variable_seq_lengths: bool = False
+    num_micro_batches_with_partial_ac: int = None
+    batch_p2p_comm: bool = False
+    deallocate_pipeline_outputs: bool = True
+    enable_autocast: bool = True
+    autocast_dtype: torch.dtype = None
+    # DES-LOC sync schedule (pipeline-level concerns)
+    Kx: int = 32
+    Ku: int = 96
+    Kv: int = 192
+    # DES-LOC memory pressure threshold for adaptive AC
+    memory_pressure_threshold: float = 0.85
+    # Enable per-layer drift monitoring in momentum decay
+    drift_monitoring: bool = True
+    # Sequence parallelism (from Megatron PipelineConfig)
+    sequence_parallel: bool = False
+    decoder_seq_length: int = None
+
+    def __post_init__(self):
+        if self.autocast_dtype is None:
+            self.autocast_dtype = self.pipeline_dtype
+        if self.tensor_shape is not None and self.decoder_seq_length is None:
+            self.decoder_seq_length = self.tensor_shape[0]
+        print(f"[M1449-PIPECFG] DESLOCPipelineConfig initialized: "
+              f"dtype={self.pipeline_dtype} shape={self.tensor_shape} "
+              f"Kx/Ku/Kv={self.Kx}/{self.Ku}/{self.Kv} "
+              f"mem_threshold={self.memory_pressure_threshold} "
+              f"partial_ac={self.num_micro_batches_with_partial_ac} "
+              f"sp={self.sequence_parallel} drift_mon={self.drift_monitoring}")
+
+
+@dataclass
 class TrainingConfig:
     """Training configuration - no defaults that allow fallback."""
     # Model
