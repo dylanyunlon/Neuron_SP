@@ -1653,7 +1653,8 @@ class GPT(nn.Module):
                  num_kv_heads: int = None,
                  group_query_attention: bool = False,
                  num_query_groups: int = 1,
-                 embedding_weights_in_fp32: bool = False):
+                 embedding_weights_in_fp32: bool = False,
+                 share_embeddings_and_output_weights: bool = False):
         super().__init__()
         self.max_seq_len = max_seq_len
         # M458: if QK layer scaling is on, fp32 softmax is auto-implied (Megatron 691747b1)
@@ -1668,11 +1669,20 @@ class GPT(nn.Module):
         # Fix: temporarily upcast wte to fp32 before the gather, downcast output back.
         # Auto-disable when model already runs in fp32 (no-op and wastes bandwidth).
         self.embedding_weights_in_fp32 = embedding_weights_in_fp32
+        # M1534: Megatron bdd554731 — Do not tie output layer with word embeddings unless specified.
+        # 鲁迅曾言：未经明言的捆绑，不过是懒惰的遮羞布——weight tying当明示，不当默许。
+        # Previously the output layer and word embeddings were always tied (shared weights).
+        # bdd554731 decouples them by default: share_embeddings_and_output_weights=False means
+        # output_layer gets its own independent weight, only tied when explicitly requested.
+        self.share_embeddings_and_output_weights = share_embeddings_and_output_weights
         # Track params_dtype so forward() can cast back correctly (mirrors Megatron language_model.py)
         self._params_dtype = torch.float32  # default; may be overridden by mixed-precision context
         print(f"[M1541-GPT-INIT] embedding_weights_in_fp32={embedding_weights_in_fp32} "
               f"(Megatron 28802670f non-determinism workaround; "
               f"active only when training bf16)")
+        print(f"[M1534-GPT-INIT] share_embeddings_and_output_weights={share_embeddings_and_output_weights} "
+              f"(Megatron bdd554731: output layer {'TIED to' if share_embeddings_and_output_weights else 'INDEPENDENT from'} "
+              f"word embeddings)")
 
         # M1513: Megatron 6902465a8 — if group_query_attention is set, use num_query_groups
         # as the effective num_kv_heads. This maps the 6902465a8 parameter naming
@@ -1736,8 +1746,21 @@ class GPT(nn.Module):
                 print('   layer: {:3d} --> unique layer: {:3d}'.format(
                     i, self._get_layer_index(i)))
         
-        # Weight tying
-        self.transformer.wte.weight = self.lm_head.weight
+        # M1534: Megatron bdd554731 — Weight tying only when explicitly requested.
+        # Old behaviour (pre-bdd554731): always tied, no opt-out.
+        # New behaviour: independent weights by default; shared only when
+        # share_embeddings_and_output_weights=True is explicitly passed.
+        # 鲁迅曾言：沉默的绑定，是旧秩序留给后人最重的枷——今日明言，方得自由。
+        if self.share_embeddings_and_output_weights:
+            self.transformer.wte.weight = self.lm_head.weight
+            print(f"[M1534-WEIGHT-TIE] wte.weight TIED to lm_head.weight "
+                  f"(share_embeddings_and_output_weights=True, Megatron bdd554731)")
+        else:
+            # lm_head keeps its own independently initialised weight.
+            # shared_embedding_or_output_weight() follows Megatron's new convention:
+            # pre-process stage → return embedding weight; post-process stage → return output_layer weight.
+            print(f"[M1534-NO-TIE] lm_head.weight is INDEPENDENT from wte.weight "
+                  f"(share_embeddings_and_output_weights=False, Megatron bdd554731 default)")
 
         # NEURON_SP PORT: Megatron 57c2060fe — layers.py _initialize_affine_weight
         # Mark the vocab-parallel embedding weight with partition_dim + stride so
@@ -1769,6 +1792,29 @@ class GPT(nn.Module):
     def _get_layer(self, layer_number: int):
         """Return the (possibly shared) layer for the given absolute index."""
         return self.transformer.h[self._get_layer_index(layer_number)]
+
+    def shared_embedding_or_output_weight(self) -> torch.Tensor:
+        """M1534: Megatron bdd554731 — return the appropriate weight for embedding/output sharing.
+
+        Mirrors Megatron's GPTModel.shared_embedding_or_output_weight():
+          - pre-process stage  → embedding (wte) weight
+          - post-process stage → output layer (lm_head) weight
+        In a non-pipeline setup this model is always both stages, so wte.weight is
+        canonical when tied; lm_head.weight when independent.
+        鲁迅曾言：名正则言顺，权重亦然——该谁的就是谁的，不必混淆。
+        """
+        if self.share_embeddings_and_output_weights:
+            # Tied: both point to the same storage; return embedding side per Megatron convention.
+            _w = self.transformer.wte.weight
+            print(f"[M1534-SHARED-WEIGHT] returning wte.weight (tied, share=True) "
+                  f"shape={tuple(_w.shape)} dtype={_w.dtype}")
+            return _w
+        else:
+            # Untied: output layer has its own independent weight.
+            _w = self.lm_head.weight
+            print(f"[M1534-SHARED-WEIGHT] returning lm_head.weight (independent, share=False) "
+                  f"shape={tuple(_w.shape)} dtype={_w.dtype}")
+            return _w
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
