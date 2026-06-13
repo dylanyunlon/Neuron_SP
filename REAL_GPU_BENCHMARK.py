@@ -229,6 +229,17 @@ def _neuronsp_add_network_size_args(parser):
                        help='Transformer hidden size.')
     group.add_argument('--num_attention_heads', type=int, default=12,
                        help='Number of transformer attention heads.')
+    # M1510: Megatron d4878ef01 — multi-query attention support.
+    # num_kv_heads controls the number of key/value projection heads:
+    #   None / omitted  → standard MHA (num_kv_heads == num_attention_heads)
+    #   1               → Multi-Query Attention (MQA)
+    #   1 < k < n_head  → Grouped-Query Attention (GQA)
+    # num_attention_heads must be divisible by num_kv_heads.
+    group.add_argument('--num_kv_heads', type=int, default=None,
+                       help='Number of key/value heads for GQA/MQA. '
+                            'None means standard MHA. '
+                            '1 means MQA. k<num_attention_heads means GQA. '
+                            'Must divide num_attention_heads evenly.')
     group.add_argument('--max_position_embeddings', type=int, default=1024,
                        help='Maximum number of position embeddings to use. '
                        'This is the size of position embedding.')
@@ -1020,7 +1031,7 @@ def _ulysses_a2a(t, scatter_idx, gather_idx, grp):
 
 
 class CausalSelfAttention(nn.Module):
-    """Multi-head causal self-attention.
+    """Multi-head causal self-attention with GQA/MQA support.
 
     Uses F.scaled_dot_product_attention (PyTorch 2.0+) which:
     1. Automatically selects FlashAttention / Memory-Efficient / Math backend
@@ -1040,17 +1051,44 @@ class CausalSelfAttention(nn.Module):
     Finally cutlass refines GEMM-based attention for non-SDPA fallback,
     ensuring AutoSP is compatible with all GPU architectures,
     fully upgrading attention to support both DES-LOC and AutoSP.
+
+    M1510: Megatron d4878ef01 — Multi-query attention (GQA/MQA).
+    num_kv_heads controls the number of key/value heads:
+      - num_kv_heads == n_head  → standard Multi-Head Attention (MHA)
+      - num_kv_heads == 1       → Multi-Query Attention (MQA, Shazeer 2019)
+      - 1 < num_kv_heads < n_head → Grouped-Query Attention (GQA, Ainslie 2023)
+    KV heads are shared across groups of Q heads via torch.repeat_interleave,
+    mirroring Megatron's transformer.py expand-before-SDPA approach.
+    鲁迅曾言：世上本无捷径，KV cache压缩得多了，也便有了GQA。
+    DES-LOC 20%: in distributed settings, KV tensors are replicated across
+    tensor-parallel ranks (not sharded) — same as Megatron's key_value linear
+    which bypasses ColumnParallel. Diagnostic prints report the effective
+    KV replication factor so workers can audit memory asymmetry per tier.
     """
     def __init__(self, n_embd: int, n_head: int, max_seq_len: int, dropout: float = 0.0,
                  layer_number: int = 1,
                  apply_query_key_layer_scaling: bool = False,
-                 attention_softmax_in_fp32: bool = False):
+                 attention_softmax_in_fp32: bool = False,
+                 num_kv_heads: int = None):
         super().__init__()
         assert n_embd % n_head == 0
         self.n_head = n_head
         self.n_embd = n_embd
         self.head_dim = n_embd // n_head
         self.dropout = dropout
+
+        # M1510: GQA/MQA — num_kv_heads defaults to n_head (standard MHA).
+        # When num_kv_heads < n_head, K and V are projected to fewer heads
+        # then broadcast to all Q heads before the dot-product.
+        # Constraint: n_head must be evenly divisible by num_kv_heads so that
+        # each KV head services an integer number of Q heads (a "query group").
+        self.num_kv_heads = num_kv_heads if num_kv_heads is not None else n_head
+        assert n_head % self.num_kv_heads == 0, (
+            f"n_head ({n_head}) must be divisible by num_kv_heads ({self.num_kv_heads})"
+        )
+        self.kv_groups = n_head // self.num_kv_heads  # Q heads per KV head
+        # multi_query flag: True for both MQA (num_kv_heads=1) and GQA (num_kv_heads<n_head)
+        self.multi_query_attention = self.num_kv_heads < self.n_head
 
         # M458: Megatron 691747b1 — per-layer QK scaling + fp32 softmax
         # apply_query_key_layer_scaling multiplies Q*K^T by 1/layer_number on top of
@@ -1069,21 +1107,47 @@ class CausalSelfAttention(nn.Module):
         self._qk_scale = 1.0 / (math.sqrt(self.head_dim) * self.layer_number) \
             if apply_query_key_layer_scaling else 1.0 / math.sqrt(self.head_dim)
         print(f"[ATTN-INIT] layer={self.layer_number} head_dim={self.head_dim} "
+              f"n_head={self.n_head} num_kv_heads={self.num_kv_heads} "
+              f"kv_groups={self.kv_groups} "
+              f"mode={'MQA' if self.num_kv_heads == 1 else 'GQA' if self.multi_query_attention else 'MHA'} "
               f"qk_layer_scale={apply_query_key_layer_scaling} "
               f"softmax_fp32={self.attention_softmax_in_fp32} "
               f"effective_scale={self._qk_scale:.6f}")
 
-        self.c_attn = nn.Linear(n_embd, 3 * n_embd, bias=False)
+        # M1510: separate Q and KV projections for GQA/MQA — mirrors Megatron's
+        # self.query (ColumnParallel) + self.key_value (get_linear_layer) split.
+        # For standard MHA, keep the fused c_attn for backward compatibility.
+        if self.multi_query_attention:
+            # Q projects to full n_embd; KV projects to 2 * num_kv_heads * head_dim
+            self.c_q = nn.Linear(n_embd, n_embd, bias=False)
+            self.c_kv = nn.Linear(n_embd, 2 * self.num_kv_heads * self.head_dim, bias=False)
+        else:
+            self.c_attn = nn.Linear(n_embd, 3 * n_embd, bias=False)
         self.c_proj = nn.Linear(n_embd, n_embd, bias=False)
         self.resid_dropout = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, T, C = x.size()
-        qkv = self.c_attn(x)
-        q, k, v = qkv.split(self.n_embd, dim=2)
-        q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
-        k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
-        v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+
+        # M1510: GQA/MQA projection path
+        if self.multi_query_attention:
+            q = self.c_q(x)
+            kv = self.c_kv(x)
+            k, v = kv.split(self.num_kv_heads * self.head_dim, dim=2)
+            q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2)          # [B, n_head, T, head_dim]
+            k = k.view(B, T, self.num_kv_heads, self.head_dim).transpose(1, 2)    # [B, num_kv_heads, T, head_dim]
+            v = v.view(B, T, self.num_kv_heads, self.head_dim).transpose(1, 2)    # [B, num_kv_heads, T, head_dim]
+            # Expand K/V to match Q heads: each KV head serves kv_groups Q heads
+            # repeat_interleave preserves head ordering (group-consecutive), matching
+            # how Megatron's CoreAttention receives a squeezed KV then broadcasts via bmm.
+            k = k.repeat_interleave(self.kv_groups, dim=1)   # [B, n_head, T, head_dim]
+            v = v.repeat_interleave(self.kv_groups, dim=1)   # [B, n_head, T, head_dim]
+        else:
+            qkv = self.c_attn(x)
+            q, k, v = qkv.split(self.n_embd, dim=2)
+            q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+            k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+            v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
 
         s = _SP_CTX['step']
         _r = dist.get_rank() if dist.is_initialized() else 0
@@ -1095,6 +1159,19 @@ class CausalSelfAttention(nn.Module):
                 print(f"[ATTN-M458] rank={_r} step={s} layer={self.layer_number} "
                       f"qk_scale={self._qk_scale:.6f} "
                       f"softmax_fp32={self.attention_softmax_in_fp32}")
+
+        # M1510: GQA/MQA diagnostic — report KV configuration so we can audit
+        # memory savings vs MHA. 鲁迅：沉默啊沉默，KV heads不在减少中消亡，
+        # 就在减少中爆发。After repeat_interleave, K/V are full-headed; the
+        # savings live in the projection weights (num_kv_heads * head_dim vs n_head * head_dim).
+        if _diag and s % 50 == 1:
+            with torch.no_grad():
+                _mode = 'MQA' if self.num_kv_heads == 1 else 'GQA' if self.multi_query_attention else 'MHA'
+                _kv_param_ratio = self.num_kv_heads / self.n_head
+                print(f"[ATTN-M1510] rank={_r} step={s} layer={self.layer_number} "
+                      f"mode={_mode} n_head={self.n_head} num_kv_heads={self.num_kv_heads} "
+                      f"kv_groups={self.kv_groups} kv_param_ratio={_kv_param_ratio:.3f} "
+                      f"K={list(k.shape)} V={list(v.shape)}")
 
         # M365 DIAG: pre-A2A QKV statistics on ALL ranks (not just rank 0)
         # This reveals whether SP ranks have divergent activations
@@ -1302,14 +1379,17 @@ class TransformerBlock(nn.Module):
                  dropout: float = 0.0, use_ac: bool = False,
                  layer_number: int = 1,
                  apply_query_key_layer_scaling: bool = False,
-                 attention_softmax_in_fp32: bool = False):
+                 attention_softmax_in_fp32: bool = False,
+                 num_kv_heads: int = None):
         super().__init__()
         self.ln_1 = LayerNorm(n_embd)
         # M458: pass Megatron 691747b1 per-layer QK scaling + fp32 softmax flags
+        # M1510: pass num_kv_heads for GQA/MQA support (Megatron d4878ef01)
         self.attn = CausalSelfAttention(n_embd, n_head, max_seq_len, dropout,
                                         layer_number=layer_number,
                                         apply_query_key_layer_scaling=apply_query_key_layer_scaling,
-                                        attention_softmax_in_fp32=attention_softmax_in_fp32)
+                                        attention_softmax_in_fp32=attention_softmax_in_fp32,
+                                        num_kv_heads=num_kv_heads)
         self.ln_2 = LayerNorm(n_embd)
         self.mlp = MLP(n_embd, dropout)
         self.use_ac = use_ac
@@ -1451,14 +1531,21 @@ class GPT(nn.Module):
                  apply_query_key_layer_scaling: bool = False,
                  attention_softmax_in_fp32: bool = False,
                  num_unique_layers: int = None,
-                 param_sharing_style: str = 'grouped'):
+                 param_sharing_style: str = 'grouped',
+                 num_kv_heads: int = None):
         super().__init__()
         self.max_seq_len = max_seq_len
         # M458: if QK layer scaling is on, fp32 softmax is auto-implied (Megatron 691747b1)
         _softmax_fp32 = attention_softmax_in_fp32 or apply_query_key_layer_scaling
+        # M1510: resolve num_kv_heads — None → MHA (num_kv_heads == n_head)
+        _num_kv_heads = num_kv_heads  # None is fine; CausalSelfAttention defaults to MHA
+        _kv_mode = ('MQA' if _num_kv_heads == 1 else
+                    f'GQA({_num_kv_heads}kv)' if (_num_kv_heads is not None and _num_kv_heads < n_head)
+                    else 'MHA')
         print('[M249]')
         print(f"[GPT-INIT] n_layer={n_layer} apply_qk_layer_scaling={apply_query_key_layer_scaling} "
-              f"attention_softmax_in_fp32={_softmax_fp32}")
+              f"attention_softmax_in_fp32={_softmax_fp32} "
+              f"n_head={n_head} num_kv_heads={_num_kv_heads} kv_mode={_kv_mode}")
 
         # M249: parameter sharing — track num_unique_layers and sharing style
         # Port of Megatron 80f90dcdc (added parameters sharing).
@@ -1479,7 +1566,8 @@ class GPT(nn.Module):
                 TransformerBlock(n_embd, n_head, max_seq_len, use_ac=use_ac,
                                  layer_number=i + 1,
                                  apply_query_key_layer_scaling=apply_query_key_layer_scaling,
-                                 attention_softmax_in_fp32=_softmax_fp32)
+                                 attention_softmax_in_fp32=_softmax_fp32,
+                                 num_kv_heads=_num_kv_heads)
                 for i in range(self.num_unique_layers)
             ]),
             ln_f = LayerNorm(n_embd),
