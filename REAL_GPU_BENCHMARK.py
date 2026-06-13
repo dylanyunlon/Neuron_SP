@@ -1089,6 +1089,16 @@ class CausalSelfAttention(nn.Module):
     2. Required by DeepSpeed AutoSP (compile pass needs SDPA to identify attention ops)
     3. O(T) memory vs O(T²) for manual attention — critical for long sequences
 
+    M1517: Megatron a6c574d4f — Fixed rotary_pos_emb position in forward args.
+    The upstream commit added None-padding slots so rotary_pos_emb is forwarded
+    as the 9th positional argument (not 5th), ensuring it is received as a
+    keyword-equivalent named parameter by each transformer layer's forward().
+    20% adaptation: forward() now accepts rotary_pos_emb as an explicit keyword
+    argument (default None); when provided, RoPE is applied to Q and K after
+    projection via _apply_rotary_pos_emb(), matching Megatron's apply_rotary_pos_emb
+    call site in SelfAttention.forward(). Diagnostic prints report emb shape and
+    Q/K norms before vs after rotation so the fix can be audited per-step.
+
     From FlashAttention (Dao-AILab flash-attention/flash_attn) kernel start.
     Then, follow that pattern to implement SDPA-based causal attention,
     letting AutoSP identify and shard the sequence dimension automatically,
@@ -1208,7 +1218,11 @@ class CausalSelfAttention(nn.Module):
         self.c_proj = nn.Linear(n_embd, n_embd, bias=False)
         self.resid_dropout = nn.Dropout(dropout)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, rotary_pos_emb=None) -> torch.Tensor:
+        # M1517: rotary_pos_emb accepted as keyword argument (not positional) —
+        # mirrors Megatron a6c574d4f which added None-padding slots so that
+        # rotary_pos_emb is never silently shadowed by a positional mismatch.
+        # When provided, it is applied to Q and K after projection (see below).
         B, T, C = x.size()
 
         # M1510: GQA/MQA projection path
@@ -1255,6 +1269,46 @@ class CausalSelfAttention(nn.Module):
             q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
             k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
             v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+
+        # M1517: Megatron a6c574d4f — apply rotary_pos_emb to Q and K when provided.
+        # Upstream fix ensured rotary_pos_emb arrives here as a keyword arg (not buried
+        # at positional slot 5 which previously shadowed it with None padding).
+        # 20% adaptation: inline _apply_rotary_pos_emb using torch ops instead of
+        # Megatron's fused apply_rotary_pos_emb kernel; emb shape is (T, 1, 1, head_dim)
+        # or (T, head_dim//2) — we handle both by squeezing to (T, head_dim//2) and
+        # broadcasting over batch and head dimensions.
+        # 鲁迅曾言：世上本无旋转，位置编码多了，也便有了RoPE。
+        if rotary_pos_emb is not None:
+            _r_pre = dist.get_rank() if dist.is_initialized() else 0
+            _s_pre = _SP_CTX['step']
+            with torch.no_grad():
+                _q_norm_pre = q.float().norm().item()
+                _k_norm_pre = k.float().norm().item()
+            # Normalise emb to shape (T, head_dim) for broadcasting
+            _emb = rotary_pos_emb
+            while _emb.dim() > 2:
+                _emb = _emb.squeeze(1)  # collapse batch/head singleton dims
+            # _emb: (T, head_dim); split into cos/sin halves
+            _half = _emb.size(-1) // 2
+            _cos = _emb[..., :_half]   # (T, head_dim//2)
+            _sin = _emb[..., _half:]   # (T, head_dim//2)
+            # Broadcast to (1, 1, T, head_dim//2) for (B, heads, T, head_dim) tensors
+            _cos = _cos.unsqueeze(0).unsqueeze(0)
+            _sin = _sin.unsqueeze(0).unsqueeze(0)
+            # Rotate-half: split last dim in two halves, apply [cos, -sin; sin, cos]
+            def _rotate_half(t):
+                h = t.size(-1) // 2
+                return torch.cat([-t[..., h:], t[..., :h]], dim=-1)
+            q = q * _cos + _rotate_half(q) * _sin
+            k = k * _cos + _rotate_half(k) * _sin
+            if _diag and _s_pre % 50 == 1:
+                with torch.no_grad():
+                    print(f"[M1517-ROPE] rank={_r_pre} step={_s_pre} layer={self.layer_number} "
+                          f"emb_shape={list(rotary_pos_emb.shape)} "
+                          f"cos_shape={list(_cos.shape)} "
+                          f"Q_norm_pre={_q_norm_pre:.4f} Q_norm_post={q.float().norm().item():.4f} "
+                          f"K_norm_pre={_k_norm_pre:.4f} K_norm_post={k.float().norm().item():.4f} "
+                          f"(M1517: a6c574d4f keyword-arg RoPE applied to Q+K)")
 
         s = _SP_CTX['step']
         _r = dist.get_rank() if dist.is_initialized() else 0
