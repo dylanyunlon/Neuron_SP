@@ -107,3 +107,42 @@ git log --oneline | grep "M15" | tail -5
 ### 诊断 print 标记
 - `[M1960]` — 模块加载时打印（3 个文件各一处）
 - `[M1960] TELayerNormColumnParallelLinear.__init__ ub_overlap_rs_dgrad=...` — 运行时
+
+## M1990 — Megatron-LM commit 38722c39b: Support jit.script with cross entropy fusion
+
+**日期**: 2026-06-13  
+**来源**: NVIDIA/Megatron-LM@38722c39b (Support jit.script with cross entropy fusion)
+
+### 核心问题
+
+`jit.script`（即 `@jit_fuser`）不允许在被 script 的函数内部调用 `torch.distributed` state 查询函数（`get_tensor_model_parallel_rank` 等）。旧版 `calculate_predicted_logits` 在函数体内做此调用，导致 JIT 编译失败。
+
+### 修复要点
+
+1. **`cross_entropy.py` → `core_tensor_parallel_cross_entropy.py`**:
+   - 重构为 `VocabParallelCrossEntropy` 静态方法容器（`calculate_logits_max`、`calculate_predicted_logits`、`calculate_cross_entropy_loss`、`prepare_gradient_calculation_operands`、`calculate_gradients`）。
+   - `calculate_predicted_logits` 签名：`vocab_start_index: int`、`vocab_end_index: int` 升格为显式参数。
+   - vocab 范围计算移入 `_VocabParallelCrossEntropy.forward()`（非 JIT 上下文），以 int 传入静态方法。
+   - `prepare_gradient_calculation_operands` 参数列表末尾加逗号（PEP 8 风格）。
+
+2. **`fused_cross_entropy.py` → `core_fusions_fused_cross_entropy.py`**（**NEW FILE**）:
+   - `@jit_fuser` → `@torch.jit.script`（项目映射）。
+   - `calculate_predicted_logits`：+`vocab_start_index: int`、+`vocab_end_index: int` 参数。
+   - `_VocabParallelCrossEntropy.forward()`：在调用 fused 函数前计算 vocab 范围并传入。
+   - `grad_input.bfloat16()` → `grad_input.to(torch.bfloat16)`（jit.script 兼容写法）。
+   - `VocabUtility` import 从 `core_tensor_parallel_utils` 引入。
+
+### 鲁迅式评注（20% 适配注记）
+> 旧代码在 script 内问询分布式，如入无人之境却偏要拦门验证；  
+> 今将问询移出 script，令纯计算之函数得以自由驰骋。  
+> vocab 范围本是 int 二数，何必混入张量之 JIT？提而传之，各司其职。
+
+### 诊断 print 标记
+- `[M1990] core_tensor_parallel_cross_entropy: jit.script-compatible vocab-range refactor loaded` — 模块加载
+- `[M1990] core_fusions_fused_cross_entropy: jit.script cross-entropy fusion loaded` — 模块加载
+- `[M1990] _VocabParallelCrossEntropy.forward vocab_start=... vocab_end=...` — 运行时（unfused 路径）
+- `[M1990] fused forward vocab_start=... vocab_end=... partition_vocab_size=...` — 运行时（fused 路径）
+
+### 存档文件
+- `deepspeed/compile/core_tensor_parallel_cross_entropy.py` — 更新（含 VocabParallelCrossEntropy 类）
+- `deepspeed/compile/core_fusions_fused_cross_entropy.py` — 新增 fused 路径
