@@ -760,6 +760,15 @@ class TrainingConfig:
     use_swiglu: bool = False
     add_bias_linear: bool = False
 
+    # M2120: Megatron 0bbcbb115 — SwiGLU activation offload to CPU
+    # When cpu_offload=True and cpu_offloading_activations=True, marks SwiGLU gate/up
+    # activations saved for backward with .activation_offloading=True so TE's offload
+    # hook can evict them to CPU RAM, reducing peak GPU memory during forward.
+    # Only effective when Transformer Engine (TE) is installed (HAVE_TE check).
+    # DES-LOC adaptation: activates per-tier during Kx local steps where GPU memory
+    # spikes from accumulated AllReduce buffers — offload acts as a pressure valve.
+    cpu_offloading_activations: bool = False
+
     # M1513: Megatron 6902465a8 — group query attention (GQA) with TP-aware KV partitioning.
     # group_query_attention=True activates the 6902465a8 GQA path in CausalSelfAttention.
     # num_query_groups controls KV group count; the query_groups_divide_flag in
@@ -1666,11 +1675,20 @@ class MLP(nn.Module):
     gate values collapse toward 0 (dead gate), log a warning — this indicates
     the model may need a different Kx schedule (too many local steps cause
     gate drift between workers).
+
+    M2120: Megatron 0bbcbb115 -- SwiGLU activation offload to CPU.
+    cpu_offload_input=True marks gate/up activations with .activation_offloading=True
+    so TE's offload hook evicts them to CPU RAM after forward, reclaims GPU memory
+    before backward fetches them back. Mirrors BiasSwiGLUFunction / SwiGLUFunction
+    changes in megatron/core/fusions/fused_bias_swiglu.py.
     """
     def __init__(self, n_embd: int, dropout: float = 0.0,
-                 use_swiglu: bool = False, add_bias: bool = False):
+                 use_swiglu: bool = False, add_bias: bool = False,
+                 cpu_offload_input: bool = False):
         super().__init__()
         self.use_swiglu = use_swiglu
+        # M2120: Megatron 0bbcbb115 — store offload flag; applied in forward to SwiGLU activations
+        self._cpu_offload_input = cpu_offload_input
         if use_swiglu:
             # SwiGLU: two parallel projections (gate + up), then down
             # Intermediate size = 8/3 * n_embd (rounded to multiple of 256)
@@ -1694,6 +1712,19 @@ class MLP(nn.Module):
             _gate_raw, _ = self.w_gate(x)
             gate = F.silu(_gate_raw)  # Swish activation
             up, _ = self.w_up(x)
+            # M2120: Megatron 0bbcbb115 — SwiGLU activation CPU offload
+            # Mark gate and up tensors with .activation_offloading=True so TE's offload
+            # hook evicts them to CPU RAM after forward, freeing GPU memory; they are
+            # fetched back before backward. Mirrors SwiGLUFunction.forward in
+            # megatron/core/fusions/fused_bias_swiglu.py (input_for_backward.activation_offloading).
+            # DES-LOC: during Kx local steps, AllReduce buffers spike GPU memory;
+            # this acts as a pressure valve preventing OOM on A6000 (48GB) at 7B scale.
+            if self._cpu_offload_input:
+                gate.activation_offloading = True
+                up.activation_offloading = True
+                print(f"[M2120-SWIGLU-OFFLOAD] cpu_offload_input=True: "
+                      f"gate.shape={tuple(gate.shape)} up.shape={tuple(up.shape)} "
+                      f"marked .activation_offloading=True (Megatron 0bbcbb115)")
             x = gate * up
             # DES-LOC diagnostic: detect dead gates (gate collapse)
             self._forward_count += 1
@@ -1820,7 +1851,8 @@ class TransformerBlock(nn.Module):
                  layer_number: int = 1,
                  apply_query_key_layer_scaling: bool = False,
                  attention_softmax_in_fp32: bool = False,
-                 num_kv_heads: int = None):
+                 num_kv_heads: int = None,
+                 cpu_offload_swiglu: bool = False):
         super().__init__()
         self.ln_1 = LayerNorm(n_embd)
         # M458: pass Megatron 691747b1 per-layer QK scaling + fp32 softmax flags
@@ -1831,7 +1863,8 @@ class TransformerBlock(nn.Module):
                                         attention_softmax_in_fp32=attention_softmax_in_fp32,
                                         num_kv_heads=num_kv_heads)
         self.ln_2 = LayerNorm(n_embd)
-        self.mlp = MLP(n_embd, dropout)
+        # M2120: pass cpu_offload_swiglu so MLP can mark gate/up activations for TE offload
+        self.mlp = MLP(n_embd, dropout, cpu_offload_input=cpu_offload_swiglu)
         self.use_ac = use_ac
 
     def _block_forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -2021,7 +2054,8 @@ class GPT(nn.Module):
                  share_embeddings_and_output_weights: bool = False,
                  init_method_std: float = 0.02,
                  init_method_xavier_uniform: bool = False,
-                 cross_entropy_fusion_impl: str = 'native'):
+                 cross_entropy_fusion_impl: str = 'native',
+                 cpu_offload_swiglu: bool = False):
         super().__init__()
         # M1532: Megatron 305b3901a — store init params from config instead of hardcoding
         # 鲁迅曾言：不从config读参数的初始化，不过是写死的谎言。
@@ -2055,6 +2089,11 @@ class GPT(nn.Module):
         print(f"[M2070-GPT-INIT] cross_entropy_fusion_impl={cross_entropy_fusion_impl!r} "
               f"(Megatron 0f60adbd3: 'native'=in-place CE 57064fd6f, "
               f"'te'=TE parallel_cross_entropy stub [raises on single-GPU])")
+        # M2120: Megatron 0bbcbb115 — SwiGLU activation CPU offload flag
+        # 铁屋中的激活，无声无息地驻留于GPU——今加一印，令其暂赴CPU，待反传时再归。
+        self._cpu_offload_swiglu = cpu_offload_swiglu
+        print(f"[M2120-GPT-INIT] cpu_offload_swiglu={cpu_offload_swiglu} "
+              f"(Megatron 0bbcbb115: SwiGLU gate/up activations offload to CPU RAM when True)")
         # Track params_dtype so forward() can cast back correctly (mirrors Megatron language_model.py)
         self._params_dtype = torch.float32  # default; may be overridden by mixed-precision context
         print(f"[M1541-GPT-INIT] embedding_weights_in_fp32={embedding_weights_in_fp32} "
@@ -2112,7 +2151,8 @@ class GPT(nn.Module):
                                  layer_number=i + 1,
                                  apply_query_key_layer_scaling=apply_query_key_layer_scaling,
                                  attention_softmax_in_fp32=_softmax_fp32,
-                                 num_kv_heads=_num_kv_heads)
+                                 num_kv_heads=_num_kv_heads,
+                                 cpu_offload_swiglu=cpu_offload_swiglu)
                 for i in range(self.num_unique_layers)
             ]),
             ln_f = LayerNorm(n_embd),
@@ -4781,6 +4821,14 @@ class Trainer:
             init_method_xavier_uniform=getattr(config, 'init_method_xavier_uniform', False),
             # M2070: Megatron 0f60adbd3 — parallel cross entropy option
             cross_entropy_fusion_impl=getattr(config, 'cross_entropy_fusion_impl', 'native'),
+            # M2120: Megatron 0bbcbb115 — SwiGLU activation CPU offload
+            # Mirrors mlp.py: cpu_offloading and cpu_offloading_activations gate the flag.
+            # In Neuron_SP the TE-availability check (HAVE_TE) is skipped — we expose the
+            # attribute unconditionally so DES-LOC runs without TE can still test the path.
+            cpu_offload_swiglu=(
+                getattr(config, 'cpu_offload', False)
+                and getattr(config, 'cpu_offloading_activations', False)
+            ),
             **model_config
         )
 
@@ -6560,6 +6608,13 @@ def main():
                         help='ZeRO stage (0=off, 1=optimizer state partition)')
     parser.add_argument('--cpu_offload', action='store_true',
                         help='Offload optimizer states to CPU (saves ~56GB for 7B)')
+    # M2120: Megatron 0bbcbb115 — SwiGLU activation CPU offload flag
+    # Requires --cpu_offload; marks SwiGLU gate/up activations for TE offload hook.
+    parser.add_argument('--cpu_offloading_activations', action='store_true',
+                        help='M2120: Offload SwiGLU gate/up activations to CPU RAM '
+                             '(Megatron 0bbcbb115); requires --cpu_offload and TE installed. '
+                             'Reduces peak GPU memory during forward pass at cost of '
+                             'PCIe bandwidth on fetch-back during backward.')
     parser.add_argument('--max_seq_len', type=int, default=1024,
                         help='Maximum sequence length (default: 1024)')
     # M452: Megatron 66719e9 dataloader flags
@@ -6628,6 +6683,8 @@ def main():
         use_autosp=args.use_autosp,
         zero_stage=args.zero_stage,
         cpu_offload=args.cpu_offload,
+        # M2120: Megatron 0bbcbb115 — SwiGLU activation CPU offload
+        cpu_offloading_activations=args.cpu_offloading_activations,
         max_seq_len=args.max_seq_len,
         use_activation_checkpointing=args.use_ac,
         output_dir=args.output,
