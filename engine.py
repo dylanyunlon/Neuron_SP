@@ -298,6 +298,106 @@ def _neuronsp_resolve_bert_data_config(engine_config: dict) -> dict:
     return resolved
 
 
+# M1810: Megatron b684719fa — Refactoring: GradBuffer inherits from MemoryBuffer
+# 鲁迅式迁移: 20%适配. Megatron原版在megatron/model/distributed.py.
+# DES-LOC版本: DesLocMemoryBuffer管理连续grad buffer; DesLocGradBuffer继承并加入
+# tier感知分桶 (DES-LOC Kx/Ku/Kv门控通信特有逻辑).
+class DesLocMemoryBuffer:
+    """Contiguous memory buffer for gradient storage.
+
+    M1810: Mirrors Megatron MemoryBuffer (b684719fa).
+    Holds a flat tensor; slices are handed out via get().
+    DES-LOC extension: tracks allocation watermark for diagnostics.
+    """
+
+    def __init__(self, numel, dtype, device):
+        self.numel = numel
+        self.dtype = dtype
+        self.device = device
+        self.data = torch.zeros(numel, dtype=dtype, device=device)
+        self._alloc_high_watermark = 0  # DES-LOC diag: max bytes allocated
+        print(f"[DESLOC-MEMBUF] alloc numel={numel} "
+              f"dtype={dtype} device={device} "
+              f"bytes={numel * self.data.element_size() / 1e6:.2f}MB")
+
+    def zero(self):
+        """Reset buffer to zero — mirrors Megatron MemoryBuffer.zero()."""
+        self.data.zero_()
+        print(f"[DESLOC-MEMBUF] zero() numel={self.numel}")
+
+    def get(self, shape, start_index):
+        """Return a view into the buffer starting at start_index.
+
+        Mirrors Megatron MemoryBuffer.get(). DES-LOC: logs high-watermark.
+        """
+        end_index = start_index + shape.numel()
+        assert end_index <= self.numel, (
+            f"DesLocMemoryBuffer.get: end_index={end_index} > numel={self.numel}")
+        self._alloc_high_watermark = max(self._alloc_high_watermark, end_index)
+        return self.data[start_index:end_index].view(shape)
+
+
+class DesLocGradBuffer(DesLocMemoryBuffer):
+    """Gradient buffer for a single dtype bucket group in DES-LOC.
+
+    M1810: Mirrors Megatron GradBuffer(MemoryBuffer) from b684719fa.
+    Inherits flat-buffer management from DesLocMemoryBuffer.
+    DES-LOC extensions vs Megatron:
+      - dominant_tier tracking (x/u/v) for Kx/Ku/Kv gating
+      - comm_count/comm_bytes per-bucket telemetry
+      - ready flag for lazy fill pattern
+    """
+
+    def __init__(self, bucket_id, named_params):
+        params = [p for _, p in named_params]
+        names = [n for n, _ in named_params]
+        numel = sum(p.numel() for p in params)
+        dtype = params[0].dtype
+        device = params[0].device
+
+        # M1810: call super().__init__ — mirrors GradBuffer calling MemoryBuffer.__init__
+        super(DesLocGradBuffer, self).__init__(numel, dtype, device)
+
+        self.id = bucket_id
+        self.params = params
+        self.names = names
+
+        # DES-LOC: dominant tier for Kx/Ku/Kv gating (20% extension vs Megatron)
+        tier_counts = {'x': 0, 'u': 0, 'v': 0}
+        for p in params:
+            tier = getattr(p, 'desloc_tier', 'x')
+            tier_counts[tier] += p.numel()
+        self.tier = max(tier_counts, key=tier_counts.get)
+
+        # Build param→slice mapping (mirrors Megatron param_to_bucket)
+        self.param_offsets = {}
+        offset = 0
+        for p in params:
+            self.param_offsets[id(p)] = (offset, offset + p.numel())
+            offset += p.numel()
+
+        # Telemetry
+        self.comm_count = 0
+        self.comm_bytes = 0
+        self.ready = False
+
+        print(f"[DESLOC-GRADBUF] bucket_id={bucket_id} "
+              f"numel={numel} tier={self.tier} "
+              f"n_params={len(params)} "
+              f"bytes={numel * self.data.element_size() / 1e6:.2f}MB "
+              f"names_sample={names[:2]}")
+
+    def reset(self):
+        """Zero the buffer and clear ready flag — mirrors GradBuffer.reset()."""
+        self.zero()
+        self.ready = False
+
+    @property
+    def grad_buffer(self):
+        """Compatibility shim: exposes self.data as grad_buffer for legacy callers."""
+        return self.data
+
+
 class DeepSpeedEngine(Module):
     r"""DeepSpeed engine for training."""
 
@@ -2730,13 +2830,17 @@ class DeepSpeedEngine(Module):
             self._desloc_create_bucket(bucket_id, current_bucket_params)
 
         if dist.get_rank() == 0:
-            total_params = sum(b['numel'] for b in self._desloc_buckets)
+            total_params = sum(b.numel for b in self._desloc_buckets)
             print(f"[DES-LOC] Initialized {len(self._desloc_buckets)} grad buckets, "
                   f"{total_params:,} params total, "
                   f"bucket_size={self._desloc_bucket_size:,}")
 
     def _desloc_create_bucket(self, bucket_id, named_params):
-        """Create a single gradient bucket.
+        """Create a single gradient bucket as a DesLocGradBuffer object.
+
+        M1810: Megatron b684719fa — mirrors GradBuffer(MemoryBuffer) refactor.
+        Previously used a raw dict + torch.zeros; now DesLocGradBuffer inherits
+        DesLocMemoryBuffer so buffer lifecycle is managed by the class, not the caller.
 
         Ref: Megatron _ParamAndGradBucket.__init__
           - params: list of params
@@ -2744,70 +2848,51 @@ class DeepSpeedEngine(Module):
           - offset: offset in global buffer
           - numel_unpadded: actual param count
         """
-        params = [p for _, p in named_params]
-        names = [n for n, _ in named_params]
-        numel = sum(p.numel() for p in params)
-
-        # Determine dominant tier for this bucket
-        tier_counts = {'x': 0, 'u': 0, 'v': 0}
-        for p in params:
-            tier = getattr(p, 'desloc_tier', 'x')
-            tier_counts[tier] += p.numel()
-        dominant_tier = max(tier_counts, key=tier_counts.get)
-
-        # Allocate contiguous grad buffer
-        # Ref: Megatron uses torch.zeros for grad_data
-        dtype = params[0].dtype
-        device = params[0].device
-        grad_buffer = torch.zeros(numel, dtype=dtype, device=device)
-
-        # Map params to slices in the contiguous buffer
-        param_offsets = {}
-        offset = 0
-        for p in params:
-            param_offsets[id(p)] = (offset, offset + p.numel())
-            offset += p.numel()
-
-        bucket = {
-            'id': bucket_id,
-            'params': params,
-            'names': names,
-            'numel': numel,
-            'grad_buffer': grad_buffer,
-            'param_offsets': param_offsets,
-            'tier': dominant_tier,
-            'comm_count': 0,
-            'comm_bytes': 0,
-            'ready': False,  # set True after backward fills grads
-        }
+        # M1810: instantiate DesLocGradBuffer — allocation + param mapping inside __init__
+        bucket = DesLocGradBuffer(bucket_id, named_params)
+        print(f"[DESLOC-CREATE-BUCKET] id={bucket_id} "
+              f"tier={bucket.tier} numel={bucket.numel} "
+              f"watermark={bucket._alloc_high_watermark} "
+              f"total_buckets_so_far={len(self._desloc_buckets) + 1}")
         self._desloc_buckets.append(bucket)
 
     def _desloc_fill_buckets(self):
         """Copy parameter gradients into contiguous bucket buffers.
 
+        M1810: bucket is now DesLocGradBuffer object; access via attrs not dict keys.
         Ref: Megatron's register_grad_ready hook — fires per-param when
         backward computes gradient. We batch this for simplicity.
         """
         for bucket in self._desloc_buckets:
-            for p in bucket['params']:
+            filled = 0
+            for p in bucket.params:
                 if p.grad is not None:
-                    start, end = bucket['param_offsets'][id(p)]
-                    bucket['grad_buffer'][start:end].copy_(p.grad.data.view(-1))
-            bucket['ready'] = True
+                    start, end = bucket.param_offsets[id(p)]
+                    bucket.data[start:end].copy_(p.grad.data.view(-1))
+                    filled += 1
+            bucket.ready = True
+            print(f"[DESLOC-FILL] bucket_id={bucket.id} tier={bucket.tier} "
+                  f"filled={filled}/{len(bucket.params)} "
+                  f"numel={bucket.numel}")
 
     def _desloc_scatter_buckets(self):
         """Copy reduced gradients from bucket buffers back to param.grad.
 
+        M1810: bucket is now DesLocGradBuffer object; access via attrs not dict keys.
         Inverse of _desloc_fill_buckets.
         """
         for bucket in self._desloc_buckets:
-            if not bucket['ready']:
+            if not bucket.ready:
                 continue
-            for p in bucket['params']:
+            scattered = 0
+            for p in bucket.params:
                 if p.grad is not None:
-                    start, end = bucket['param_offsets'][id(p)]
-                    p.grad.data.copy_(bucket['grad_buffer'][start:end].view_as(p.grad))
-            bucket['ready'] = False
+                    start, end = bucket.param_offsets[id(p)]
+                    p.grad.data.copy_(bucket.data[start:end].view_as(p.grad))
+                    scattered += 1
+            bucket.ready = False
+            print(f"[DESLOC-SCATTER] bucket_id={bucket.id} tier={bucket.tier} "
+                  f"scattered={scattered}/{len(bucket.params)}")
 
     def _desloc_bucket_allreduce(self):
         """Run async AllReduce on all ready buckets, then synchronize.
@@ -2839,34 +2924,38 @@ class DeepSpeedEngine(Module):
         t0 = _t.perf_counter_ns()
 
         for bucket in self._desloc_buckets:
-            if not bucket['ready']:
+            if not bucket.ready:
                 continue
 
             # Scale gradients for averaging
             # Ref: Megatron _ParamAndGradBucket.gradient_scaling_factor
+            # M1810: use bucket.data (DesLocMemoryBuffer) instead of bucket['grad_buffer']
             world_size = dist.get_world_size()
             if world_size > 1:
-                bucket['grad_buffer'].div_(world_size)
+                bucket.data.div_(world_size)
                 handle = dist.all_reduce(
-                    bucket['grad_buffer'],
+                    bucket.data,
                     op=dist.ReduceOp.SUM,
                     async_op=True
                 )
                 handles.append(handle)
 
                 # Track comm stats
-                elem_bytes = bucket['grad_buffer'].element_size()
-                comm_bytes = bucket['numel'] * elem_bytes
-                bucket['comm_count'] += 1
-                bucket['comm_bytes'] += comm_bytes
+                elem_bytes = bucket.data.element_size()
+                comm_bytes = bucket.numel * elem_bytes
+                bucket.comm_count += 1
+                bucket.comm_bytes += comm_bytes
                 self._desloc_comm_bytes_total += comm_bytes
                 self._desloc_comm_ops_total += 1
 
                 # Per-tier tracking
-                tier = bucket['tier']
+                tier = bucket.tier
                 if tier in self._desloc_tier_stats:
                     self._desloc_tier_stats[tier]['count'] += 1
                     self._desloc_tier_stats[tier]['bytes'] += comm_bytes
+                print(f"[DESLOC-ALLREDUCE] bucket_id={bucket.id} tier={tier} "
+                      f"comm_bytes={comm_bytes/1e6:.2f}MB "
+                      f"comm_count={bucket.comm_count} world_size={world_size}")
 
         # Wait for all async ops
         # Ref: Megatron BucketGroup.finish_grad_sync — barrier pattern
