@@ -911,6 +911,22 @@ class TrainingConfig:
     # TE version guard is omitted (no TE dependency), unfused interleaved path always applies.
     rotary_interleaved: bool = False  # f37edff1d: use interleaved (adjacent-pair) RoPE rotation
 
+    # M2110: Megatron 4ca43093f -- MoE fix for Llama4 (moe_apply_probs_on_input)
+    # Upstream adds `moe_apply_probs_on_input` to TransformerConfig: when True,
+    # expert routing probs are multiplied into the hidden states BEFORE the expert
+    # MLP (GroupedMLP / TEGroupedMLP / SequentialMLP), then reset to 1.0.
+    # Required for Llama4-style MoE where topk=1 and routing weight is absorbed
+    # into the token representation (not applied post-activation after GLU/SwiGLU).
+    #
+    # Companion fix: sigmoid routing in topk_softmax_with_capacity now uses fp32
+    # for stability, and expert_bias is added before topk selection (not after).
+    #
+    # Luxun note (20% DES-LOC adaptation):
+    # (see moe_topk_router_forward() stub below for the routing logic port)
+    moe_apply_probs_on_input: bool = False
+    moe_router_pre_softmax: bool = False  # True = pre-sigmoid (Llama4 path)
+    moe_router_topk: int = 1  # MoE top-k experts per token
+
     def get_pipeline_config(self) -> Dict:
         """Extract pipeline-parallel configuration (Megatron 31d133bba pattern).
 
@@ -968,13 +984,20 @@ class TrainingConfig:
             # M1532: Megatron 305b3901a — expose init_method params via config object
             'init_method_std': self.init_method_std,
             'init_method_xavier_uniform': self.init_method_xavier_uniform,
+            # M2110: Megatron 4ca43093f -- MoE Llama4 config fields
+            'moe_apply_probs_on_input': self.moe_apply_probs_on_input,
+            'moe_router_pre_softmax': self.moe_router_pre_softmax,
+            'moe_router_topk': self.moe_router_topk,
         }
         print(f"[M1448-XFORMCFG] transformer config: "
               f"layers={xformer_cfg['num_layers']} "
               f"hidden={xformer_cfg['hidden_size']} "
               f"heads={xformer_cfg['num_attention_heads']} "
               f"ac={xformer_cfg['use_activation_checkpointing']} "
-              f"gqa={self.group_query_attention} num_query_groups={self.num_query_groups}")
+              f"gqa={self.group_query_attention} num_query_groups={self.num_query_groups} "
+              f"[M2110] moe_apply_probs_on_input={self.moe_apply_probs_on_input} "
+              f"moe_router_pre_softmax={self.moe_router_pre_softmax} "
+              f"moe_router_topk={self.moe_router_topk}")
         return xformer_cfg
 
     def get_model_config(self) -> Dict:
@@ -1687,6 +1710,73 @@ class MLP(nn.Module):
             x, _ = self.c_proj(x)
         x = self.dropout(x)
         return x
+
+
+def moe_topk_router_forward(logits, topk, score_function='sigmoid',
+                             use_pre_softmax=False, expert_bias=None,
+                             moe_apply_probs_on_input=False,
+                             hidden_states=None):
+    """M2110: Megatron 4ca43093f -- MoE topk routing with Llama4 sigmoid fix.
+
+    Ports topk_softmax_with_capacity (moe_utils.py) sigmoid branch fix and
+    moe_apply_probs_on_input logic from GroupedMLP/SequentialMLP forward.
+
+    Key changes vs naive sigmoid routing:
+      1. fp32 upcast for sigmoid stability (logits.float())
+      2. expert_bias added BEFORE topk (not after) -- fixes Llama4 bias routing
+      3. use_pre_softmax=True: sigmoid -> topk (pre-selection)
+         use_pre_softmax=False: topk -> sigmoid (post-selection, Llama4 default)
+      4. moe_apply_probs_on_input: multiply probs into hidden_states before MLP,
+         reset probs to 1.0 so expert forward doesn't double-apply.
+
+    Luxun note (20% DES-LOC adaptation):
+      Neuron_SP runs dense GPT-2 (no expert dispatch), so this function is a
+      diagnostic stub -- it runs the routing math but does not dispatch tokens
+      to separate expert MLPs.  When moe_apply_probs_on_input=True and
+      hidden_states is provided, it returns the prob-weighted hidden states as
+      a smoke test of the Llama4 absorb path.
+
+      (Lu Xun would say: the routing gate opens before the expert's door,
+      not after -- a small change of order that separates Llama4 from the crowd.)
+    """
+    import torch
+
+    if score_function == 'sigmoid':
+        logits_fp32 = logits.float()  # fp32 for stability (M2110 fix)
+        if use_pre_softmax:
+            logits_fp32 = torch.sigmoid(logits_fp32)
+        if expert_bias is not None:
+            logits_fp32 = logits_fp32 + expert_bias
+        scores_topk, top_indices = torch.topk(logits_fp32, k=topk, dim=-1)
+        if use_pre_softmax:
+            scores = scores_topk.to(logits.dtype)
+        else:
+            scores = torch.sigmoid(scores_topk).to(logits.dtype)
+        probs = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20) if topk > 1 else scores
+    elif score_function == 'softmax':
+        if use_pre_softmax:
+            probs_pre = torch.softmax(logits, dim=-1, dtype=torch.float32).type_as(logits)
+            probs, top_indices = torch.topk(probs_pre, k=topk, dim=-1)
+        else:
+            scores, top_indices = torch.topk(logits, k=topk, dim=-1)
+            probs = torch.softmax(scores, dim=-1, dtype=torch.float32).type_as(logits)
+    else:
+        raise ValueError(f"[M2110] Invalid score_function: {score_function}")
+
+    print(f"[M2110-MoE-ROUTER] score_fn={score_function} topk={topk} "
+          f"pre_softmax={use_pre_softmax} apply_probs_on_input={moe_apply_probs_on_input} "
+          f"probs_mean={probs.mean().item():.4f} probs_max={probs.max().item():.4f}")
+
+    if moe_apply_probs_on_input and hidden_states is not None:
+        assert topk == 1, "[M2110] moe_apply_probs_on_input only works with topk=1"
+        original_dtype = hidden_states.dtype
+        hidden_states = probs.unsqueeze(-1) * hidden_states
+        hidden_states = hidden_states.to(original_dtype)
+        probs = torch.ones_like(probs)  # probs absorbed; reset to 1
+        print(f"[M2110-MoE-ABSORB] probs absorbed into hidden_states "
+              f"(Llama4 path); probs reset to 1.0, hidden dtype={original_dtype}")
+
+    return probs, top_indices, hidden_states
 
 
 class TransformerBlock(nn.Module):

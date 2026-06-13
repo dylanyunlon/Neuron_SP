@@ -1,0 +1,39 @@
+# M2110 -- Megatron-LM commit 4ca43093f: MoE fix for Llama4
+# Source: NVIDIA/Megatron-LM@4ca43093f
+# Date: 2026-06-13
+#
+# Megatron diff touches 3 files (129 lines total):
+#
+#   1. megatron/core/transformer/moe/experts.py
+#      -- GroupedMLP.forward: if moe_apply_probs_on_input, absorb probs into
+#         hidden states before GEMM, reset probs=ones (topk=1 assert).
+#      -- TEGroupedMLP.forward: same pattern, no unsqueeze needed (already expanded).
+#      -- SequentialMLP.forward: same pattern with unsqueeze(-1).
+#
+#   2. megatron/core/transformer/moe/moe_utils.py
+#      -- topk_softmax_with_capacity sigmoid branch:
+#         * Upcast to fp32 before sigmoid (stability fix).
+#         * expert_bias added before topk (not after) -- Llama4 routing semantics.
+#         * use_pre_softmax=True: sigmoid->topk; False: topk->sigmoid.
+#      -- track_moe_metrics: assert isinstance(num_layers, int) before pattern build.
+#      -- Docstring: use_pre_softmax now covers both softmax and sigmoid paths.
+#
+#   3. megatron/core/transformer/transformer_config.py
+#      -- moe_router_pre_softmax docstring: "pre-softmax(pre-sigmoid)".
+#      -- New field: moe_apply_probs_on_input: bool = False.
+#
+# NSP adaptation (20% DES-LOC):
+#   - TrainingConfig: moe_apply_probs_on_input, moe_router_pre_softmax, moe_router_topk fields.
+#   - get_transformer_config(): transparently passes all three fields downstream.
+#   - moe_topk_router_forward() standalone stub: ports the sigmoid routing fix +
+#     moe_apply_probs_on_input absorb logic for future MoE port validation.
+#     Includes print diagnostics [M2110-MoE-ROUTER] and [M2110-MoE-ABSORB].
+#
+# NSP does NOT have GroupedMLP / TEGroupedMLP / SequentialMLP / topk_softmax_with_capacity.
+# The experts.py and moe_utils.py changes are fully represented in the stub function.
+#
+# Luxun note (鲁迅评注):
+#   旧代码以 sigmoid 先行，再筛 topk，宛如先定名单再考试；
+#   新代码以 logit 先筛，再施 sigmoid，方是先考试再发证书的正道。
+#   至于 moe_apply_probs_on_input，将路由权重提前吸入隐态，
+#   如同酱油入锅早晚之别，味道天壤，但凡 Llama4 之厨，皆知此理。

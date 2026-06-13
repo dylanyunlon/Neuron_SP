@@ -1,7 +1,7 @@
 # Megatron-LM → Neuron_SP Migration Progress
 
 ## 状态
-- 最新处理: M2040 (Megatron acba19cb9 — Reduce CPU overhead of TEDotProductAttention for packed sequence)
+- 最新处理: M2110 (Megatron 4ca43093f -- MoE fix for Llama4: moe_apply_probs_on_input)
 - 总进度: 146/7156 commits (2.0%)
 - 实际代码改动 commits: M1445(partial AC), M1500(SwiGLU)
 - 小弟 dispatched: M1461(dist ckpt), M1510(MQA)
@@ -24,7 +24,39 @@ cd /path/to/Neuron_SP
 # 查看当前进度
 git log --oneline | grep "M15" | tail -5
 # 继续从 M1588 开始
-# 参考 /home/claude/megatron_pending_commits.txt 第 14## M2040 — Megatron-LM commit acba19cb9: Reduce CPU overhead of TEDotProductAttention for packed sequence
+# 参考 /home/claude/megatron_pending_commits.txt 第 14## M2110 -- Megatron-LM commit 4ca43093f: MoE fix for Llama4
+
+**日期**: 2026-06-13
+**来源**: NVIDIA/Megatron-LM@4ca43093f (MoE fix for Llama4, 3 files, 129 lines)
+
+### 修改要点
+1. **`experts.py` (GroupedMLP / TEGroupedMLP / SequentialMLP)**:
+   - 新增 `moe_apply_probs_on_input` 路径：在 expert MLP forward 之前将路由概率
+     乘入 hidden states，再将 probs reset 为 ones（topk=1 强制断言）。
+   - 对应 NSP: `moe_topk_router_forward()` stub 的 moe_apply_probs_on_input 分支。
+
+2. **`moe_utils.py` — `topk_softmax_with_capacity` sigmoid 分支**:
+   - fp32 upcast（稳定性修复）。
+   - expert_bias 在 topk 之前加入（非之后）。
+   - use_pre_softmax=True: sigmoid→topk；False: topk→sigmoid（Llama4 默认）。
+   - 对应 NSP: `moe_topk_router_forward()` 全路由逻辑。
+
+3. **`transformer_config.py`**:
+   - 新字段 `moe_apply_probs_on_input: bool = False`。
+   - `moe_router_pre_softmax` docstring 更新（含 sigmoid 说明）。
+   - 对应 NSP: `TrainingConfig.moe_apply_probs_on_input / moe_router_pre_softmax / moe_router_topk`。
+
+### 鲁迅式评注（20% 适配注记）
+> 旧代码以 sigmoid 先行，再筛 topk，宛如先定名单再考试；
+> 新代码以 logit 先筛，再施 sigmoid，方是先考试再发证书的正道。
+> 至于 moe_apply_probs_on_input，将路由权重提前吸入隐态，
+> 如同酱油入锅早晚之别，味道天壤，但凡 Llama4 之厨，皆知此理。
+
+### 存档文件
+- `archive/patches/M2110_Megatron_4ca43093f_MoE_fix_Llama4.patch` -- 原始 Megatron diff 说明 (129行)
+- `REAL_GPU_BENCHMARK.py` -- `TrainingConfig` 新增3字段 + `moe_topk_router_forward()` stub
+
+## M2040 -- Megatron-LM commit acba19cb9: Reduce CPU overhead of TEDotProductAttention for packed sequence
 
 **日期**: 2026-06-13  
 **来源**: NVIDIA/Megatron-LM@acba19cb9 (Reduce CPU overhead of TEDotProductAttention for packed sequence)
