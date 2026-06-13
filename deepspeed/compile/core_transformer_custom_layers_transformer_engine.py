@@ -32,11 +32,44 @@
 # 20% adaptation: adds print('[M1527]') diagnostic markers and 鲁迅式 docstring.
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# M1750: Megatron 7891eb1fe — Replace TELN+TELinear with TELayerNormLinear
+# Source: megatron/core/transformer/custom_layers/transformer_engine.py
+#         megatron/core/transformer/attention.py
+#         megatron/core/transformer/mlp.py
+#         megatron/core/transformer/transformer_layer.py
+#
+# Mapping:
+#   megatron/core/transformer/custom_layers/transformer_engine.py
+#     -> deepspeed/compile/core_transformer_custom_layers_transformer_engine.py
+#
+# Changes ported (M1750):
+#   TELayerNormColumnParallelLinear (NEW CLASS):
+#     - Wraps te.pytorch.LayerNormLinear: fuses LayerNorm + ColumnParallelLinear
+#       into a single kernel, eliminates separate TENorm pass before linear.
+#     - te_return_bias / forward() pattern identical to TEColumnParallelLinear.
+#     - attention.py: TEColumnParallelLinear -> TELayerNormColumnParallelLinear
+#       for linear_qkv (SelfAttention), linear_q / linear_kv (CrossAttention).
+#     - mlp.py: TEColumnParallelLinear -> TELayerNormColumnParallelLinear
+#       for linear_fc1.
+#     - transformer_layer.py: input_layernorm / post_self_attn_layernorm
+#       TENorm -> IdentityOp (LayerNorm now absorbed into fused kernel above).
+#
+# 20% adaptation (鲁迅式迁移):
+#   - 鲁迅云：「无穷的远方，无数的人们，都和我有关。」
+#     层归一化与线性层，合二为一，消弭边界，性能相关。
+#   - Adds print('[M1750]') diagnostic marker.
+#   - TELayerNormColumnParallelLinear.__init__ prints fusion params on construction.
+#   - TELayerNormColumnParallelLinear.forward prints input shape for diagnostics.
+# ---------------------------------------------------------------------------
 print('[M1425]')
 print('[M1525]')
 print('[M1527]')
+print('[M1750]')
 import torch
 import transformer_engine as te
+from importlib.metadata import version as _te_version
+from pkg_resources import packaging as _pkg
 
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.enums import AttnMaskType
@@ -119,6 +152,75 @@ class TELinear(te.pytorch.module.Linear):
         print(f'[M1527] TELinear.forward te_return_bias=False, appending None bias')
         return out, None
 
+
+
+class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
+    """
+    Wrapper for Transformer-Engine's `LayerNormLinear` layer — 融合 LayerNorm
+    与 ColumnParallelLinear，单一核函数完成归一化与投影，省去独立 TENorm 开销。
+
+    M1750: 鲁迅云：「无穷的远方，无数的人们，都和我有关。」
+    层归一化与线性层，合二为一，消弭边界——性能之事，细节攸关。
+
+    取代 SelfAttention.linear_qkv、CrossAttention.linear_q/linear_kv、
+    MLP.linear_fc1 处原本分离的 TENorm + TEColumnParallelLinear 组合。
+    transformer_layer.py 中对应的 input_layernorm / post_self_attn_layernorm
+    随之改为 IdentityOp（LayerNorm 已内嵌于本层）。
+    """
+
+    def __init__(
+        self,
+        input_size: int,
+        output_size: int,
+        config: TransformerConfig,
+        bias: bool = True,
+        skip_bias_add: bool = False,
+        **kwargs
+    ):
+        self.config = config
+        # TE returns zero-length Tensor when bias=False and return_bias=True;
+        # we prefer None — so we handle it ourselves.
+        self.te_return_bias = skip_bias_add and bias
+
+        # Only TE >= 0.11.0 supports normalization kwarg (RMSNorm support).
+        try:
+            _te_ver = _pkg.version.Version(_te_version("transformer-engine"))
+            if _te_ver >= _pkg.version.Version("0.11.0"):
+                kwargs.setdefault("normalization", self.config.normalization)
+        except Exception:
+            pass  # 无法检测版本时跳过，默认 LayerNorm
+
+        print(
+            f'[M1750] TELayerNormColumnParallelLinear.__init__ '
+            f'input={input_size} output={output_size} '
+            f'bias={bias} skip_bias_add={skip_bias_add} '
+            f'te_return_bias={self.te_return_bias}'
+        )
+
+        super().__init__(
+            in_features=input_size,
+            out_features=output_size,
+            bias=bias,
+            sequence_parallel=self.config.sequence_parallel,
+            fuse_wgrad_accumulation=self.config.gradient_accumulation_fusion,
+            tp_group=get_tensor_model_parallel_group(),
+            tp_size=self.config.tensor_model_parallel_size,
+            get_rng_state_tracker=get_cuda_rng_tracker,
+            init_method=self.config.init_method,
+            params_dtype=self.config.params_dtype,
+            parallel_mode="column",
+            return_bias=self.te_return_bias,
+            **kwargs
+        )
+
+    def forward(self, x):
+        print(f'[M1750] TELayerNormColumnParallelLinear.forward input_shape={tuple(x.shape)}')
+        out = super().forward(x)
+        # TE 只在 return_bias=True 时返回元组，否则返回单个 Tensor；
+        # 我们无论如何都返回两个值——接口一律平等，调用方一律 output, _ = layer(x)。
+        if self.te_return_bias:
+            return out
+        return out, None
 
 class TEColumnParallelLinear(TELinear):
     """
