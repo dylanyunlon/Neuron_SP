@@ -307,10 +307,33 @@ class ParallelAttention(MegatronModule):
         # ==================================
         # Adjust key and value for inference
         # ==================================
-
-        # M1910: Apply fused rotary position embeddings if provided
-        if rotary_pos_emb is not None:
-            query_layer, key_layer = _apply_rope(query_layer, key_layer, rotary_pos_emb)
+        # ---------------------------------------------------------------------------
+        # M2010: Megatron 96f5c4165 — Fix inference pipelining error
+        # Source: megatron/core/transformer/attention.py (NVIDIA/Megatron-LM commit 96f5c4165)
+        #
+        # Bug fixed: 旧代码用 is_first_step 标记区分"首次前向"与"续生成"，
+        #   但此标记于 pipeline 并行下失效——各 stage 独立分配 KV 缓存，
+        #   is_first_step 仅反映本层是否初次分配，而非全局时间步。
+        #   正确判据: inference_params.sequence_len_offset > 0 代表"prompt 已过，
+        #   处于 token-by-token 生成阶段"，此时须关闭因果 mask，
+        #   且 q_pos_emb 应取 [sequence_start:sequence_end] 而非全 prefix。
+        #
+        # Changes ported:
+        #   1. 删除 is_first_step 布尔标记（来源于 KV 分配副作用，不可靠）。
+        #   2. attn_mask_type = AttnMaskType.no_mask 移至 sequence_len_offset > 0 处。
+        #   3. RoPE 切片: q_pos_emb[sequence_start:sequence_end] 替代 is_first_step 分支。
+        #   4. 早返回路径: rotary_pos_emb is None 时直接返回（此处保留为注释，
+        #      因 ParallelAttention 已在函数末尾统一 return output, bias）。
+        #
+        # 20% 适配（鲁迅式迁移）:
+        #   鲁迅曰: "is_first_step 如旧官印，印于本层，却不知天下大势；
+        #            sequence_len_offset 方是朝廷公告，令出必行，各层皆知。"
+        #   - 保留 _apply_rope helper（M1910 引入，apex fused path），
+        #     但推理路径改为内联切片后再调用，以匹配 upstream 语义。
+        #   - attention_mask 参数传递保持不变（dot_product_attention 签名兼容）。
+        #   - print('[M2010]') 诊断标记。
+        # ---------------------------------------------------------------------------
+        print('[M2010] inference pipeline fix active — sequence_len_offset-based mask logic')
 
         if inference_params:
             batch_start = inference_params.batch_size_offset
@@ -319,11 +342,33 @@ class ParallelAttention(MegatronModule):
             sequence_start = inference_params.sequence_len_offset
             sequence_end = sequence_start + key_layer.size(0)
             assert sequence_end <= inference_key_memory.size(0)
-            # Copy key and values.
+            print(f'[M2010] sequence_start={sequence_start} sequence_end={sequence_end} '
+                  f'batch_start={batch_start} batch_end={batch_end}')
+
+            # M2010: mask 关闭依据 sequence_len_offset，而非 is_first_step —— 各 pipeline stage 均可正确感知
+            if inference_params.sequence_len_offset > 0:
+                # 已过 prompt forward_step，进入逐 token 生成：关闭因果 mask
+                attention_mask = None  # AttnMaskType.no_mask 语义：传 None 给 dot_product_attention
+                print(f'[M2010] past prompt step (offset={inference_params.sequence_len_offset}): mask disabled')
+
+            # M2010: 先处理 RoPE 切片，再写入 KV cache（upstream 96f5c4165 语义）
+            if rotary_pos_emb is not None:
+                q_pos_emb, k_pos_emb = rotary_pos_emb
+                # q_pos_emb 取当前 step 的位置区间，而非依赖 is_first_step 分支
+                q_pos_emb = q_pos_emb[sequence_start:sequence_end, :, :, :]
+                k_pos_emb = k_pos_emb[:sequence_end, :, :, :]
+                print(f'[M2010] RoPE sliced: q_pos_emb[{sequence_start}:{sequence_end}] '
+                      f'k_pos_emb[:{sequence_end}]')
+                query_layer, key_layer = _apply_rope(query_layer, key_layer, (q_pos_emb, k_pos_emb))
+            # Copy key and values into pre-allocated inference buffers.
             inference_key_memory[sequence_start:sequence_end, batch_start:batch_end, ...] = key_layer
             inference_value_memory[sequence_start:sequence_end, batch_start:batch_end, ...] = value_layer
             key_layer = inference_key_memory[:sequence_end, batch_start:batch_end, ...]
             value_layer = inference_value_memory[:sequence_end, batch_start:batch_end, ...]
+        else:
+            # Non-inference path: apply RoPE globally (M1910 behaviour unchanged)
+            if rotary_pos_emb is not None:
+                query_layer, key_layer = _apply_rope(query_layer, key_layer, rotary_pos_emb)
 
         # ==================================
         # core attention computation

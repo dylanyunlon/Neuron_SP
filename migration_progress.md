@@ -181,3 +181,37 @@ git log --oneline | grep "M15" | tail -5
 - `archive/patches/M2000_Megatron_de16089be_distrib_opt_no_apex.patch` — 原始 Megatron diff
 - `deepspeed/compile/megatron_optimizer.py` — HAVE_APEX_OR_TE 标志 + state_dict/load_state_dict 适配
 - `deepspeed/compile/megatron_checkpointing.py` — load_optimizer_state_safe() helper (except KeyError as e)
+
+## M2010 — Megatron-LM commit 96f5c4165: Fix inference pipelining error
+
+**日期**: 2026-06-13  
+**来源**: NVIDIA/Megatron-LM@96f5c4165 (Fix inference pipelining error)
+
+### 核心问题
+
+推理 pipeline 并行时，旧代码以 `is_first_step` 布尔标记区分"首次前向（prompt 阶段）"与"续生成（token-by-token 阶段）"。然而各 pipeline stage 独立为每层分配 KV cache，`is_first_step` 仅反映**本层**是否首次分配，而非**全局时间步**。在多 stage 流水中，此标记对非首层 stage 永远为 `False`，导致：
+1. 因果 mask 在 prompt 阶段被错误关闭（应保留）。
+2. RoPE 位置编码切片错误——续生成时只应取当前 token 的位置，而非全 prefix。
+
+### 修复要点
+
+1. **删除 `is_first_step`** 布尔标记及其赋值（共 2 处）。
+2. **mask 关闭判据改为 `inference_params.sequence_len_offset > 0`**：offset > 0 意味着 prompt forward_step 已完成，处于逐 token 生成阶段，可安全关闭因果 mask。
+3. **RoPE 切片重构**：
+   - `q_pos_emb[sequence_start:sequence_end, :, :, :]`（统一用 offset 区间，无需 is_first_step 分支）。
+   - `k_pos_emb[:sequence_end, :, :, :]`（保持完整历史）。
+4. **RoPE 移至 KV cache 写入之前**，先切片再写入，语义更清晰。
+
+### 鲁迅式评注（20% 适配注记）
+> is_first_step 如旧官印，印于本层，却不知天下大势；  
+> sequence_len_offset 方是朝廷公告，令出必行，各层皆知。  
+> 推理流水犹如驿站接力，各驿不可各立旗帜；当以全局偏移为令，方能一令贯通。
+
+### 诊断 print 标记
+- `[M2010] inference pipeline fix active — sequence_len_offset-based mask logic` — 每次前向
+- `[M2010] sequence_start=... sequence_end=... batch_start=... batch_end=...` — 推理时
+- `[M2010] past prompt step (offset=...): mask disabled` — offset > 0 时
+- `[M2010] RoPE sliced: q_pos_emb[S:E] k_pos_emb[:E]` — 有 RoPE 时
+
+### 存档文件
+- `deepspeed/compile/core_transformer_parallel_attention.py` — 更新（推理 KV cache + RoPE + mask 逻辑重构）
