@@ -678,6 +678,19 @@ class TrainingConfig:
     # Orthogonal to SP and DEC: SP(data) × DEC(comm) × AC(memory)
     use_activation_checkpointing: bool = False
 
+    # M1445: Megatron 13c96dc08 — Partial Activation Checkpointing
+    # Instead of checkpointing ALL micro-batches uniformly, checkpoint only
+    # a subset within each pipeline window. Micro-batches with IDs below this
+    # threshold skip AC (faster forward), the rest checkpoint (saves memory).
+    # See Appendix C in https://arxiv.org/pdf/2205.05198.pdf
+    #
+    # DES-LOC 20% adaptation: when GPU memory pressure exceeds 85% of capacity,
+    # dynamically lower the threshold (checkpoint more micro-batches) regardless
+    # of the configured value. This prevents OOM on the A6000 (48GB) during
+    # DES-LOC sync phases when AllReduce buffers temporarily spike memory usage.
+    # Set to None to disable partial AC (= checkpoint all or none uniformly).
+    num_micro_batches_with_partial_ac: int = None
+
     # M458: Megatron 691747b1 — per-layer QK scaling + fp32 softmax
     # apply_query_key_layer_scaling: scale Q*K^T by 1/layer_number on top of 1/sqrt(d).
     #   Deeper layers produce smaller raw logit magnitudes, preventing softmax saturation.
@@ -4635,6 +4648,39 @@ class Trainer:
                   f"pipe_rank={_pipe_rank} num_micro={_num_micro} "
                   f"num_warmup={_num_warmup}")
 
+            # M1445: Megatron 13c96dc08 — Partial Activation Checkpointing
+            # Compute per-microbatch AC decision: micro-batches below the
+            # partial_ac threshold skip checkpointing (faster forward),
+            # the rest checkpoint (saves memory). This is the DES-LOC
+            # adaptation of Appendix C in arxiv.org/pdf/2205.05198.
+            #
+            # 20% DES-LOC twist: monitor GPU memory pressure and dynamically
+            # tighten the threshold when approaching OOM. During DES-LOC
+            # sync phases, AllReduce flat buffers can spike memory by ~512MB,
+            # so we proactively checkpoint more micro-batches when memory
+            # usage exceeds 85% of GPU capacity.
+            _partial_ac_threshold = self.config.num_micro_batches_with_partial_ac
+            _max_outstanding = None
+            if _partial_ac_threshold is not None:
+                _max_outstanding = _num_warmup + 1
+                # DES-LOC memory-pressure override
+                _gpu_total = torch.cuda.get_device_properties(self.device).total_mem
+                _gpu_used = torch.cuda.memory_allocated(self.device)
+                _gpu_pressure = _gpu_used / max(_gpu_total, 1)
+                if _gpu_pressure > 0.85:
+                    # Under memory pressure: checkpoint more aggressively
+                    _original = _partial_ac_threshold
+                    _partial_ac_threshold = max(1, _partial_ac_threshold // 2)
+                    print(f"[M1445-PARTIAL-AC] step={step} MEMORY PRESSURE "
+                          f"{_gpu_pressure:.1%} > 85% — tightening threshold "
+                          f"{_original} → {_partial_ac_threshold}")
+                if step <= 3 or step % 50 == 0:
+                    print(f"[M1445-PARTIAL-AC] step={step} "
+                          f"threshold={_partial_ac_threshold} "
+                          f"max_outstanding={_max_outstanding} "
+                          f"num_micro={_num_micro} "
+                          f"mem_pressure={_gpu_pressure:.1%}")
+
             for micro_step in range(self.config.gradient_accumulation):
                 try:
                     batch = next(data_iter)
@@ -4701,7 +4747,31 @@ class Trainer:
                         _diag.log_data_hash(step, self.rank, labels, "post-scatter-labels")
 
                 with autocast():
+                    # M1445: Per-microbatch AC override (Megatron 13c96dc08)
+                    # If partial AC is configured, toggle AC on/off per micro-batch
+                    # based on the outstanding backprop window.
+                    _ac_override = None
+                    if _max_outstanding is not None and self.config.use_activation_checkpointing:
+                        _ac_override = (micro_step % _max_outstanding) >= _partial_ac_threshold
+                        # Temporarily override AC flag on all TransformerBlocks
+                        for _module in self.model.modules():
+                            if hasattr(_module, 'use_ac') and hasattr(_module, '_block_forward'):
+                                _module._original_use_ac = _module.use_ac
+                                _module.use_ac = _ac_override
+                        if micro_step == 0 and (step <= 3 or step % 100 == 0):
+                            print(f"[M1445-AC] step={step} micro={micro_step} "
+                                  f"ac_override={_ac_override} "
+                                  f"outstanding_idx={micro_step % _max_outstanding} "
+                                  f"threshold={_partial_ac_threshold}")
+
                     _, loss = self.model(input_ids, labels)
+
+                    # M1445: Restore original AC flags after forward
+                    if _ac_override is not None:
+                        for _module in self.model.modules():
+                            if hasattr(_module, '_original_use_ac'):
+                                _module.use_ac = _module._original_use_ac
+                                del _module._original_use_ac
                     # M457: apply loss_mask — normalise by active token count
                     # Knuth §1.2.10: division by clamp(sum,1) avoids zero-div when
                     # an entire micro-batch is masked (pathological but possible).

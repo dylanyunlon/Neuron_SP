@@ -1,87 +1,72 @@
 #!/usr/bin/env bash
-# master_loop.sh — 主调度循环: 逐commit派发给子Claude
-# 用法: bash master_loop.sh [start_idx] [end_idx]
-# 默认: 从commit 1开始
-set -euo pipefail
+# master_loop.sh — 循环派发 Megatron commits 给 sub-Claude 小弟们
+# 用法: bash master_loop.sh [start_index] [count]
+# 例:   bash master_loop.sh 1 10   # 从第1个待迁移commit开始, 派10个
+set -eo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-cd "$SCRIPT_DIR"
-
-MEGATRON_BARE="/home/claude/megatron_bare"
-RESULTS_DIR="$SCRIPT_DIR/megatron_review_results"
-mkdir -p "$RESULTS_DIR"
+MEGATRON_DIR="/home/claude/Megatron-LM"
+COMMIT_LIST="/home/claude/megatron_pending_commits.txt"
+LOG_DIR="/home/claude/dispatch_logs"
+mkdir -p "$LOG_DIR"
 
 START=${1:-1}
-END=${2:-20}
+COUNT=${2:-5}
+BASE_M=1444  # Neuron_SP 当前最高 M 编号
 
-# 生成全部commit列表(正序: 从first commit开始)
-cd "$MEGATRON_BARE"
-git log --reverse --format="%H" > /tmp/megatron_all_commits.txt
-TOTAL=$(wc -l < /tmp/megatron_all_commits.txt)
-echo "Megatron-LM total commits: $TOTAL"
-echo "Processing: #${START} to #${END}"
-cd "$SCRIPT_DIR"
+echo "============================================"
+echo " Megatron → Neuron_SP Migration Loop"
+echo " Start: commit #$START"
+echo " Count: $COUNT commits"
+echo " Base M: M${BASE_M}"
+echo " $(date)"
+echo "============================================"
 
-IDX=0
-while IFS= read -r COMMIT; do
-    IDX=$((IDX + 1))
-    if [ "$IDX" -lt "$START" ]; then continue; fi
-    if [ "$IDX" -gt "$END" ]; then break; fi
+COMPLETED=0
+FAILED=0
 
-    # 获取commit消息
-    MSG=$(cd "$MEGATRON_BARE" && git log --format="%s" -1 "$COMMIT")
-    STAT=$(cd "$MEGATRON_BARE" && git show "$COMMIT" --stat --format="" 2>/dev/null | tail -1 || echo "?")
-
-    echo ""
-    echo "================================================================"
-    echo " [${IDX}/${END}] Commit: ${COMMIT:0:12} — ${MSG:0:70}"
-    echo " Stats: $STAT"
-    echo "================================================================"
-
-    # 获取diff(截断到6000字符)
-    DIFF_CONTENT=$(cd "$MEGATRON_BARE" && git show "$COMMIT" --format="" 2>/dev/null | head -250 || echo "empty")
-
-    PROMPT="你是Neuron_SP算法审阅员。审阅Megatron-LM commit,提取算法精华融入DES-LOC。
-
-Megatron commit #${IDX}: ${COMMIT:0:12}
-Message: ${MSG}
-Stats: ${STAT}
-
-== DIFF ==
-${DIFF_CONTENT}
-== END ==
-
-执行:
-1. git clone https://github.com/dylanyunlon/Neuron_SP.git && cd Neuron_SP && git log --oneline -3
-2. 阅读diff,找算法核心(跳过纯文档/格式)
-3. 有算法改动→修改Neuron_SP现有文件,20%化用+print诊断
-4. 无算法改动→回复SKIP-TRIVIAL
-5. 有改动时: git add -A && git commit --signoff --author='dylanyunlon <dogechat@163.com>' -m 'M${IDX}: integrate Megatron ${COMMIT:0:9} — ${MSG:0:50}'
-6. 铁律: 不用v2/port后缀,不开新分支,MODIFY EXISTING FILES ONLY"
-
-    OUTFILE="${RESULTS_DIR}/commit_${IDX}_${COMMIT:0:12}.txt"
-
-    # 派发给子Claude
-    echo "$PROMPT" > /tmp/dispatch_prompt.txt
-    TASK_FILE=/tmp/dispatch_prompt.txt timeout 180 bash claude_hk_chat.sh 2>&1 | tee "$OUTFILE" || true
-
-    # 检查结果
-    if grep -qi "SKIP-TRIVIAL" "$OUTFILE" 2>/dev/null; then
-        echo "  → SKIPPED (trivial)"
-    elif [ -s "$OUTFILE" ]; then
-        BYTES=$(wc -c < "$OUTFILE")
-        echo "  → Response: ${BYTES} bytes"
-    else
-        echo "  → EMPTY response (retry needed)"
+for i in $(seq $START $((START + COUNT - 1))); do
+    LINE=$(sed -n "${i}p" "$COMMIT_LIST")
+    if [ -z "$LINE" ]; then
+        echo "[LOOP] No more commits at index $i"
+        break
     fi
-
-    # 短暂间隔避免rate limit
-    sleep 3
-
-done < /tmp/megatron_all_commits.txt
+    
+    HASH=$(echo "$LINE" | cut -d' ' -f1)
+    MNUM="M$((BASE_M + i))"
+    MSG=$(echo "$LINE" | cut -d' ' -f2-)
+    
+    # 检查 diff 大小, 跳过 merge commits (diff=0)
+    DIFF_SIZE=$(cd "$MEGATRON_DIR" && git diff "${HASH}~1" "$HASH" 2>/dev/null | wc -l)
+    if [ "$DIFF_SIZE" -eq 0 ]; then
+        echo "[LOOP] [$MNUM] $HASH — SKIP (merge commit, 0 diff)"
+        echo "SKIP:MERGE" > "$LOG_DIR/${MNUM}.status"
+        continue
+    fi
+    
+    echo ""
+    echo "[LOOP] [$MNUM] $HASH — $MSG (${DIFF_SIZE} lines)"
+    echo "[LOOP] Dispatching sub-Claude..."
+    
+    # 派发任务
+    if bash "$SCRIPT_DIR/dispatch_megatron_commit.sh" "$HASH" "$MNUM" 2>&1; then
+        echo "OK" > "$LOG_DIR/${MNUM}.status"
+        COMPLETED=$((COMPLETED + 1))
+    else
+        echo "FAILED" > "$LOG_DIR/${MNUM}.status"
+        FAILED=$((FAILED + 1))
+    fi
+    
+    echo "[LOOP] [$MNUM] Done. Completed=$COMPLETED Failed=$FAILED"
+    
+    # 限速: 每个 commit 之间等 5 秒
+    sleep 5
+done
 
 echo ""
-echo "================================================================"
-echo " Master loop complete: processed commits #${START}-#${END}"
-echo " Results in: $RESULTS_DIR"
-echo "================================================================"
+echo "============================================"
+echo " Loop Complete"
+echo " Completed: $COMPLETED"
+echo " Failed: $FAILED"
+echo " $(date)"
+echo "============================================"
