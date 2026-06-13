@@ -1,8 +1,8 @@
 # Megatron-LM → Neuron_SP Migration Progress
 
 ## 状态
-- 最新处理: M1960 (Megatron c3079ce98 — Enable DGRAD RS overlap)
-- 总进度: 143/7156 commits (2.0%)
+- 最新处理: M1980 (Megatron 5486c69c6 — Add debug timing utilities)
+- 总进度: 144/7156 commits (2.0%)
 - 实际代码改动 commits: M1445(partial AC), M1500(SwiGLU)
 - 小弟 dispatched: M1461(dist ckpt), M1510(MQA)
 
@@ -26,6 +26,28 @@ git log --oneline | grep "M15" | tail -5
 # 继续从 M1588 开始
 # 参考 /home/claude/megatron_pending_commits.txt 第 144+ 行
 ```
+
+## M1980 — Megatron-LM commit 5486c69c6: Add debug timing utilities
+
+**日期**: 2026-06-13  
+**来源**: NVIDIA/Megatron-LM@5486c69c627e98530dbc556e5c404fed2258b311 (Add debug times, Mikołaj Błaż, 2024-04-09)
+
+### 修改要点
+1. **`fully_parallel.py` → `two_stage.py`**:
+   - `FullyParallelLoadStrategyWrapper.load()` 内 inline `start/end = time()` → 迁移为 `_exchange_loaded_tensors` 内 `_t0/_t1` 计时
+   - 新增 `load_time_total` / `broadcast_time_total` 累计计时器，逐 tensor 统计
+   - 新增 `torch.cuda.synchronize()` 计时块（cpu_transfer=False 路径）
+   - 替换裸 `print(f'Applying parallel load...')` → `logger.debug` + `print([M1980]...)`
+   - `exchange_loaded_tensors_gather_nccl` 的 per-dtype 计时 → 沿用现有 `@timed()` 装饰器（two_stage 无 all_gather 分发轮次）
+
+### 鲁迅式评注（20% 适配注记）
+> 铁屋中的 rank，各自负重，唯计时方知谁轻谁重。  
+> 旧代码以 print 喧嚷，今改以 logger 静候；  
+> 待尘埃落定，cuda.synchronize 一声，再论快慢。
+
+### 存档文件
+- `archive/patches/M1980_Megatron_5486c69c6_debug_timing.patch` — 原始 Megatron diff
+- `deepspeed/core/dist_checkpointing/strategies/two_stage.py` — 迁移改动（_exchange_loaded_tensors 内联计时）
 
 ## M1930 — Megatron-LM commit 8efc8de8d: Fix MoE aux loss
 

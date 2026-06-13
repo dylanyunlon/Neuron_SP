@@ -175,11 +175,16 @@ class TwoStageDataParallelLoadShardedStrategy(LoadShardedStrategy):
 
     @timed()
     def _exchange_loaded_tensors(self, ten_metas: List[_ShardedTensorMetadata], sharded_state_dict, checkpoint_dir):
+        # M1980: 铁屋中的 rank，各自负重，唯计时方知谁轻谁重。
         logger.debug(f'_exchange_loaded_tensors, num ten_metas: {len(ten_metas)}')
+        print(f'[M1980] _exchange_loaded_tensors start: {len(ten_metas)} tensors, rank={self.global_rank}')
+        load_time_total = 0.0
+        broadcast_time_total = 0.0
         for ten_meta in ten_metas:
 
             src_rank = torch.distributed.get_global_rank(self.data_parallel_group, ten_meta.dist_group_rank)
 
+            _t0 = time.time()
             if self.dp_group_rank == ten_meta.dist_group_rank:
                 exchange_tensor = self.load_tensor_from_storage(checkpoint_dir, ten_meta)
                 if not self.cpu_transfer:
@@ -188,14 +193,27 @@ class TwoStageDataParallelLoadShardedStrategy(LoadShardedStrategy):
                 # TODO: for non-flattened ranges we could reuse the buffer from the start here
                 exchange_tensor = torch.empty(ten_meta.sharded_tensor_no_data.local_shape, device='cpu' if self.cpu_transfer else 'cuda',
                                               dtype=ten_meta.sharded_tensor_no_data.dtype)
+            load_time_total += time.time() - _t0
 
             logger.debug(f'exchange {ten_meta.sharded_tensor_no_data.key}, {exchange_tensor.shape}({exchange_tensor.numel()}), broadcast({src_rank} -> {self.dp_group_ranks})')
+            _t1 = time.time()
             torch.distributed.broadcast(exchange_tensor, group=self.data_parallel_group, src=src_rank)
+            broadcast_time_total += time.time() - _t1
             self._distribute_data_to_state_dict(ten_meta, exchange_tensor, sharded_state_dict)
             logger.debug(f'exchange {ten_meta.sharded_tensor_no_data.key} done')
 
             # free buffer memory
             exchange_tensor = None
+
+        # M1980: synchronize before reporting — 待尘埃落定，再论快慢。
+        _sync_t0 = time.time()
+        if not self.cpu_transfer:
+            torch.cuda.synchronize()
+        _sync_took = time.time() - _sync_t0
+        logger.debug(f'load_tensor_from_storage total took {load_time_total:.4f}s')
+        logger.debug(f'broadcast total took {broadcast_time_total:.4f}s')
+        logger.debug(f'cuda.synchronize took {_sync_took:.4f}s')
+        print(f'[M1980] _exchange_loaded_tensors done: load={load_time_total:.4f}s bcast={broadcast_time_total:.4f}s sync={_sync_took:.4f}s')
 
     @timed(verbose=False)
     def _distribute_data_to_state_dict(self, ten_meta: _ShardedTensorMetadata, loaded_ten: torch.Tensor, sharded_state_dict: ShardedStateDict):
