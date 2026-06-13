@@ -37,6 +37,34 @@
 
 print('[M1302]')
 print('[M1420]')
+# ---------------------------------------------------------------------------
+# M1556: Megatron 8360677cc — Add GroupQueryCoreAttention class
+# Source: megatron/model/transformer.py (NVIDIA/Megatron-LM commit 8360677cc)
+# Author: Megatron-LM team  Date: 2023
+#
+# Mapping: megatron/model/transformer.py  GroupQueryCoreAttention
+#       -> deepspeed/compile/core_transformer_core_attention.py
+#          GroupQueryCoreAttention
+#          (project convention: megatron/model/* ->
+#           deepspeed/compile/core_transformer_*)
+#
+# Changes in this commit (upstream):
+#   1. Refactored GQA logic out of CoreAttention.forward() conditional branches
+#      into a standalone GroupQueryCoreAttention subclass.
+#   2. CoreAttention.forward() now handles MHA only (no group_query_attention flag).
+#   3. GroupQueryCoreAttention.__init__ computes num_query_groups_per_partition
+#      (handles world_size >= num_query_groups edge case → 1 partition).
+#   4. GroupQueryCoreAttention.forward reshapes Q as [b*ng, np/ng*sq, hn] and
+#      K/V as [b*ng, sk, hn] for grouped batched-matmul via torch.baddbmm/bmm.
+#
+# 20% adaptation (鲁迅式迁移):
+#   - Upstream uses megatron.model imports (mpu, get_args); here we use
+#     megatron.core (parallel_state, divide) to match Neuron_SP conventions.
+#   - config.num_query_groups replaces args.num_query_groups.
+#   - parallel_state.get_global_memory_buffer() replaces mpu.get_global_memory_buffer().
+#   - Adds print('[M1556]') diagnostic marker (鲁迅: 沉默是金，但诊断是命).
+# ---------------------------------------------------------------------------
+print('[M1556]')
 
 import math
 
@@ -186,4 +214,131 @@ class CoreAttention(MegatronModule):
         new_context_layer_shape = context_layer.size()[:-2] + (self.hidden_size_per_partition,)
         context_layer = context_layer.view(*new_context_layer_shape)
 
+        return context_layer
+
+
+class GroupQueryCoreAttention(CoreAttention):
+    """GQA core attention: Groups of query heads share key/value heads.
+
+    Ported from Megatron-LM commit 8360677cc (megatron/model/transformer.py).
+    Adapts the upstream mpu / get_args pattern to Neuron_SP's megatron.core /
+    TransformerConfig conventions.
+
+    Upstream shape notation (retained verbatim for traceability):
+      b  = batch size
+      np = num_attention_heads_per_partition
+      ng = num_query_groups_per_partition
+      sq = source sequence length
+      sk = target sequence length
+      hn = hidden size per attention head
+    """
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+
+        # M1556: num_query_groups_per_partition — mirror of upstream logic.
+        # When num_query_groups < world_size every partition holds 1 group.
+        world_size = parallel_state.get_tensor_model_parallel_world_size()
+        num_query_groups = self.config.num_query_groups
+        print(f'[M1556] GroupQueryCoreAttention.__init__: '
+              f'num_query_groups={num_query_groups}, world_size={world_size}')
+        if num_query_groups >= world_size:
+            self.num_query_groups_per_partition = divide(num_query_groups, world_size)
+        else:
+            self.num_query_groups_per_partition = 1
+        print(f'[M1556] num_query_groups_per_partition={self.num_query_groups_per_partition}')
+
+    def forward(self, query_layer, key_layer, value_layer, attention_mask):
+
+        # ===================================
+        # Raw attention scores. [b, np, s, s]
+        # ===================================
+
+        # [b, np, sq, sk]
+        output_size = (query_layer.size(1),
+                       query_layer.size(2),
+                       query_layer.size(0),
+                       key_layer.size(0))
+
+        print(f'[M1556] GroupQueryCoreAttention.forward: output_size={output_size}, '
+              f'num_query_groups_per_partition={self.num_query_groups_per_partition}')
+
+        # [sq, b, np, hn] -> [b * ng, np/ng * sq, hn]
+        query_layer = query_layer.permute([1, 2, 0, 3]).reshape(
+            output_size[0] * self.num_query_groups_per_partition,
+            int(output_size[1] / self.num_query_groups_per_partition) * output_size[2],
+            -1)
+
+        # [sk, b, 1*ng, hn] -> [b * ng, sk, hn]
+        key_layer = key_layer.permute([1, 2, 0, 3]).reshape(
+            output_size[0] * self.num_query_groups_per_partition,
+            output_size[3],
+            -1)
+
+        # preallocate input tensor: [b * ng, np/ng * sq, sk]
+        matmul_input_buffer = parallel_state.get_global_memory_buffer().get_tensor(
+            (output_size[0] * self.num_query_groups_per_partition,
+             int(output_size[1] / self.num_query_groups_per_partition) * output_size[2],
+             output_size[3]),
+            query_layer.dtype, "mpu")
+
+        # Raw attention scores. [b * ng, np/ng * sq, sk]
+        matmul_result = torch.baddbmm(
+            matmul_input_buffer,
+            query_layer,                    # [b * ng, np/ng * sq, hn]
+            key_layer.transpose(1, 2),      # [b * ng, hn, sk]
+            beta=0.0,
+            alpha=(1.0 / self.norm_factor),
+        )
+
+        # change view to [b, np, sq, sk]
+        attention_scores = matmul_result.view(*output_size)
+
+        # ===========================
+        # Attention probs and dropout
+        # ===========================
+
+        # attention scores and attention mask [b, np, sq, sk]
+        attention_probs = self.scale_mask_softmax(attention_scores, attention_mask)
+
+        # Drop entire tokens (standard Transformer paper behaviour).
+        if not self.sequence_parallel:
+            with tensor_parallel.get_cuda_rng_tracker().fork():
+                attention_probs = self.attention_dropout(attention_probs)
+        else:
+            attention_probs = self.attention_dropout(attention_probs)
+
+        # =========================
+        # Context layer. [sq, b, hp]
+        # =========================
+
+        # context layer shape: [b, np, sq, hn]
+        context_output_size = (value_layer.size(1), value_layer.size(2),
+                               query_layer.size(0), value_layer.size(3))
+
+        # change view [sk, b, ng, hn] --> [sk, b * ng, hn]
+        value_layer = value_layer.view(
+            value_layer.size(0), context_output_size[0] * context_output_size[1], -1)
+
+        # change view from [b, np, sq, sk] --> [b * ng, np/ng * sq, sk]
+        attention_probs = attention_probs.view(
+            output_size[0] * self.num_query_groups_per_partition,
+            int(output_size[1] / self.num_query_groups_per_partition) * output_size[2],
+            -1)
+
+        # matmul: [b * ng, np/ng * sq, hn]
+        context_layer = torch.bmm(attention_probs, value_layer.transpose(0, 1))
+
+        # change view [b, np, sq, hn]
+        context_layer = context_layer.view(
+            output_size[0], output_size[1], output_size[2], -1)
+
+        # [b, np, sq, hn] --> [sq, b, np, hn]
+        context_layer = context_layer.permute(2, 0, 1, 3).contiguous()
+
+        # [sq, b, np, hn] --> [sq, b, hp]
+        new_context_layer_shape = context_layer.size()[:-2] + (self.hidden_size_per_partition,)
+        context_layer = context_layer.view(*new_context_layer_shape)
+
+        print(f'[M1556] GroupQueryCoreAttention.forward done: context_layer.shape={context_layer.shape}')
         return context_layer
