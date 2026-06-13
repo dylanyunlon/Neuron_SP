@@ -76,12 +76,29 @@
 #     return (mirrors upstream second assert after timers stop).
 #   Both calls wrapped in # >>> / # <<< debug markers matching upstream style.
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# M1860: Megatron c2df7e3c1 — Only call finalize_model_grads when available
+# Source: megatron/core/pipeline_parallel/schedules.py (NVIDIA/Megatron-LM commit c2df7e3c1)
+#
+# Mapping: megatron/core/pipeline_parallel/schedules.py
+#        → deepspeed/compile/megatron_schedules.py
+#
+# Changes ported:
+#   • forward_backward_no_pipelining: add config param; call
+#     config.finalize_model_grads_func([model]) guarded by is not None.
+#   • forward_backward_pipelining_with_interleaving: same guard pattern.
+#   • forward_backward_pipelining: same guard pattern.
+#
+# 20% adaptation: config defaults to None to preserve backward compat with
+# callers that don't yet pass a PipelineConfig; print diagnostic on call.
+# ---------------------------------------------------------------------------
 
 print('[M556]')
 print('[M735]')
 print('[M971]')
 print('[M972]')
 print('[M1003]')
+print('[M1860]')
 
 import torch
 
@@ -219,7 +236,7 @@ def backward_step(optimizer, input_tensor, output_tensor, output_tensor_grad):
 
 
 def forward_backward_no_pipelining(forward_step_func, data_iterator, model,
-                                   optimizer, timers, forward_only):
+                                   optimizer, timers, forward_only, config=None):
     """Run forward and backward passes without inter-stage communication.
 
     Megatron dd8890626 schedules.py forward_backward_no_pipelining():
@@ -237,12 +254,17 @@ def forward_backward_no_pipelining(forward_step_func, data_iterator, model,
         if not forward_only:
             backward_step(optimizer, input_tensor, output_tensor, output_tensor_grad)
 
+    # M1860: Only finalize grads when config.finalize_model_grads_func is set.
+    if config is not None and config.finalize_model_grads_func is not None and not forward_only:
+        print('[M1860] forward_backward_no_pipelining: calling finalize_model_grads_func')
+        config.finalize_model_grads_func([model])
+
     return losses_reduced
 
 
 def forward_backward_pipelining_with_interleaving(
         forward_step_func, data_iterator, model,
-        optimizer, timers, forward_only):
+        optimizer, timers, forward_only, config=None):
     """Run interleaved 1F1B schedule (virtual pipeline stages).
 
     Megatron dd8890626 schedules.py
@@ -409,11 +431,16 @@ def forward_backward_pipelining_with_interleaving(
             output_tensor_grads[next_backward_model_chunk_id].append(
                 send_backward_recv_backward(input_tensor_grad, recv_next=recv_next, timers=timers))
 
+    # M1860: Only finalize grads when config.finalize_model_grads_func is set.
+    if config is not None and config.finalize_model_grads_func is not None and not forward_only:
+        print('[M1860] forward_backward_pipelining_with_interleaving: calling finalize_model_grads_func')
+        config.finalize_model_grads_func(model)
+
     return losses_reduced
 
 
 def forward_backward_pipelining(forward_step_func, data_iterator, model,
-                                optimizer, timers, forward_only):
+                                optimizer, timers, forward_only, config=None):
     """Run standard 1F1B pipeline schedule.
 
     Megatron dd8890626 schedules.py forward_backward_pipelining():
@@ -480,5 +507,10 @@ def forward_backward_pipelining(forward_step_func, data_iterator, model,
             input_tensor_grad = backward_step(
                 optimizer, input_tensor, output_tensor, output_tensor_grad)
             send_backward(input_tensor_grad, timers=timers)
+
+    # M1860: Only finalize grads when config.finalize_model_grads_func is set.
+    if config is not None and config.finalize_model_grads_func is not None and not forward_only:
+        print('[M1860] forward_backward_pipelining: calling finalize_model_grads_func')
+        config.finalize_model_grads_func([model])
 
     return losses_reduced

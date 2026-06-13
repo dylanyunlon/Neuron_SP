@@ -1688,7 +1688,7 @@ def desloc_interleaved_kx_warmup(ns, nm, num_model_chunks=1,
 # ---------------------------------------------------------------------------
 
 def m592_forward_backward_pipelining_without_interleaving(
-        forward_step_func, data_iterator, model, optimizer, timers, forward_only):
+        forward_step_func, data_iterator, model, optimizer, timers, forward_only, config=None):
     """Non-interleaved 1F1B schedule with pipeline-stall measurement guarded
     by measure_pipeline_stall so we never deadlock when the number of
     microbatches is smaller than the pipeline-parallel world size."""
@@ -1771,6 +1771,11 @@ def m592_forward_backward_pipelining_without_interleaving(
             input_tensor_grad = backward_step(
                 optimizer, input_tensor, output_tensor, output_tensor_grad)
             p2p_communication.send_backward(input_tensor_grad, timers)
+
+    # M1860: Only finalize grads when config.finalize_model_grads_func is set.
+    if config is not None and config.finalize_model_grads_func is not None and not forward_only:
+        print('[M1860] m592_forward_backward_pipelining_without_interleaving: calling finalize_model_grads_func')
+        config.finalize_model_grads_func([model])
 
     return losses_reduced
 # --- End M592 ---

@@ -677,6 +677,8 @@ class DESLOCPipelineConfig:
     # Sequence parallelism (from Megatron PipelineConfig)
     sequence_parallel: bool = False
     decoder_seq_length: int = None
+    # M1860: Megatron c2df7e3c1 — finalize grad func, called only when not None
+    finalize_model_grads_func: object = None
 
     def __post_init__(self):
         if self.autocast_dtype is None:
@@ -689,6 +691,7 @@ class DESLOCPipelineConfig:
               f"mem_threshold={self.memory_pressure_threshold} "
               f"partial_ac={self.num_micro_batches_with_partial_ac} "
               f"sp={self.sequence_parallel} drift_mon={self.drift_monitoring}")
+        print(f"[M1860] DESLOCPipelineConfig: finalize_model_grads_func={self.finalize_model_grads_func is not None}")
 
 
 @dataclass

@@ -28,6 +28,22 @@ from typing import Callable
 
 import torch
 
+# ---------------------------------------------------------------------------
+# M1860: Megatron c2df7e3c1 — Only call finalize_model_grads when available
+# Source: megatron/core/model_parallel_config.py (NVIDIA/Megatron-LM commit c2df7e3c1)
+#
+# Mapping: megatron/core/model_parallel_config.py ModelParallelConfig
+#        → deepspeed/runtime/pipe/pipeline_config.py PipelineConfig
+#
+# Changes ported:
+#   1. Docstring: added Parallelism section documenting finalize_model_grads_func.
+#   2. Field: finalize_model_grads_func: Callable = None
+#
+# 20% adaptation: field added alongside param_sync_func (parallelism group);
+# print diagnostic in __post__init__ reports the func presence.
+# ---------------------------------------------------------------------------
+
+print('[M1860]')
 @dataclass
 class PipelineConfig:
     """Pipeline configuration for Megatron Core
@@ -88,7 +104,11 @@ class PipelineConfig:
     
     timers (optional, default=None): TODO
 
-    Legacy args (TODO: remove these)
+    finalize_model_grads_func (optional): Function that finalizes gradients on all workers.
+        Could include ensuring that grads are all-reduced across data parallelism, pipeline
+        parallelism, and sequence parallelism dimensions.  When None, finalization is skipped.
+
+        Legacy args (TODO: remove these)
     ------------------
     decoder_seq_length (int, required for ModelType.encoder_and_decoder models):
         Sequence length of the decoder portion, used to determine tensor shapes.
@@ -113,6 +133,8 @@ class PipelineConfig:
     no_sync_func: Callable = None
     grad_sync_func: Callable = None
     param_sync_func: Callable = None
+    # Parallelism (M1860)
+    finalize_model_grads_func: Callable = None
 
     # Legacy
     decoder_seq_length: int = None
@@ -137,6 +159,8 @@ class PipelineConfig:
                 'overlap_p2p_comm and batch_p2p_comm are mutually exclusive '
                 '(Megatron 4ef31451d / Neuron_SP M1506).'
             )
+        print('[M1860] PipelineConfig.__post__init__: finalize_model_grads_func=%s' % (
+            self.finalize_model_grads_func is not None))
         print('[M1506] PipelineConfig.__post__init__: overlap_p2p_comm=%s '
               'batch_p2p_comm=%s batch_p2p_sync=%s' % (
                   self.overlap_p2p_comm, self.batch_p2p_comm, self.batch_p2p_sync))
