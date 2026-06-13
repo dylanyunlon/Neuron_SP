@@ -1,7 +1,8 @@
 # Megatron-LM → Neuron_SP Migration Progress
 
 ## 状态
-- 最新处理: M2110 (Megatron 4ca43093f -- MoE fix for Llama4: moe_apply_probs_on_input)
+- 最新处理: M2130 (Megatron ab77e527c -- Rename original_max_position_embeddings in MLATransformerConfig)
+- 上一批: M2110 (Megatron 4ca43093f -- MoE fix for Llama4: moe_apply_probs_on_input)
 - 总进度: 146/7156 commits (2.0%)
 - 实际代码改动 commits: M1445(partial AC), M1500(SwiGLU)
 - 小弟 dispatched: M1461(dist ckpt), M1510(MQA)
@@ -24,7 +25,40 @@ cd /path/to/Neuron_SP
 # 查看当前进度
 git log --oneline | grep "M15" | tail -5
 # 继续从 M1588 开始
-# 参考 /home/claude/megatron_pending_commits.txt 第 14## M2110 -- Megatron-LM commit 4ca43093f: MoE fix for Llama4
+# 参考 /home/claude/megatron_pending_commits.txt 第 14## M2130 -- Megatron-LM commit ab77e527c: Rename original_max_position_embeddings
+
+**日期**: 2026-06-13
+**来源**: NVIDIA/Megatron-LM@ab77e527c (3 files, ~40 lines)
+
+### 修改要点
+1. **`transformer_config.py` — MLATransformerConfig**:
+   - 新增 `original_max_position_embeddings: int = 4096` 字段 (YaRN RoPE真实参考长度)
+   - `max_position_embeddings` docstring 更新为 "not used, will be deprecated"
+   - `__post_init__` 向后兼容：若旧代码设置 max_position_embeddings!=4096，自动迁移值
+
+2. **`multi_latent_attention.py`**:
+   - `YarnRotaryEmbedding(...)` 调用：`original_max_position_embeddings=self.config.original_max_position_embeddings`
+   - 不再使用 max_position_embeddings 作为 YaRN 参考长度
+
+3. **`test_multi_latent_attention.py`** (4处):
+   - 测试配置: `max_position_embeddings=N` → `original_max_position_embeddings=N`
+
+### NSP适配 (REAL_GPU_BENCHMARK.py)
+- `TrainingConfig` 新增 `original_max_position_embeddings: int = 4096`
+- `get_transformer_config()` 注入 `xformer_cfg['original_max_position_embeddings']`
+- `[M2130-XFMR]` print诊断: 打印两个字段值，可在log确认语义分离正确
+
+### 鲁迅式评注（20% 适配注记）
+> max_position_embeddings占着位子，实为闲职；original才是主角，却藏身幕后。
+> 世人皆用max_position传original之值，如以假名行正事，错乱由此而生。
+> 今日正名，立original_max_position_embeddings为显职，
+> 令max_position退居deprecation，不失其位，只失其用。
+
+### 存档文件
+- `archive/patches/M2130_Megatron_ab77e527c_Rename_original_max_position_embeddings.patch`
+- `REAL_GPU_BENCHMARK.py` — TrainingConfig + get_transformer_config() 适配
+
+## M2110 -- Megatron-LM commit 4ca43093f: MoE fix for Llama4
 
 **日期**: 2026-06-13
 **来源**: NVIDIA/Megatron-LM@4ca43093f (MoE fix for Llama4, 3 files, 129 lines)

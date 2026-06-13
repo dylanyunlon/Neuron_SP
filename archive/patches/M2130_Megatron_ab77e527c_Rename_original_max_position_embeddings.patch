@@ -1,0 +1,92 @@
+diff --git a/megatron/core/transformer/multi_latent_attention.py b/megatron/core/transformer/multi_latent_attention.py
+index d462c9c0f..4cfe91e98 100644
+--- a/megatron/core/transformer/multi_latent_attention.py
++++ b/megatron/core/transformer/multi_latent_attention.py
+@@ -103,11 +103,12 @@ class MultiLatentAttention(Attention):
+                 cp_group=self.model_comm_pgs.cp,
+             )
+         elif self.config.rope_type == "yarn":
++
+             self.rotary_pos_emb = YarnRotaryEmbedding(
+                 self.config.qk_pos_emb_head_dim,
+                 rotary_base=self.config.rotary_base,
+                 scaling_factor=self.config.rotary_scaling_factor,
+-                original_max_position_embeddings=self.config.max_position_embeddings,
++                original_max_position_embeddings=self.config.original_max_position_embeddings,
+                 beta_fast=self.config.beta_fast,
+                 beta_slow=self.config.beta_slow,
+                 mscale=self.config.mscale,
+diff --git a/megatron/core/transformer/transformer_config.py b/megatron/core/transformer/transformer_config.py
+index 32b8e9fb7..4f5652457 100644
+--- a/megatron/core/transformer/transformer_config.py
++++ b/megatron/core/transformer/transformer_config.py
+@@ -1273,7 +1273,10 @@ class MLATransformerConfig(TransformerConfig):
+     """Rotary scaling factor for the rotary embeddings, used by yarn."""
+ 
+     max_position_embeddings: int = 4096
+-    """Maximum position embeddings for the original model, used by yarn."""
++    """This arg is not used, will be deprecated."""
++
++    original_max_position_embeddings: int = 4096
++    """Original maximum position embeddings for the original model, used by yarn."""
+ 
+     beta_fast: float = 32
+     """Beta fast for YaRN RoPE, used by yarn."""
+@@ -1291,3 +1294,17 @@ class MLATransformerConfig(TransformerConfig):
+         super().__post_init__()
+         if self.multi_latent_attention and self.apply_rope_fusion and self.rope_type != "yarn":
+             raise ValueError("apply_rope_fusion for MLA only works with YARN RoPE.")
++
++        # TODO(boxiangw): Deprecate this check
++        if self.max_position_embeddings != 4096:
++            if self.original_max_position_embeddings == 4096:
++                # only override the original_max_position_embeddings if it is not set
++                self.original_max_position_embeddings = self.max_position_embeddings
++            self.max_position_embeddings = 4096
++            warnings.warn(
++                "MLA config max_position_embeddings is overridden by customer input, "
++                "please use the original_max_position_embeddings instead for YaRN!"
++                "max_position_embeddings will be deprecated in the future."
++                "Assigned original_max_position_embeddings to max_position_embeddings if not set,"
++                "and assigned max_position_embeddings back to the original value."
++            )
+diff --git a/tests/unit_tests/transformer/test_multi_latent_attention.py b/tests/unit_tests/transformer/test_multi_latent_attention.py
+index 5008ebad0..471b90479 100644
+--- a/tests/unit_tests/transformer/test_multi_latent_attention.py
++++ b/tests/unit_tests/transformer/test_multi_latent_attention.py
+@@ -56,7 +56,7 @@ class TestParallelMLAAttention:
+             qk_pos_emb_head_dim=64,
+             rope_type=rope_type,
+             rotary_base=10000,
+-            max_position_embeddings=32,
++            original_max_position_embeddings=32,
+         )
+         self.parallel_attention = MLASelfAttention(
+             self.transformer_config,
+@@ -288,7 +288,7 @@ class TestSequenceParallelMLAAttention:
+             v_head_dim=128,
+             qk_pos_emb_head_dim=64,
+             rotary_base=10000,
+-            max_position_embeddings=64,
++            original_max_position_embeddings=64,
+             tensor_model_parallel_size=self.tensor_parallel_size,
+             sequence_parallel=True,
+         )
+@@ -345,7 +345,7 @@ class TestTensorParallelMLAAttention:
+             v_head_dim=128,
+             qk_pos_emb_head_dim=64,
+             rotary_base=10000,
+-            max_position_embeddings=64,
++            original_max_position_embeddings=64,
+             tensor_model_parallel_size=self.tensor_parallel_size,
+             sequence_parallel=False,
+         )
+@@ -406,7 +406,7 @@ class TestParallelMLAAttentionPrecision:
+             qk_pos_emb_head_dim=64,
+             rope_type=rope_type,
+             rotary_base=10000,
+-            max_position_embeddings=32,
++            original_max_position_embeddings=32,
+             deterministic_mode=True,
+             hidden_dropout=0.0,
+             attention_dropout=0.0,

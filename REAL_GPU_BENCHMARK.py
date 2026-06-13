@@ -936,6 +936,24 @@ class TrainingConfig:
     moe_router_pre_softmax: bool = False  # True = pre-sigmoid (Llama4 path)
     moe_router_topk: int = 1  # MoE top-k experts per token
 
+    # M2130: Megatron ab77e527c — Rename original_max_position_embeddings in MLATransformerConfig
+    # Upstream: MLATransformerConfig.max_position_embeddings was silently used as
+    # original_max_position_embeddings for YaRN RoPE — a semantic collision with
+    # TransformerConfig.max_position_embeddings (a different concept).  The fix
+    # adds original_max_position_embeddings (default 4096) as the canonical field,
+    # deprecates max_position_embeddings via __post_init__ backward-compat guard.
+    #
+    # DES-LOC 20% adaptation: Neuron_SP surfaces both fields at TrainingConfig level.
+    # max_position_embeddings retains its pre-M2130 meaning (CLI surface, seq-limit check).
+    # original_max_position_embeddings is the NEW YaRN-only field — the base context
+    # length the model was pre-trained at, before RoPE frequency extrapolation.
+    # Separating these prevents YaRN scaling from accidentally using the extended
+    # context window length as its own reference, which folds extrapolation onto itself.
+    #
+    # 鲁迅曰：旧名烂账，新名另立；max_position是门牌，original_max_position是祖籍。
+    # 不分清楚，YaRN便把客居之地当故乡，频率表全然失准，训练白费。
+    original_max_position_embeddings: int = 4096  # YaRN RoPE reference context length (M2130)
+
     def get_pipeline_config(self) -> Dict:
         """Extract pipeline-parallel configuration (Megatron 31d133bba pattern).
 
@@ -1007,6 +1025,12 @@ class TrainingConfig:
               f"[M2110] moe_apply_probs_on_input={self.moe_apply_probs_on_input} "
               f"moe_router_pre_softmax={self.moe_router_pre_softmax} "
               f"moe_router_topk={self.moe_router_topk}")
+        # M2130: expose original_max_position_embeddings so YaRN callers can read
+        # the pre-training context length without colliding with max_position_embeddings.
+        xformer_cfg['original_max_position_embeddings'] = self.original_max_position_embeddings
+        print(f"[M2130-XFMR] original_max_position_embeddings="
+              f"{self.original_max_position_embeddings} "
+              f"(YaRN base; max_position_embeddings={getattr(self, 'max_seq_len', '?')} seq-limit)")
         return xformer_cfg
 
     def get_model_config(self) -> Dict:
