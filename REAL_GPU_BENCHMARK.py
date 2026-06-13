@@ -824,6 +824,17 @@ class TrainingConfig:
     replacement_sampling: bool = False   # enable with-replacement RandomSampler (Megatron 66719e9)
     presplit_sentences: bool = False     # data pre-split into newline-separated sentences
 
+    # M1950: Megatron 057ae6c12 — Allow using an external dataloader.
+    # When data_loader_type='external', _make_dataloader_m452 is bypassed and the
+    # caller is expected to assign self.dataloader directly before training starts.
+    # Mirrors Megatron's arguments.py choices=['single','cyclic','external'] and the
+    # data_samplers.py "return dataset" passthrough path.
+    # 鲁迅曾言：内置采样器，如官府之驿站，路固定，马亦固定；
+    # 外置dataloader，则如江湖客自备车马，去留自便，官府不问。
+    # 20% adaptation: exposed as a top-level TrainingConfig str field so sweep
+    # scripts can select the external path without modifying Trainer internals.
+    data_loader_type: str = "standard"  # 'standard' | 'external'
+
     # M459: Megatron adec01d05 training sample builder — triple-array index scheme
     # doc_idx (shuffled document order) + sample_idx (packing boundaries) +
     # shuffle_idx (global sample permutation). Knuth §3.4.2: two independent
@@ -2745,8 +2756,26 @@ def _make_dataloader_m452(dataset, config: 'TrainingConfig',
     replacement_sampling=False → standard DistributedSampler / RandomSampler
                                  (Fisher-Yates, no waste).
 
+    M1950: data_loader_type='external' → dataset is returned as-is (passthrough).
+    Caller is responsible for providing a torch-compatible iterable and defining
+    samplers if needed. Mirrors Megatron 057ae6c12 data_samplers.py line 38.
+
     Diagnostic prints on rank-0 only to avoid log storms in multi-GPU runs.
     """
+    # M1950: Megatron 057ae6c12 — external dataloader passthrough.
+    # When the user selects 'external', we skip all sampler construction and
+    # return the dataset object directly — the same semantics as Megatron's
+    # "return dataset" at data_samplers.py:38.  The caller (Trainer.__init__)
+    # assigns self.dataloader = dataset and the training loop iterates it.
+    _dl_type = getattr(config, 'data_loader_type', 'standard')
+    if _dl_type == 'external':
+        print(
+            f"[M1950-DL] rank={rank} data_loader_type='external' — "
+            f"dataset passed through as-is (type={type(dataset).__name__}). "
+            f"User is responsible for samplers and iteration protocol."
+        )
+        return dataset  # passthrough: user-defined iterable
+
     # -------------------------------------------------------------------------
     # NEURON_SP PORT: Megatron d64856847 — fixed gpt-2 dataloader
     # Adapted from pretrain_gpt2.py get_train_val_test_data.
@@ -4616,9 +4645,17 @@ class Trainer:
 
             # M452: Megatron 66719e9 replacement sampling + presplit_sentences
             # replaces the previous DistributedSampler / shuffle=(sampler is None) pattern
+            # M1950: when data_loader_type='external', _make_dataloader_m452 returns
+            # dataset unchanged; Trainer stores it directly and iterates without wrapping.
             self.dataloader = _make_dataloader_m452(
                 dataset, config, self.world_size, self.rank
             )
+            if getattr(config, 'data_loader_type', 'standard') == 'external':
+                print(
+                    f"[M1950-TRAINER] rank={self.rank} external dataloader active — "
+                    f"self.dataloader is the raw dataset (type={type(self.dataloader).__name__}). "
+                    f"Training loop will iterate it directly without sampler wrapping."
+                )
 
         # ============================================================
         # M339 — Claude-30: SP+DEC Initialization for baseline path
@@ -6260,6 +6297,13 @@ def main():
                         help='M452: Data is pre-split into newline-separated sentences '
                              '(Megatron --presplit-sentences flag from 66719e9 datasets.py). '
                              'Bypasses NLTK sent_tokenize at load time.')
+    # M1950: Megatron 057ae6c12 — external dataloader support
+    parser.add_argument('--data_loader_type', type=str, default='standard',
+                        choices=['standard', 'external'],
+                        help='M1950: dataloader type. "standard" uses _make_dataloader_m452 '
+                             '(Megatron 66719e9 samplers). "external" passes the dataset '
+                             'through as-is; caller must set self.dataloader before training. '
+                             'Mirrors Megatron 057ae6c12 choices=[single,cyclic,external].')
     # M457: Megatron 872b4a6 — multi-EOS edge case flags
     parser.add_argument('--eod_token_id', type=int, default=-1,
                         help='M457: EOD/EOS token ID (Megatron 872b4a6). '
@@ -6315,6 +6359,8 @@ def main():
         seed=args.seed,
         replacement_sampling=args.replacement_sampling,
         presplit_sentences=args.presplit_sentences,
+        # M1950: Megatron 057ae6c12 external dataloader
+        data_loader_type=args.data_loader_type,
         # M457: Megatron 872b4a6 multi-EOS edge case
         eod_token_id=args.eod_token_id,
         eod_mask_loss=not args.no_eod_mask_loss,
