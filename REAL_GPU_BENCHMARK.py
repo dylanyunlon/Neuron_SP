@@ -4986,6 +4986,74 @@ class LocalAdamW(torch.optim.Optimizer):
 
 
 # =============================================================================
+# M2210: ChainedOptimizer — Megatron f708b5da8
+# 来源: megatron/core/optimizer/optimizer.py ChainedOptimizer.get_parameters()
+#
+# 鲁迅式迁移注记(20%适配):
+# 世有链式优化器，以多个子优化器串联而行，
+# 然问之"你的参数在哪"，则呼optimizer.optimizer——
+# 此属性若遇VPP/MoE之多优化器场景，断言必死，
+# 如同大家族里只认长子，却忘了还有三房四房。
+# 今实现get_parameters，遍历chained_optimizers，
+# 方知"山川异域，参数同在"。
+# =============================================================================
+
+class ChainedOptimizer:
+    """Chains multiple PyTorch-compatible optimizers into one interface.
+
+    NSP adaptation of Megatron-LM ChainedOptimizer (megatron/core/optimizer/optimizer.py).
+    Used when VPP (virtual pipeline parallelism) or MoE requires separate optimizers
+    per model chunk — each chunk's parameters are wrapped in its own sub-optimizer,
+    and this class presents a unified param_groups / get_parameters() interface.
+
+    M2210: Implement get_parameters() so callers (e.g. gradient clipping, param norm
+    diagnostics) don't hit the self.optimizer single-optimizer assertion.
+    """
+
+    def __init__(self, optimizers: list):
+        self.chained_optimizers = optimizers
+        print(f"[M2210-CHAIN] ChainedOptimizer init: {len(optimizers)} sub-optimizers, "
+              f"types={[type(o).__name__ for o in optimizers]}")
+
+    @property
+    def param_groups(self):
+        """Aggregate param_groups from all chained optimizers."""
+        groups = []
+        for opt in self.chained_optimizers:
+            groups += opt.param_groups
+        return groups
+
+    def get_parameters(self):
+        """Get list of parameters wrapped in all chained optimizers.
+
+        M2210 (Megatron f708b5da8): override prevents fallback to self.optimizer
+        which asserts only one optimizer exists — failing for VPP/MoE multi-chunk.
+        """
+        params = []
+        for optimizer in self.chained_optimizers:
+            params.extend(optimizer.get_parameters())
+        print(f"[M2210-CHAIN] get_parameters(): collected {len(params)} params "
+              f"from {len(self.chained_optimizers)} sub-optimizers "
+              f"(M2210: VPP/MoE safe path; no single-optimizer assertion)")
+        return params
+
+    def zero_grad(self, set_to_none: bool = True):
+        for opt in self.chained_optimizers:
+            opt.zero_grad(set_to_none=set_to_none)
+
+    def step(self):
+        for opt in self.chained_optimizers:
+            opt.step()
+
+    def state_dict(self):
+        return [opt.state_dict() for opt in self.chained_optimizers]
+
+    def load_state_dict(self, state_dicts):
+        for opt, sd in zip(self.chained_optimizers, state_dicts):
+            opt.load_state_dict(sd)
+
+
+# =============================================================================
 # TRAINER
 # =============================================================================
 
