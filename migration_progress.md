@@ -1,9 +1,9 @@
 # Megatron-LM → Neuron_SP Migration Progress
 
 ## 状态
-- 最新处理: M2170 (Megatron 2751749d8 -- Add MoE layer type to hybrid models)
-- 上一批: M2130 (Megatron ab77e527c -- Rename original_max_position_embeddings in MLATransformerConfig)
-- 总进度: 146/7156 commits (2.0%)
+- 最新处理: M2200 (Megatron a4008d0f2 -- Fix latent MoE FLOPS and backward_dw)
+- 上一批: M2170 (Megatron 2751749d8 -- Add MoE layer type to hybrid models)
+- 总进度: 147/7156 commits (2.1%)
 - 实际代码改动 commits: M1445(partial AC), M1500(SwiGLU)
 - 小弟 dispatched: M1461(dist ckpt), M1510(MQA)
 
@@ -25,7 +25,36 @@ cd /path/to/Neuron_SP
 # 查看当前进度
 git log --oneline | grep "M15" | tail -5
 # 继续从 M1588 开始
-# 参考 /home/claude/megatron_pending_commits.txt 第 14## M2130 -- Megatron-LM commit ab77e527c: Rename original_max_position_embeddings
+# 参考 /home/claude/megatron_pending_commits.txt 第 14## M2200 -- Megatron-LM commit a4008d0f2: Fix latent MoE FLOPS and backward_dw
+
+**日期**: 2026-06-13
+**来源**: NVIDIA/Megatron-LM@a4008d0f2 (2 files, ~40 lines)
+
+### 修改要点
+1. **`training.py` — `num_floating_point_operations()`**:
+   - 新增 `moe_latent_size = args.moe_latent_size`
+   - Routed expert FLOPS 分两路：无latent按原式；有latent按 `moe_ffn_h * topk * expansion * latent/hidden + 2*latent`
+
+2. **`moe_layer.py` — `MoELayer.backward_dw()`**:
+   - routed path 新增: `if moe_latent_size: fc2_latent_proj.backward_dw()` in comm stream
+   - shared path 重构: `if use_shared_expert and not overlap: shared_experts.backward_dw()` + `if moe_latent_size: fc1_latent_proj.backward_dw()`
+
+### NSP适配 (REAL_GPU_BENCHMARK.py)
+- `TrainingConfig` 新增 `moe_latent_size: int = None`
+- `get_transformer_config()` 注入 `moe_latent_size` + `[M2200-XFMR]` print
+- `_finalize_results()` FLOPS 计算新增 `[M2200-FLOP]` latent-MoE分支 (stub)
+- 新增 `moe_latent_backward_dw()` stub 函数，对齐 fc1/fc2_latent_proj.backward_dw() 调用路径
+
+### 鲁迅式评注（20% 适配注记）
+> fc2走通信之流，fc1随共享专家——各司其职，不得僭越。
+> 权重梯度之路，表面平静，暗流涌动：stream不对，梯度错位，损失无声地消失。
+> FLOPS公式亦然：latent_size高踞分子，hidden_size压于分母，
+> 专家越压缩，浮点数越少——效率之名，实为算力之省。
+
+### 存档文件
+- `REAL_GPU_BENCHMARK.py` — TrainingConfig.moe_latent_size + FLOPS stub + backward_dw stub
+
+## M2130 -- Megatron-LM commit ab77e527c: Rename original_max_position_embeddings
 
 **日期**: 2026-06-13
 **来源**: NVIDIA/Megatron-LM@ab77e527c (3 files, ~40 lines)

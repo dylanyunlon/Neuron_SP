@@ -1025,6 +1025,20 @@ class TrainingConfig:
     # 规格之锁既开，spec与MoE得以并存，旧日禁令原是庸人自扰。
     moe_layer_type: str = ''  # M2170: hybrid layer string e.g. 'M*M*E' ('' = dense GPT-2, no MoE)
 
+    # M2200: Megatron a4008d0f2 — Fix latent MoE FLOPS and backward_dw
+    # Upstream adds moe_latent_size to TransformerConfig for "latent MoE" architectures
+    # where routed experts operate on a compressed latent space (dim=moe_latent_size)
+    # rather than the full hidden_size.  The FLOPS formula changes:
+    #   Without latent: expert_flops = moe_ffn_h * topk * ffn_expansion
+    #   With latent:    expert_flops = moe_ffn_h * topk * ffn_expansion * latent/hidden
+    #                                  + 2 * latent  (up+down proj for latent space)
+    # backward_dw for fc2_latent_proj runs in comm stream; fc1_latent_proj in shared-expert path.
+    #
+    # 鲁迅曰：专家本已精简，却又压缩入潜空间；
+    # 浮点之算，藏在分母里——hidden_size高坐庙堂，latent_size才是干事之人。
+    # backward_dw兵分两路：fc2走通信流，fc1随共享专家——各就各位，不得错乱。
+    moe_latent_size: int = None  # M2200: latent dim for latent-MoE (None = standard MoE)
+
     def get_pipeline_config(self) -> Dict:
         """Extract pipeline-parallel configuration (Megatron 31d133bba pattern).
 
@@ -1123,6 +1137,10 @@ class TrainingConfig:
               f"cpu_offload={self.cpu_offload} "
               f"(M2190: H2D stream sync fix; d2h_stream→h2d_stream in param_copy_back_gpu_hook; "
               f"stale-weight race eliminated for non_blocking H2D copies)")
+        # M2200: Megatron a4008d0f2 — expose moe_latent_size for latent-MoE FLOPS.
+        xformer_cfg['moe_latent_size'] = self.moe_latent_size
+        print(f"[M2200-XFMR] moe_latent_size={self.moe_latent_size} "
+              f"(M2200: None=standard-MoE; int=latent-MoE, experts run on compressed dim)")
         return xformer_cfg
 
     def get_model_config(self) -> Dict:
@@ -1924,6 +1942,39 @@ def moe_topk_router_forward(logits, topk, score_function='sigmoid',
               f"(Llama4 path); probs reset to 1.0, hidden dtype={original_dtype}")
 
     return probs, top_indices, hidden_states
+
+
+def moe_latent_backward_dw(
+    routed_experts: bool = True,
+    shared_experts: bool = False,
+    moe_latent_size: int = None,
+):
+    """M2200: Megatron a4008d0f2 — backward_dw for latent-MoE fc1/fc2 latent projections.
+
+    Upstream MoELayer.backward_dw() gains two new branches when moe_latent_size is set:
+      - routed path:  after experts.backward_dw(), call fc2_latent_proj.backward_dw()
+                      in the comm stream (forward/backward both run there).
+      - shared path:  after shared_experts.backward_dw(), call fc1_latent_proj.backward_dw()
+                      in the default stream.
+
+    Neuron_SP has no separate expert dispatch yet, so this is a diagnostic stub
+    that logs the call and signals which proj would fire.  Wire into actual latent
+    projection modules when the MoE backbone is ported.
+
+    鲁迅曰：fc2走通信之流，fc1随共享专家——各司其职，不得僭越。
+    权重梯度之路，表面平静，暗流涌动：stream不对，梯度错位，损失无声地消失。
+    """
+    if moe_latent_size is None:
+        return  # standard MoE — nothing to do here
+
+    if routed_experts:
+        # fc2_latent_proj.backward_dw() would run in comm stream
+        print(f"[M2200-BWD-DW] routed_experts: fc2_latent_proj.backward_dw() "
+              f"(comm stream; moe_latent_size={moe_latent_size}) — stub, no actual module yet")
+    if shared_experts:
+        # fc1_latent_proj.backward_dw() runs in default stream alongside shared experts
+        print(f"[M2200-BWD-DW] shared_experts: fc1_latent_proj.backward_dw() "
+              f"(default stream; moe_latent_size={moe_latent_size}) — stub, no actual module yet")
 
 
 def cudagraph_manager_init_vp_stage(
@@ -6405,6 +6456,24 @@ class Trainer:
         )
         _mlp_flops_per_layer  = 12 * _hidden_size * _ffn_hidden * _gated_mult
         _logit_flops          = 6 * _hidden_size * _vocab_size / (2 * _num_layers)
+        # M2200: Megatron a4008d0f2 — latent-MoE FLOPS correction.
+        # Standard MoE: expert_flops = moe_ffn_h * topk * ffn_expansion (same dim as hidden).
+        # Latent MoE:   experts run on moe_latent_size dim (compressed), so:
+        #   expert_flops = moe_ffn_h * topk * ffn_expansion * latent/hidden  (reduced matmuls)
+        #                + 2 * latent                                          (up+down proj)
+        # Neuron_SP is currently dense (no separate MoE path) so this reads from config
+        # as a FLOPS accounting stub; when MoE is wired in, this formula activates.
+        _moe_latent_size = getattr(self.config, 'moe_latent_size', None)
+        if _moe_latent_size is not None:
+            # Latent-MoE: scale expert contribution by latent/hidden ratio + proj overhead.
+            _moe_router_topk = getattr(self.config, 'moe_router_topk', 1)
+            _latent_expert_flops = (
+                _ffn_hidden * _moe_router_topk * _gated_mult * _moe_latent_size / _hidden_size
+                + 2 * _moe_latent_size
+            )
+            print(f"[M2200-FLOP] latent_moe active: moe_latent_size={_moe_latent_size} "
+                  f"topk={_moe_router_topk} latent_expert_flops={_latent_expert_flops:.3e} "
+                  f"(M2200: experts shrunk to latent dim, up+down proj added)")
         flops_per_token = _num_layers * (_attn_flops_per_layer + _mlp_flops_per_layer) + _logit_flops
         print(f"[M2060-FLOP] layers={_num_layers} hidden={_hidden_size} heads={_num_heads} "
               f"kv_groups={_num_kv_groups} seq={_seq_len} ffn_h={_ffn_hidden} "
