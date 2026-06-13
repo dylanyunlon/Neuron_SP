@@ -5931,10 +5931,41 @@ class Trainer:
         per_gpu_tps = total_tokens / total_time
         cluster_tps = per_gpu_tps * self.world_size
 
-        # MFU
+        # MFU — M2060: Megatron 8873b55d6 accurate FLOP estimate.
+        # Old path: `6 * n_params` overcounts for MoE (counts all experts, not topk)
+        # and undercounts the attention causal mask correction (/2 on seq/hidden term).
+        # New path mirrors num_floating_point_operations() from Megatron training.py.
         model_ref = self.engine.module if self.engine else self.model
         n_params = sum(p.numel() for p in model_ref.parameters())
-        flops_per_token = 6 * n_params
+        _mcfg = self.config.get_model_config()
+        _num_layers     = _mcfg.get('n_layer', 12)
+        _hidden_size    = _mcfg.get('n_embd', 768)
+        _num_heads      = _mcfg.get('n_head', 12)
+        _num_kv_groups  = getattr(self.config, 'num_query_groups', _num_heads)
+        _seq_len        = self.config.max_seq_len
+        _vocab_size     = self.config.vocab_size
+        _swiglu         = getattr(self.config, 'use_swiglu', False)
+        # FFN: assume dense (no MoE in current Neuron_SP; placeholder for future port).
+        _ffn_hidden     = int(round(4 * _hidden_size))   # standard 4× expansion
+        # SwiGLU multiplier: gate + up proj adds 50% extra params (Shazeer 2020).
+        _gated_mult     = 3 / 2 if _swiglu else 1
+        # QK projection ratio (GQA-aware).
+        _qk_ratio       = _num_kv_groups / _num_heads if _num_kv_groups else 1
+        # Per-layer per-token FLOPs (Megatron arxiv:2104.04473 Appendix, 8873b55d6 fix):
+        #   Attention:  12 * h^2 * (1 + kv_ratio + seq/(2*h))   ← /2 for causal mask
+        #   MLP:        12 * h * ffn_h * gated_mult
+        #   Logit:      6 * h * vocab / (2 * L)  (amortised over layers)
+        _attn_flops_per_layer = (
+            12 * _hidden_size * _hidden_size *
+            (1 + _qk_ratio + _seq_len / (_hidden_size * 2))  # 8873b55d6: /2 causal fix
+        )
+        _mlp_flops_per_layer  = 12 * _hidden_size * _ffn_hidden * _gated_mult
+        _logit_flops          = 6 * _hidden_size * _vocab_size / (2 * _num_layers)
+        flops_per_token = _num_layers * (_attn_flops_per_layer + _mlp_flops_per_layer) + _logit_flops
+        print(f"[M2060-FLOP] layers={_num_layers} hidden={_hidden_size} heads={_num_heads} "
+              f"kv_groups={_num_kv_groups} seq={_seq_len} ffn_h={_ffn_hidden} "
+              f"swiglu={_swiglu} flops_per_tok={flops_per_token:.3e} "
+              f"(vs naive 6*n_params={6*n_params:.3e})")
         achieved_flops = per_gpu_tps * flops_per_token
         gpu_name = torch.cuda.get_device_name(self.device)
         # GPU peak BF16 TFLOPS lookup — MUST match actual hardware
