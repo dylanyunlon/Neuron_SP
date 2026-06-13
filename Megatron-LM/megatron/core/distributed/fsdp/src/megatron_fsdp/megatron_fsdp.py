@@ -648,12 +648,18 @@ class MegatronFSDP(torch.nn.Module):
             assert self.data_parallel_sharding_strategy == "optim_grads_params"
 
             # Release parameters for this module after backward.
+            # [M2230-DIAG] MXFP8核心修复: bwd=False确保FP8 transpose cache同步释放，防止显存泄漏
+            print(f"[M2230-FSDP] post-bwd release: {module._get_name()} bwd=True+False (MXFP8 cache cleared)", flush=True)
             release_module_parameters(module, bwd=True)
             release_module_parameters(module, bwd=False)
 
             # Transition this module back to the IDLE training state.
+            # [M2230-DIAG] 铁证: 递归重置所有子模块为IDLE，防止MXFP8残留PRE_BACKWARD污染前向
+            n_idle = 0
             for sub_module in module.modules():
                 sub_module._training_state = TrainingState.IDLE
+                n_idle += 1
+            print(f"[M2230-FSDP] post-bwd IDLE reset: {module._get_name()} → {n_idle} sub_modules → IDLE", flush=True)
 
         @torch.compiler.disable
         def _process_post_backward_gradients(param_list):
@@ -863,6 +869,9 @@ class MegatronFSDP(torch.nn.Module):
             before the backward pass.
             """
             # Set the module's training state to PRE_BACKWARD.
+            # [M2230-DIAG] 铁证: 递归传播PRE_BACKWARD，MXFP8 all-gather须全子图感知
+            n_pre = sum(1 for _ in module.modules())
+            print(f"[M2230-FSDP] pre-bwd PRE_BACKWARD: {module._get_name()} → {n_pre} sub_modules → PRE_BACKWARD", flush=True)
             for sub_module in module.modules():
                 sub_module._training_state = TrainingState.PRE_BACKWARD
 
@@ -892,6 +901,9 @@ class MegatronFSDP(torch.nn.Module):
             self._root_pre_backward_hook_issued = True
 
             if self.data_parallel_sharding_strategy == "optim_grads_params":
+                # [M2230-DIAG] 铁证: optim_grads_params下全图PRE_BACKWARD，不再只设FSDP单元
+                n_root_pre = sum(1 for _ in root_module.modules())
+                print(f"[M2230-FSDP] root pre-bwd: broadcasting PRE_BACKWARD to ALL {n_root_pre} modules (was: FSDP-units-only)", flush=True)
                 for sub_module in root_module.modules():
                     # Set PRE_BACKWARD state to skip resharding and forward pre-fetching
                     # when performing activation recomputation / gradient checkpointing.
