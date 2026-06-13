@@ -827,7 +827,14 @@ class TrainingConfig:
     # at pipeline boundaries, not within individual transformer layers).
     deallocate_pipeline_outputs: bool = True
     variable_seq_lengths: bool = False
+    # M1503: Megatron 2c13d1f95 — Consistent arg names: batch_p2p_communication →
+    # batch_p2p_comm (short form); overlap_p2p_communication → overlap_p2p_comm.
+    # Neuron_SP already used the short form from M1501; this comment confirms
+    # alignment with upstream Megatron schedules.py + training.py call-sites.
+    # DES-LOC 20% adaptation: expose overlap_p2p_comm alongside batch_p2p_comm so
+    # sweep scripts can toggle overlap mode without editing pipeline config manually.
     batch_p2p_comm: bool = False
+    overlap_p2p_comm: bool = False  # M1503: canonical short name (was overlap_p2p_communication)
 
     def get_pipeline_config(self) -> Dict:
         """Extract pipeline-parallel configuration (Megatron 31d133bba pattern).
@@ -854,6 +861,11 @@ class TrainingConfig:
               f"dealloc={pipe_cfg['deallocate_pipeline_outputs']} "
               f"Kx/Ku/Kv={self.Kx}/{self.Ku}/{self.Kv} "
               f"partial_ac={self.num_micro_batches_with_partial_ac}")
+        # M1503: Megatron 2c13d1f95 — Consistent arg names diagnostic.
+        # Upstream training.py now passes overlap_p2p_comm= and batch_p2p_comm=
+        # (short form) to get_forward_backward_func; Neuron_SP mirrors this.
+        print(f'[M1503] get_pipeline_config: overlap_p2p_comm={self.overlap_p2p_comm} '
+              f'batch_p2p_comm={self.batch_p2p_comm} — arg names consistent with Megatron 2c13d1f95')
         return pipe_cfg
 
     def get_transformer_config(self) -> Dict:

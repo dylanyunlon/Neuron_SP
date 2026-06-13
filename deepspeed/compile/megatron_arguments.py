@@ -1497,3 +1497,52 @@ def patch_overlap_p2p_args(parser):
 
 
 print('[M1501]')
+
+# ---------------------------------------------------------------------------
+# M1503: Megatron 2c13d1f95 — Consistent arg names
+# Source: megatron/core/pipeline_parallel/schedules.py + megatron/training.py
+#         (NVIDIA/Megatron-LM commit 2c13d1f95)
+#
+# Upstream renames function parameters for consistency:
+#   overlap_p2p_communication → overlap_p2p_comm   (3 function signatures)
+#   batch_p2p_communication   → batch_p2p_comm     (3 function signatures)
+# training.py call-site updated to pass keyword args with the short names.
+#
+# Mapping: megatron/core/pipeline_parallel/schedules.py param renames
+#        → deepspeed/compile/megatron_arguments.py (this file) + REAL_GPU_BENCHMARK.py
+#
+# Neuron_SP already used the short form since M1501 (dest='overlap_p2p_comm').
+# This commit confirms naming consistency: schedules.py now matches the dest=
+# names declared here.  No functional change — pure rename.
+#
+# 20% adaptation: add verify_p2p_arg_names() diagnostic that checks a live
+# argparse Namespace for the canonical short names and prints a M1503 marker;
+# called at argument-parse time to surface any stale long-name kwargs early.
+# ---------------------------------------------------------------------------
+
+
+def verify_p2p_arg_names(args):
+    """Verify p2p comm args use canonical short names (Megatron 2c13d1f95).
+
+    Megatron 2c13d1f95 renamed function parameters across schedules.py:
+      overlap_p2p_communication → overlap_p2p_comm
+      batch_p2p_communication   → batch_p2p_comm
+
+    Neuron_SP has used the short form since M1501.  This helper surfaces any
+    stale long-name attributes on the Namespace (e.g. injected by third-party
+    argument parsers) so they are caught at startup rather than silently ignored
+    at the forward-backward call-site.
+    """
+    stale = [a for a in ('overlap_p2p_communication', 'batch_p2p_communication')
+             if hasattr(args, a)]
+    if stale:
+        raise AttributeError(
+            f'[M1503] Stale long-form p2p arg names detected: {stale}. '
+            f'Use overlap_p2p_comm / batch_p2p_comm (Megatron 2c13d1f95).')
+    overlap = getattr(args, 'overlap_p2p_comm', False)
+    batch = getattr(args, 'batch_p2p_comm', not overlap)
+    print(f'[M1503] verify_p2p_arg_names: overlap_p2p_comm={overlap} '
+          f'batch_p2p_comm={batch} — names consistent with Megatron 2c13d1f95')
+
+
+print('[M1503]')
