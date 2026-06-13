@@ -1,8 +1,8 @@
 # Megatron-LM → Neuron_SP Migration Progress
 
 ## 状态
-- 最新处理: M2000 (Megatron de16089be — Distributed optimizer for TE/Apex-independent training)
-- 总进度: 145/7156 commits (2.0%)
+- 最新处理: M2040 (Megatron acba19cb9 — Reduce CPU overhead of TEDotProductAttention for packed sequence)
+- 总进度: 146/7156 commits (2.0%)
 - 实际代码改动 commits: M1445(partial AC), M1500(SwiGLU)
 - 小弟 dispatched: M1461(dist ckpt), M1510(MQA)
 
@@ -24,7 +24,32 @@ cd /path/to/Neuron_SP
 # 查看当前进度
 git log --oneline | grep "M15" | tail -5
 # 继续从 M1588 开始
-# 参考 /home/claude/megatron_pending_commits.txt 第 144+ 行
+# 参考 /home/claude/megatron_pending_commits.txt 第 14## M2040 — Megatron-LM commit acba19cb9: Reduce CPU overhead of TEDotProductAttention for packed sequence
+
+**日期**: 2026-06-13  
+**来源**: NVIDIA/Megatron-LM@acba19cb9 (Reduce CPU overhead of TEDotProductAttention for packed sequence)
+
+### 修改要点
+1. **`transformer_engine.py` → `REAL_GPU_BENCHMARK.py` `CausalSelfAttention.__init__`**:
+   - 原来每次 `forward()` 都调 `get_te_version()` + `.pop()` 过滤 packed_seq_kwargs
+   - 现在在 `__init__` 里一次性构建 `_te_packed_fields: frozenset`，把版本 discard 提前
+   - `forward()` 直接用 `self._te_packed_fields` 过滤，零 Python 函数调用开销
+
+2. **`CausalSelfAttention.forward()` SDPA 路径**:
+   - `[ATTN-SDPA]` print 追加 `[M2040] packed_fields=N (no per-step version checks)` 诊断
+   - 可在 log 里确认每层的 packed_fields 数量，验证 TE 版本适配正确
+
+### 鲁迅式评注（20% 适配注记）
+> 铁屋中的每一步 forward，都曾悄悄推开版本检查这扇门，再悄悄带走几个微秒。  
+> 众人浑然不觉，以为那不过是"查一查而已"——  
+> 殊不知千步之行，积弊成山。  
+> 今将门锁提前配好，forward 但凭旧钥，再不须当门而立。
+
+### 存档文件
+- `archive/patches/M2040_Megatron_acba19cb9_packed_seq_cpu_overhead.patch` — 原始 Megatron diff (60行)
+- `REAL_GPU_BENCHMARK.py` — `CausalSelfAttention.__init__` 新增 `_te_packed_fields` 初始化块
+
+4+ 行
 ```
 
 ## M1980 — Megatron-LM commit 5486c69c6: Add debug timing utilities

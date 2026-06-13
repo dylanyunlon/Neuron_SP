@@ -1298,6 +1298,44 @@ class CausalSelfAttention(nn.Module):
         self.c_proj = NeuronLinear(n_embd, n_embd, bias=False)
         self.resid_dropout = nn.Dropout(dropout)
 
+        # M2040: Megatron acba19cb9 — Reduce CPU overhead of TEDotProductAttention
+        # for packed sequence.
+        # 原来每次 forward 都要调 get_te_version() 然后 pop()，
+        # 一步一坑，步步消耗，如同鲁迅笔下那些消磨在无谓仪式里的光阴。
+        # 现在把版本检查提前到 __init__，只查一次，用 kept_packed_seq_params
+        # 记录本环境实际支持的字段，forward 里直接按集合取值，不再反复推门试锁。
+        #
+        # 20% DES-LOC 适配：CausalSelfAttention 不直接用 PackedSeqParams dataclass，
+        # 而是把同等逻辑落在 _packed_sdpa_kwargs dict 上：
+        #   - max_seqlen_{q,kv}  只有 TE ≥ 1.3.0 才支持（D2H 预计算）
+        #   - cu_seqlens_*_padded 只有 TE ≥ 1.10.0 才支持（THD padding aware）
+        # _te_packed_fields 在 init 时确定，forward 用它过滤 kwargs，避免每步查版本。
+        _te_packed_all = {
+            'cu_seqlens_q', 'cu_seqlens_kv',
+            'max_seqlen_q', 'max_seqlen_kv',
+            'cu_seqlens_q_padded', 'cu_seqlens_kv_padded',
+            'qkv_format',
+        }
+        try:
+            from transformer_engine.pytorch.utils import get_te_version  # type: ignore
+            from packaging.version import Version as PkgVersion             # type: ignore
+            _tv = get_te_version()
+            if _tv < PkgVersion("1.3.0"):
+                _te_packed_all.discard("max_seqlen_q")
+                _te_packed_all.discard("max_seqlen_kv")
+            if _tv < PkgVersion("1.10.0"):
+                _te_packed_all.discard("cu_seqlens_q_padded")
+                _te_packed_all.discard("cu_seqlens_kv_padded")
+            print(f"[M2040-INIT] layer={layer_number} TE={_tv} "
+                  f"kept_packed_fields={sorted(_te_packed_all)} "
+                  f"(acba19cb9: version-check hoisted to __init__)")
+        except ImportError:
+            # TE not installed — keep full set; SDPA path never uses it anyway
+            print(f"[M2040-INIT] layer={layer_number} TE=not-installed "
+                  f"kept_packed_fields=all (no-op, SDPA path active) "
+                  f"(acba19cb9: version-check hoisted to __init__)")
+        self._te_packed_fields = frozenset(_te_packed_all)
+
     def forward(self, x: torch.Tensor, rotary_pos_emb=None) -> torch.Tensor:
         # M1517: rotary_pos_emb accepted as keyword argument (not positional) —
         # mirrors Megatron a6c574d4f which added None-padding slots so that
@@ -1495,7 +1533,9 @@ class CausalSelfAttention(nn.Module):
                 print(f"[ATTN-SDPA] rank={_r} step={s} y_pre_reverse={list(y.shape)} "
                       f"y_norm={y.float().norm().item():.4f} "
                       f"y_mean={y.float().mean().item():.8f} "
-                      f"y_std={y.float().std().item():.6f}")
+                      f"y_std={y.float().std().item():.6f} "
+                      f"[M2040] packed_fields={len(self._te_packed_fields)} "
+                      f"(no per-step version checks)")
 
             y_pre_rev = y
             y = _ulysses_a2a(y, 2, 1, _SP_CTX['grp'])
