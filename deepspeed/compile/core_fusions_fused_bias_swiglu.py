@@ -58,33 +58,66 @@ def bias_swiglu_back(g, y, bias, y_2, bias_2):
     return swiglu_back(g, x_1, x_2)
 
 
+# ---------------------------------------------------------------------------
+# M1970: Megatron 21648b5ab — Store SwiGLU inputs in fp8 to save activation memory
+# fp8_input_store=True → save gate/up halves as float8_e4m3fn; cast back before backward.
+# 鲁迅曰：「省内存如省粮，fp8 压缩乃当今节粮之道；backward 还原，不差毫厘。」
+# ---------------------------------------------------------------------------
 class BiasSwiGLUFunction(torch.autograd.Function):
     @staticmethod
     # bias is an optional argument
-    def forward(ctx, input, bias, input_2, bias_2):
-        ctx.save_for_backward(input, bias, input_2, bias_2)
+    def forward(ctx, input, bias, input_2, bias_2, fp8_input_store):
+        # M1970: cast both gate/up halves to fp8 for cheaper activation storage
+        inp_save = input.to(torch.float8_e4m3fn) if fp8_input_store else input
+        inp2_save = input_2.to(torch.float8_e4m3fn) if fp8_input_store else input_2
+        ctx.save_for_backward(inp_save, bias, inp2_save, bias_2)
+        ctx.ori_input_dtype = input.dtype
+        ctx.fp8_input_store = fp8_input_store
+        print(f'[M1970] BiasSwiGLUFunction.forward fp8_input_store={fp8_input_store} '
+              f'input.dtype={input.dtype}')
         return bias_swiglu(input, bias, input_2, bias_2)
 
     @staticmethod
     def backward(ctx, grad_output):
         input, bias, input_2, bias_2 = ctx.saved_tensors
+        # M1970: cast fp8 tensors back to original precision before computing gradients
+        if ctx.fp8_input_store:
+            input = input.to(ctx.ori_input_dtype)
+            input_2 = input_2.to(ctx.ori_input_dtype)
         tmp, tmp2 = bias_swiglu_back(grad_output, input, bias, input_2, bias_2)
-        return tmp, tmp, tmp2, tmp2
+        return tmp, tmp, tmp2, tmp2, None
 
 
 class SwiGLUFunction(torch.autograd.Function):
     @staticmethod
     # bias is an optional argument
-    def forward(ctx, input, input_2):
-        ctx.save_for_backward(input, input_2)
+    def forward(ctx, input, input_2, fp8_input_store):
+        # M1970: cast both halves to fp8 for cheaper activation storage
+        inp_save = input.to(torch.float8_e4m3fn) if fp8_input_store else input
+        inp2_save = input_2.to(torch.float8_e4m3fn) if fp8_input_store else input_2
+        ctx.save_for_backward(inp_save, inp2_save)
+        ctx.ori_input_dtype = input.dtype
+        ctx.fp8_input_store = fp8_input_store
+        print(f'[M1970] SwiGLUFunction.forward fp8_input_store={fp8_input_store} '
+              f'input.dtype={input.dtype}')
         return swiglu(input, input_2)
 
     @staticmethod
     def backward(ctx, grad_output):
         input, input_2 = ctx.saved_tensors
+        # M1970: cast fp8 tensors back to original precision before computing gradients
+        if ctx.fp8_input_store:
+            input = input.to(ctx.ori_input_dtype)
+            input_2 = input_2.to(ctx.ori_input_dtype)
         tmp, tmp2 = swiglu_back(grad_output, input, input_2)
-        return tmp, tmp2
+        return tmp, tmp2, None
 
 
-bias_swiglu_impl = BiasSwiGLUFunction.apply
-swiglu_impl = SwiGLUFunction.apply
+def bias_swiglu_impl(input, bias, input_2, bias_2, fp8_input_store=False):
+    """Wrapper for BiasSwiGLUFunction; fp8_input_store saves activation memory (M1970)."""
+    return BiasSwiGLUFunction.apply(input, bias, input_2, bias_2, fp8_input_store)
+
+
+def swiglu_impl(input, input_2, fp8_input_store=False):
+    """Wrapper for SwiGLUFunction; fp8_input_store saves activation memory (M1970)."""
+    return SwiGLUFunction.apply(input, input_2, fp8_input_store)

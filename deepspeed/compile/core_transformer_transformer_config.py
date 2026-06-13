@@ -67,6 +67,21 @@
 # 20% adaptation (鲁迅笔法): 懒得迁移 transformer_engine 那堆进口，
 # 只把配置字段塞进来，fp8_context 的事留给 block 文件去伤脑筋。
 # fp8 default 改成 False — 没装 transformer_engine 的机器别乱 True。
+# ---------------------------------------------------------------------------
+# M1970: Megatron 21648b5ab — Store SwiGLU inputs in fp8 to save activation memory
+# Source: megatron/core/transformer/transformer_config.py (NVIDIA/Megatron-LM commit 21648b5ab)
+#
+# Changes ported from upstream:
+#   1. New field: activation_func_fp8_input_store: bool = False
+#      "Store the input of MLP activation function in FP8 for backprop to save memory."
+#   2. __post_init__: validation — if True, must be on SwiGLU path
+#      (nsp: bias_activation_fusion=True AND activation_func != gelu).
+#
+# 20% adaptation (鲁迅式迁移):
+#   鲁迅曰：「上游以 F.silu + gated_linear_unit 判断 SwiGLU；
+#            本项目另辟蹊径，bias_activation_fusion + not gelu 为凭，殊途同归。」
+#   - 校验逻辑改用本地 SwiGLU 判据，无需引入 gated_linear_unit 字段。
+#   - print 诊断在 __post_init__ 中输出 fp8_input_store 值，实验可见。
 # Adds print('[M1544]') diagnostic marker.
 # ---------------------------------------------------------------------------
 # M1910: Megatron 80de44fda — Add RoPE and SwiGLU fusion
@@ -239,6 +254,13 @@ class TransformerConfig(BaseConfig):
     fp8_amax_history_len: int = 1
     fp8_amax_compute_algo: str = "most_recent"
 
+    # M1970: Megatron 21648b5ab — Store SwiGLU inputs in fp8 to save activation memory
+    # 鲁迅曰：「此字段默认 False，不强迫任何人节食；True 则开启 fp8 压缩，省存换精度。」
+    activation_func_fp8_input_store: bool = False
+    """Store the input of MLP activation function in FP8 for backprop to save memory.
+    The stored input is cast back to the original precision before backprop computation.
+    Only supported for SwiGLU (bias_activation_fusion=True, activation_func != gelu)."""
+
     @property
     def sequence_parallel_enabled(self) -> bool:
         """Backward-compat alias: upstream renamed this to sequence_parallel in M1420."""
@@ -278,3 +300,19 @@ class TransformerConfig(BaseConfig):
                     "add_bias_linear must also be True."
                 )
         print('[M1910] __post_init__: bias_activation_fusion validated')
+
+        # M1970: fp8 activation input store — only valid for SwiGLU path
+        # 鲁迅曰：「fp8 压缩只护 SwiGLU 一族；gelu 若来，概不接待。」
+        if self.activation_func_fp8_input_store:
+            # In nsp: SwiGLU path = bias_activation_fusion=True AND activation_func != gelu
+            is_swiglu_path = (
+                self.bias_activation_fusion
+                and getattr(self, 'activation_func', F.gelu) != F.gelu
+            )
+            if not is_swiglu_path:
+                raise ValueError(
+                    "activation_func_fp8_input_store=True is only supported for the SwiGLU "
+                    "path (bias_activation_fusion=True and activation_func != gelu)."
+                )
+        print(f'[M1970] __post_init__: activation_func_fp8_input_store='
+              f'{self.activation_func_fp8_input_store}')

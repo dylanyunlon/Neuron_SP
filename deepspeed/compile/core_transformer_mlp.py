@@ -56,6 +56,20 @@
 #   - 增加 try/except 保护 SwiGLU import，防止无 apex 环境崩溃。
 #   - print('[M1910]') 诊断标记。
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# M1970: Megatron 21648b5ab — Store SwiGLU inputs in fp8 to save activation memory
+# Source: megatron/core/transformer/mlp.py (NVIDIA/Megatron-LM commit 21648b5ab)
+#
+# Changes ported from upstream:
+#   forward(): SwiGLU path reads config.activation_func_fp8_input_store and
+#   passes it to bias_swiglu_impl / swiglu_impl for fp8-compressed activation storage.
+#
+# 20% adaptation (鲁迅式迁移):
+#   鲁迅曰：「内存有限，世人皆知；fp8 压缩，实乃节衣缩食之计。
+#            旧代码不传 fp8_store，宛如饥荒年间浪费余粮——罪莫大焉。」
+#   - getattr 安全读取 activation_func_fp8_input_store，向后兼容无此字段的旧 config。
+#   - 双 print 诊断：SwiGLU path + fp8_store 值，方便实验中快速确认。
+# ---------------------------------------------------------------------------
 
 print('[M1302]')
 print('[M1420]')
@@ -160,13 +174,17 @@ class ParallelMLP(MegatronModule):
                 intermediate_parallel = bias_gelu_impl(intermediate_parallel, bias_parallel)
             else:
                 # SwiGLU: chunk intermediate 和 bias 各一半，再 fused apply
+                # M1970: pass fp8_input_store flag for activation memory saving
                 x = torch.chunk(intermediate_parallel, 2, dim=-1)
+                fp8_store = getattr(self.config, 'activation_func_fp8_input_store', False)
                 print(f'[M1910] SwiGLU fusion path: x[0].shape={x[0].shape}')
+                print(f'[M1970] SwiGLU fp8_input_store={fp8_store}')
                 if bias_parallel is not None:
                     bias = torch.chunk(bias_parallel, 2, dim=-1)
-                    intermediate_parallel = bias_swiglu_impl(x[0], bias[0], x[1], bias[1])
+                    intermediate_parallel = bias_swiglu_impl(x[0], bias[0], x[1], bias[1],
+                                                             fp8_store)
                 else:
-                    intermediate_parallel = swiglu_impl(x[0], x[1])
+                    intermediate_parallel = swiglu_impl(x[0], x[1], fp8_store)
         else:
             intermediate_parallel = self.activation_func(intermediate_parallel + bias_parallel)
 
