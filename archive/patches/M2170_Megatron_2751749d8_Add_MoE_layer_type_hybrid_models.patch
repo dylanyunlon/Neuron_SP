@@ -1,0 +1,119 @@
+diff --git a/megatron/core/inference/contexts/dynamic_context.py b/megatron/core/inference/contexts/dynamic_context.py
+index 22a4b1b14..430060d36 100644
+--- a/megatron/core/inference/contexts/dynamic_context.py
++++ b/megatron/core/inference/contexts/dynamic_context.py
+@@ -321,7 +321,7 @@ class DynamicInferenceContext(BaseInferenceContext):
+             # For hybrid models, the layer map converts the global layer index to the
+             # corresponding attention layer index or Mamba layer index depending on the
+             # layer type.
+-            attention_layer_map, mamba_layer_map, _ = get_layer_maps_from_layer_type_list(
++            attention_layer_map, mamba_layer_map, _, _ = get_layer_maps_from_layer_type_list(
+                 layer_type_list
+             )
+             self.num_attention_layers = len(attention_layer_map)
+diff --git a/megatron/core/models/mamba/mamba_layer_specs.py b/megatron/core/models/mamba/mamba_layer_specs.py
+index 8ef4a2ab3..bfe38c2bb 100755
+--- a/megatron/core/models/mamba/mamba_layer_specs.py
++++ b/megatron/core/models/mamba/mamba_layer_specs.py
+@@ -3,9 +3,11 @@
+ from megatron.core.extensions.transformer_engine import (
+     TEDotProductAttention,
+     TELayerNormColumnParallelLinear,
++    TENorm,
+     TERowParallelLinear,
+ )
+ from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
++from megatron.core.models.gpt.moe_module_specs import get_moe_module_spec
+ from megatron.core.ssm.mamba_block import MambaStack, MambaStackSubmodules
+ from megatron.core.ssm.mamba_layer import MambaLayer, MambaLayerSubmodules
+ from megatron.core.ssm.mamba_mixer import MambaMixer, MambaMixerSubmodules
+@@ -16,6 +18,13 @@ from megatron.core.transformer.mlp import MLP, MLPSubmodules
+ from megatron.core.transformer.spec_utils import ModuleSpec
+ from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
+ 
++moe = get_moe_module_spec(
++    use_te=True,
++    num_experts=8,  # Can be any positive integer (must not be None).
++    moe_grouped_gemm=True,
++    moe_use_legacy_grouped_gemm=False,
++)
++
+ mamba_stack_spec = ModuleSpec(
+     module=MambaStack,
+     submodules=MambaStackSubmodules(
+@@ -64,5 +73,12 @@ mamba_stack_spec = ModuleSpec(
+                 mlp_bda=get_bias_dropout_add,
+             ),
+         ),
++        moe_layer=ModuleSpec(
++            # TODO (rwaleffe): change this to be an "MoELayer" to work with CudaGraphs?
++            module=TransformerLayer,
++            submodules=TransformerLayerSubmodules(
++                pre_mlp_layernorm=TENorm, mlp=moe, mlp_bda=get_bias_dropout_add
++            ),
++        ),
+     ),
+ )
+diff --git a/megatron/core/ssm/mamba_block.py b/megatron/core/ssm/mamba_block.py
+index 7d8ca74c8..18633d4e7 100644
+--- a/megatron/core/ssm/mamba_block.py
++++ b/megatron/core/ssm/mamba_block.py
+@@ -86,6 +86,7 @@ class MambaStackSubmodules:
+     mamba_layer: Union[ModuleSpec, type] = IdentityOp
+     attention_layer: Union[ModuleSpec, type] = IdentityOp
+     mlp_layer: Union[ModuleSpec, type] = IdentityOp
++    moe_layer: Union[ModuleSpec, type] = IdentityOp
+ 
+ 
+ class MambaStack(MegatronModule):
+@@ -188,6 +189,11 @@ class MambaStack(MegatronModule):
+                         layer_number=i + 1,
+                         pg_collection=pg_collection,
+                     )
++                elif layer_type == LayerSymbols.MOE:
++                    # Transformer layers apply their own pp_layer_offset
++                    layer = build_module(
++                        submodules.moe_layer, config=self.config, layer_number=i + 1
++                    )
+                 else:
+                     assert False, "unexpected layer_type"
+             self.layers.append(layer)
+diff --git a/megatron/core/ssm/mamba_hybrid_layer_allocation.py b/megatron/core/ssm/mamba_hybrid_layer_allocation.py
+index 7407bfe89..fe997e224 100644
+--- a/megatron/core/ssm/mamba_hybrid_layer_allocation.py
++++ b/megatron/core/ssm/mamba_hybrid_layer_allocation.py
+@@ -28,7 +28,8 @@ class Symbols:
+     MAMBA = "M"
+     ATTENTION = "*"
+     MLP = "-"
+-    VALID = {MAMBA, ATTENTION, MLP}
++    MOE = 'E'
++    VALID = {MAMBA, ATTENTION, MLP, MOE}
+ 
+ 
+ def _allocate_auto(
+@@ -172,9 +173,9 @@ def get_layer_maps_from_layer_type_list(
+ ) -> Tuple[Dict[int, int], Dict[int, int], Dict[int, int]]:
+     """
+     Returns maps from global layer index to the corresponding layer index
+-    for each layer type in [Attention, Mamba, MLP] given a layer type list.
++    for each layer type in [Attention, Mamba, MLP, MoE] given a layer type list.
+     """
+-    layer_types = [Symbols.ATTENTION, Symbols.MAMBA, Symbols.MLP]
++    layer_types = [Symbols.ATTENTION, Symbols.MAMBA, Symbols.MLP, Symbols.MOE]
+     layer_maps = {layer_type: {} for layer_type in layer_types}
+     for global_layer_idx, layer_type in enumerate(layer_type_list):
+         layer_map = layer_maps[layer_type]
+diff --git a/megatron/training/arguments.py b/megatron/training/arguments.py
+index b5f777a30..a726ae1de 100644
+--- a/megatron/training/arguments.py
++++ b/megatron/training/arguments.py
+@@ -1023,8 +1023,6 @@ def validate_args(args, defaults={}):
+     # MoE Spec check
+     if args.num_experts == 0:
+         args.num_experts = None
+-    if args.num_experts is not None:
+-        assert args.spec is None, "Model Spec must be None when using MoEs"
+     if args.num_experts is not None and args.moe_ffn_hidden_size is None:
+         args.moe_ffn_hidden_size = args.ffn_hidden_size
+         print("Warning: moe_ffn_hidden_size is not set, using ffn_hidden_size for MoE instead.")

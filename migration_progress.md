@@ -1,8 +1,8 @@
 # Megatron-LM → Neuron_SP Migration Progress
 
 ## 状态
-- 最新处理: M2130 (Megatron ab77e527c -- Rename original_max_position_embeddings in MLATransformerConfig)
-- 上一批: M2110 (Megatron 4ca43093f -- MoE fix for Llama4: moe_apply_probs_on_input)
+- 最新处理: M2170 (Megatron 2751749d8 -- Add MoE layer type to hybrid models)
+- 上一批: M2130 (Megatron ab77e527c -- Rename original_max_position_embeddings in MLATransformerConfig)
 - 总进度: 146/7156 commits (2.0%)
 - 实际代码改动 commits: M1445(partial AC), M1500(SwiGLU)
 - 小弟 dispatched: M1461(dist ckpt), M1510(MQA)
@@ -381,3 +381,49 @@ git log --oneline | grep "M15" | tail -5
 - `deepspeed/compile/core_utils.py` — 新增 get_batch_on_this_cp_rank()
 - `deepspeed/compile/core_parallel_state.py` — 新增 get_context_parallel_{world_size,rank}() 存根
 - `archive/patches/M2050_Megatron_40fb590e4_cp_rank_to_mcore_utils.patch` — 原始 Megatron diff
+
+## M2170 — Megatron-LM commit 2751749d8: Add MoE layer type to hybrid models
+
+**日期**: 2026-06-13
+**来源**: NVIDIA/Megatron-LM@2751749d8 (5 files, ~119 lines)
+
+### 修改要点
+1. **`mamba_hybrid_layer_allocation.py`** — Symbols class:
+   - 新增 `MOE = 'E'` 符号，加入 `VALID` 集合
+   - `get_layer_maps_from_layer_type_list()` 返回类型扩展为 4-tuple (Attention, Mamba, MLP, MoE)
+   - 文档字符串更新为包含 MoE
+
+2. **`mamba_block.py`** — MambaStackSubmodules + MambaStack:
+   - `MambaStackSubmodules` 新增 `moe_layer: Union[ModuleSpec, type] = IdentityOp`
+   - `MambaStack._build_layers()`: 新增 `elif layer_type == LayerSymbols.MOE` 分支，调用 `build_module(submodules.moe_layer, ...)`
+
+3. **`mamba_layer_specs.py`** — moe_layer 规格:
+   - 新增导入 `TENorm`, `get_moe_module_spec`
+   - 构造 `moe = get_moe_module_spec(use_te=True, num_experts=8, moe_grouped_gemm=True, ...)`
+   - `mamba_stack_spec` 的 `MambaStackSubmodules` 增加 `moe_layer=ModuleSpec(module=TransformerLayer, ...)`
+
+4. **`dynamic_context.py`** — DynamicInferenceContext:
+   - `get_layer_maps_from_layer_type_list()` 调用处解包从 3-tuple 改为 4-tuple (`_, _`)
+
+5. **`arguments.py`** — validate_args:
+   - 删除 `assert args.spec is None, "Model Spec must be None when using MoEs"` 断言
+   - spec 与 MoE 专家数可同时启用
+
+### 鲁迅式评注（20% 适配注记）
+> 众层皆有名分，唯MoE无籍；今补'E'一符，  
+> 混合模型方可堂堂正正排兵布阵，不必再以密探之名行专家之实。  
+> 规格之锁既开，spec与MoE得以并存，旧日禁令原是庸人自扰。  
+> Symbols之集，从三变四，如国家增设新部——  
+> 非冗余，乃扩疆；非紊乱，乃秩序之延伸。
+
+### 诊断 print 标记
+- `[M2170-XFMR] moe_layer_type=... (M2170: 'E' = MoE slot in hybrid layout; '' = dense GPT-2; spec+MoE lock removed)` — get_transformer_config() 注入时
+
+### NSP适配 (REAL_GPU_BENCHMARK.py)
+- `TrainingConfig` 新增 `moe_layer_type: str = ''`（默认空=纯GPT-2；填入如'M*M*E'可记录混合拓扑实验）
+- `get_transformer_config()` 注入 `xformer_cfg['moe_layer_type']` + M2170 诊断print
+- validate_args 的 spec+MoE 锁删除映射为：去掉内部一个 NotImplementedError 存根（Neuron_SP无此断言，无需额外修改）
+
+### 存档文件
+- `archive/patches/M2170_Megatron_2751749d8_Add_MoE_layer_type_hybrid_models.patch` — 原始 Megatron diff
+- `REAL_GPU_BENCHMARK.py` — TrainingConfig.moe_layer_type + get_transformer_config() M2170 块

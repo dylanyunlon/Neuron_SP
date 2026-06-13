@@ -995,6 +995,24 @@ class TrainingConfig:
     # and add a diagnostic stub that mirrors the assert logic from upstream.
     virtual_pipeline_model_parallel_size: int = None   # M2150: VPP chunks per PP stage (None = VPP off)
 
+    # M2170: Megatron 2751749d8 — Add MoE layer type to hybrid (Mamba) models
+    # Upstream adds 'E' (MOE) as a valid layer symbol alongside 'M' (Mamba), '*' (Attention),
+    # '-' (MLP) in mamba_hybrid_layer_allocation.py. A new moe_layer field is wired into
+    # MambaStackSubmodules and built during MambaStack construction. get_layer_maps_from_layer_type_list
+    # now returns 4 maps (Attention, Mamba, MLP, MoE); callers in dynamic_context.py unpack
+    # `_, _` for the unused MLP and MoE slots. The MoE spec restriction ("Model Spec must be
+    # None when using MoEs") is removed from validate_args, enabling spec+MoE co-use.
+    #
+    # 20% DES-LOC adaptation: Neuron_SP is a dense single-GPU GPT-2; there is no MambaStack.
+    # We surface moe_layer_type as a TrainingConfig string field (default '') so sweep scripts
+    # can record hybrid topology experiments (e.g. 'M*M*E') without changing the GPT-2 forward
+    # pass. The validate_args guard removal maps to dropping a NotImplementedError stub.
+    #
+    # 鲁迅曰：众层皆有名分，唯MoE无籍；今补'E'一符，
+    # 混合模型方可堂堂正正排兵布阵，不必再以密探之名行专家之实。
+    # 规格之锁既开，spec与MoE得以并存，旧日禁令原是庸人自扰。
+    moe_layer_type: str = ''  # M2170: hybrid layer string e.g. 'M*M*E' ('' = dense GPT-2, no MoE)
+
     def get_pipeline_config(self) -> Dict:
         """Extract pipeline-parallel configuration (Megatron 31d133bba pattern).
 
@@ -1078,6 +1096,12 @@ class TrainingConfig:
         print(f"[M2150-XFMR] virtual_pipeline_model_parallel_size="
               f"{self.virtual_pipeline_model_parallel_size} "
               f"(M2150: None=VPP-off, int=VPP-on; vp_stage must be passed to CudaGraphManager when set)")
+        # M2170: Megatron 2751749d8 — expose moe_layer_type so hybrid topology is logged.
+        # Upstream adds MOE='E' symbol to mamba_hybrid_layer_allocation; here we forward
+        # the field so downstream model builders can read the topology string from config.
+        xformer_cfg['moe_layer_type'] = self.moe_layer_type
+        print(f"[M2170-XFMR] moe_layer_type={self.moe_layer_type!r} "
+              f"(M2170: 'E' = MoE slot in hybrid layout; '' = dense GPT-2; spec+MoE lock removed)")
         return xformer_cfg
 
     def get_model_config(self) -> Dict:
