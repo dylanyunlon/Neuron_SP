@@ -12,20 +12,29 @@
 #   megatron/core/transformer/custom_layers/transformer_engine.py
 #     -> deepspeed/compile/core_transformer_custom_layers_transformer_engine.py
 #
-# Changes ported:
+# Changes ported (M1525):
 #   TELinear.__init__:
-#     - Added bias/return_bias params; self.te_return_bias = return_bias and bias
+#     - Added bias/skip_bias_add params; self.te_return_bias = skip_bias_add and bias
 #     - Passes bias and return_bias=self.te_return_bias to TE super().__init__
 #   TELinear.forward (new):
-#     - Always returns (output, bias_or_None) regardless of return_bias arg
+#     - Always returns (output, bias_or_None) regardless of skip_bias_add arg
 #     - If te_return_bias: TE already returns tuple, pass through
 #     - Else: return out, None
 #
-# 20% adaptation: adds print('[M1525]') diagnostic markers and 鲁迅式 docstring.
+# ---------------------------------------------------------------------------
+# M1527: Megatron 5b6fb1ecd — Rename return_bias back to skip_bias_add
+# Source: megatron/core/transformer/custom_layers/transformer_engine.py
+#
+# Changes ported:
+#   TELinear.__init__: param return_bias -> skip_bias_add
+#   self.te_return_bias = skip_bias_add and bias  (logic unchanged)
+#
+# 20% adaptation: adds print('[M1527]') diagnostic markers and 鲁迅式 docstring.
 # ---------------------------------------------------------------------------
 
 print('[M1425]')
 print('[M1525]')
+print('[M1527]')
 import torch
 import transformer_engine as te
 
@@ -57,9 +66,12 @@ class TELinear(te.pytorch.module.Linear):
     to megatron's `RowParallelLinear` layer.
 
     M1525: forward() 始终返回 (output, bias_or_None) 两个值，
-    不管 return_bias 参数如何设置 —— 学鲁迅先生所言：
+    不管 skip_bias_add 参数如何设置 —— 学鲁迅先生所言：
     "横眉冷对千夫指，俯首甘为孺子牛"，接口一律平等，
     调用方无需猜测返回几个值。
+
+    M1527: 参数由 return_bias 正名为 skip_bias_add，与 Megatron 上游保持一致。
+    鲁迅又云：名不正则言不顺，言不顺则事不成——参数命名亦然。
     """
     def __init__(self,
                  input_size: int,
@@ -67,16 +79,17 @@ class TELinear(te.pytorch.module.Linear):
                  config: TransformerConfig,
                  parallel_mode: str,
                  bias: bool = True,
-                 return_bias: bool = False,
+                 skip_bias_add: bool = False,
                  **kwargs):
         self.config = config
 
-        # TE 在 bias=False、return_bias=True 时返回零长 Tensor，
+        # M1527: skip_bias_add replaces return_bias (rename only, logic identical).
+        # TE 在 bias=False、skip_bias_add=True 时返回零长 Tensor，
         # 我们更喜欢 None。所以此时让 TE 不返回 bias，
         # 由我们自己补 None——这样 forward 始终两个返回值，
         # 省得上层代码还要猜。
-        self.te_return_bias = return_bias and bias
-        print(f'[M1525] TELinear.__init__ bias={bias} return_bias={return_bias} '
+        self.te_return_bias = skip_bias_add and bias
+        print(f'[M1527] TELinear.__init__ bias={bias} skip_bias_add={skip_bias_add} '
               f'te_return_bias={self.te_return_bias}')
 
         super().__init__(
@@ -101,9 +114,9 @@ class TELinear(te.pytorch.module.Linear):
         # TE 只在 return_bias=True 时返回元组，否则返回单个 Tensor；
         # 我们无论如何都返回两个值，调用方一律用 output, _ = layer(x)。
         if self.te_return_bias:
-            print(f'[M1525] TELinear.forward te_return_bias=True, returning tuple as-is')
+            print(f'[M1527] TELinear.forward te_return_bias=True, returning tuple as-is')
             return out
-        print(f'[M1525] TELinear.forward te_return_bias=False, appending None bias')
+        print(f'[M1527] TELinear.forward te_return_bias=False, appending None bias')
         return out, None
 
 

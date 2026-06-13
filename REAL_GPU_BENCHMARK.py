@@ -1086,42 +1086,48 @@ class NeuronLinear(nn.Linear):
 
     M1525: Megatron ea97be889 — Always return two values from linear layer.
     Upstream TELinear.forward() was refactored so it unconditionally returns a
-    (output, bias) tuple regardless of the return_bias constructor argument.
+    (output, bias) tuple regardless of the skip_bias_add constructor argument.
     Callers unpack with ``out, _ = layer(x)`` and never branch on tuple-vs-tensor.
+
+    M1527: Megatron 5b6fb1ecd — Rename return_bias back to skip_bias_add.
+    Parameter renamed upstream in TELinear and all call-sites (attention, mlp).
+    Logic is identical; only the name changes.
 
     20% adaptation: we replicate the same contract for the plain nn.Linear layers
     used in CausalSelfAttention and MLP.  When the layer has a bias and
-    return_bias=True the second element is the bias Parameter; otherwise None.
+    skip_bias_add=True the second element is the bias Parameter; otherwise None.
     A one-time print on first forward exposes the return shape so audits are easy.
 
     鲁迅曾言：世上本无两返，接口统一了，也便有了双值线性层。
+    名不正则言不顺——return_bias 正名为 skip_bias_add，言顺而事成。
     """
 
     def __init__(self, in_features: int, out_features: int,
-                 bias: bool = True, return_bias: bool = False, **kwargs):
+                 bias: bool = True, skip_bias_add: bool = False, **kwargs):
         super().__init__(in_features, out_features, bias=bias, **kwargs)
-        # Mirror ea97be889: te_return_bias = return_bias AND bias exists.
-        # When bias=False but return_bias=True we still return None, avoiding
+        # M1527: skip_bias_add replaces return_bias (rename only, logic identical).
+        # Mirror 5b6fb1ecd: te_return_bias = skip_bias_add AND bias exists.
+        # When bias=False but skip_bias_add=True we still return None, avoiding
         # a zero-length Tensor (the exact problem ea97be889 fixed in TE).
-        self.te_return_bias = return_bias and bias
-        self._m1525_printed = False
+        self.te_return_bias = skip_bias_add and bias
+        self._m1527_printed = False
 
     def forward(self, x):
         out = super().forward(x)
 
         # Always return two values — callers use ``output, _ = layer(x)``.
-        # Mirrors Megatron ea97be889 TELinear.forward() unconditional tuple.
+        # Mirrors Megatron 5b6fb1ecd TELinear.forward() unconditional tuple.
         if self.te_return_bias:
             bias_val = self.bias  # Parameter, not None
         else:
             bias_val = None
 
-        if not self._m1525_printed:
-            print(f"[M1525-NeuronLinear] in={self.in_features} out={self.out_features} "
+        if not self._m1527_printed:
+            print(f"[M1527-NeuronLinear] in={self.in_features} out={self.out_features} "
                   f"te_return_bias={self.te_return_bias} "
                   f"bias_val={'Parameter' if bias_val is not None else 'None'} "
                   f"out_shape={tuple(out.shape)}")
-            self._m1525_printed = True
+            self._m1527_printed = True
 
         return out, bias_val
 
