@@ -901,6 +901,16 @@ class TrainingConfig:
     # instead branches to a stub that raises RuntimeError, preserving the upstream guard logic.
     cross_entropy_fusion_impl: str = 'native'  # 'native' | 'te'
 
+    # M2100: Megatron f37edff1d — Enable fusion for interleaved RoPE
+    # rotary_interleaved=True uses adjacent-pair rotation (d0*cos - d1*sin, d0*sin + d1*cos)
+    # instead of rotate-half (swap two equal halves). Required for LLaMA-style models.
+    # apply_rope_fusion=True + rotary_interleaved=True requires TE >= 2.3.0.dev0;
+    # without TE this falls back to our unfused interleaved torch path (always safe).
+    # 鲁迅曾言：旋转之法有二，世人皆用折半，殊不知还有交错一途，差之毫厘，谬以千里。
+    # 20% DES-LOC adaptation: TransformerConfig.rotary_interleaved check is mirrored here;
+    # TE version guard is omitted (no TE dependency), unfused interleaved path always applies.
+    rotary_interleaved: bool = False  # f37edff1d: use interleaved (adjacent-pair) RoPE rotation
+
     def get_pipeline_config(self) -> Dict:
         """Extract pipeline-parallel configuration (Megatron 31d133bba pattern).
 
@@ -1216,13 +1226,16 @@ class CausalSelfAttention(nn.Module):
                  layer_number: int = 1,
                  apply_query_key_layer_scaling: bool = False,
                  attention_softmax_in_fp32: bool = False,
-                 num_kv_heads: int = None):
+                 num_kv_heads: int = None,
+                 rotary_interleaved: bool = False):
         super().__init__()
         assert n_embd % n_head == 0
         self.n_head = n_head
         self.n_embd = n_embd
         self.head_dim = n_embd // n_head
         self.dropout = dropout
+        # M2100: Megatron f37edff1d — store interleaved flag for RoPE dispatch in forward()
+        self.rotary_interleaved = rotary_interleaved
 
         # M1510: GQA/MQA — num_kv_heads defaults to n_head (standard MHA).
         # When num_kv_heads < n_head, K and V are projected to fewer heads
@@ -1423,20 +1436,49 @@ class CausalSelfAttention(nn.Module):
             # Broadcast to (1, 1, T, head_dim//2) for (B, heads, T, head_dim) tensors
             _cos = _cos.unsqueeze(0).unsqueeze(0)
             _sin = _sin.unsqueeze(0).unsqueeze(0)
-            # Rotate-half: split last dim in two halves, apply [cos, -sin; sin, cos]
-            def _rotate_half(t):
-                h = t.size(-1) // 2
-                return torch.cat([-t[..., h:], t[..., :h]], dim=-1)
-            q = q * _cos + _rotate_half(q) * _sin
-            k = k * _cos + _rotate_half(k) * _sin
+
+            # M2100: Megatron f37edff1d — branch on rotary_interleaved flag.
+            # Interleaved: adjacent pairs (d0, d1) → (d0*cos - d1*sin, d0*sin + d1*cos).
+            # Rotate-half (default): upper half swapped, negated → standard LLaMA-2 style.
+            # Mirrors rope_utils.py apply_rotary_pos_emb interleaved branch and
+            # transformer_engine.py fused_apply_rotary_pos_emb(interleaved=True) path.
+            # 鲁迅曾言：同是旋转，折半者以整体换位，交错者以相邻为偶——
+            #           差一个参数，模型权重便南辕北辙，令人汗颜。
+            # 20% DES-LOC adaptation: unfused torch path replaces TE kernel;
+            # interleaved=True requires freqs to be interleaved (not half-concat), which
+            # we reconstruct by repeating each cos/sin element: [c0,c0,c1,c1,...].
+            if self.rotary_interleaved:
+                # Interleaved: repeat each freq element for adjacent-pair rotation
+                _cos_il = _cos.repeat_interleave(2, dim=-1)  # (1, 1, T, head_dim)
+                _sin_il = _sin.repeat_interleave(2, dim=-1)
+
+                def _rotate_interleaved(t):
+                    # Negate odd indices for the [-d1, d0] part
+                    t_rot = torch.stack([-t[..., 1::2], t[..., 0::2]], dim=-1)
+                    return t_rot.flatten(-2)
+
+                q = q * _cos_il + _rotate_interleaved(q) * _sin_il
+                k = k * _cos_il + _rotate_interleaved(k) * _sin_il
+                _rope_mode = 'interleaved'
+            else:
+                # Rotate-half: split last dim in two halves, apply [cos, -sin; sin, cos]
+                def _rotate_half(t):
+                    h = t.size(-1) // 2
+                    return torch.cat([-t[..., h:], t[..., :h]], dim=-1)
+
+                q = q * _cos + _rotate_half(q) * _sin
+                k = k * _cos + _rotate_half(k) * _sin
+                _rope_mode = 'rotate_half'
+
             if _diag and _s_pre % 50 == 1:
                 with torch.no_grad():
-                    print(f"[M1517-ROPE] rank={_r_pre} step={_s_pre} layer={self.layer_number} "
+                    print(f"[M2100-ROPE] rank={_r_pre} step={_s_pre} layer={self.layer_number} "
+                          f"mode={_rope_mode} rotary_interleaved={self.rotary_interleaved} "
                           f"emb_shape={list(rotary_pos_emb.shape)} "
                           f"cos_shape={list(_cos.shape)} "
                           f"Q_norm_pre={_q_norm_pre:.4f} Q_norm_post={q.float().norm().item():.4f} "
                           f"K_norm_pre={_k_norm_pre:.4f} K_norm_post={k.float().norm().item():.4f} "
-                          f"(M1517: a6c574d4f keyword-arg RoPE applied to Q+K)")
+                          f"(M2100: f37edff1d interleaved-RoPE fusion, unfused torch path)")
 
         s = _SP_CTX['step']
         _r = dist.get_rank() if dist.is_initialized() else 0
