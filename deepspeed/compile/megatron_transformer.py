@@ -865,3 +865,51 @@ print('[M1730] SwitchMLP: gather/scatter no longer dispatched via mpu, bias=None
 # ---------------------------------------------------------------------------
 
 print('[M1880] megatron_transformer: SwitchMLP.forward guard SP/EP for gather/scatter; fix globa_indices typo')
+
+# ---------------------------------------------------------------------------
+# M1900: Megatron d931ba8a4 — Expose rotary base for Code Llama support
+# Source: megatron/core/models/gpt/gpt_model.py
+# Author: NVIDIA  Date: 2023-xx-xx
+#
+# Mapping: megatron/core/models/gpt/gpt_model.py → deepspeed/compile/megatron_transformer.py
+#
+# Upstream changes ported (GPTModel side, 4 lines):
+#
+#   1. GPTModel.__init__ — new `rotary_base: int = 10000` parameter:
+#        OLD: __init__(self, ..., rotary_percent=1.0, seq_len_interpolation_factor=None)
+#        NEW: __init__(self, ..., rotary_percent=1.0, rotary_base=10000,
+#                      seq_len_interpolation_factor=None)
+#      Inserted between rotary_percent and seq_len_interpolation_factor, matching
+#      upstream ordering.
+#
+#   2. RotaryEmbedding call site switched to full keyword-argument form and
+#      now passes rotary_base through:
+#        OLD: RotaryEmbedding(self.config.kv_channels, rotary_percent,
+#                             seq_len_interpolation_factor)
+#        NEW: RotaryEmbedding(kv_channels=self.config.kv_channels,
+#                             rotary_percent=rotary_percent,
+#                             seq_len_interpolation_factor=seq_len_interpolation_factor,
+#                             rotary_base=rotary_base)
+#
+# 20% DES-LOC adaptation (code-constants only; no live class here):
+#   - Canonical call-site template below for use in future GPTModel port.
+#   - 鲁迅曾言：世上本无底数，用10000的人多了，也便成了惯例；
+#     Code Llama一出，百万底数横空，惯例遂成笑谈。
+# ---------------------------------------------------------------------------
+
+# M1900: canonical GPTModel.rotary_pos_emb instantiation template (keyword form).
+# Copy-paste into any future GPTModel port in this project.
+_M1900_ROTARY_CALL_TEMPLATE = """\
+# M1900: rotary_base exposed — default 10000; set to 1000000 for Code Llama.
+if self.position_embedding_type == 'rope':
+    self.rotary_pos_emb = RotaryEmbedding(
+        kv_channels=self.config.kv_channels,
+        rotary_percent=rotary_percent,
+        seq_len_interpolation_factor=seq_len_interpolation_factor,
+        rotary_base=rotary_base,
+    )
+"""
+
+print('[M1900] megatron_transformer: GPTModel.rotary_base param template recorded; '
+      'see megatron_rotary_pos_embedding.py for live RotaryEmbedding change')
+

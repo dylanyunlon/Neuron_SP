@@ -50,6 +50,31 @@
 #   - seq_len_interpolation_factor stored and used in forward (upstream behaviour).
 #   - 鲁迅曾言：世上本无旋转，维度乘以百分比的人多了，也便有了rotary_percent。
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# M1900: Megatron d931ba8a4 — Expose rotary base for Code Llama support
+# Source: megatron/core/models/common/embeddings/rotary_pos_embedding.py
+#         megatron/core/models/gpt/gpt_model.py
+# Author: NVIDIA  Date: 2023-xx-xx
+#
+# Upstream changes ported (2 files, 6 lines changed):
+#
+#   1. RotaryEmbedding.__init__ — new `rotary_base: int = 10000` parameter:
+#        OLD: __init__(self, kv_channels, rotary_percent, seq_len_interpolation_factor=None)
+#        NEW: __init__(self, kv_channels, rotary_percent,
+#                      seq_len_interpolation_factor=None, rotary_base=10000)
+#      inv_freq denominator now uses `rotary_base` instead of the hard-coded
+#      literal 10000, enabling Code Llama's 1 000 000 base without monkey-patching.
+#
+#   2. GPTModel.__init__ — new `rotary_base: int = 10000` parameter forwarded
+#      through to RotaryEmbedding via keyword args (also switches call site to
+#      fully keyword-argument form for clarity and forward-compatibility).
+#
+# 20% DES-LOC adaptation:
+#   - __init__ prints rotary_base so every run confirms the correct base is live.
+#   - inv_freq line uses rotary_base variable (not literal) matching upstream exactly.
+#   - 鲁迅曾言：世上本无底数，用10000的人多了，也便成了惯例；Code Llama一出，
+#     百万底数横空，惯例遂成笑谈。
+# ---------------------------------------------------------------------------
 
 import importlib.util
 import torch
@@ -60,7 +85,8 @@ __all__ = ['RotaryEmbedding', 'apply_rotary_pos_emb']
 
 
 class RotaryEmbedding(nn.Module):
-    def __init__(self, kv_channels, rotary_percent, seq_len_interpolation_factor=None):
+    def __init__(self, kv_channels, rotary_percent, seq_len_interpolation_factor=None,
+                 rotary_base: int = 10000):
         super().__init__()
 
         # M1850: dim computed here from kv_channels × rotary_percent (was caller's job).
@@ -70,7 +96,8 @@ class RotaryEmbedding(nn.Module):
             dim = int(dim * rotary_percent)
 
         self.seq_len_interpolation_factor = seq_len_interpolation_factor
-        inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2).float() / dim))
+        # M1900: use rotary_base instead of hard-coded 10000 (enables Code Llama 1e6 base).
+        inv_freq = 1.0 / (rotary_base ** (torch.arange(0, dim, 2).float() / dim))
         self.register_buffer('inv_freq', inv_freq)
         if importlib.util.find_spec('einops') is None:
             raise RuntimeError("einops is required for Rotary Embedding")
@@ -79,6 +106,9 @@ class RotaryEmbedding(nn.Module):
               f"rotary_percent={rotary_percent} effective_dim={dim} "
               f"seq_len_interpolation_factor={seq_len_interpolation_factor} "
               f"(Megatron 7314fe221: dim computation moved into __init__)")
+        # M1900: rotary_base diagnostic — confirms non-default base (e.g. 1000000 for Code Llama).
+        print(f"[M1900-RotaryEmbedding-INIT] rotary_base={rotary_base} "
+              f"(Megatron d931ba8a4: expose rotary_base; Code Llama uses 1000000)")
 
     def forward(self, max_seq_len, offset=0):
         seq = torch.arange(max_seq_len, device=self.inv_freq.device) + offset
@@ -160,3 +190,4 @@ def apply_rotary_pos_emb(t, freqs):
 
 print('[M1333]')
 print('[M1850]')
+print('[M1900]')
