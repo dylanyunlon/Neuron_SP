@@ -254,7 +254,7 @@ class CudaRNGStatesTracker:
     every set_states() and fork() to surface corruption early.
     """
 
-    def __init__(self):
+    def __init__(self, is_inference_rng_tracker=False):
         # DES-LOC M158: tracked
         # Map from a string name to the cuda rng state.
         self.states_ = {}
@@ -262,6 +262,11 @@ class CudaRNGStatesTracker:
         self.seeds_ = set()
         # M453: expected numel for Knuth invariant; set on first add().
         self._expected_state_numel = None
+        # M2080: Megatron cabbf74e9 — inference mode flag so CudaGraphManager
+        # can branch on is_inference_rng_tracker without isinstance checks.
+        # 鲁迅: 推理时的随机数，是不需要被训练驯服的；给它一个身份证，才能放行。
+        self.is_inference_rng_tracker = is_inference_rng_tracker
+        print(f'[M2080-RNG] CudaRNGStatesTracker.__init__ is_inference_rng_tracker={is_inference_rng_tracker}')
 
     def reset(self):
         # DES-LOC M158: tracked

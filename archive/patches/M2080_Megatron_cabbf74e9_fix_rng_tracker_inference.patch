@@ -1,0 +1,19 @@
+# M2080 — Megatron-LM commit cabbf74e9: Fix RNG tracker for inference
+# Source: NVIDIA/Megatron-LM@cabbf74e9
+# Date: 2026-06-13
+#
+# Megatron diff adds is_inference_rng_tracker flag to:
+#   1. CudaRNGStatesTracker.__init__    (random.py)
+#   2. TECudaRNGStatesTracker.__init__  (transformer_engine.py)
+#   3. initialize_rng_tracker()         (random.py) — tracker_kwargs refactor
+#   4. CudaGraphManager assertion       (cuda_graphs.py)
+#
+# NSP adaptation (20% DES-LOC):
+#   - deepspeed/runtime/activation_checkpointing/checkpointing.py
+#     CudaRNGStatesTracker.__init__ gets is_inference_rng_tracker=False
+#     + print diagnostic [M2080-RNG]
+#
+# NSP does not have TECudaRNGStatesTracker / initialize_rng_tracker /
+# CudaGraphManager — those are TE/Megatron-only paths not present in NSP.
+#
+# 鲁迅注: 推理时的随机数，是不需要被训练驯服的；给它一个身份证，才能放行。
