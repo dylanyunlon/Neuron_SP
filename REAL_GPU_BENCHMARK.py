@@ -240,6 +240,20 @@ def _neuronsp_add_network_size_args(parser):
                             'None means standard MHA. '
                             '1 means MQA. k<num_attention_heads means GQA. '
                             'Must divide num_attention_heads evenly.')
+    # M1513: Megatron 6902465a8 — group query attention with tensor-parallel partitioning.
+    # Adds --group_query_attention flag + --num_query_groups count (distinct from M1510's
+    # --num_kv_heads). The key 6902465a8 contribution is the query_groups_divide_flag:
+    # when num_query_groups >= world_size, groups are evenly partitioned per TP rank;
+    # when num_query_groups < world_size, each rank independently selects its KV shard
+    # via rank % num_query_groups. 20% adaptation: underscore naming, print diagnostics.
+    # 鲁迅曾言：世上本无分组，query多了，也便有了group query attention。
+    group.add_argument('--group_query_attention', action='store_true',
+                       help='Use group-query attention (Megatron 6902465a8).')
+    group.add_argument('--num_query_groups', type=int, default=1,
+                       help='Number of KV head groups for GQA (Megatron 6902465a8). '
+                            '1=MQA-equivalent, k=GQA with k groups. '
+                            'n_head must be divisible by num_query_groups.')
+    print('[NEURONSP-ARGS] M1513: group_query_attention + num_query_groups registered')
     group.add_argument('--max_position_embeddings', type=int, default=1024,
                        help='Maximum number of position embeddings to use. '
                        'This is the size of position embedding.')
@@ -743,6 +757,17 @@ class TrainingConfig:
     use_swiglu: bool = False
     add_bias_linear: bool = False
 
+    # M1513: Megatron 6902465a8 — group query attention (GQA) with TP-aware KV partitioning.
+    # group_query_attention=True activates the 6902465a8 GQA path in CausalSelfAttention.
+    # num_query_groups controls KV group count; the query_groups_divide_flag in
+    # CausalSelfAttention.__init__ selects between partitioned (groups>=world_size)
+    # and rank-modulo (groups<world_size) KV selection at each TP rank.
+    # 20% adaptation: exposed as top-level TrainingConfig fields so sweep scripts
+    # can vary GQA configuration without touching model-level args directly.
+    # 鲁迅曾言：世上本无partition，tensor parallel多了，也便有了query_groups_divide_flag。
+    group_query_attention: bool = False   # enable 6902465a8 GQA path
+    num_query_groups: int = 1             # number of KV groups (1=MQA-like, >1=GQA)
+
     # M1445: Megatron 13c96dc08 — Partial Activation Checkpointing
     # Instead of checkpointing ALL micro-batches uniformly, checkpoint only
     # a subset within each pipeline window. Micro-batches with IDs below this
@@ -885,14 +910,18 @@ class TrainingConfig:
             'attention_softmax_in_fp32': self.attention_softmax_in_fp32,
             'max_seq_len': self.max_seq_len,
             'vocab_size': self.vocab_size,
+            # M1513: Megatron 6902465a8 — GQA config fields
+            'group_query_attention': self.group_query_attention,
+            'num_query_groups': self.num_query_groups,
         }
         print(f"[M1448-XFORMCFG] transformer config: "
               f"layers={xformer_cfg['num_layers']} "
               f"hidden={xformer_cfg['hidden_size']} "
               f"heads={xformer_cfg['num_attention_heads']} "
-              f"ac={xformer_cfg['use_activation_checkpointing']}")
+              f"ac={xformer_cfg['use_activation_checkpointing']} "
+              f"gqa={self.group_query_attention} num_query_groups={self.num_query_groups}")
         return xformer_cfg
-    
+
     def get_model_config(self) -> Dict:
         """Get model configuration based on size."""
         configs = {
@@ -1102,6 +1131,37 @@ class CausalSelfAttention(nn.Module):
         # multi_query flag: True for both MQA (num_kv_heads=1) and GQA (num_kv_heads<n_head)
         self.multi_query_attention = self.num_kv_heads < self.n_head
 
+        # ==========================================================================
+        # M1513: Megatron 6902465a8 — group query attention with TP-aware partitioning
+        # ==========================================================================
+        # Key innovation over M1510: the query_groups_divide_flag determines KV layout.
+        # When num_query_groups >= world_size: each TP rank gets its own shard of KV heads
+        #   (num_query_groups_per_partition = num_query_groups // world_size).
+        # When num_query_groups < world_size: KV is NOT split — each rank independently
+        #   picks its KV shard via rank % num_query_groups (6902465a8 key_list[i] pattern).
+        #
+        # 20% adaptation: world_size from dist (not mpu); separate self.query + self.key_value
+        # projections mirror Megatron's ColumnParallelLinear + get_linear_layer split;
+        # diagnostic prints expose the divide_flag and partition count per rank.
+        # 鲁迅曾言：世上本无分区，query group多了，也便有了tensor-parallel KV分组。
+        self.group_query_attention = (num_kv_heads is not None and num_kv_heads < n_head)
+        self.num_query_groups = self.num_kv_heads  # alias: groups = num_kv_heads in our model
+        _world_size = get_model_parallel_world_size()
+        _rank = get_model_parallel_rank()
+        # query_groups_divide_flag: True if groups >= world_size (can partition evenly)
+        self.query_groups_divide_flag = self.num_query_groups >= _world_size
+        if self.query_groups_divide_flag:
+            # Each rank handles num_query_groups // world_size groups
+            self.num_query_groups_per_partition = max(1, self.num_query_groups // _world_size)
+        else:
+            # Fewer groups than ranks: each rank gets 1 KV group (selected by rank)
+            self.num_query_groups_per_partition = 1
+        print(f"[M1513-GQA-INIT] layer={layer_number} n_head={n_head} "
+              f"num_query_groups={self.num_query_groups} world_size={_world_size} "
+              f"rank={_rank} divide_flag={self.query_groups_divide_flag} "
+              f"groups_per_partition={self.num_query_groups_per_partition} "
+              f"kv_param_ratio={self.num_query_groups/max(n_head,1):.3f}")
+
         # M458: Megatron 691747b1 — per-layer QK scaling + fp32 softmax
         # apply_query_key_layer_scaling multiplies Q*K^T by 1/layer_number on top of
         # the standard 1/sqrt(head_dim), deepening numerical stability in deep stacks.
@@ -1149,11 +1209,36 @@ class CausalSelfAttention(nn.Module):
             q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2)          # [B, n_head, T, head_dim]
             k = k.view(B, T, self.num_kv_heads, self.head_dim).transpose(1, 2)    # [B, num_kv_heads, T, head_dim]
             v = v.view(B, T, self.num_kv_heads, self.head_dim).transpose(1, 2)    # [B, num_kv_heads, T, head_dim]
-            # Expand K/V to match Q heads: each KV head serves kv_groups Q heads
-            # repeat_interleave preserves head ordering (group-consecutive), matching
-            # how Megatron's CoreAttention receives a squeezed KV then broadcasts via bmm.
-            k = k.repeat_interleave(self.kv_groups, dim=1)   # [B, n_head, T, head_dim]
-            v = v.repeat_interleave(self.kv_groups, dim=1)   # [B, n_head, T, head_dim]
+
+            # M1513: Megatron 6902465a8 — TP-aware KV shard selection.
+            # query_groups_divide_flag=True: groups >= world_size, each rank gets its shard
+            #   → slice out groups_per_partition KV heads from the full projection.
+            # query_groups_divide_flag=False: fewer groups than ranks, each rank picks
+            #   KV head at index rank % num_query_groups (6902465a8 key_list[i] pattern).
+            # After selection, repeat_interleave expands the local KV shard to serve
+            # this rank's Q heads — matching Megatron CoreAttention bmm broadcast.
+            # 20% adaptation: uses dist.get_rank() instead of mpu.get_tensor_model_parallel_rank().
+            _cur_rank = get_model_parallel_rank()
+            if not self.query_groups_divide_flag:
+                # Fewer groups than ranks: rank selects its KV group (6902465a8 key_list[i])
+                _kv_idx = _cur_rank % self.num_query_groups
+                k = k[:, _kv_idx:_kv_idx+1, :, :]   # [B, 1, T, head_dim]
+                v = v[:, _kv_idx:_kv_idx+1, :, :]
+                print(f"[M1513-PARTITION] rank={_cur_rank} divide_flag=False "
+                      f"kv_idx={_kv_idx} (rank%{self.num_query_groups})")
+            else:
+                # Groups >= ranks: slice this rank's contiguous shard of KV heads
+                _gpp = self.num_query_groups_per_partition
+                _kv_start = _cur_rank * _gpp
+                k = k[:, _kv_start:_kv_start+_gpp, :, :]   # [B, groups_per_partition, T, head_dim]
+                v = v[:, _kv_start:_kv_start+_gpp, :, :]
+                print(f"[M1513-PARTITION] rank={_cur_rank} divide_flag=True "
+                      f"kv_start={_kv_start} gpp={_gpp}")
+
+            # Expand K/V to match local Q heads: each KV head serves kv_groups Q heads
+            # repeat_interleave preserves group-consecutive ordering (Megatron convention).
+            k = k.repeat_interleave(self.kv_groups, dim=1)   # [B, n_head or local_q_heads, T, head_dim]
+            v = v.repeat_interleave(self.kv_groups, dim=1)
         else:
             qkv = self.c_attn(x)
             q, k, v = qkv.split(self.n_embd, dim=2)
@@ -1164,14 +1249,16 @@ class CausalSelfAttention(nn.Module):
         s = _SP_CTX['step']
         _r = dist.get_rank() if dist.is_initialized() else 0
 
-        # M1510: GQA/MQA diagnostic — log KV expansion info once per 50 steps
+        # M1510/M1513: GQA diagnostic — log KV expansion info once per 50 steps
         if _diag and s % 50 == 1 and self.num_kv_heads < self.n_head:
             with torch.no_grad():
                 print(f"[ATTN-GQA] rank={_r} step={s} layer={self.layer_number} "
                       f"n_head={self.n_head} num_kv_heads={self.num_kv_heads} "
-                      f"groups={self.num_kv_groups} "
+                      f"kv_groups={self.kv_groups} "
+                      f"num_query_groups_per_partition={self.num_query_groups_per_partition} "
+                      f"divide_flag={self.query_groups_divide_flag} "
                       f"Q={list(q.shape)} K={list(k.shape)} V={list(v.shape)} "
-                      f"(after repeat_interleave KV expansion)")
+                      f"(M1513: 6902465a8 GQA TP-aware partitioning)")
 
         # M458: QK scale diagnostic — log effective scale once per 50 steps so we
         # can verify per-layer attenuation is actually different across layers.
@@ -1553,20 +1640,43 @@ class GPT(nn.Module):
                  attention_softmax_in_fp32: bool = False,
                  num_unique_layers: int = None,
                  param_sharing_style: str = 'grouped',
-                 num_kv_heads: int = None):
+                 num_kv_heads: int = None,
+                 group_query_attention: bool = False,
+                 num_query_groups: int = 1):
         super().__init__()
         self.max_seq_len = max_seq_len
         # M458: if QK layer scaling is on, fp32 softmax is auto-implied (Megatron 691747b1)
         _softmax_fp32 = attention_softmax_in_fp32 or apply_query_key_layer_scaling
         # M1510: resolve num_kv_heads — None → MHA (num_kv_heads == n_head)
         _num_kv_heads = num_kv_heads  # None is fine; CausalSelfAttention defaults to MHA
+
+        # M1513: Megatron 6902465a8 — if group_query_attention is set, use num_query_groups
+        # as the effective num_kv_heads. This maps the 6902465a8 parameter naming
+        # (--group-query-attention + --num-query-groups) onto the M1510 infrastructure.
+        # When both are set, group_query_attention takes precedence (explicit beats implicit).
+        # 20% adaptation: merge both parameter schemes into one unified resolution path,
+        # printing which scheme is active for audit traceability.
+        if group_query_attention and num_query_groups > 0 and num_query_groups < n_head:
+            _num_kv_heads = num_query_groups
+            print(f"[M1513-GPT] group_query_attention=True → num_kv_heads={_num_kv_heads} "
+                  f"(from num_query_groups={num_query_groups}, Megatron 6902465a8)")
+        elif group_query_attention and num_query_groups == 1:
+            # num_query_groups=1 with GQA flag = MQA
+            _num_kv_heads = 1
+            print(f"[M1513-GPT] group_query_attention=True num_query_groups=1 → MQA path "
+                  f"num_kv_heads=1 (Megatron 6902465a8)")
+        elif group_query_attention:
+            print(f"[M1513-GPT] group_query_attention=True but num_query_groups={num_query_groups} "
+                  f">= n_head={n_head} — treating as MHA (no KV compression)")
+
         _kv_mode = ('MQA' if _num_kv_heads == 1 else
                     f'GQA({_num_kv_heads}kv)' if (_num_kv_heads is not None and _num_kv_heads < n_head)
                     else 'MHA')
         print('[M249]')
         print(f"[GPT-INIT] n_layer={n_layer} apply_qk_layer_scaling={apply_query_key_layer_scaling} "
               f"attention_softmax_in_fp32={_softmax_fp32} "
-              f"n_head={n_head} num_kv_heads={_num_kv_heads} kv_mode={_kv_mode}")
+              f"n_head={n_head} num_kv_heads={_num_kv_heads} kv_mode={_kv_mode} "
+              f"group_query_attention={group_query_attention} num_query_groups={num_query_groups}")
 
         # M249: parameter sharing — track num_unique_layers and sharing style
         # Port of Megatron 80f90dcdc (added parameters sharing).
@@ -4160,6 +4270,9 @@ class Trainer:
             # M458: Megatron 691747b1 per-layer QK scaling + fp32 softmax
             apply_query_key_layer_scaling=getattr(config, 'apply_query_key_layer_scaling', False),
             attention_softmax_in_fp32=getattr(config, 'attention_softmax_in_fp32', False),
+            # M1513: Megatron 6902465a8 — group query attention with TP-aware KV partitioning
+            group_query_attention=getattr(config, 'group_query_attention', False),
+            num_query_groups=getattr(config, 'num_query_groups', 1),
             **model_config
         )
 
