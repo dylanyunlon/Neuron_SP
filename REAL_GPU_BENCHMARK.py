@@ -893,6 +893,14 @@ class TrainingConfig:
     init_method_std: float = 0.02          # std for normal init (Megatron default; was hardcoded)
     init_method_xavier_uniform: bool = False  # use xavier_uniform instead of normal (ViT default)
 
+    # M2070: Megatron 0f60adbd3 — parallel cross entropy option (model_parallel_config.py)
+    # If 'native', NeuronSP in-place CE (57064fd6f) is used.
+    # If 'te', TE-style parallel_cross_entropy kernel path is used (requires TE present).
+    # 鲁迅曾言：凡以"原生"自称者，皆习以为常之人；能择"并行"者，方是有备而来之客。
+    # 20% DES-LOC adaptation: 'te' path skips TE import (single-GPU benchmark has no TP group),
+    # instead branches to a stub that raises RuntimeError, preserving the upstream guard logic.
+    cross_entropy_fusion_impl: str = 'native'  # 'native' | 'te'
+
     def get_pipeline_config(self) -> Dict:
         """Extract pipeline-parallel configuration (Megatron 31d133bba pattern).
 
@@ -1802,6 +1810,48 @@ def _neuronsp_cross_entropy_memory_opt(
     return mean_loss
 
 
+# =============================================================================
+# NEURON_SP PORT: Megatron 0f60adbd3 — Add option for parallel cross entropy
+# Adapted from megatron/core/extensions/transformer_engine.py te_parallel_cross_entropy.
+#
+# Upstream: imports parallel_cross_entropy from transformer_engine.pytorch.cross_entropy,
+#   wraps it with (logits, labels, 0.0, False, get_tensor_model_parallel_group(...)).
+#   labels are re-strided to (S, B) column-major before the call.
+#
+# 20% DES-LOC adaptation: NeuronSP is single-GPU; no TP group exists.
+#   'te' path raises RuntimeError (same guard as upstream "TE not present").
+#   'native' path delegates to the existing in-place CE (57064fd6f).
+#   print diagnostics fire every 50 steps on the 'te' selection attempt.
+# 鲁迅曾言：那并行的熵，本是众人联手才能计算的——独行客硬要借用，碰壁方知路径之误。
+# =============================================================================
+
+def _neuronsp_te_parallel_cross_entropy(
+    logits: torch.Tensor,   # [B*T, V] — flattened, NOT in-place safe
+    targets: torch.Tensor,  # [B*T]    — integer target indices
+    step: int = 0,
+    rank: int = 0,
+) -> torch.Tensor:
+    """Stub for TE parallel_cross_entropy path (Megatron 0f60adbd3).
+
+    Upstream te_parallel_cross_entropy requires a tensor-model-parallel group from
+    TE's parallel_cross_entropy kernel. NeuronSP runs single-GPU; the TP group is
+    never initialised, so this path always raises RuntimeError — matching the upstream
+    guard: 'Trying to use a TE block when it's not present.'
+    """
+    # Diagnostic: log the attempt so sweep logs reveal mis-configuration early.
+    if step % 50 == 1:
+        _msg = (f"[CE-M2070-TE] rank={rank} step={step} "
+                f"ATTEMPTED te_parallel_cross_entropy path — "
+                f"logits={tuple(logits.shape)} targets={tuple(targets.shape)} "
+                f"(0f60adbd3: requires TP group, unavailable in single-GPU NeuronSP)")
+        print(_msg)
+    raise RuntimeError(
+        "[M2070] cross_entropy_fusion_impl='te' requires transformer_engine "
+        "parallel_cross_entropy + initialised TP group. "
+        "NeuronSP is single-GPU — use cross_entropy_fusion_impl='native'."
+    )
+
+
 def _neuronsp_vocab_size_with_padding(num_tokens: int,
                                       divisible_by: int = NEURONSP_VOCAB_DIVISIBLE_BY,
                                       world_size: int = 1) -> int:
@@ -1838,7 +1888,8 @@ class GPT(nn.Module):
                  embedding_weights_in_fp32: bool = False,
                  share_embeddings_and_output_weights: bool = False,
                  init_method_std: float = 0.02,
-                 init_method_xavier_uniform: bool = False):
+                 init_method_xavier_uniform: bool = False,
+                 cross_entropy_fusion_impl: str = 'native'):
         super().__init__()
         # M1532: Megatron 305b3901a — store init params from config instead of hardcoding
         # 鲁迅曾言：不从config读参数的初始化，不过是写死的谎言。
@@ -1866,6 +1917,12 @@ class GPT(nn.Module):
         # bdd554731 decouples them by default: share_embeddings_and_output_weights=False means
         # output_layer gets its own independent weight, only tied when explicitly requested.
         self.share_embeddings_and_output_weights = share_embeddings_and_output_weights
+        # M2070: Megatron 0f60adbd3 — parallel cross entropy option
+        # 鲁迅曾言：选择之前，须先知路在何方——'native'是熟路，'te'是险途，单卡者勿往。
+        self.cross_entropy_fusion_impl = cross_entropy_fusion_impl
+        print(f"[M2070-GPT-INIT] cross_entropy_fusion_impl={cross_entropy_fusion_impl!r} "
+              f"(Megatron 0f60adbd3: 'native'=in-place CE 57064fd6f, "
+              f"'te'=TE parallel_cross_entropy stub [raises on single-GPU])")
         # Track params_dtype so forward() can cast back correctly (mirrors Megatron language_model.py)
         self._params_dtype = torch.float32  # default; may be overridden by mixed-precision context
         print(f"[M1541-GPT-INIT] embedding_weights_in_fp32={embedding_weights_in_fp32} "
@@ -2074,62 +2131,76 @@ class GPT(nn.Module):
         logits = self.lm_head(x)
         loss = None
         if targets is not None:
-            # M461 (57064fd): CE memory opt — no full logits clone; in-place max-sub
-            # then in-place exp after scalar predicted-logit is extracted.
-            # Megatron 57064fd key sequence:
-            #   1. max in-place (no clone) → subtract → extract predicted logit (clone+contiguous)
-            #   2. torch.exp(..., out=logits) reuses logits storage for exp — O(0) extra alloc
-            #   3. loss = log(sum_exp) − predicted_logit
-            # Knuth §2.3: "The real problem is that programmers have spent far too much
-            # time worrying about efficiency in the wrong places." — here the clone was
-            # exactly in the wrong place: O(B*T*V) before a O(B*T) extraction.
-            _logits_flat = logits.view(-1, logits.size(-1))   # [B*T, V]; no copy
-            _targets_flat = targets.view(-1)                  # [B*T]
+            # M2070: Megatron 0f60adbd3 — branch on cross_entropy_fusion_impl
+            # 'native': in-place CE (57064fd6f) — NeuronSP default, single-GPU safe.
+            # 'te':     TE parallel_cross_entropy stub — raises RuntimeError on single-GPU
+            #           (mirrors upstream guard: "Trying to use a TE block when it's not present.")
+            # 鲁迅曾言：殊途或同归，然'te'之路单卡不通——知路者，方不误入歧途。
+            if s % 50 == 1:
+                print(f"[CE-M2070] rank={_r} step={s} "
+                      f"cross_entropy_fusion_impl={self.cross_entropy_fusion_impl!r} "
+                      f"(Megatron 0f60adbd3: native=in-place-57064fd6f, te=TE-stub)")
+            if self.cross_entropy_fusion_impl == 'te':
+                _logits_flat = logits.view(-1, logits.size(-1))   # [B*T, V]
+                _targets_flat = targets.view(-1)                  # [B*T]
+                loss = _neuronsp_te_parallel_cross_entropy(_logits_flat, _targets_flat, s, _r)
+            else:
+                # M461 (57064fd): CE memory opt — no full logits clone; in-place max-sub
+                # then in-place exp after scalar predicted-logit is extracted.
+                # Megatron 57064fd key sequence:
+                #   1. max in-place (no clone) → subtract → extract predicted logit (clone+contiguous)
+                #   2. torch.exp(..., out=logits) reuses logits storage for exp — O(0) extra alloc
+                #   3. loss = log(sum_exp) − predicted_logit
+                # Knuth §2.3: "The real problem is that programmers have spent far too much
+                # time worrying about efficiency in the wrong places." — here the clone was
+                # exactly in the wrong place: O(B*T*V) before a O(B*T) extraction.
+                _logits_flat = logits.view(-1, logits.size(-1))   # [B*T, V]; no copy
+                _targets_flat = targets.view(-1)                  # [B*T]
 
-            # Step 1: max-subtract in-place (57064fd: skip clone, operate directly)
-            with torch.no_grad():
-                _logit_max = _logits_flat.max(dim=-1)[0]      # [B*T]
-                _logit_max_global = _logit_max.max().item()
-                _logit_min_global = _logit_max.min().item()
-                # M461 DIAG: logit range — detect explosion (57064fd threshold: >50)
-                if s % 50 == 1:
-                    print(f"[CE-M461] rank={_r} step={s} "
-                          f"logit_max={_logit_max_global:.4f} "
-                          f"logit_min_of_max={_logit_min_global:.4f} "
-                          f"range={_logit_max_global - _logit_min_global:.4f} "
-                          f"vocab={logits.size(-1)} "
-                          f"n_tokens={_targets_flat.numel()} "
-                          f"opt=no_clone+inplace_exp")
-                if _logit_max_global > 50.0:
-                    print(f"[CE-WARN-M461] rank={_r} step={s} "
-                          f"LOGIT EXPLOSION: max={_logit_max_global:.2f} "
-                          f"(threshold=50). Stale params may be causing drift.")
-            _logits_flat.sub_(_logit_max.unsqueeze(dim=-1))   # in-place; 57064fd line
+                # Step 1: max-subtract in-place (57064fd: skip clone, operate directly)
+                with torch.no_grad():
+                    _logit_max = _logits_flat.max(dim=-1)[0]      # [B*T]
+                    _logit_max_global = _logit_max.max().item()
+                    _logit_min_global = _logit_max.min().item()
+                    # M461 DIAG: logit range — detect explosion (57064fd threshold: >50)
+                    if s % 50 == 1:
+                        print(f"[CE-M461] rank={_r} step={s} "
+                              f"logit_max={_logit_max_global:.4f} "
+                              f"logit_min_of_max={_logit_min_global:.4f} "
+                              f"range={_logit_max_global - _logit_min_global:.4f} "
+                              f"vocab={logits.size(-1)} "
+                              f"n_tokens={_targets_flat.numel()} "
+                              f"opt=no_clone+inplace_exp")
+                    if _logit_max_global > 50.0:
+                        print(f"[CE-WARN-M461] rank={_r} step={s} "
+                              f"LOGIT EXPLOSION: max={_logit_max_global:.2f} "
+                              f"(threshold=50). Stale params may be causing drift.")
+                _logits_flat.sub_(_logit_max.unsqueeze(dim=-1))   # in-place; 57064fd line
 
-            # Step 2: extract predicted logit BEFORE exp (critical: clone+contiguous
-            # — advanced-index shares storage with _logits_flat; in-place exp below
-            # would corrupt the slice without this.  57064fd: predicted_logits_1d.clone())
-            _arange = torch.arange(_logits_flat.size(0), device=_logits_flat.device)
-            _pred_logit = _logits_flat[_arange, _targets_flat].clone().contiguous()  # [B*T]
+                # Step 2: extract predicted logit BEFORE exp (critical: clone+contiguous
+                # — advanced-index shares storage with _logits_flat; in-place exp below
+                # would corrupt the slice without this.  57064fd: predicted_logits_1d.clone())
+                _arange = torch.arange(_logits_flat.size(0), device=_logits_flat.device)
+                _pred_logit = _logits_flat[_arange, _targets_flat].clone().contiguous()  # [B*T]
 
-            # Step 3: in-place exp — reuses _logits_flat storage (57064fd: out=exp_logits)
-            torch.exp(_logits_flat, out=_logits_flat)
-            _sum_exp = _logits_flat.sum(dim=-1)               # [B*T]
+                # Step 3: in-place exp — reuses _logits_flat storage (57064fd: out=exp_logits)
+                torch.exp(_logits_flat, out=_logits_flat)
+                _sum_exp = _logits_flat.sum(dim=-1)               # [B*T]
 
-            # Step 4: loss = log(Σexp) − predicted_logit
-            loss = torch.log(_sum_exp) - _pred_logit          # [B*T]
-            loss = loss.mean()
-            # M364: With Ulysses A2A each SP rank sees its local token subset.
-            # Gradients sync via DES-LOC AllReduce — do NOT all_reduce loss here.
+                # Step 4: loss = log(Σexp) − predicted_logit
+                loss = torch.log(_sum_exp) - _pred_logit          # [B*T]
+                loss = loss.mean()
+                # M364: With Ulysses A2A each SP rank sees its local token subset.
+                # Gradients sync via DES-LOC AllReduce — do NOT all_reduce loss here.
 
-            # M461 DIAG: full loss decomposition on ALL ranks
-            if _diag and s % 50 == 1:
-                _diag.log_loss_decomp(s, _r, loss, logits, targets, _SP_CTX['on'])
-                print(f"[FWD-LOSS-M461] rank={_r} step={s} loss={loss.item():.6f} "
-                      f"sum_exp_mean={_sum_exp.float().mean().item():.4f} "
-                      f"pred_logit_mean={_pred_logit.float().mean().item():.6f} "
-                      f"sp={'local' if _SP_CTX['on'] else 'full'} "
-                      f"n_tokens={targets.numel()}")
+                # M461 DIAG: full loss decomposition on ALL ranks
+                if _diag and s % 50 == 1:
+                    _diag.log_loss_decomp(s, _r, loss, logits, targets, _SP_CTX['on'])
+                    print(f"[FWD-LOSS-M461] rank={_r} step={s} loss={loss.item():.6f} "
+                          f"sum_exp_mean={_sum_exp.float().mean().item():.4f} "
+                          f"pred_logit_mean={_pred_logit.float().mean().item():.6f} "
+                          f"sp={'local' if _SP_CTX['on'] else 'full'} "
+                          f"n_tokens={targets.numel()}")
         return logits, loss
 
 
@@ -4576,6 +4647,8 @@ class Trainer:
             # M1532: Megatron 305b3901a — pass init_method config instead of hardcoded 0.02
             init_method_std=getattr(config, 'init_method_std', 0.02),
             init_method_xavier_uniform=getattr(config, 'init_method_xavier_uniform', False),
+            # M2070: Megatron 0f60adbd3 — parallel cross entropy option
+            cross_entropy_fusion_impl=getattr(config, 'cross_entropy_fusion_impl', 'native'),
             **model_config
         )
 
