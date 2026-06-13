@@ -1081,6 +1081,51 @@ def _ulysses_a2a(t, scatter_idx, gather_idx, grp):
     return _UlyssesA2A.apply(t, scatter_idx, gather_idx, grp)
 
 
+class NeuronLinear(nn.Linear):
+    """Drop-in nn.Linear wrapper whose forward always returns (output, bias_or_None).
+
+    M1525: Megatron ea97be889 — Always return two values from linear layer.
+    Upstream TELinear.forward() was refactored so it unconditionally returns a
+    (output, bias) tuple regardless of the return_bias constructor argument.
+    Callers unpack with ``out, _ = layer(x)`` and never branch on tuple-vs-tensor.
+
+    20% adaptation: we replicate the same contract for the plain nn.Linear layers
+    used in CausalSelfAttention and MLP.  When the layer has a bias and
+    return_bias=True the second element is the bias Parameter; otherwise None.
+    A one-time print on first forward exposes the return shape so audits are easy.
+
+    鲁迅曾言：世上本无两返，接口统一了，也便有了双值线性层。
+    """
+
+    def __init__(self, in_features: int, out_features: int,
+                 bias: bool = True, return_bias: bool = False, **kwargs):
+        super().__init__(in_features, out_features, bias=bias, **kwargs)
+        # Mirror ea97be889: te_return_bias = return_bias AND bias exists.
+        # When bias=False but return_bias=True we still return None, avoiding
+        # a zero-length Tensor (the exact problem ea97be889 fixed in TE).
+        self.te_return_bias = return_bias and bias
+        self._m1525_printed = False
+
+    def forward(self, x):
+        out = super().forward(x)
+
+        # Always return two values — callers use ``output, _ = layer(x)``.
+        # Mirrors Megatron ea97be889 TELinear.forward() unconditional tuple.
+        if self.te_return_bias:
+            bias_val = self.bias  # Parameter, not None
+        else:
+            bias_val = None
+
+        if not self._m1525_printed:
+            print(f"[M1525-NeuronLinear] in={self.in_features} out={self.out_features} "
+                  f"te_return_bias={self.te_return_bias} "
+                  f"bias_val={'Parameter' if bias_val is not None else 'None'} "
+                  f"out_shape={tuple(out.shape)}")
+            self._m1525_printed = True
+
+        return out, bias_val
+
+
 class CausalSelfAttention(nn.Module):
     """Multi-head causal self-attention with GQA/MQA support.
 
@@ -1209,13 +1254,15 @@ class CausalSelfAttention(nn.Module):
         # M1510: separate Q and KV projections for GQA/MQA — mirrors Megatron's
         # self.query (ColumnParallel) + self.key_value (get_linear_layer) split.
         # For standard MHA, keep the fused c_attn for backward compatibility.
+        # M1525: Megatron ea97be889 — use NeuronLinear so projections always
+        # return (output, None) matching the unified TELinear interface.
         if self.multi_query_attention:
             # Q projects to full n_embd; KV projects to 2 * num_kv_heads * head_dim
-            self.c_q = nn.Linear(n_embd, n_embd, bias=False)
-            self.c_kv = nn.Linear(n_embd, 2 * self.num_kv_heads * self.head_dim, bias=False)
+            self.c_q = NeuronLinear(n_embd, n_embd, bias=False)
+            self.c_kv = NeuronLinear(n_embd, 2 * self.num_kv_heads * self.head_dim, bias=False)
         else:
-            self.c_attn = nn.Linear(n_embd, 3 * n_embd, bias=False)
-        self.c_proj = nn.Linear(n_embd, n_embd, bias=False)
+            self.c_attn = NeuronLinear(n_embd, 3 * n_embd, bias=False)
+        self.c_proj = NeuronLinear(n_embd, n_embd, bias=False)
         self.resid_dropout = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor, rotary_pos_emb=None) -> torch.Tensor:
@@ -1227,8 +1274,9 @@ class CausalSelfAttention(nn.Module):
 
         # M1510: GQA/MQA projection path
         if self.multi_query_attention:
-            q = self.c_q(x)
-            kv = self.c_kv(x)
+            # M1525: unpack (output, None) — mirrors Megatron ea97be889 always-two-value interface
+            q, _ = self.c_q(x)
+            kv, _ = self.c_kv(x)
             k, v = kv.split(self.num_kv_heads * self.head_dim, dim=2)
             q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2)          # [B, n_head, T, head_dim]
             k = k.view(B, T, self.num_kv_heads, self.head_dim).transpose(1, 2)    # [B, num_kv_heads, T, head_dim]
@@ -1264,7 +1312,8 @@ class CausalSelfAttention(nn.Module):
             k = k.repeat_interleave(self.kv_groups, dim=1)   # [B, n_head or local_q_heads, T, head_dim]
             v = v.repeat_interleave(self.kv_groups, dim=1)
         else:
-            qkv = self.c_attn(x)
+            # M1525: unpack (output, None) — mirrors Megatron ea97be889 always-two-value interface
+            qkv, _ = self.c_attn(x)
             q, k, v = qkv.split(self.n_embd, dim=2)
             q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
             k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
@@ -1452,7 +1501,9 @@ class CausalSelfAttention(nn.Module):
                     dropout_p=self.dropout if self.training else 0.0, is_causal=True)
 
         y = y.transpose(1, 2).contiguous().view(B, T, C)
-        y = self.resid_dropout(self.c_proj(y))
+        # M1525: unpack (output, None) from NeuronLinear — mirrors ea97be889 interface
+        _proj_out, _ = self.c_proj(y)
+        y = self.resid_dropout(_proj_out)
         return y
 
 
@@ -1479,20 +1530,24 @@ class MLP(nn.Module):
             # Intermediate size = 8/3 * n_embd (rounded to multiple of 256)
             intermediate = int(8 * n_embd / 3)
             intermediate = ((intermediate + 255) // 256) * 256
-            self.w_gate = nn.Linear(n_embd, intermediate, bias=add_bias)
-            self.w_up = nn.Linear(n_embd, intermediate, bias=add_bias)
-            self.c_proj = nn.Linear(intermediate, n_embd, bias=add_bias)
+            # M1525: NeuronLinear — always returns (output, None), mirrors ea97be889
+            self.w_gate = NeuronLinear(n_embd, intermediate, bias=add_bias)
+            self.w_up = NeuronLinear(n_embd, intermediate, bias=add_bias)
+            self.c_proj = NeuronLinear(intermediate, n_embd, bias=add_bias)
         else:
-            self.c_fc = nn.Linear(n_embd, 4 * n_embd, bias=add_bias)
+            # M1525: NeuronLinear — always returns (output, None), mirrors ea97be889
+            self.c_fc = NeuronLinear(n_embd, 4 * n_embd, bias=add_bias)
             self.gelu = nn.GELU()
-            self.c_proj = nn.Linear(4 * n_embd, n_embd, bias=add_bias)
+            self.c_proj = NeuronLinear(4 * n_embd, n_embd, bias=add_bias)
         self.dropout = nn.Dropout(dropout)
         self._forward_count = 0
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.use_swiglu:
-            gate = F.silu(self.w_gate(x))  # Swish activation
-            up = self.w_up(x)
+            # M1525: unpack (output, None) — mirrors Megatron ea97be889 always-two-value interface
+            _gate_raw, _ = self.w_gate(x)
+            gate = F.silu(_gate_raw)  # Swish activation
+            up, _ = self.w_up(x)
             x = gate * up
             # DES-LOC diagnostic: detect dead gates (gate collapse)
             self._forward_count += 1
@@ -1502,11 +1557,11 @@ class MLP(nn.Module):
                       f"gate_alive={gate_alive:.4f} "
                       f"gate_mean={gate.mean().item():.6f} "
                       f"gate_std={gate.std().item():.6f}")
-            x = self.c_proj(x)
+            x, _ = self.c_proj(x)
         else:
-            x = self.c_fc(x)
+            x, _ = self.c_fc(x)
             x = self.gelu(x)
-            x = self.c_proj(x)
+            x, _ = self.c_proj(x)
         x = self.dropout(x)
         return x
 
