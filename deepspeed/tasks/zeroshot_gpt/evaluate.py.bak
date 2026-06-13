@@ -19,8 +19,11 @@ from tasks.finetune_utils import build_data_loader
 
 from .datasets import build_dataset
 
-# M1830: wrapper class list moved to megatron.utils.ALL_MODULE_WRAPPER_CLASSNAMES (cb7f46cd3)
-print('[M1830][unwrap_model] wrapper class list now lives in megatron.utils — no local imports needed')
+# These are needed to unwrap the model, would be nice to put these in megatron.utils if possible?
+print('[M1281]')
+from torch.nn.parallel.distributed import DistributedDataParallel as torchDDP
+from megatron.model import DistributedDataParallel as LocalDDP
+from megatron.model import Float16Module
 
 def get_model_provider(eval_metric):
     """Based on evaluation metric set the parallel-output flag and
@@ -81,8 +84,8 @@ def forward_step(batch, model, eval_metric):
     input_tensor = recv_forward()
 
     # Forward pass through the model.
-    print('[M1830][unwrap_model] calling unwrap_model(model) — default wrapper classes from megatron.utils')
-    unwrapped_model = unwrap_model(model)
+    unwrapped_model = unwrap_model(
+        model, (torchDDP, LocalDDP, Float16Module))
     unwrapped_model.set_input_tensor(input_tensor)
     output = model(tokens, position_ids, attention_mask)
 
