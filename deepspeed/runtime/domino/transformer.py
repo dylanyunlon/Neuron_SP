@@ -3,6 +3,8 @@
 
 # DeepSpeed Team
 
+from typing import Optional, Tuple
+
 import torch
 import torch.nn.functional as F
 import enum
@@ -258,18 +260,50 @@ class ShardedAttention(DominoModule):
         return context_layer
 
 
+def _bias_dropout_add_func(x_with_bias, residual, prob, training):
+    # type: (Tuple[torch.Tensor, Optional[torch.Tensor]], torch.Tensor, float, bool) -> torch.Tensor
+    # [M1770] Refactored after Megatron ac422cb9b: unpack tuple input, restore dtype-cast line.
+    # 鲁迅曰：从来如此，便对么？旧接口以三参数裂解真理，今以元组归一，方得正道。
+    print(f"[M1770][bias_dropout] _bias_dropout_add_func called | training={training} | prob={prob}")
+
+    x, bias = x_with_bias  # unpack — ac422cb9b style
+
+    # [RESTORED LINE — ac422cb9b] If we want to train mixed precision, then the output of
+    # this function should be half precision. However, in AMP O1, the input (residual) is
+    # in fp32, and it will up-cast the result to fp32, causing pipeline parallel GPU
+    # communication to hang. Therefore, we need to cast residual to the same dtype as x.
+    residual = residual if residual.dtype == x.dtype else residual.to(x.dtype)
+    print(f"[M1770][bias_dropout] x.dtype={x.dtype} | residual.dtype={residual.dtype} | bias={'None' if bias is None else bias.dtype}")
+
+    if bias is not None:
+        x = x + bias
+    out = torch.nn.functional.dropout(x, p=prob, training=training)
+    out = residual + out
+    print(f"[M1770][bias_dropout] out.shape={out.shape} | out.dtype={out.dtype}")
+    return out
+
+
+def bias_dropout_add_unfused(training):
+    # [M1770] Closure factory — mirrors Megatron ac422cb9b bias_dropout_add_unfused(training).
+    # 鲁迅曰：愿中国少年都摆脱冷气，向上走，不必听自暮气笼罩的train/inference两函数的话。
+    def _bias_dropout_add(x_with_bias, residual, prob):
+        return _bias_dropout_add_func(x_with_bias, residual, prob, training)
+    return _bias_dropout_add
+
+
 class bias_dropout_add(torch.nn.Module):
+    """[M1770] Domino wrapper kept for call-site compatibility (forward still takes x, bias, residual).
+    Internally delegates to _bias_dropout_add_func with the new tuple-unpack contract."""
 
     def __init__(self, prob: float):
         super(bias_dropout_add, self).__init__()
-        self.dropout = torch.nn.Dropout(prob)
+        self.prob = prob
+        print(f"[M1770][bias_dropout_add.__init__] prob={prob}")
 
     def forward(self, x: torch.Tensor, bias: torch.Tensor, residual: torch.Tensor) -> torch.Tensor:
-        if bias is not None:
-            x = x + bias
-        out = self.dropout(x)
-        out = out + residual
-        return out
+        # Pack into tuple to match ac422cb9b _bias_dropout_add_func signature.
+        training = self.training
+        return _bias_dropout_add_func((x, bias), residual, self.prob, training)
 
 
 class DominoTransformerLayer(DominoModule):
