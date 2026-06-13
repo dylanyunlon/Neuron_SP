@@ -62,6 +62,28 @@
 #   - TELayerNormColumnParallelLinear.__init__ prints fusion params on construction.
 #   - TELayerNormColumnParallelLinear.forward prints input shape for diagnostics.
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# M1960: Megatron c3079ce98 — Enable DGRAD RS overlap
+# Source: megatron/core/transformer/custom_layers/transformer_engine.py
+#
+# Mapping: megatron/core/transformer/custom_layers/transformer_engine.py
+#        → deepspeed/compile/core_transformer_custom_layers_transformer_engine.py
+#
+# Changes ported (TELayerNormColumnParallelLinear.__init__):
+#   When _te_ver > 1.6.0.dev0, pass ub_overlap_rs_dgrad kwarg to TE super().__init__
+#   reflecting config.tp_comm_overlap_rs_dgrad (new field from M1960/c3079ce98).
+#   Upstream also refactors ub_overlap_ag / ub_overlap_rs hasattr guards in TELinear
+#   and TELayerNormColumnParallelLinear — our simplified wrappers omit UB plumbing
+#   (no tp_comm_overlap flag path), so only the rs_dgrad addition is ported.
+#
+# 20% adaptation (鲁迅式迁移):
+#   鲁迅曰：「梯度之流散，若不乘势而行，则徒费光阴；
+#             ub_overlap_rs_dgrad 一旦启用，则 Reduce-Scatter 掩于 DGRAD 之下，
+#             如燕雀翱翔于长天，何其自在。」
+#   - Version guard mirrors upstream (> 1.6.0.dev0).
+#   - print('[M1960]') diagnostic in __init__ reports rs_dgrad setting.
+# ---------------------------------------------------------------------------
+print('[M1960] core_transformer_custom_layers_transformer_engine: ub_overlap_rs_dgrad support')
 print('[M1425]')
 print('[M1525]')
 print('[M1527]')
@@ -246,10 +268,18 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
         self.te_return_bias = skip_bias_add and bias
 
         # Only TE >= 0.11.0 supports normalization kwarg (RMSNorm support).
+        # M1960: TE > 1.6.0.dev0 supports ub_overlap_rs_dgrad for DGRAD RS overlap.
         try:
             _te_ver = _pkg.version.Version(_te_version("transformer-engine"))
             if _te_ver >= _pkg.version.Version("0.11.0"):
                 kwargs.setdefault("normalization", self.config.normalization)
+            # M1960: Megatron c3079ce98 — pass rs_dgrad overlap flag when TE supports it.
+            # 鲁迅曰：「版本之墙，不可强攻；版本既足，则通信重叠，梯度计算如虎添翼。」
+            if _te_ver > _pkg.version.Version("1.6.0.dev0"):
+                rs_dgrad = getattr(self.config, "tp_comm_overlap_rs_dgrad", False)
+                kwargs.setdefault("ub_overlap_rs_dgrad", rs_dgrad)
+                print(f'[M1960] TELayerNormColumnParallelLinear.__init__ \'
+                      f'ub_overlap_rs_dgrad={rs_dgrad} (TE={_te_ver})')
         except Exception:
             pass  # 无法检测版本时跳过，默认 LayerNorm
 

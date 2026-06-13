@@ -1595,3 +1595,51 @@ print('[M1503]')
 # ---------------------------------------------------------------------------
 
 print('[M1506]')
+
+
+# ---------------------------------------------------------------------------
+# M1960: Megatron c3079ce98 — Enable DGRAD RS overlap
+# Source: megatron/training/arguments.py _add_training_args()
+#
+# Mapping: megatron/training/arguments.py
+#        → deepspeed/compile/megatron_arguments.py
+#
+# Changes ported from arguments.py:
+#   group.add_argument('--tp-comm-overlap-rs-dgrad', action='store_true',
+#                      help='Enables the Reduce-Scatter overlap with dgrad GEMM.',
+#                      dest='tp_comm_overlap_rs_dgrad')
+#
+# Placement: added alongside other TP comm overlap args.
+#
+# 20% adaptation (鲁迅式迁移):
+#   鲁迅曰：「命令行参数者，入口之钥也；无此钥则门户紧闭，
+#             梯度与通信之重叠，永不得启。」
+#   - patch_tp_comm_rs_dgrad_args(parser) 函数封装新参数，
+#     与既有 M1501/M1503/M1506 风格保持一致。
+#   - print('[M1960]') diagnostic added.
+# ---------------------------------------------------------------------------
+
+
+def patch_tp_comm_rs_dgrad_args(parser):
+    """Register --tp-comm-overlap-rs-dgrad CLI flag (Megatron c3079ce98 / M1960).
+
+    鲁迅曰：「梯度反传时 Reduce-Scatter 与 DGRAD GEMM 若能流水并行，
+    则通信之延迟深藏于计算之下，性能方可名副其实。」
+    When enabled, TransformerEngine pipelines the DGRAD GEMM and Reduce-Scatter
+    splits so communication is hidden behind computation.
+    Requires tp_comm_overlap=True and TE > 1.6.0.dev0.
+    """
+    group = parser.add_argument_group(title='M1960 DGRAD RS overlap')
+    group.add_argument(
+        '--tp-comm-overlap-rs-dgrad',
+        action='store_true',
+        help='Enables the Reduce-Scatter overlap with dgrad GEMM '
+             '(Megatron c3079ce98 / Neuron_SP M1960). '
+             'Requires --tp-comm-overlap and TransformerEngine > 1.6.0.dev0.',
+        dest='tp_comm_overlap_rs_dgrad',
+    )
+    print('[M1960] patch_tp_comm_rs_dgrad_args: --tp-comm-overlap-rs-dgrad registered, '
+          'sets args.tp_comm_overlap_rs_dgrad=True when present')
+
+
+print('[M1960]')
