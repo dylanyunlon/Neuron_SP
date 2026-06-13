@@ -370,11 +370,19 @@ class DesLocGradBuffer(DesLocMemoryBuffer):
         self.tier = max(tier_counts, key=tier_counts.get)
 
         # Build param→slice mapping (mirrors Megatron param_to_bucket)
+        # M1835: Megatron 54b416891 — Fix for DistributedOptimizer.
+        # Iterate params in non-reversed order to maintain exactly same losses
+        # with the old DDP wrapper when using distributed optimizer.
+        # Index counts DOWN from numel (mirrors upstream grad_buffer_param_index_map fix).
         self.param_offsets = {}
-        offset = 0
-        for p in params:
-            self.param_offsets[id(p)] = (offset, offset + p.numel())
-            offset += p.numel()
+        index = numel
+        for i in range(len(params)):
+            p = params[len(params) - i - 1]
+            index -= p.numel()
+            self.param_offsets[id(p)] = (index, index + p.numel())
+        print(f"[M1835] DesLocGradBuffer param_offsets rebuilt (reversed index): "
+              f"n_params={len(params)} numel={numel} "
+              f"index_range=[0,{numel}) — matches Megatron 54b416891 fix")
 
         # Telemetry
         self.comm_count = 0

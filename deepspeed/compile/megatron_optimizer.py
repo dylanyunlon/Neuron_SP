@@ -1395,3 +1395,30 @@ class Float16DistributedOptimizer(BaseFloat16Optimizer):
                 main_view = main_param[main_shard.start:main_shard.end]
 
                 model_view.detach().copy_(main_view)
+
+# ---------------------------------------------------------------------------
+# M1835: Megatron 54b416891 — Fix for DistributedOptimizer.
+# Source: megatron/model/distributed.py (NVIDIA/Megatron-LM commit 54b416891)
+# Author: NVIDIA/Megatron-LM  Date: 2023-xx-xx
+#
+# Mapping: megatron/model/distributed.py → engine.py (DesLocGradBuffer.__init__)
+#
+# Upstream change in DistributedDataParallel.__init__():
+#   1. Rename grad_dtype_to_param → grad_dtype_to_params (typo fix).
+#   2. param_to_grad_buffer index loop changed from forward (index=0, +numel)
+#      to reverse (index=numel, -numel) so param_index_map coordinates align
+#      with GradBuffer allocation order when using DistributedOptimizer.
+#      Prevents parameter-index misalignment that caused wrong gradient
+#      partitioning and subtle loss discrepancies under distributed optimizer.
+#
+# Neuron_SP adaptation:
+#   Neuron_SP does not have megatron/model/distributed.py; the equivalent is
+#   DesLocGradBuffer.__init__() in engine.py (lines ~372-385).
+#   param_offsets dict changed from forward offset (offset=0, offset+=numel)
+#   to reverse index (index=numel, index-=numel, iterate params reversed).
+#   This ensures DeslocDistributedOptimizerShardManager.build_shard_ranges()
+#   in deepspeed/runtime/engine.py reads consistent [start,end) coords.
+#   Adds print('[M1835]') in engine.py inside DesLocGradBuffer.__init__().
+# ---------------------------------------------------------------------------
+
+print('[M1835]')
