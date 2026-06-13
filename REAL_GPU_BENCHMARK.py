@@ -869,6 +869,16 @@ class TrainingConfig:
     batch_p2p_comm: bool = False
     overlap_p2p_comm: bool = False  # M1503: canonical short name (was overlap_p2p_communication)
 
+    # M1532: Megatron 305b3901a — non-core models use config objects instead of direct args reads.
+    # arguments.py now routes xavier_uniform init through core_transformer_config_from_args so
+    # classification/vision/race pretrain scripts no longer reach into args directly.
+    # DES-LOC 20% adaptation: mirror init_method_std + init_method_xavier_uniform in TrainingConfig
+    # so GPT._init_weights reads from config instead of the hardcoded 0.02 that silently ignores
+    # whatever --init-method-std the user passes.  Xavier path is the ViT default; normal is GPT default.
+    # 鲁迅曾言：硬编码的0.02，是懒惰者留给后人的枷锁——config对象方能还权于调用者。
+    init_method_std: float = 0.02          # std for normal init (Megatron default; was hardcoded)
+    init_method_xavier_uniform: bool = False  # use xavier_uniform instead of normal (ViT default)
+
     def get_pipeline_config(self) -> Dict:
         """Extract pipeline-parallel configuration (Megatron 31d133bba pattern).
 
@@ -923,6 +933,9 @@ class TrainingConfig:
             'num_query_groups': self.num_query_groups,
             # M1541: Megatron 28802670f — embedding fp32 non-determinism workaround
             'embedding_weights_in_fp32': self.embedding_weights_in_fp32,
+            # M1532: Megatron 305b3901a — expose init_method params via config object
+            'init_method_std': self.init_method_std,
+            'init_method_xavier_uniform': self.init_method_xavier_uniform,
         }
         print(f"[M1448-XFORMCFG] transformer config: "
               f"layers={xformer_cfg['num_layers']} "
@@ -1769,8 +1782,17 @@ class GPT(nn.Module):
                  group_query_attention: bool = False,
                  num_query_groups: int = 1,
                  embedding_weights_in_fp32: bool = False,
-                 share_embeddings_and_output_weights: bool = False):
+                 share_embeddings_and_output_weights: bool = False,
+                 init_method_std: float = 0.02,
+                 init_method_xavier_uniform: bool = False):
         super().__init__()
+        # M1532: Megatron 305b3901a — store init params from config instead of hardcoding
+        # 鲁迅曾言：不从config读参数的初始化，不过是写死的谎言。
+        self._init_method_std = init_method_std
+        self._init_method_xavier_uniform = init_method_xavier_uniform
+        print(f"[M1532-GPT-INIT] init_method_std={init_method_std} "
+              f"init_method_xavier_uniform={init_method_xavier_uniform} "
+              f"(Megatron 305b3901a: config object replaces direct args read)")
         self.max_seq_len = max_seq_len
         # M458: if QK layer scaling is on, fp32 softmax is auto-implied (Megatron 691747b1)
         _softmax_fp32 = attention_softmax_in_fp32 or apply_query_key_layer_scaling
@@ -1932,12 +1954,19 @@ class GPT(nn.Module):
             return _w
 
     def _init_weights(self, module):
+        # M1532: Megatron 305b3901a — use init params from config object, not hardcoded 0.02.
+        # xavier_uniform_ is the ViT default (vit_backbone.py pre-305b3901a checked args directly).
+        # Normal with configurable std is the GPT default (Megatron arguments.py default=0.02).
+        if self._init_method_xavier_uniform:
+            _init_fn = torch.nn.init.xavier_uniform_
+        else:
+            _init_fn = lambda t: torch.nn.init.normal_(t, mean=0.0, std=self._init_method_std)
         if isinstance(module, nn.Linear):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            _init_fn(module.weight)
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            _init_fn(module.weight)
     
     def forward(self, idx: torch.Tensor, targets: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         B, T = idx.size()
@@ -4472,6 +4501,9 @@ class Trainer:
             num_query_groups=getattr(config, 'num_query_groups', 1),
             # M1541: Megatron 28802670f — embedding fp32 non-determinism workaround
             embedding_weights_in_fp32=getattr(config, 'embedding_weights_in_fp32', False),
+            # M1532: Megatron 305b3901a — pass init_method config instead of hardcoded 0.02
+            init_method_std=getattr(config, 'init_method_std', 0.02),
+            init_method_xavier_uniform=getattr(config, 'init_method_xavier_uniform', False),
             **model_config
         )
 
