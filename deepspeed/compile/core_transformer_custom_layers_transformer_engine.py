@@ -3,7 +3,29 @@
 
 # DeepSpeed Team
 
+# ---------------------------------------------------------------------------
+# M1525: Megatron ea97be889 — Always return two values from linear layer
+# Source: megatron/core/transformer/custom_layers/transformer_engine.py
+#         megatron/core/transformer/attention.py
+#
+# Mapping:
+#   megatron/core/transformer/custom_layers/transformer_engine.py
+#     -> deepspeed/compile/core_transformer_custom_layers_transformer_engine.py
+#
+# Changes ported:
+#   TELinear.__init__:
+#     - Added bias/return_bias params; self.te_return_bias = return_bias and bias
+#     - Passes bias and return_bias=self.te_return_bias to TE super().__init__
+#   TELinear.forward (new):
+#     - Always returns (output, bias_or_None) regardless of return_bias arg
+#     - If te_return_bias: TE already returns tuple, pass through
+#     - Else: return out, None
+#
+# 20% adaptation: adds print('[M1525]') diagnostic markers and 鲁迅式 docstring.
+# ---------------------------------------------------------------------------
+
 print('[M1425]')
+print('[M1525]')
 import torch
 import transformer_engine as te
 
@@ -33,14 +55,30 @@ class TELinear(te.pytorch.module.Linear):
     """
     Wrapper for the Transformer-Engine's `Linear` layer but specialized similar
     to megatron's `RowParallelLinear` layer.
+
+    M1525: forward() 始终返回 (output, bias_or_None) 两个值，
+    不管 return_bias 参数如何设置 —— 学鲁迅先生所言：
+    "横眉冷对千夫指，俯首甘为孺子牛"，接口一律平等，
+    调用方无需猜测返回几个值。
     """
     def __init__(self,
                  input_size: int,
                  output_size: int,
                  config: TransformerConfig,
                  parallel_mode: str,
+                 bias: bool = True,
+                 return_bias: bool = False,
                  **kwargs):
         self.config = config
+
+        # TE 在 bias=False、return_bias=True 时返回零长 Tensor，
+        # 我们更喜欢 None。所以此时让 TE 不返回 bias，
+        # 由我们自己补 None——这样 forward 始终两个返回值，
+        # 省得上层代码还要猜。
+        self.te_return_bias = return_bias and bias
+        print(f'[M1525] TELinear.__init__ bias={bias} return_bias={return_bias} '
+              f'te_return_bias={self.te_return_bias}')
+
         super().__init__(
             in_features=input_size,
             out_features=output_size,
@@ -52,8 +90,21 @@ class TELinear(te.pytorch.module.Linear):
             init_method=self.config.init_method,
             params_dtype=self.config.params_dtype,
             parallel_mode=parallel_mode,
+            bias=bias,
+            return_bias=self.te_return_bias,
             **kwargs
         )
+
+    def forward(self, x):
+        out = super().forward(x)
+
+        # TE 只在 return_bias=True 时返回元组，否则返回单个 Tensor；
+        # 我们无论如何都返回两个值，调用方一律用 output, _ = layer(x)。
+        if self.te_return_bias:
+            print(f'[M1525] TELinear.forward te_return_bias=True, returning tuple as-is')
+            return out
+        print(f'[M1525] TELinear.forward te_return_bias=False, appending None bias')
+        return out, None
 
 
 class TEColumnParallelLinear(TELinear):
