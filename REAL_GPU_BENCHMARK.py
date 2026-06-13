@@ -8979,3 +8979,160 @@ def _neuronsp_ict_bert_forward_m487(
           f'diag_mean={retrieval_scores.diagonal().mean().item():.4f}')
 
     return retrieval_scores
+
+
+# =============================================================================
+# NEURON_SP PORT: Megatron 942b8ab12 — Constant eval batch size with skip-train
+# Source: megatron/training.py evaluate() and build_train_valid_test_data_loaders()
+# Key changes:
+#   1. evaluate(): derive eval_batch_size = args.global_batch_size independently
+#      of training schedule; eval_num_microbatches computed from eval_batch_size;
+#      num_microbatches=eval_num_microbatches (was get_num_microbatches());
+#      consumed_valid_samples += eval_batch_size (was manual product);
+#      total_loss_dict normalised by eval_num_microbatches (was get_num_microbatches());
+#      verbose prints every iter (was every log_interval iters);
+#      upfront "Evaluating on N samples" line added.
+#   2. build_train_valid_test_data_loaders(): when args.skip_train, reset
+#      consumed_valid_samples offset to 0 so val iterator starts from beginning.
+#   3. pretrain(): prefix strings simplified (drop sample-count formula).
+# 20% adaptation: _neuronsp_evaluate_m1587() and
+#   _neuronsp_build_val_loader_m1587() mirror these changes for Neuron_SP's
+#   benchmark loop; print diagnostics at entry, each iter, and exit.
+# Signed-off-by: dylanyunlon <dogechat@163.com>
+# =============================================================================
+
+def _neuronsp_evaluate_m1587(
+        val_loader,
+        forward_fn,
+        eval_iters: int,
+        global_batch_size: int,
+        micro_batch_size: int,
+        data_parallel_size: int = 1,
+        verbose: bool = True):
+    """Evaluate over eval_iters steps with a constant eval batch size.
+
+    Port of megatron/training.py::evaluate() (942b8ab12).
+    Key change: eval_batch_size is pinned to global_batch_size regardless of
+    any mid-training schedule changes.  eval_num_microbatches is derived from
+    that constant rather than from the runtime get_num_microbatches() call,
+    so validation loss normalisation is always consistent.
+
+    20% adaptation: operates on a plain DataLoader instead of Megatron's
+    data_iterator; forward_fn(batch) returns a scalar loss tensor.
+
+    Arguments:
+        val_loader:        DataLoader for the validation set
+        forward_fn:        callable(batch) -> loss tensor (no grad)
+        eval_iters:        number of validation steps
+        global_batch_size: pinned eval batch size (args.global_batch_size)
+        micro_batch_size:  per-GPU micro-batch size
+        data_parallel_size: number of data-parallel ranks (default 1)
+        verbose:           whether to print per-iter progress
+
+    Returns:
+        avg_loss (float): mean loss over eval_iters * eval_num_microbatches steps
+    """
+    import torch
+
+    # Derive a fixed microbatch count — independent of training schedule.
+    eval_num_microbatches = global_batch_size // (micro_batch_size * data_parallel_size)
+    total_eval_samples = eval_iters * global_batch_size
+
+    print(
+        f'[M1587-EVAL] starting: eval_iters={eval_iters}, '
+        f'eval_batch_size={global_batch_size}, '
+        f'eval_num_microbatches={eval_num_microbatches}, '
+        f'total_eval_samples={total_eval_samples}'
+    )
+
+    if verbose:
+        print(f'[M1587-EVAL] Evaluating on {total_eval_samples} samples')
+
+    total_loss = 0.0
+    consumed_valid_samples = 0
+    val_iter = iter(val_loader)
+
+    with torch.no_grad():
+        for iteration in range(1, eval_iters + 1):
+            if verbose:
+                print(f'[M1587-EVAL] Evaluating iter {iteration}/{eval_iters}')
+
+            try:
+                batch = next(val_iter)
+            except StopIteration:
+                print(f'[M1587-EVAL] val_loader exhausted at iter {iteration}, resetting')
+                val_iter = iter(val_loader)
+                batch = next(val_iter)
+
+            loss = forward_fn(batch)
+            total_loss += loss.item() if hasattr(loss, 'item') else float(loss)
+
+            # Advance consumed counter by the pinned eval_batch_size (942b8ab12).
+            consumed_valid_samples += global_batch_size
+
+            print(
+                f'[M1587-EVAL] iter {iteration}: loss={total_loss / iteration:.6f} '
+                f'consumed_valid_samples={consumed_valid_samples}'
+            )
+
+    # Normalise by total microbatch count — mirrors 942b8ab12 denominator fix.
+    avg_loss = total_loss / (eval_iters * eval_num_microbatches)
+    print(
+        f'[M1587-EVAL] done: avg_loss={avg_loss:.6f} '
+        f'consumed_valid_samples={consumed_valid_samples}'
+    )
+    return avg_loss
+
+
+def _neuronsp_build_val_loader_m1587(
+        val_dataset,
+        consumed_valid_samples: int,
+        batch_size: int,
+        skip_train: bool = False):
+    """Build a validation DataLoader with optional skip-train reset.
+
+    Port of megatron/training.py::build_train_valid_test_data_loaders()
+    fragment (942b8ab12).
+    Key change: when skip_train=True the consumed_valid_samples offset is
+    reset to 0 so that the validation iterator always starts from the
+    beginning of the dataset — giving a constant, reproducible eval subset.
+
+    20% adaptation: wraps torch DataLoader instead of Megatron's
+    build_pretraining_data_loader; prints the chosen start offset.
+
+    Arguments:
+        val_dataset:            dataset for validation
+        consumed_valid_samples: running offset (from checkpoint)
+        batch_size:             batch size for the loader
+        skip_train:             if True, reset offset to 0 (942b8ab12)
+
+    Returns:
+        DataLoader starting at the appropriate offset
+    """
+    from torch.utils.data import DataLoader as _DL, Subset
+
+    # 942b8ab12: when skipping training, always start val from index 0.
+    if skip_train:
+        start_idx = 0
+        print(
+            f'[M1587-VALLOAD] skip_train=True → resetting val start_idx to 0 '
+            f'(was consumed_valid_samples={consumed_valid_samples})'
+        )
+    else:
+        start_idx = consumed_valid_samples
+        print(
+            f'[M1587-VALLOAD] skip_train=False → val start_idx={start_idx} '
+            f'(consumed_valid_samples={consumed_valid_samples})'
+        )
+
+    n = len(val_dataset)
+    start_idx = start_idx % max(n, 1)
+    indices = list(range(start_idx, n)) + list(range(0, start_idx))
+    subset = Subset(val_dataset, indices)
+
+    loader = _DL(subset, batch_size=batch_size, shuffle=False, num_workers=0)
+    print(
+        f'[M1587-VALLOAD] loader ready: dataset_len={n}, '
+        f'effective_start={start_idx}, batch_size={batch_size}'
+    )
+    return loader
