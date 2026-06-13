@@ -23,7 +23,22 @@
 #   - KV cache (_allocate_memory / inference_params) for autoregressive decode.
 #
 # 10% adaptation: imports from megatron.core.* (upstream convention retained
-# for reference); adds print('[M1302]') marker.
+# for reference); adds # ---------------------------------------------------------------------------
+# M1700: Megatron efc434ccc — Rename CoreAttention to DotProductAttention
+# Source: megatron/core/transformer/attention.py (NVIDIA/Megatron-LM commit efc434ccc)
+#
+# Changes ported:
+#   - Import DotProductAttention (was CoreAttention) from core_attention module.
+#   - self.core_attention -> self.dot_product_attention (attribute rename).
+#   - self.checkpoint_core_attention -> self.checkpoint_dot_product_attention.
+#   - All forward() call sites updated accordingly.
+#
+# 20% adaptation (鲁迅式迁移):
+#   - 改名如改骨，骨相未变，精神长存。
+#   - Adds print('[M1700]') diagnostic marker.
+# ---------------------------------------------------------------------------
+print('[M1700] dot_product_attention module active')
+print('[M1302]') marker.
 # ---------------------------------------------------------------------------
 # M1420: Megatron 397d0b2eb — Split TransformerConfig into BaseConfig and
 #        TransformerConfig, use BaseConfig for model parallel functions.
@@ -49,7 +64,7 @@ print('[M1420]')
 import torch
 
 from megatron.core import parallel_state, tensor_parallel
-from megatron.core.transformer.core_attention import CoreAttention
+from megatron.core.transformer.core_attention import DotProductAttention
 from megatron.core.utils import divide
 
 from megatron.core.transformer.module import MegatronModule
@@ -139,10 +154,10 @@ class ParallelAttention(MegatronModule):
                 sequence_parallel_enabled=self.sequence_parallel,  # M1420: was sequence_parallel_enabled
             )
 
-        self.core_attention = CoreAttention(
+        self.dot_product_attention = DotProductAttention(
             config=self.config, layer_number=self.layer_number, attn_mask_type=self.attn_mask_type
         )
-        self.checkpoint_core_attention = self.recompute_granularity == 'selective'
+        self.checkpoint_dot_product_attention = self.recompute_granularity == 'selective'
 
         # Output.
         self.dense = tensor_parallel.RowParallelLinear(
@@ -166,7 +181,7 @@ class ParallelAttention(MegatronModule):
             key_layer = inputs[1]
             value_layer = inputs[2]
             attention_mask = inputs[3]
-            output_ = self.core_attention(query_layer, key_layer, value_layer, attention_mask)
+            output_ = self.dot_product_attention(query_layer, key_layer, value_layer, attention_mask)
             return output_
 
         hidden_states = tensor_parallel.checkpoint(
@@ -270,10 +285,10 @@ class ParallelAttention(MegatronModule):
         # core attention computation
         # ==================================
 
-        if self.checkpoint_core_attention:
+        if self.checkpoint_dot_product_attention:
             context_layer = self._checkpointed_attention_forward(query_layer, key_layer, value_layer, attention_mask)
         else:
-            context_layer = self.core_attention(query_layer, key_layer, value_layer, attention_mask)
+            context_layer = self.dot_product_attention(query_layer, key_layer, value_layer, attention_mask)
 
         # =================
         # Output. [sq, b, h]

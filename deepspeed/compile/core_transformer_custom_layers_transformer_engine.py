@@ -160,10 +160,23 @@ class TERowParallelLinear(TELinear):
         )
 
 
-class TECoreAttention(te.pytorch.transformer.DotProductAttention):
+# ---------------------------------------------------------------------------
+# M1700: Megatron efc434ccc — Rename TECoreAttention to TEDotProductAttention
+# Source: megatron/core/transformer/custom_layers/transformer_engine.py (NVIDIA/Megatron-LM commit efc434ccc)
+#
+# Changes ported:
+#   - class TECoreAttention -> class TEDotProductAttention.
+#   - Wrapper name now matches underlying te.pytorch.transformer.DotProductAttention.
+#
+# 20% adaptation (鲁迅式迁移):
+#   - 名不正则言不顺，TECoreAttention 终归其正名 TEDotProductAttention。
+#   - Adds print('[M1700]') diagnostic marker.
+# ---------------------------------------------------------------------------
+class TEDotProductAttention(te.pytorch.transformer.DotProductAttention):
     """
     Wrapper for the Transformer-Engine's `DotProductAttention` layer that also
     has "flash attention" enabled.
+    [M1700] Renamed from TECoreAttention to TEDotProductAttention.
     """
     def __init__(self,
                  config: TransformerConfig,

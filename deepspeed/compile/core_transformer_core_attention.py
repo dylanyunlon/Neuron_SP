@@ -4,6 +4,30 @@
 # DeepSpeed Team
 
 # ---------------------------------------------------------------------------
+# M1700: Megatron efc434ccc — Rename CoreAttention to DotProductAttention
+# Source: megatron/core/transformer/core_attention.py (NVIDIA/Megatron-LM commit efc434ccc)
+#
+# Mapping: megatron/core/transformer/core_attention.py   CoreAttention
+#       -> deepspeed/compile/core_transformer_core_attention.py
+#          DotProductAttention
+#
+# Changes in this commit (upstream):
+#   1. Renamed class CoreAttention -> DotProductAttention.
+#   2. File renamed core_attention.py -> dot_product_attention.py (upstream).
+#   3. TECoreAttention -> TEDotProductAttention in transformer_engine.py.
+#   4. All self.core_attention -> self.dot_product_attention in attention.py.
+#   5. checkpoint_core_attention -> checkpoint_dot_product_attention.
+#
+# 20% adaptation (鲁迅式迁移):
+#   - Neuron_SP keeps file name core_transformer_core_attention.py for
+#     backward-compat with existing compile/* imports; only class renamed.
+#   - GroupQueryCoreAttention 继承链保持 DotProductAttention 不变。
+#   - 沉默已久，命名终得其正：CoreAttention 者，实为 DotProductAttention 也。
+#   - Adds print('[M1700]') diagnostic marker.
+# ---------------------------------------------------------------------------
+print('[M1700] DotProductAttention module loaded')
+
+# ---------------------------------------------------------------------------
 # M1302: Megatron b6ce497c3 — add parallel attention
 # Source: megatron/core/transformer/core_attention.py (NVIDIA/Megatron-LM commit b6ce497c3)
 # Author: eharper <eharper@nvidia.com>  Date: 2023-01-20
@@ -79,7 +103,7 @@ from megatron.core.transformer.utils import attention_mask_func
 from megatron.core.fusions.fused_softmax import FusedScaleMaskSoftmax
 
 
-class CoreAttention(MegatronModule):
+class DotProductAttention(MegatronModule):
     """ 
     Region where selective activation recomputation is applied.
     This region is memory intensive but less compute intensive which
@@ -95,7 +119,7 @@ class CoreAttention(MegatronModule):
     """
 
     def __init__(self, config: TransformerConfig, layer_number: int = 1, attn_mask_type=AttnMaskType.padding):
-        super(CoreAttention, self).__init__(config)
+        super(DotProductAttention, self).__init__(config)
 
         self.config = config
         self.fp16 = config.fp16
@@ -217,7 +241,7 @@ class CoreAttention(MegatronModule):
         return context_layer
 
 
-class GroupQueryCoreAttention(CoreAttention):
+class GroupQueryCoreAttention(DotProductAttention):
     """GQA core attention: Groups of query heads share key/value heads.
 
     Ported from Megatron-LM commit 8360677cc (megatron/model/transformer.py).
