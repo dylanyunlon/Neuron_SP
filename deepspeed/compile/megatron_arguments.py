@@ -1450,7 +1450,15 @@ def core_config_from_args(args):
     kw_args['persist_layer_norm'] = not args.no_persist_layer_norm
     kw_args['layernorm_zero_centered_gamma'] = args.apply_layernorm_1p
     kw_args['deallocate_pipeline_outputs'] = True
+    # M1506: Megatron 4ef31451d — batch_p2p_comm is the logical inverse of
+    # overlap_p2p_comm; when overlap is on, batch mode must be off so that
+    # individual async isend/irecv calls can be tracked separately and waited
+    # on out-of-order.  Derived here to keep both config flags consistent with
+    # the CLI flag rather than letting each call-site compute the negation.
+    kw_args['batch_p2p_comm'] = not getattr(args, 'overlap_p2p_comm', False)
     print('[M1420]')
+    print('[M1506] core_config_from_args: batch_p2p_comm=%s (overlap_p2p_comm=%s)' % (
+        kw_args['batch_p2p_comm'], getattr(args, 'overlap_p2p_comm', False)))
     return TransformerConfig(**kw_args)
 
 print('[M1420]')
@@ -1546,3 +1554,44 @@ def verify_p2p_arg_names(args):
 
 
 print('[M1503]')
+
+# ---------------------------------------------------------------------------
+# M1506: Megatron 4ef31451d — Fixes/cleanup from overlap p2p merge
+# Source: megatron/arguments.py (NVIDIA/Megatron-LM commit 4ef31451d)
+#
+# Mapping: megatron/arguments.py core_transformer_config_from_args()
+#        → deepspeed/compile/megatron_arguments.py core_config_from_args()
+#
+# Change ported from arguments.py core_transformer_config_from_args():
+#   After kw_args['pipeline_dtype'] = args.params_dtype, add:
+#     kw_args['batch_p2p_comm'] = not args.overlap_p2p_comm
+#
+# The overlap flag is the primary control surface; batch_p2p_comm is its
+# logical inverse.  Deriving it here ensures the two flags are always kept
+# consistent when a TransformerConfig (or BaseConfig) is built from CLI args,
+# rather than relying on each call-site to compute `not overlap_p2p_comm`.
+#
+# Companion changes across model_parallel_config.py and schedules.py:
+#   • overlap_p2p_comm field added to ModelParallelConfig (default False)
+#   • batch_p2p_comm default changed False → True
+#   • batch_p2p_sync field added (default True) — cuda sync workaround
+#   • Bare `overlap_p2p_comm` local references in schedules.py replaced by
+#     config.overlap_p2p_comm (consistency + correct config lookup)
+#   • Bare `deallocate_pipeline_outputs` replaced by
+#     config.deallocate_pipeline_outputs (same reason)
+#   • Non-interleaved schedule: ValueError for !batch_p2p_comm removed
+#     (the restriction was overly strict; non-interleaved now tolerates
+#      individual send/recv even without overlap, so the guard is gone)
+#
+# 20% Neuron_SP adaptation:
+#   • core_config_from_args (M1420) updated with batch_p2p_comm derivation
+#   • BaseConfig (core_base_config.py) and PipelineConfig (pipeline_config.py)
+#     updated with overlap_p2p_comm, batch_p2p_comm=True, batch_p2p_sync fields
+#   • __post__init__ in both config classes enforces the mutual-exclusion
+#     invariant with a ValueError + print diagnostic
+#   • megatron_schedules.py skipped — that file is an early port (M556/M971)
+#     that predates the config-object plumbing; the bare-variable references
+#     targeted by the upstream diff do not exist here
+# ---------------------------------------------------------------------------
+
+print('[M1506]')

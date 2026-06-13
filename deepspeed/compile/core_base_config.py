@@ -48,7 +48,29 @@
 
 print('[M1420]')
 
-from dataclasses import dataclass
+# ---------------------------------------------------------------------------
+# M1506: Megatron 4ef31451d — Fixes/cleanup from overlap p2p merge
+# Source: megatron/core/model_parallel_config.py (NVIDIA/Megatron-LM commit 4ef31451d)
+#
+# Mapping: megatron/core/model_parallel_config.py ModelParallelConfig
+#        → deepspeed/compile/core_base_config.py BaseConfig
+#
+# Changes ported from model_parallel_config.py:
+#   1. Docstring: replace bare "batch_p2p_comm (bool, default = False)" entry
+#      with three entries:
+#        overlap_p2p_comm (bool, optional, default=False)
+#        batch_p2p_comm   (bool, default=True) — note default flip False → True
+#        batch_p2p_sync   (bool, default=True)
+#   2. Field declarations:
+#        overlap_p2p_comm: bool = False   (NEW)
+#        batch_p2p_comm: bool = True      (default was False)
+#        batch_p2p_sync: bool = True      (NEW)
+#
+# 20% adaptation: mutual-exclusion invariant (overlap XOR batch) enforced in
+# __post__init__ with ValueError; print diagnostic added.
+# ---------------------------------------------------------------------------
+
+print('[M1506]')
 from typing import Callable
 
 import torch
@@ -142,7 +164,14 @@ class BaseConfig:
         of maximum outstanding microbatches will recompute all layers (either full recompute or selective recompute). If
         None, the checkpoint and recompute will be left up to the forward_step function.
 
-    batch_p2p_comm (bool, default = False): Use batch_isend_irecv instead of individual isend/irecv calls.
+    overlap_p2p_comm (bool, optional, default=False): When True some of the peer to peer communication for pipeline
+        parallelism will overlap with computation. Must be False if batch_p2p_comm is true.
+
+    batch_p2p_comm (bool, default=True): Use batch_isend_irecv instead of individual isend/irecv calls. Must be False
+        if overlap_p2p_comm is True.
+
+    batch_p2p_sync (bool, default=True): When using batch_isend_irecv, do a cuda.device.synchronize afterward to work
+        around a bug in older version of PyTorch.
 
     use_ring_exchange_p2p (bool, default = False): Use custom ring_exchange kernel instead of
         torch.distributed.batch_isend_irecv(). Requires custom built torch with torch.distributed.ring_exchange.
@@ -200,7 +229,9 @@ class BaseConfig:
     tensor_shape: torch.Size = None
     variable_seq_lengths: bool = False
     num_microbatches_with_partial_activation_checkpoints: int = None
-    batch_p2p_comm: bool = False
+    batch_p2p_comm: bool = True
+    overlap_p2p_comm: bool = False
+    batch_p2p_sync: bool = True
     use_ring_exchange_p2p: bool = False
     deallocate_pipeline_outputs: bool = False
     no_sync_func: Callable = None
@@ -231,3 +262,18 @@ class BaseConfig:
 
         if self.autocast_dtype is None:
             self.autocast_dtype = self.params_dtype
+
+        # M1506: Megatron 4ef31451d — batch_p2p_comm and overlap_p2p_comm are
+        # mutually exclusive; the cleanup commit makes this constraint explicit
+        # in both the docstring and the validation logic.  batch_p2p_sync is
+        # orthogonal: it only has meaning when batch_p2p_comm is True and
+        # guards against a PyTorch < 1.8 device synchronisation bug.
+        if self.overlap_p2p_comm and self.batch_p2p_comm:
+            raise ValueError(
+                'overlap_p2p_comm and batch_p2p_comm are mutually exclusive: '
+                'set batch_p2p_comm=False when overlap_p2p_comm=True '
+                '(Megatron 4ef31451d / Neuron_SP M1506).'
+            )
+        print('[M1506] BaseConfig.__post__init__: overlap_p2p_comm=%s '
+              'batch_p2p_comm=%s batch_p2p_sync=%s' % (
+                  self.overlap_p2p_comm, self.batch_p2p_comm, self.batch_p2p_sync))
