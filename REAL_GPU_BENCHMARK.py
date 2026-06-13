@@ -795,7 +795,15 @@ class TrainingConfig:
     #   use only when numerical precision matters more than memory efficiency.
     apply_query_key_layer_scaling: bool = False
     attention_softmax_in_fp32: bool = False
-    
+
+    # M1541: Megatron 28802670f — workaround for non-determinism in bf16 training.
+    # 鲁迅曾言：训练的可复现性如同黑夜里的灯笼，照亮脚下，却未必能照清前路。
+    # embedding_weights_in_fp32: cast word-embedding weight to fp32 before each
+    # forward lookup, then cast result back. Prevents scatter/gather non-determinism
+    # that arises when bf16 VocabParallelEmbedding weight indices hit rounding in
+    # different orders across ranks. Auto-disabled when params_dtype == float32.
+    embedding_weights_in_fp32: bool = False
+
     # M452: Megatron 66719e9 dataloader — replacement sampling + presplit sentences
     # Megatron configure_data.py: RandomSampler(replacement=True, num_samples=batch_size*train_iters)
     # Knuth §3.4.2 argues uniform replacement is strictly inferior to Fisher-Yates shuffle
@@ -913,6 +921,8 @@ class TrainingConfig:
             # M1513: Megatron 6902465a8 — GQA config fields
             'group_query_attention': self.group_query_attention,
             'num_query_groups': self.num_query_groups,
+            # M1541: Megatron 28802670f — embedding fp32 non-determinism workaround
+            'embedding_weights_in_fp32': self.embedding_weights_in_fp32,
         }
         print(f"[M1448-XFORMCFG] transformer config: "
               f"layers={xformer_cfg['num_layers']} "
@@ -1642,13 +1652,27 @@ class GPT(nn.Module):
                  param_sharing_style: str = 'grouped',
                  num_kv_heads: int = None,
                  group_query_attention: bool = False,
-                 num_query_groups: int = 1):
+                 num_query_groups: int = 1,
+                 embedding_weights_in_fp32: bool = False):
         super().__init__()
         self.max_seq_len = max_seq_len
         # M458: if QK layer scaling is on, fp32 softmax is auto-implied (Megatron 691747b1)
         _softmax_fp32 = attention_softmax_in_fp32 or apply_query_key_layer_scaling
         # M1510: resolve num_kv_heads — None → MHA (num_kv_heads == n_head)
         _num_kv_heads = num_kv_heads  # None is fine; CausalSelfAttention defaults to MHA
+
+        # M1541: Megatron 28802670f — non-determinism workaround for embedding scatter/gather.
+        # 鲁迅曾言：世上本无非确定性，遇到bf16的人多了，便有了。
+        # When training in bf16, VocabParallelEmbedding gathers weight shards across ranks;
+        # floating-point accumulation order differs per launch → results diverge across runs.
+        # Fix: temporarily upcast wte to fp32 before the gather, downcast output back.
+        # Auto-disable when model already runs in fp32 (no-op and wastes bandwidth).
+        self.embedding_weights_in_fp32 = embedding_weights_in_fp32
+        # Track params_dtype so forward() can cast back correctly (mirrors Megatron language_model.py)
+        self._params_dtype = torch.float32  # default; may be overridden by mixed-precision context
+        print(f"[M1541-GPT-INIT] embedding_weights_in_fp32={embedding_weights_in_fp32} "
+              f"(Megatron 28802670f non-determinism workaround; "
+              f"active only when training bf16)")
 
         # M1513: Megatron 6902465a8 — if group_query_attention is set, use num_query_groups
         # as the effective num_kv_heads. This maps the 6902465a8 parameter naming
@@ -1768,7 +1792,19 @@ class GPT(nn.Module):
                   f"ids[:8]={idx[0,:min(8,T)].tolist()} "
                   f"ids_hash={idx.float().sum().item():.0f}")
 
+        # M1541: Megatron 28802670f — upcast wte to fp32 before lookup to avoid
+        # scatter/gather non-determinism when training in bf16 (mirrors language_model.py).
+        # 鲁迅曾言：凡做大事者，须先铸钢而后铸炮——此处先铸fp32而后铸token。
+        if self.embedding_weights_in_fp32:
+            _orig_wte_dtype = self.transformer.wte.weight.dtype
+            self.transformer.wte = self.transformer.wte.to(torch.float32)
+            print(f"[M1541-FWD] rank={_r} step={s} "
+                  f"upcasting wte {_orig_wte_dtype}→fp32 for deterministic gather "
+                  f"(Megatron 28802670f workaround)")
         tok_emb = self.transformer.wte(idx)
+        if self.embedding_weights_in_fp32:
+            tok_emb = tok_emb.to(_orig_wte_dtype)
+            self.transformer.wte = self.transformer.wte.to(_orig_wte_dtype)
         pos_emb = self.transformer.wpe(pos)
         x = self.transformer.drop(tok_emb + pos_emb)
 
@@ -4273,6 +4309,8 @@ class Trainer:
             # M1513: Megatron 6902465a8 — group query attention with TP-aware KV partitioning
             group_query_attention=getattr(config, 'group_query_attention', False),
             num_query_groups=getattr(config, 'num_query_groups', 1),
+            # M1541: Megatron 28802670f — embedding fp32 non-determinism workaround
+            embedding_weights_in_fp32=getattr(config, 'embedding_weights_in_fp32', False),
             **model_config
         )
 
@@ -6004,6 +6042,11 @@ def main():
     parser.add_argument('--attention_softmax_in_fp32', action='store_true',
                         help='M458: Run attention softmax in fp32 (Megatron 691747b1). '
                              'Automatically set when --apply_query_key_layer_scaling is used.')
+    # M1541: Megatron 28802670f — non-determinism workaround for embedding in bf16 training
+    parser.add_argument('--embedding_weights_in_fp32', action='store_true',
+                        help='M1541: Cast word embedding weights to fp32 before forward lookup '
+                             '(Megatron 28802670f). Prevents scatter/gather non-determinism '
+                             'when training in bf16. No-op for fp32 models.')
     parser.add_argument('--zero_stage', type=int, default=0, choices=[0, 1, 2],
                         help='ZeRO stage (0=off, 1=optimizer state partition)')
     parser.add_argument('--cpu_offload', action='store_true',
@@ -6088,6 +6131,8 @@ def main():
         # M458: Megatron 691747b1 per-layer QK scaling + fp32 softmax
         apply_query_key_layer_scaling=args.apply_query_key_layer_scaling,
         attention_softmax_in_fp32=args.attention_softmax_in_fp32,
+        # M1541: Megatron 28802670f — embedding fp32 non-determinism workaround
+        embedding_weights_in_fp32=args.embedding_weights_in_fp32,
     )
     
     rank = int(os.environ.get('RANK', 0))
@@ -8257,6 +8302,11 @@ def _neuronsp_add_training_args_m484(parser):
                        help='Scale Q * K^T by 1 / layer-number.')
     group.add_argument('--attention_softmax_in_fp32', action='store_true',
                        help='Run attention masking and softmax in fp32.')
+    # M1541: Megatron 28802670f — embedding fp32 non-determinism workaround
+    group.add_argument('--embedding_weights_in_fp32', action='store_true',
+                       help='M1541: Cast word embedding weights to fp32 before embedding fwd '
+                            '(Megatron 28802670f). Required to maintain reproducibility '
+                            'when training in bf16.')
     print('[M484-TRAINING-ARGS] batch_size=None (not required); training arg group registered')
     return parser
 
