@@ -3239,25 +3239,58 @@ class DESLOCAdamW(torch.optim.Optimizer):
         # High variance → landscape is bumpy, workers diverge fast → sync more.
         # Low variance → landscape is smooth, local steps are safe → sync less.
         # Uses the rate-of-change history already collected at sync points.
+        # ── Smooth Adaptive Kx with EMA Drift + Cosine Floor ──
+        # Instead of 3 hard buckets (0.25/1.0/2.0), compute a continuous
+        # ratio from the exponential moving average of loss variance and
+        # parameter drift rate. The ratio smoothly interpolates between
+        # aggressive sync (ratio=0.25) and lazy sync (ratio=2.0) using
+        # a sigmoid mapping, avoiding the discontinuous jumps that cause
+        # sync oscillation when loss_std hovers near bucket boundaries.
+        #
+        # Additionally, apply a cosine floor: as training progresses past
+        # warmup, Kx_min rises via cos(pi * t/T) from 1 → Kx_target/2,
+        # reflecting the empirical observation that converging models
+        # tolerate more local steps (Stich 2019, Local SGD Converges Fast).
         if not hasattr(self, '_adaptive_loss_window'):
             self._adaptive_loss_window = []
+        if not hasattr(self, '_ema_loss_var'):
+            self._ema_loss_var = 0.0
+            self._ema_drift_rate = 0.0
         _adaptive_Kx_ratio = 1.0
         if len(self._adaptive_loss_window) >= 10 and Kx_target > 1:
             _recent = self._adaptive_loss_window[-50:]
             _mean = sum(_recent) / len(_recent)
             _var = sum((x - _mean) ** 2 for x in _recent) / len(_recent)
             _std = _var ** 0.5
-            if _std > 0.5:
-                _adaptive_Kx_ratio = 0.25
-            elif _std < 0.1:
-                _adaptive_Kx_ratio = 2.0
+            # EMA smoothing: avoids ratio thrashing on noisy loss signals
+            _ema_alpha = 0.05
+            self._ema_loss_var = (1 - _ema_alpha) * self._ema_loss_var + _ema_alpha * _std
+            # Incorporate parameter drift rate from rate_of_change history
+            _x_roc = self._rate_of_change.get('x', [])
+            if _x_roc:
+                _recent_roc = _x_roc[-10:]
+                _drift = sum(_recent_roc) / len(_recent_roc)
+                self._ema_drift_rate = (1 - _ema_alpha) * self._ema_drift_rate + _ema_alpha * _drift
             else:
-                _adaptive_Kx_ratio = 1.0
+                _drift = 0.0
+            # Smooth sigmoid mapping: high variance+drift → small ratio (sync more)
+            # σ(x) maps combined signal to [0.25, 2.0] range
+            _combined = self._ema_loss_var + self._ema_drift_rate * 5.0
+            _sigmoid_input = (_combined - 0.3) * 8.0  # centered at 0.3
+            _sigmoid = 1.0 / (1.0 + math.exp(max(-20, min(20, _sigmoid_input))))
+            _adaptive_Kx_ratio = 0.25 + _sigmoid * 1.75  # maps to [0.25, 2.0]
+            # Cosine floor: as training progresses, minimum Kx rises
+            _max_steps = getattr(self, '_expected_max_steps', 500)
+            if self.global_step > 100 and _max_steps > 100:
+                _progress = min(1.0, self.global_step / _max_steps)
+                _cosine_floor_ratio = 0.5 * (1.0 + math.cos(math.pi * (1.0 - _progress)))
+                _adaptive_Kx_ratio = max(_adaptive_Kx_ratio, 0.5 + _cosine_floor_ratio)
             if self.global_step % 50 == 1:
                 _r = dist.get_rank() if dist.is_initialized() else 0
                 print(f"[ADAPTIVE-KX] rank={_r} step={self.global_step} "
-                      f"loss_std={_std:.4f} ratio={_adaptive_Kx_ratio:.2f} "
-                      f"Kx: target={Kx_target} -> effective={max(1, int(Kx_target * _adaptive_Kx_ratio))}")
+                      f"ema_var={self._ema_loss_var:.4f} ema_drift={self._ema_drift_rate:.6f} "
+                      f"combined={_combined:.4f} ratio={_adaptive_Kx_ratio:.3f} "
+                      f"Kx: {Kx_target} -> {max(1, int(Kx_target * _adaptive_Kx_ratio))}")
 
         # --- Warmup: ramp Kx from 1 → Kx_target over warmup_steps ---
         # Charles et al. (2025): warm-start from DDP-equivalent training
@@ -3528,38 +3561,58 @@ class DESLOCAdamW(torch.optim.Optimizer):
         # Their average points NOWHERE useful. Decaying is strictly better:
         # it removes the stale signal without injecting a meaningless average.
         if sync_x:
-            # M448: Gradient variance-aware momentum decay.
-            # When grad norms vary widely across params, workers have diverged
-            # significantly → aggressive decay (0.05). When grads are uniform,
-            # workers are still aligned → gentle decay (0.5) preserves momentum.
-            _grad_norms_for_decay = []
+            # ── Drift-Proportional Per-Layer Momentum Decay ──
+            # Instead of a single global decay factor picked from 3 buckets,
+            # compute per-layer decay proportional to how much each layer's
+            # parameters drifted since last x-sync. Layers that drifted more
+            # have staler momentum → decay more aggressively. Layers that barely
+            # moved can keep their momentum as warm-start.
+            #
+            # decay_i = clip(1.0 - drift_i / (drift_median + eps), 0.02, 0.8)
+            # where drift_i = ||p_i_current - p_i_at_last_sync|| / ||p_i||
+            #
+            # This is strictly more informative than the old variance-of-norms
+            # heuristic, which treated all layers the same even when some layers
+            # (e.g., embeddings) barely move while others (attention heads) diverge.
+            _layer_decays = []
+            _pre_sync_key = '_param_snapshot_at_last_xsync'
             for grp in self.param_groups:
                 for p in grp['params']:
                     st = self.state.get(p, {})
-                    if 'exp_avg' in st:
-                        _gn = st['exp_avg'].float().norm().item()
-                        _grad_norms_for_decay.append(_gn)
-            if len(_grad_norms_for_decay) > 1:
-                _gn_mean = sum(_grad_norms_for_decay) / len(_grad_norms_for_decay)
-                _gn_var = sum((x - _gn_mean) ** 2 for x in _grad_norms_for_decay) / len(_grad_norms_for_decay)
-                if _gn_var > 1.0:
-                    momentum_decay_on_sync = 0.05
-                elif _gn_var < 0.01:
-                    momentum_decay_on_sync = 0.5
-                else:
-                    momentum_decay_on_sync = 0.1
+                    if 'exp_avg' not in st:
+                        continue
+                    _pid = id(p)
+                    _prev = getattr(self, f'{_pre_sync_key}_{_pid}', None)
+                    _pnorm = p.data.float().norm().item()
+                    if _prev is not None and _pnorm > 1e-12:
+                        _drift = (p.data.float() - _prev).norm().item() / _pnorm
+                    else:
+                        _drift = 0.1  # default: moderate decay on first sync
+                    _layer_decays.append((_pid, _drift, p, st))
+            # Compute median drift for normalization
+            if _layer_decays:
+                _drifts_only = sorted([d[1] for d in _layer_decays])
+                _drift_median = _drifts_only[len(_drifts_only) // 2]
+                _n_aggressive = 0
+                _n_gentle = 0
+                for _pid, _drift, _p, _st in _layer_decays:
+                    _ratio = _drift / (_drift_median + 1e-8)
+                    _decay = max(0.02, min(0.8, 1.0 - _ratio * 0.5))
+                    _st['exp_avg'].mul_(_decay)
+                    if _decay < 0.15:
+                        _n_aggressive += 1
+                    elif _decay > 0.4:
+                        _n_gentle += 1
+                    # Snapshot current params for next sync's drift calculation
+                    setattr(self, f'{_pre_sync_key}_{_pid}', _p.data.float().clone())
+                _r_md = dist.get_rank() if dist.is_initialized() else 0
+                print(f"[MDECAY] rank={_r_md} step={self.global_step} "
+                      f"n_layers={len(_layer_decays)} drift_median={_drift_median:.6f} "
+                      f"aggressive(<0.15)={_n_aggressive} gentle(>0.4)={_n_gentle} "
+                      f"drift_range=[{_drifts_only[0]:.6f}, {_drifts_only[-1]:.6f}]")
             else:
-                momentum_decay_on_sync = 0.1
-                _gn_var = 0.0
-            _r_md = dist.get_rank() if dist.is_initialized() else 0
-            print(f"[MDECAY] rank={_r_md} step={self.global_step} "
-                  f"m_var={_gn_var:.6f} decay={momentum_decay_on_sync:.2f} "
-                  f"n_params={len(_grad_norms_for_decay)}")
-            for group in self.param_groups:
-                for p in group['params']:
-                    state = self.state[p]
-                    if 'exp_avg' in state:
-                        state['exp_avg'].mul_(momentum_decay_on_sync)
+                _r_md = dist.get_rank() if dist.is_initialized() else 0
+                print(f"[MDECAY] rank={_r_md} step={self.global_step} n_layers=0 (no exp_avg yet)")
 
         # === RQ5: Nesterov outer optimizer (Section 5.5) ===
         # After AllReduce averaging, apply Nesterov momentum:
@@ -4862,21 +4915,67 @@ class Trainer:
                     if len(self.optimizer._adaptive_loss_window) > 200:
                         self.optimizer._adaptive_loss_window = self.optimizer._adaptive_loss_window[-200:]
 
-                # M447: STEP-DUMP — full state snapshot for debugging
+                # ── STEP-DIAG: Comprehensive real-time diagnostic dashboard ──
+                # Prints a structured state snapshot at every step (brief) and
+                # a full JSON dump every 10 steps. Designed for pipe-to-file +
+                # grep debugging workflow:
+                #   bash run.sh 2>&1 | tee train.log
+                #   grep '\[STEP-DIAG\]' train.log | python3 parse_diag.py
+                _sd_pnorm = sum(p.data.float().norm().item()**2
+                                for p in self.model.parameters())**0.5
+                _sd_gnorm = getattr(self.optimizer, '_last_grad_norm',
+                                    getattr(self.optimizer, '_cached_grad_norm', 0.0))
+                _sd_kx = getattr(self.optimizer, '_last_effective_Kx', self.config.Kx)
+                _sd_oas = getattr(self.optimizer, '_oas_scale', 1.0)
+                _sd_lr = self.optimizer.param_groups[0].get('lr', 0.0)
+                _sd_mem_alloc = torch.cuda.memory_allocated(self.device) / 1e9
+                _sd_mem_reserved = torch.cuda.memory_reserved(self.device) / 1e9
+                _sd_mem_max = torch.cuda.max_memory_allocated(self.device) / 1e9
+                _sd_loss = accumulated_loss.item()
+                # Compute per-layer gradient sparsity (% of near-zero grads)
+                _sd_sparsity = 0.0
+                _sd_total_params = 0
+                _sd_near_zero = 0
+                for _p in self.model.parameters():
+                    if _p.grad is not None:
+                        _sd_total_params += _p.grad.numel()
+                        _sd_near_zero += (_p.grad.abs() < 1e-7).sum().item()
+                if _sd_total_params > 0:
+                    _sd_sparsity = _sd_near_zero / _sd_total_params
+                # EMA drift from adaptive Kx
+                _sd_ema_var = getattr(self.optimizer, '_ema_loss_var', 0.0)
+                _sd_ema_drift = getattr(self.optimizer, '_ema_drift_rate', 0.0)
+                # Brief one-liner every step
+                print(f"[STEP-DIAG] r={self.rank} s={step} "
+                      f"L={_sd_loss:.5f} lr={_sd_lr:.2e} "
+                      f"‖g‖={_sd_gnorm:.3f} ‖p‖={_sd_pnorm:.1f} "
+                      f"Kx={_sd_kx} oas={_sd_oas:.0f} "
+                      f"mem={_sd_mem_alloc:.1f}/{_sd_mem_reserved:.1f}GB "
+                      f"spar={_sd_sparsity:.3f}")
+                # Full JSON dump every 10 steps for structured post-hoc analysis
                 if step % 10 == 0 or step <= 5:
-                    _sd_pnorm = sum(p.data.float().norm().item()**2
-                                    for p in self.model.parameters())**0.5
-                    _sd_gnorm = getattr(self.optimizer, '_last_grad_norm', 0.0)
-                    _sd_kx = getattr(self.optimizer, '_last_effective_Kx', self.config.Kx)
-                    _sd_oas = getattr(self.optimizer, '_oas_scale', 'N/A')
-                    print(f"[STEP-DUMP] rank={self.rank} step={step} "
-                          f"loss={accumulated_loss.item():.6f} "
-                          f"lr={self.optimizer.param_groups[0]['lr']:.2e} "
-                          f"grad_norm={_sd_gnorm:.4f} "
-                          f"param_norm={_sd_pnorm:.4f} "
-                          f"oas_scale={_sd_oas} "
-                          f"Kx_eff={_sd_kx} "
-                          f"mem={torch.cuda.memory_allocated(self.device)/1e9:.2f}GB")
+                    import json as _json_diag
+                    _diag_dict = {
+                        'step': step, 'rank': self.rank,
+                        'loss': round(_sd_loss, 6),
+                        'lr': _sd_lr,
+                        'grad_norm': round(_sd_gnorm, 6),
+                        'param_norm': round(_sd_pnorm, 4),
+                        'effective_Kx': _sd_kx,
+                        'oas_scale': _sd_oas,
+                        'mem_allocated_gb': round(_sd_mem_alloc, 3),
+                        'mem_reserved_gb': round(_sd_mem_reserved, 3),
+                        'mem_peak_gb': round(_sd_mem_max, 3),
+                        'grad_sparsity': round(_sd_sparsity, 4),
+                        'ema_loss_var': round(_sd_ema_var, 6),
+                        'ema_drift_rate': round(_sd_ema_drift, 8),
+                        'method': self.method,
+                        'Kx': self.config.Kx,
+                        'Ku': self.config.Ku,
+                        'Kv': self.config.Kv,
+                        'elapsed_sec': round(time.time() - start_time, 2),
+                    }
+                    print(f"[STEP-JSON] {_json_diag.dumps(_diag_dict)}")
 
                 # M365 DIAG: pre-sync param norm
                 _pre_sync_pnorm = None
