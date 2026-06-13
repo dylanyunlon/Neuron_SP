@@ -1,0 +1,45 @@
+diff --git a/megatron/core/model_parallel_config.py b/megatron/core/model_parallel_config.py
+index caae41cb4..f2751673e 100644
+--- a/megatron/core/model_parallel_config.py
++++ b/megatron/core/model_parallel_config.py
+@@ -213,6 +213,11 @@ class ModelParallelConfig:
+        If true, the AllGather -> Gemm overlap for FC1 layer of MLP gets disabled
+     """
+ 
++    tp_comm_bootstrap_backend: str = 'nccl'
++    """
++       Set the bootstrapping backend out of 'nccl', 'mpi', and 'gloo'
++    """
++
+     ###################
+     # Pipeline Parallel
+     ###################
+diff --git a/megatron/training/arguments.py b/megatron/training/arguments.py
+index 162d71931..e3d876a5f 100644
+--- a/megatron/training/arguments.py
++++ b/megatron/training/arguments.py
+@@ -1160,6 +1160,9 @@ def _add_training_args(parser):
+     group.add_argument('--disable-tp-comm-bulk-wgrad', action='store_false',
+                        help='Disables the Reduce-Scatter overlap with bprop weight gradient GEMM.',
+                        dest='tp_comm_bulk_wgrad')
++    group.add_argument('--tp-comm-bootstrap-backend', default='nccl', type=str,
++                       choices=['nccl', 'mpi', 'gloo'],
++                       help='Set the bootstrapping backend of Tensor parallel communications.')
+diff --git a/megatron/training/initialize.py b/megatron/training/initialize.py
+index 8e4877c8b..ad68ce8cb 100644
+--- a/megatron/training/initialize.py
++++ b/megatron/training/initialize.py
+@@ -211,12 +211,21 @@ def _initialize_tp_communicators():
+-    torch.distributed.new_group(backend='mpi')
+-    te_module.base.initialize_ub(shape = input_shape, tp_size = args.tensor_model_parallel_size,
+-                                 use_fp8 = (args.fp8 is not None) , ub_cfgs = ub_cfgs,)
++    if is_te_min_version("1.9.0"):
++        te_module.base.initialize_ub(shape = input_shape, tp_size = args.tensor_model_parallel_size,
++                                     use_fp8 = (args.fp8 is not None) , ub_cfgs = ub_cfgs,
++                                     bootstrap_backend = args.tp_comm_bootstrap_backend)
++    else:
++        if args.tp_comm_bootstrap_backend != 'mpi':
++            warnings.warn(...)
++        torch.distributed.new_group(backend='mpi')
++        te_module.base.initialize_ub(shape = input_shape, tp_size = args.tensor_model_parallel_size,
++                                     use_fp8 = (args.fp8 is not None) , ub_cfgs = ub_cfgs)

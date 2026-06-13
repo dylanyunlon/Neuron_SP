@@ -1643,3 +1643,52 @@ def patch_tp_comm_rs_dgrad_args(parser):
 
 
 print('[M1960]')
+
+# ---------------------------------------------------------------------------
+# M2030: Megatron f76b465e0 — Add TP communication bootstrap backend interface
+# Source: megatron/training/arguments.py _add_training_args()
+#
+# Mapping: megatron/training/arguments.py
+#        → deepspeed/compile/megatron_arguments.py
+#
+# Changes ported from arguments.py:
+#   group.add_argument('--tp-comm-bootstrap-backend', default='nccl', type=str,
+#                      choices=['nccl', 'mpi', 'gloo'],
+#                      help='Set the bootstrapping backend of Tensor parallel communications.')
+#
+# Placement: added alongside other TP comm overlap args (after --disable-tp-comm-bulk-wgrad).
+#
+# 20% adaptation (鲁迅式迁移):
+#   鲁迅曰：「命令行参数者，入口之钥也；无此钥则后端锁定于 mpi，
+#             如旧制度之枷锁，令人无从选择。今开 nccl/mpi/gloo 三门，
+#             用者自取，方为真正的接口开放。」
+#   - patch_tp_comm_bootstrap_backend_args(parser) 封装新参数，
+#     与既有 M1960 风格保持一致。
+#   - print('[M2030]') diagnostic added.
+# ---------------------------------------------------------------------------
+
+
+def patch_tp_comm_bootstrap_backend_args(parser):
+    """Register --tp-comm-bootstrap-backend CLI flag (Megatron f76b465e0 / M2030).
+
+    鲁迅曰：「mpi 独占后端之旧制，今以 --tp-comm-bootstrap-backend 破之；
+    nccl 为默，mpi、gloo 为辅，用者持钥开门，自择其路。」
+    Sets the bootstrapping backend for Tensor Parallel userbuffer communications.
+    Requires tp_comm_overlap=True and TransformerEngine >= 1.9.0 for non-mpi backends.
+    """
+    group = parser.add_argument_group(title='M2030 TP comm bootstrap backend')
+    group.add_argument(
+        '--tp-comm-bootstrap-backend',
+        default='nccl',
+        type=str,
+        choices=['nccl', 'mpi', 'gloo'],
+        help='Set the bootstrapping backend of Tensor parallel communications '
+             '(Megatron f76b465e0 / Neuron_SP M2030). '
+             'Requires --tp-comm-overlap. For TE < 1.9.0 only mpi is supported.',
+        dest='tp_comm_bootstrap_backend',
+    )
+    print('[M2030] patch_tp_comm_bootstrap_backend_args: --tp-comm-bootstrap-backend registered, '
+          'default=nccl, choices=[nccl, mpi, gloo]')
+
+
+print('[M2030]')

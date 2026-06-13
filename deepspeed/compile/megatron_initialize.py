@@ -408,3 +408,95 @@ def core_initialize_model_parallel(tensor_model_parallel_size,
     print(f'> initialized pipeline model parallel with size '
           f'{get_pipeline_model_parallel_world_size()}')
     print('[M1233] core_initialize_model_parallel: done.')
+
+# ---------------------------------------------------------------------------
+# M2030: Megatron f76b465e0 — Add TP communication bootstrap backend interface
+# Source: megatron/training/initialize.py _initialize_tp_communicators()
+#
+# Mapping: megatron/training/initialize.py
+#        → deepspeed/compile/megatron_initialize.py
+#
+# Changes ported from initialize.py:
+#   1. Import get_te_version, is_te_min_version from megatron.core.utils
+#      (mapped to deepspeed.compile.core_utils)
+#   2. In _initialize_tp_communicators():
+#      - Replace hardcoded torch.distributed.new_group(backend='mpi') +
+#        te_module.base.initialize_ub(...)  with TE version branch:
+#        * TE >= 1.9.0: pass bootstrap_backend=args.tp_comm_bootstrap_backend
+#          directly to initialize_ub (TE creates the process group internally)
+#        * TE < 1.9.0: warn if backend != 'mpi', then create MPI group and
+#          call initialize_ub without bootstrap_backend kwarg
+#
+# 20% adaptation (鲁迅式迁移):
+#   鲁迅曰：「旧代码以 mpi 为唯一后端，如铁屋中人，虽安于一隅却不知外有天地；
+#             今以版本判断开两门——新版 TE 自立门户，旧版 TE 仍守 mpi 旧制，
+#             但至少警告用者：此路仅此一条，莫强求。」
+#   - initialize_tp_communicators_m2030() 函数封装新逻辑，
+#     与既有 M1233 风格一致。
+#   - print('[M2030]') diagnostic added at module level.
+#   - print('[M2030-TP-INIT] ...') diagnostic added inside the function.
+# ---------------------------------------------------------------------------
+
+
+def initialize_tp_communicators_m2030(te_module, args, ub_cfgs):
+    """Initialize TP userbuffer communicators with configurable bootstrap backend.
+
+    M2030: megatron/training/initialize.py — replaces hardcoded MPI bootstrap
+    with a version-aware branch:
+      - TE >= 1.9.0: TE manages process group; pass bootstrap_backend kwarg.
+      - TE < 1.9.0:  Only MPI supported; create group manually, warn if other
+                     backend was requested.
+
+    鲁迅曰：「旧代码以 mpi 独占后端，犹如一家之言；
+             今以 is_te_min_version 辨新旧，各行其道，方为正途。」
+    """
+    # Lazy import — core_utils maps megatron.core.utils in this project
+    try:
+        from deepspeed.compile.core_utils import get_te_version, is_te_min_version
+        _have_te_version_utils = True
+    except ImportError:
+        _have_te_version_utils = False
+
+    input_shape = [
+        (args.seq_length * args.micro_batch_size) // args.context_parallel_size,
+        args.hidden_size,
+    ]
+    backend = getattr(args, 'tp_comm_bootstrap_backend', 'nccl')
+
+    print(f'[M2030-TP-INIT] initialize_tp_communicators: backend={backend} '
+          f'input_shape={input_shape} tp_size={args.tensor_model_parallel_size}')
+
+    if _have_te_version_utils and is_te_min_version("1.9.0"):
+        # TE >= 1.9.0: process group is created inside TE; pass backend kwarg.
+        print(f'[M2030-TP-INIT] TE >= 1.9.0 path: passing bootstrap_backend={backend} to initialize_ub')
+        te_module.base.initialize_ub(
+            shape=input_shape,
+            tp_size=args.tensor_model_parallel_size,
+            use_fp8=(args.fp8 is not None),
+            ub_cfgs=ub_cfgs,
+            bootstrap_backend=backend,
+        )
+    else:
+        # TE < 1.9.0: only MPI bootstrap is supported.
+        if backend != 'mpi':
+            import warnings
+            te_ver = get_te_version() if _have_te_version_utils else 'unknown'
+            warnings.warn(
+                f'[M2030] Transformer Engine v{te_ver} supports only MPI bootstrap backend. '
+                f'Requested backend={backend!r} ignored; falling back to mpi.'
+            )
+        print(f'[M2030-TP-INIT] TE < 1.9.0 path: creating MPI process group, bootstrap_backend forced to mpi')
+        # Create a MPI process group to help with TP communication overlap bootstrap.
+        import torch
+        torch.distributed.new_group(backend='mpi')
+        te_module.base.initialize_ub(
+            shape=input_shape,
+            tp_size=args.tensor_model_parallel_size,
+            use_fp8=(args.fp8 is not None),
+            ub_cfgs=ub_cfgs,
+        )
+
+    print(f'[M2030-TP-INIT] initialize_tp_communicators done.')
+
+
+print('[M2030]')

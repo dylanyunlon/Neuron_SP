@@ -267,6 +267,12 @@ class BaseConfig:
     # 鲁迅曰：「梯度计算与归约重叠，方为真正的流水线并行——不掩通信者，性能虚耗。」
     tp_comm_overlap_rs_dgrad: bool = False
 
+    # M2030: TP communication bootstrap backend (Megatron f76b465e0)
+    # 鲁迅曰：「通信后端之选择，如选路之岔口——nccl者速，mpi者稳，gloo者广；
+    #          旧代码硬写 mpi，不知变通，今以接口开放，让调用者自择其路。」
+    tp_comm_bootstrap_backend: str = 'nccl'
+    """Set the bootstrapping backend out of 'nccl', 'mpi', and 'gloo'"""
+
 
     def __post__init__(self):
         """ Python dataclass method that is used to modify attributes after initialization.
@@ -304,3 +310,23 @@ class BaseConfig:
         print('[M1506] BaseConfig.__post__init__: overlap_p2p_comm=%s '
               'batch_p2p_comm=%s batch_p2p_sync=%s' % (
                   self.overlap_p2p_comm, self.batch_p2p_comm, self.batch_p2p_sync))
+
+# ---------------------------------------------------------------------------
+# M2030: Megatron f76b465e0 — Add TP communication bootstrap backend interface
+# Source: megatron/core/model_parallel_config.py
+#
+# Mapping: megatron/core/model_parallel_config.py ModelParallelConfig
+#        → deepspeed/compile/core_base_config.py BaseConfig
+#
+# Changes ported:
+#   Field: tp_comm_bootstrap_backend: str = 'nccl'
+#     Set the bootstrapping backend out of 'nccl', 'mpi', and 'gloo'
+#
+# 20% adaptation (鲁迅式迁移):
+#   鲁迅曰：「通信后端之选择，如选路之岔口——nccl者速，mpi者稳，gloo者广；
+#             旧代码硬写 mpi，不知变通，犹如守旧官僚，误人不浅。
+#             今以 tp_comm_bootstrap_backend 开接口，让调用者自择其路。」
+#   - tp_comm_bootstrap_backend 字段加入 BaseConfig
+#   - print('[M2030]') diagnostic added.
+# ---------------------------------------------------------------------------
+print('[M2030] core_base_config: tp_comm_bootstrap_backend field added to BaseConfig (default=nccl)')

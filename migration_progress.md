@@ -215,3 +215,46 @@ git log --oneline | grep "M15" | tail -5
 
 ### 存档文件
 - `deepspeed/compile/core_transformer_parallel_attention.py` — 更新（推理 KV cache + RoPE + mask 逻辑重构）
+
+## M2030 — Megatron-LM commit f76b465e0: Add TP communication bootstrap backend interface
+
+**日期**: 2026-06-13  
+**来源**: NVIDIA/Megatron-LM@f76b465e0 (Add TP communication bootstrap backend interface)
+
+### 核心问题
+
+旧代码在 `_initialize_tp_communicators()` 中硬编码 `backend='mpi'`，调用 `torch.distributed.new_group(backend='mpi')`，完全不给用户选择。TransformerEngine >= 1.9.0 已支持在 `initialize_ub()` 内部自建进程组，并接受 `bootstrap_backend` 参数（nccl/mpi/gloo）。旧代码对此毫不知情，仍强制走 MPI 路径。
+
+### 修复要点
+
+1. **`model_parallel_config.py` → `core_base_config.py`**：
+   - 新增字段 `tp_comm_bootstrap_backend: str = 'nccl'`，位于 TP comm overlap 字段组末尾。
+
+2. **`arguments.py` → `megatron_arguments.py`**：
+   - 新增 `patch_tp_comm_bootstrap_backend_args(parser)`，注册 `--tp-comm-bootstrap-backend` 参数。
+   - choices=['nccl', 'mpi', 'gloo']，default='nccl'。
+
+3. **`initialize.py` → `megatron_initialize.py`**：
+   - 新增 `initialize_tp_communicators_m2030(te_module, args, ub_cfgs)` 函数。
+   - TE >= 1.9.0：直接传 `bootstrap_backend` 给 `initialize_ub()`，TE 内部建组。
+   - TE < 1.9.0：若 backend != 'mpi' 则 warnings.warn，然后仍走旧路（`new_group(backend='mpi')` + 无 bootstrap_backend 的 `initialize_ub()`）。
+
+### 鲁迅式评注（20% 适配注记）
+> 旧代码以 mpi 为唯一后端，如铁屋中人，虽安于一隅却不知外有天地；  
+> nccl 者速，mpi 者稳，gloo 者广——三门洞开，用者自择。  
+> TE 版本之墙，以 is_te_min_version 轻轻一推，新旧两路各行其道。  
+> 所谓接口，不在于写了多少代码，而在于给了用者多少选择。
+
+### 诊断 print 标记
+- `[M2030] core_base_config: tp_comm_bootstrap_backend field added to BaseConfig (default=nccl)` — 模块加载时
+- `[M2030] patch_tp_comm_bootstrap_backend_args: --tp-comm-bootstrap-backend registered, default=nccl, choices=[nccl, mpi, gloo]` — 参数注册时
+- `[M2030-TP-INIT] initialize_tp_communicators: backend=... input_shape=... tp_size=...` — 初始化入口
+- `[M2030-TP-INIT] TE >= 1.9.0 path: passing bootstrap_backend=... to initialize_ub` — 新版 TE 路径
+- `[M2030-TP-INIT] TE < 1.9.0 path: creating MPI process group, bootstrap_backend forced to mpi` — 旧版 TE 路径
+- `[M2030-TP-INIT] initialize_tp_communicators done.` — 初始化完成
+
+### 存档文件
+- `archive/patches/M2030_Megatron_f76b465e0_tp_comm_bootstrap_backend.patch` — 原始 Megatron diff
+- `deepspeed/compile/core_base_config.py` — tp_comm_bootstrap_backend 字段
+- `deepspeed/compile/megatron_arguments.py` — patch_tp_comm_bootstrap_backend_args()
+- `deepspeed/compile/megatron_initialize.py` — initialize_tp_communicators_m2030()
