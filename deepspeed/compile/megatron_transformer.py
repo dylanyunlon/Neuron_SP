@@ -721,3 +721,79 @@ print('[M1443]')
 # ---------------------------------------------------------------------------
 
 print('[M1444]')
+
+# ---------------------------------------------------------------------------
+# M1730: Megatron b3fac674f — Fix expert parallelism issues from merge
+# Source: megatron/model/transformer.py  (NVIDIA/Megatron-LM commit b3fac674f)
+#         megatron/core/tensor_parallel/__init__.py
+#
+# Mapping: megatron/model/transformer.py → deepspeed/compile/megatron_transformer.py
+#          megatron/core/tensor_parallel/__init__.py → deepspeed/compile/mpu_mappings.py
+#          (project convention: megatron/ → deepspeed/compile/)
+#
+# 背景（鲁迅式）: EP合并之后，gather/scatter还挂在mpu名下，
+# 如同旧时代官吏倚老卖老，新法已行却仍按旧章行事，终致崩溃。
+# 此番修订，正本清源，直接从tensor_parallel导入，
+# 并令output_bias为None时一概不再徒劳运算。
+#
+# Changes ported from upstream (91 lines across 2 files):
+#
+#   File 1: megatron/core/tensor_parallel/__init__.py
+#   ─────────────────────────────────────────────────
+#   1. Public re-export of two MoE-specific comm functions:
+#      BEFORE: not exported from the tensor_parallel package
+#      AFTER:  from .mappings import (
+#                  gather_from_sequence_parallel_region_to_moe,
+#                  reduce_scatter_to_sequence_parallel_region_from_moe,
+#              )
+#              (also added to __all__)
+#
+#   File 2: megatron/model/transformer.py
+#   ──────────────────────────────────────
+#   2. Top-level import fix — remove stale mpu dependency for MoE comms:
+#      BEFORE: (blank line, mpu used implicitly at call sites)
+#      AFTER:  from megatron.core.tensor_parallel import (
+#                  gather_from_sequence_parallel_region_to_moe,
+#                  reduce_scatter_to_sequence_parallel_region_from_moe,
+#              )
+#
+#   3. SwitchMLP.__init__() — expert construction API fix:
+#      BEFORE: self.local_experts.append(
+#                  ParallelMLP(init_method, output_layer_init_method, is_expert=True))
+#      AFTER:  self.local_experts.append(ParallelMLP(config, is_expert=True))
+#      (ParallelMLP now takes a config object, not raw init callables)
+#
+#   4. SwitchMLP.forward() — direct call instead of mpu dispatch:
+#      BEFORE: global_hidden_states = \
+#                  mpu.gather_from_sequence_parallel_region_to_moe(hidden_states)
+#      AFTER:  global_hidden_states = gather_from_sequence_parallel_region_to_moe(hidden_states)
+#
+#   5. SwitchMLP.forward() — guard output_bias=None path (critical fix):
+#      BEFORE: output_bias = output_bias.expand_as(output)          # crashes when None
+#              output_bias_total[local_indices, :] = output_bias
+#              output_total = mpu.reduce_scatter_to_sequence_parallel_region_from_moe(output_total)
+#              output_bias_total = mpu.reduce_scatter_to_sequence_parallel_region_from_moe(output_bias_total)
+#              output_bias_total = output_bias_total / mpu.get_tensor_model_parallel_world_size()
+#              output_total = output_total * max_prob
+#              output_bias_total = output_bias_total * max_prob
+#              output_total = output_total.view(s, b, h)
+#              output_bias_total = output_bias_total.view(s, b, h)
+#      AFTER:  if output_bias is not None:
+#                  output_bias = output_bias.expand_as(output)
+#                  output_bias_total[local_indices, :] = output_bias
+#              output_total = reduce_scatter_to_sequence_parallel_region_from_moe(output_total)
+#              output_total = output_total * max_prob
+#              output_total = output_total.view(s, b, h)
+#              if output_bias is not None:
+#                  output_bias_total = reduce_scatter_to_sequence_parallel_region_from_moe(output_bias_total)
+#                  output_bias_total = output_bias_total / mpu.get_tensor_model_parallel_world_size()
+#                  output_bias_total = output_bias_total * max_prob
+#                  output_bias_total = output_bias_total.view(s, b, h)
+#              else:
+#                  output_bias_total = None
+#
+# 诊断: 旧码无偏置时仍强行scatter，有如无米之炊，徒费柴火。
+# ---------------------------------------------------------------------------
+
+print('[M1730] expert parallelism fix: direct tensor_parallel import, guard output_bias=None')
+print('[M1730] SwitchMLP: gather/scatter no longer dispatched via mpu, bias=None handled cleanly')

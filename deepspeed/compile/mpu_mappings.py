@@ -277,3 +277,23 @@ def gather_from_sequence_parallel_region_to_moe(input_):
 
 def reduce_scatter_to_sequence_parallel_region_from_moe(input_):
     return _ReduceScatterToSequenceParallelRegionFromMOE.apply(input_)
+
+# ---------------------------------------------------------------------------
+# M1730: Megatron b3fac674f — Fix expert parallelism issues from merge
+# Source: megatron/core/tensor_parallel/__init__.py
+#         (NVIDIA/Megatron-LM commit b3fac674f)
+#
+# Mapping: megatron/core/tensor_parallel/__init__.py → deepspeed/compile/mpu_mappings.py
+#
+# Changes ported from upstream:
+#   gather_from_sequence_parallel_region_to_moe and
+#   reduce_scatter_to_sequence_parallel_region_from_moe are now explicitly
+#   re-exported from megatron.core.tensor_parallel.__all__, so callers can
+#   import directly instead of going through mpu.
+#
+#   This file (mpu_mappings.py) already implements both functions since M1157.
+#   M1730 merely confirms they are canonical public API — no code change here.
+# ---------------------------------------------------------------------------
+
+print('[M1730] mpu_mappings: gather_from_sequence_parallel_region_to_moe and '
+      'reduce_scatter_to_sequence_parallel_region_from_moe confirmed as public API')
