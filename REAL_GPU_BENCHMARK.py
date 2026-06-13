@@ -1152,6 +1152,15 @@ class CausalSelfAttention(nn.Module):
         s = _SP_CTX['step']
         _r = dist.get_rank() if dist.is_initialized() else 0
 
+        # M1510: GQA/MQA diagnostic — log KV expansion info once per 50 steps
+        if _diag and s % 50 == 1 and self.num_kv_heads < self.n_head:
+            with torch.no_grad():
+                print(f"[ATTN-GQA] rank={_r} step={s} layer={self.layer_number} "
+                      f"n_head={self.n_head} num_kv_heads={self.num_kv_heads} "
+                      f"groups={self.num_kv_groups} "
+                      f"Q={list(q.shape)} K={list(k.shape)} V={list(v.shape)} "
+                      f"(after repeat_interleave KV expansion)")
+
         # M458: QK scale diagnostic — log effective scale once per 50 steps so we
         # can verify per-layer attenuation is actually different across layers.
         if _diag and s % 50 == 1:
