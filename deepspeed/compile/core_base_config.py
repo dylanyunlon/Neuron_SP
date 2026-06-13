@@ -70,7 +70,7 @@ print('[M1420]')
 # __post__init__ with ValueError; print diagnostic added.
 # ---------------------------------------------------------------------------
 
-print('[M1506]')
+print('[M1506]')\n# ---------------------------------------------------------------------------\n# M1870: Megatron 7a70c5401 — GPT model level change for context parallelism\n# Source: megatron/core/model_parallel_config.py\n#\n# Mapping: megatron/core/model_parallel_config.py ModelParallelConfig\n#        → deepspeed/compile/core_base_config.py BaseConfig\n#\n# Changes ported:\n#   1. Docstring: add context_parallel_size description\n#   2. Field: context_parallel_size: int = 1  (after tensor_model_parallel_size)\n#\n# 20% adaptation (鲁迅式迁移):\n#   鲁迅云：「不在沉默中爆发，就在沉默中灭亡。」\n#   序列维度被切分，各rank各得其所，上下文并行从config始。\n#   print('[M1870]') diagnostic added.\n# ---------------------------------------------------------------------------\nprint('[M1870] context_parallel_size field added to BaseConfig')
 from typing import Callable
 
 import torch
@@ -84,6 +84,8 @@ class BaseConfig:
     -----------------
 
     tensor_model_parallel_size (int): Intra-layer model parallelism. Splits tensors across GPU ranks. Defaults to 1.
+
+    context_parallel_size (int): Splits network input along sequence dimension across GPU ranks. Defaults to 1.
 
     pipeline_model_parallel_size (int): Inter-layer model parallelism. Splits transformer layers across GPU
         ranks. Defaults to 1.
@@ -200,6 +202,7 @@ class BaseConfig:
 
     # Model parallelism
     tensor_model_parallel_size: int = 1
+    context_parallel_size: int = 1
     pipeline_model_parallel_size: int = 1
     virtual_pipeline_model_parallel_size: int = None
     sequence_parallel: bool = False

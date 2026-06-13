@@ -65,7 +65,25 @@
 # backend bundled inside Neuron_SP.  Adds print('[M1312]') marker.
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# M1870: Megatron 7a70c5401 — GPT model level change for context parallelism
+# Source: megatron/core/models/gpt/gpt_model.py
+#
+# Changes ported:
+#   1. GPTModel.get_pos_emb_on_this_cp_rank(pos_emb, seq_dim):
+#      Slices rotary positional embeddings for the current CP rank using a
+#      mirrored index pattern [cp_rank, 2*cp_size - cp_rank - 1].
+#   2. GPTModel.forward: rotary_seq_len *= context_parallel_size
+#   3. GPTModel.forward: call get_pos_emb_on_this_cp_rank when cp_size > 1
+#
+# 20% adaptation (鲁迅式迁移):
+#   鲁迅云：「横眉冷对千夫指，俯首甘为孺子牛。」
+#   位置编码本无涯，上下文并行划其境，各rank守一隅，合则知全序。
+#   Adds print('[M1870]') diagnostic markers at key code paths.
+# ---------------------------------------------------------------------------
+
 print('[M1312]')
+print('[M1870] GPT model context parallelism: get_pos_emb_on_this_cp_rank loaded')
 
 import torch
 from torch import Tensor
@@ -146,6 +164,25 @@ class GPTModel(MegatronModule):
         assert len(input_tensor) == 1, 'input_tensor should only be length 1 for gpt'
         self.transformer_block.set_input_tensor(input_tensor[0])
 
+    def get_pos_emb_on_this_cp_rank(self, pos_emb, seq_dim):
+        """Slice rotary positional embeddings for the current context-parallel rank.
+
+        M1870: mirrors the mirrored-index scheme from Megatron 7a70c5401:
+          each CP rank owns tokens [cp_rank, 2*cp_size - cp_rank - 1] within
+          each 2*cp_size-sized chunk, enabling ring-attention causal masking.
+        """
+        cp_size = self.config.context_parallel_size
+        cp_rank = parallel_state.get_context_parallel_rank()
+        cp_idx = torch.tensor([cp_rank, (2 * cp_size - cp_rank - 1)], device=pos_emb.device)
+        pos_emb = pos_emb.view(
+            *pos_emb.shape[:seq_dim], 2 * cp_size, -1, *pos_emb.shape[(seq_dim + 1):]
+        )
+        pos_emb = pos_emb.index_select(seq_dim, cp_idx)
+        pos_emb = pos_emb.view(*pos_emb.shape[:seq_dim], -1, *pos_emb.shape[(seq_dim + 2):])
+        print('[M1870] get_pos_emb_on_this_cp_rank: cp_rank=%d cp_size=%d out_shape=%s'
+              % (cp_rank, cp_size, list(pos_emb.shape)))
+        return pos_emb
+
     def forward(
         self,
         input_ids: Tensor,
@@ -163,12 +200,34 @@ class GPTModel(MegatronModule):
             # transformer_block will get hidden_states from input_tensor
             encoder_input = None
 
+        # M1870: Rotary positional embedding CP-aware length scaling.
+        # When context_parallel_size > 1, the full sequence is distributed
+        # across ranks; rotary_seq_len must span the full (unsharded) sequence
+        # so that each rank sees the correct absolute positional indices before
+        # slicing its own shard.
+        rotary_pos_emb = None
+        if hasattr(self, 'rotary_pos_emb'):
+            rotary_seq_len = self.max_sequence_length
+            if self.config.sequence_parallel:
+                rotary_seq_len *= self.config.tensor_model_parallel_size
+            rotary_seq_len *= self.config.context_parallel_size
+            rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len)
+            # Slice rotary_pos_emb along sequence dim and select the partition
+            # of the current CP rank (M1870).
+            if self.config.context_parallel_size > 1:
+                print('[M1870] forward: slicing rotary_pos_emb for cp_size=%d'
+                      % self.config.context_parallel_size)
+                rotary_pos_emb = self.get_pos_emb_on_this_cp_rank(rotary_pos_emb, 0)
+
         # Run transformer.
-        hidden_states = self.transformer_block(
+        transformer_kwargs = dict(
             hidden_states=encoder_input,
             attention_mask=attention_mask,
             inference_params=inference_params,
         )
+        if rotary_pos_emb is not None:
+            transformer_kwargs['rotary_pos_emb'] = rotary_pos_emb
+        hidden_states = self.transformer_block(**transformer_kwargs)
 
         if self.post_process:
             logits = self.post_language_model_processing(

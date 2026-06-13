@@ -66,6 +66,23 @@ print('[M1425]')
 print('[M1525]')
 print('[M1527]')
 print('[M1750]')
+# ---------------------------------------------------------------------------
+# M1870: Megatron 7a70c5401 — GPT model level change for context parallelism
+# Source: megatron/core/transformer/custom_layers/transformer_engine.py
+#
+# Changes ported:
+#   1. Expand parallel_state import: add get_context_parallel_global_ranks,
+#      get_context_parallel_group.
+#   2. cp_stream = torch.cuda.Stream() module-level CUDA stream for CP comms.
+#   3. TEDotProductAttention.__init__: pass cp_group, cp_global_ranks, cp_stream
+#      to te.pytorch.DotProductAttention super().__init__.
+#
+# 20% adaptation (鲁迅式迁移):
+#   鲁迅云：「真的猛士，敢于直面惨淡的人生，敢于正视淋漓的鲜血。」
+#   注意力之计算，跨rank之通信，cp_stream承载异步之望，各rank之数据轮转如环。
+#   Adds print('[M1870]') diagnostic markers.
+# ---------------------------------------------------------------------------
+print('[M1870] context parallelism: cp_stream + CP group args for TEDotProductAttention')
 import torch
 import transformer_engine as te
 from importlib.metadata import version as _te_version
@@ -73,8 +90,17 @@ from pkg_resources import packaging as _pkg
 
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.enums import AttnMaskType
-from megatron.core.parallel_state import get_tensor_model_parallel_group
+from megatron.core.parallel_state import (
+    get_context_parallel_global_ranks,
+    get_context_parallel_group,
+    get_tensor_model_parallel_group,
+)
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
+
+# M1870: Dedicated CUDA stream for context-parallel ring-attention communication.
+# Allows CP all-to-all comms to overlap with compute on the main stream.
+cp_stream = torch.cuda.Stream()
+print('[M1870] cp_stream created: %s' % cp_stream)
 
 
 class TELayerNorm(te.pytorch.module.LayerNorm):
@@ -296,5 +322,9 @@ class TEDotProductAttention(te.pytorch.transformer.DotProductAttention):
             tp_size=self.config.tensor_model_parallel_size,
             get_rng_state_tracker=get_cuda_rng_tracker,
             tp_group=get_tensor_model_parallel_group(),
+            cp_group=get_context_parallel_group(),
+            cp_global_ranks=get_context_parallel_global_ranks(),
+            cp_stream=cp_stream,
             **kwargs
         )
+        print('[M1870] TEDotProductAttention.__init__: cp_group=%s' % get_context_parallel_group())
