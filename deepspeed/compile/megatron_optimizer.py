@@ -282,6 +282,27 @@ from abc import abstractmethod
 
 import torch
 
+# ---------------------------------------------------------------------------
+# M2000: Megatron de16089be — Distributed optimizer for TE/Apex-independent training
+# Source: megatron/core/optimizer/distrib_optimizer.py
+#
+# HAVE_APEX_OR_TE flag: True when transformer_engine.pytorch or apex.optimizers.FusedAdam
+# is importable; False when falling back to native torch.optim.Adam.
+# This flag gates step-tensor handling differences between Apex/TE and native Adam.
+# ---------------------------------------------------------------------------
+try:
+    import transformer_engine  # noqa: F401
+    HAVE_APEX_OR_TE = True
+except ImportError:
+    try:
+        from apex.optimizers import FusedAdam as _FusedAdam  # noqa: F401
+        HAVE_APEX_OR_TE = True
+    except ImportError:
+        from torch.optim import Adam as _TorchAdam  # noqa: F401
+        HAVE_APEX_OR_TE = False
+
+print(f'[M2000] HAVE_APEX_OR_TE={HAVE_APEX_OR_TE}')
+
 from apex.multi_tensor_apply import multi_tensor_applier
 import amp_C
 
@@ -1200,10 +1221,32 @@ class Float16DistributedOptimizer(BaseFloat16Optimizer):
         return self.get_main_param(group_index).grad
 
     def state_dict(self):
+        # M2000: cache state_dict once; avoids calling self.optimizer.state_dict() twice.
+        inner_state_dict = self.optimizer.state_dict()
+        print(f'[M2000] Float16DistributedOptimizer.state_dict: '
+              f'HAVE_APEX_OR_TE={HAVE_APEX_OR_TE}, '
+              f'num_param_groups={len(inner_state_dict.get("param_groups", []))}')
         state_dict = {}
-        state_dict['optimizer'] = self.optimizer.state_dict()
+
+        # M2000: Extract global 'step' for native PyTorch Adam (non-Apex/TE).
+        # Native Adam stores per-param step tensors; we consolidate to one scalar
+        # and store it in each param_group so load_state_dict() can reinject it.
+        if not HAVE_APEX_OR_TE:
+            steps = list(set([s['step'].item() for s in inner_state_dict['state'].values()]))
+            assert len(steps) == 1, f'[M2000] expected uniform step; got {steps}'
+            step = steps[0]
+            print(f'[M2000] state_dict: extracted step={step}')
+
+        state_dict['optimizer'] = {k: v for k, v in inner_state_dict.items() if k != 'state'}
         if self.grad_scaler:
             state_dict['grad_scaler'] = self.grad_scaler.state_dict()
+
+        for param_group in state_dict['optimizer']['param_groups']:
+            if not HAVE_APEX_OR_TE:
+                # Native PyTorch Adam param_group must carry step for checkpoint round-trip.
+                param_group['step'] = step
+                print(f'[M2000] state_dict: injecting step={step} into param_group')
+
         state_dict['groups'] = [g['params'] for g in self.optimizer.param_groups]
         return state_dict
 
@@ -1213,7 +1256,19 @@ class Float16DistributedOptimizer(BaseFloat16Optimizer):
             optimizer_key = 'optimizer_state_dict'
             print_rank_0('***WARNING*** loading optimizer from '
                          'an old checkpoint ...')
+        print(f'[M2000] Float16DistributedOptimizer.load_state_dict: '
+              f'HAVE_APEX_OR_TE={HAVE_APEX_OR_TE}')
         self.optimizer.load_state_dict(state_dict[optimizer_key])
+
+        # M2000: Reinject 'step' into per-param optimizer state for native PyTorch Adam.
+        # Apex/TE stores step differently (or not at all); only needed for torch.optim.Adam.
+        if not HAVE_APEX_OR_TE:
+            steps = list(set([g['step'] for g in state_dict[optimizer_key]['param_groups']]))
+            assert len(steps) == 1, f'[M2000] expected uniform step in ckpt; got {steps}'
+            step = torch.tensor(steps[0], dtype=torch.float)
+            for s in self.optimizer.state.values():
+                s['step'] = step
+            print(f'[M2000] load_state_dict: reinjected step={step.item()} into optimizer state')
 
         # Grad scaler.
         if 'grad_scaler' not in state_dict:

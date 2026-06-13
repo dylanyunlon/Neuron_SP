@@ -597,10 +597,56 @@ def _load_checkpoint_finetune_notes():
         + else:
         +     if args.fp16 and optimizer is not None:
         +         optimizer.reload_model_params()
+
+    M2000 (Megatron de16089be) further changes the except clause:
+        - except KeyError:
+        -     print_rank_0('Unable to load optimizer ...')
+        -     sys.exit()
+        + except KeyError as e:
+        +     print_rank_0('Unable to load optimizer ...')
+        +     raise e
+      Raising the original exception (instead of sys.exit) preserves the full
+      traceback and lets callers catch the error for graceful recovery rather
+      than hard-exiting the process.
     """
     pass  # documentation-only function
 
 print('[M1278]')
+
+
+def load_optimizer_state_safe(optimizer, state_dict, checkpoint_name):
+    """Load optimizer state from *state_dict*, raising KeyError with traceback on failure.
+
+    M2000 (Megatron de16089be) megatron/training/checkpointing.py load_checkpoint():
+      Converts the bare except-and-sys.exit pattern into except-as-e + raise e so
+      that the original KeyError (and its traceback) propagates to the caller rather
+      than silently killing the process.
+
+        BEFORE:
+            except KeyError:
+                print_rank_0('Unable to load optimizer from checkpoint {}'.format(...))
+                sys.exit()
+
+        AFTER:
+            except KeyError as e:
+                print_rank_0('Unable to load optimizer from checkpoint {}'.format(...))
+                raise e
+
+    DES-LOC adaptation: extracted into a standalone helper so that distributed
+    checkpoint loading (DES-LOC partitioned optimizer state) can reuse the
+    error-raising pattern without duplicating the try/except block.
+    """
+    try:
+        optimizer.load_state_dict(state_dict)
+        print(f'[M2000] load_optimizer_state_safe: optimizer loaded from {checkpoint_name}')
+    except KeyError as e:
+        print_rank_0(
+            f'[M2000] Unable to load optimizer from checkpoint {checkpoint_name}. '
+            'Specify --no-load-optim or --finetune to prevent attempting to load '
+            'the optimizer state.'
+        )
+        print(f'[M2000] KeyError detail: {e!r}')
+        raise e
 
 # ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------

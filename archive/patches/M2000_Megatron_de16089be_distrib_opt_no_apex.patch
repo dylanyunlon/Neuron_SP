@@ -1,0 +1,86 @@
+diff --git a/megatron/core/optimizer/distrib_optimizer.py b/megatron/core/optimizer/distrib_optimizer.py
+index d31cbf108..39e5000b2 100644
+--- a/megatron/core/optimizer/distrib_optimizer.py
++++ b/megatron/core/optimizer/distrib_optimizer.py
+@@ -17,6 +17,8 @@ except ImportError:
+     try:
+         from apex.optimizers import FusedAdam as Adam
+     except ImportError:
++        from torch.optim import Adam
++
+         HAVE_APEX_OR_TE = False
+ 
+ from .. import parallel_state, tensor_parallel
+@@ -407,10 +409,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
+                 distributed checkpointing logic).
+         """
+ 
+-        assert (
+-            HAVE_APEX_OR_TE
+-        ), f'Please install Apex or Transformer Engine to use DistributedOptimizer.'
+-
+         super().__init__(
+             optimizer,
+             config,
+@@ -560,14 +558,22 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
+         checkpoint file by calling 'save_parameter_state()'.
+         """
+ 
++        inner_state_dict = self.optimizer.state_dict()
+         state_dict = {}
+ 
++        # Extract 'step', for non-Apex/TE support.
++        if not HAVE_APEX_OR_TE:
++            steps = list(set([s["step"].item() for s in inner_state_dict["state"].values()]))
++            assert len(steps) == 1
++            step = steps[0]
++
+         # Optimizer state (do not store parameter state here).
+-        state_dict['optimizer'] = {
+-            k: v for k, v in self.optimizer.state_dict().items() if k != "state"
+-        }
++        state_dict['optimizer'] = {k: v for k, v in inner_state_dict.items() if k != "state"}
+         for param_group in state_dict["optimizer"]["param_groups"]:
+             del param_group["params"]
++            if not HAVE_APEX_OR_TE:
++                # Native PyTorch param group requires step (i.e., iteration).
++                param_group["step"] = step
+ 
+         # Grad scaler state.
+         if self.grad_scaler:
+@@ -654,6 +660,16 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
+         state_dict_state.sort(key=lambda s: s[0])
+         state_dict_state = {s[0]: s[1] for s in state_dict_state}
+ 
++        # Extract 'step', for non-Apex/TE support.
++        if not HAVE_APEX_OR_TE:
++            steps = list(set([g["step"] for g in state_dict["optimizer"]["param_groups"]]))
++            assert len(steps) == 1
++            step = torch.tensor(steps[0], dtype=torch.float)
++
++            for s in state_dict_state.values():
++                # Native PyTorch state dict requires step (i.e., iteration).
++                s["step"] = step
++
+         # Optimizer.
+         self.optimizer.load_state_dict(
+             {
+diff --git a/megatron/training/checkpointing.py b/megatron/training/checkpointing.py
+index 5a2bfffc8..5572b0074 100644
+--- a/megatron/training/checkpointing.py
++++ b/megatron/training/checkpointing.py
+@@ -1075,12 +1075,12 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
+                     opt_param_scheduler.load_state_dict(state_dict['lr_scheduler'])
+                 else:
+                     opt_param_scheduler.load_state_dict(state_dict['opt_param_scheduler'])
+-        except KeyError:
++        except KeyError as e:
+             print_rank_0('Unable to load optimizer from checkpoint {}. '
+                          'Specify --no-load-optim or --finetune to prevent '
+                          'attempting to load the optimizer state, '
+                          'exiting ...'.format(checkpoint_name))
+-            sys.exit()
++            raise e
+     else:
+         if (args.fp16 or args.bf16) and optimizer is not None:
+             optimizer.reload_model_params()

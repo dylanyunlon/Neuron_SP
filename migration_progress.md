@@ -1,8 +1,8 @@
 # Megatron-LM → Neuron_SP Migration Progress
 
 ## 状态
-- 最新处理: M1980 (Megatron 5486c69c6 — Add debug timing utilities)
-- 总进度: 144/7156 commits (2.0%)
+- 最新处理: M2000 (Megatron de16089be — Distributed optimizer for TE/Apex-independent training)
+- 总进度: 145/7156 commits (2.0%)
 - 实际代码改动 commits: M1445(partial AC), M1500(SwiGLU)
 - 小弟 dispatched: M1461(dist ckpt), M1510(MQA)
 
@@ -146,3 +146,38 @@ git log --oneline | grep "M15" | tail -5
 ### 存档文件
 - `deepspeed/compile/core_tensor_parallel_cross_entropy.py` — 更新（含 VocabParallelCrossEntropy 类）
 - `deepspeed/compile/core_fusions_fused_cross_entropy.py` — 新增 fused 路径
+## M2000 — Megatron-LM commit de16089be: Distributed optimizer for TE/Apex-independent training
+
+**日期**: 2026-06-13  
+**来源**: NVIDIA/Megatron-LM@de16089be (Distributed optimizer for TE/Apex-independent training)
+
+### 修改要点
+1. **`megatron_optimizer.py` — `HAVE_APEX_OR_TE` 标志**:
+   - 新增三级 try/except 导入检测: transformer_engine → apex.optimizers.FusedAdam → torch.optim.Adam
+   - `HAVE_APEX_OR_TE=False` 时使用原生 PyTorch Adam，不再强制依赖 Apex/TE
+   - 移除 `DistributedOptimizer.__init__()` 中的 `assert HAVE_APEX_OR_TE`（对应 Float16DistributedOptimizer）
+
+2. **`megatron_optimizer.py` — `Float16DistributedOptimizer.state_dict()`**:
+   - 缓存 `inner_state_dict = self.optimizer.state_dict()` 避免二次调用
+   - `HAVE_APEX_OR_TE=False` 时从 per-param state 提取统一 step 值写入 param_group
+   - 旧代码: `{k: v for k, v in self.optimizer.state_dict().items() if k != "state"}` → 新: 复用 inner_state_dict
+
+3. **`megatron_optimizer.py` — `Float16DistributedOptimizer.load_state_dict()`**:
+   - `HAVE_APEX_OR_TE=False` 时从 ckpt param_group 读取 step，注入回 per-param optimizer state
+   - 原生 Adam 要求 state["step"] 为 float tensor，`torch.tensor(step, dtype=torch.float)`
+
+4. **`megatron_checkpointing.py` — `load_optimizer_state_safe()`**:
+   - 新增辅助函数实现 `except KeyError as e: raise e` 模式（替代旧的 sys.exit）
+   - 保留完整 traceback，让调用方可以 catch 并做优雅恢复
+
+### 鲁迅式评注（20% 适配注记）
+> 铁屋中的 Apex，今已成一道非必要的门槛。  
+> 旧代码以 assert HAVE_APEX_OR_TE 把守，寒冬无处投身；  
+> 今改以 HAVE_APEX_OR_TE 标志，使原生 Adam 亦可上堂。  
+> step 之一字，Apex 藏之于暗，PyTorch 晒之于阳；  
+> 保存时摘下，加载时戴回，往来之间，无痛而化。
+
+### 存档文件
+- `archive/patches/M2000_Megatron_de16089be_distrib_opt_no_apex.patch` — 原始 Megatron diff
+- `deepspeed/compile/megatron_optimizer.py` — HAVE_APEX_OR_TE 标志 + state_dict/load_state_dict 适配
+- `deepspeed/compile/megatron_checkpointing.py` — load_optimizer_state_safe() helper (except KeyError as e)
