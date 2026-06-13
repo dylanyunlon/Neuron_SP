@@ -797,3 +797,71 @@ print('[M1444]')
 
 print('[M1730] expert parallelism fix: direct tensor_parallel import, guard output_bias=None')
 print('[M1730] SwitchMLP: gather/scatter no longer dispatched via mpu, bias=None handled cleanly')
+
+# ---------------------------------------------------------------------------
+# M1880: Megatron 063edede9 — Bug fix for no sequence and expert parallel case
+# Source: megatron/model/transformer.py
+#         (NVIDIA/Megatron-LM commit 063edede9)
+#         megatron/core/transformer/switch_mlp.py
+#         (NVIDIA/Megatron-LM commit 063edede9)
+#
+# Mapping: megatron/model/transformer.py     -> deepspeed/compile/megatron_transformer.py
+#          megatron/core/transformer/switch_mlp.py -> deepspeed/compile/core_transformer_switch_mlp.py
+#          (project convention: megatron/ -> deepspeed/compile/)
+#
+# 背景（鲁迅式）: 昔人造屋，不论晴雨，一概开天窗迎雨；
+# 今番始悟，无雨之日大可不开，白白受了风寒。
+# gather与scatter本为sequence parallel与expert parallel而设，
+# 若二者皆无，强行调用，犹如无病服药，百害而无一利。
+# 此番修订，正本清源，条件守门，免去无谓通信。
+#
+# Changes ported from upstream (megatron/model/transformer.py):
+#
+#   SwitchMLP.forward() — guard gather with SP/EP condition [line ~233]:
+#
+#   BEFORE:
+#     global_hidden_states = \
+#         gather_from_sequence_parallel_region_to_moe(hidden_states)
+#     global_indices = self.gather_indices(max_ind)
+#
+#   AFTER:
+#     if self.sequence_parallel or (self.expert_parallel_size > 1):
+#         global_hidden_states = \
+#             gather_from_sequence_parallel_region_to_moe(hidden_states)
+#         global_indices = self.gather_indices(max_ind)
+#     else:
+#         global_hidden_states = hidden_states
+#         global_indices = max_ind
+#
+#   SwitchMLP.forward() — guard scatter with SP/EP condition [line ~255]:
+#
+#   BEFORE:
+#     output_total = \
+#         reduce_scatter_to_sequence_parallel_region_from_moe(output_total)
+#     if self.add_bias:
+#         output_bias_total = \
+#             reduce_scatter_to_sequence_parallel_region_from_moe(output_bias_total)
+#         output_bias_total = \
+#             output_bias_total/mpu.get_tensor_model_parallel_world_size()
+#
+#   AFTER:
+#     if self.sequence_parallel or (self.expert_parallel_size > 1):
+#         output_total = \
+#             reduce_scatter_to_sequence_parallel_region_from_moe(output_total)
+#         if self.add_bias:
+#             output_bias_total = \
+#                 reduce_scatter_to_sequence_parallel_region_from_moe(output_bias_total)
+#             output_bias_total = \
+#                 output_bias_total/mpu.get_tensor_model_parallel_world_size()
+#
+# Additional fix (core/transformer/switch_mlp.py):
+#   upstream commit has typo 'globa_indices = max_ind' in the else branch;
+#   NSP port corrects to 'global_indices = max_ind' — the variable is used
+#   on the next line in the for-loop as (global_indices == local_expert_index).
+#
+# 诊断: 无SP/EP时仍强行gather/scatter，
+# 犹如太平盛世仍按战时粮票配给，
+# 徒增耗损，贻误百姓。
+# ---------------------------------------------------------------------------
+
+print('[M1880] megatron_transformer: SwitchMLP.forward guard SP/EP for gather/scatter; fix globa_indices typo')
