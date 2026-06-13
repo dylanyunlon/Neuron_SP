@@ -3972,6 +3972,25 @@ class Trainer:
             dist.init_process_group(backend='nccl')
             torch.cuda.set_device(self.local_rank)
 
+        # M1454: Megatron 120300178 — Initialize FP8 amax reduction group.
+        # FP8 training requires an amax reduction group spanning TP×DP ranks
+        # for scaling factor synchronization. In Neuron_SP (no TP), the group
+        # equals the full world group. We create it proactively so that
+        # TransformerEngine layers can find it when FP8 is enabled.
+        # DES-LOC twist: log GPU capabilities to diagnose FP8 support
+        # (requires SM89+ / Hopper for hardware FP8).
+        self._amax_reduction_group = None
+        if self.world_size > 1 and dist.is_initialized():
+            _gpu_name = torch.cuda.get_device_name(self.local_rank)
+            _sm_major = torch.cuda.get_device_capability(self.local_rank)[0]
+            _fp8_capable = _sm_major >= 9  # Hopper (SM90) or newer
+            if _fp8_capable:
+                self._amax_reduction_group = dist.new_group(
+                    ranks=list(range(self.world_size)))
+            print(f"[M1454-FP8] rank={self.rank} gpu='{_gpu_name}' "
+                  f"sm={_sm_major} fp8_capable={_fp8_capable} "
+                  f"amax_group={'created' if _fp8_capable else 'skipped'}")
+
         self.device = torch.device(f'cuda:{self.local_rank}')
 
         # Reproducibility
