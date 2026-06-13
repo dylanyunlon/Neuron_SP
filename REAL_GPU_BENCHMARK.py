@@ -760,6 +760,14 @@ class TrainingConfig:
     # for finite datasets (coupon-collector waste). We implement it anyway because the
     # benchmark cares about throughput stability, not convergence quality.
     seed: int = 42                       # generator seed (rank-offset applied per worker)
+
+    # M1453: Megatron 8c86034b6 — Separate data cache path from data directory.
+    # Index files (doc_idx.npy, sample_idx.npy, shuffle_idx.npy) go here instead
+    # of next to the data files. Enables read-only NFS data mounts.
+    # DES-LOC 20% adaptation: when set, each rank gets its own subdirectory
+    # (data_cache_path/rank_{N}/) to avoid write contention on shared filesystems
+    # during parallel index building. Content-addressed via MD5(desc) per Megatron.
+    data_cache_path: str = ""
     replacement_sampling: bool = False   # enable with-replacement RandomSampler (Megatron 66719e9)
     presplit_sentences: bool = False     # data pre-split into newline-separated sentences
 
@@ -2267,6 +2275,22 @@ def _make_dataloader_m452(dataset, config: 'TrainingConfig',
         import sys; sys.exit(1)
 
     n_total = config.batch_size * config.max_steps * config.gradient_accumulation
+
+    # M1453: Megatron 8c86034b6 — Data cache path for index files.
+    # When data_cache_path is set, index files (doc_idx/sample_idx/shuffle_idx)
+    # go to a separate writable directory instead of next to the data.
+    # DES-LOC: each rank gets its own subdirectory to avoid write contention.
+    _cache_path = getattr(config, 'data_cache_path', '')
+    if _cache_path:
+        _rank_cache = os.path.join(_cache_path, f"rank_{rank}")
+        os.makedirs(_rank_cache, exist_ok=True)
+        print(f"[M1453-CACHE] rank={rank} data_cache_path='{_rank_cache}' "
+              f"(index files separated from data dir)")
+    else:
+        _rank_cache = None
+        if rank == 0:
+            print(f"[M1453-CACHE] data_cache_path not set — index files "
+                  f"written next to data (may fail on read-only NFS)")
     # presplit_sentences diagnostic — real-data paths would use NLTK bypass here
     if rank == 0:
         print(
