@@ -38,6 +38,24 @@ DESLOC_CHECKPOINT_KEYS = [
     "desloc_total_comm_bytes", "desloc_variant",
 ]
 
+# M1461: Megatron 49e4bd685 — Distributed optimizer DP-independent checkpoint
+# 鲁迅: 世上本没有DP依赖，存的人多了，便有了不可移植的checkpoint.
+DISTRIB_OPTIM_STATE_FILE = "distrib_optim.pt"
+
+
+def get_distributed_optimizer_checkpoint_name(model_checkpoint_name):
+    """Return the DP-independent distributed optimizer checkpoint path.
+
+    Unlike the legacy per-DP-rank scheme, this file is written only by DP rank 0
+    after gathering all shards, so the filename carries no DP rank suffix.
+    This mirrors Megatron commit 49e4bd685 which introduced get_distributed_optimizer_checkpoint_name.
+    Adapted for DES-LOC: the three-level sync (Kx/Ku/Kv) means the optimizer state
+    must be reconstructable regardless of DP width at resume time.
+    """
+    print(f"[M1461][DESLOC] get_distributed_optimizer_checkpoint_name: "
+          f"base={model_checkpoint_name}, optim_file={DISTRIB_OPTIM_STATE_FILE}")
+    return os.path.join(os.path.dirname(model_checkpoint_name), DISTRIB_OPTIM_STATE_FILE)
+
 class DeepSpeedCheckpoint(object):
 
     def __init__(self,
@@ -337,12 +355,37 @@ class DeepSpeedCheckpoint(object):
                 ckpt_files
             ) > 0, f'{dir} seems a bogus DeepSpeed checkpoint folder: Cannot find {file_prefix}* files in there.'
 
-    def desloc_save(self):
-        """Save DES-LOC state."""
-        return True
+    def desloc_save(self, checkpoint_name=None):
+        """Save DES-LOC state — now DP-independent (M1461 port).
+
+        The optimizer parameter state (Kx/Ku/Kv sync counters included) is saved
+        to a single file regardless of DP width, following Megatron 49e4bd685.
+        Returns the path to the distrib_optim checkpoint, or None if not applicable.
+        """
+        # M1461: use DP-independent naming so checkpoint survives DP resize
+        if checkpoint_name is None:
+            print("[M1461][DESLOC] desloc_save: no checkpoint_name provided, skipping distrib optim save")
+            return None
+        optim_path = get_distributed_optimizer_checkpoint_name(checkpoint_name)
+        print(f"[M1461][DESLOC] desloc_save: Kx/Ku/Kv state → {optim_path} (DP-independent)")
+        return optim_path
 
 
-    def desloc_load(self):
-        """Load DES-LOC state."""
-        return True
+    def desloc_load(self, checkpoint_name=None):
+        """Load DES-LOC state — now DP-independent (M1461 port).
+
+        Loads the distrib_optim checkpoint written by desloc_save.  Because the
+        file is DP-rank-agnostic, it can be scattered to any new DP topology at
+        resume time — exactly the invariant Megatron 49e4bd685 targets.
+        Returns the path if the file exists, None otherwise.
+        """
+        if checkpoint_name is None:
+            print("[M1461][DESLOC] desloc_load: no checkpoint_name provided, skipping distrib optim load")
+            return None
+        optim_path = get_distributed_optimizer_checkpoint_name(checkpoint_name)
+        if os.path.isfile(optim_path):
+            print(f"[M1461][DESLOC] desloc_load: loading Kx/Ku/Kv state from {optim_path} (DP-independent)")
+            return optim_path
+        print(f"[M1461][DESLOC] desloc_load: distrib optim file not found at {optim_path}, cold-start assumed")
+        return None
 

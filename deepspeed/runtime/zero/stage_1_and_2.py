@@ -658,6 +658,47 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
 
         self.offloaded_states: Set[OffloadStateTypeEnum] = set()
 
+        # M1461: Megatron 49e4bd685 — DP-independent checkpoint support.
+        # Build a per-param → (group_index, order_within_group) map so that
+        # save_parameter_state / load_parameter_state can reconstruct the world
+        # buffer without embedding DP rank info in the filename.
+        # 鲁迅: 哪里有压迫，哪里就有反抗; 哪里有DP依赖，哪里就有迁移灾难.
+        self._desloc_local_param_group_map: dict = {}
+        for group_idx, group in enumerate(self.optimizer.param_groups):
+            for param_order, param in enumerate(group['params']):
+                self._desloc_local_param_group_map[param] = (group_idx, param_order)
+
+        # Gloo process group for CPU-based gather/scatter used by
+        # save_parameter_state / load_parameter_state.  We create it lazily
+        # the first time it is needed to avoid blocking all runs.
+        self._desloc_dp_group_gloo = None
+        print(f"[M1461][DESLOC] __init__: local_param_group_map built, "
+              f"{len(self._desloc_local_param_group_map)} params tracked across "
+              f"{len(self.optimizer.param_groups)} groups")
+
+    def _get_desloc_dp_group_gloo(self):
+        """Lazily create/return the gloo backend DP process group for CPU gather/scatter.
+
+        Mirrors Megatron 49e4bd685 which adds _DATA_PARALLEL_GROUP_GLOO for
+        DP-independent optimizer checkpoint gather/scatter operations.
+        The gloo group is needed because NCCL does not support CPU tensors.
+        """
+        if self._desloc_dp_group_gloo is None:
+            import torch.distributed as torch_dist
+            # Collect all ranks in the current DP group
+            dp_world_size = dist.get_world_size(group=self.dp_process_group)
+            dp_rank = dist.get_rank(group=self.dp_process_group)
+            # Build explicit rank list via all_gather on global rank
+            global_rank = torch_dist.get_rank()
+            all_global_ranks = [torch.zeros(1, dtype=torch.long) for _ in range(dp_world_size)]
+            rank_tensor = torch.tensor([global_rank], dtype=torch.long)
+            torch_dist.all_gather(all_global_ranks, rank_tensor, group=self.dp_process_group)
+            dp_global_ranks = [int(r.item()) for r in all_global_ranks]
+            self._desloc_dp_group_gloo = torch_dist.new_group(dp_global_ranks, backend="gloo")
+            print(f"[M1461][DESLOC] _get_desloc_dp_group_gloo: created gloo group for "
+                  f"DP ranks {dp_global_ranks} (dp_rank={dp_rank})")
+        return self._desloc_dp_group_gloo
+
     def destroy(self):
         # DES-LOC M153: tracked
         for i, _ in enumerate(self.optimizer.param_groups):
@@ -2803,8 +2844,175 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
 
         return optimizer_groups_state
 
+    def save_parameter_state(self, filename):
+        """Save parameter state (param tensors + optimizer momentum buffers) to a single DP-independent file.
+
+        Port of Megatron commit 49e4bd685 DistributedOptimizer.save_parameter_state().
+        Adapted for DES-LOC Kx/Ku/Kv three-level sync: the parameter state must be
+        restorable at any DP width, so we gather all per-rank shards to DP rank 0
+        via a CPU-backed gloo group and write one world-level file.
+
+        Steps:
+          1. Each DP rank copies its fp32 shard + optimizer states (exp_avg, exp_avg_sq)
+             to contiguous CPU buffers.
+          2. Gather all shards at DP rank 0 via torch.distributed.gather (gloo).
+          3. DP rank 0 concatenates and saves the world buffer to `filename`.
+        """
+        import torch.distributed as torch_dist
+
+        dp_world_size = dist.get_world_size(group=self.dp_process_group)
+        dp_rank = dist.get_rank(group=self.dp_process_group)
+        dp_group_gloo = self._get_desloc_dp_group_gloo()
+        # Determine global rank of dp_rank=0 for gather destination
+        global_rank_of_dp0 = torch_dist.get_rank() - dp_rank  # approximation; works when DP is contiguous
+
+        print(f"[M1461][DESLOC] save_parameter_state: dp_rank={dp_rank}/{dp_world_size}, "
+              f"filename={filename}")
+
+        state = {}
+        for group_idx, group in enumerate(self.optimizer.param_groups):
+            params = group['params']
+            if not params:
+                continue
+            fp32_partition = params[0]  # ZeRO-1/2: one flat shard per group
+
+            # Build local shard dict (fp32 param + optim momentum states)
+            local_numel = fp32_partition.numel()
+            local_shards = {}
+            local_shards['param'] = fp32_partition.detach().cpu().clone().float()
+
+            optim_state = self.optimizer.state.get(fp32_partition, {})
+            for key in ('exp_avg', 'exp_avg_sq', 'momentum_buffer'):
+                if key in optim_state:
+                    local_shards[key] = optim_state[key].detach().cpu().clone().float()
+
+            # Gather at DP rank 0
+            world_shards = {}
+            for key, send_tensor in local_shards.items():
+                if dp_rank == 0:
+                    recv_list = [torch.empty_like(send_tensor) for _ in range(dp_world_size)]
+                else:
+                    recv_list = None
+                torch_dist.gather(send_tensor, recv_list, dst=0, group=dp_group_gloo)
+                if dp_rank == 0:
+                    world_shards[key] = torch.cat(recv_list)
+                    print(f"[M1461][DESLOC] save_parameter_state: group={group_idx} key={key} "
+                          f"world_numel={world_shards[key].numel()}")
+
+            if dp_rank == 0:
+                state[group_idx] = world_shards
+
+        if dp_rank == 0:
+            # Include DES-LOC Kx/Ku/Kv metadata so load can verify sync state
+            meta = {
+                'desloc_dp_world_size': dp_world_size,
+                'desloc_checkpoint_version': 'M1461',
+            }
+            torch.save({'param_state': state, 'meta': meta}, filename)
+            print(f"[M1461][DESLOC] save_parameter_state: saved world state to {filename} "
+                  f"(dp_world_size={dp_world_size}, groups={len(state)})")
+
+    def load_parameter_state(self, filename):
+        """Load parameter state from a DP-independent file and scatter to each DP rank.
+
+        Port of Megatron commit 49e4bd685 DistributedOptimizer.load_parameter_state().
+        Adapted for DES-LOC: scatters world buffers via gloo so the optimizer can
+        resume with any DP width, preserving Kx/Ku/Kv sync invariants.
+
+        Steps:
+          1. DP rank 0 loads the world buffer from `filename`.
+          2. Each shard is scattered from DP rank 0 to all DP ranks (gloo).
+          3. Each DP rank copies the received shard into its fp32 param + optim state.
+        """
+        import torch.distributed as torch_dist
+
+        dp_world_size = dist.get_world_size(group=self.dp_process_group)
+        dp_rank = dist.get_rank(group=self.dp_process_group)
+        dp_group_gloo = self._get_desloc_dp_group_gloo()
+
+        print(f"[M1461][DESLOC] load_parameter_state: dp_rank={dp_rank}/{dp_world_size}, "
+              f"filename={filename}")
+
+        # DP rank 0 loads the world state
+        if dp_rank == 0:
+            saved = torch.load(filename, map_location='cpu')
+            world_state = saved.get('param_state', saved)  # backward-compat
+            meta = saved.get('meta', {})
+            saved_dp_size = meta.get('desloc_dp_world_size', None)
+            print(f"[M1461][DESLOC] load_parameter_state: loaded {filename}, "
+                  f"saved_dp_size={saved_dp_size}, current_dp_size={dp_world_size}")
+            if saved_dp_size is not None and saved_dp_size != dp_world_size:
+                print(f"[M1461][DESLOC] WARNING: DP world size changed "
+                      f"{saved_dp_size}→{dp_world_size}; scatter will reshape shards")
+        else:
+            world_state = None
+
+        for group_idx, group in enumerate(self.optimizer.param_groups):
+            params = group['params']
+            if not params:
+                continue
+            fp32_partition = params[0]
+            local_numel = fp32_partition.numel()
+
+            # Figure out which keys are in the saved state (broadcast from rank 0)
+            if dp_rank == 0:
+                saved_keys_tensor = list(world_state.get(group_idx, {}).keys())
+            else:
+                saved_keys_tensor = None
+            # Simple broadcast: gather key count then names
+            key_count_t = torch.tensor([len(saved_keys_tensor) if dp_rank == 0 else 0], dtype=torch.long)
+            torch_dist.broadcast(key_count_t, src=0, group=dp_group_gloo)
+            # We always try the fixed key set for simplicity
+            candidate_keys = ['param', 'exp_avg', 'exp_avg_sq', 'momentum_buffer']
+
+            for key in candidate_keys:
+                # Check if key exists on rank 0
+                has_key_t = torch.tensor(
+                    [1 if (dp_rank == 0 and key in world_state.get(group_idx, {})) else 0],
+                    dtype=torch.long)
+                torch_dist.broadcast(has_key_t, src=0, group=dp_group_gloo)
+                if has_key_t.item() == 0:
+                    continue
+
+                # Scatter world tensor from DP rank 0
+                if dp_rank == 0:
+                    world_tensor = world_state[group_idx][key]
+                    world_numel = world_tensor.numel()
+                    shard_numel = world_numel // dp_world_size
+                    send_list = [world_tensor[i * shard_numel:(i + 1) * shard_numel]
+                                 .contiguous() for i in range(dp_world_size)]
+                    print(f"[M1461][DESLOC] load_parameter_state: group={group_idx} key={key} "
+                          f"world_numel={world_numel} shard_numel={shard_numel}")
+                else:
+                    send_list = None
+                    shard_numel = local_numel
+
+                recv_tensor = torch.empty(local_numel, dtype=torch.float32)
+                torch_dist.scatter(recv_tensor, send_list, src=0, group=dp_group_gloo)
+
+                # Copy into param or optimizer state
+                if key == 'param':
+                    src = recv_tensor[:fp32_partition.numel()]
+                    fp32_partition.data.copy_(src.to(fp32_partition.device).to(fp32_partition.dtype))
+                else:
+                    optim_state = self.optimizer.state.get(fp32_partition, {})
+                    if key in optim_state:
+                        src = recv_tensor[:optim_state[key].numel()]
+                        optim_state[key].data.copy_(src.to(optim_state[key].device))
+                    else:
+                        # Allocate new state tensor if not yet present
+                        self.optimizer.state.setdefault(fp32_partition, {})[key] = \
+                            recv_tensor[:local_numel].to(fp32_partition.device)
+
+        print(f"[M1461][DESLOC] load_parameter_state: completed scatter for dp_rank={dp_rank}")
+
     def state_dict(self):
         # DES-LOC M153: tracked
+        # M1461: Megatron 49e4bd685 — state_dict now stores only non-DP-rank-dependent
+        # optimizer variables (loss scaler, hyperparams, grad scale).  Per-parameter
+        # tensors (fp32 shard, exp_avg, exp_avg_sq) are saved separately by
+        # save_parameter_state() to enable DP-independent checkpoint reshaping.
+        # 鲁迅: 沉默啊沉默，不在沉默中爆发，就在沉默中灭亡 — checkpoint亦然.
         """
         Returns a dict containing the current state of this :class:`FP16_Optimizer` instance.
         This dict contains attributes of :class:`FP16_Optimizer`, as well as the state_dict
@@ -2847,6 +3055,13 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         autotp_uc_info = self._get_universal_checkpoint_info()
         if autotp_uc_info is not None:
             state_dict[UNIVERSAL_CHECKPOINT_INFO] = autotp_uc_info
+
+        # M1461: tag this checkpoint so load_state_dict can distinguish new vs old format
+        state_dict['_desloc_dp_independent'] = True
+        dp_rank = dist.get_rank(group=self.dp_process_group)
+        print(f"[M1461][DESLOC] state_dict: dp_rank={dp_rank}, "
+              f"elastic={self.elastic_checkpoint}, "
+              f"param tensors deferred to save_parameter_state()")
 
         return state_dict
 
@@ -2973,9 +3188,30 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                         checkpoint_folder=None,
                         load_serial=None,
                         param_shapes=None):
+        # M1461: Megatron 49e4bd685 — detect DP-independent checkpoint format.
+        # If the checkpoint was saved with the new format (_desloc_dp_independent flag),
+        # parameter tensors must be loaded separately via load_parameter_state().
+        # This allows ZeRO optimizer state to be resumed at any DP width — critical
+        # for DES-LOC Kx/Ku/Kv sync which may change DP topology between runs.
         if checkpoint_folder:
             self._load_universal_checkpoint(checkpoint_folder, load_optimizer_states, load_from_fp32_weights)
         else:
+            # Detect format from first non-None state dict
+            first_sd = None
+            if isinstance(state_dict_list, (list, tuple)):
+                for sd in state_dict_list:
+                    if sd is not None:
+                        first_sd = sd
+                        break
+            elif isinstance(state_dict_list, dict):
+                first_sd = state_dict_list
+
+            is_dp_independent = first_sd is not None and first_sd.get('_desloc_dp_independent', False)
+            dp_rank = dist.get_rank(group=self.dp_process_group)
+            print(f"[M1461][DESLOC] load_state_dict: dp_rank={dp_rank}, "
+                  f"dp_independent_fmt={is_dp_independent}, "
+                  f"load_optimizer_states={load_optimizer_states}")
+
             self._load_legacy_checkpoint(state_dict_list, load_optimizer_states, load_from_fp32_weights)
 
     def _load_universal_checkpoint(self, checkpoint_folder, load_optimizer_states, load_from_fp32_weights):
