@@ -745,6 +745,68 @@ class TrainingConfig:
     
     # Paths
     output_dir: str = "./real_benchmark_results"
+
+    # M1448: Megatron 31d133bba — Pipeline config separated from transformer config.
+    # In Megatron, PipelineConfig holds deallocate_pipeline_outputs, pipeline_dtype,
+    # tensor_shape, variable_seq_lengths, batch_p2p_comm, no_sync_func, etc.
+    # DES-LOC 20% adaptation: include Kx/Ku/Kv in the pipeline view because
+    # DES-LOC sync scheduling is a pipeline-level concern (it gates AllReduce
+    # at pipeline boundaries, not within individual transformer layers).
+    deallocate_pipeline_outputs: bool = True
+    variable_seq_lengths: bool = False
+    batch_p2p_comm: bool = False
+
+    def get_pipeline_config(self) -> Dict:
+        """Extract pipeline-parallel configuration (Megatron 31d133bba pattern).
+
+        Separates pipeline-level concerns from transformer-level concerns.
+        DES-LOC twist: includes sync schedule (Kx/Ku/Kv) since DES-LOC
+        operates at the pipeline boundary (between gradient accumulation
+        micro-batches), not inside transformer layers.
+        """
+        pipe_cfg = {
+            'deallocate_pipeline_outputs': self.deallocate_pipeline_outputs,
+            'pipeline_dtype': torch.bfloat16,  # DES-LOC always uses bf16 for p2p
+            'tensor_shape': (self.max_seq_len, self.batch_size,
+                             self.get_model_config().get('n_embd', 768)),
+            'variable_seq_lengths': self.variable_seq_lengths,
+            'batch_p2p_comm': self.batch_p2p_comm,
+            'num_micro_batches_with_partial_ac': self.num_micro_batches_with_partial_ac,
+            # DES-LOC sync schedule (pipeline-level, not layer-level)
+            'Kx': self.Kx, 'Ku': self.Ku, 'Kv': self.Kv,
+            'gradient_accumulation': self.gradient_accumulation,
+        }
+        print(f"[M1448-PIPECFG] pipeline config extracted: "
+              f"shape={pipe_cfg['tensor_shape']} "
+              f"dealloc={pipe_cfg['deallocate_pipeline_outputs']} "
+              f"Kx/Ku/Kv={self.Kx}/{self.Ku}/{self.Kv} "
+              f"partial_ac={self.num_micro_batches_with_partial_ac}")
+        return pipe_cfg
+
+    def get_transformer_config(self) -> Dict:
+        """Extract transformer-only configuration (Megatron 31d133bba pattern).
+
+        Contains model architecture params WITHOUT pipeline/comm fields.
+        This separation lets us swap pipeline strategies (DES-LOC vs DDP)
+        without touching the transformer definition.
+        """
+        model_cfg = self.get_model_config()
+        xformer_cfg = {
+            'num_layers': model_cfg.get('n_layer', 12),
+            'hidden_size': model_cfg.get('n_embd', 768),
+            'num_attention_heads': model_cfg.get('n_head', 12),
+            'use_activation_checkpointing': self.use_activation_checkpointing,
+            'apply_query_key_layer_scaling': self.apply_query_key_layer_scaling,
+            'attention_softmax_in_fp32': self.attention_softmax_in_fp32,
+            'max_seq_len': self.max_seq_len,
+            'vocab_size': self.vocab_size,
+        }
+        print(f"[M1448-XFORMCFG] transformer config: "
+              f"layers={xformer_cfg['num_layers']} "
+              f"hidden={xformer_cfg['hidden_size']} "
+              f"heads={xformer_cfg['num_attention_heads']} "
+              f"ac={xformer_cfg['use_activation_checkpointing']}")
+        return xformer_cfg
     
     def get_model_config(self) -> Dict:
         """Get model configuration based on size."""
