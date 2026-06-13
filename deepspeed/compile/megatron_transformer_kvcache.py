@@ -29,7 +29,7 @@
 #     - Old: allocate a list of tensors, one per entry in
 #       inference_params.micro_batch_size_list
 #     - New: allocate a single tensor of shape
-#       [max_sequence_len, max_batch_size, np, hn] once using
+#       [max_sequence_length, max_batch_size, np, hn] once using
 #       inference_params.max_batch_size
 #
 #   ParallelAttention.forward() — else (no inference_params):
@@ -80,9 +80,9 @@ def allocate_kvcache(inference_params, allocate_memory_fn):
 
     Args:
         inference_params: InferenceParams instance (from megatron_forward_step).
-            Must have .allocate_key_value_memory (bool), .max_sequence_len,
+            Must have .allocate_key_value_memory (bool), .max_sequence_length,
             .max_batch_size.
-        allocate_memory_fn: callable(max_sequence_len, max_batch_size) → Tensor.
+        allocate_memory_fn: callable(max_sequence_length, max_batch_size) → Tensor.
             Typically ParallelAttention._allocate_memory().
 
     Returns:
@@ -91,10 +91,11 @@ def allocate_kvcache(inference_params, allocate_memory_fn):
     """
     if inference_params is None or not inference_params.allocate_key_value_memory:
         return None, None
-    inf_max_seq_len = inference_params.max_sequence_len
+    inf_max_seq_length = inference_params.max_sequence_length
+    print(f'[M1735][kvcache] inf_max_seq_length={inf_max_seq_length}')
     inf_max_batch_size = inference_params.max_batch_size
-    key_memory = allocate_memory_fn(inf_max_seq_len, inf_max_batch_size)
-    value_memory = allocate_memory_fn(inf_max_seq_len, inf_max_batch_size)
+    key_memory = allocate_memory_fn(inf_max_seq_length, inf_max_batch_size)
+    value_memory = allocate_memory_fn(inf_max_seq_length, inf_max_batch_size)
     return key_memory, value_memory
 
 

@@ -21,13 +21,13 @@
 #   InferenceParams (redesigned):
 #     - Drop micro_batch_size_list / micro_batch_index / allocate list
 #       approach entirely.
-#     - New init signature: __init__(max_batch_size, max_sequence_len)
+#     - New init signature: __init__(max_batch_size, max_sequence_length)
 #     - New attributes: sequence_len_offset = 0, batch_size_offset = 0
 #     - Keep allocate_key_value_memory = True flag.
 #
 #   ForwardStep (replaces ForwardStepBase + SimplePipeliningForwardStep
 #                         + NoPipeliningForwardStep + forward_step_provider):
-#     - Unified class: __init__(model, max_batch_size, max_sequence_len)
+#     - Unified class: __init__(model, max_batch_size, max_sequence_length)
 #     - Sets self.constant = 512 to decide pipelining threshold.
 #     - __call__ dispatches to _with_pipelining_forward_step when
 #       batch*seq >= constant, else _no_pipelining_forward_step.
@@ -76,7 +76,7 @@ class InferenceParams:
     (max_batch_size, sequence_len_offset, batch_size_offset) model.
 
     Attributes:
-        max_sequence_len: maximum sequence length (context + generation).
+        max_sequence_length: maximum sequence length (context + generation).
         max_batch_size:   maximum batch size supported by the kv allocation.
         sequence_len_offset: tokens processed so far (updated after each step).
         batch_size_offset:   offset into the batch dimension for micro-batch
@@ -85,10 +85,11 @@ class InferenceParams:
                                    after memory has been allocated.
     """
 
-    def __init__(self, max_batch_size, max_sequence_len):
-        assert max_sequence_len > 0
+    def __init__(self, max_batch_size, max_sequence_length):
+        assert max_sequence_length > 0
         assert max_batch_size > 0
-        self.max_sequence_len = max_sequence_len
+        self.max_sequence_length = max_sequence_length
+        print(f'[M1735][InferenceParams] max_sequence_length={max_sequence_length}')
         self.max_batch_size = max_batch_size
         self.sequence_len_offset = 0
         self.batch_size_offset = 0
@@ -111,12 +112,12 @@ class ForwardStep:
     Args:
         model:            model or list of pipeline-stage models.
         max_batch_size:   max batch size (passed to InferenceParams).
-        max_sequence_len: max sequence length (passed to InferenceParams).
+        max_sequence_length: max sequence length (passed to InferenceParams).
         get_args:         callable returning the global args namespace.
         mpu:              mpu module providing pipeline-parallel helpers.
     """
 
-    def __init__(self, model, max_batch_size, max_sequence_len,
+    def __init__(self, model, max_batch_size, max_sequence_length,
                  get_args=None, mpu=None):
         # Make sure model is in eval mode.
         if isinstance(model, Iterable):
@@ -133,7 +134,7 @@ class ForwardStep:
 
         # Initialize inference parameters.
         self.inference_params = InferenceParams(max_batch_size,
-                                                max_sequence_len)
+                                                max_sequence_length)
 
     def __call__(self, tokens, position_ids, attention_mask):
         if tokens.size(0) * tokens.size(1) >= self.constant:

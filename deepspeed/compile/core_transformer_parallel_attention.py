@@ -190,9 +190,9 @@ class ParallelAttention(MegatronModule):
 
         return hidden_states
 
-    def _allocate_memory(self, inference_max_sequence_len, batch_size):
+    def _allocate_memory(self, inference_max_sequence_length, batch_size):
         return torch.empty(
-            inference_max_sequence_len,
+            inference_max_sequence_length,
             batch_size,
             self.num_attention_heads_per_partition,
             self.hidden_size_per_attention_head,
@@ -211,10 +211,11 @@ class ParallelAttention(MegatronModule):
         # 3. create another config object 4. something else?
         if inference_params:
             if self.layer_number not in inference_params.key_value_memory_dict:
-                inf_max_seq_len = inference_params.max_sequence_len
+                inf_max_seq_length = inference_params.max_sequence_length
+                print(f'[M1735][attention] inf_max_seq_length={inf_max_seq_length}')
                 inf_max_batch_size = inference_params.max_batch_size
-                inference_key_memory = self._allocate_memory(inf_max_seq_len, inf_max_batch_size)
-                inference_value_memory = self._allocate_memory(inf_max_seq_len, inf_max_batch_size)
+                inference_key_memory = self._allocate_memory(inf_max_seq_length, inf_max_batch_size)
+                inference_value_memory = self._allocate_memory(inf_max_seq_length, inf_max_batch_size)
                 inference_params.key_value_memory_dict[self.layer_number] = (
                     inference_key_memory,
                     inference_value_memory,
