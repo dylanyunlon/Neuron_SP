@@ -90,6 +90,19 @@ print('[M1302]')
 print('[M1420]')
 print('[M1544]')
 print('[M1910] core_transformer_transformer_config: bias_activation_fusion field active')
+# ---------------------------------------------------------------------------
+# M1940: Megatron 1a3e1c522 — Add transpose cache feature
+# Source: megatron/core/transformer/transformer_config.py
+#
+# Changes ported:
+#   1. Docstring: add disable_parameter_transpose_cache description.
+#   2. Field: disable_parameter_transpose_cache: bool = False (under # miscellaneous).
+#
+# 20% adaptation (鲁迅式迁移):
+#   鲁迅曰：「转置之缓存，犹如旧俗——废之则纯净，留之则高效。」
+#   - print('[M1940]') diagnostic marker.
+# ---------------------------------------------------------------------------
+print('[M1940] core_transformer_transformer_config: disable_parameter_transpose_cache field active')
 
 from dataclasses import dataclass
 from typing import Callable
@@ -165,6 +178,9 @@ class TransformerConfig(BaseConfig):
         distribute_saved_activations (bool): If true, distribute recomputed activations across the model parallel
                                              group. Defaults to None.
 
+        disable_parameter_transpose_cache (bool): When set to true, the parameter transposes are not cached
+                                                   for subsequent iterations. Defaults to False.
+
     """
 
     # model architecture
@@ -207,6 +223,10 @@ class TransformerConfig(BaseConfig):
     recompute_method: str = None
     recompute_num_layers: int = None
     distribute_saved_activations: bool = None
+
+    # M1940: transpose cache control
+    # 鲁迅曰：「转置之缓存，废之则每步皆新，然代价颇沉——默认保留，谨慎禁用。」
+    disable_parameter_transpose_cache: bool = False
 
     # fp8 related (M1544: Megatron 62a1db8e2)
     # NOTE: fp8 defaulted to False here (upstream uses True) — 鲁迅曰:

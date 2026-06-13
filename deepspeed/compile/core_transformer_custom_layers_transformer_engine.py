@@ -82,6 +82,26 @@ print('[M1750]')
 #   注意力之计算，跨rank之通信，cp_stream承载异步之望，各rank之数据轮转如环。
 #   Adds print('[M1870]') diagnostic markers.
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# M1940: Megatron 1a3e1c522 — Add transpose cache feature
+# Source: megatron/core/transformer/custom_layers/transformer_engine.py
+#
+# Mapping: megatron/core/transformer/custom_layers/transformer_engine.py
+#       -> deepspeed/compile/core_transformer_custom_layers_transformer_engine.py
+#
+# Changes ported from upstream:
+#   TELinear.__init__: self.is_first_microbatch = True +
+#     self.disable_parameter_transpose_cache = self.config.disable_parameter_transpose_cache
+#   TELinear.forward: _is_first_microbatch logic (None disables cache, else tracks batch)
+#   TELayerNormColumnParallelLinear: same two changes as TELinear.
+#
+# 20% adaptation (鲁迅式迁移):
+#   鲁迅曰：「转置之缓存，犹如旧俗——废之则纯净，留之则高效，两难之间，配置为鉴。」
+#   - is_first_microbatch 追踪每轮首批，确保缓存在正确时刻失效。
+#   - disable_parameter_transpose_cache=True 时传 None，令 TE 逐步重计算转置。
+#   - Adds print('[M1940]') diagnostic markers in __init__ and forward.
+# ---------------------------------------------------------------------------
+print('[M1940] transpose cache feature: disable_parameter_transpose_cache support')
 print('[M1870] context parallelism: cp_stream + CP group args for TEDotProductAttention')
 import torch
 import transformer_engine as te
@@ -142,6 +162,12 @@ class TELinear(te.pytorch.module.Linear):
                  **kwargs):
         self.config = config
 
+        # M1940: track first microbatch for transpose cache control.
+        self.is_first_microbatch = True
+        self.disable_parameter_transpose_cache = self.config.disable_parameter_transpose_cache
+        print(f'[M1940] TELinear.__init__ disable_parameter_transpose_cache='
+              f'{self.disable_parameter_transpose_cache}')
+
         # M1527: skip_bias_add replaces return_bias (rename only, logic identical).
         # TE 在 bias=False、skip_bias_add=True 时返回零长 Tensor，
         # 我们更喜欢 None。所以此时让 TE 不返回 bias，
@@ -168,7 +194,13 @@ class TELinear(te.pytorch.module.Linear):
         )
 
     def forward(self, x):
-        out = super().forward(x)
+        # M1940: None disables TE's transpose cache entirely; otherwise track first microbatch.
+        _is_first_microbatch = (
+            None if self.disable_parameter_transpose_cache else self.is_first_microbatch
+        )
+        print(f'[M1940] TELinear.forward _is_first_microbatch={_is_first_microbatch}')
+        out = super().forward(x, is_first_microbatch=_is_first_microbatch)
+        self.is_first_microbatch = False
 
         # TE 只在 return_bias=True 时返回元组，否则返回单个 Tensor；
         # 我们无论如何都返回两个值，调用方一律用 output, _ = layer(x)。
@@ -204,6 +236,11 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
         **kwargs
     ):
         self.config = config
+        # M1940: track first microbatch for transpose cache control.
+        self.is_first_microbatch = True
+        self.disable_parameter_transpose_cache = self.config.disable_parameter_transpose_cache
+        print(f'[M1940] TELayerNormColumnParallelLinear.__init__ disable_parameter_transpose_cache='
+              f'{self.disable_parameter_transpose_cache}')
         # TE returns zero-length Tensor when bias=False and return_bias=True;
         # we prefer None — so we handle it ourselves.
         self.te_return_bias = skip_bias_add and bias
@@ -241,7 +278,13 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
 
     def forward(self, x):
         print(f'[M1750] TELayerNormColumnParallelLinear.forward input_shape={tuple(x.shape)}')
-        out = super().forward(x)
+        # M1940: None disables TE's transpose cache entirely; otherwise track first microbatch.
+        _is_first_microbatch = (
+            None if self.disable_parameter_transpose_cache else self.is_first_microbatch
+        )
+        print(f'[M1940] TELayerNormColumnParallelLinear.forward _is_first_microbatch={_is_first_microbatch}')
+        out = super().forward(x, is_first_microbatch=_is_first_microbatch)
+        self.is_first_microbatch = False
         # TE 只在 return_bias=True 时返回元组，否则返回单个 Tensor；
         # 我们无论如何都返回两个值——接口一律平等，调用方一律 output, _ = layer(x)。
         if self.te_return_bias:
