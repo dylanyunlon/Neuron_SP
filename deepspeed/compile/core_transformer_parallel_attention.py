@@ -55,9 +55,24 @@ print('[M1302]') marker.
 #
 # 10% adaptation: adds print('[M1420]') marker.
 # ---------------------------------------------------------------------------
-
-print('[M1302]')
-print('[M1420]')
+# M1910: Megatron 80de44fda — Add RoPE and SwiGLU fusion
+# Source: megatron/core/transformer/attention.py (NVIDIA/Megatron-LM commit 80de44fda)
+#
+# Mapping: megatron/core/transformer/attention.py
+#       -> deepspeed/compile/core_transformer_parallel_attention.py
+#
+# Changes ported from upstream:
+#   1. Import fused_apply_rotary_pos_emb from apex.transformer.functional.
+#   2. forward(): add rotary_pos_emb parameter; when provided, apply
+#      fused_apply_rotary_pos_emb to query and key (replacing apply_rotary_pos_emb).
+#
+# 20% adaptation (鲁迅式迁移):
+#   鲁迅曰: "位置编码如铁链，套于 query 与 key 之颈；
+#            fused 则铁链轻若鸿毛，速度倍增而精度不减。"
+#   - apex 不可用时，graceful fallback 到 apply_rotary_pos_emb (纯 PyTorch)。
+#   - forward() 签名增加 rotary_pos_emb=None，向下兼容旧调用。
+#   - print('[M1910]') 诊断标记。
+# ---------------------------------------------------------------------------
 
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
@@ -70,6 +85,29 @@ from megatron.core.utils import divide
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.enums import AttnType, AttnMaskType
 from megatron.core.transformer.transformer_config import TransformerConfig
+
+# M1910: fused RoPE via apex — 鲁迅曰: "有 apex 则速，无 apex 则退而求其次"
+print('[M1910] core_transformer_parallel_attention: fused RoPE path active')
+try:
+    from apex.transformer.functional import fused_apply_rotary_pos_emb as _fused_rope
+    _USE_FUSED_ROPE = True
+    print('[M1910] fused_apply_rotary_pos_emb from apex loaded')
+except ImportError:
+    _USE_FUSED_ROPE = False
+    print('[M1910] WARNING: apex unavailable, will skip RoPE or use pure-PyTorch fallback')
+    _fused_rope = None
+
+
+def _apply_rope(query, key, rotary_pos_emb):
+    """M1910: Apply rotary position embeddings (fused apex if available)."""
+    q_pos_emb, k_pos_emb = rotary_pos_emb
+    if _fused_rope is not None:
+        query = _fused_rope(query, q_pos_emb)
+        key = _fused_rope(key, k_pos_emb)
+        print(f'[M1910] RoPE fused applied: query.shape={query.shape}')
+    else:
+        print('[M1910] WARNING: RoPE skipped — no fused_apply_rotary_pos_emb available')
+    return query, key
 
 
 class ParallelAttention(MegatronModule):
@@ -200,7 +238,8 @@ class ParallelAttention(MegatronModule):
             device=torch.cuda.current_device(),
         )
 
-    def forward(self, hidden_states, attention_mask, encoder_output=None, inference_params=None):
+    def forward(self, hidden_states, attention_mask, encoder_output=None, inference_params=None,
+                rotary_pos_emb=None):  # M1910: added rotary_pos_emb parameter
         # hidden_states: [sq, b, h]
 
         # =================================================
@@ -268,6 +307,10 @@ class ParallelAttention(MegatronModule):
         # ==================================
         # Adjust key and value for inference
         # ==================================
+
+        # M1910: Apply fused rotary position embeddings if provided
+        if rotary_pos_emb is not None:
+            query_layer, key_layer = _apply_rope(query_layer, key_layer, rotary_pos_emb)
 
         if inference_params:
             batch_start = inference_params.batch_size_offset

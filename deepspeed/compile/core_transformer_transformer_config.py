@@ -69,9 +69,27 @@
 # fp8 default 改成 False — 没装 transformer_engine 的机器别乱 True。
 # Adds print('[M1544]') diagnostic marker.
 # ---------------------------------------------------------------------------
+# M1910: Megatron 80de44fda — Add RoPE and SwiGLU fusion
+# Source: megatron/core/transformer/transformer_config.py (NVIDIA/Megatron-LM commit 80de44fda)
+#
+# Mapping: megatron/core/transformer/transformer_config.py
+#       -> deepspeed/compile/core_transformer_transformer_config.py
+#
+# Changes ported from upstream:
+#   1. Docstring: bias_gelu_fustion → bias_activation_fustion (typo kept as upstream).
+#   2. Field: bias_gelu_fusion: bool = False → bias_activation_fusion: bool = False.
+#   3. __post_init__: validation now checks bias_activation_fusion + activation_func == gelu.
+#
+# 20% adaptation (鲁迅式迁移):
+#   鲁迅曰: "TODO 存活多年，终成历史文物；改名一刻，万古长存。"
+#   - bias_gelu_fusion 字段彻底消除，bias_activation_fusion 取而代之。
+#   - __post_init__ 中的 bias_gelu_fusion 校验改为 bias_activation_fusion。
+#   - print('[M1910]') 诊断标记。
+# ---------------------------------------------------------------------------
 print('[M1302]')
 print('[M1420]')
 print('[M1544]')
+print('[M1910] core_transformer_transformer_config: bias_activation_fusion field active')
 
 from dataclasses import dataclass
 from typing import Callable
@@ -118,7 +136,7 @@ class TransformerConfig(BaseConfig):
                                           This should be true if apply_query_key_layer_scaling is true.
 
         # fusion
-        bias_gelu_fustion (bool): If true, fuses bias and gelu. Defaults to False.
+        bias_activation_fustion (bool): If true, fuses bias and activation. Defaults to False.
         masked_softmax_fusion (bool): If true, uses softmax fusion.
         persist_layer_norm (bool): If true, uses the persistent fused layer norm kernel.
                                    Defaults to False.
@@ -179,7 +197,8 @@ class TransformerConfig(BaseConfig):
     # communication (async_tensor_model_parallel_allreduce now in BaseConfig)
 
     # fusion (gradient_accumulation_fusion now in BaseConfig)
-    bias_gelu_fusion: bool = False  # TODO: this should be bias_activation_fusion ?
+    # M1910: bias_gelu_fusion → bias_activation_fusion (supports SwiGLU and other activations)
+    bias_activation_fusion: bool = False
     masked_softmax_fusion: bool = False
     persist_layer_norm: bool = False
 
@@ -230,3 +249,12 @@ class TransformerConfig(BaseConfig):
                 raise ValueError(
                     f'self.recompute_granuarlity: {self.recompute_granularity} must be "full" or "selective".'
                 )
+
+        # M1910: bias_activation_fusion — gelu 需要 add_bias_linear，swiglu 无此限制
+        if self.bias_activation_fusion and getattr(self, 'activation_func', None) == F.gelu:
+            if not getattr(self, 'add_bias_linear', True):
+                raise ValueError(
+                    "When bias_activation_fusion is True and activation function is gelu, "
+                    "add_bias_linear must also be True."
+                )
+        print('[M1910] __post_init__: bias_activation_fusion validated')
