@@ -954,6 +954,21 @@ class TrainingConfig:
     # 不分清楚，YaRN便把客居之地当故乡，频率表全然失准，训练白费。
     original_max_position_embeddings: int = 4096  # YaRN RoPE reference context length (M2130)
 
+    # M2140: Megatron 8d9dbed4a — Add CUDA graph capture flag to CrossEntropyLoss
+    # Upstream adds is_cg_capturable: bool = False to te_parallel_cross_entropy() and
+    # infers it from config.cuda_graph_scope == 'full_iteration' in language_module.py.
+    # When True, TE's parallel_cross_entropy avoids torch.equal() calls that break graph capture.
+    # TE >= 2.7.0 is required; a version check raises AssertionError if mismatched.
+    #
+    # 20% DES-LOC adaptation: NeuronSP is single-GPU; 'te' path is already a stub that
+    # raises RuntimeError. cuda_graph_scope is recorded on config and forwarded to
+    # _neuronsp_te_parallel_cross_entropy for diagnostic print — the version guard is
+    # preserved as a warning print (no TE import, so AssertionError path never fires).
+    #
+    # 鲁迅曰：CUDA图者，一次录制，百次重放；然图内不容张望——torch.equal乃图之乱贼，
+    # is_cg_capturable一标，方令熵函数知收敛之道，不再于图中横生枝节。
+    cuda_graph_scope: str = 'none'  # 'none' | 'full_iteration' — M2140 CG capture scope
+
     def get_pipeline_config(self) -> Dict:
         """Extract pipeline-parallel configuration (Megatron 31d133bba pattern).
 
@@ -2019,6 +2034,7 @@ def _neuronsp_te_parallel_cross_entropy(
     targets: torch.Tensor,  # [B*T]    — integer target indices
     step: int = 0,
     rank: int = 0,
+    is_cg_capturable: bool = False,
 ) -> torch.Tensor:
     """Stub for TE parallel_cross_entropy path (Megatron 0f60adbd3).
 
@@ -2026,13 +2042,17 @@ def _neuronsp_te_parallel_cross_entropy(
     TE's parallel_cross_entropy kernel. NeuronSP runs single-GPU; the TP group is
     never initialised, so this path always raises RuntimeError — matching the upstream
     guard: 'Trying to use a TE block when it's not present.'
+
+    M2140: is_cg_capturable mirrors 8d9dbed4a — forwarded from cuda_graph_scope check.
+    On single-GPU stubs this has no runtime effect but is logged for sweep diagnostics.
     """
     # Diagnostic: log the attempt so sweep logs reveal mis-configuration early.
     if step % 50 == 1:
         _msg = (f"[CE-M2070-TE] rank={rank} step={step} "
                 f"ATTEMPTED te_parallel_cross_entropy path — "
                 f"logits={tuple(logits.shape)} targets={tuple(targets.shape)} "
-                f"(0f60adbd3: requires TP group, unavailable in single-GPU NeuronSP)")
+                f"is_cg_capturable={is_cg_capturable} "
+                f"(8d9dbed4a: CG flag forwarded; TP group unavailable in single-GPU NeuronSP)")
         print(_msg)
     raise RuntimeError(
         "[M2070] cross_entropy_fusion_impl='te' requires transformer_engine "
@@ -2079,6 +2099,7 @@ class GPT(nn.Module):
                  init_method_std: float = 0.02,
                  init_method_xavier_uniform: bool = False,
                  cross_entropy_fusion_impl: str = 'native',
+                 cuda_graph_scope: str = 'none',
                  cpu_offload_swiglu: bool = False):
         super().__init__()
         # M1532: Megatron 305b3901a — store init params from config instead of hardcoding
@@ -2113,6 +2134,12 @@ class GPT(nn.Module):
         print(f"[M2070-GPT-INIT] cross_entropy_fusion_impl={cross_entropy_fusion_impl!r} "
               f"(Megatron 0f60adbd3: 'native'=in-place CE 57064fd6f, "
               f"'te'=TE parallel_cross_entropy stub [raises on single-GPU])")
+        # M2140: Megatron 8d9dbed4a — CUDA graph scope for CrossEntropyLoss CG capture flag
+        # 鲁迅曰：图中不容探底——is_cg_capturable一标，令熵函数识大局、守规矩。
+        self.cuda_graph_scope = cuda_graph_scope
+        print(f"[M2140-GPT-INIT] cuda_graph_scope={cuda_graph_scope!r} "
+              f"(8d9dbed4a: 'full_iteration' sets is_cg_capturable=True in TE CE call; "
+              f"NeuronSP single-GPU stub logs flag, TE AssertionError guard not active)")
         # M2120: Megatron 0bbcbb115 — SwiGLU activation CPU offload flag
         # 铁屋中的激活，无声无息地驻留于GPU——今加一印，令其暂赴CPU，待反传时再归。
         self._cpu_offload_swiglu = cpu_offload_swiglu
@@ -2339,7 +2366,19 @@ class GPT(nn.Module):
             if self.cross_entropy_fusion_impl == 'te':
                 _logits_flat = logits.view(-1, logits.size(-1))   # [B*T, V]
                 _targets_flat = targets.view(-1)                  # [B*T]
-                loss = _neuronsp_te_parallel_cross_entropy(_logits_flat, _targets_flat, s, _r)
+                # M2140: Megatron 8d9dbed4a — infer is_cg_capturable from cuda_graph_scope.
+                # Mirrors language_module.py: full_iteration scope means CUDA graph capture
+                # is active; TE CE must skip torch.equal() checks that break graph recording.
+                # NeuronSP single-GPU: forwarded to stub for diagnostic logging only.
+                _is_cg_capturable = (self.cuda_graph_scope == 'full_iteration')
+                if s % 50 == 1:
+                    print(f"[CE-M2140] rank={_r} step={s} "
+                          f"cuda_graph_scope={self.cuda_graph_scope!r} "
+                          f"is_cg_capturable={_is_cg_capturable} "
+                          f"(8d9dbed4a: CG flag prevents torch.equal in TE CE kernel)")
+                loss = _neuronsp_te_parallel_cross_entropy(
+                    _logits_flat, _targets_flat, s, _r, _is_cg_capturable
+                )
             else:
                 # M461 (57064fd): CE memory opt — no full logits clone; in-place max-sub
                 # then in-place exp after scalar predicted-logit is extracted.
@@ -4845,6 +4884,8 @@ class Trainer:
             init_method_xavier_uniform=getattr(config, 'init_method_xavier_uniform', False),
             # M2070: Megatron 0f60adbd3 — parallel cross entropy option
             cross_entropy_fusion_impl=getattr(config, 'cross_entropy_fusion_impl', 'native'),
+            # M2140: Megatron 8d9dbed4a — CUDA graph scope for CrossEntropyLoss CG capture flag
+            cuda_graph_scope=getattr(config, 'cuda_graph_scope', 'none'),
             # M2120: Megatron 0bbcbb115 — SwiGLU activation CPU offload
             # Mirrors mlp.py: cpu_offloading and cpu_offloading_activations gate the flag.
             # In Neuron_SP the TE-availability check (HAVE_TE) is skipped — we expose the
