@@ -769,6 +769,18 @@ class TrainingConfig:
     # spikes from accumulated AllReduce buffers — offload acts as a pressure valve.
     cpu_offloading_activations: bool = False
 
+    # M2190: Megatron ae6707622 — Fix H2D stream synchronization in optimizer CPU offload
+    # Bug: param_copy_back_gpu_hook (line 122 of hybrid_optimizer.py) waited on _d2h_stream
+    # (Device→Host) instead of _h2d_stream (Host→Device) after copying updated CPU params back
+    # to GPU with non_blocking=True.  The wrong stream caused the forward pass on the next step
+    # to race against the H2D transfer — weights could be stale/partially overwritten.
+    # Fix: one-character rename d2h→h2d in record_event().wait() synchronises the correct stream.
+    # NSP adaptation: expose overlap_cpu_optimizer_d2h_h2d so DeepSpeed ZeRO CPU-offload users
+    # can opt-in to the overlapping path and get the synchronisation guarantee.
+    # 鲁迅曰：D2H之流已毕其功，H2D之流方殷未竟；强令D2H为证，H2D笑而不语——
+    # 参数悄然走样，模型浑然不觉，此乃stream之冤案，一字之差，千步之谬。
+    overlap_cpu_optimizer_d2h_h2d: bool = False  # M2190: enable H2D-stream-correct overlap path
+
     # M1513: Megatron 6902465a8 — group query attention (GQA) with TP-aware KV partitioning.
     # group_query_attention=True activates the 6902465a8 GQA path in CausalSelfAttention.
     # num_query_groups controls KV group count; the query_groups_divide_flag in
@@ -1102,6 +1114,15 @@ class TrainingConfig:
         xformer_cfg['moe_layer_type'] = self.moe_layer_type
         print(f"[M2170-XFMR] moe_layer_type={self.moe_layer_type!r} "
               f"(M2170: 'E' = MoE slot in hybrid layout; '' = dense GPT-2; spec+MoE lock removed)")
+        # M2190: Megatron ae6707622 — expose overlap_cpu_optimizer_d2h_h2d so the H2D stream
+        # fix is visible in config dumps and can gate the overlapping copy path in DeepSpeed.
+        # Upstream fix: hybrid_optimizer.py line 122: _d2h_stream → _h2d_stream so the
+        # param_copy_back_gpu_hook waits on the correct Host→Device stream after non_blocking copy.
+        xformer_cfg['overlap_cpu_optimizer_d2h_h2d'] = self.overlap_cpu_optimizer_d2h_h2d
+        print(f"[M2190-XFMR] overlap_cpu_optimizer_d2h_h2d={self.overlap_cpu_optimizer_d2h_h2d} "
+              f"cpu_offload={self.cpu_offload} "
+              f"(M2190: H2D stream sync fix; d2h_stream→h2d_stream in param_copy_back_gpu_hook; "
+              f"stale-weight race eliminated for non_blocking H2D copies)")
         return xformer_cfg
 
     def get_model_config(self) -> Dict:

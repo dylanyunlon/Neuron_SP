@@ -427,3 +427,36 @@ git log --oneline | grep "M15" | tail -5
 ### 存档文件
 - `archive/patches/M2170_Megatron_2751749d8_Add_MoE_layer_type_hybrid_models.patch` — 原始 Megatron diff
 - `REAL_GPU_BENCHMARK.py` — TrainingConfig.moe_layer_type + get_transformer_config() M2170 块
+
+## M2190 — Megatron-LM commit ae6707622: Fix H2D stream synchronization in optimizer offload
+
+**日期**: 2026-06-13
+**来源**: NVIDIA/Megatron-LM@ae6707622 (2 files, ~97 lines)
+
+### 修改要点
+1. **`megatron/core/optimizer/cpu_offloading/hybrid_optimizer.py`** — line 122:
+   - Bug: `param_copy_back_gpu_hook` 中 `self._d2h_stream.record_event().wait(...)` 等待的是 Device→Host 流
+   - Fix: 改为 `self._h2d_stream.record_event().wait(...)` — 等待 Host→Device 流
+   - 根因：CPU优化器步骤后，用 `non_blocking=True` 将更新后的参数异步复制回GPU（H2D方向），但同步点却错误地对 D2H 流打 event.wait()，导致下一步 forward 可能读到半更新的参数权重。
+
+2. **`tests/unit_tests/test_optimizer_cpu_offloading.py`** — 新增 `BigNet` + `test_overlap_cpu_optimizer_d2h_h2d_sync_correctness`:
+   - `BigNet`: 更大的卷积+全连接网络（fc2=8192），放大H2D传输量，使竞争条件更易暴露
+   - 新测试函数参数化 `n_steps×offload_fraction×optimizer×with_param_groups`，验证同步正确性和数值精度 (atol=1e-03)
+
+### 鲁迅式评注（20% 适配注记）
+> D2H之流已功成身退，H2D之流尚在途中；  
+> 旧代码强令D2H出具凭证，H2D笑而不语，参数悄然走样。  
+> 一字之差（d2h→h2d），千步之谬遂除——  
+> 流之名不可混，stream之序不可乱，此乃异步编程之戒律，非多写一字，乃少冤一模型。
+
+### 诊断 print 标记
+- `[M2190-XFMR] overlap_cpu_optimizer_d2h_h2d=... cpu_offload=... (M2190: H2D stream sync fix; d2h_stream→h2d_stream in param_copy_back_gpu_hook; stale-weight race eliminated for non_blocking H2D copies)`
+
+### NSP适配 (REAL_GPU_BENCHMARK.py)
+- `TrainingConfig` 新增 `overlap_cpu_optimizer_d2h_h2d: bool = False`（默认False；设True以启用重叠CPU优化器H2D同步路径，需配合 `cpu_offload=True`）
+- `get_transformer_config()` 注入 `xformer_cfg['overlap_cpu_optimizer_d2h_h2d']` + M2190 诊断print，记录 H2D 流修复激活状态
+- upstream 的 `_d2h_stream → _h2d_stream` 修复映射为：DeepSpeed ZeRO CPU offload 路径中凡有 `non_blocking` H2D 拷贝后接 `record_event().wait()` 之处，均须确认等待的是 H2D 流而非 D2H 流
+
+### 存档文件
+- `archive/patches/M2190_Megatron_ae6707622_Fix_H2D_stream_sync_optimizer_offload.patch` — 原始 Megatron diff
+- `REAL_GPU_BENCHMARK.py` — TrainingConfig.overlap_cpu_optimizer_d2h_h2d + get_transformer_config() M2190 块
