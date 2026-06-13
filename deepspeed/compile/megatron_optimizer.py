@@ -1008,8 +1008,12 @@ class Float16DistributedOptimizer(BaseFloat16Optimizer):
     @classmethod
     def get_model_gbuf_param_shard_map(cls, model, dtype, gbuf_world_shard):
 
-        # Param shard map.
-        param_world_index_map = model._grad_buffer_param_index_map[dtype]
+        # M1820: 公共属性时代已来，私有前缀如旧社会辫子，剪去方为新人。
+        # Megatron 4feb2b0d: _grad_buffer_param_index_map → grad_buffer_param_index_map
+        print(f"[M1820-DIST-OPT] get_model_gbuf_param_shard_map: dtype={dtype}, "
+              f"model={type(model).__name__}, "
+              f"has grad_buffer_param_index_map={hasattr(model, 'grad_buffer_param_index_map')}")
+        param_world_index_map = model.grad_buffer_param_index_map[dtype]
         param_shard_map = {}
         for param, param_world_indexes in param_world_index_map.items():
 
@@ -1042,8 +1046,12 @@ class Float16DistributedOptimizer(BaseFloat16Optimizer):
         data_parallel_rank = mpu.get_data_parallel_rank()
         data_parallel_world_size = mpu.get_data_parallel_world_size()
 
+        # M1820: _grad_buffers 已成历史尘埃，grad_buffers 方为正道。
+        # Megatron 4feb2b0d: _grad_buffers → grad_buffers (public rename)
+        print(f"[M1820-DIST-OPT] get_model_gbuf_shard: dtype={dtype}, "
+              f"has grad_buffers={hasattr(model, 'grad_buffers')}")
         # Grad buffer shard.
-        grad_buffer = model._grad_buffers[dtype]
+        grad_buffer = model.grad_buffers[dtype]
         gbuf_size = grad_buffer.numel
         max_gbuf_shard_size = int(math.ceil(gbuf_size / data_parallel_world_size))
 
@@ -1074,7 +1082,7 @@ class Float16DistributedOptimizer(BaseFloat16Optimizer):
     def get_model_gbuf_shard_map(cls, model):
         return {
             dtype: cls.get_model_gbuf_shard(model, dtype)
-            for dtype in model._grad_buffers
+            for dtype in model.grad_buffers
         }
 
     @classmethod
@@ -1227,7 +1235,7 @@ class Float16DistributedOptimizer(BaseFloat16Optimizer):
         # Collect model params.
         model_params = []
         for model in self.models:
-            for dtype, param_map in model._grad_buffer_param_index_map.items():
+            for dtype, param_map in model.grad_buffer_param_index_map.items():
                 model_params.extend(param_map.keys())
 
         # Distributed optimizer requires contiguous buffer; don't set to None.
@@ -1247,7 +1255,7 @@ class Float16DistributedOptimizer(BaseFloat16Optimizer):
             for dtype, gbuf_shard in self.model_gbuf_shards[model_index].items():
                 world_shards = gbuf_shard["world_all"]
 
-                gbuf = model._grad_buffers[dtype]
+                gbuf = model.grad_buffers[dtype]
                 gbuf_views = []
                 for shard in world_shards:
                     gbuf_views.append(gbuf.data[shard.start:shard.end])
@@ -1354,7 +1362,7 @@ class Float16DistributedOptimizer(BaseFloat16Optimizer):
                 assert main_shard.size == model_shard.size
 
                 # Copy from DDP's contiguous buffer to main shard's grad.
-                model_grad = self.models[model_index]._grad_buffers[dtype].data
+                model_grad = self.models[model_index].grad_buffers[dtype].data
                 # main_grad = self.main_param_shards[group_index].grad
                 # M1061: use get_main_grad()
                 main_grad = self.get_main_grad(group_index)
@@ -1378,7 +1386,7 @@ class Float16DistributedOptimizer(BaseFloat16Optimizer):
                 assert main_shard.size == model_shard.size
 
                 # Use DDP's contiguous buffer to temporarily hold params.
-                model_param = self.models[model_index]._grad_buffers[dtype].data
+                model_param = self.models[model_index].grad_buffers[dtype].data
                 # main_param = self.main_param_shards[group_index]
                 main_param = self.get_main_param(group_index)
 
