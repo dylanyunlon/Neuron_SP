@@ -1643,6 +1643,12 @@ class ParamAndGradBuffer:
 
         self.ddp_config = ddp_config
         self.use_decoupled_grad = ddp_config.megatron_fsdp_use_decoupled_grad
+        # [M2220] 鲁迅曰：不在沉默中爆发，便在沉默中灭亡。梯度路径，今日明朗。
+        print(
+            f"[M2220][ParamAndGradBuffer.__init__] "
+            f"precision_aware_optimizer wired: use_decoupled_grad={self.use_decoupled_grad} "
+            f"| module={type(module).__name__}"
+        )
         self.module = module
         self.bucketing_policy = bucketing_policy
         self.param_to_name = {p: name for name, p in self.module.named_parameters()}
@@ -2971,6 +2977,11 @@ class ParamAndGradBuffer:
                 # Convert the gradient to the main weight data-type for optimization.
                 # Not needed for decoupled gradients, because the precision-aware
                 # optimizer can apply gradients to parameters of different precision!
+                # [M2220] 鲁迅曰：路是人走出来的，梯度是人cast出来的。
+                print(
+                    f"[M2220][assign_grad_to_param] dtype-cast path: "
+                    f"param={name} grad_dtype={optimizer_grad.dtype} -> param_dtype={param.dtype}"
+                )
                 optimizer_grad = optimizer_grad.to(param.dtype)
 
             if name not in self.dist_main_grad:
@@ -2997,6 +3008,11 @@ class ParamAndGradBuffer:
             # If use_decoupled_grad (i.e. for precision-aware optimizers like TE FusedAdam),
             # install the gradient into param.decoupled_grad.
             if self.use_decoupled_grad:
+                # [M2220] 鲁迅曰：有了decoupled_grad，精度感知优化器方得解脱。
+                print(
+                    f"[M2220][assign_grad_to_param] decoupled_grad path: "
+                    f"param={name} grad={'None' if grad is None else grad.shape}"
+                )
                 setattr(param, "decoupled_grad", grad)
             else:
                 # Attach the gradient to the optimizer parameter.
