@@ -1454,3 +1454,46 @@ def core_config_from_args(args):
     return TransformerConfig(**kw_args)
 
 print('[M1420]')
+
+# ---------------------------------------------------------------------------
+# M1501: Megatron f9283c5a8 — Add option to overlap p2p communication
+# Source: megatron/arguments.py (NVIDIA/Megatron-LM commit f9283c5a8)
+# Author: Mostofa Patwary <mpatwary@nvidia.com>
+#
+# Mapping: megatron/arguments.py _add_distributed_args()
+#        → deepspeed/compile/megatron_arguments.py patch_overlap_p2p_args()
+#
+# Upstream adds --overlap-p2p-communication (store_true, dest=overlap_p2p_comm)
+# to _add_distributed_args() after --num-layers-per-virtual-pipeline-stage.
+#
+# 20% adaptation: surfaced as a standalone patch_overlap_p2p_args() helper
+# matching the existing pattern (patch_virtual_pipeline_args, etc.); adds
+# print('[M1501]') marker at registration and call time.
+# ---------------------------------------------------------------------------
+
+
+def patch_overlap_p2p_args(parser):
+    """Register --overlap-p2p-communication argument.
+
+    Megatron f9283c5a8 _add_distributed_args():
+      group.add_argument('--overlap-p2p-communication',
+                         action='store_true',
+                         help='overlap pipeline parallel communication with '
+                              'forward and backward chunks',
+                         dest='overlap_p2p_comm')
+
+    DS mapping: standalone helper following the same group/print pattern as
+    patch_virtual_pipeline_args (M556) and patch_num_layers_per_vp_stage (M1097).
+    """
+    group = parser.add_argument_group(title='M1501 overlap p2p patches')
+    group.add_argument(
+        '--overlap-p2p-communication',
+        action='store_true',
+        help='overlap pipeline parallel communication with forward and backward chunks',
+        dest='overlap_p2p_comm',
+    )
+    print('[M1501] patch_overlap_p2p_args: --overlap-p2p-communication registered, '
+          'sets args.overlap_p2p_comm=True when present')
+
+
+print('[M1501]')

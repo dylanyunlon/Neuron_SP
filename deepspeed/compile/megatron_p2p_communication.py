@@ -68,10 +68,36 @@
 #   _communicate(): tensor_shape=None default now applies the same
 #   model_parallel_memory_opt-aware seq_length split.
 # ---------------------------------------------------------------------------
+# M1501: Megatron f9283c5a8 — Add option to overlap p2p communication
+# Source: megatron/core/pipeline_parallel/p2p_communication.py
+#         (NVIDIA/Megatron-LM commit f9283c5a8)
+#
+# Mapping: megatron/core/pipeline_parallel/p2p_communication.py
+#        → deepspeed/compile/megatron_p2p_communication.py
+#
+# Upstream changes ported:
+#   • New helper _batched_p2p_ops(): batched isend/irecv using P2POp list.
+#   • New helper _p2p_ops(): rank-parity-aware individual isend/irecv ops
+#     (even ranks: send-next first; odd ranks: recv-prev first) to avoid
+#     deadlock when p2p ops run non-batched.
+#   • _communicate(): adds batch_p2p_comm (default True) and wait_on_reqs
+#     (default True) params; dispatches to _ring_exchange_wrapper,
+#     _batched_p2p_ops, or _p2p_ops; returns (recv_prev, recv_next, reqs).
+#   • All public wrappers: add batch_p2p_comm param; unpack 3-tuple from
+#     _communicate; pass batch_p2p_comm through.
+#   • send_forward_recv_forward / send_backward_recv_backward: add
+#     overlap_p2p_comm param; when True, skip wait and return (tensor, reqs).
+#
+# 20% adaptation:
+#   • _batched_p2p_ops/_p2p_ops use DS-local _prev_rank()/_next_rank() and
+#     pass group=None (pipeline group; DS simplified form).
+#   • Adds print('[M1501]') markers at module load and in each changed site.
+# ---------------------------------------------------------------------------
 
 print('[M556]')
 print('[M734]')
 print('[M1161]')
+print('[M1501]')
 
 import operator
 from functools import reduce
@@ -163,16 +189,89 @@ def _next_rank():
     return (rank + 1) % world_size
 
 
+def _batched_p2p_ops(*, tensor_send_prev, tensor_recv_prev,
+                     tensor_send_next, tensor_recv_next):
+    """Batched isend/irecv using P2POp list.
+
+    M1501: Megatron f9283c5a8 _batched_p2p_ops().
+    DS adaptation: uses _prev_rank()/_next_rank() instead of
+    get_pipeline_model_parallel_{prev,next}_rank(); group=None (pipeline group).
+    """
+    ops = []
+    if tensor_send_prev is not None:
+        ops.append(torch.distributed.P2POp(
+            torch.distributed.isend, tensor_send_prev, _prev_rank()))
+    if tensor_recv_prev is not None:
+        ops.append(torch.distributed.P2POp(
+            torch.distributed.irecv, tensor_recv_prev, _prev_rank()))
+    if tensor_send_next is not None:
+        ops.append(torch.distributed.P2POp(
+            torch.distributed.isend, tensor_send_next, _next_rank()))
+    if tensor_recv_next is not None:
+        ops.append(torch.distributed.P2POp(
+            torch.distributed.irecv, tensor_recv_next, _next_rank()))
+    if len(ops) > 0:
+        reqs = torch.distributed.batch_isend_irecv(ops)
+    else:
+        reqs = []
+    print('[M1501] _batched_p2p_ops: dispatched', len(ops), 'ops')
+    return reqs
+
+
+def _p2p_ops(*, tensor_send_prev, tensor_recv_prev,
+             tensor_send_next, tensor_recv_next):
+    """Rank-parity-aware individual isend/irecv to avoid deadlock.
+
+    M1501: Megatron f9283c5a8 _p2p_ops().
+    Even ranks: send-next first; odd ranks: recv-prev first.
+    DS adaptation: uses _prev_rank()/_next_rank() and torch.distributed directly.
+    """
+    reqs = []
+    rank = _get_pipeline_rank()
+    if rank % 2 == 0:
+        if tensor_send_next is not None:
+            reqs.append(torch.distributed.isend(
+                tensor=tensor_send_next, dst=_next_rank()))
+        if tensor_recv_prev is not None:
+            reqs.append(torch.distributed.irecv(
+                tensor=tensor_recv_prev, src=_prev_rank()))
+        if tensor_send_prev is not None:
+            reqs.append(torch.distributed.isend(
+                tensor=tensor_send_prev, dst=_prev_rank()))
+        if tensor_recv_next is not None:
+            reqs.append(torch.distributed.irecv(
+                tensor=tensor_recv_next, src=_next_rank()))
+    else:
+        if tensor_recv_prev is not None:
+            reqs.append(torch.distributed.irecv(
+                tensor=tensor_recv_prev, src=_prev_rank()))
+        if tensor_send_next is not None:
+            reqs.append(torch.distributed.isend(
+                tensor=tensor_send_next, dst=_next_rank()))
+        if tensor_recv_next is not None:
+            reqs.append(torch.distributed.irecv(
+                tensor=tensor_recv_next, src=_next_rank()))
+        if tensor_send_prev is not None:
+            reqs.append(torch.distributed.isend(
+                tensor=tensor_send_prev, dst=_prev_rank()))
+    print('[M1501] _p2p_ops: rank', rank, 'dispatched', len(reqs), 'ops')
+    return reqs
+
+
 def _communicate(tensor_send_next, tensor_send_prev, recv_prev, recv_next,
                  use_ring_exchange=False, tensor_shape=None,
                  override_scatter_gather_tensors_in_pipeline=False,
-                 dtype_=None):
+                 dtype_=None, batch_p2p_comm=True, wait_on_reqs=True):
     """Communicate tensors between pipeline stages.
 
     Megatron dd8890626 p2p_communication.py _communicate():
       Creates placeholder receive tensors when recv_prev/recv_next are True,
       then uses either ring_exchange (use_ring_exchange=True) or
       batch_isend_irecv for the actual sends/receives.
+
+    M1501: Megatron f9283c5a8 — adds batch_p2p_comm and wait_on_reqs params;
+      dispatches to _ring_exchange_wrapper, _batched_p2p_ops, or _p2p_ops;
+      returns (recv_prev, recv_next, reqs).
 
     Args:
         tensor_send_next: tensor to send to next rank or None.
@@ -189,8 +288,12 @@ def _communicate(tensor_send_next, tensor_send_prev, recv_prev, recv_next,
                                                      scatter gather tensors
         dtype_: optional, this is used when tensor_shape is provied and what
                 is the type of tensor_shape
+        batch_p2p_comm: if True use batch_isend_irecv, otherwise use
+                        individual isend/irecv calls. (M1501)
+        wait_on_reqs: for non-batched p2p communication, wait on each request
+                      before returning. (M1501)
     Returns:
-        (tensor_recv_prev, tensor_recv_next)
+        (tensor_recv_prev, tensor_recv_next, reqs)
     """
     args = _get_comm_args()
 
@@ -240,33 +343,41 @@ def _communicate(tensor_send_next, tensor_send_prev, recv_prev, recv_next,
         if tensor_send_prev is not None:
             tensor_send_prev = _split_tensor_into_1d_equal_chunks(tensor_send_prev)
 
+    # Send tensors in both the forward and backward directions as appropriate.
+    # M1501: dispatch to _ring_exchange_wrapper, _batched_p2p_ops, or _p2p_ops.
     if use_ring_exchange:
-        torch.distributed.ring_exchange(
-            tensor_send_prev=tensor_send_prev,
-            tensor_recv_prev=tensor_recv_prev,
-            tensor_send_next=tensor_send_next,
-            tensor_recv_next=tensor_recv_next,
-            group=None)  # pipeline group; simplified for DS mapping
+        def _ring_exchange_wrapper(**kwargs):
+            torch.distributed.ring_exchange(
+                tensor_send_prev=kwargs['tensor_send_prev'],
+                tensor_recv_prev=kwargs['tensor_recv_prev'],
+                tensor_send_next=kwargs['tensor_send_next'],
+                tensor_recv_next=kwargs['tensor_recv_next'],
+                group=None)  # pipeline group; simplified for DS mapping
+            return []
+        p2p_func = _ring_exchange_wrapper
+    elif batch_p2p_comm:
+        assert wait_on_reqs
+        p2p_func = _batched_p2p_ops
     else:
-        ops = []
-        if tensor_send_prev is not None:
-            ops.append(torch.distributed.P2POp(
-                torch.distributed.isend, tensor_send_prev, _prev_rank()))
-        if tensor_recv_prev is not None:
-            ops.append(torch.distributed.P2POp(
-                torch.distributed.irecv, tensor_recv_prev, _prev_rank()))
-        if tensor_send_next is not None:
-            ops.append(torch.distributed.P2POp(
-                torch.distributed.isend, tensor_send_next, _next_rank()))
-        if tensor_recv_next is not None:
-            ops.append(torch.distributed.P2POp(
-                torch.distributed.irecv, tensor_recv_next, _next_rank()))
-        if ops:
-            reqs = torch.distributed.batch_isend_irecv(ops)
-            for req in reqs:
-                req.wait()
+        p2p_func = _p2p_ops
 
-    torch.cuda.synchronize()
+    reqs = p2p_func(
+        tensor_send_prev=tensor_send_prev,
+        tensor_recv_prev=tensor_recv_prev,
+        tensor_send_next=tensor_send_next,
+        tensor_recv_next=tensor_recv_next,
+    )
+
+    if wait_on_reqs and len(reqs) > 0:
+        for req in reqs:
+            req.wait()
+        reqs = None
+
+    if batch_p2p_comm:
+        # To protect against race condition when using batch_isend_irecv().
+        torch.cuda.synchronize()
+    print('[M1501] _communicate: batch_p2p_comm=%s wait_on_reqs=%s' % (
+        batch_p2p_comm, wait_on_reqs))
 
     # If using scatter-gather optimization, gather smaller chunks.
     if not override_scatter_gather_tensors_in_pipeline and \
@@ -278,7 +389,7 @@ def _communicate(tensor_send_next, tensor_send_prev, recv_prev, recv_next,
             tensor_recv_next = _gather_split_1d_tensor(
                 tensor_recv_next).view(tensor_shape).requires_grad_()
 
-    return tensor_recv_prev, tensor_recv_next
+    return tensor_recv_prev, tensor_recv_next, reqs
 
 
 def _split_tensor_into_1d_equal_chunks(tensor):
@@ -301,17 +412,18 @@ def _gather_split_1d_tensor(tensor):
 
 def recv_forward(tensor_shape=None,
                  override_scatter_gather_tensors_in_pipeline=False,
-                 dtype_=None, timers=None):
+                 dtype_=None, timers=None, batch_p2p_comm=True):
     """Receive input tensor from previous pipeline stage for forward pass.
 
     Megatron dd8890626 p2p_communication.py recv_forward().
+    M1501: adds batch_p2p_comm param; unpacks 3-tuple from _communicate.
     """
 
     if _is_pipeline_first_stage():
         return None
     if timers is not None:
         timers('forward-recv').start()
-    input_tensor, _ = _communicate(
+    input_tensor, _, _ = _communicate(
         tensor_send_next=None,
         tensor_send_prev=None,
         recv_prev=True,
@@ -319,26 +431,29 @@ def recv_forward(tensor_shape=None,
         tensor_shape=tensor_shape,
         override_scatter_gather_tensors_in_pipeline=\
             override_scatter_gather_tensors_in_pipeline,
-        dtype_=dtype_)
+        dtype_=dtype_,
+        batch_p2p_comm=batch_p2p_comm)
     if timers is not None:
         timers('forward-recv').stop()
     return input_tensor
 
 
-def recv_backward(timers=None):
+def recv_backward(timers=None, batch_p2p_comm=True):
     """Receive grad tensor from next pipeline stage for backward pass.
 
     Megatron dd8890626 p2p_communication.py recv_backward().
+    M1501: adds batch_p2p_comm param; unpacks 3-tuple from _communicate.
     """
     if _is_pipeline_last_stage():
         return None
     if timers is not None:
         timers('backward-recv').start()
-    _, output_tensor_grad = _communicate(
+    _, output_tensor_grad, _ = _communicate(
         tensor_send_next=None,
         tensor_send_prev=None,
         recv_prev=False,
-        recv_next=True)
+        recv_next=True,
+        batch_p2p_comm=batch_p2p_comm)
     if timers is not None:
         timers('backward-recv').stop()
     return output_tensor_grad
@@ -346,10 +461,11 @@ def recv_backward(timers=None):
 
 def send_forward(output_tensor, timers=None,
                  override_scatter_gather_tensors_in_pipeline=False,
-                 dtype_=None):
+                 dtype_=None, batch_p2p_comm=True):
     """Send activation tensor to next pipeline stage.
 
     Megatron dd8890626 p2p_communication.py send_forward().
+    M1501: adds batch_p2p_comm param.
     """
 
     if not _is_pipeline_last_stage():
@@ -362,124 +478,159 @@ def send_forward(output_tensor, timers=None,
             recv_next=False,
             override_scatter_gather_tensors_in_pipeline=\
             override_scatter_gather_tensors_in_pipeline,
-            dtype_=dtype_)
+            dtype_=dtype_,
+            batch_p2p_comm=batch_p2p_comm)
         if timers is not None:
             timers('forward-send').stop()
 
 
-def send_backward(input_tensor_grad, timers=None, use_ring_exchange=False):
+def send_backward(input_tensor_grad, timers=None, use_ring_exchange=False,
+                  batch_p2p_comm=True):
     """Send grad tensor to previous pipeline stage.
 
     Megatron dd8890626 p2p_communication.py send_backward().
+    M1501: adds batch_p2p_comm param.
     """
     if _is_pipeline_first_stage():
         return
     if timers is not None:
         timers('backward-send').start()
+    print(f'[M1501] send_backward: grad_shape='
+          f'{input_tensor_grad.shape if input_tensor_grad is not None else None} '
+          f'batch_p2p_comm={batch_p2p_comm}')
     _communicate(
         tensor_send_next=None,
         tensor_send_prev=input_tensor_grad,
         recv_prev=False,
         recv_next=False,
-        use_ring_exchange=use_ring_exchange)
+        use_ring_exchange=use_ring_exchange,
+        batch_p2p_comm=batch_p2p_comm)
     if timers is not None:
         timers('backward-send').stop()
 
 
-def send_forward_recv_backward(output_tensor, timers=None, use_ring_exchange=False):
+def send_forward_recv_backward(output_tensor, timers=None, use_ring_exchange=False,
+                               batch_p2p_comm=True):
     """Send activation forward and receive grad backward (combined).
 
     Megatron dd8890626 p2p_communication.py send_forward_recv_backward().
+    M1501: adds batch_p2p_comm param; unpacks 3-tuple from _communicate.
     """
     if _is_pipeline_last_stage():
         return None
     if timers is not None:
         timers('forward-send-backward-recv').start()
-    _, output_tensor_grad = _communicate(
+    print(f'[M1501] send_forward_recv_backward: output_shape='
+          f'{output_tensor.shape if output_tensor is not None else None} '
+          f'batch_p2p_comm={batch_p2p_comm}')
+    _, output_tensor_grad, _ = _communicate(
         tensor_send_next=output_tensor,
         tensor_send_prev=None,
         recv_prev=False,
         recv_next=True,
-        use_ring_exchange=use_ring_exchange)
+        use_ring_exchange=use_ring_exchange,
+        batch_p2p_comm=batch_p2p_comm)
     if timers is not None:
         timers('forward-send-backward-recv').stop()
+    print(f'[M1501] send_forward_recv_backward: received grad_shape='
+          f'{output_tensor_grad.shape if output_tensor_grad is not None else None}')
     return output_tensor_grad
 
 
-def send_backward_recv_forward(input_tensor_grad, timers=None, use_ring_exchange=False):
+def send_backward_recv_forward(input_tensor_grad, timers=None, use_ring_exchange=False,
+                               batch_p2p_comm=True):
     """Send grad backward and receive activation forward (combined).
 
     Megatron dd8890626 p2p_communication.py send_backward_recv_forward().
+    M1501: adds batch_p2p_comm param; unpacks 3-tuple from _communicate.
     """
     if _is_pipeline_first_stage():
         return None
     if timers is not None:
         timers('backward-send-forward-recv').start()
-    input_tensor, _ = _communicate(
+    input_tensor, _, _ = _communicate(
         tensor_send_next=None,
         tensor_send_prev=input_tensor_grad,
         recv_prev=True,
         recv_next=False,
-        use_ring_exchange=use_ring_exchange)
+        use_ring_exchange=use_ring_exchange,
+        batch_p2p_comm=batch_p2p_comm)
     if timers is not None:
         timers('backward-send-forward-recv').stop()
     return input_tensor
 
 
-def send_forward_recv_forward(output_tensor, recv_prev, timers=None):
+def send_forward_recv_forward(output_tensor, recv_prev, timers=None,
+                              batch_p2p_comm=True, overlap_p2p_comm=False):
     """Send activation forward and receive next activation forward via ring.
 
     Megatron dd8890626 p2p_communication.py send_forward_recv_forward().
     Uses ring_exchange (use_ring_exchange=True) as required by interleaved schedule.
+    M1501: adds batch_p2p_comm and overlap_p2p_comm params; when overlap_p2p_comm
+    is True, skips wait and returns (tensor, reqs).
     """
     if timers is not None:
         timers('forward-send-forward-recv').start()
-    input_tensor, _ = _communicate(
+    input_tensor, _, wait_handles = _communicate(
         tensor_send_next=output_tensor,
         tensor_send_prev=None,
         recv_prev=recv_prev,
         recv_next=False,
-        use_ring_exchange=True)
+        use_ring_exchange=True,
+        batch_p2p_comm=batch_p2p_comm,
+        wait_on_reqs=(not overlap_p2p_comm))
     if timers is not None:
         timers('forward-send-forward-recv').stop()
+    if overlap_p2p_comm:
+        return input_tensor, wait_handles
     return input_tensor
 
 
-def send_backward_recv_backward(input_tensor_grad, recv_next, timers=None):
+def send_backward_recv_backward(input_tensor_grad, recv_next, timers=None,
+                                batch_p2p_comm=True, overlap_p2p_comm=False):
     """Send grad backward and receive next grad backward via ring.
 
     Megatron dd8890626 p2p_communication.py send_backward_recv_backward().
     Uses ring_exchange (use_ring_exchange=True) as required by interleaved schedule.
+    M1501: adds batch_p2p_comm and overlap_p2p_comm params; when overlap_p2p_comm
+    is True, skips wait and returns (tensor, reqs).
     """
     if timers is not None:
         timers('backward-send-backward-recv').start()
-    _, output_tensor_grad = _communicate(
+    _, output_tensor_grad, wait_handles = _communicate(
         tensor_send_next=None,
         tensor_send_prev=input_tensor_grad,
         recv_prev=False,
         recv_next=recv_next,
-        use_ring_exchange=True)
+        use_ring_exchange=True,
+        batch_p2p_comm=batch_p2p_comm,
+        wait_on_reqs=(not overlap_p2p_comm))
     if timers is not None:
         timers('backward-send-backward-recv').stop()
+    if overlap_p2p_comm:
+        return output_tensor_grad, wait_handles
     return output_tensor_grad
 
 
 def send_forward_backward_recv_forward_backward(
-        output_tensor, input_tensor_grad, recv_prev, recv_next, timers=None):
+        output_tensor, input_tensor_grad, recv_prev, recv_next, timers=None,
+        batch_p2p_comm=True):
     """Full interleaved exchange: send fwd+bwd, receive fwd+bwd simultaneously.
 
     Megatron dd8890626 p2p_communication.py
     send_forward_backward_recv_forward_backward().
     Uses ring_exchange for the combined send/recv.
+    M1501: adds batch_p2p_comm param; unpacks 3-tuple from _communicate.
     """
     if timers is not None:
         timers('forward-backward-send-forward-backward-recv').start()
-    input_tensor, output_tensor_grad = _communicate(
+    input_tensor, output_tensor_grad, _ = _communicate(
         tensor_send_next=output_tensor,
         tensor_send_prev=input_tensor_grad,
         recv_prev=recv_prev,
         recv_next=recv_next,
-        use_ring_exchange=True)
+        use_ring_exchange=True,
+        batch_p2p_comm=batch_p2p_comm)
     if timers is not None:
         timers('forward-backward-send-forward-backward-recv').stop()
     return input_tensor, output_tensor_grad
