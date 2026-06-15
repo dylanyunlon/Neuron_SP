@@ -8,8 +8,8 @@ import torch
 from megatron.core.tensor_parallel import reduce_from_tensor_model_parallel_region
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.moe_utils import (
-    ModelCommProcessGroups,
     MoEAuxLossAutoScaler,
+    ProcessGroupCollection,
     apply_random_logits,
     apply_router_token_dropping,
     compute_routing_scores_for_aux_loss,
@@ -27,30 +27,36 @@ class Router(ABC, MegatronModule):
     """Base Router class"""
 
     def __init__(
-        self, config: TransformerConfig, model_comm_pgs: Optional[ModelCommProcessGroups] = None
+        self, config: TransformerConfig, pg_collection: Optional[ProcessGroupCollection] = None
     ) -> None:
         """
         Initialize the Router module.
 
         Args:
             config (TransformerConfig): Configuration object for the Transformer model.
-            model_comm_pgs (ModelCommProcessGroups, optional): Process groups for MoE operations.
+            pg_collection (ProcessGroupCollection, optional): Process groups for MoE operations.
         """
         super().__init__(config)
         self.config = config
         self.num_experts = self.config.num_moe_experts
         self.moe_aux_loss_func = None
         self.layer_number = None
-        self.tp_group = model_comm_pgs.tp
-        self.cp_group = model_comm_pgs.cp
-        self.tp_cp_group = model_comm_pgs.tp_cp
-        self.tp_dp_cp_group = model_comm_pgs.tp_dp_cp
+        self.tp_group = pg_collection.tp
+        self.cp_group = pg_collection.cp
+        self.tp_cp_group = pg_collection.tp_cp
+        self.tp_dp_cp_group = pg_collection.tp_dp_cp
 
         # Initialize the gate weights.
         # TODO: Add support for GPU initialization, which requires updating the golden values.
         self.weight = torch.nn.Parameter(
             torch.empty((self.config.num_moe_experts, self.config.hidden_size), dtype=torch.float32)
         )
+        if self.config.add_bias_linear:
+            self.bias = torch.nn.Parameter(
+                torch.empty((self.config.num_moe_experts), dtype=torch.float32)
+            )
+        else:
+            self.bias = None
         # If calculate per token loss, we need to scale up moe aux loss by the number of tokens.
         # So we need to know if the model is configured to calculate per token loss.
         self.calculate_per_token_loss = self.config.calculate_per_token_loss
@@ -62,6 +68,9 @@ class Router(ABC, MegatronModule):
             self.config.init_method(self.weight)
         self.weight.data = self.weight.data.to(dtype=self.config.params_dtype)
         setattr(self.weight, 'sequence_parallel', self.config.sequence_parallel)
+        if self.bias is not None:
+            self.bias.data = self.bias.data.to(dtype=self.config.params_dtype)
+            setattr(self.bias, 'sequence_parallel', self.config.sequence_parallel)
 
     def gating(self, input: torch.Tensor):
         """Forward pass of the router gate.
@@ -75,13 +84,16 @@ class Router(ABC, MegatronModule):
         if self.weight.device.type == 'cpu':
             # move weights to GPU
             self.weight.data = self.weight.data.to(device=torch.cuda.current_device())
+        if self.bias is not None and self.bias.device.type == 'cpu':
+            self.bias.data = self.bias.data.to(device=torch.cuda.current_device())
+
         # Convert to specified datatype for routing computation if enabled
         router_dtype = input.dtype
         if self.config.moe_router_dtype == 'fp32':
             router_dtype = torch.float32
         elif self.config.moe_router_dtype == 'fp64':
             router_dtype = torch.float64
-        logits = router_gating_linear(input, self.weight, router_dtype)
+        logits = router_gating_linear(input, self.weight, self.bias, router_dtype)
         return logits
 
     @abstractmethod
@@ -129,15 +141,15 @@ class TopKRouter(Router):
     """
 
     def __init__(
-        self, config: TransformerConfig, model_comm_pgs: Optional[ModelCommProcessGroups] = None
+        self, config: TransformerConfig, pg_collection: Optional[ProcessGroupCollection] = None
     ) -> None:
         """Initialize the zero token dropping router.
 
         Args:
             config (TransformerConfig): The configuration for the transformer model.
-            model_comm_pgs (ModelCommProcessGroups, optional): Process groups for MoE operations.
+            pg_collection (ProcessGroupCollection, optional): Process groups for MoE operations.
         """
-        super().__init__(config=config, model_comm_pgs=model_comm_pgs)
+        super().__init__(config=config, pg_collection=pg_collection)
         self.topk = self.config.moe_router_topk
         self.routing_type = self.config.moe_router_load_balancing_type
         self.score_function = self.config.moe_router_score_function
