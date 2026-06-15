@@ -614,6 +614,8 @@ def validate_args(args, defaults={}):
                 'all_gather instead, turning off fp8_param_gather',
                 args.rank,
             )
+        if args.fp4_param and not is_te_min_version("2.7.0.dev0"):
+            raise ValueError("--fp4-param requires Transformer Engine >= 2.7.0.dev0.")   
 
     if args.overlap_param_gather_with_optimizer_step:
         assert args.use_distributed_optimizer, \
@@ -638,6 +640,18 @@ def validate_args(args, defaults={}):
     if args.fp8_param_gather:
         assert args.use_distributed_optimizer or args.use_torch_fsdp2 or args.use_megatron_fsdp or not torch.is_grad_enabled(), \
             '--fp8-param-gather only supported with distributed optimizer, torch fsdp2, megatron fsdp, or inference mode'
+
+    # FP4 and FP8 are mutually exclusive
+    if args.fp4 and args.fp8:
+        raise ValueError("--fp4-format and --fp8-format cannot be used simultaneously. Please choose one.")
+
+    # FP4 param requires FP4 mode
+    if args.fp4_param and not args.fp4:
+        raise ValueError("--fp4-param-gather must be used together with --fp4-format.")
+    
+    # FP4 requires TE >= 2.7.0.dev0
+    if args.fp4 and not is_te_min_version("2.7.0.dev0"):
+        raise ValueError("--fp4-format requires Transformer Engine >= 2.7.0.dev0 for NVFP4BlockScaling support.")
 
     if args.use_megatron_fsdp:
         # NOTE: The flag `use_custom_fsdp` is deprecated and will be removed in future versions.
@@ -1277,6 +1291,20 @@ def _add_transformer_engine_args(parser):
                        help='Number of layers at start to construct in bf16 when --first-last-layers-bf16 is enabled.')
     group.add_argument('--num-layers-at-end-in-bf16', type=int, default=1,
                        help='Number of layers at end to construct in bf16 when --first-last-layers-bf16 is enabled.')
+    
+    # FP4 related arguments
+    group.add_argument('--fp4-format', default=None,
+                       choices=['e2m1'],
+                       help='Which nvfp4 format scheme to use for FP4 tensors in the forward and backward pass',
+                       dest='fp4')
+    group.add_argument('--fp4-recipe', default='nvfp4',
+                       choices=['nvfp4'],
+                       help='Which fp4 recipe to use for FP4 tensors in the forward and backward pass',
+                       dest='fp4_recipe')
+    group.add_argument('--fp4-param-gather', action='store_true',
+                       help='Keep the compute param in fp4 (do not use any other intermediate '
+                            'dtype) and perform the param all-gather in fp4.',
+                       dest='fp4_param')
     group.add_argument('--te-rng-tracker', action='store_true', default=False,
                        help='Use the Transformer Engine version of the random number generator. '
                             'Required for CUDA graphs support.')
@@ -2619,12 +2647,17 @@ def _add_tokenizer_args(parser):
                        help='What type of tokenizer to use.')
     group.add_argument('--tokenizer-model', type=str, default=None,
                        help='Sentencepiece tokenizer model.')
+    group.add_argument('--tokenizer-metadata', type=str, default=None,
+                       help='Path to tokenizer metadata in json format.')
     group.add_argument('--tiktoken-pattern', type=str, default=None,
                        help='Which tiktoken pattern to use. Options: [v1, v2]')
     group.add_argument('--tiktoken-num-special-tokens', type=int, default=1000,
                        help='Number of special tokens in tiktoken tokenizer')
     group.add_argument('--tiktoken-special-tokens', type=str, nargs='+', default=None,
-                       help='List of tiktoken special tokens, needs to have ["<unk>", "<s>", "</s>"]')
+                       help='List of tiktoken special tokens, needs to have '
+                            '["<unk>", "<s>", "</s>", "<mask>", "<pad>", "<cls>", "<sep>"]')
+    group.add_argument('--legacy-tokenizer', action='store_true', default=False,
+                       help='To use legacy tokenizer system.')
     group.add_argument("--trust-remote-code", action="store_true",
                        help='Whether or not to allow PreTrainedTokenizer to execute remote code')
     return parser
