@@ -16,11 +16,8 @@ from torch.cuda.nvtx import range_pop, range_push
 
 from megatron.core import parallel_state
 from megatron.core.inference.contexts.dynamic_context import (
-    ChunkOverflowError,
+    ContextOverflowError,
     DynamicInferenceContext,
-    MaxSequenceLengthOverflowError,
-    RequestOverflowError,
-    TokenOverflowError,
 )
 from megatron.core.inference.data_parallel_inference_coordinator import (
     DataParallelInferenceCoordinator,
@@ -34,7 +31,6 @@ from megatron.core.inference.text_generation_controllers.simple_text_generation_
 )
 from megatron.core.inference.utils import Counter
 from megatron.core.transformer.cuda_graphs import create_cudagraphs
-from megatron.core.utils import get_asyncio_loop
 
 try:
     from tqdm import tqdm
@@ -118,7 +114,12 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Initialize the asyncio loop if it has not already been initialized.
         # TODO: Start the engine loop here.
-        self._loop = get_asyncio_loop()
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError as e:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+        self._loop = loop
         self._cond = asyncio.Condition()
 
         # Capture cuda graph.
@@ -367,10 +368,11 @@ class DynamicInferenceEngine(AbstractEngine):
             self._loop.call_soon_threadsafe(
                 asyncio.create_task, self._notify_cond_for_new_request()
             )
-        except (TokenOverflowError, RequestOverflowError, ChunkOverflowError) as e:
-            self.waiting_request_ids.append(request_id)
-        except MaxSequenceLengthOverflowError as e:
-            raise e
+        except ContextOverflowError as e:
+            if e.is_transient:
+                self.waiting_request_ids.append(request_id)
+            else:
+                raise e
 
         # Create a new asyncio Future to notify the user when the request has completed.
         self.request_completion_futures[request_id] = asyncio.Future()
