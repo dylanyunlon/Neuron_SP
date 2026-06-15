@@ -19,7 +19,6 @@ from megatron.core import parallel_state
 from megatron.core.inference.contexts.dynamic_context import (
     ContextOverflowError,
     DynamicInferenceContext,
-    WarmupEngineMode,
 )
 from megatron.core.inference.data_parallel_inference_coordinator import (
     DataParallelInferenceCoordinator,
@@ -32,6 +31,7 @@ from megatron.core.inference.text_generation_controllers.simple_text_generation_
     SimpleTextGenerationController,
 )
 from megatron.core.inference.utils import Counter
+from megatron.core.utils import get_asyncio_loop
 
 try:
     from tqdm import tqdm
@@ -124,12 +124,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Initialize the asyncio loop if it has not already been initialized.
         # TODO: Start the engine loop here.
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError as e:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-        self._loop = loop
+        self._loop = get_asyncio_loop()
         self._cond = asyncio.Condition()
 
         # Capture cuda graph.
@@ -147,58 +142,39 @@ class DynamicInferenceEngine(AbstractEngine):
 
             print(
                 "> dynamic_engine.py: building cuda graphs for %d batch size(s): %s."
-                % (len(context.cuda_graph_token_counts), context.cuda_graph_token_counts)
+                % (len(context.cuda_graph_request_counts), context.cuda_graph_request_counts)
             )
-            for warmup_engine_mode in [WarmupEngineMode.DECODE, WarmupEngineMode.NON_DECODE]:
-                # Iterate cuda graph dims.
-                if (
-                    warmup_engine_mode == WarmupEngineMode.NON_DECODE
-                    and not context.non_decode_cuda_graphs
-                ):
-                    continue
-                tbar = enumerate(context.cuda_graph_token_counts)
+
+            # Iterate cuda graph dims.
+            tbar = enumerate(context.cuda_graph_request_counts)
+            if HAVE_TQDM:
+                tbar = tqdm(tbar, total=len(context.cuda_graph_request_counts))
+            for tbar_idx, cuda_graph_request_count in tbar:
+                # Initialize attention state.
+                context.initialize_attention_state(num_warmup_requests=cuda_graph_request_count)
+                assert (
+                    cuda_graph_request_count == context.padded_active_token_count
+                ), f"{cuda_graph_request_count} vs. {context.padded_active_token_count}."
+                assert context.is_decode_only(), "Decode-only required for cuda graph capture."
+
+                # Progress.
+                tbar_str = f"cuda graph warmup, d {cuda_graph_request_count}"
                 if HAVE_TQDM:
-                    tbar = tqdm(tbar, total=len(context.cuda_graph_token_counts))
-                for tbar_idx, cuda_graph_token_count in tbar:
-                    if (
-                        cuda_graph_token_count == 1
-                        and warmup_engine_mode == WarmupEngineMode.NON_DECODE
-                    ):
-                        # This case is not supported`` as we require atleast two
-                        # tokens for a non-decode engine step.
-                        continue
-                    # Initialize attention state.
-                    context.initialize_attention_state(
-                        num_warmup_tokens=cuda_graph_token_count,
-                        warmup_engine_mode=warmup_engine_mode,
+                    tbar.set_description(tbar_str)
+                else:
+                    print(f"{tbar_idx}/{len(context.cuda_graph_request_counts)}. {tbar_str}")
+
+                # Get flat tokens, position ids.
+                input_ids, position_ids = context.current_input_and_position_ids(
+                    num_warmup_tokens=cuda_graph_request_count
+                )
+
+                # Forward pass -> logits.
+                with torch.inference_mode():
+                    logits = controller.inference_wrapped_model.run_one_forward_step(
+                        {"tokens": input_ids, "position_ids": position_ids, "attention_mask": None}
                     )
-                    assert (
-                        cuda_graph_token_count == context.padded_active_token_count
-                    ), f"{cuda_graph_token_count} vs. {context.padded_active_token_count}."
-
-                    # Progress.
-                    mode_str = warmup_engine_mode.name.lower()
-                    tbar_str = f"cuda graph warmup - {mode_str}, d {cuda_graph_token_count}"
-                    if HAVE_TQDM:
-                        tbar.set_description(tbar_str)
-                    else:
-                        print(f"{tbar_idx}/{len(context.cuda_graph_token_counts)}. {tbar_str}")
-
-                    # Get flat tokens, position ids.
-                    input_ids, position_ids = context.current_input_and_position_ids(
-                        num_warmup_tokens=cuda_graph_token_count
-                    )
-
-                    # Forward pass -> logits.
-                    with torch.inference_mode():
-                        controller.inference_wrapped_model.run_one_forward_step(
-                            {
-                                "tokens": input_ids,
-                                "position_ids": position_ids,
-                                "attention_mask": None,
-                            }
-                        )
-                        context.reset()  # todo: @lmcafee, remove if unnecessary.
+                    context.reset()  # todo: @lmcafee, remove if unnecessary.
 
             # Memory usage.
             time_end = time.time()
@@ -535,7 +511,6 @@ class DynamicInferenceEngine(AbstractEngine):
         prev_is_decode_only = self.context.is_decode_only()
         prev_total_request_count = self.context.total_request_count
         prev_paused_request_count = self.context.paused_request_count
-        prev_active_token_count = self.context.active_token_count
 
         range_push("Prefill" if not prev_is_decode_only else "Decode")
 
@@ -573,7 +548,6 @@ class DynamicInferenceEngine(AbstractEngine):
         if verbose:
             context = self.context
             mem = torch.cuda.memory_stats()
-            step_type = "decode" if is_decode_only else "non-decode"
             output_str = (
                 "* step %d | %s ... time: %.3f%s ... "
                 "reqs: %d [ gtd %d, active %d, paused %d, finished %d ] ... "
@@ -583,16 +557,20 @@ class DynamicInferenceEngine(AbstractEngine):
                     datetime.now().strftime("%H:%M:%S"),
                     step_time,
                     (
-                        " [%s + cuda graph %s]"
-                        % (
-                            step_type,
-                            (
+                        (
+                            " [decode + cuda graph %s]"
+                            % (
                                 "DIM %d:%d"
-                                % (context.padded_active_token_count, prev_active_token_count)
-                                if self.context.using_cuda_graph_this_step()
+                                % (
+                                    context.padded_active_request_count,
+                                    prev_total_request_count - prev_paused_request_count,
+                                )
+                                if self.enable_cuda_graph
                                 else "OFF"
-                            ),
+                            )
                         )
+                        if prev_is_decode_only
+                        else "[prefill]"
                     ),
                     prev_total_request_count,
                     context.gtd_request_count,
