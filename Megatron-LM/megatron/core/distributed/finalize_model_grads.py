@@ -31,7 +31,7 @@ from ..utils import (
 )
 
 
-def _get_main_grad_attr(param: torch.nn.Parameter, use_megatron_fsdp: bool = False):
+def _get_main_grad_attr(param: torch.nn.Parameter):
     if hasattr(param, "main_grad"):
         return "main_grad"
     return "grad"
@@ -239,7 +239,7 @@ def _allreduce_embedding_grad(
         if weight is None and skip_if_none:
             return
 
-        grad_attr = _get_main_grad_attr(weight, ddp_config.use_megatron_fsdp)
+        grad_attr = _get_main_grad_attr(weight)
         orig_grad = getattr(weight, grad_attr)
         if ddp_config.use_megatron_fsdp:
             orig_grad = orig_grad._local_tensor if orig_grad is not None else None
@@ -267,13 +267,18 @@ def _allreduce_position_embedding_grads(
     )
 
 
-def _reset_global_aux_loss_tracker(model: List[torch.nn.Module]):
+def reset_model_temporary_tensors(config: TransformerConfig, model: List[torch.nn.Module]):
     """
-    Reset the global aux loss tracker.
+    Reset the temporary tensors of the model.
     """
     for model_chunk in model:
         for module in get_attr_wrapped_model(model_chunk, 'modules')():
-            if hasattr(module, 'reset_global_aux_loss_tracker'):
+            if config.moe_router_enable_expert_bias and hasattr(module, 'expert_bias'):
+                module.local_tokens_per_expert.zero_()
+            if (
+                config.moe_router_load_balancing_type == "global_aux_loss"
+                or "global_aux_loss" in config.moe_router_load_balancing_type
+            ) and hasattr(module, 'reset_global_aux_loss_tracker'):
                 module.reset_global_aux_loss_tracker()
 
 
@@ -298,10 +303,7 @@ def _update_router_expert_bias(model: List[torch.nn.Module], config: Transformer
         stacked_tokens_per_expert, stacked_expert_bias, config.moe_router_bias_update_rate
     )
 
-    for tokens_per_expert, expert_bias, updated_expert_bias in zip(
-        tokens_per_expert_list, expert_bias_list, stacked_updated_expert_bias
-    ):
-        tokens_per_expert.zero_()
+    for expert_bias, updated_expert_bias in zip(expert_bias_list, stacked_updated_expert_bias):
         expert_bias.copy_(updated_expert_bias)
 
 
@@ -330,7 +332,7 @@ def _allreduce_non_tensor_model_parallel_grads(
             if param.requires_grad:
                 # Check if this param needs average reduction (average_gradients_across_tp_domain)
                 if getattr(param, "average_gradients_across_tp_domain", False):
-                    grad_attr = _get_main_grad_attr(param, ddp_config.use_megatron_fsdp)
+                    grad_attr = _get_main_grad_attr(param)
                     grad = getattr(param, grad_attr)
                     if grad is None:
                         continue
@@ -344,7 +346,7 @@ def _allreduce_non_tensor_model_parallel_grads(
                 elif (config.sequence_parallel and getattr(param, "sequence_parallel", False)) or (
                     config.qk_layernorm and ("q_layernorm" in name or "k_layernorm" in name)
                 ):
-                    grad_attr = _get_main_grad_attr(param, ddp_config.use_megatron_fsdp)
+                    grad_attr = _get_main_grad_attr(param)
                     grad = getattr(param, grad_attr)
                     if grad is None:
                         continue
@@ -368,7 +370,7 @@ def _allreduce_non_tensor_model_parallel_grads(
                 params, grads, _unflatten_dense_tensors(coalesced, grads)
             ):
                 buf.copy_(synced)
-                grad_attr = _get_main_grad_attr(param, ddp_config.use_megatron_fsdp)
+                grad_attr = _get_main_grad_attr(param)
                 orig_grad = getattr(param, grad_attr)
                 if ddp_config.use_megatron_fsdp:
                     setattr(param, grad_attr, orig_grad)
@@ -465,11 +467,7 @@ def finalize_model_grads(
     if config.moe_router_enable_expert_bias:
         _update_router_expert_bias(model, config)
 
-    if (
-        config.moe_router_load_balancing_type == "global_aux_loss"
-        or "global_aux_loss" in config.moe_router_load_balancing_type
-    ):
-        _reset_global_aux_loss_tracker(model)
+    reset_model_temporary_tensors(config, model)
 
     # normalize gradients for per-token loss normalization.
     # if we are using by the number of tokens, then we use that as a divisor. this number
