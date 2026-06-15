@@ -1221,8 +1221,6 @@ def core_transformer_config_from_args(args, config_class=None):
     if args.is_hybrid_model:
         kw_args['is_hybrid_model'] = args.is_hybrid_model
 
-    kw_args['inference_sampling_seed'] = args.seed
-
     # handle quantization config
     # NOTE: Kitchen arguments are only added to the namespace when
     # Kitchen library is available.
@@ -1463,7 +1461,10 @@ def _add_network_size_args(parser):
     group.add_argument('--group-query-attention', action='store_true',
                           help='Use group-query attention.')
     group.add_argument('--num-query-groups', type=int, default=1)
-
+    group.add_argument('--softmax-type', type=str, default='vanilla',
+                       choices=['learnable', 'vanilla', 'off-by-one'],
+                       help='Type of softmax to use for the attention. Supports both a fixed offset and '
+                       'learnable offset.')
     group.add_argument('--max-position-embeddings', type=int, default=None,
                        help='Maximum number of position embeddings to use. '
                        'This is the size of position embedding.')
@@ -2903,7 +2904,7 @@ def _add_moe_args(parser):
                        'Upcycling is implemented on the top of distributed checkpointing, so it supports parallel modes different from the dense model.')
     # Router arguments
     group.add_argument('--moe-router-load-balancing-type', nargs='+', type=str,
-                       choices=['aux_loss', 'seq_aux_loss', 'global_aux_loss', 'sinkhorn', 'none'],
+                       choices=['aux_loss', 'seq_aux_loss', 'sinkhorn', 'none'],
                        default='aux_loss',
                        help='Determines the load balancing strategy for the router. "aux_loss" corresponds to the load balancing loss used in GShard and SwitchTransformer; "seq_aux_loss" corresponds to the load balancing loss used in DeepSeekV2, which computes the loss for each individual sample; "sinkhorn" corresponds to the balancing algorithm used in S-BASE, and "none" implies no load balancing. The default is "aux_loss".')
     group.add_argument('--moe-router-dtype', type=str,
