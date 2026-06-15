@@ -664,7 +664,13 @@ def log_single_rank(logger: logging.Logger, *args: Any, rank: int = 0, **kwargs:
         logger.log(*args, **kwargs)
 
 
-def log_on_each_pipeline_stage(logger: logging.Logger, *args: Any, **kwargs: Any):
+def log_on_each_pipeline_stage(
+    logger: logging.Logger,
+    *args: Any,
+    tp_group: Optional[torch.distributed.ProcessGroup] = None,
+    dp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
+    **kwargs: Any,
+):
     """Log on first rank in each pipeline stage
 
     Args:
@@ -676,10 +682,16 @@ def log_on_each_pipeline_stage(logger: logging.Logger, *args: Any, **kwargs: Any
     """
     assert torch.distributed.is_initialized()
 
-    if (
-        parallel_state.get_data_parallel_rank(with_context_parallel=True) == 0
-        and parallel_state.get_tensor_model_parallel_rank() == 0
-    ):
+    if tp_group is None and dp_cp_group is None:
+        tp_rank = parallel_state.get_tensor_model_parallel_rank()
+        dp_cp_rank = parallel_state.get_data_parallel_rank(with_context_parallel=True)
+    elif tp_group is not None and dp_cp_group is not None:
+        tp_rank = tp_group.rank()
+        dp_cp_rank = dp_cp_group.rank()
+    else:
+        raise ValueError("tp_group and dp_cp_group must be provided or not provided together")
+
+    if tp_rank == 0 and dp_cp_rank == 0:
         logger.log(*args, **kwargs)
 
 
@@ -943,6 +955,9 @@ def drain_embedding_wgrad_compute(
         grad_output, all_gathered_input = prepare_input_tensors_for_wgrad_compute(
             grad_output, all_gathered_input
         )
+
+        if hasattr(weight, "__fsdp_param__"):
+            weight.main_grad = weight.get_main_grad()
 
         if config.gradient_accumulation_fusion:
             if weight.main_grad.dtype == torch.float32:
