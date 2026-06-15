@@ -25,7 +25,7 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_group,
     get_tensor_model_parallel_world_size,
 )
-from megatron.core.process_groups_config import ModelCommProcessGroups
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.layers import (
     _initialize_affine_weight_cpu,
     set_tensor_model_parallel_attributes,
@@ -39,7 +39,10 @@ from megatron.core.tensor_parallel.utils import divide
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.mlp import MLP
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint
+from megatron.core.transformer.utils import (
+    is_layer_window_attention,
+    make_sharded_tensors_for_checkpoint,
+)
 from megatron.core.utils import (
     get_pg_rank,
     get_pg_size,
@@ -845,7 +848,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         k_channels: Optional[int] = None,
         v_channels: Optional[int] = None,
         cp_comm_type: str = "p2p",
-        model_comm_pgs: ModelCommProcessGroups = None,
+        pg_collection: ProcessGroupCollection = None,
     ):
         if not HAVE_TE:
             raise ImportError(
@@ -878,25 +881,23 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                 f"num_attention_heads ({self.config.num_attention_heads}))"
             )
 
-        if model_comm_pgs is None:
-            # For backward compatibility, remove in v0.14 and raise error
-            # raise ValueError("TEDotProductAttention was called without ModelCommProcessGroups")
-            model_comm_pgs = ModelCommProcessGroups(
+        if pg_collection is None:
+            pg_collection = ProcessGroupCollection(
                 tp=get_tensor_model_parallel_group(check_initialized=False),
                 cp=get_context_parallel_group(check_initialized=False),
                 hcp=get_hierarchical_context_parallel_groups(check_initialized=False),
             )
         else:
             assert hasattr(
-                model_comm_pgs, "tp"
-            ), "TEDotProductAttention model_comm_pgs must have tp pg"
+                pg_collection, "tp"
+            ), "TEDotProductAttention pg_collection must have tp pg"
             assert hasattr(
-                model_comm_pgs, "cp"
-            ), "TEDotProductAttention model_comm_pgs must have cp pg"
+                pg_collection, "cp"
+            ), "TEDotProductAttention pg_collection must have cp pg"
             if cp_comm_type == "a2a+p2p":
                 assert hasattr(
-                    model_comm_pgs, "hcp"
-                ), "TEDotProductAttention model_comm_pgs must have hierarchical cp pg"
+                    pg_collection, "hcp"
+                ), "TEDotProductAttention pg_collection must have hierarchical cp pg"
 
         if is_te_min_version("0.10.0"):
             extra_kwargs["attention_type"] = attention_type
@@ -913,9 +914,9 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             ), "Only Transformer-Engine version >= 1.0.0 supports context parallelism!"
             if getattr(TEDotProductAttention, "cp_stream") is None:
                 TEDotProductAttention.cp_stream = torch.cuda.Stream()
-            extra_kwargs["cp_group"] = model_comm_pgs.cp
+            extra_kwargs["cp_group"] = pg_collection.cp
             extra_kwargs["cp_global_ranks"] = torch.distributed.get_process_group_ranks(
-                model_comm_pgs.cp
+                pg_collection.cp
             )
             extra_kwargs["cp_stream"] = TEDotProductAttention.cp_stream
             if is_te_min_version("1.10.0"):
@@ -941,7 +942,9 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                     f"Currently set to: {os.getenv('NVTE_ALLOW_NONDETERMINISTIC_ALGO', 'not set')}."
                 )
 
-        if config.window_size is not None:
+        if is_layer_window_attention(
+            config.window_size, config.window_attn_skip_freq, layer_number
+        ):
             # Check version
             assert is_te_min_version("1.2.0"), (
                 f"Transformer-Engine v{get_te_version()} must be >= 1.2.0 to support"
@@ -996,7 +999,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             get_rng_state_tracker=(
                 get_cuda_rng_tracker if get_cuda_rng_tracker().is_initialized() else None
             ),
-            tp_group=model_comm_pgs.tp,
+            tp_group=pg_collection.tp,
             layer_number=layer_number,
             **extra_kwargs,
         )
@@ -1029,6 +1032,12 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                 core_attention_bias_type="post_scale_bias", core_attention_bias=attention_bias
             )
 
+        if attn_mask_type == AttnMaskType.no_mask and self.config.window_size is not None:
+            if (qkv_format == "bshd" and query.size(1) == 1) or (
+                qkv_format == "sbhd" and query.size(0) == 1
+            ):
+                #  need to change mask type for SWA inference decode stage.
+                attn_mask_type = AttnMaskType.causal_bottom_right
         if self.te_forward_mask_type:
             if qkv_format == "thd" and is_te_min_version("1.7.0"):
                 # thd format uses flash attention with cuDNN kernel which requires is_padding=True,

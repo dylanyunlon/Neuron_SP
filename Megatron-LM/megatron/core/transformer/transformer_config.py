@@ -2,7 +2,7 @@
 
 import warnings
 from dataclasses import dataclass
-from typing import Callable, List, Optional, Tuple, Union
+from typing import Callable, List, Literal, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -108,6 +108,11 @@ class TransformerConfig(ModelParallelConfig):
     softmax_scale: Optional[float] = None
     """Softmax scale for attention scaling."""
 
+    softmax_type: Literal['vanilla', 'off-by-one', 'learnable'] = 'vanilla'
+    """Applies modified softmax from https://www.evanmiller.org/attention-is-off-by-one.html. 
+       Supports both TE FusedAttention and local unfused attention. Supports both a fixed offset and 
+       and learnable offset."""
+
     num_query_groups: Optional[int] = None
     """Number of query groups for group query attention. If None, normal attention is used."""
 
@@ -175,6 +180,11 @@ class TransformerConfig(ModelParallelConfig):
     window_size: Optional[Tuple[int, int]] = None
     """If not None, then will use sliding window attention. The size of the window is specified by
     the numbers inside the tuple; -1 is special value meaning "infinite window size"."""
+
+    window_attn_skip_freq: Optional[Union[int, List[int]]] = None
+    """Frequency of full attention layers among sliding window attention layers. Accepts either:
+    - An integer N: Represents a (N-1):1 ratio, one full attention layer after (N-1) SWA layers.
+    - A list that defines a custom pattern, e.g.: [1,1,1,1,0,0,0,0], where 1 represents SWA. """
 
     normalization: str = "LayerNorm"
     """Which norm to use for normalization layers, valid options are `LayerNorm` and `RMSNorm`."""
