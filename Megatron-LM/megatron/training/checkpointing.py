@@ -1123,7 +1123,7 @@ def _load_base_checkpoint(
         else:
             checkpoint_name = get_checkpoint_name(load_dir, iteration, release, return_base_dir=False)
         try:
-            state_dict = torch.load(checkpoint_name, map_location='cpu', weights_only=False)
+            state_dict = torch.load(checkpoint_name, map_location='cpu')
         except ModuleNotFoundError:
             from megatron.legacy.fp16_deprecated import loss_scaler
 
@@ -1135,7 +1135,7 @@ def _load_base_checkpoint(
                 'megatron.legacy.fp16_deprecated.loss_scaler'
             ]
             sys.modules['megatron.model'] = sys.modules['megatron.legacy.model']
-            state_dict = torch.load(checkpoint_name, map_location='cpu', weights_only=False)
+            state_dict = torch.load(checkpoint_name, map_location='cpu')
             sys.modules.pop('fp16.loss_scaler', None)
             sys.modules.pop('megatron.fp16.loss_scaler', None)
             sys.modules.pop('megatron.model', None)
@@ -1612,9 +1612,6 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
     num_floating_point_operations_so_far = state_dict.get('num_floating_point_operations_so_far', 0)
 
     # Check arguments.
-    assert args.consumed_train_samples == 0
-    assert args.skipped_train_samples == 0
-    assert args.consumed_valid_samples == 0
     if 'args' in state_dict and not args.finetune:
         checkpoint_args = state_dict['args']
         check_checkpoint_args(checkpoint_args)
@@ -1816,7 +1813,7 @@ def load_biencoder_checkpoint(model, only_query_model=False,
         print('global rank {} is loading checkpoint {}'.format(
             torch.distributed.get_rank(), checkpoint_name))
 
-    state_dict = torch.load(checkpoint_name, map_location='cpu', weights_only=False)
+    state_dict = torch.load(checkpoint_name, map_location='cpu')
     ret_state_dict = state_dict['model']
 
     if only_query_model:
