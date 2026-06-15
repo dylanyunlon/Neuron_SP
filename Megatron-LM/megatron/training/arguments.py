@@ -1051,6 +1051,11 @@ def validate_args(args, defaults={}):
             # optimizer state in the CPU memory of DP rank 0.
             assert args.use_dist_ckpt
 
+            if args.dist_ckpt_optim_fully_reshardable:
+                assert not args.distrib_optim_fully_reshardable_mem_efficient, \
+                    '--distrib-optim-fully-reshardable-mem-efficient requires -enable-gloo-process-groups'
+
+
     # Checkpointing
     if args.ckpt_fully_parallel_save_deprecated and args.rank == 0:
         print('--ckpt-fully-parallel-save flag is deprecated and has no effect.'
@@ -1119,8 +1124,8 @@ def validate_args(args, defaults={}):
         assert args.transformer_impl == 'transformer_engine', \
             "Delaying wgrad compute is only supported with transformer_engine implementation"
         if args.overlap_grad_reduce:
-            assert is_te_min_version("2.7.0"), (
-                "overlap_grad_reduce is only supported with TE >= 2.7.0 when enabling delay_wgrad_compute"
+            assert is_te_min_version("2.8.0"), (
+                "overlap_grad_reduce is only supported with TE >= 2.8.0 when enabling delay_wgrad_compute"
             )
         if not args.gradient_accumulation_fusion:
             assert is_te_min_version("2.7.0"), (
@@ -1407,6 +1412,11 @@ def _add_inference_args(parser):
                        '(See `dynamic_context.py` for details on how '
                        '`max_requests` is computed). Due to rounding, the actual '
                        'number of cuda graphs may not equal this argument.')
+    group.add_argument('--inference-dynamic-batching-track-paused-request-events',
+                       action='store_true',
+                       help='Track paused request ids by adding \'paused\' events '
+                       'to each request\'s event history. This has a very minor '
+                       'impact on latency.')
     group.add_argument('--symmetric-ar-type', type=str, default=None,
                        choices=['two_shot', "one_shot", "multimem_all_reduce", None],
                        help='What type of symmetric all reduce to use. The default is none which is no use of symetric memory')
@@ -1496,7 +1506,10 @@ def _add_network_size_args(parser):
     group.add_argument('--group-query-attention', action='store_true',
                           help='Use group-query attention.')
     group.add_argument('--num-query-groups', type=int, default=1)
-
+    group.add_argument('--softmax-type', type=str, default='vanilla',
+                       choices=['learnable', 'vanilla', 'off-by-one'],
+                       help='Type of softmax to use for the attention. Supports both a fixed offset and '
+                       'learnable offset.')
     group.add_argument('--max-position-embeddings', type=int, default=None,
                        help='Maximum number of position embeddings to use. '
                        'This is the size of position embedding.')
@@ -2384,6 +2397,20 @@ def _add_checkpointing_args(parser):
                             ' Check StrictHandling docs for flags meaning.'
                             ' NOTE: This flag controls only distributed checkpoint'
                             ' load from storage, not loading state dict into the model.')
+    group.add_argument('--dist-ckpt-save-pre-mcore-014', action='store_true',
+                       help='Revert checkpointing simplifications introduced in Megatron-Core'
+                            ' v0.14. This option affects only checkpoint saving format and will'
+                            ' be removed soon (checkpoint load format is determined based on'
+                            ' checkpoint metadata).')
+    group.add_argument('--dist-ckpt-optim-fully-reshardable', action='store_true',
+                       help='Make optimizer distributed checkpoint fully reshardable (TP/PP/EP/DP)'
+                            ' as opposed to plain DP reshardability.')
+    group.add_argument('--distrib-optim-fully-reshardable-mem-efficient', action='store_true',
+                       help='During distributed optimizer checkpoint save and load tries to use as'
+                            ' little memory as possible by using Gloo (instead of NCCL) and only one'
+                            ' rank for saving. Turn on only if experiencing host or device memory'
+                            ' issues. Has affect only with `--dist-ckpt-optim-fully-reshardable`'
+                            ' flag.')
     group.add_argument('--load-model-opt-format', action='store_true',
                        help='Load a checkpoint for TensorRT model optimizer (nvidia-modelopt).'
                             'This function can also be used to load NeMo .nemo sharded checkpoints.')
