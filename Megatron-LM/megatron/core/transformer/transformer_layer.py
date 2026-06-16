@@ -378,14 +378,14 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             if "layernorm" in self.config.recompute_modules:
                 if (
                     not isinstance(self.input_layernorm, IdentityOp)
-                    and not self.config.external_cuda_graph
+                    and self.config.cuda_graph_impl == "none"
                 ):
                     self.recompute_input_layernorm = True
-                    if self.config.fp8:
+                    if self.config.fp8 or self.config.fp4:
                         self.self_attention.set_for_recompute_input_layernorm()
                 if not isinstance(self.pre_mlp_layernorm, IdentityOp):
                     self.recompute_pre_mlp_layernorm = True
-                    if self.config.fp8:
+                    if self.config.fp8 or self.config.fp4:
                         if isinstance(self.mlp, MoELayer):
                             self.mlp.set_for_recompute_pre_mlp_layernorm()
                         else:
@@ -585,7 +585,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         )
 
         if self.recompute_mlp:
-            if self.config.fp8:
+            if self.config.fp8 or self.config.fp4:
                 # import here to avoid circular import
                 from megatron.core.extensions.transformer_engine import te_checkpoint
 
@@ -738,7 +738,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         ), (
             "CUDA graph accepts only Tensor inputs. "
             "inference_context and packed_seq_params are excluded from input list. "
-            "For inference cuda graph, please use enable_cuda_graph instead."
+            "For inference cuda graph, please use cuda_graph_impl=local instead."
         )
 
         cuda_graph_output = super()._te_cuda_graph_replay(*args, **kwargs)
