@@ -1,21 +1,13 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-#
-# Migrated from Megatron-LM upstream commit 806022f14
-# Fix: tool call crash at sequence length boundary — `.index(">")` raises ValueError
-# when a parameter block is truncated at the context window edge.
-# Resolution: switch to `.find(">")` and `continue` on -1, so malformed trailing
-# fragments are silently skipped instead of crashing the whole inference pass.
-# 鲁迅曰：旧代码以 .index() 待天下，遇截断则崩，一如旧社会以礼法待人，
-# 稍有逾矩便不留余地。今以 .find() 易之，idx == -1 则 continue，
-# 宽容一字，救无数推理进程于水火。                   —— M2240 迁移者记
 
 import ast
 import json
 import logging
 import re
 import uuid
+from types import SimpleNamespace
 from typing import Any
 
 from megatron.core.tokenizers.text.parsers.base_parser import BaseParser
@@ -56,20 +48,21 @@ class _Qwen3CoderToolParser:
         if tools is None:
             return {}
         for config in tools:
-            if not isinstance(config, dict):
+            config = SimpleNamespace(**config)  # Convert to SimpleNamespace for ease of access
+            if not hasattr(config, "type") or not (
+                hasattr(config, "function") and hasattr(config.function, "name")
+            ):
                 continue
-            fn = config.get("function", {})
-            if not isinstance(fn, dict):
-                continue
-            if config.get("type") != "function" or fn.get("name") != func_name:
-                continue
-            params = fn.get("parameters", {})
-            if isinstance(params, dict) and "properties" in params:
-                return params["properties"]
-            elif isinstance(params, dict):
-                return params
-            else:
-                return {}
+            if config.type == "function" and config.function.name == func_name:
+                if not hasattr(config.function, "parameters"):
+                    return {}
+                params = config.function.parameters
+                if isinstance(params, dict) and "properties" in params:
+                    return params["properties"]
+                elif isinstance(params, dict):
+                    return params
+                else:
+                    return {}
         logger.debug("Tool '%s' is not defined in the tools list.", func_name)
         return {}
 
@@ -94,9 +87,6 @@ class _Qwen3CoderToolParser:
 
         if isinstance(param_config[param_name], dict) and "type" in param_config[param_name]:
             param_type = str(param_config[param_name]["type"]).strip().lower()
-        elif isinstance(param_config[param_name], dict) and "anyOf" in param_config[param_name]:
-            # anyOf has no top-level "type"; treat as object to trigger json.loads.
-            param_type = "object"
         else:
             param_type = "string"
         if param_type in ["string", "str", "text", "varchar", "char", "enum"]:
@@ -183,30 +173,13 @@ class _Qwen3CoderToolParser:
         self, function_call_str: str, tools: list[ChatCompletionToolsParam] | None
     ) -> ToolCall | None:
         # Extract function name
-        end_index = function_call_str.find(">")
-        if end_index == -1:
-            return None
+        end_index = function_call_str.index(">")
         function_name = function_call_str[:end_index]
         param_config = self._get_arguments_config(function_name, tools)
         parameters = function_call_str[end_index + 1 :]
         param_dict = {}
         for match_text in self.tool_call_parameter_regex.findall(parameters):
-            # FIX (Megatron 806022f14): use .find() instead of .index() so a
-            # truncated parameter block at the sequence-length boundary does not
-            # raise ValueError and crash the whole inference pass.
-            idx = match_text.find(">")
-            # Malformed parameter block with no name/value delimiter, e.g. truncated tool call.
-            if idx == -1:
-                # [M2240 diag] 序列长度截断：参数块缺失 '>' 分隔符，旧代码此处崩溃。
-                # 今 continue 之，化险为夷，一如鲁迅笔下那沉默的大多数，
-                # 不言而喻地承受着 context window 的铁壁。
-                print(
-                    f"[Neuron-SP M2240 | qwen3_coder_tool_parser] "
-                    f"SKIP malformed param block (no '>' delimiter) — "
-                    f"likely truncated at sequence length. "
-                    f"match_text={match_text!r:.120}"
-                )
-                continue
+            idx = match_text.index(">")
             param_name = match_text[:idx]
             param_value = str(match_text[idx + 1 :])
             # Remove prefix and trailing \n
@@ -218,12 +191,6 @@ class _Qwen3CoderToolParser:
             param_dict[param_name] = self._convert_param_value(
                 param_value, param_name, param_config, function_name
             )
-
-        print(
-            f"[Neuron-SP M2240 | qwen3_coder_tool_parser] "
-            f"_parse_xml_function_call: func={function_name!r} "
-            f"params={list(param_dict.keys())}"
-        )
         return ToolCall(
             type="function",
             id=self._generate_tool_call_id(),
@@ -246,11 +213,6 @@ class _Qwen3CoderToolParser:
             raw_function_calls.extend(self.tool_call_function_regex.findall(tool_call))
 
         function_calls = [match[0] if match[0] else match[1] for match in raw_function_calls]
-
-        print(
-            f"[Neuron-SP M2240 | qwen3_coder_tool_parser] "
-            f"_get_function_calls: found {len(function_calls)} function call(s)"
-        )
         return function_calls
 
     def extract_tool_calls(
@@ -263,11 +225,6 @@ class _Qwen3CoderToolParser:
                 tools_called=False, tool_calls=[], content=model_output
             )
 
-        print(
-            f"[Neuron-SP M2240 | qwen3_coder_tool_parser] "
-            f"extract_tool_calls: prefix detected, output_len={len(model_output)}"
-        )
-
         try:
             function_calls = self._get_function_calls(model_output)
             if len(function_calls) == 0:
@@ -279,7 +236,6 @@ class _Qwen3CoderToolParser:
                 self._parse_xml_function_call(function_call_str, tools)
                 for function_call_str in function_calls
             ]
-            tool_calls = [tc for tc in tool_calls if tc is not None]
 
             # Extract content before tool calls
             content_index = model_output.find(self.tool_call_start_token)
@@ -287,11 +243,6 @@ class _Qwen3CoderToolParser:
             content_index = content_index if content_index >= 0 else idx
             content = model_output[:content_index]  # .rstrip()
 
-            print(
-                f"[Neuron-SP M2240 | qwen3_coder_tool_parser] "
-                f"extract_tool_calls: tools_called={len(tool_calls) > 0}, "
-                f"n_tool_calls={len(tool_calls)}"
-            )
             return ExtractedToolCallInformation(
                 tools_called=(len(tool_calls) > 0),
                 tool_calls=tool_calls,
