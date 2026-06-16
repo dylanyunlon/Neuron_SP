@@ -91,7 +91,7 @@ mlm = [
 
 dev = [
     "nvidia-modelopt[torch]>=0.44; sys_platform != 'darwin'",
-    "nvidia-resiliency-ext",
+    "nvidia-resiliency-ext==0.6.0",
     "tqdm",
     "einops~=0.8",
     "tensorstore~=0.1,!=0.1.46,!=0.1.72",
