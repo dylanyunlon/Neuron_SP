@@ -45,12 +45,18 @@ inputs:
   PAT:
     description: "GitHub Personal Access Token"
     required: true
-  is_ci_workload:
-    description: "Is CI workload"
-    required: true
-  is_merge_group:
-    description: "Is merge group"
-    required: true
+  scope:
+    description: "Test scope (e.g. mr-github, mr-github-slim)"
+    required: false
+    default: "mr-github-slim"
+  n_repeat:
+    description: "Number of test repetitions"
+    required: false
+    default: "5"
+  lightweight:
+    description: "Enable lightweight mode"
+    required: false
+    default: "false"
   platform:
     description: "Platform to run tests on (e.g. dgx_h100, dgx_gb200)"
     required: false
@@ -153,27 +159,12 @@ runs:
         #!/bin/bash
         set -euxo pipefail
 
-        if [ "${{ inputs.is_merge_group }}" == "true" ]; then
-          ARGS=(
-            --scope mr-github
-            --n-repeat 1
-          )
-        elif [ "${{ steps.has-run-tests-label.outputs.main }}" == "true" ]; then
-          ARGS=(
-            --scope mr-github
-            --enable-lightweight-mode
-            --n-repeat 1
-          )
-        elif [ "${{ steps.has-run-functional-tests-label.outputs.main }}" == "true" ]; then
-          ARGS=(
-            --scope mr-github
-            --n-repeat 5
-          )
-        else
-          ARGS=(
-            --scope mr-github-slim
-            --n-repeat 5
-          )
+        ARGS=(
+          --scope ${{ inputs.scope }}
+          --n-repeat ${{ inputs.n_repeat }}
+        )
+        if [ "${{ inputs.lightweight }}" == "true" ]; then
+          ARGS+=(--enable-lightweight-mode)
         fi
 
         export PYTHONPATH=$(pwd)
