@@ -110,6 +110,7 @@ dev = [
     "quart",
     "openai[aiohttp]",
     "orjson",
+    "fast-hadamard-transform",
 ]
 
 ### 'lts' extra is deprecated                                                   ###
@@ -180,6 +181,7 @@ no-build-isolation-package = [
     "mamba-ssm",
     "transformer-engine",
     "transformer-engine-torch",
+    "fast-hadamard-transform",
 ]
 link-mode = "copy"
 # We don't define override-dependencies globally but rather locally where we need it.
@@ -190,6 +192,30 @@ override-dependencies = [
     "torchvision; sys_platform == 'never'",
     "triton; sys_platform == 'never'",
 ]
+
+[[tool.uv.dependency-metadata]]
+name = "flash-mla"
+version = "1.0.0+9edee0c"
+requires-dist = []
+
+[[tool.uv.dependency-metadata]]
+name = "transformer-engine"
+version = "2.15.0+42b84005"
+requires-dist = [
+    "pydantic",
+    "importlib-metadata>=1.0",
+    "packaging",
+    "torch>=2.1",
+    "einops",
+    "onnxscript",
+    "onnx",
+    "nvdlfw-inspect",
+]
+
+[[tool.uv.dependency-metadata]]
+name = "fast-hadamard-transform"
+version = "1.0.4.post1"
+requires-dist = ["torch", "packaging", "ninja"]
 
 [tool.uv.sources]
 
