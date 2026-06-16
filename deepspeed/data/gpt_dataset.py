@@ -15,11 +15,14 @@
 
 """GPT style dataset."""
 
+import logging
 import os
 import time
 
 import numpy as np
 import torch
+
+logger = logging.getLogger(__name__)
 
 from megatron import mpu, print_rank_0
 from megatron.data.blendable_dataset import BlendableDataset
@@ -218,10 +221,31 @@ def get_indexed_dataset_(data_prefix, data_impl, skip_warmup):
     return indexed_dataset
 
 
+def _resolve_token_dtype(vocab_size):
+    """Select the narrowest integer dtype that covers the full vocab range.
+
+    Mirrors Megatron b305422a1 GPTDatasetConfig.token_dtype_code logic, reinterpreted
+    as a standalone helper for DES-LOC heterogeneous training: in ZeRO shard size
+    calculations the per-token byte width directly scales AllGather traffic, so
+    choosing uint16 when vocab_size <= 65535 halves inter-node token communication
+    bandwidth on heterogeneous GPU clusters where embedding shards live on slow links.
+
+    Returns (numpy_dtype, dtype_code) where dtype_code matches Megatron convention:
+      8 -> uint16 (2 bytes, vocab <= 65535)
+      4 -> int32  (4 bytes, fallback)
+    """
+    # M4187: Megatron b305422a1 — vocab_size threshold mirrors upstream exactly;
+    # uint16 max is 65535 so we require strict less-than to avoid wrap-around
+    # on the pad/EOS token that typically sits at vocab_size-1.
+    if vocab_size is not None and vocab_size <= 65535:
+        return np.uint16, 8
+    return np.int32, 4
+
+
 class GPTDataset(torch.utils.data.Dataset):
 
     def __init__(self, name, data_prefix, documents, indexed_dataset,
-                 num_samples, seq_length, seed):
+                 num_samples, seq_length, seed, vocab_size=None):
 
         self.name = name
         self.indexed_dataset = indexed_dataset
@@ -229,6 +253,32 @@ class GPTDataset(torch.utils.data.Dataset):
         # Checks
         assert np.min(documents) >= 0
         assert np.max(documents) < indexed_dataset.sizes.shape[0]
+
+        # M4187: Megatron b305422a1 — resolve token dtype once at construction so
+        # ZeRO shard-size math (bytes_per_element * shard_numel) uses the correct
+        # width, and so __getitem__ never upcasts unnecessarily to int64 on the
+        # hot path.  Emit a single structured diagnostic at dtype-selection time
+        # (mirrors M451 loss_scaler scale-grow event pattern) so training logs
+        # record which dtype is active without per-step noise.
+        self.token_dtype, self.token_dtype_code = _resolve_token_dtype(vocab_size)
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            _rank0 = torch.distributed.get_rank() == 0
+        else:
+            _rank0 = True
+        if _rank0:
+            _dtype_name = "uint16" if self.token_dtype_code == 8 else "int32"
+            print(
+                f"[deepspeed] GPTDataset '{name}' token_dtype={_dtype_name} "
+                f"(code={self.token_dtype_code}, vocab_size={vocab_size}); "
+                f"ZeRO AllGather bytes/token={np.dtype(self.token_dtype).itemsize}"
+            )
+            logger.info(
+                "[deepspeed] GPTDataset '%s' token_dtype=%s "
+                "(code=%d, vocab_size=%s); ZeRO AllGather bytes/token=%d",
+                name, _dtype_name, self.token_dtype_code, vocab_size,
+                np.dtype(self.token_dtype).itemsize,
+            )
+        # M4187: end
 
         # Build index mappings.
         self.doc_idx, self.sample_idx, self.shuffle_idx = _build_index_mappings(
@@ -266,7 +316,9 @@ class GPTDataset(torch.utils.data.Dataset):
                 length=offset_l + 1))
             sample = np.concatenate(sample_list)
 
-        return {'text': np.array(sample, dtype=np.int64)}
+        # M4187: Megatron b305422a1 — cast to the dtype selected at __init__ instead
+        # of always upcasting to int64; halves AllGather payload on uint16 vocabs.
+        return {'text': np.array(sample, dtype=self.token_dtype)}
 
 
 def _build_index_mappings(name, data_prefix, documents, sizes,
