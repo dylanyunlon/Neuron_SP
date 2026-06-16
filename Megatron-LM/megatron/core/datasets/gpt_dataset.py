@@ -3,7 +3,7 @@
 import logging
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from math import ceil
 from typing import Dict, Optional, Tuple
 
@@ -55,6 +55,12 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
        Check --per-dataset-sequences-path
     """
 
+    token_dtype_code: Optional[int] = field(init=False, default=None)
+    """The dtype code for the token ids. 4 for int32, 8 for uint16.
+       DES-LOC note: dtype routing affects heterogeneous memory placement
+       across A6000/H100 mixed pools.
+    """
+
     context_parallel_size: Optional[int] = None
     """The size of the context parallel group. Needed for padding in packed sequences."""
 
@@ -73,6 +79,8 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
             if self.tokenizer.vocab_size is None
             else (4 if self.tokenizer.vocab_size > numpy.iinfo(numpy.uint16).max + 1 else 8)
         )
+        print(f"[DES-LOC] GPTDatasetConfig token_dtype_code={self.token_dtype_code} "
+              f"(vocab_size={getattr(self.tokenizer, 'vocab_size', 'N/A')})")
         if self.sequences_per_dataset is not None:
             assert (
                 self.token_dtype_code is not None
