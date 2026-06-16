@@ -739,7 +739,7 @@ jobs:
         success()
         || needs.pre-flight.outputs.is_ci_workload == 'true'
         || needs.pre-flight.outputs.force_run_all == 'true'
-        || needs.pre-flight.outputs.is_merge_group == 'true'
+        || (needs.pre-flight.outputs.is_merge_group == 'true' && !failure())
       )
       && !cancelled()
     outputs:
@@ -847,7 +847,7 @@ jobs:
         success()
         || needs.pre-flight.outputs.is_ci_workload == 'true'
         || needs.pre-flight.outputs.force_run_all == 'true'
-        || needs.pre-flight.outputs.is_merge_group == 'true'
+        || (needs.pre-flight.outputs.is_merge_group == 'true' && !failure())
       )
       && !cancelled()
     steps:
@@ -869,6 +869,7 @@ jobs:
           n_repeat: ${{ needs.configure.outputs.n_repeat }}
           lightweight: ${{ needs.configure.outputs.lightweight }}
           cadence: ${{ needs.configure.outputs.cadence }}
+          sha: ${{ needs.configure.outputs.sha }}
 
   cicd-parse-integration-tests-gb200:
     runs-on: ubuntu-latest
@@ -891,7 +892,7 @@ jobs:
         success()
         || needs.pre-flight.outputs.is_ci_workload == 'true'
         || needs.pre-flight.outputs.force_run_all == 'true'
-        || needs.pre-flight.outputs.is_merge_group == 'true'
+        || (needs.pre-flight.outputs.is_merge_group == 'true' && !failure())
       )
       && !cancelled()
     outputs:
@@ -970,7 +971,7 @@ jobs:
         success()
         || needs.pre-flight.outputs.is_ci_workload == 'true'
         || needs.pre-flight.outputs.force_run_all == 'true'
-        || needs.pre-flight.outputs.is_merge_group == 'true'
+        || (needs.pre-flight.outputs.is_merge_group == 'true' && !failure())
       )
       && !cancelled()
     steps:
@@ -993,6 +994,7 @@ jobs:
           lightweight: ${{ needs.configure.outputs.lightweight }}
           platform: dgx_gb200
           cadence: ${{ needs.configure.outputs.cadence }}
+          sha: ${{ needs.configure.outputs.sha }}
 
   Nemo_CICD_Test:
     needs:
