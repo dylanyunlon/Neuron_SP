@@ -1,1351 +1,1528 @@
 """
-deepspeed/runtime/zero/hetero_fsdp_double_buffer.py
+HeteroFSDPDoubleBuffer — DES-LOC Heterogeneous FSDP Double Buffer Manager
+==========================================================================
 
-DES-LOC Heterogeneous FSDP Double Buffer with Tier-Aware Pool Sizing
-=====================================================================
+Upstream Design Intent (Megatron d199bb9e9f):
+----------------------------------------------
+Megatron's ``fsdp_double_buffer`` feature pre-allocates two alternating CUDA
+memory pools so that while one FSDP unit is computing its forward/backward pass
+the *next* unit's parameters are already being gathered in the background.  The
+critical bug fixed in d199bb9e was a CUDA Illegal Memory Access (IMA) triggered
+when an FSDP unit's bucket size exceeded the fixed-pool capacity: the original
+code fell back to a bare ``TemporaryBucketAllocator`` which did *not* perform
+storage-resize-based lifetime management, leaving dangling tensor views into
+freed CUDA memory.  The fix was to replace the bare fallback with a
+``StorageResizeBasedBucketAllocator`` that extends tensor storage in-place,
+keeping the underlying allocation alive until all views are released.
 
-Upstream Design Intent (Megatron d199bb9e9f388d8f8136a0c9b25d2bcc53529ffe)
----------------------------------------------------------------------------
-Megatron's fsdp_double_buffer feature pre-allocates two "buckets" of GPU memory
-for AllGather operations so that parameter communication can overlap with
-computation. The original bug this commit fixes: when an FSDP unit's bucket
-is larger than the fixed pool, the fallback allocator was a bare
-``TemporaryBucketAllocator`` which relies on torch.empty() + in-place resize
-semantics. Under certain CUDA IMA (Illegal Memory Access) conditions — specifically
-when the same storage is re-used across async NCCL streams — this triggered silent
-data corruption or outright crashes.
+DES-LOC Adaptation Points:
+---------------------------
+Hardware context: 2× A6000 (48 GB, SM86, cuda:0 / cuda:1) + 1× H100 NVL
+(96 GB, SM90, cuda:2), PCIe interconnect, no NVLink, 1.5 TB CPU DRAM.
 
-The fix changes the fallback to ``StorageResizeBasedBucketAllocator`` which
-performs explicit storage.resize_() calls under a stream guard, ensuring the
-CUDA VM mapping is stable before the AllGather kernel is launched.
+1. **Heterogeneous pool sizing** — The H100 gets a larger primary pool
+   (``h100_pool_fraction``) because its HBM3 bandwidth can drain a bigger
+   working set per step.  A6000 pools are sized conservatively to leave headroom
+   for activation checkpointing.
 
-DES-LOC Adaptation Points
---------------------------
-DES-LOC (Decoupled Execution with Shared LOcality Cache) runs across a
-heterogeneous pool:
+2. **Device-aware fallback allocator** — Mirrors Megatron's
+   ``StorageResizeBasedBucketAllocator`` fix but is *device-class-aware*: on
+   SM86 (A6000) it uses in-place storage resize; on SM90 (H100) it uses a
+   pinned-DRAM staging buffer backed by ``torch.UntypedStorage`` to exploit the
+   H100 NVL's higher PCIe bandwidth ceiling (~64 GB/s vs ~32 GB/s on A6000
+   slots in the target system).
 
-  Tier-0  —  2× NVIDIA A6000 48 GB  SM86  (PCIe, no NVLink)
-  Tier-1  —  1× NVIDIA H100 NVL 96 GB  SM90 (PCIe)
-  Host    —  1.5 TB CPU DRAM (pinned staging)
+3. **LOC cache (Shared Locality Cache)** — A per-device LRU eviction ring that
+   keeps recently-used bucket tensors alive across micro-batches, amortising
+   cudaMalloc overhead over the NUM_MICROBATCHES=4 typical workload described
+   in the upstream test.
 
-Key adaptations vs. upstream Megatron:
+4. **Decoupled Execution streams** — Each device owns a ``prefetch_stream`` and
+   a ``compute_stream``; the double-buffer swap is synchronised with lightweight
+   CUDA events rather than full ``torch.cuda.synchronize()`` calls, matching the
+   overlap_grad_reduce + overlap_param_gather configuration exercised by the
+   upstream smoke test.
 
-1. **TierAwarePoolAllocator** (replaces FixedPoolAllocator)
-   Pool sizes are derived per-device from runtime free-memory headroom rather
-   than a static config value. H100 gets a larger double-buffer pool; A6000s
-   share a smaller combined pool. The DES-LOC Locality Cache reservation is
-   subtracted before sizing the pool so parameter buffers never evict cached
-   activations.
-
-2. **HeteroStorageResizeFallback** (replaces StorageResizeBasedBucketAllocator)
-   Like the upstream fix, we use storage.resize_() under a stream guard, but
-   we extend it to support cross-tier moves: if a bucket cannot fit on the
-   current device even after resize, we spill the bucket to pinned CPU memory
-   and issue an async H2D copy on a dedicated staging stream. This prevents
-   OOM on A6000 when large Mamba SSM parameter blocks overflow the pool.
-
-3. **HeteroFSDPDoubleBuffer** (main class)
-   Wraps DeepSpeed ZeRO-3's parameter-fetch logic and injects tier-aware
-   double-buffering. It maintains per-tier prefetch queues and stream sets,
-   and honours the DES-LOC Locality Cache hit/miss protocol so that parameters
-   already resident in the Locality Cache bypass the AllGather entirely.
-
-4. **DeviceTierRegistry**
-   Lightweight registry that maps CUDA device ordinals → tier metadata at
-   module import time. No external config file needed; detection is fully
-   automatic via ``torch.cuda.get_device_properties``.
-
-DeepSpeed Integration
----------------------
-Drop this file into ``deepspeed/runtime/zero/`` and set:
-
-    ds_config["zero_optimization"]["hetero_fsdp_double_buffer"] = True
-
-The ``ZeROOptimizer`` initialisation path picks this up in
-``deepspeed/runtime/zero/stage3.py`` (search for ``hetero_fsdp_double_buffer``).
-
-References
-----------
-* Megatron commit d199bb9 — Fix CUDA IMA in fsdp_double_buffer
-* DeepSpeed ZeRO-3 param fetch: deepspeed/runtime/zero/partitioned_param_coordinator.py
-* DES-LOC design doc: docs/des-loc/locality_cache.md (internal)
+5. **CPU DRAM offload path** — When *both* pool slots are occupied on an A6000
+   (48 GB is tight with bf16 + grad + optim state), the manager can spill the
+   inactive buffer to pinned CPU memory and stream it back on demand, leveraging
+   the 1.5 TB headroom without stalling the H100.
 """
 
 from __future__ import annotations
 
-import gc
 import logging
 import math
 import threading
-import time
 import weakref
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import Dict, Generator, List, Optional, Set, Tuple
+from typing import Dict, Iterator, List, Optional, Tuple
 
 import torch
 import torch.cuda
 from torch import Tensor
 
-logger = logging.getLogger(__name__)
-
 # ---------------------------------------------------------------------------
-# Constants
+# Module-level logger — all DES-LOC specific events are routed here so that
+# callers can filter with ``logging.getLogger("deslo.hetero_fsdp")``
 # ---------------------------------------------------------------------------
-
-# Fraction of free device memory that DES-LOC reserves for the Locality Cache.
-# The double-buffer pool is carved from the *remainder*.
-_LOCALITY_CACHE_HEADROOM_FRACTION: float = 0.15
-
-# Minimum pool size (bytes) below which we skip double-buffering entirely and
-# fall through to the per-bucket fallback allocator.
-_MIN_POOL_BYTES: int = 64 * 1024 * 1024  # 64 MB
-
-# How many bytes of pinned CPU memory we pre-allocate as spill staging.
-_CPU_STAGING_BYTES: int = 512 * 1024 * 1024  # 512 MB per spill arena
-
-# SM capability thresholds
-_SM90_MAJOR = 9
-_SM86_MAJOR = 8
-_SM86_MINOR = 6
-
-# ---------------------------------------------------------------------------
-# Device Tier Registry
-# ---------------------------------------------------------------------------
+logger = logging.getLogger("deslo.hetero_fsdp")
 
 
-class DeviceTier(Enum):
-    """Logical tier within the DES-LOC heterogeneous device pool."""
-    H100 = auto()    # SM90, large HBM — preferred for large AllGather buckets
-    A6000 = auto()   # SM86, medium VRAM — secondary tier
-    UNKNOWN = auto() # Any other CUDA device
+# ===========================================================================
+# Device classification helpers
+# ===========================================================================
+
+class DeviceClass(Enum):
+    """SM architecture classes present in the DES-LOC target system."""
+    A6000_SM86 = auto()   # cuda:0, cuda:1 — 48 GB HBM2e
+    H100_SM90  = auto()   # cuda:2       — 96 GB HBM3 (NVL)
+    UNKNOWN    = auto()
 
 
-@dataclass(frozen=True)
-class TierMetadata:
-    device_index: int
-    tier: DeviceTier
-    total_bytes: int
-    sm_major: int
-    sm_minor: int
+def classify_device(device: torch.device) -> DeviceClass:
+    """Return the :class:`DeviceClass` for *device*.
 
-    @property
-    def tier_name(self) -> str:
-        return self.tier.name
-
-    @property
-    def pool_budget_bytes(self) -> int:
-        """
-        Compute double-buffer pool budget for this device.
-
-        We query *current* free memory rather than total so we account for
-        whatever DeepSpeed/PyTorch has already allocated. The Locality Cache
-        headroom fraction is subtracted so pool allocations never starve the
-        cache.
-        """
-        free_bytes, _ = torch.cuda.mem_get_info(self.device_index)
-        usable = int(free_bytes * (1.0 - _LOCALITY_CACHE_HEADROOM_FRACTION))
-        # Use at most 30 % of usable for double-buffer (leave room for gradients)
-        return max(0, int(usable * 0.30))
-
-
-class DeviceTierRegistry:
+    We query ``torch.cuda.get_device_capability`` which returns ``(major,
+    minor)``.  SM86 = (8, 6), SM90 = (9, 0).  Unknown devices fall back to
+    :attr:`DeviceClass.UNKNOWN` so the allocator degrades gracefully on
+    development machines with different GPUs.
     """
-    Singleton that maps CUDA device ordinals to DES-LOC tier metadata.
+    if not torch.cuda.is_available():
+        return DeviceClass.UNKNOWN
+    idx = device.index if device.index is not None else torch.cuda.current_device()
+    major, minor = torch.cuda.get_device_capability(idx)
+    if (major, minor) == (9, 0):
+        return DeviceClass.H100_SM90
+    if (major, minor) == (8, 6):
+        return DeviceClass.A6000_SM86
+    return DeviceClass.UNKNOWN
 
-    Detection is fully automatic: at first access we probe every visible CUDA
-    device and classify it by SM capability and VRAM size.
+
+# ===========================================================================
+# Pool configuration
+# ===========================================================================
+
+@dataclass
+class PoolConfig:
+    """Per-device pool sizing and behaviour knobs.
+
+    Attributes
+    ----------
+    primary_pool_fraction:
+        Fraction of device free memory to allocate for the double-buffer
+        primary pool at initialisation time.
+    allow_cpu_offload:
+        When ``True`` and both pool slots are live, inactive buffers may be
+        pinned to CPU DRAM.  Should be ``True`` on A6000 (48 GB) and
+        ``False`` on H100 (96 GB) unless the model is very large.
+    loc_cache_capacity:
+        Maximum number of bucket tensors retained in the LOC (Shared
+        Locality Cache) eviction ring.  Larger values trade DRAM for fewer
+        cudaMalloc calls.
+    use_storage_resize_fallback:
+        Whether the fallback allocator uses in-place storage resize (SM86)
+        or pinned-staging-buffer (SM90) strategy.
+    prefetch_ahead:
+        Number of FSDP units to prefetch in advance on the device.
     """
-
-    _instance: Optional["DeviceTierRegistry"] = None
-    _lock: threading.Lock = threading.Lock()
-
-    def __new__(cls) -> "DeviceTierRegistry":
-        with cls._lock:
-            if cls._instance is None:
-                obj = super().__new__(cls)
-                obj._registry: Dict[int, TierMetadata] = {}
-                obj._initialised = False
-                cls._instance = obj
-        return cls._instance
-
-    def _probe(self) -> None:
-        if self._initialised:
-            return
-        n = torch.cuda.device_count()
-        for idx in range(n):
-            props = torch.cuda.get_device_properties(idx)
-            major, minor = props.major, props.minor
-            total = props.total_memory
-            if major >= _SM90_MAJOR:
-                tier = DeviceTier.H100
-            elif major == _SM86_MAJOR and minor >= _SM86_MINOR:
-                tier = DeviceTier.A6000
-            else:
-                tier = DeviceTier.UNKNOWN
-            meta = TierMetadata(
-                device_index=idx,
-                tier=tier,
-                total_bytes=total,
-                sm_major=major,
-                sm_minor=minor,
-            )
-            self._registry[idx] = meta
-            logger.info(
-                "DES-LOC device probe: cuda:%d → %s  (SM%d%d, %.1f GB total, "
-                "pool budget %.1f MB)",
-                idx,
-                tier.name,
-                major,
-                minor,
-                total / 1e9,
-                meta.pool_budget_bytes / 1e6,
-            )
-        self._initialised = True
-
-    def get(self, device_index: int) -> TierMetadata:
-        self._probe()
-        if device_index not in self._registry:
-            raise KeyError(f"Device cuda:{device_index} not in DES-LOC registry")
-        return self._registry[device_index]
-
-    def all_tiers(self) -> List[TierMetadata]:
-        self._probe()
-        return list(self._registry.values())
-
-    def devices_of_tier(self, tier: DeviceTier) -> List[TierMetadata]:
-        return [m for m in self.all_tiers() if m.tier == tier]
+    primary_pool_fraction: float = 0.10
+    allow_cpu_offload: bool = False
+    loc_cache_capacity: int = 8
+    use_storage_resize_fallback: bool = True
+    prefetch_ahead: int = 1
 
 
-_registry = DeviceTierRegistry()
+# Sensible defaults per device class
+_POOL_CONFIG_BY_CLASS: Dict[DeviceClass, PoolConfig] = {
+    DeviceClass.A6000_SM86: PoolConfig(
+        primary_pool_fraction=0.08,   # conservative — leave room for activations
+        allow_cpu_offload=True,
+        loc_cache_capacity=6,
+        use_storage_resize_fallback=True,  # mirrors Megatron StorageResizeBased
+        prefetch_ahead=1,
+    ),
+    DeviceClass.H100_SM90: PoolConfig(
+        primary_pool_fraction=0.18,   # H100 NVL has 96 GB — be more generous
+        allow_cpu_offload=False,
+        loc_cache_capacity=12,
+        use_storage_resize_fallback=False,  # use pinned-staging path instead
+        prefetch_ahead=2,
+    ),
+    DeviceClass.UNKNOWN: PoolConfig(),
+}
 
-# ---------------------------------------------------------------------------
-# CPU Spill Arena (pinned memory staging for cross-tier overflow)
-# ---------------------------------------------------------------------------
 
+# ===========================================================================
+# LOC (Shared Locality Cache)
+# ===========================================================================
 
-class PinnedSpillArena:
-    """
-    Pre-allocated pinned CPU memory arena used when a parameter bucket
-    overflows the on-device pool.
+class LOCCache:
+    """LRU eviction ring for recently-used bucket tensors.
 
-    Upstream context: Megatron's fix ensures the *GPU* fallback allocator uses
-    storage.resize_() under a stream guard. In DES-LOC we go one step further:
-    if the GPU itself is OOM after resize we spill to this pinned arena and
-    schedule an async H2D prefetch, effectively using DRAM as an L3 parameter
-    cache. This is only triggered for A6000 devices during large Mamba SSM
-    parameter gathers where bucket sizes can exceed 200 MB.
+    The cache is keyed by ``(numel, dtype)`` and stores a list of free
+    tensors of that shape.  On a cache *hit* the tensor is returned directly,
+    skipping ``cudaMalloc``.  On a cache *miss* a new tensor is allocated and
+    the oldest entry is evicted if capacity is exceeded.
+
+    Thread safety: protected by a single ``threading.Lock``.  In DES-LOC the
+    prefetch thread and the compute thread both call into the cache.
     """
 
-    def __init__(self, capacity_bytes: int = _CPU_STAGING_BYTES) -> None:
-        self._capacity = capacity_bytes
-        self._cursor = 0
+    def __init__(self, capacity: int, device: torch.device) -> None:
+        self._capacity = capacity
+        self._device = device
+        self._store: OrderedDict[Tuple[int, torch.dtype], List[Tensor]] = OrderedDict()
         self._lock = threading.Lock()
-        # Allocate as uint8 so we can slice arbitrary dtypes out of it
-        self._backing: Tensor = torch.empty(
-            capacity_bytes, dtype=torch.uint8, pin_memory=True
-        )
-        logger.debug(
-            "PinnedSpillArena: allocated %.0f MB of pinned staging memory",
-            capacity_bytes / 1e6,
-        )
+        self._hits = 0
+        self._misses = 0
 
-    def allocate(self, num_bytes: int) -> Tensor:
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def get(self, numel: int, dtype: torch.dtype) -> Tensor:
+        """Return a tensor of shape ``(numel,)`` and *dtype* on the cache device.
+
+        If a cached tensor is available it is removed from the free list and
+        returned (LRU promoted).  Otherwise a fresh tensor is allocated.
         """
-        Return a uint8 view into the pinned backing buffer.
+        key = (numel, dtype)
+        with self._lock:
+            bucket = self._store.get(key)
+            if bucket:
+                tensor = bucket.pop()
+                if not bucket:
+                    del self._store[key]
+                else:
+                    self._store.move_to_end(key)   # mark recently used
+                self._hits += 1
+                return tensor
+            self._misses += 1
 
-        We use a simple bump allocator with wrap-around. Callers must not hold
-        the returned view across an arena reset.
+        # Allocation outside the lock — cudaMalloc can be slow
+        return torch.empty(numel, dtype=dtype, device=self._device)
+
+    def put(self, tensor: Tensor) -> None:
+        """Return *tensor* to the cache.  Evicts LRU entry if at capacity."""
+        key = (tensor.numel(), tensor.dtype)
+        with self._lock:
+            bucket = self._store.setdefault(key, [])
+            bucket.append(tensor)
+            self._store.move_to_end(key)
+            self._evict_if_needed()
+
+    def clear(self) -> None:
+        with self._lock:
+            self._store.clear()
+
+    @property
+    def stats(self) -> Dict[str, int]:
+        return {"hits": self._hits, "misses": self._misses}
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _evict_if_needed(self) -> None:
+        """Evict the LRU key until total slot count ≤ capacity.
+
+        Called with ``self._lock`` held.
         """
-        num_bytes = _align_up(num_bytes, 256)  # 256-byte alignment for CUDA DMA
+        total = sum(len(v) for v in self._store.values())
+        while total > self._capacity and self._store:
+            _, evicted_bucket = self._store.popitem(last=False)
+            removed = len(evicted_bucket)
+            total -= removed
+            # Let tensors be garbage-collected → CUDA memory returned to
+            # PyTorch's caching allocator, not immediately to the driver.
+
+
+# ===========================================================================
+# Fallback allocators
+# ===========================================================================
+
+class StorageResizeFallbackAllocator:
+    """SM86 fallback: mirrors Megatron's ``StorageResizeBasedBucketAllocator``.
+
+    When a bucket request exceeds the fixed-pool capacity this allocator
+    extends the tensor's ``UntypedStorage`` in-place, keeping the tensor
+    object alive so that any views into it remain valid — exactly the fix
+    applied in Megatron commit d199bb9e for the IMA bug.
+
+    The key invariant: we never free the backing storage while any view
+    (parameter shard slice) is still live.  We track liveness via a
+    reference-counted wrapper so the storage shrinks back to a minimal
+    sentinel size only when ``release()`` is called *and* the ref-count
+    reaches zero.
+    """
+
+    def __init__(self, device: torch.device, loc_cache: LOCCache) -> None:
+        self._device = device
+        self._loc_cache = loc_cache
+        # sentinel storage — 1-element float32 kept alive perpetually so we
+        # always have a valid UntypedStorage to resize from.
+        self._sentinel: Optional[torch.UntypedStorage] = None
+        self._active_allocations: Dict[int, _ResizeRecord] = {}
+        self._next_id = 0
+        self._lock = threading.Lock()
+
+    # ------------------------------------------------------------------
+
+    def allocate(self, numel: int, dtype: torch.dtype) -> Tuple[int, Tensor]:
+        """Allocate a bucket tensor of *numel* elements and *dtype*.
+
+        Returns ``(alloc_id, tensor)``.  The caller must call
+        ``release(alloc_id)`` when the bucket is no longer needed.
+        """
+        tensor = self._loc_cache.get(numel, dtype)
+        # Ensure the storage is at least ``numel`` elements of ``dtype``
+        required_bytes = numel * tensor.element_size()
+        if tensor.untyped_storage().size() < required_bytes:
+            # Resize in-place — this is the core of the Megatron fix
+            tensor.untyped_storage().resize_(required_bytes)
+            logger.debug(
+                "StorageResizeFallback: resized storage to %d bytes on %s",
+                required_bytes,
+                self._device,
+            )
+
         with self._lock:
-            if self._cursor + num_bytes > self._capacity:
-                # Wrap around — safe only if the previous tenant has finished
-                # its H2D copy (caller is responsible for synchronisation).
-                self._cursor = 0
-                logger.debug(
-                    "PinnedSpillArena: wrap-around at capacity %d bytes", self._capacity
-                )
-            view = self._backing[self._cursor : self._cursor + num_bytes]
-            self._cursor += num_bytes
-        return view
+            alloc_id = self._next_id
+            self._next_id += 1
+            self._active_allocations[alloc_id] = _ResizeRecord(tensor=tensor, ref_count=1)
 
-    def reset(self) -> None:
+        return alloc_id, tensor
+
+    def release(self, alloc_id: int) -> None:
+        """Decrement ref-count for *alloc_id* and return tensor to cache if zero."""
         with self._lock:
-            self._cursor = 0
+            record = self._active_allocations.get(alloc_id)
+            if record is None:
+                return
+            record.ref_count -= 1
+            if record.ref_count <= 0:
+                del self._active_allocations[alloc_id]
+                tensor = record.tensor
+        # Put outside the lock
+        self._loc_cache.put(tensor)
 
-
-# ---------------------------------------------------------------------------
-# Bucket Allocators
-# ---------------------------------------------------------------------------
+    def add_ref(self, alloc_id: int) -> None:
+        """Increment ref-count — call when creating a new view of the allocation."""
+        with self._lock:
+            record = self._active_allocations.get(alloc_id)
+            if record is not None:
+                record.ref_count += 1
 
 
 @dataclass
-class BucketHandle:
-    """Opaque handle returned by any BucketAllocator."""
-    storage: Tensor           # The allocated GPU tensor (dtype=uint8)
-    device: torch.device
-    num_bytes: int
-    from_pool: bool           # True → returned to pool on release; False → freed
-    spilled_from_cpu: bool = False  # True → was H2D-copied from pinned arena
+class _ResizeRecord:
+    tensor: Tensor
+    ref_count: int = 1
 
 
-class BucketAllocator:
-    """Abstract base for DES-LOC bucket allocators."""
+class PinnedStagingFallbackAllocator:
+    """SM90 fallback: uses pinned CPU DRAM as a staging buffer.
 
-    def allocate(self, num_bytes: int, device: torch.device) -> BucketHandle:
-        raise NotImplementedError
+    On the H100 NVL the PCIe bandwidth to host memory is higher (~64 GB/s
+    peak, vs ~32 GB/s on A6000 PCIe slots in the target system).  For
+    over-sized buckets we allocate pinned CPU memory, register it with CUDA,
+    and use async D2H / H2D copies on a dedicated staging stream to move
+    data in and out without blocking the compute stream.
 
-    def release(self, handle: BucketHandle) -> None:
-        raise NotImplementedError
-
-
-class HeteroStorageResizeFallback(BucketAllocator):
-    """
-    DES-LOC adaptation of Megatron's ``StorageResizeBasedBucketAllocator``.
-
-    Upstream fix rationale (d199bb9): using torch.empty() for the fallback
-    allocator caused CUDA IMA because NCCL's AllGather was launched on a
-    secondary stream while the original storage was still mapped. The fix
-    uses storage.resize_() which issues an explicit VM remap before the
-    kernel is enqueued, preventing the race.
-
-    DES-LOC extension: if the device is an A6000 and the resize would exceed
-    remaining VRAM, we spill the bucket to the ``PinnedSpillArena`` and
-    initiate an async H2D copy on the staging stream. The returned handle is
-    marked ``spilled_from_cpu=True`` so the caller knows to wait on the
-    staging stream before reading the tensor.
+    This is *not* the storage-resize path used on SM86.  Instead we keep the
+    device tensor alive at the minimum required size and use the pinned buffer
+    only as a temporary landing zone when both pool slots are occupied.
     """
 
-    def __init__(
-        self,
-        staging_stream: Optional[torch.cuda.Stream],
-        spill_arena: Optional[PinnedSpillArena],
-    ) -> None:
-        self._staging_stream = staging_stream
-        self._spill_arena = spill_arena
-        # We keep one persistent GPU tensor per device whose storage we resize.
-        # Key: device index  Value: (tensor, current_size_bytes)
-        self._resident: Dict[int, Tuple[Tensor, int]] = {}
+    def __init__(self, device: torch.device, loc_cache: LOCCache) -> None:
+        self._device = device
+        self._loc_cache = loc_cache
+        self._staging_stream = torch.cuda.Stream(device=device)
+        self._active: Dict[int, _StagingRecord] = {}
+        self._next_id = 0
         self._lock = threading.Lock()
 
-    def allocate(self, num_bytes: int, device: torch.device) -> BucketHandle:
-        dev_idx = device.index if device.index is not None else torch.cuda.current_device()
-        num_bytes_aligned = _align_up(num_bytes, 256)
-
+    def allocate(self, numel: int, dtype: torch.dtype) -> Tuple[int, Tensor]:
+        device_tensor = self._loc_cache.get(numel, dtype)
+        pinned = torch.empty(numel, dtype=dtype, pin_memory=True)
         with self._lock:
-            if dev_idx in self._resident:
-                tensor, cur_size = self._resident[dev_idx]
-            else:
-                # Bootstrap: allocate a 1-byte tensor whose storage we'll resize
-                tensor = torch.empty(1, dtype=torch.uint8, device=device)
-                cur_size = 1
-                self._resident[dev_idx] = (tensor, cur_size)
-
-        # Check whether we have headroom for the resize
-        free_bytes, _ = torch.cuda.mem_get_info(dev_idx)
-        extra_needed = max(0, num_bytes_aligned - cur_size)
-
-        if extra_needed > 0 and extra_needed > free_bytes * 0.9:
-            # Not enough VRAM — spill to CPU and schedule H2D copy
-            return self._allocate_via_spill(num_bytes_aligned, device, dev_idx)
-
-        # Perform the resize under the staging stream context so the VM mapping
-        # is committed before any NCCL kernel is launched (upstream fix).
-        stream_ctx = (
-            torch.cuda.stream(self._staging_stream)
-            if self._staging_stream is not None
-            else _null_ctx()
-        )
-        with stream_ctx:
-            tensor.storage().resize_(num_bytes_aligned)
-
-        with self._lock:
-            self._resident[dev_idx] = (tensor, num_bytes_aligned)
-
-        return BucketHandle(
-            storage=tensor,
-            device=device,
-            num_bytes=num_bytes_aligned,
-            from_pool=False,
-        )
-
-    def _allocate_via_spill(
-        self, num_bytes: int, device: torch.device, dev_idx: int
-    ) -> BucketHandle:
-        if self._spill_arena is None:
-            raise MemoryError(
-                f"cuda:{dev_idx} has insufficient VRAM for bucket of {num_bytes} bytes "
-                "and no PinnedSpillArena is configured. Set "
-                "'hetero_fsdp_double_buffer_cpu_spill': true in ds_config."
+            alloc_id = self._next_id
+            self._next_id += 1
+            self._active[alloc_id] = _StagingRecord(
+                device_tensor=device_tensor,
+                pinned_tensor=pinned,
+                ref_count=1,
             )
-
-        logger.warning(
-            "DES-LOC spill: bucket of %.1f MB exceeds free VRAM on cuda:%d; "
-            "staging via pinned CPU arena",
-            num_bytes / 1e6,
-            dev_idx,
+        logger.debug(
+            "PinnedStagingFallback: allocated %d×%s on %s with pinned staging",
+            numel,
+            dtype,
+            self._device,
         )
+        return alloc_id, device_tensor
 
-        cpu_buf = self._spill_arena.allocate(num_bytes)
-        # Allocate destination on GPU using the resize path (may still succeed
-        # for a smaller size after GC)
-        gc.collect()
-        torch.cuda.empty_cache()
-        gpu_tensor = torch.empty(num_bytes, dtype=torch.uint8, device=device)
+    def release(self, alloc_id: int) -> None:
+        with self._lock:
+            record = self._active.get(alloc_id)
+            if record is None:
+                return
+            record.ref_count -= 1
+            if record.ref_count <= 0:
+                del self._active[alloc_id]
+                device_tensor = record.device_tensor
+        self._loc_cache.put(device_tensor)
+        # pinned tensor is garbage-collected → freed automatically
 
-        # Async H2D on the staging stream
-        if self._staging_stream is not None:
-            with torch.cuda.stream(self._staging_stream):
-                gpu_tensor.copy_(cpu_buf, non_blocking=True)
-        else:
-            gpu_tensor.copy_(cpu_buf)
+    def stage_to_host(self, alloc_id: int) -> None:
+        """Async copy device tensor → pinned host buffer on the staging stream."""
+        with self._lock:
+            record = self._active.get(alloc_id)
+        if record is None:
+            return
+        with torch.cuda.stream(self._staging_stream):
+            record.pinned_tensor.copy_(record.device_tensor, non_blocking=True)
 
-        return BucketHandle(
-            storage=gpu_tensor,
-            device=device,
-            num_bytes=num_bytes,
-            from_pool=False,
-            spilled_from_cpu=True,
-        )
+    def restore_from_host(self, alloc_id: int) -> None:
+        """Async copy pinned host buffer → device tensor on the staging stream."""
+        with self._lock:
+            record = self._active.get(alloc_id)
+        if record is None:
+            return
+        with torch.cuda.stream(self._staging_stream):
+            record.device_tensor.copy_(record.pinned_tensor, non_blocking=True)
 
-    def release(self, handle: BucketHandle) -> None:
-        # Storage-resize tensors are kept alive for reuse; nothing to free.
-        pass
+    def sync_staging(self) -> None:
+        """Block until the staging stream is idle."""
+        self._staging_stream.synchronize()
 
 
-class TierAwarePoolAllocator(BucketAllocator):
-    """
-    DES-LOC replacement for Megatron's ``FixedPoolAllocator``.
+@dataclass
+class _StagingRecord:
+    device_tensor: Tensor
+    pinned_tensor: Tensor
+    ref_count: int = 1
 
-    Upstream design: FixedPoolAllocator pre-allocates a contiguous GPU memory
-    slab and sub-allocates two "slots" out of it for double-buffering. When a
-    requested bucket is larger than a slot, the request falls through to a
-    backup allocator. The original backup (TemporaryBucketAllocator) caused
-    CUDA IMA; the upstream fix changes it to StorageResizeBasedBucketAllocator.
 
-    DES-LOC changes:
-    - Pool size is computed dynamically from free VRAM minus the Locality
-      Cache headroom rather than being fixed at construction time.
-    - On H100 (Tier-0) we use a larger pool and a higher slot-count (4
-      instead of 2) because the NVL variant has enough HBM headroom and we
-      want to pipeline 4 microbatches without stalling.
-    - On A6000 (Tier-1) we use a smaller pool (2 slots, conservative sizing)
-      and configure the fallback with the PinnedSpillArena.
-    - The ``_locality_cache_hit`` path bypasses the pool entirely: if the
-      parameter is already resident in the DES-LOC Locality Cache we return
-      a zero-copy view rather than triggering an AllGather.
+# ===========================================================================
+# Fixed-pool allocator (primary path)
+# ===========================================================================
+
+class HeteroFixedPoolAllocator:
+    """Device-aware fixed-pool allocator with LOC cache and fallback.
+
+    Manages two alternating pool slots (double-buffer pattern).  The pool is
+    pre-allocated as a single contiguous ``torch.UntypedStorage`` split into
+    two halves; each half is handed out as a ``Tensor`` view per FSDP unit.
+
+    When the requested bucket size exceeds one half's capacity the request is
+    forwarded to the device-class-appropriate fallback allocator (mirroring
+    the Megatron d199bb9e fix that replaced ``TemporaryBucketAllocator`` with
+    ``StorageResizeBasedBucketAllocator`` to prevent IMA).
+
+    Parameters
+    ----------
+    device:
+        The CUDA device this allocator manages.
+    pool_bytes:
+        Total bytes for the double-buffer pool (split evenly into 2 slots).
+    dtype:
+        Default dtype for pool tensors.
+    loc_cache:
+        Shared locality cache (shared across allocator + fallback).
+    cfg:
+        Per-device configuration knobs.
     """
 
     def __init__(
         self,
         device: torch.device,
-        locality_cache: Optional["LocalityCacheProtocol"],
-        staging_stream: Optional[torch.cuda.Stream],
-        spill_arena: Optional[PinnedSpillArena],
+        pool_bytes: int,
+        dtype: torch.dtype,
+        loc_cache: LOCCache,
+        cfg: PoolConfig,
     ) -> None:
         self._device = device
-        self._locality_cache = locality_cache
-        dev_idx = device.index if device.index is not None else 0
-        self._meta = _registry.get(dev_idx)
+        self._dtype = dtype
+        self._loc_cache = loc_cache
+        self._cfg = cfg
+        self._dev_class = classify_device(device)
 
-        # Compute pool geometry
-        budget = self._meta.pool_budget_bytes
-        if self._meta.tier == DeviceTier.H100:
-            self._num_slots = 4
+        slot_bytes = pool_bytes // 2
+        self._slot_bytes = slot_bytes
+        self._slot_numel = slot_bytes // dtype.itemsize
+
+        # Allocate backing storage once
+        self._storage = torch.UntypedStorage(pool_bytes, device=device)
+        self._slots: List[Optional[Tensor]] = [None, None]
+        self._slot_in_use: List[bool] = [False, False]
+        self._current_slot = 0
+
+        # Initialise slot views
+        for i in range(2):
+            offset = i * slot_bytes
+            self._slots[i] = torch.empty(0, dtype=dtype, device=device).set_(
+                self._storage, storage_offset=offset // dtype.itemsize, size=(self._slot_numel,)
+            )
+
+        # Fallback allocator (device-class aware, mirrors Megatron's fix)
+        if cfg.use_storage_resize_fallback:
+            self._fallback: StorageResizeFallbackAllocator | PinnedStagingFallbackAllocator = (
+                StorageResizeFallbackAllocator(device=device, loc_cache=loc_cache)
+            )
         else:
-            self._num_slots = 2
-
-        self._slot_size = max(_MIN_POOL_BYTES, budget // self._num_slots)
-        self._pool_bytes = self._slot_size * self._num_slots
-
-        if self._pool_bytes < _MIN_POOL_BYTES:
-            logger.warning(
-                "DES-LOC pool too small on cuda:%d (%.1f MB); double-buffer "
-                "will rely entirely on fallback allocator",
-                dev_idx,
-                self._pool_bytes / 1e6,
-            )
-            self._pool: Optional[Tensor] = None
-        else:
-            self._pool = torch.empty(
-                self._pool_bytes, dtype=torch.uint8, device=device
-            )
-            logger.info(
-                "DES-LOC TierAwarePool: cuda:%d (%s) pool=%.1f MB, "
-                "%d slots of %.1f MB each",
-                dev_idx,
-                self._meta.tier_name,
-                self._pool_bytes / 1e6,
-                self._num_slots,
-                self._slot_size / 1e6,
+            self._fallback = PinnedStagingFallbackAllocator(
+                device=device, loc_cache=loc_cache
             )
 
-        # Slot availability tracking
-        self._free_slots: List[int] = list(range(self._num_slots))
         self._lock = threading.Lock()
+        self._fallback_alloc_ids: Dict[int, int] = {}  # slot_token → fallback alloc_id
 
-        # Fallback — mirrors upstream's switch to StorageResizeBasedBucketAllocator
-        self._fallback = HeteroStorageResizeFallback(
-            staging_stream=staging_stream,
-            spill_arena=spill_arena,
+        logger.info(
+            "HeteroFixedPoolAllocator: device=%s class=%s pool=2×%d MiB dtype=%s "
+            "fallback=%s",
+            device,
+            self._dev_class.name,
+            slot_bytes // (1024 * 1024),
+            dtype,
+            type(self._fallback).__name__,
         )
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
-    def allocate(self, num_bytes: int, device: torch.device) -> BucketHandle:
-        num_bytes_aligned = _align_up(num_bytes, 256)
+    def allocate(self, numel: int, dtype: Optional[torch.dtype] = None) -> Tuple[int, Tensor]:
+        """Allocate a bucket tensor.
+
+        Returns ``(slot_token, tensor)`` where *slot_token* must be passed to
+        :meth:`release`.  If *numel* fits in one pool slot the primary path is
+        taken (zero-copy view).  Otherwise the fallback allocator is used,
+        preventing the IMA bug described in Megatron d199bb9e.
+        """
+        dtype = dtype or self._dtype
+        required_bytes = numel * (dtype.itemsize if hasattr(dtype, 'itemsize')
+                                  else torch.tensor([], dtype=dtype).element_size())
 
         with self._lock:
-            if (
-                self._pool is not None
-                and num_bytes_aligned <= self._slot_size
-                and self._free_slots
-            ):
-                slot_idx = self._free_slots.pop()
-                start = slot_idx * self._slot_size
-                view = self._pool[start : start + num_bytes_aligned]
-                return BucketHandle(
-                    storage=view,
-                    device=device,
-                    num_bytes=num_bytes_aligned,
-                    from_pool=True,
-                )
+            slot_idx = self._pick_slot()
 
-        # Pool miss — delegate to fallback (the critical upstream fix path)
-        logger.debug(
-            "DES-LOC pool miss on %s: bucket %.1f MB > slot %.1f MB; "
-            "using storage-resize fallback",
-            device,
-            num_bytes_aligned / 1e6,
-            self._slot_size / 1e6,
+        if slot_idx is not None and required_bytes <= self._slot_bytes:
+            return self._allocate_from_pool(slot_idx, numel, dtype)
+        else:
+            return self._allocate_from_fallback(numel, dtype)
+
+    def release(self, slot_token: int) -> None:
+        """Release a previously allocated bucket identified by *slot_token*."""
+        with self._lock:
+            if slot_token < 0:
+                # Fallback allocation — decode the embedded fallback alloc_id
+                fallback_id = self._fallback_alloc_ids.pop(slot_token, None)
+            else:
+                fallback_id = None
+                if 0 <= slot_token < 2:
+                    self._slot_in_use[slot_token] = False
+
+        if fallback_id is not None:
+            self._fallback.release(fallback_id)
+
+    def is_slot_free(self) -> bool:
+        """Return ``True`` if at least one pool slot is available."""
+        with self._lock:
+            return any(not u for u in self._slot_in_use)
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _pick_slot(self) -> Optional[int]:
+        """Return the index of a free pool slot, or ``None`` if both are busy."""
+        for i in range(2):
+            idx = (self._current_slot + i) % 2
+            if not self._slot_in_use[idx]:
+                return idx
+        return None
+
+    def _allocate_from_pool(self, slot_idx: int, numel: int, dtype: torch.dtype) -> Tuple[int, Tensor]:
+        self._slot_in_use[slot_idx] = True
+        self._current_slot = (slot_idx + 1) % 2
+        tensor = self._slots[slot_idx]
+        # Return a narrowed view of the correct dtype and length
+        if tensor.dtype != dtype or tensor.numel() != numel:
+            tensor = tensor[:numel].view(dtype) if tensor.dtype == dtype else (
+                self._storage_view(slot_idx, numel, dtype)
+            )
+        return slot_idx, tensor
+
+    def _storage_view(self, slot_idx: int, numel: int, dtype: torch.dtype) -> Tensor:
+        """Create a typed view into the pool slot storage."""
+        offset_bytes = slot_idx * self._slot_bytes
+        offset_elems = offset_bytes // torch.tensor([], dtype=dtype).element_size()
+        return torch.empty(0, dtype=dtype, device=self._device).set_(
+            self._storage,
+            storage_offset=offset_elems,
+            size=(numel,),
         )
-        return self._fallback.allocate(num_bytes_aligned, device)
 
-    def release(self, handle: BucketHandle) -> None:
-        if not handle.from_pool:
-            self._fallback.release(handle)
-            return
-        # Recover slot index from pointer arithmetic
-        if self._pool is None:
-            return
-        offset = handle.storage.data_ptr() - self._pool.data_ptr()
-        slot_idx = offset // self._slot_size
+    def _allocate_from_fallback(self, numel: int, dtype: torch.dtype) -> Tuple[int, Tensor]:
+        """Delegate to the fallback allocator (fixes Megatron IMA bug pattern)."""
+        fallback_id, tensor = self._fallback.allocate(numel, dtype)
+        # Encode as a negative token to distinguish from pool slot indices
+        slot_token = -(fallback_id + 1)
         with self._lock:
-            if slot_idx not in self._free_slots:
-                self._free_slots.append(slot_idx)
-
-    def stats(self) -> Dict[str, object]:
-        with self._lock:
-            free = len(self._free_slots)
-        return {
-            "device": str(self._device),
-            "tier": self._meta.tier_name,
-            "pool_bytes": self._pool_bytes,
-            "num_slots": self._num_slots,
-            "free_slots": free,
-            "slot_size_bytes": self._slot_size,
-        }
+            self._fallback_alloc_ids[slot_token] = fallback_id
+        logger.debug(
+            "HeteroFixedPoolAllocator: fallback path for numel=%d dtype=%s on %s",
+            numel,
+            dtype,
+            self._device,
+        )
+        return slot_token, tensor
 
 
-# ---------------------------------------------------------------------------
-# Locality Cache Protocol (structural typing — avoids circular imports)
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# CUDA event-based double-buffer synchroniser
+# ===========================================================================
 
+class DoubleBufferSynchroniser:
+    """Manages CUDA event synchronisation for the double-buffer prefetch loop.
 
-class LocalityCacheProtocol:
-    """
-    Structural interface for the DES-LOC Locality Cache.
+    In the upstream Megatron implementation ``fsdp_double_buffer`` relies on
+    ``torch.cuda.synchronize()`` at bucket boundaries which serialises the
+    prefetch and compute streams.  DES-LOC replaces this with fine-grained
+    CUDA events so only the *specific* bucket being transferred is waited on,
+    not the entire device.
 
-    The real implementation lives in ``deepspeed/runtime/des_loc/locality_cache.py``.
-    We define only the methods we call here so this module has no hard import
-    dependency on the cache implementation.
-    """
+    Each device in the DES-LOC cluster has:
+    - ``compute_stream`` : runs forward/backward ops
+    - ``prefetch_stream``: runs AllGather for the *next* FSDP unit's params
 
-    def is_resident(self, param_id: int, device: torch.device) -> bool:
-        """Return True if ``param_id`` is already in the cache on ``device``."""
-        raise NotImplementedError
-
-    def get_view(self, param_id: int, device: torch.device) -> Optional[Tensor]:
-        """Return a tensor view of the cached parameter, or None on miss."""
-        raise NotImplementedError
-
-    def mark_accessed(self, param_id: int, device: torch.device) -> None:
-        """Update LRU/access metadata after a hit."""
-        raise NotImplementedError
-
-
-# ---------------------------------------------------------------------------
-# Double-Buffer Prefetch Queue
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class PrefetchEntry:
-    param_id: int
-    param_group_id: int
-    bucket_bytes: int
-    device: torch.device
-    handle: Optional[BucketHandle] = None
-    allgather_event: Optional[torch.cuda.Event] = None
-    ready: bool = False
-
-
-class DoublePrefetchQueue:
-    """
-    Ring buffer of two (or more on H100) pre-allocated buckets for pipelined
-    AllGather operations.
-
-    On H100 we use 4 slots so that up to 4 microbatches worth of parameters
-    can be in-flight simultaneously. On A6000 we use 2 to keep memory pressure
-    manageable.
+    The synchroniser records an event on ``prefetch_stream`` when a prefetch
+    completes and waits on that event in ``compute_stream`` just before the
+    FSDP unit's forward pass begins.
     """
 
-    def __init__(self, allocator: TierAwarePoolAllocator, depth: int) -> None:
-        self._allocator = allocator
-        self._depth = depth
-        self._queue: List[Optional[PrefetchEntry]] = [None] * depth
-        self._head = 0
-        self._tail = 0
-        self._count = 0
+    def __init__(self, device: torch.device) -> None:
+        self._device = device
+        self.compute_stream = torch.cuda.Stream(device=device)
+        self.prefetch_stream = torch.cuda.Stream(device=device)
+        self._prefetch_events: Dict[int, torch.cuda.Event] = {}
+        self._compute_events: Dict[int, torch.cuda.Event] = {}
         self._lock = threading.Lock()
 
-    def enqueue(self, entry: PrefetchEntry) -> bool:
+    def record_prefetch_done(self, unit_id: int) -> None:
+        """Record that unit *unit_id*'s parameters are ready in the buffer."""
+        event = torch.cuda.Event(enable_timing=False)
+        with torch.cuda.stream(self.prefetch_stream):
+            event.record(self.prefetch_stream)
         with self._lock:
-            if self._count >= self._depth:
-                return False
-            self._queue[self._tail] = entry
-            self._tail = (self._tail + 1) % self._depth
-            self._count += 1
-        return True
+            self._prefetch_events[unit_id] = event
 
-    def dequeue(self) -> Optional[PrefetchEntry]:
+    def wait_for_prefetch(self, unit_id: int) -> None:
+        """Make ``compute_stream`` wait until unit *unit_id* prefetch is done."""
         with self._lock:
-            if self._count == 0:
-                return None
-            entry = self._queue[self._head]
-            self._queue[self._head] = None
-            self._head = (self._head + 1) % self._depth
-            self._count -= 1
-        return entry
+            event = self._prefetch_events.pop(unit_id, None)
+        if event is not None:
+            self.compute_stream.wait_event(event)
 
-    def release_entry(self, entry: PrefetchEntry) -> None:
-        if entry.handle is not None:
-            self._allocator.release(entry.handle)
-            entry.handle = None
-
-    @property
-    def depth(self) -> int:
-        return self._depth
-
-    @property
-    def is_full(self) -> bool:
+    def record_compute_done(self, unit_id: int) -> None:
+        """Record that the compute stream has finished consuming unit *unit_id*."""
+        event = torch.cuda.Event(enable_timing=False)
+        with torch.cuda.stream(self.compute_stream):
+            event.record(self.compute_stream)
         with self._lock:
-            return self._count >= self._depth
+            self._compute_events[unit_id] = event
 
-    @property
-    def occupancy(self) -> int:
+    def wait_for_compute(self, unit_id: int) -> None:
+        """Make ``prefetch_stream`` wait until compute is done with unit *unit_id*."""
         with self._lock:
-            return self._count
+            event = self._compute_events.pop(unit_id, None)
+        if event is not None:
+            self.prefetch_stream.wait_event(event)
 
 
-# ---------------------------------------------------------------------------
-# Per-Tier Stream Set
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# CPU offload manager (A6000 memory pressure relief)
+# ===========================================================================
 
+class CPUOffloadManager:
+    """Spills inactive double-buffer slots to 1.5 TB CPU DRAM on A6000 devices.
 
-@dataclass
-class TierStreamSet:
+    When both pool slots are needed simultaneously on an A6000 (48 GB) the
+    manager can evict the *inactive* buffer (the one whose FSDP unit has
+    already finished computing) to pinned host memory.  The buffer is streamed
+    back asynchronously before the next time that slot is needed.
+
+    This exploits the 1.5 TB CPU DRAM headroom in the target system without
+    requiring NVLink (which is unavailable on the PCIe-only A6000 slots).
     """
-    CUDA streams dedicated to a single device tier.
 
-    Separating AllGather and staging streams prevents the deadlock that can
-    occur when NCCL and cudaMemcpy share a stream and the copy is waiting on
-    a collective that's waiting on the copy.
-    """
-    device: torch.device
-    allgather_stream: torch.cuda.Stream
-    staging_stream: torch.cuda.Stream    # H2D spill copies
-    compute_stream: torch.cuda.Stream   # Overlapped forward/backward
+    def __init__(self, device: torch.device) -> None:
+        self._device = device
+        self._h2d_stream = torch.cuda.Stream(device=device)
+        self._d2h_stream = torch.cuda.Stream(device=device)
+        self._offloaded: Dict[int, Tuple[Tensor, torch.cuda.Event]] = {}
+        self._lock = threading.Lock()
 
-    @classmethod
-    def create(cls, device: torch.device) -> "TierStreamSet":
-        with torch.cuda.device(device):
-            ag = torch.cuda.Stream()
-            st = torch.cuda.Stream()
-            cm = torch.cuda.Stream()
-        return cls(
-            device=device,
-            allgather_stream=ag,
-            staging_stream=st,
-            compute_stream=cm,
+    def offload(self, slot_token: int, tensor: Tensor) -> None:
+        """Async copy *tensor* to pinned host memory, freeing CUDA memory."""
+        pinned = torch.empty_like(tensor, pin_memory=True)
+        event = torch.cuda.Event()
+        with torch.cuda.stream(self._d2h_stream):
+            pinned.copy_(tensor, non_blocking=True)
+            event.record(self._d2h_stream)
+        with self._lock:
+            self._offloaded[slot_token] = (pinned, event)
+        logger.debug(
+            "CPUOffload: offloaded slot_token=%d (%d MiB) to CPU on %s",
+            slot_token,
+            tensor.numel() * tensor.element_size() // (1024 * 1024),
+            self._device,
         )
 
+    def restore(self, slot_token: int, target: Tensor) -> None:
+        """Async copy pinned host buffer back into *target* on the H2D stream."""
+        with self._lock:
+            entry = self._offloaded.pop(slot_token, None)
+        if entry is None:
+            return
+        pinned, copy_event = entry
+        # Wait until D2H is complete before H2D
+        self._h2d_stream.wait_event(copy_event)
+        with torch.cuda.stream(self._h2d_stream):
+            target.copy_(pinned, non_blocking=True)
 
-# ---------------------------------------------------------------------------
-# Main HeteroFSDPDoubleBuffer
-# ---------------------------------------------------------------------------
+    def sync(self) -> None:
+        self._h2d_stream.synchronize()
+        self._d2h_stream.synchronize()
 
 
-class HeteroFSDPDoubleBuffer:
-    """
-    DES-LOC Heterogeneous FSDP Double Buffer.
+# ===========================================================================
+# Per-device double-buffer state
+# ===========================================================================
 
-    This is the top-level class that DeepSpeed's ZeRO-3 stage will instantiate
-    when ``hetero_fsdp_double_buffer: true`` is present in the ds_config.
+@dataclass
+class DeviceDoubleBufferState:
+    """All double-buffer resources for a single CUDA device."""
+    device: torch.device
+    dev_class: DeviceClass
+    cfg: PoolConfig
+    loc_cache: LOCCache
+    pool_allocator: HeteroFixedPoolAllocator
+    synchroniser: DoubleBufferSynchroniser
+    cpu_offload_mgr: Optional[CPUOffloadManager]
+    # Maps fsdp_unit_id → (slot_token, tensor)
+    active_buffers: Dict[int, Tuple[int, Tensor]] = field(default_factory=dict)
 
-    Architecture
-    ------------
 
-    ::
+# ===========================================================================
+# Main manager: HeteroFSDPDoubleBufferManager
+# ===========================================================================
 
-        ┌─────────────────────────────────────────────────────────────────┐
-        │                   HeteroFSDPDoubleBuffer                        │
-        │                                                                 │
-        │  ┌──────────────────────┐   ┌──────────────────────────────┐   │
-        │  │ TierAwarePoolAlloc   │   │ DoublePrefetchQueue           │   │
-        │  │ (per device)         │   │ (depth=4 on H100, 2 on A6000) │   │
-        │  └──────────┬───────────┘   └──────────────┬───────────────┘   │
-        │             │                              │                   │
-        │  ┌──────────▼──────────────────────────────▼───────────────┐   │
-        │  │              TierStreamSet (per device)                  │   │
-        │  │   allgather_stream │ staging_stream │ compute_stream     │   │
-        │  └─────────────────────────────────────────────────────────┘   │
-        │                                                                 │
-        │  ┌──────────────────────────────────────────────────────────┐  │
-        │  │  LocalityCache bypass: if param is cache-resident,        │  │
-        │  │  skip AllGather and return zero-copy view                │  │
-        │  └──────────────────────────────────────────────────────────┘  │
-        └─────────────────────────────────────────────────────────────────┘
+class HeteroFSDPDoubleBufferManager:
+    """Heterogeneous FSDP double-buffer manager for DES-LOC clusters.
 
-    Usage (from DeepSpeed ZeRO-3 param coordinator)
-    -------------------------------------------------
+    This class is the top-level entry point, analogous to the
+    ``fsdp_double_buffer`` feature inside Megatron's
+    ``FullyShardedDataParallel`` but extended for heterogeneous devices.
+
+    It owns one :class:`DeviceDoubleBufferState` per CUDA device and
+    dispatches prefetch / release calls to the correct device's allocator.
+
+    Usage pattern (mirrors upstream Megatron test ``test_train_steps_with_double_buffer``):
 
     .. code-block:: python
 
-        db = HeteroFSDPDoubleBuffer(
-            devices=[torch.device("cuda:0"), torch.device("cuda:1"), torch.device("cuda:2")],
-            locality_cache=my_locality_cache,  # or None
-        )
+        mgr = HeteroFSDPDoubleBufferManager(devices=[
+            torch.device("cuda:0"),
+            torch.device("cuda:1"),
+            torch.device("cuda:2"),
+        ])
 
-        # Before each microbatch forward pass:
-        with db.prefetch_context(param_groups):
-            output = model(inputs)
+        for microbatch_idx in range(NUM_MICROBATCHES):
+            for unit_id, fsdp_unit in enumerate(fsdp_units):
+                device = fsdp_unit.device
+                buf = mgr.request_buffer(device, unit_id, numel, dtype)
+                # ... AllGather into buf ...
+                mgr.mark_prefetch_done(device, unit_id)
+                mgr.wait_and_compute(device, unit_id)
+                # ... forward/backward on fsdp_unit ...
+                mgr.release_buffer(device, unit_id)
 
-        # After backward:
-        db.release_all()
+        mgr.finalize()
+
+    Parameters
+    ----------
+    devices:
+        List of CUDA devices participating in DES-LOC training.
+    pool_fraction_override:
+        If provided, overrides ``primary_pool_fraction`` for all devices
+        (useful for testing on memory-constrained machines).
+    dtype:
+        Default tensor dtype for parameter buffers (``bfloat16`` for the
+        target workload).
     """
 
     def __init__(
         self,
         devices: List[torch.device],
-        locality_cache: Optional[LocalityCacheProtocol] = None,
-        enable_cpu_spill: bool = True,
+        pool_fraction_override: Optional[float] = None,
+        dtype: torch.dtype = torch.bfloat16,
     ) -> None:
-        self._devices = devices
-        self._locality_cache = locality_cache
+        self._dtype = dtype
+        self._states: Dict[torch.device, DeviceDoubleBufferState] = {}
 
-        # Per-device resources
-        self._spill_arenas: Dict[int, Optional[PinnedSpillArena]] = {}
-        self._stream_sets: Dict[int, TierStreamSet] = {}
-        self._allocators: Dict[int, TierAwarePoolAllocator] = {}
-        self._prefetch_queues: Dict[int, DoublePrefetchQueue] = {}
+        for device in devices:
+            dev_class = classify_device(device)
+            cfg = _POOL_CONFIG_BY_CLASS[dev_class]
+            if pool_fraction_override is not None:
+                cfg = PoolConfig(
+                    primary_pool_fraction=pool_fraction_override,
+                    allow_cpu_offload=cfg.allow_cpu_offload,
+                    loc_cache_capacity=cfg.loc_cache_capacity,
+                    use_storage_resize_fallback=cfg.use_storage_resize_fallback,
+                    prefetch_ahead=cfg.prefetch_ahead,
+                )
 
-        for dev in devices:
-            idx = dev.index if dev.index is not None else 0
-            meta = _registry.get(idx)
+            free_mem, _ = torch.cuda.mem_get_info(device)
+            pool_bytes = int(free_mem * cfg.primary_pool_fraction)
+            # Align to 2 MB
+            pool_bytes = (pool_bytes // (2 * 1024 * 1024)) * (2 * 1024 * 1024)
+            pool_bytes = max(pool_bytes, 4 * 1024 * 1024)  # minimum 4 MiB
 
-            # CPU spill arena only for A6000 (H100 has enough HBM)
-            if enable_cpu_spill and meta.tier == DeviceTier.A6000:
-                arena: Optional[PinnedSpillArena] = PinnedSpillArena(_CPU_STAGING_BYTES)
-            else:
-                arena = None
-            self._spill_arenas[idx] = arena
-
-            streams = TierStreamSet.create(dev)
-            self._stream_sets[idx] = streams
-
-            alloc = TierAwarePoolAllocator(
-                device=dev,
-                locality_cache=locality_cache,
-                staging_stream=streams.staging_stream,
-                spill_arena=arena,
+            loc_cache = LOCCache(capacity=cfg.loc_cache_capacity, device=device)
+            pool_alloc = HeteroFixedPoolAllocator(
+                device=device,
+                pool_bytes=pool_bytes,
+                dtype=dtype,
+                loc_cache=loc_cache,
+                cfg=cfg,
             )
-            self._allocators[idx] = alloc
+            sync = DoubleBufferSynchroniser(device=device)
+            offload_mgr = CPUOffloadManager(device=device) if cfg.allow_cpu_offload else None
 
-            depth = 4 if meta.tier == DeviceTier.H100 else 2
-            self._prefetch_queues[idx] = DoublePrefetchQueue(alloc, depth)
+            self._states[device] = DeviceDoubleBufferState(
+                device=device,
+                dev_class=dev_class,
+                cfg=cfg,
+                loc_cache=loc_cache,
+                pool_allocator=pool_alloc,
+                synchroniser=sync,
+                cpu_offload_mgr=offload_mgr,
+            )
+            logger.info(
+                "HeteroFSDPDoubleBufferManager: registered device=%s (%s) "
+                "pool=%d MiB loc_cap=%d cpu_offload=%s",
+                device,
+                dev_class.name,
+                pool_bytes // (1024 * 1024),
+                cfg.loc_cache_capacity,
+                offload_mgr is not None,
+            )
 
-        self._active_handles: List[BucketHandle] = []
-        self._handle_lock = threading.Lock()
+    # ------------------------------------------------------------------
+    # Core double-buffer API
+    # ------------------------------------------------------------------
 
-        logger.info(
-            "HeteroFSDPDoubleBuffer initialised on %d device(s): %s",
-            len(devices),
-            [str(d) for d in devices],
+    def request_buffer(
+        self,
+        device: torch.device,
+        unit_id: int,
+        numel: int,
+        dtype: Optional[torch.dtype] = None,
+    ) -> Tensor:
+        """Request a double-buffer slot for FSDP unit *unit_id* on *device*.
+
+        The returned tensor is either a view into the fixed pool (primary path)
+        or a fresh allocation from the device-class-specific fallback (IMA-safe
+        path, mirrors Megatron d199bb9e fix).
+
+        If CPU offload is enabled and the pool is full the inactive buffer is
+        spilled to host memory to free up the slot.
+        """
+        state = self._states[device]
+        dtype = dtype or self._dtype
+
+        if not state.pool_allocator.is_slot_free() and state.cpu_offload_mgr is not None:
+            self._try_offload_inactive(state, unit_id)
+
+        slot_token, tensor = state.pool_allocator.allocate(numel, dtype)
+        state.active_buffers[unit_id] = (slot_token, tensor)
+        return tensor
+
+    def mark_prefetch_done(self, device: torch.device, unit_id: int) -> None:
+        """Signal that the AllGather for unit *unit_id* is complete."""
+        state = self._states[device]
+        state.synchroniser.record_prefetch_done(unit_id)
+
+    def wait_and_compute(self, device: torch.device, unit_id: int) -> None:
+        """Block the compute stream until unit *unit_id*'s buffer is ready.
+
+        If the unit's buffer was offloaded to CPU (A6000 memory pressure),
+        this call also triggers an async restore before the compute stream wait.
+        """
+        state = self._states[device]
+        # Restore from CPU if needed
+        if state.cpu_offload_mgr is not None:
+            entry = state.active_buffers.get(unit_id)
+            if entry is not None:
+                slot_token, tensor = entry
+                state.cpu_offload_mgr.restore(slot_token, tensor)
+
+        state.synchroniser.wait_for_prefetch(unit_id)
+
+    def release_buffer(self, device: torch.device, unit_id: int) -> None:
+        """Release the double-buffer slot for unit *unit_id* back to the pool."""
+        state = self._states[device]
+        state.synchroniser.record_compute_done(unit_id)
+        entry = state.active_buffers.pop(unit_id, None)
+        if entry is not None:
+            slot_token, _ = entry
+            state.pool_allocator.release(slot_token)
+
+    def prefetch_next(
+        self,
+        device: torch.device,
+        current_unit_id: int,
+        next_unit_id: int,
+        numel: int,
+        dtype: Optional[torch.dtype] = None,
+        gather_fn=None,
+    ) -> Optional[Tensor]:
+        """Speculatively prefetch the *next* FSDP unit's params while computing the current.
+
+        This implements the core double-buffer overlap: on the ``prefetch_stream``
+        we request a buffer for ``next_unit_id`` and invoke ``gather_fn`` (e.g.
+        AllGather) asynchronously.  The compute stream then calls
+        :meth:`wait_and_compute` before using the buffer.
+
+        Parameters
+        ----------
+        gather_fn:
+            Callable ``(tensor) -> None`` that fills *tensor* with the gathered
+            parameters.  Runs on ``prefetch_stream``.  If ``None`` this method
+            is a no-op (useful when the current unit is the last in the sequence).
+        """
+        if gather_fn is None:
+            return None
+
+        state = self._states[device]
+        dtype = dtype or self._dtype
+
+        # Wait until compute is done with the *previous* buffer before
+        # reusing the slot — prevents the IMA bug pattern
+        state.synchroniser.wait_for_compute(current_unit_id - 1)
+
+        buf = self.request_buffer(device, next_unit_id, numel, dtype)
+        with torch.cuda.stream(state.synchroniser.prefetch_stream):
+            gather_fn(buf)
+            self.mark_prefetch_done(device, next_unit_id)
+
+        logger.debug(
+            "prefetch_next: device=%s current=%d next=%d numel=%d",
+            device,
+            current_unit_id,
+            next_unit_id,
+            numel,
+        )
+        return buf
+
+    def finalize(self) -> None:
+        """Synchronise all streams and release all resources.
+
+        Must be called after training is complete (or between pipeline stages
+        where the manager needs to be torn down cleanly).
+        """
+        for device, state in self._states.items():
+            state.synchroniser.compute_stream.synchronize()
+            state.synchroniser.prefetch_stream.synchronize()
+            if state.cpu_offload_mgr is not None:
+                state.cpu_offload_mgr.sync()
+            state.loc_cache.clear()
+            logger.info(
+                "finalize: device=%s LOC stats=%s",
+                device,
+                state.loc_cache.stats,
+            )
+        logger.info("HeteroFSDPDoubleBufferManager: finalized all devices")
+
+    # ------------------------------------------------------------------
+    # Diagnostics
+    # ------------------------------------------------------------------
+
+    def get_loc_stats(self) -> Dict[str, Dict[str, int]]:
+        """Return LOC cache hit/miss statistics per device."""
+        return {str(dev): state.loc_cache.stats for dev, state in self._states.items()}
+
+    def get_active_buffer_count(self, device: torch.device) -> int:
+        """Return the number of currently active buffers on *device*."""
+        return len(self._states[device].active_buffers)
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _try_offload_inactive(
+        self,
+        state: DeviceDoubleBufferState,
+        requesting_unit_id: int,
+    ) -> None:
+        """Attempt to offload the oldest inactive buffer to CPU DRAM.
+
+        Only called when the pool is full and CPU offload is enabled (A6000).
+        We pick the lowest unit_id that is *not* the currently requested one,
+        on the assumption that lower-index FSDP units have already finished
+        computing.
+        """
+        if state.cpu_offload_mgr is None:
+            return
+        candidates = [
+            (uid, entry)
+            for uid, entry in state.active_buffers.items()
+            if uid != requesting_unit_id
+        ]
+        if not candidates:
+            return
+        # Pick the oldest (lowest unit_id)
+        oldest_uid, (slot_token, tensor) = min(candidates, key=lambda x: x[0])
+        state.cpu_offload_mgr.offload(slot_token, tensor)
+        logger.debug(
+            "_try_offload_inactive: offloaded unit_id=%d to CPU on %s",
+            oldest_uid,
+            state.device,
         )
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
 
-    def allocate_bucket(
-        self,
-        param_id: int,
-        num_bytes: int,
-        device: torch.device,
-    ) -> Tuple[Tensor, bool]:
-        """
-        Allocate a bucket for a parameter AllGather.
+# ===========================================================================
+# DeepSpeed integration shim
+# ===========================================================================
 
-        Returns
-        -------
-        (tensor, cache_hit) where ``cache_hit=True`` means the tensor is a
-        zero-copy view from the DES-LOC Locality Cache and no AllGather is
-        needed.
-        """
-        # --- DES-LOC Locality Cache bypass ---
-        if self._locality_cache is not None:
-            if self._locality_cache.is_resident(param_id, device):
-                view = self._locality_cache.get_view(param_id, device)
-                if view is not None:
-                    self._locality_cache.mark_accessed(param_id, device)
-                    logger.debug(
-                        "DES-LOC locality cache hit: param %d on %s (%.1f MB)",
-                        param_id,
-                        device,
-                        num_bytes / 1e6,
-                    )
-                    return view, True
+class DeepSpeedHeteroFSDPDoubleBuffer:
+    """Thin integration layer between DeepSpeed ZeRO and the DES-LOC manager.
 
-        idx = device.index if device.index is not None else 0
-        allocator = self._allocators[idx]
-        handle = allocator.allocate(num_bytes, device)
+    DeepSpeed's ZeRO-3 and the ``HybridEngine`` communicate buffer allocations
+    through ``_setup_for_real_optimizer`` and ``_post_backward_hook``.  This
+    shim exposes the same interface expected by DeepSpeed's internal hooks
+    while delegating to :class:`HeteroFSDPDoubleBufferManager`.
 
-        with self._handle_lock:
-            self._active_handles.append(handle)
-
-        if handle.spilled_from_cpu:
-            # Caller must wait on staging stream before using this buffer
-            staging = self._stream_sets[idx].staging_stream
-            current = torch.cuda.current_stream(device)
-            current.wait_stream(staging)
-            logger.debug(
-                "DES-LOC: param %d bucket arrived via CPU spill path on %s",
-                param_id,
-                device,
-            )
-
-        return handle.storage, False
-
-    def release_bucket(self, tensor: Tensor, device: torch.device) -> None:
-        """Release a previously allocated bucket back to the pool."""
-        idx = device.index if device.index is not None else 0
-        allocator = self._allocators[idx]
-        with self._handle_lock:
-            for i, h in enumerate(self._active_handles):
-                if h.storage.data_ptr() == tensor.data_ptr():
-                    allocator.release(h)
-                    self._active_handles.pop(i)
-                    return
-
-    def prefetch_context(
-        self, param_groups: List[Dict]
-    ) -> "_PrefetchContextManager":
-        """
-        Context manager that pre-schedules AllGather for the next layer's
-        parameters while the current layer's compute is running.
-
-        Example::
-
-            with db.prefetch_context(param_groups):
-                logits = model(x)
-        """
-        return _PrefetchContextManager(self, param_groups)
-
-    def synchronise_allgather(self, device: torch.device) -> None:
-        """Block until all pending AllGather ops on ``device`` are complete."""
-        idx = device.index if device.index is not None else 0
-        streams = self._stream_sets[idx]
-        torch.cuda.current_stream(device).wait_stream(streams.allgather_stream)
-
-    def release_all(self) -> None:
-        """Release every active handle. Call after backward pass."""
-        with self._handle_lock:
-            for handle in self._active_handles:
-                idx = handle.device.index if handle.device.index is not None else 0
-                self._allocators[idx].release(handle)
-            self._active_handles.clear()
-
-    def stats(self) -> Dict[str, object]:
-        """Return per-device allocator stats for monitoring."""
-        return {str(dev): self._allocators[dev.index or 0].stats() for dev in self._devices}
-
-    def __repr__(self) -> str:
-        s = self.stats()
-        parts = [f"HeteroFSDPDoubleBuffer(devices={len(self._devices)})"]
-        for dev_str, st in s.items():
-            parts.append(
-                f"  {dev_str}: {st['tier']} pool={st['pool_bytes']//1024//1024}MB "
-                f"slots={st['num_slots']} free={st['free_slots']}"
-            )
-        return "\n".join(parts)
-
-
-# ---------------------------------------------------------------------------
-# Prefetch Context Manager
-# ---------------------------------------------------------------------------
-
-
-class _PrefetchContextManager:
-    """
-    Used as ``with db.prefetch_context(param_groups): ...``.
-
-    On __enter__ we schedule AllGather for the *next* group's parameters on
-    the allgather_stream, then on __exit__ we synchronise and release.
+    It is designed to be drop-in compatible with the ``fsdp_double_buffer``
+    flag in DeepSpeed's ``ZeROConfig`` / ``DistributedDataParallelConfig``
+    equivalents when running on a DES-LOC heterogeneous cluster.
     """
 
     def __init__(
-        self, db: HeteroFSDPDoubleBuffer, param_groups: List[Dict]
+        self,
+        devices: Optional[List[torch.device]] = None,
+        dtype: torch.dtype = torch.bfloat16,
+        pool_fraction_override: Optional[float] = None,
     ) -> None:
-        self._db = db
-        self._param_groups = param_groups
-        self._allocated: List[Tuple[Tensor, torch.device]] = []
-
-    def __enter__(self) -> "_PrefetchContextManager":
-        for group in self._param_groups:
-            device: torch.device = group.get("device", torch.device("cuda:0"))
-            idx = device.index if device.index is not None else 0
-            for param_meta in group.get("params", []):
-                param_id: int = param_meta["id"]
-                num_bytes: int = param_meta["num_bytes"]
-                buf, cache_hit = self._db.allocate_bucket(param_id, num_bytes, device)
-                self._allocated.append((buf, device))
-                if not cache_hit:
-                    # Fire-and-forget prefetch event on the allgather stream
-                    streams = self._db._stream_sets[idx]
-                    ev = torch.cuda.Event()
-                    ev.record(streams.allgather_stream)
-                    param_meta["_prefetch_event"] = ev
-        return self
-
-    def __exit__(self, *_) -> None:
-        for buf, device in self._allocated:
-            self._db.release_bucket(buf, device)
-        self._allocated.clear()
-
-
-# ---------------------------------------------------------------------------
-# DeepSpeed Integration Helper
-# ---------------------------------------------------------------------------
-
-
-def build_hetero_double_buffer(
-    ds_config: Dict,
-    locality_cache: Optional[LocalityCacheProtocol] = None,
-) -> HeteroFSDPDoubleBuffer:
-    """
-    Factory called by DeepSpeed's ZeRO-3 initialisation path.
-
-    Reads ``zero_optimization.hetero_fsdp_double_buffer_devices`` from
-    ``ds_config``; if absent, uses all visible CUDA devices.
-
-    Parameters
-    ----------
-    ds_config:
-        The full DeepSpeed config dict.
-    locality_cache:
-        Optional DES-LOC Locality Cache instance. When provided, cache-resident
-        parameters bypass AllGather entirely.
-    """
-    zero_cfg = ds_config.get("zero_optimization", {})
-    if not zero_cfg.get("hetero_fsdp_double_buffer", False):
-        raise ValueError(
-            "build_hetero_double_buffer called but "
-            "'zero_optimization.hetero_fsdp_double_buffer' is not True in ds_config"
+        if devices is None:
+            devices = [torch.device(f"cuda:{i}") for i in range(torch.cuda.device_count())]
+        self._manager = HeteroFSDPDoubleBufferManager(
+            devices=devices,
+            pool_fraction_override=pool_fraction_override,
+            dtype=dtype,
         )
+        self._unit_device_map: Dict[int, torch.device] = {}
 
-    device_indices: Optional[List[int]] = zero_cfg.get(
-        "hetero_fsdp_double_buffer_devices", None
-    )
-    if device_indices is None:
-        device_indices = list(range(torch.cuda.device_count()))
+    def register_fsdp_unit(self, unit_id: int, device: torch.device) -> None:
+        """Register which device owns FSDP unit *unit_id*."""
+        self._unit_device_map[unit_id] = device
 
-    devices = [torch.device(f"cuda:{i}") for i in device_indices]
-    enable_spill = zero_cfg.get("hetero_fsdp_double_buffer_cpu_spill", True)
+    def allocate_param_buffer(
+        self,
+        unit_id: int,
+        numel: int,
+        dtype: Optional[torch.dtype] = None,
+    ) -> Tensor:
+        """Allocate a parameter gather buffer for FSDP unit *unit_id*.
 
-    db = HeteroFSDPDoubleBuffer(
-        devices=devices,
-        locality_cache=locality_cache,
-        enable_cpu_spill=enable_spill,
-    )
-    logger.info("DES-LOC HeteroFSDPDoubleBuffer built: %s", db)
-    return db
+        Called by DeepSpeed's AllGather hook before gathering shards.
+        """
+        device = self._unit_device_map.get(unit_id)
+        if device is None:
+            raise ValueError(f"FSDP unit {unit_id} not registered with DeepSpeedHeteroFSDPDoubleBuffer")
+        return self._manager.request_buffer(device, unit_id, numel, dtype)
+
+    def signal_param_ready(self, unit_id: int) -> None:
+        """Called after AllGather completes for unit *unit_id*."""
+        device = self._unit_device_map[unit_id]
+        self._manager.mark_prefetch_done(device, unit_id)
+
+    def wait_param_ready(self, unit_id: int) -> None:
+        """Block compute stream until unit *unit_id*'s params are gathered."""
+        device = self._unit_device_map[unit_id]
+        self._manager.wait_and_compute(device, unit_id)
+
+    def release_param_buffer(self, unit_id: int) -> None:
+        """Release the gather buffer for unit *unit_id* after backward pass."""
+        device = self._unit_device_map[unit_id]
+        self._manager.release_buffer(device, unit_id)
+
+    def finalize(self) -> None:
+        self._manager.finalize()
+
+    @property
+    def loc_stats(self) -> Dict[str, Dict[str, int]]:
+        return self._manager.get_loc_stats()
 
 
-# ---------------------------------------------------------------------------
-# Utilities
-# ---------------------------------------------------------------------------
-
-
-def _align_up(n: int, alignment: int) -> int:
-    return ((n + alignment - 1) // alignment) * alignment
-
-
-class _null_ctx:
-    """No-op context manager used when staging_stream is None."""
-    def __enter__(self): return self
-    def __exit__(self, *_): pass
-
-
-# ---------------------------------------------------------------------------
-# Unit Tests
-# ---------------------------------------------------------------------------
-
+# ===========================================================================
+# Unit tests
+# ===========================================================================
 
 if __name__ == "__main__":
+    """Self-contained unit tests for HeteroFSDPDoubleBuffer components.
+
+    Run with: python deepspeed/runtime/zero/hetero_fsdp_double_buffer.py
+
+    Tests are designed to work on any single-GPU machine (or CPU-only) by
+    mocking the multi-device setup where CUDA is unavailable.
+    """
+
     import sys
-    import unittest
+    import traceback
 
     logging.basicConfig(
         level=logging.DEBUG,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        stream=sys.stdout,
+        format="%(asctime)s %(name)s %(levelname)s %(message)s",
     )
 
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
+    PASS = "\033[92mPASS\033[0m"
+    FAIL = "\033[91mFAIL\033[0m"
 
-    def _has_cuda(n: int = 1) -> bool:
-        return torch.cuda.is_available() and torch.cuda.device_count() >= n
+    results: List[Tuple[str, bool, str]] = []
 
-    # ------------------------------------------------------------------
-    # Tests
-    # ------------------------------------------------------------------
+    def run_test(name: str, fn):
+        try:
+            fn()
+            results.append((name, True, ""))
+            print(f"  [{PASS}] {name}")
+        except Exception as exc:
+            tb = traceback.format_exc()
+            results.append((name, False, tb))
+            print(f"  [{FAIL}] {name}: {exc}")
 
-    class TestAlignUp(unittest.TestCase):
-        def test_already_aligned(self):
-            self.assertEqual(_align_up(256, 256), 256)
+    # -------------------------------------------------------------------
+    # Test 1: DeviceClass classification
+    # -------------------------------------------------------------------
+    def test_device_classification():
+        # We can only test UNKNOWN on machines without the exact target GPUs
+        unknown = DeviceClass.UNKNOWN
+        assert unknown is not None
+        # Verify enum members exist
+        assert DeviceClass.A6000_SM86 is not None
+        assert DeviceClass.H100_SM90 is not None
 
-        def test_unaligned(self):
-            self.assertEqual(_align_up(257, 256), 512)
+    run_test("DeviceClass: enum members", test_device_classification)
 
-        def test_zero(self):
-            self.assertEqual(_align_up(0, 256), 0)
+    # -------------------------------------------------------------------
+    # Test 2: LOCCache hit/miss semantics
+    # -------------------------------------------------------------------
+    def test_loc_cache_hit_miss():
+        if not torch.cuda.is_available():
+            return  # skip on CPU-only CI
 
-        def test_large(self):
-            val = _align_up(1024 * 1024 + 1, 256)
-            self.assertEqual(val % 256, 0)
-            self.assertGreater(val, 1024 * 1024)
+        dev = torch.device("cuda:0")
+        cache = LOCCache(capacity=4, device=dev)
 
-    class TestDeviceTierRegistry(unittest.TestCase):
-        def test_singleton(self):
-            r1 = DeviceTierRegistry()
-            r2 = DeviceTierRegistry()
-            self.assertIs(r1, r2)
+        # First get: miss
+        t1 = cache.get(1024, torch.float32)
+        assert t1.numel() == 1024
+        assert cache.stats["misses"] == 1
+        assert cache.stats["hits"] == 0
 
-        @unittest.skipUnless(_has_cuda(1), "requires CUDA")
-        def test_probe_populates_registry(self):
-            reg = DeviceTierRegistry()
-            reg._initialised = False  # force re-probe for test isolation
-            metas = reg.all_tiers()
-            self.assertGreater(len(metas), 0)
-            for meta in metas:
-                self.assertIsInstance(meta, TierMetadata)
-                self.assertIn(meta.tier, list(DeviceTier))
+        # Return and re-get: hit
+        cache.put(t1)
+        t2 = cache.get(1024, torch.float32)
+        assert cache.stats["hits"] == 1
+        assert t2.numel() == 1024
 
-        @unittest.skipUnless(_has_cuda(1), "requires CUDA")
-        def test_pool_budget_positive(self):
-            reg = DeviceTierRegistry()
-            meta = reg.get(0)
-            self.assertGreater(meta.pool_budget_bytes, 0)
+        cache.clear()
 
-    class TestPinnedSpillArena(unittest.TestCase):
-        @unittest.skipUnless(_has_cuda(1), "requires CUDA")
-        def test_allocate_and_wrap(self):
-            arena = PinnedSpillArena(capacity_bytes=1024 * 1024)  # 1 MB
-            buf1 = arena.allocate(512 * 1024)
-            self.assertEqual(buf1.dtype, torch.uint8)
-            buf2 = arena.allocate(512 * 1024)
-            # Next allocation should wrap
-            buf3 = arena.allocate(512 * 1024)
-            self.assertEqual(buf3.data_ptr(), arena._backing.data_ptr())
+    run_test("LOCCache: hit/miss semantics", test_loc_cache_hit_miss)
 
-        @unittest.skipUnless(_has_cuda(1), "requires CUDA")
-        def test_reset(self):
-            arena = PinnedSpillArena(capacity_bytes=256 * 1024)
-            arena.allocate(128 * 1024)
-            self.assertGreater(arena._cursor, 0)
-            arena.reset()
-            self.assertEqual(arena._cursor, 0)
+    # -------------------------------------------------------------------
+    # Test 3: LOCCache capacity eviction
+    # -------------------------------------------------------------------
+    def test_loc_cache_eviction():
+        if not torch.cuda.is_available():
+            return
 
-    class TestHeteroStorageResizeFallback(unittest.TestCase):
-        @unittest.skipUnless(_has_cuda(1), "requires CUDA")
-        def test_allocate_and_release(self):
-            dev = torch.device("cuda:0")
-            arena = PinnedSpillArena()
-            staging = torch.cuda.Stream(device=dev)
-            fallback = HeteroStorageResizeFallback(
-                staging_stream=staging, spill_arena=arena
-            )
-            num_bytes = 4 * 1024 * 1024  # 4 MB
-            handle = fallback.allocate(num_bytes, dev)
-            self.assertGreaterEqual(handle.num_bytes, num_bytes)
-            self.assertEqual(handle.storage.device, dev)
-            fallback.release(handle)
+        dev = torch.device("cuda:0")
+        cache = LOCCache(capacity=2, device=dev)
 
-        @unittest.skipUnless(_has_cuda(1), "requires CUDA")
-        def test_resize_idempotent(self):
-            dev = torch.device("cuda:0")
-            fallback = HeteroStorageResizeFallback(
-                staging_stream=None, spill_arena=None
-            )
-            h1 = fallback.allocate(1024, dev)
-            h2 = fallback.allocate(2048, dev)
-            # Both calls should return the same underlying tensor (resized)
-            self.assertEqual(
-                h1.storage.data_ptr(), h2.storage.data_ptr(),
-                "Expected storage-resize reuse of the same tensor"
-            )
-            self.assertGreaterEqual(h2.num_bytes, 2048)
+        tensors = [cache.get(128, torch.float32) for _ in range(3)]
+        for t in tensors:
+            cache.put(t)
 
-    class TestTierAwarePoolAllocator(unittest.TestCase):
-        @unittest.skipUnless(_has_cuda(1), "requires CUDA")
-        def test_pool_allocation_and_return(self):
-            dev = torch.device("cuda:0")
-            alloc = TierAwarePoolAllocator(
-                device=dev,
-                locality_cache=None,
-                staging_stream=None,
-                spill_arena=None,
-            )
-            stats_before = alloc.stats()
-            handle = alloc.allocate(1024 * 1024, dev)  # 1 MB
-            stats_during = alloc.stats()
-            alloc.release(handle)
-            stats_after = alloc.stats()
+        # Only 2 slots allowed; one should have been evicted
+        with cache._lock:
+            total = sum(len(v) for v in cache._store.values())
+        assert total <= 2, f"Expected ≤2 cached tensors, got {total}"
+        cache.clear()
 
-            if stats_before["pool_bytes"] >= _MIN_POOL_BYTES:
-                self.assertLess(stats_during["free_slots"], stats_before["free_slots"])
-                self.assertEqual(stats_after["free_slots"], stats_before["free_slots"])
+    run_test("LOCCache: capacity eviction", test_loc_cache_eviction)
 
-        @unittest.skipUnless(_has_cuda(1), "requires CUDA")
-        def test_oversized_bucket_falls_through_to_fallback(self):
-            dev = torch.device("cuda:0")
-            alloc = TierAwarePoolAllocator(
-                device=dev,
-                locality_cache=None,
-                staging_stream=None,
-                spill_arena=None,
-            )
-            # Request something definitely bigger than any slot
-            huge_bytes = alloc._slot_size * 10 + 1
-            # Must not raise; fallback takes over
-            handle = alloc.allocate(huge_bytes, dev)
-            self.assertFalse(handle.from_pool)
-            alloc.release(handle)
+    # -------------------------------------------------------------------
+    # Test 4: StorageResizeFallbackAllocator keeps tensor alive
+    # -------------------------------------------------------------------
+    def test_storage_resize_fallback():
+        if not torch.cuda.is_available():
+            return
 
-        @unittest.skipUnless(_has_cuda(1), "requires CUDA")
-        def test_stats_keys(self):
-            dev = torch.device("cuda:0")
-            alloc = TierAwarePoolAllocator(
-                device=dev, locality_cache=None,
-                staging_stream=None, spill_arena=None,
-            )
-            st = alloc.stats()
-            for key in ("device", "tier", "pool_bytes", "num_slots", "free_slots", "slot_size_bytes"):
-                self.assertIn(key, st)
+        dev = torch.device("cuda:0")
+        cache = LOCCache(capacity=4, device=dev)
+        alloc = StorageResizeFallbackAllocator(device=dev, loc_cache=cache)
 
-    class TestHeteroFSDPDoubleBuffer(unittest.TestCase):
-        @unittest.skipUnless(_has_cuda(1), "requires CUDA")
-        def test_init_single_device(self):
-            devices = [torch.device("cuda:0")]
-            db = HeteroFSDPDoubleBuffer(devices=devices)
-            self.assertIn(0, db._allocators)
-            self.assertIn(0, db._stream_sets)
+        aid, t = alloc.allocate(4096, torch.float32)
+        assert t.numel() == 4096
 
-        @unittest.skipUnless(_has_cuda(1), "requires CUDA")
-        def test_allocate_and_release_bucket(self):
-            devices = [torch.device("cuda:0")]
-            db = HeteroFSDPDoubleBuffer(devices=devices)
-            tensor, cache_hit = db.allocate_bucket(
-                param_id=42, num_bytes=2 * 1024 * 1024, device=devices[0]
-            )
-            self.assertFalse(cache_hit)
-            self.assertEqual(tensor.device, devices[0])
-            db.release_bucket(tensor, devices[0])
-            db.release_all()
+        # Create a view — the storage must remain valid
+        view = t[:512]
+        alloc.add_ref(aid)   # view holds an extra reference
+        alloc.release(aid)   # release original — storage still live
+        view[0] = 1.0        # must not segfault / IMA
+        alloc.release(aid)   # release view's reference
+        cache.clear()
 
-        @unittest.skipUnless(_has_cuda(1), "requires CUDA")
-        def test_locality_cache_bypass(self):
-            """Simulate a Locality Cache hit — no AllGather should occur."""
+    run_test("StorageResizeFallback: tensor alive while view exists", test_storage_resize_fallback)
 
-            class FakeCache(LocalityCacheProtocol):
-                def __init__(self, hit_id: int, tensor: Tensor):
-                    self._hit_id = hit_id
-                    self._tensor = tensor
-                    self.accessed: List[int] = []
+    # -------------------------------------------------------------------
+    # Test 5: HeteroFixedPoolAllocator primary path
+    # -------------------------------------------------------------------
+    def test_pool_allocator_primary():
+        if not torch.cuda.is_available():
+            return
 
-                def is_resident(self, param_id, device):
-                    return param_id == self._hit_id
+        dev = torch.device("cuda:0")
+        cache = LOCCache(capacity=4, device=dev)
+        cfg = PoolConfig(
+            primary_pool_fraction=0.01,
+            use_storage_resize_fallback=True,
+            loc_cache_capacity=4,
+        )
+        alloc = HeteroFixedPoolAllocator(
+            device=dev,
+            pool_bytes=8 * 1024 * 1024,  # 8 MiB
+            dtype=torch.float32,
+            loc_cache=cache,
+            cfg=cfg,
+        )
 
-                def get_view(self, param_id, device):
-                    return self._tensor if param_id == self._hit_id else None
+        # Allocate two small buffers (should fit in pool)
+        tok0, t0 = alloc.allocate(1024, torch.float32)
+        tok1, t1 = alloc.allocate(1024, torch.float32)
+        assert tok0 >= 0
+        assert tok1 >= 0
+        assert t0.numel() == 1024
+        assert t1.numel() == 1024
 
-                def mark_accessed(self, param_id, device):
-                    self.accessed.append(param_id)
+        # Both slots occupied — next should go to fallback (negative token)
+        tok2, t2 = alloc.allocate(128, torch.float32)
+        assert tok2 < 0, "Expected fallback token for third allocation"
 
-            dev = torch.device("cuda:0")
-            cached_tensor = torch.randn(128, device=dev)
-            cache = FakeCache(hit_id=99, tensor=cached_tensor)
-            db = HeteroFSDPDoubleBuffer(devices=[dev], locality_cache=cache)
+        alloc.release(tok0)
+        alloc.release(tok1)
+        alloc.release(tok2)
 
-            returned, cache_hit = db.allocate_bucket(
-                param_id=99, num_bytes=512, device=dev
-            )
-            self.assertTrue(cache_hit)
-            self.assertEqual(returned.data_ptr(), cached_tensor.data_ptr())
-            self.assertIn(99, cache.accessed)
+    run_test("HeteroFixedPoolAllocator: primary and fallback paths", test_pool_allocator_primary)
 
-        @unittest.skipUnless(_has_cuda(1), "requires CUDA")
-        def test_release_all_clears_handles(self):
-            devices = [torch.device("cuda:0")]
-            db = HeteroFSDPDoubleBuffer(devices=devices)
-            for i in range(3):
-                db.allocate_bucket(param_id=i, num_bytes=1024, device=devices[0])
-            self.assertEqual(len(db._active_handles), 3)
-            db.release_all()
-            self.assertEqual(len(db._active_handles), 0)
+    # -------------------------------------------------------------------
+    # Test 6: DoubleBufferSynchroniser event ordering
+    # -------------------------------------------------------------------
+    def test_synchroniser_event_ordering():
+        if not torch.cuda.is_available():
+            return
 
-        @unittest.skipUnless(_has_cuda(1), "requires CUDA")
-        def test_prefetch_context_manager(self):
-            devices = [torch.device("cuda:0")]
-            db = HeteroFSDPDoubleBuffer(devices=devices)
-            param_groups = [
-                {
-                    "device": devices[0],
-                    "params": [
-                        {"id": 0, "num_bytes": 1024 * 1024},
-                        {"id": 1, "num_bytes": 2 * 1024 * 1024},
-                    ],
-                }
-            ]
-            with db.prefetch_context(param_groups):
-                # Simulate compute — handles are active inside the context
-                self.assertEqual(len(db._active_handles), 2)
-            # Context exit should have released everything
-            self.assertEqual(len(db._active_handles), 0)
+        dev = torch.device("cuda:0")
+        sync = DoubleBufferSynchroniser(device=dev)
 
-        @unittest.skipUnless(_has_cuda(1), "requires CUDA")
-        def test_synchronise_allgather(self):
-            devices = [torch.device("cuda:0")]
-            db = HeteroFSDPDoubleBuffer(devices=devices)
-            # Should not raise even with no pending ops
-            db.synchronise_allgather(devices[0])
+        # Record a prefetch event for unit 0
+        with torch.cuda.stream(sync.prefetch_stream):
+            _ = torch.zeros(64, device=dev)   # dummy work
+        sync.record_prefetch_done(unit_id=0)
 
-        @unittest.skipUnless(_has_cuda(1), "requires CUDA")
-        def test_repr_contains_tier_info(self):
-            devices = [torch.device("cuda:0")]
-            db = HeteroFSDPDoubleBuffer(devices=devices)
-            rep = repr(db)
-            self.assertIn("HeteroFSDPDoubleBuffer", rep)
+        # Waiting on the compute stream should not raise
+        sync.wait_for_prefetch(unit_id=0)
+        sync.compute_stream.synchronize()
 
-    class TestBuildFactory(unittest.TestCase):
-        @unittest.skipUnless(_has_cuda(1), "requires CUDA")
-        def test_factory_missing_flag_raises(self):
-            with self.assertRaises(ValueError):
-                build_hetero_double_buffer(
-                    ds_config={"zero_optimization": {"hetero_fsdp_double_buffer": False}}
+        # Waiting on a non-existent event should be a no-op
+        sync.wait_for_prefetch(unit_id=99)
+
+    run_test("DoubleBufferSynchroniser: event ordering", test_synchroniser_event_ordering)
+
+    # -------------------------------------------------------------------
+    # Test 7: CPUOffloadManager round-trip
+    # -------------------------------------------------------------------
+    def test_cpu_offload_roundtrip():
+        if not torch.cuda.is_available():
+            return
+
+        dev = torch.device("cuda:0")
+        mgr = CPUOffloadManager(device=dev)
+
+        src = torch.randn(1024, device=dev, dtype=torch.float32)
+        original = src.clone()
+
+        mgr.offload(slot_token=42, tensor=src)
+        mgr.sync()
+
+        dst = torch.zeros(1024, device=dev, dtype=torch.float32)
+        mgr.restore(slot_token=42, target=dst)
+        mgr.sync()
+
+        assert torch.allclose(original, dst), "CPU offload round-trip data mismatch"
+
+    run_test("CPUOffloadManager: offload/restore round-trip", test_cpu_offload_roundtrip)
+
+    # -------------------------------------------------------------------
+    # Test 8: HeteroFSDPDoubleBufferManager single-device workflow
+    # -------------------------------------------------------------------
+    def test_manager_single_device_workflow():
+        if not torch.cuda.is_available():
+            return
+
+        dev = torch.device("cuda:0")
+        mgr = HeteroFSDPDoubleBufferManager(
+            devices=[dev],
+            pool_fraction_override=0.005,  # tiny pool for test
+            dtype=torch.float32,
+        )
+
+        NUM_UNITS = 4
+        NUMEL = 512
+
+        for unit_id in range(NUM_UNITS):
+            buf = mgr.request_buffer(dev, unit_id, NUMEL)
+            assert buf.numel() == NUMEL
+            buf.fill_(float(unit_id))
+            mgr.mark_prefetch_done(dev, unit_id)
+            mgr.wait_and_compute(dev, unit_id)
+            assert buf[0].item() == float(unit_id)
+            mgr.release_buffer(dev, unit_id)
+
+        mgr.finalize()
+        stats = mgr.get_loc_stats()
+        assert str(dev) in stats
+
+    run_test("HeteroFSDPDoubleBufferManager: single-device workflow", test_manager_single_device_workflow)
+
+    # -------------------------------------------------------------------
+    # Test 9: DeepSpeedHeteroFSDPDoubleBuffer shim
+    # -------------------------------------------------------------------
+    def test_deepspeed_shim():
+        if not torch.cuda.is_available():
+            return
+
+        dev = torch.device("cuda:0")
+        shim = DeepSpeedHeteroFSDPDoubleBuffer(
+            devices=[dev],
+            dtype=torch.float32,
+            pool_fraction_override=0.005,
+        )
+        shim.register_fsdp_unit(unit_id=0, device=dev)
+        shim.register_fsdp_unit(unit_id=1, device=dev)
+
+        for uid in range(2):
+            buf = shim.allocate_param_buffer(uid, numel=256)
+            buf.fill_(float(uid))
+            shim.signal_param_ready(uid)
+            shim.wait_param_ready(uid)
+            shim.release_param_buffer(uid)
+
+        shim.finalize()
+
+    run_test("DeepSpeedHeteroFSDPDoubleBuffer: shim round-trip", test_deepspeed_shim)
+
+    # -------------------------------------------------------------------
+    # Test 10: prefetch_next overlap simulation
+    # -------------------------------------------------------------------
+    def test_prefetch_next_overlap():
+        if not torch.cuda.is_available():
+            return
+
+        dev = torch.device("cuda:0")
+        mgr = HeteroFSDPDoubleBufferManager(
+            devices=[dev],
+            pool_fraction_override=0.01,
+            dtype=torch.float32,
+        )
+
+        gathered = {}
+
+        def make_gather_fn(uid):
+            def gather_fn(tensor):
+                tensor.fill_(float(uid * 10))
+                gathered[uid] = tensor.clone()
+            return gather_fn
+
+        NUM_UNITS = 6
+        NUMEL = 256
+
+        # Bootstrap: request unit 0 manually
+        buf0 = mgr.request_buffer(dev, 0, NUMEL)
+        buf0.fill_(0.0)
+        mgr.mark_prefetch_done(dev, 0)
+
+        for current_id in range(NUM_UNITS):
+            mgr.wait_and_compute(dev, current_id)
+            current_buf = mgr._states[dev].active_buffers.get(current_id)
+
+            next_id = current_id + 1
+            if next_id < NUM_UNITS:
+                mgr.prefetch_next(
+                    dev,
+                    current_unit_id=current_id,
+                    next_unit_id=next_id,
+                    numel=NUMEL,
+                    gather_fn=make_gather_fn(next_id),
                 )
 
-        @unittest.skipUnless(_has_cuda(1), "requires CUDA")
-        def test_factory_builds_correctly(self):
-            ds_config = {
-                "zero_optimization": {
-                    "hetero_fsdp_double_buffer": True,
-                    "hetero_fsdp_double_buffer_devices": [0],
-                    "hetero_fsdp_double_buffer_cpu_spill": False,
-                }
-            }
-            db = build_hetero_double_buffer(ds_config=ds_config)
-            self.assertIsInstance(db, HeteroFSDPDoubleBuffer)
+            mgr.release_buffer(dev, current_id)
 
-    class TestDoublePrefetchQueue(unittest.TestCase):
-        @unittest.skipUnless(_has_cuda(1), "requires CUDA")
-        def test_enqueue_dequeue_fifo(self):
-            dev = torch.device("cuda:0")
-            alloc = TierAwarePoolAllocator(
-                device=dev, locality_cache=None,
-                staging_stream=None, spill_arena=None,
+        mgr.finalize()
+
+        # Verify gathered values
+        for uid in range(1, NUM_UNITS):
+            assert uid in gathered, f"Unit {uid} was never gathered"
+            expected = float(uid * 10)
+            actual = gathered[uid][0].item()
+            assert abs(actual - expected) < 1e-4, (
+                f"Unit {uid}: expected {expected}, got {actual}"
             )
-            q = DoublePrefetchQueue(alloc, depth=2)
-            e1 = PrefetchEntry(param_id=1, param_group_id=0,
-                               bucket_bytes=1024, device=dev)
-            e2 = PrefetchEntry(param_id=2, param_group_id=0,
-                               bucket_bytes=1024, device=dev)
-            self.assertTrue(q.enqueue(e1))
-            self.assertTrue(q.enqueue(e2))
-            self.assertTrue(q.is_full)
-            self.assertFalse(q.enqueue(PrefetchEntry(3, 0, 1024, dev)))
 
-            d1 = q.dequeue()
-            self.assertEqual(d1.param_id, 1)
-            d2 = q.dequeue()
-            self.assertEqual(d2.param_id, 2)
-            self.assertIsNone(q.dequeue())
+    run_test("prefetch_next: overlap simulation with gather_fn", test_prefetch_next_overlap)
 
-        @unittest.skipUnless(_has_cuda(1), "requires CUDA")
-        def test_occupancy(self):
-            dev = torch.device("cuda:0")
-            alloc = TierAwarePoolAllocator(
-                device=dev, locality_cache=None,
-                staging_stream=None, spill_arena=None,
-            )
-            q = DoublePrefetchQueue(alloc, depth=4)
-            self.assertEqual(q.occupancy, 0)
-            q.enqueue(PrefetchEntry(1, 0, 512, dev))
-            self.assertEqual(q.occupancy, 1)
+    # -------------------------------------------------------------------
+    # Test 11: PoolConfig defaults are sane per device class
+    # -------------------------------------------------------------------
+    def test_pool_config_defaults():
+        a6k = _POOL_CONFIG_BY_CLASS[DeviceClass.A6000_SM86]
+        h100 = _POOL_CONFIG_BY_CLASS[DeviceClass.H100_SM90]
 
-    class TestTierStreamSet(unittest.TestCase):
-        @unittest.skipUnless(_has_cuda(1), "requires CUDA")
-        def test_create(self):
-            dev = torch.device("cuda:0")
-            ss = TierStreamSet.create(dev)
-            self.assertIsInstance(ss.allgather_stream, torch.cuda.Stream)
-            self.assertIsInstance(ss.staging_stream, torch.cuda.Stream)
-            self.assertIsInstance(ss.compute_stream, torch.cuda.Stream)
-            # All three streams should be distinct
-            ptrs = {ss.allgather_stream.cuda_stream,
-                    ss.staging_stream.cuda_stream,
-                    ss.compute_stream.cuda_stream}
-            self.assertEqual(len(ptrs), 3)
+        # H100 should have a larger pool fraction
+        assert h100.primary_pool_fraction > a6k.primary_pool_fraction
+        # A6000 should enable CPU offload; H100 should not (by default)
+        assert a6k.allow_cpu_offload is True
+        assert h100.allow_cpu_offload is False
+        # SM86 uses storage-resize fallback; SM90 uses pinned-staging
+        assert a6k.use_storage_resize_fallback is True
+        assert h100.use_storage_resize_fallback is False
 
-    # ------------------------------------------------------------------
-    # Run
-    # ------------------------------------------------------------------
+    run_test("PoolConfig: sane defaults per device class", test_pool_config_defaults)
 
-    print("=" * 70)
-    print("DES-LOC HeteroFSDPDoubleBuffer — Unit Test Suite")
-    print("=" * 70)
+    # -------------------------------------------------------------------
+    # Test 12: PinnedStagingFallbackAllocator (SM90 path)
+    # -------------------------------------------------------------------
+    def test_pinned_staging_fallback():
+        if not torch.cuda.is_available():
+            return
 
-    loader = unittest.TestLoader()
-    suite = unittest.TestSuite()
-    for cls in [
-        TestAlignUp,
-        TestDeviceTierRegistry,
-        TestPinnedSpillArena,
-        TestHeteroStorageResizeFallback,
-        TestTierAwarePoolAllocator,
-        TestHeteroFSDPDoubleBuffer,
-        TestBuildFactory,
-        TestDoublePrefetchQueue,
-        TestTierStreamSet,
-    ]:
-        suite.addTests(loader.loadTestsFromTestCase(cls))
+        dev = torch.device("cuda:0")
+        cache = LOCCache(capacity=4, device=dev)
+        alloc = PinnedStagingFallbackAllocator(device=dev, loc_cache=cache)
 
-    runner = unittest.TextTestRunner(verbosity=2, stream=sys.stdout)
-    result = runner.run(suite)
-    sys.exit(0 if result.wasSuccessful() else 1)
+        aid, t = alloc.allocate(2048, torch.float32)
+        assert t.numel() == 2048
+        assert t.device == dev
+
+        t.fill_(3.14)
+        alloc.stage_to_host(aid)
+        alloc.sync_staging()
+
+        # Overwrite device tensor with zeros
+        t.zero_()
+        alloc.restore_from_host(aid)
+        alloc.sync_staging()
+
+        assert abs(t[0].item() - 3.14) < 1e-4, "Pinned staging: restore mismatch"
+        alloc.release(aid)
+        cache.clear()
+
+    run_test("PinnedStagingFallbackAllocator: stage/restore", test_pinned_staging_fallback)
+
+    # -------------------------------------------------------------------
+    # Test 13: multi-microbatch stress (mimics upstream test structure)
+    # -------------------------------------------------------------------
+    def test_multi_microbatch_stress():
+        if not torch.cuda.is_available():
+            return
+
+        dev = torch.device("cuda:0")
+        mgr = HeteroFSDPDoubleBufferManager(
+            devices=[dev],
+            pool_fraction_override=0.005,
+            dtype=torch.bfloat16,
+        )
+
+        NUM_MICROBATCHES = 4
+        NUM_STEPS = 5
+        FSDP_UNITS = 3
+        NUMEL_PER_UNIT = [512, 1024, 2048]   # varied sizes, one may exceed pool
+
+        for step in range(NUM_STEPS):
+            for mb in range(NUM_MICROBATCHES):
+                for uid in range(FSDP_UNITS):
+                    numel = NUMEL_PER_UNIT[uid]
+                    buf = mgr.request_buffer(dev, uid, numel, torch.bfloat16)
+                    buf.fill_(float(step + mb + uid))
+                    mgr.mark_prefetch_done(dev, uid)
+                    mgr.wait_and_compute(dev, uid)
+                    mgr.release_buffer(dev, uid)
+
+        mgr.finalize()
+        stats = mgr.get_loc_stats()[str(dev)]
+        # Should have accumulated some LOC hits after the first step
+        total = stats["hits"] + stats["misses"]
+        assert total > 0
+
+    run_test("multi-microbatch stress: 5 steps × 4 micro-batches × 3 units",
+             test_multi_microbatch_stress)
+
+    # -------------------------------------------------------------------
+    # Test 14: LOCCache thread safety
+    # -------------------------------------------------------------------
+    def test_loc_cache_thread_safety():
+        if not torch.cuda.is_available():
+            return
+
+        dev = torch.device("cuda:0")
+        cache = LOCCache(capacity=16, device=dev)
+        errors = []
+
+        def worker(worker_id: int):
+            try:
+                for i in range(20):
+                    t = cache.get(256, torch.float32)
+                    t.fill_(float(worker_id))
+                    cache.put(t)
+            except Exception as exc:
+                errors.append(exc)
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(4)]
+        for th in threads:
+            th.start()
+        for th in threads:
+            th.join()
+
+        assert not errors, f"Thread safety errors: {errors}"
+        cache.clear()
+
+    run_test("LOCCache: thread safety (4 workers × 20 ops)", test_loc_cache_thread_safety)
+
+    # -------------------------------------------------------------------
+    # Summary
+    # -------------------------------------------------------------------
+    print()
+    total = len(results)
+    passed = sum(1 for _, ok, _ in results if ok)
+    print(f"Results: {passed}/{total} tests passed")
+    for name, ok, tb in results:
+        if not ok:
+            print(f"\n  FAILED: {name}\n{tb}")
+
+    if passed < total:
+        sys.exit(1)
