@@ -3,7 +3,8 @@
 
 # DeepSpeed Team
 
-from .logging import logger, log_dist, log_dist_once, set_log_level_from_string
+from .logging import (logger, log_dist, log_dist_once, set_log_level_from_string,
+                       log_single_rank, TierAwareLogger, get_tier_aware_logger)
 from .comms_logging import get_caller_func
 #from .distributed import init_distributed
 from .init_on_device import OnDevice
