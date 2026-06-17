@@ -15,3 +15,12 @@ from .heterogeneous_engine import (
     _DeviceRouter,
     _TierHandle,
 )
+
+# DES-LOC: adaptive sampling router (mirrors Megatron 878228fd0)
+from .adaptive_sampling_router import (
+    AdaptiveSamplingRouter,
+    SamplingRouterConfig,
+    SamplingParams,
+    SamplingBackend,
+    build_sampling_router,
+)
