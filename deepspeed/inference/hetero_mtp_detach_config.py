@@ -1,49 +1,78 @@
 """
 deepspeed/inference/hetero_mtp_detach_config.py
 
-DES-LOC Heterogeneous MTP Detach Configuration and Scheduling
-=============================================================
+DES-LOC Heterogeneous Multi-Token Prediction with Detached Head Configuration
+==============================================================================
 
-Upstream design intent (Megatron commit 71e418ea7d7b3a6c9a53238c543c3e0b43e11026):
-    Yi-Fu Wu introduced ``mtp_detach_heads`` as a single boolean flag in
-    ``TransformerConfig`` that, when enabled, prevents Multi-Token Prediction (MTP)
-    loss gradients from propagating back into the main transformer body.  Three
-    detach sites were added:
+Upstream Design Intent (Megatron-LM commit 71e418ea):
+------------------------------------------------------
+The original Megatron-LM commit introduces ``mtp_detach_heads``, a boolean flag
+that severs gradient flow between the Multi-Token Prediction (MTP) auxiliary heads
+and the main model backbone.  The core insight is that MTP heads are speculative
+decoders: they predict future tokens from intermediate hidden states, but their
+loss gradients need not propagate back into the backbone weights during stable
+training phases.  Detaching achieves three benefits in Megatron's homogeneous
+setting:
 
-      1. ``process_mtp_loss`` — detaches the shared output-projection weight so the
-         output head is frozen w.r.t. the MTP loss.
-      2. ``MultiTokenPredictionLayer._get_embeddings`` — detaches the decoder input
-         coming out of the shared embedding, severing the gradient path to the
-         embedding table.
-      3. ``MultiTokenPredictionBlock.forward`` — detaches ``hidden_states`` after
-         chunking so that MTP-layer gradients cannot leak into the upstream backbone.
+  1. Gradient isolation — MTP loss only trains the MTP-specific parameters
+     (enorm, hnorm, eh_proj), not the shared embedding or backbone.
+  2. Numerical stability — avoids accumulated gradient noise from auxiliary
+     paths polluting the primary language-model gradient.
+  3. Activation checkpointing compatibility — after detach(), tensors lose
+     ``requires_grad``; the commit re-enables it on ``hidden_states`` explicitly
+     so that ``CheckpointFunction.apply`` can still build a differentiable graph
+     through the MTP layer parameters.
 
-    The motivation is to train MTP heads as semi-independent speculative-decoding
-    assistants without disturbing the carefully tuned main-model gradients.
+The diff touches three callsites:
+  * ``process_mtp_loss``   — detaches ``output_weight`` before computing logits.
+  * ``MultiTokenPredictionLayer._get_embeddings`` — detaches ``decoder_input``.
+  * ``MultiTokenPredictionBlock.forward``         — detaches the per-offset chunk
+    of ``hidden_states`` before feeding MTP layers.
 
-DES-LOC adaptation rationale:
-    In the Neuron_SP DES-LOC (Decoupled Execution with Shared LOcality Cache)
-    framework the three physical tiers have radically different gradient bandwidth:
+DES-LOC Adaptation Points:
+---------------------------
+DES-LOC (Decoupled Execution with Shared LOcality Cache) adds a heterogeneous
+hardware dimension that Megatron's homogeneous design ignores.  In our cluster:
 
-      • A6000-0 / A6000-1  (48 GB each, SM86, PCIe-only)
-         — DRAM-bandwidth-limited; remat is cheap relative to PCIe gradient traffic.
-      • H100-NVL            (96 GB, SM90, PCIe-only)
-         — Compute-rich; can absorb backward passes that the A6000s cannot.
+  * 2× A6000 48 GB  (SM86, compute capability 8.6) — speculative draft devices
+  * 1× H100 NVL 96 GB (SM90, compute capability 9.0) — verification / backbone device
+  * PCIe interconnect only (no NVLink) — P2P bandwidth ≈ 24 GB/s, latency matters
+  * 1.5 TB CPU DRAM — locality cache for KV and activation spill
 
-    A global ``mtp_detach_heads=True`` would throw away gradient information that the
-    H100 could exploit.  A global ``False`` would flood the PCIe bus with MTP
-    gradients on the A6000 tier at every step.
+The critical adaptation is **device-aware gradient isolation**:
 
-    This module replaces the single boolean with a *per-tier, per-MTP-layer*
-    detach schedule that is aware of:
-      - which physical device hosts each MTP layer (locality affinity),
-      - the current training step (warm-up, steady-state, fine-tuning),
-      - gradient-traffic budgets derived from PCIe topology,
-      - the shared locality cache occupancy so that detaching can free cache slots.
+  * Detach boundaries must coincide with PCIe transfer boundaries.  A tensor
+    that crosses PCIe should almost always be detached: keeping the autograd
+    graph alive across PCIe means gradient tensors must cross back in the
+    backward pass at full precision — a bandwidth tax we cannot afford.
 
-    The public API mirrors the Megatron flag (``should_detach(site, layer_idx)``)
-    so that DES-LOC-aware wrappers around the three upstream detach sites can call a
-    single predicate without restructuring the training loop.
+  * The H100 owns the backbone and the shared output projection (``output_weight``).
+    A6000s own MTP draft heads.  Gradient isolation is therefore not just an
+    optional training trick but a hard architectural boundary: A6000s cannot
+    accumulate gradients into H100-resident parameters without a synchronous PCIe
+    round-trip.
+
+  * The ``HeteroMTPDetachConfig`` defined here extends Megatron's scalar boolean
+    into a per-device-group policy, tracking which devices are "draft" (A6000)
+    vs "verify" (H100) and enforcing appropriate detach semantics at each
+    callsite.
+
+  * The LOcality Cache (shared CPU DRAM) serves as the handoff buffer for
+    detached tensors: when a hidden-state chunk is detached on an A6000, it is
+    optionally spilled to pinned CPU memory before being moved to the next
+    device, amortising PCIe cost via async prefetch.
+
+Module layout:
+  ``HeteroDeviceRole``        — enum marking a device as DRAFT or VERIFY.
+  ``HeteroMTPDetachPolicy``   — per-device detach rules (replaces the scalar bool).
+  ``HeteroMTPDetachConfig``   — dataclass integrating policy into DS engine config.
+  ``LocalityCacheBuffer``     — lightweight pinned-memory buffer for cross-device
+                                 tensor handoff.
+  ``HeteroMTPDetachManager``  — runtime manager; called at each MTP callsite.
+  ``HeteroProcessMTPLoss``    — drop-in replacement for Megatron's
+                                 ``process_mtp_loss`` with hetero-aware detach.
+  ``HeteroMultiTokenPredictionLayer`` — wraps ``_get_embeddings`` detach logic.
+  ``HeteroMultiTokenPredictionBlock`` — wraps block-level hidden_states detach.
 """
 
 from __future__ import annotations
@@ -52,1462 +81,1627 @@ import dataclasses
 import enum
 import logging
 import math
-import os
-import threading
 import time
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+import unittest
+from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
+import torch.nn as nn
 
 logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Enumerations
+# Hardware role taxonomy
 # ---------------------------------------------------------------------------
 
-
-class DetachSite(enum.Enum):
-    """The three architectural sites where Megatron applies detach.
-
-    These map 1-to-1 to the upstream diff hunk locations:
-      OUTPUT_WEIGHT  → process_mtp_loss, line +817 in diff
-      DECODER_INPUT  → _get_embeddings, line +1107 in diff
-      HIDDEN_STATES  → MultiTokenPredictionBlock.forward, line +1808 in diff
+class HeteroDeviceRole(enum.Enum):
     """
+    Logical role of a physical device in the DES-LOC heterogeneous cluster.
 
-    OUTPUT_WEIGHT = "output_weight"
-    DECODER_INPUT = "decoder_input"
-    HIDDEN_STATES = "hidden_states"
-
-
-class TierKind(enum.Enum):
-    """Physical hardware tier in the DES-LOC cluster."""
-
-    A6000 = "a6000"   # SM86, 48 GB, PCIe
-    H100 = "h100"     # SM90, 96 GB, PCIe
-
-
-class SchedulePhase(enum.Enum):
-    """High-level training phase that controls detach aggressiveness."""
-
-    WARMUP = "warmup"
-    STEADY = "steady"
-    FINETUNE = "finetune"
+    DRAFT  — A6000 48 GB SM86.  Executes MTP speculative heads.  Gradients
+              must not escape to backbone parameters on VERIFY devices.
+    VERIFY — H100 NVL 96 GB SM90.  Executes backbone and output projection.
+              Receives detached tensors from DRAFT devices; never sends live
+              autograd graphs to DRAFT devices.
+    CPU    — CPU DRAM locality cache.  Intermediate spill target for PCIe
+              handoff buffers.
+    """
+    DRAFT = "draft"
+    VERIFY = "verify"
+    CPU = "cpu"
 
 
 # ---------------------------------------------------------------------------
-# Hardware topology constants
+# Per-device detach policy
 # ---------------------------------------------------------------------------
-
-# PCIe Gen4 x16 peak bandwidth in GB/s (unidirectional).
-# In practice DES-LOC observes ~24 GB/s cross-device due to shared root complex.
-_PCIE_BW_GBS: float = float(os.environ.get("DESLOCK_PCIE_BW_GBS", "24.0"))
-
-# Size of the DES-LOC shared locality cache per tier (bytes).
-# Default: 4 GB per A6000, 8 GB for H100.
-_CACHE_SIZE_A6000: int = int(os.environ.get("DESLOCK_CACHE_A6000_BYTES", str(4 * 1024 ** 3)))
-_CACHE_SIZE_H100: int = int(os.environ.get("DESLOCK_CACHE_H100_BYTES", str(8 * 1024 ** 3)))
-
-# Fraction of cache above which we consider the tier "cache-pressured".
-_CACHE_PRESSURE_THRESHOLD: float = float(os.environ.get("DESLOCK_CACHE_PRESSURE", "0.75"))
-
-
-# ---------------------------------------------------------------------------
-# Dataclasses
-# ---------------------------------------------------------------------------
-
-
-@dataclasses.dataclass(frozen=True)
-class TierSpec:
-    """Static description of one physical device tier."""
-
-    kind: TierKind
-    device_ids: Tuple[int, ...]   # torch device indices
-    vram_bytes: int
-    sm_version: int               # e.g. 86 for A6000, 90 for H100
-    cache_bytes: int
-    pcie_bw_gbs: float            # effective cross-tier bandwidth
-
-    @property
-    def is_bandwidth_constrained(self) -> bool:
-        """True when the tier relies on PCIe without NVLink acceleration."""
-        # In the Neuron_SP cluster there is no NVLink at all; every tier is PCIe.
-        return True
-
-    @property
-    def gradient_budget_bytes_per_step(self) -> float:
-        """Conservative upper bound on gradient bytes we can move per step.
-
-        We allow at most 10 % of peak PCIe bandwidth to be consumed by MTP
-        gradient traffic before the detach heuristic kicks in.  The remaining
-        90 % is reserved for forward activations and parameter all-reduces.
-        """
-        return self.pcie_bw_gbs * 1e9 * 0.10
-
 
 @dataclasses.dataclass
-class MTPLayerPlacement:
-    """Maps each MTP layer index to a tier and records its gradient size."""
-
-    layer_idx: int
-    tier: TierSpec
-    # Estimated bytes of gradient produced by one backward pass through this layer.
-    gradient_bytes: int = 0
-    # Whether this layer's parameters are pinned in the locality cache.
-    cache_pinned: bool = False
-
-
-@dataclasses.dataclass
-class DetachDecision:
-    """Result of a single detach query."""
-
-    should_detach: bool
-    site: DetachSite
-    layer_idx: int
-    tier_kind: TierKind
-    reason: str   # human-readable justification for the decision
-
-
-# ---------------------------------------------------------------------------
-# Locality cache occupancy oracle
-# ---------------------------------------------------------------------------
-
-
-class LocalityCacheOracle:
-    """Thread-safe occupancy tracker for the DES-LOC shared locality cache.
-
-    The actual cache resides in CPU DRAM (1.5 TB) and is managed by the
-    DES-LOC runtime.  This class only tracks *occupancy estimates* so that
-    the detach scheduler can decide whether freeing a gradient path would
-    release cache slots.
-
-    In production the DES-LOC runtime would call ``update_occupancy`` after
-    each cache eviction or insertion event.  In unit tests a synthetic
-    occupancy sequence is injected via ``_inject_occupancy`` for
-    deterministic behaviour.
+class HeteroMTPDetachPolicy:
     """
+    Fine-grained detach policy that replaces Megatron's scalar ``mtp_detach_heads``.
 
-    def __init__(self, tier: TierSpec) -> None:
-        self._tier = tier
-        self._lock = threading.Lock()
-        self._occupancy_bytes: int = 0
-        self._last_update_ts: float = time.monotonic()
-
-    def update_occupancy(self, occupancy_bytes: int) -> None:
-        with self._lock:
-            self._occupancy_bytes = occupancy_bytes
-            self._last_update_ts = time.monotonic()
-
-    @property
-    def occupancy_fraction(self) -> float:
-        with self._lock:
-            return self._occupancy_bytes / max(self._tier.cache_bytes, 1)
-
-    @property
-    def is_pressured(self) -> bool:
-        return self.occupancy_fraction >= _CACHE_PRESSURE_THRESHOLD
-
-    def _inject_occupancy(self, fraction: float) -> None:
-        """Test helper: set occupancy as a fraction of total capacity."""
-        with self._lock:
-            self._occupancy_bytes = int(fraction * self._tier.cache_bytes)
-
-    def __repr__(self) -> str:
-        return (
-            f"LocalityCacheOracle(tier={self._tier.kind.value}, "
-            f"occupancy={self.occupancy_fraction:.1%})"
-        )
-
-
-# ---------------------------------------------------------------------------
-# Step-wise phase resolver
-# ---------------------------------------------------------------------------
-
-
-def resolve_phase(
-    global_step: int,
-    warmup_steps: int,
-    finetune_start_step: Optional[int],
-) -> SchedulePhase:
-    """Map a global training step to a SchedulePhase.
-
-    Args:
-        global_step: Current optimizer step (0-indexed).
-        warmup_steps: Number of LR warm-up steps.
-        finetune_start_step: If set, steps >= this value enter FINETUNE phase.
-
-    Returns:
-        The active SchedulePhase.
+    Attributes
+    ----------
+    detach_decoder_input : bool
+        Mirrors Megatron's ``_get_embeddings`` detach of ``decoder_input``.
+        Always True for DRAFT devices; configurable for homogeneous fallback.
+    detach_hidden_states : bool
+        Mirrors Megatron's block-level detach of the hidden-state chunk.
+        Enabled when the chunk crosses a PCIe boundary (VERIFY→DRAFT transfer).
+    detach_output_weight : bool
+        Mirrors Megatron's ``process_mtp_loss`` detach of ``output_weight``.
+        Must be True whenever ``output_weight`` lives on a VERIFY device but
+        the loss is computed on a DRAFT device.
+    ensure_hidden_grad : bool
+        Re-enable ``requires_grad`` on hidden_states after detach, matching
+        Megatron's fix for ``CheckpointFunction.apply`` compatibility.
+        Should remain True unless activation checkpointing is fully disabled.
+    spill_to_locality_cache : bool
+        When True, detached tensors are staged through pinned CPU DRAM before
+        the next device-to-device transfer, amortising PCIe latency via
+        async prefetch.  Only meaningful for cross-device boundaries.
+    locality_cache_pin_memory : bool
+        Whether the CPU-side locality cache buffer uses pinned memory.
+        Pinned memory is required for async cudaMemcpyAsync; set False only
+        in test environments without CUDA.
     """
-    if global_step < warmup_steps:
-        return SchedulePhase.WARMUP
-    if finetune_start_step is not None and global_step >= finetune_start_step:
-        return SchedulePhase.FINETUNE
-    return SchedulePhase.STEADY
-
-
-# ---------------------------------------------------------------------------
-# Per-tier detach policy
-# ---------------------------------------------------------------------------
-
-
-@dataclasses.dataclass
-class TierDetachPolicy:
-    """Encodes which DetachSites are active for a given tier and phase.
-
-    The policy is intentionally over-specified: callers can query any
-    (site, phase) combination.  The defaults below reflect the DES-LOC
-    design decision:
-
-      A6000 tier:
-        WARMUP   — detach ALL sites (save PCIe bandwidth while LR is low)
-        STEADY   — detach HIDDEN_STATES only (allow embedding gradients)
-        FINETUNE — detach nothing (full gradient flow for quality recovery)
-
-      H100 tier:
-        WARMUP   — detach OUTPUT_WEIGHT only (protect shared weight)
-        STEADY   — detach nothing (H100 can absorb full backward)
-        FINETUNE — detach nothing
-    """
-
-    tier_kind: TierKind
-    active_sites: Dict[SchedulePhase, frozenset[DetachSite]] = dataclasses.field(
-        default_factory=dict
-    )
+    detach_decoder_input: bool = True
+    detach_hidden_states: bool = True
+    detach_output_weight: bool = True
+    ensure_hidden_grad: bool = True
+    spill_to_locality_cache: bool = False
+    locality_cache_pin_memory: bool = True
 
     @classmethod
-    def default_for_tier(cls, kind: TierKind) -> "TierDetachPolicy":
-        if kind == TierKind.A6000:
-            return cls(
-                tier_kind=kind,
-                active_sites={
-                    SchedulePhase.WARMUP: frozenset(DetachSite),
-                    SchedulePhase.STEADY: frozenset({DetachSite.HIDDEN_STATES}),
-                    SchedulePhase.FINETUNE: frozenset(),
-                },
-            )
-        else:  # H100
-            return cls(
-                tier_kind=kind,
-                active_sites={
-                    SchedulePhase.WARMUP: frozenset({DetachSite.OUTPUT_WEIGHT}),
-                    SchedulePhase.STEADY: frozenset(),
-                    SchedulePhase.FINETUNE: frozenset(),
-                },
-            )
+    def for_draft_device(cls) -> "HeteroMTPDetachPolicy":
+        """
+        Policy for an A6000 DRAFT device.
 
-    def is_active(self, site: DetachSite, phase: SchedulePhase) -> bool:
-        return site in self.active_sites.get(phase, frozenset())
-
-    def override(self, phase: SchedulePhase, sites: Sequence[DetachSite]) -> None:
-        """Replace the active site set for ``phase``."""
-        self.active_sites[phase] = frozenset(sites)
-
-
-# ---------------------------------------------------------------------------
-# Gradient traffic estimator
-# ---------------------------------------------------------------------------
-
-
-class GradientTrafficEstimator:
-    """Estimates PCIe gradient traffic per training step per MTP layer.
-
-    The estimator tracks a running average of observed gradient tensor
-    sizes.  When no observed data is available it falls back to a
-    formula-based estimate derived from the layer's hidden dimension.
-
-    DES-LOC relevance:
-        On a PCIe-only topology gradient synchronisation is the dominant
-        bottleneck.  We use this estimate to decide whether the current
-        accumulated gradient budget for a tier has been exhausted, at which
-        point the detach policy is upgraded to a more aggressive setting
-        regardless of training phase.
-    """
-
-    def __init__(self, hidden_size: int, num_heads: int, head_dim: int) -> None:
-        self._hidden = hidden_size
-        self._heads = num_heads
-        self._head_dim = head_dim
-        self._observed: List[int] = []
-        self._lock = threading.Lock()
-
-    def record(self, grad_bytes: int) -> None:
-        with self._lock:
-            self._observed.append(grad_bytes)
-            if len(self._observed) > 128:
-                self._observed = self._observed[-128:]
-
-    @property
-    def estimate_bytes(self) -> int:
-        with self._lock:
-            if self._observed:
-                return int(sum(self._observed) / len(self._observed))
-        # Formula estimate: 2 * (QKV + output projection + MLP) parameter count * 2 bytes
-        qkv_params = 3 * self._hidden * self._heads * self._head_dim
-        out_params = self._heads * self._head_dim * self._hidden
-        mlp_params = 4 * self._hidden * self._hidden * 2  # gate + down
-        return 2 * (qkv_params + out_params + mlp_params) * 2  # bf16
-
-    def exceeds_budget(self, budget_bytes: float) -> bool:
-        return self.estimate_bytes > budget_bytes
-
-
-# ---------------------------------------------------------------------------
-# Core scheduler
-# ---------------------------------------------------------------------------
-
-
-class HeteroMTPDetachScheduler:
-    """Per-tier, per-step detach scheduler for DES-LOC MTP heads.
-
-    This is the central object that the DES-LOC training loop interacts
-    with.  It replaces the single ``mtp_detach_heads`` boolean flag from
-    Megatron with a stateful, topology-aware decision engine.
-
-    Usage
-    -----
-    >>> scheduler = HeteroMTPDetachScheduler.from_neuron_sp_env(config)
-    >>> # Inside the training step:
-    >>> scheduler.step(global_step)
-    >>> decision = scheduler.should_detach(
-    ...     site=DetachSite.HIDDEN_STATES,
-    ...     layer_idx=0,
-    ...     device=torch.device("cuda:0"),
-    ... )
-    >>> if decision.should_detach:
-    ...     hidden_states = hidden_states.detach()
-
-    Design notes
-    ------------
-    * ``step()`` is called once per optimizer step and resolves the current
-      SchedulePhase and per-tier gradient budgets.
-    * ``should_detach()`` is O(1) and lock-free after ``step()`` completes.
-    * Cache pressure can promote a tier to a more aggressive detach policy
-      mid-phase without waiting for the next phase boundary.
-    * All decisions are logged at DEBUG level the first time they change,
-      and at WARNING level when a budget overrun triggers an emergency detach.
-    """
-
-    def __init__(
-        self,
-        tier_specs: List[TierSpec],
-        mtp_layer_placements: List[MTPLayerPlacement],
-        tier_policies: Dict[TierKind, TierDetachPolicy],
-        cache_oracles: Dict[TierKind, LocalityCacheOracle],
-        gradient_estimators: Dict[int, GradientTrafficEstimator],
-        warmup_steps: int = 200,
-        finetune_start_step: Optional[int] = None,
-        num_mtp_layers: int = 1,
-    ) -> None:
-        self._tier_specs: Dict[TierKind, TierSpec] = {t.kind: t for t in tier_specs}
-        self._placements: Dict[int, MTPLayerPlacement] = {
-            p.layer_idx: p for p in mtp_layer_placements
-        }
-        self._policies = tier_policies
-        self._oracles = cache_oracles
-        self._estimators = gradient_estimators
-        self._warmup_steps = warmup_steps
-        self._finetune_start_step = finetune_start_step
-        self._num_mtp_layers = num_mtp_layers
-
-        # Mutable state, updated by step()
-        self._current_step: int = 0
-        self._current_phase: SchedulePhase = SchedulePhase.WARMUP
-        # Cache last decisions to detect transitions and log only on change.
-        self._prev_decisions: Dict[Tuple[DetachSite, int], bool] = {}
-        self._lock = threading.Lock()  # protects _current_step / _current_phase
-
-    # ------------------------------------------------------------------
-    # Class methods / factory
-    # ------------------------------------------------------------------
+        All detach flags are enabled; locality cache spill is enabled so that
+        the hidden-state handoff from H100 (VERIFY) can be prefetched.
+        """
+        return cls(
+            detach_decoder_input=True,
+            detach_hidden_states=True,
+            detach_output_weight=True,
+            ensure_hidden_grad=True,
+            spill_to_locality_cache=True,
+            locality_cache_pin_memory=True,
+        )
 
     @classmethod
-    def from_neuron_sp_env(
-        cls,
-        hidden_size: int,
-        num_attention_heads: int,
-        num_mtp_layers: int,
-        warmup_steps: int = 200,
-        finetune_start_step: Optional[int] = None,
-        mtp_layer_device_map: Optional[Dict[int, int]] = None,
-    ) -> "HeteroMTPDetachScheduler":
-        """Construct a scheduler from the canonical Neuron_SP hardware layout.
-
-        Hardware assumed:
-          cuda:0 → A6000 #0
-          cuda:1 → A6000 #1
-          cuda:2 → H100 NVL
-
-        Args:
-            hidden_size: Model hidden dimension.
-            num_attention_heads: Number of attention heads.
-            num_mtp_layers: Number of MTP prediction layers.
-            warmup_steps: LR warm-up duration.
-            finetune_start_step: Step at which fine-tuning phase begins.
-            mtp_layer_device_map: Optional override mapping layer_idx → cuda device id.
-
-        Returns:
-            A fully configured HeteroMTPDetachScheduler.
+    def for_verify_device(cls) -> "HeteroMTPDetachPolicy":
         """
-        a6000_spec = TierSpec(
-            kind=TierKind.A6000,
-            device_ids=(0, 1),
-            vram_bytes=48 * 1024 ** 3,
-            sm_version=86,
-            cache_bytes=_CACHE_SIZE_A6000,
-            pcie_bw_gbs=_PCIE_BW_GBS,
-        )
-        h100_spec = TierSpec(
-            kind=TierKind.H100,
-            device_ids=(2,),
-            vram_bytes=96 * 1024 ** 3,
-            sm_version=90,
-            cache_bytes=_CACHE_SIZE_H100,
-            pcie_bw_gbs=_PCIE_BW_GBS,
+        Policy for the H100 VERIFY device.
+
+        The backbone never receives MTP gradients, so detach flags are less
+        critical here; however, ``detach_output_weight`` is kept True to
+        match the invariant that the shared output projection weight is never
+        differentiated through the MTP path.
+        """
+        return cls(
+            detach_decoder_input=False,
+            detach_hidden_states=False,
+            detach_output_weight=True,
+            ensure_hidden_grad=True,
+            spill_to_locality_cache=False,
+            locality_cache_pin_memory=True,
         )
 
-        head_dim = hidden_size // num_attention_heads
-        estimators: Dict[int, GradientTrafficEstimator] = {}
-        placements: List[MTPLayerPlacement] = []
-
-        for i in range(num_mtp_layers):
-            # Default placement: distribute MTP layers round-robin across A6000s,
-            # unless the caller provides an override map or we have more layers than
-            # A6000 slots (overflow to H100).
-            if mtp_layer_device_map is not None:
-                dev_id = mtp_layer_device_map.get(i, 0)
-            else:
-                dev_id = i % 2  # cuda:0 or cuda:1
-
-            tier = a6000_spec if dev_id in a6000_spec.device_ids else h100_spec
-
-            estimators[i] = GradientTrafficEstimator(
-                hidden_size=hidden_size,
-                num_heads=num_attention_heads,
-                head_dim=head_dim,
-            )
-            placements.append(
-                MTPLayerPlacement(
-                    layer_idx=i,
-                    tier=tier,
-                    gradient_bytes=estimators[i].estimate_bytes,
-                )
-            )
-
-        tier_policies = {
-            TierKind.A6000: TierDetachPolicy.default_for_tier(TierKind.A6000),
-            TierKind.H100: TierDetachPolicy.default_for_tier(TierKind.H100),
-        }
-
-        cache_oracles = {
-            TierKind.A6000: LocalityCacheOracle(a6000_spec),
-            TierKind.H100: LocalityCacheOracle(h100_spec),
-        }
-
-        scheduler = cls(
-            tier_specs=[a6000_spec, h100_spec],
-            mtp_layer_placements=placements,
-            tier_policies=tier_policies,
-            cache_oracles=cache_oracles,
-            gradient_estimators=estimators,
-            warmup_steps=warmup_steps,
-            finetune_start_step=finetune_start_step,
-            num_mtp_layers=num_mtp_layers,
+    @classmethod
+    def homogeneous_compat(cls, mtp_detach_heads: bool) -> "HeteroMTPDetachPolicy":
+        """
+        Compatibility shim for environments where heterogeneous routing is
+        disabled.  Reproduces Megatron's original scalar behaviour.
+        """
+        return cls(
+            detach_decoder_input=mtp_detach_heads,
+            detach_hidden_states=mtp_detach_heads,
+            detach_output_weight=mtp_detach_heads,
+            ensure_hidden_grad=mtp_detach_heads,
+            spill_to_locality_cache=False,
+            locality_cache_pin_memory=False,
         )
-
-        logger.info(
-            "HeteroMTPDetachScheduler initialised: %d MTP layers, "
-            "warmup=%d steps, finetune_start=%s",
-            num_mtp_layers,
-            warmup_steps,
-            finetune_start_step,
-        )
-        return scheduler
-
-    # ------------------------------------------------------------------
-    # Step interface
-    # ------------------------------------------------------------------
-
-    def step(self, global_step: int) -> None:
-        """Advance the scheduler to ``global_step``.
-
-        Must be called once per optimizer step before querying
-        ``should_detach``.  Resolves the current training phase and
-        refreshes per-layer gradient budget state.
-        """
-        with self._lock:
-            self._current_step = global_step
-            self._current_phase = resolve_phase(
-                global_step, self._warmup_steps, self._finetune_start_step
-            )
-
-    # ------------------------------------------------------------------
-    # Decision interface
-    # ------------------------------------------------------------------
-
-    def should_detach(
-        self,
-        site: DetachSite,
-        layer_idx: int,
-        device: Optional[torch.device] = None,
-    ) -> DetachDecision:
-        """Query whether a detach is recommended at a given site and layer.
-
-        Args:
-            site: One of the three Megatron detach sites.
-            layer_idx: Zero-based MTP layer index.
-            device: The torch.device currently executing (used to infer tier
-                    when layer_idx is ambiguous).
-
-        Returns:
-            A DetachDecision with the boolean result and a diagnostic reason.
-        """
-        with self._lock:
-            phase = self._current_phase
-            step = self._current_step
-
-        placement = self._placements.get(layer_idx)
-        if placement is None:
-            # Unknown layer: conservative default — do not detach.
-            return DetachDecision(
-                should_detach=False,
-                site=site,
-                layer_idx=layer_idx,
-                tier_kind=TierKind.H100,  # assume capable tier
-                reason=f"layer_idx={layer_idx} not in placement map; defaulting to no-detach",
-            )
-
-        tier_kind = placement.tier.kind
-        policy = self._policies[tier_kind]
-        oracle = self._oracles[tier_kind]
-
-        # Primary decision: phase-driven policy.
-        base_detach = policy.is_active(site, phase)
-        reason = f"phase={phase.value} policy for {tier_kind.value}"
-
-        # Secondary promotion: cache pressure.
-        if not base_detach and oracle.is_pressured:
-            # Promote to detach when locality cache is under pressure.
-            # We only promote HIDDEN_STATES and DECODER_INPUT (which are the
-            # largest tensors); OUTPUT_WEIGHT is small and its detach has
-            # negligible cache impact.
-            if site in (DetachSite.HIDDEN_STATES, DetachSite.DECODER_INPUT):
-                base_detach = True
-                reason = (
-                    f"cache_pressure={oracle.occupancy_fraction:.1%} "
-                    f"exceeds threshold={_CACHE_PRESSURE_THRESHOLD:.0%}; "
-                    f"promoted to detach"
-                )
-                logger.warning(
-                    "DES-LOC locality cache pressure on %s (%.1f%% full): "
-                    "promoting layer %d %s to detach at step %d",
-                    tier_kind.value,
-                    oracle.occupancy_fraction * 100,
-                    layer_idx,
-                    site.value,
-                    step,
-                )
-
-        # Tertiary promotion: gradient budget exhaustion.
-        if not base_detach:
-            estimator = self._estimators.get(layer_idx)
-            if estimator is not None:
-                budget = placement.tier.gradient_budget_bytes_per_step
-                if estimator.exceeds_budget(budget):
-                    base_detach = True
-                    reason = (
-                        f"gradient_budget_bytes={budget:.0f} exceeded by "
-                        f"estimate={estimator.estimate_bytes}; emergency detach"
-                    )
-                    logger.warning(
-                        "DES-LOC gradient budget exceeded on %s for MTP layer %d "
-                        "site=%s at step %d (estimate=%d bytes, budget=%.0f bytes)",
-                        tier_kind.value,
-                        layer_idx,
-                        site.value,
-                        step,
-                        estimator.estimate_bytes,
-                        budget,
-                    )
-
-        decision = DetachDecision(
-            should_detach=base_detach,
-            site=site,
-            layer_idx=layer_idx,
-            tier_kind=tier_kind,
-            reason=reason,
-        )
-
-        # Log transitions only (avoids per-step spam).
-        key = (site, layer_idx)
-        prev = self._prev_decisions.get(key)
-        if prev != base_detach:
-            logger.debug(
-                "DES-LOC detach transition: layer=%d site=%s %s→%s step=%d reason=%s",
-                layer_idx,
-                site.value,
-                prev,
-                base_detach,
-                step,
-                reason,
-            )
-            self._prev_decisions[key] = base_detach
-
-        return decision
-
-    # ------------------------------------------------------------------
-    # Gradient recording
-    # ------------------------------------------------------------------
-
-    def record_gradient(self, layer_idx: int, grad_bytes: int) -> None:
-        """Inform the scheduler of an observed gradient size.
-
-        Call this from a ``register_hook`` on the MTP layer output tensor
-        so that the gradient estimator can refine its budget checks.
-
-        Args:
-            layer_idx: Zero-based MTP layer index.
-            grad_bytes: Byte size of the gradient tensor observed.
-        """
-        estimator = self._estimators.get(layer_idx)
-        if estimator is not None:
-            estimator.record(grad_bytes)
-
-    # ------------------------------------------------------------------
-    # Cache oracle proxy
-    # ------------------------------------------------------------------
-
-    def update_cache_occupancy(self, tier_kind: TierKind, occupancy_bytes: int) -> None:
-        """Proxy to the tier's LocalityCacheOracle.
-
-        The DES-LOC runtime calls this whenever cache occupancy changes
-        by more than a configured delta (to avoid flooding the lock).
-        """
-        oracle = self._oracles.get(tier_kind)
-        if oracle is not None:
-            oracle.update_occupancy(occupancy_bytes)
-
-    def __repr__(self) -> str:
-        with self._lock:
-            return (
-                f"HeteroMTPDetachScheduler("
-                f"step={self._current_step}, "
-                f"phase={self._current_phase.value}, "
-                f"mtp_layers={self._num_mtp_layers})"
-            )
 
 
 # ---------------------------------------------------------------------------
-# DES-LOC detach application helpers
+# Integrated configuration dataclass
 # ---------------------------------------------------------------------------
-
-
-def apply_detach_at_output_weight(
-    scheduler: HeteroMTPDetachScheduler,
-    output_weight: Optional[torch.Tensor],
-    output_layer: Any,
-    layer_idx: int,
-) -> torch.Tensor:
-    """DES-LOC equivalent of Megatron's ``process_mtp_loss`` detach block.
-
-    Upstream (diff hunk @@ -815,6 +815,12):
-        if config.mtp_detach_heads:
-            if output_weight is not None:
-                output_weight = output_weight.detach()
-            else:
-                output_weight = output_layer.weight.detach()
-
-    DES-LOC adaptation:
-        Instead of a single boolean flag the scheduler decides per-layer.
-        The output_weight is only detached when the tier policy and current
-        training phase recommend it.
-
-    Args:
-        scheduler: The active HeteroMTPDetachScheduler.
-        output_weight: Explicit weight tensor, or None to use output_layer.weight.
-        output_layer: Module whose .weight is used when output_weight is None.
-        layer_idx: MTP layer index.
-
-    Returns:
-        Possibly-detached weight tensor.
-    """
-    if output_weight is None:
-        output_weight = output_layer.weight
-
-    decision = scheduler.should_detach(DetachSite.OUTPUT_WEIGHT, layer_idx)
-    if decision.should_detach:
-        return output_weight.detach()
-    return output_weight
-
-
-def apply_detach_at_decoder_input(
-    scheduler: HeteroMTPDetachScheduler,
-    decoder_input: torch.Tensor,
-    hidden_states: torch.Tensor,
-    layer_idx: int,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """DES-LOC equivalent of Megatron's ``_get_embeddings`` detach block.
-
-    Upstream (diff hunk @@ -1103,17):
-        if self.config.mtp_detach_heads:
-            decoder_input = decoder_input.detach()
-        hidden_states = make_viewless_tensor(...)
-        if not hidden_states.requires_grad:
-            hidden_states.requires_grad_(True)
-
-    DES-LOC adaptation:
-        The decoder_input detach is gated on the scheduler.  The
-        ``hidden_states.requires_grad_(True)`` fix is always applied when
-        activation checkpointing is in use (DES-LOC always uses remat on
-        A6000 due to its 48 GB constraint), regardless of the detach
-        decision.  On H100 we skip the force-grad since the tensor almost
-        always already carries a grad_fn.
-
-    Args:
-        scheduler: Active scheduler.
-        decoder_input: Embedding output tensor [seq, batch, hidden].
-        hidden_states: Main model hidden states passed to MTP layer.
-        layer_idx: MTP layer index.
-
-    Returns:
-        (decoder_input, hidden_states) tuple, potentially with detach applied.
-    """
-    dec_decision = scheduler.should_detach(DetachSite.DECODER_INPUT, layer_idx)
-    if dec_decision.should_detach:
-        decoder_input = decoder_input.detach()
-
-    # Ensure hidden_states is differentiable so activation checkpointing
-    # (CheckpointFunction) can produce a differentiable output.  On A6000
-    # remat is always active; on H100 the tensor should already require grad.
-    placement = scheduler._placements.get(layer_idx)
-    tier_kind = placement.tier.kind if placement else TierKind.H100
-    if tier_kind == TierKind.A6000 and not hidden_states.requires_grad:
-        hidden_states = hidden_states.requires_grad_(True)
-
-    return decoder_input, hidden_states
-
-
-def apply_detach_at_hidden_states(
-    scheduler: HeteroMTPDetachScheduler,
-    hidden_states: torch.Tensor,
-    layer_idx: int,
-) -> torch.Tensor:
-    """DES-LOC equivalent of Megatron's ``MultiTokenPredictionBlock.forward`` detach.
-
-    Upstream (diff hunk @@ -1805,10):
-        if self.config.mtp_detach_heads:
-            hidden_states = hidden_states.detach()
-
-    DES-LOC adaptation:
-        The hidden_states detach is the most impactful for PCIe traffic
-        because it completely severs the backward pass from the main
-        transformer body to the MTP layers.  On A6000 this is applied
-        aggressively (WARMUP + STEADY phases).  On H100 it is never applied
-        in STEADY or FINETUNE.
-
-    Args:
-        scheduler: Active scheduler.
-        hidden_states: Chunked hidden states tensor after offset extraction.
-        layer_idx: MTP layer index.
-
-    Returns:
-        Possibly-detached hidden_states tensor.
-    """
-    decision = scheduler.should_detach(DetachSite.HIDDEN_STATES, layer_idx)
-    if decision.should_detach:
-        return hidden_states.detach()
-    return hidden_states
-
-
-# ---------------------------------------------------------------------------
-# Configuration dataclass (drop-in for TransformerConfig extension)
-# ---------------------------------------------------------------------------
-
 
 @dataclasses.dataclass
 class HeteroMTPDetachConfig:
-    """Configuration object for DES-LOC heterogeneous MTP detach scheduling.
+    """
+    Top-level configuration for DES-LOC heterogeneous MTP detach behaviour.
 
-    This replaces the single ``mtp_detach_heads: bool`` field from Megatron's
-    ``TransformerConfig`` with a richer structure that the
-    ``HeteroMTPDetachScheduler`` can be constructed from.
+    This replaces the single ``mtp_detach_heads: bool`` field in Megatron's
+    ``TransformerConfig`` with a richer structure that encodes per-device
+    policies and PCIe-crossing detection.
 
-    Intended use:
-        Attach an instance of this class to your DeepSpeed model config
-        alongside the standard TransformerConfig.  The DES-LOC training
-        loop reads it to build the scheduler.
-
-    Attributes:
-        enabled: Global enable switch.  When False the scheduler always
-                 returns should_detach=False (equivalent to Megatron's
-                 mtp_detach_heads=False).
-        warmup_steps: Steps in LR warm-up phase.
-        finetune_start_step: Step index where fine-tuning phase begins.
-        num_mtp_layers: Must match TransformerConfig.mtp_num_layers.
-        hidden_size: Must match TransformerConfig.hidden_size.
-        num_attention_heads: Must match TransformerConfig.num_attention_heads.
-        mtp_layer_device_map: Optional per-layer CUDA device assignment.
-        a6000_policy_overrides: Per-phase overrides for the A6000 tier policy.
-        h100_policy_overrides: Per-phase overrides for the H100 tier policy.
-        pcie_bw_gbs: Effective PCIe bandwidth for budget calculations.
-        cache_pressure_threshold: Cache occupancy fraction triggering promotion.
+    Parameters
+    ----------
+    mtp_num_layers : int
+        Number of MTP speculative head layers.  Mirrors Megatron's field.
+    mtp_use_repeated_layer : bool
+        Whether a single MTP layer is reused repeatedly.  Mirrors Megatron.
+    device_roles : dict[int, HeteroDeviceRole]
+        Maps ``torch.cuda.device`` ordinals to their logical role.
+        Example: ``{0: DRAFT, 1: DRAFT, 2: VERIFY}`` for our A6000×2 + H100.
+    device_policies : dict[HeteroDeviceRole, HeteroMTPDetachPolicy]
+        Maps each role to its detach policy.  Constructed automatically by
+        ``from_cluster_spec`` if not provided.
+    pcie_crossing_device_pairs : list[tuple[int,int]]
+        Pairs of (src_device, dst_device) that cross a PCIe bus.  For our
+        cluster every pair is a PCIe crossing because there is no NVLink.
+        The manager uses this to decide when to spill through locality cache.
+    locality_cache_capacity_gb : float
+        Maximum CPU DRAM to reserve for locality cache buffers, in GiB.
+        Default 16 GiB leaves headroom in the 1.5 TB system.
+    mtp_loss_scaling_factor : float
+        Scales the aggregated MTP auxiliary loss before adding to main loss.
+    enable_hetero_routing : bool
+        Master switch.  If False, falls back to Megatron's homogeneous path
+        with ``mtp_detach_heads`` semantics.
+    mtp_detach_heads : bool
+        Homogeneous fallback flag, used only when ``enable_hetero_routing``
+        is False.  Mirrors Megatron's ``TransformerConfig.mtp_detach_heads``.
     """
 
-    enabled: bool = False
-    warmup_steps: int = 200
-    finetune_start_step: Optional[int] = None
-    num_mtp_layers: int = 1
-    hidden_size: int = 4096
-    num_attention_heads: int = 32
-    mtp_layer_device_map: Optional[Dict[int, int]] = None
+    mtp_num_layers: int = 1
+    mtp_use_repeated_layer: bool = False
+    device_roles: Dict[int, HeteroDeviceRole] = dataclasses.field(default_factory=dict)
+    device_policies: Dict[HeteroDeviceRole, HeteroMTPDetachPolicy] = dataclasses.field(
+        default_factory=dict
+    )
+    pcie_crossing_device_pairs: List[Tuple[int, int]] = dataclasses.field(default_factory=list)
+    locality_cache_capacity_gb: float = 16.0
+    mtp_loss_scaling_factor: float = 0.1
+    enable_hetero_routing: bool = True
+    mtp_detach_heads: bool = False  # homogeneous compat only
 
-    # Per-phase policy overrides: keys are SchedulePhase values (strings),
-    # values are lists of DetachSite values (strings).
-    a6000_policy_overrides: Optional[Dict[str, List[str]]] = None
-    h100_policy_overrides: Optional[Dict[str, List[str]]] = None
-
-    pcie_bw_gbs: float = _PCIE_BW_GBS
-    cache_pressure_threshold: float = _CACHE_PRESSURE_THRESHOLD
-
-    def build_scheduler(self) -> Optional[HeteroMTPDetachScheduler]:
-        """Construct a HeteroMTPDetachScheduler from this config.
-
-        Returns:
-            A scheduler instance, or None if ``enabled`` is False.
+    @classmethod
+    def from_cluster_spec(
+        cls,
+        draft_device_ids: List[int],
+        verify_device_id: int,
+        mtp_num_layers: int = 1,
+        mtp_use_repeated_layer: bool = False,
+        mtp_loss_scaling_factor: float = 0.1,
+        locality_cache_capacity_gb: float = 16.0,
+    ) -> "HeteroMTPDetachConfig":
         """
-        if not self.enabled:
-            return None
+        Construct a config from the physical cluster specification.
 
-        scheduler = HeteroMTPDetachScheduler.from_neuron_sp_env(
-            hidden_size=self.hidden_size,
-            num_attention_heads=self.num_attention_heads,
-            num_mtp_layers=self.num_mtp_layers,
-            warmup_steps=self.warmup_steps,
-            finetune_start_step=self.finetune_start_step,
-            mtp_layer_device_map=self.mtp_layer_device_map,
+        For the DES-LOC target cluster:
+          draft_device_ids  = [0, 1]  (A6000 × 2)
+          verify_device_id  = 2       (H100 NVL)
+
+        All device pairs are PCIe crossings because there is no NVLink.
+
+        Parameters
+        ----------
+        draft_device_ids : list[int]
+            CUDA device ordinals for A6000 DRAFT devices.
+        verify_device_id : int
+            CUDA device ordinal for H100 VERIFY device.
+        mtp_num_layers : int
+        mtp_use_repeated_layer : bool
+        mtp_loss_scaling_factor : float
+        locality_cache_capacity_gb : float
+        """
+        device_roles: Dict[int, HeteroDeviceRole] = {}
+        for did in draft_device_ids:
+            device_roles[did] = HeteroDeviceRole.DRAFT
+        device_roles[verify_device_id] = HeteroDeviceRole.VERIFY
+
+        device_policies: Dict[HeteroDeviceRole, HeteroMTPDetachPolicy] = {
+            HeteroDeviceRole.DRAFT: HeteroMTPDetachPolicy.for_draft_device(),
+            HeteroDeviceRole.VERIFY: HeteroMTPDetachPolicy.for_verify_device(),
+        }
+
+        # All pairs cross PCIe in our cluster.
+        all_devices = draft_device_ids + [verify_device_id]
+        pcie_pairs: List[Tuple[int, int]] = []
+        for i, src in enumerate(all_devices):
+            for dst in all_devices[i + 1 :]:
+                pcie_pairs.append((src, dst))
+                pcie_pairs.append((dst, src))
+
+        logger.info(
+            "HeteroMTPDetachConfig: draft=%s verify=%d pcie_pairs=%s",
+            draft_device_ids,
+            verify_device_id,
+            pcie_pairs,
         )
 
-        # Apply policy overrides.
-        self._apply_overrides(
-            scheduler._policies[TierKind.A6000], self.a6000_policy_overrides
-        )
-        self._apply_overrides(
-            scheduler._policies[TierKind.H100], self.h100_policy_overrides
+        return cls(
+            mtp_num_layers=mtp_num_layers,
+            mtp_use_repeated_layer=mtp_use_repeated_layer,
+            device_roles=device_roles,
+            device_policies=device_policies,
+            pcie_crossing_device_pairs=pcie_pairs,
+            locality_cache_capacity_gb=locality_cache_capacity_gb,
+            mtp_loss_scaling_factor=mtp_loss_scaling_factor,
+            enable_hetero_routing=True,
         )
 
-        return scheduler
+    def policy_for(self, device: torch.device) -> HeteroMTPDetachPolicy:
+        """
+        Return the detach policy applicable to ``device``.
 
-    @staticmethod
-    def _apply_overrides(
-        policy: TierDetachPolicy,
-        overrides: Optional[Dict[str, List[str]]],
-    ) -> None:
-        if not overrides:
-            return
-        for phase_str, site_strs in overrides.items():
-            try:
-                phase = SchedulePhase(phase_str)
-                sites = [DetachSite(s) for s in site_strs]
-                policy.override(phase, sites)
-                logger.debug(
-                    "Applied DES-LOC policy override: tier=%s phase=%s sites=%s",
-                    policy.tier_kind.value,
-                    phase_str,
-                    site_strs,
-                )
-            except ValueError as exc:
-                logger.warning("Invalid DES-LOC policy override ignored: %s", exc)
+        Falls back to the homogeneous compat policy when hetero routing is
+        disabled or the device is not registered.
+        """
+        if not self.enable_hetero_routing:
+            return HeteroMTPDetachPolicy.homogeneous_compat(self.mtp_detach_heads)
+
+        role = self.device_roles.get(device.index if device.index is not None else 0)
+        if role is None:
+            logger.warning(
+                "Device %s has no registered role; defaulting to homogeneous compat policy.",
+                device,
+            )
+            return HeteroMTPDetachPolicy.homogeneous_compat(self.mtp_detach_heads)
+
+        policy = self.device_policies.get(role)
+        if policy is None:
+            logger.warning(
+                "Role %s has no registered policy; defaulting to DRAFT policy.",
+                role,
+            )
+            return HeteroMTPDetachPolicy.for_draft_device()
+
+        return policy
+
+    def is_pcie_crossing(self, src: torch.device, dst: torch.device) -> bool:
+        """Return True if the (src, dst) pair crosses a PCIe bus."""
+        src_idx = src.index if src.index is not None else 0
+        dst_idx = dst.index if dst.index is not None else 0
+        return (src_idx, dst_idx) in self.pcie_crossing_device_pairs
 
 
 # ---------------------------------------------------------------------------
-# Null scheduler (for mtp_detach_heads=False compatibility)
+# Locality cache buffer
 # ---------------------------------------------------------------------------
 
+class LocalityCacheBuffer:
+    """
+    Pinned CPU DRAM buffer used as a staging area for cross-device tensor
+    transfers in DES-LOC.
 
-class _NullDetachScheduler:
-    """Drop-in replacement when DES-LOC detach scheduling is disabled.
+    Motivation
+    ----------
+    When a hidden-state chunk is transferred from the H100 (VERIFY) to an
+    A6000 (DRAFT) over PCIe, going through pinned CPU memory enables:
 
-    Returns should_detach=False for every query, matching Megatron's
-    behaviour when ``mtp_detach_heads=False``.
+      1. Async ``cudaMemcpyDeviceToHost`` — overlapped with GPU computation.
+      2. Async ``cudaMemcpyHostToDevice`` — the destination A6000 can begin
+         work as soon as the transfer completes, without blocking the H100.
+
+    This is the "Shared LOcality Cache" component of DES-LOC.  The buffer
+    does NOT store live autograd graphs; tensors are always detached before
+    spilling, consistent with ``HeteroMTPDetachPolicy.detach_hidden_states``.
+
+    Parameters
+    ----------
+    capacity_bytes : int
+        Maximum bytes to allocate for the pinned buffer.
+    use_pinned : bool
+        If True, allocates pinned (page-locked) host memory.  Set False in
+        environments without CUDA (e.g., unit tests on CPU).
     """
 
-    def step(self, global_step: int) -> None:  # noqa: D102
-        pass
+    def __init__(self, capacity_bytes: int, use_pinned: bool = True) -> None:
+        self._capacity_bytes = capacity_bytes
+        self._use_pinned = use_pinned
+        self._buffers: Dict[str, torch.Tensor] = {}
+        self._bytes_used: int = 0
+        logger.debug(
+            "LocalityCacheBuffer: capacity=%.2f GiB pinned=%s",
+            capacity_bytes / (1024 ** 3),
+            use_pinned,
+        )
 
-    def should_detach(
+    @property
+    def capacity_bytes(self) -> int:
+        return self._capacity_bytes
+
+    @property
+    def bytes_used(self) -> int:
+        return self._bytes_used
+
+    def _alloc_or_reuse(self, key: str, shape: torch.Size, dtype: torch.dtype) -> torch.Tensor:
+        """
+        Return a CPU tensor of the requested shape and dtype, reusing an
+        existing allocation if sizes match.
+        """
+        needed = math.prod(shape) * torch.finfo(dtype).bits // 8
+        if key in self._buffers:
+            existing = self._buffers[key]
+            if existing.shape == shape and existing.dtype == dtype:
+                return existing
+            # Free old allocation.
+            self._bytes_used -= existing.numel() * existing.element_size()
+
+        if self._bytes_used + needed > self._capacity_bytes:
+            logger.warning(
+                "LocalityCacheBuffer: capacity exceeded (used=%d needed=%d cap=%d); "
+                "evicting all buffers.",
+                self._bytes_used,
+                needed,
+                self._capacity_bytes,
+            )
+            self._buffers.clear()
+            self._bytes_used = 0
+
+        if self._use_pinned and torch.cuda.is_available():
+            buf = torch.empty(shape, dtype=dtype, pin_memory=True)
+        else:
+            buf = torch.empty(shape, dtype=dtype)
+
+        self._buffers[key] = buf
+        self._bytes_used += needed
+        return buf
+
+    def stage(
         self,
-        site: DetachSite,
-        layer_idx: int,
-        device: Optional[torch.device] = None,
-    ) -> DetachDecision:  # noqa: D102
-        return DetachDecision(
-            should_detach=False,
-            site=site,
-            layer_idx=layer_idx,
-            tier_kind=TierKind.H100,
-            reason="DES-LOC detach scheduling disabled",
+        key: str,
+        tensor: torch.Tensor,
+        stream: Optional[torch.cuda.Stream] = None,
+    ) -> torch.Tensor:
+        """
+        Copy ``tensor`` (GPU) into pinned CPU buffer asynchronously.
+
+        The tensor must already be detached (no autograd graph).  Returns the
+        CPU-side buffer; the caller is responsible for synchronisation before
+        reading.
+
+        Parameters
+        ----------
+        key : str
+            Identifier for buffer reuse.
+        tensor : torch.Tensor
+            Detached GPU tensor to stage.
+        stream : torch.cuda.Stream or None
+            If provided, the copy is enqueued on this stream.
+        """
+        assert not tensor.requires_grad, (
+            "LocalityCacheBuffer.stage received a tensor with requires_grad=True; "
+            "detach before staging."
         )
+        cpu_buf = self._alloc_or_reuse(key, tensor.shape, tensor.dtype)
+        if stream is not None and tensor.is_cuda:
+            with torch.cuda.stream(stream):
+                cpu_buf.copy_(tensor, non_blocking=True)
+        else:
+            cpu_buf.copy_(tensor)
+        return cpu_buf
 
-    def record_gradient(self, layer_idx: int, grad_bytes: int) -> None:  # noqa: D102
-        pass
+    def retrieve(
+        self,
+        key: str,
+        dst_device: torch.device,
+        stream: Optional[torch.cuda.Stream] = None,
+    ) -> Optional[torch.Tensor]:
+        """
+        Retrieve a staged tensor onto ``dst_device`` asynchronously.
 
-    def update_cache_occupancy(self, tier_kind: TierKind, occupancy_bytes: int) -> None:
-        pass
+        Returns None if the key has not been staged.
+        """
+        if key not in self._buffers:
+            return None
+        cpu_buf = self._buffers[key]
+        if stream is not None and dst_device.type == "cuda":
+            with torch.cuda.stream(stream):
+                return cpu_buf.to(dst_device, non_blocking=True)
+        return cpu_buf.to(dst_device)
+
+    def clear(self) -> None:
+        self._buffers.clear()
+        self._bytes_used = 0
 
 
-NULL_SCHEDULER: _NullDetachScheduler = _NullDetachScheduler()
+# ---------------------------------------------------------------------------
+# Runtime detach manager
+# ---------------------------------------------------------------------------
 
-
-def get_scheduler(config: HeteroMTPDetachConfig) -> Any:
-    """Convenience factory that returns a real or null scheduler.
-
-    Args:
-        config: HeteroMTPDetachConfig instance.
-
-    Returns:
-        HeteroMTPDetachScheduler if enabled, else _NullDetachScheduler.
+class HeteroMTPDetachManager:
     """
-    scheduler = config.build_scheduler()
-    if scheduler is None:
-        return NULL_SCHEDULER
-    return scheduler
+    Centralised runtime manager for DES-LOC MTP detach operations.
 
+    This object is instantiated once per inference/training session and is
+    passed to each callsite that needs to perform a detach.  It encapsulates:
 
-# ---------------------------------------------------------------------------
-# DeepSpeed integration hook
-# ---------------------------------------------------------------------------
+      * Policy lookup by device.
+      * PCIe-crossing detection.
+      * Optional locality cache staging.
+      * Gradient re-enablement after detach (Megatron compat fix).
 
-
-class DeepSpeedMTPDetachHook:
-    """Integrates the detach scheduler with a DeepSpeed engine.
-
-    Intended to be called from the Neuron_SP training loop wrapper around
-    the DeepSpeed engine's ``train_batch`` method.
-
-    Usage
-    -----
-    >>> hook = DeepSpeedMTPDetachHook(engine, scheduler)
-    >>> for step, batch in enumerate(loader):
-    ...     hook.on_step_begin(step)
-    ...     loss = engine.train_batch(batch)
-    ...     hook.on_backward_end(mtp_layer_outputs)
+    Design note — why a manager rather than free functions?
+    -------------------------------------------------------
+    Megatron's original code embeds detach logic directly in the module's
+    ``forward`` methods, which works for homogeneous hardware.  In DES-LOC,
+    the decision to detach depends on runtime device placement, which can
+    change between requests (e.g., load-balancing across A6000s).  The
+    manager provides a single lookup point and makes the policy testable
+    without instantiating full model modules.
     """
 
     def __init__(
         self,
-        engine: Any,  # deepspeed.DeepSpeedEngine
-        scheduler: Any,  # HeteroMTPDetachScheduler or _NullDetachScheduler
+        config: HeteroMTPDetachConfig,
+        locality_cache: Optional[LocalityCacheBuffer] = None,
     ) -> None:
-        self._engine = engine
-        self._scheduler = scheduler
-        self._grad_hooks: List[Any] = []
+        self._config = config
+        if locality_cache is None and config.locality_cache_capacity_gb > 0:
+            capacity = int(config.locality_cache_capacity_gb * 1024 ** 3)
+            use_pinned = torch.cuda.is_available()
+            locality_cache = LocalityCacheBuffer(capacity, use_pinned=use_pinned)
+        self._cache = locality_cache
+        self._transfer_streams: Dict[int, torch.cuda.Stream] = {}
 
-    def on_step_begin(self, global_step: int) -> None:
-        """Advance the detach scheduler and clear old gradient hooks."""
-        self._scheduler.step(global_step)
-        for handle in self._grad_hooks:
-            handle.remove()
-        self._grad_hooks.clear()
+    def _get_or_create_stream(self, device_idx: int) -> Optional[torch.cuda.Stream]:
+        if not torch.cuda.is_available():
+            return None
+        if device_idx not in self._transfer_streams:
+            with torch.cuda.device(device_idx):
+                self._transfer_streams[device_idx] = torch.cuda.Stream()
+        return self._transfer_streams[device_idx]
 
-    def register_grad_hook(self, tensor: torch.Tensor, layer_idx: int) -> None:
-        """Register a hook to record observed gradient sizes for layer_idx.
-
-        Call this on the MTP layer output tensor (before detach) so that
-        the gradient estimator can refine its budget model.
-
-        Args:
-            tensor: The MTP output activation tensor.
-            layer_idx: MTP layer index.
+    def detach_decoder_input(
+        self,
+        decoder_input: torch.Tensor,
+        device: Optional[torch.device] = None,
+    ) -> torch.Tensor:
         """
-        scheduler = self._scheduler
+        Apply decoder_input detach policy.
 
-        def _hook(grad: torch.Tensor) -> None:
-            if grad is not None:
-                scheduler.record_gradient(layer_idx, grad.nelement() * grad.element_size())
+        Mirrors Megatron's ``_get_embeddings`` detach of ``decoder_input``
+        when ``mtp_detach_heads=True``, but conditioned on the device policy.
 
-        handle = tensor.register_hook(_hook)
-        self._grad_hooks.append(handle)
+        The returned tensor has ``requires_grad=False`` when the policy is
+        active, severing gradient flow back to the shared embedding.
+        """
+        if device is None:
+            device = decoder_input.device
+        policy = self._config.policy_for(device)
 
-    def on_backward_end(self, mtp_layer_outputs: List[torch.Tensor]) -> None:
-        """Post-backward callback.  Currently a no-op placeholder for future
-        per-step gradient-norm telemetry that feeds the traffic estimator."""
-        pass
+        if policy.detach_decoder_input and decoder_input.requires_grad:
+            decoder_input = decoder_input.detach()
+            logger.debug(
+                "detach_decoder_input: severed embedding grad on device %s (role=%s)",
+                device,
+                self._config.device_roles.get(
+                    device.index if device.index is not None else 0, "unknown"
+                ),
+            )
+        return decoder_input
+
+    def detach_hidden_states(
+        self,
+        hidden_states: torch.Tensor,
+        src_device: Optional[torch.device] = None,
+        dst_device: Optional[torch.device] = None,
+        cache_key: Optional[str] = None,
+        transfer_stream: Optional[torch.cuda.Stream] = None,
+    ) -> torch.Tensor:
+        """
+        Apply hidden-states detach policy, optionally staging through the
+        locality cache for PCIe crossings.
+
+        Mirrors Megatron's block-level detach of the per-offset hidden-state
+        chunk, extended with:
+
+          * PCIe-crossing detection → locality cache staging when active.
+          * Gradient re-enablement to preserve activation-checkpointing compat.
+
+        Parameters
+        ----------
+        hidden_states : torch.Tensor
+            The hidden-state chunk for this MTP offset.
+        src_device : torch.device or None
+            Source device (where ``hidden_states`` currently lives).
+        dst_device : torch.device or None
+            Destination device (where MTP layers will execute).
+        cache_key : str or None
+            Key for locality cache staging.  Auto-generated if None.
+        transfer_stream : torch.cuda.Stream or None
+            CUDA stream for async PCIe transfer.
+        """
+        if src_device is None:
+            src_device = hidden_states.device
+        if dst_device is None:
+            dst_device = src_device
+
+        policy = self._config.policy_for(dst_device)
+
+        if not policy.detach_hidden_states:
+            return hidden_states
+
+        # Detach from main-model autograd graph.
+        detached = hidden_states.detach()
+
+        # PCIe crossing: stage through locality cache if configured.
+        crosses_pcie = self._config.is_pcie_crossing(src_device, dst_device)
+        if crosses_pcie and policy.spill_to_locality_cache and self._cache is not None:
+            if cache_key is None:
+                cache_key = f"hidden_{src_device.index}_{dst_device.index}"
+
+            stream = transfer_stream or self._get_or_create_stream(
+                src_device.index if src_device.index is not None else 0
+            )
+            staged = self._cache.stage(cache_key, detached, stream=stream)
+
+            dst_stream = self._get_or_create_stream(
+                dst_device.index if dst_device.index is not None else 0
+            )
+            detached = self._cache.retrieve(cache_key, dst_device, stream=dst_stream)
+            if detached is None:
+                # Fallback: direct transfer (should not happen).
+                detached = hidden_states.detach().to(dst_device)
+
+            logger.debug(
+                "detach_hidden_states: PCIe handoff %s→%s via locality cache key=%s "
+                "shape=%s dtype=%s",
+                src_device,
+                dst_device,
+                cache_key,
+                tuple(detached.shape),
+                detached.dtype,
+            )
+
+        # Re-enable requires_grad so MTP layer params and activation
+        # checkpointing see a differentiable input (Megatron fix, line 1110).
+        if policy.ensure_hidden_grad and not detached.requires_grad:
+            detached = detached.requires_grad_(True)
+
+        return detached
+
+    def detach_output_weight(
+        self,
+        output_weight: Optional[torch.Tensor],
+        output_layer: Optional[nn.Module],
+        device: Optional[torch.device] = None,
+    ) -> Optional[torch.Tensor]:
+        """
+        Apply output-weight detach policy.
+
+        Mirrors Megatron's ``process_mtp_loss`` detach of ``output_weight``
+        when ``mtp_detach_heads=True``.  In DES-LOC this is always active when
+        the weight lives on the VERIFY device (H100) but the loss is computed
+        on a DRAFT device (A6000).
+
+        Parameters
+        ----------
+        output_weight : torch.Tensor or None
+            Explicitly passed weight tensor, or None to extract from
+            ``output_layer``.
+        output_layer : nn.Module or None
+            Module whose ``.weight`` attribute is used when
+            ``output_weight`` is None.
+        device : torch.device or None
+            Device of the MTP loss computation (usually DRAFT device).
+        """
+        if device is None:
+            if output_weight is not None:
+                device = output_weight.device
+            elif output_layer is not None and hasattr(output_layer, "weight"):
+                device = output_layer.weight.device
+            else:
+                device = torch.device("cpu")
+
+        policy = self._config.policy_for(device)
+
+        if not policy.detach_output_weight:
+            # No detach: return as-is (homogeneous path).
+            if output_weight is not None:
+                return output_weight
+            if output_layer is not None and hasattr(output_layer, "weight"):
+                return output_layer.weight
+            return None
+
+        # Detach path (mirrors Megatron lines 820–824).
+        if output_weight is not None:
+            detached = output_weight.detach()
+        elif output_layer is not None and hasattr(output_layer, "weight"):
+            detached = output_layer.weight.detach()
+        else:
+            return None
+
+        logger.debug(
+            "detach_output_weight: detached output_weight on device %s; "
+            "MTP loss will not update shared projection.",
+            device,
+        )
+        return detached
 
 
 # ---------------------------------------------------------------------------
-# Utility: tensor byte size
+# Hetero-aware process_mtp_loss
 # ---------------------------------------------------------------------------
 
+def hetero_process_mtp_loss(
+    hidden_states: torch.Tensor,
+    labels: torch.Tensor,
+    loss_mask: torch.Tensor,
+    output_layer: nn.Module,
+    output_weight: Optional[torch.Tensor],
+    compute_language_model_loss: Callable,
+    config: HeteroMTPDetachConfig,
+    manager: HeteroMTPDetachManager,
+    mtp_layer_offset: int = 1,
+    runtime_gather_output: Optional[bool] = None,
+    is_training: bool = True,
+) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    """
+    DES-LOC replacement for Megatron's ``process_mtp_loss``.
 
-def tensor_bytes(t: torch.Tensor) -> int:
-    """Return the byte size of a tensor's storage."""
-    return t.nelement() * t.element_size()
+    Upstream design (Megatron)
+    --------------------------
+    ``process_mtp_loss`` computes the auxiliary cross-entropy loss for each
+    MTP head.  When ``mtp_detach_heads=True``, it detaches ``output_weight``
+    before building logits, so that gradients from the MTP loss do not update
+    the shared output projection weight.
+
+    DES-LOC adaptation
+    ------------------
+    * Weight detach is routed through ``HeteroMTPDetachManager`` which checks
+      device roles; on the A6000 the weight is always detached because it
+      physically lives on the H100.
+    * Hidden-state slicing is performed per MTP layer, and each slice is
+      individually detached if the policy requires it.
+    * Loss aggregation uses ``mtp_loss_scaling_factor`` from config (mirrors
+      Megatron's ``mtp_loss_scaling_factor``).
+    * Per-layer loss values are returned in a diagnostic dict so the DeepSpeed
+      engine can log them without an additional forward pass.
+
+    Parameters
+    ----------
+    hidden_states : torch.Tensor
+        Concatenated [main, mtp_0, …, mtp_N] along dim 0.
+        Shape: ``[(1 + N) * seq_len, batch, hidden]``.
+    labels : torch.Tensor
+        Ground-truth token ids.  Shape: ``[batch, seq_len]``.
+    loss_mask : torch.Tensor
+        Per-token mask.  Shape: ``[batch, seq_len]``.
+    output_layer : nn.Module
+        Shared output projection from the backbone.
+    output_weight : torch.Tensor or None
+        Explicit weight tensor; if None, extracted from ``output_layer``.
+    compute_language_model_loss : callable
+        Function ``(labels, logits) -> loss`` used for each MTP head.
+    config : HeteroMTPDetachConfig
+    manager : HeteroMTPDetachManager
+    mtp_layer_offset : int
+        Typically 1: the first chunk is the main model output.
+    runtime_gather_output : bool or None
+        Passed to ``output_layer`` for tensor-parallel all-gather.
+    is_training : bool
+
+    Returns
+    -------
+    total_mtp_loss : torch.Tensor
+        Scaled sum of per-head losses.
+    per_layer_losses : dict[str, torch.Tensor]
+        Diagnostic dict mapping ``"mtp_loss_layer_N"`` to per-head loss.
+    """
+    device = hidden_states.device
+    seq_len = labels.shape[1]
+    n_mtp = config.mtp_num_layers
+
+    # Detach output weight (mirrors Megatron lines 820–824).
+    eff_weight = manager.detach_output_weight(
+        output_weight=output_weight,
+        output_layer=output_layer,
+        device=device,
+    )
+
+    per_layer_losses: Dict[str, torch.Tensor] = {}
+    total_loss = torch.tensor(0.0, device=device, dtype=hidden_states.dtype)
+
+    for i in range(n_mtp):
+        # Slice MTP head hidden states (mirrors block-level chunk logic).
+        start = (mtp_layer_offset + i) * seq_len
+        end = start + seq_len
+        mtp_hidden = hidden_states[start:end]  # [seq_len, batch, hidden]
+
+        # Compute logits via shared output projection with detached weight.
+        if eff_weight is not None:
+            logits, _ = output_layer(
+                mtp_hidden, weight=eff_weight, runtime_gather_output=runtime_gather_output
+            )
+        else:
+            logits, _ = output_layer(
+                mtp_hidden, runtime_gather_output=runtime_gather_output
+            )
+
+        # Shift labels: MTP head i predicts token i+1 (mirrors Megatron label
+        # derivation from input_ids in process_mtp_loss).
+        shifted_labels = labels.clone()
+        # Compute per-token loss.
+        layer_loss_tokens = compute_language_model_loss(shifted_labels, logits)
+
+        # Apply loss mask and average.
+        masked = layer_loss_tokens * loss_mask
+        layer_loss = masked.sum() / (loss_mask.sum() + 1e-8)
+
+        key = f"mtp_loss_layer_{i}"
+        per_layer_losses[key] = layer_loss.detach()
+        total_loss = total_loss + layer_loss
+
+    total_mtp_loss = total_loss * config.mtp_loss_scaling_factor
+    return total_mtp_loss, per_layer_losses
+
+
+# ---------------------------------------------------------------------------
+# Hetero-aware _get_embeddings replacement
+# ---------------------------------------------------------------------------
+
+class HeteroMTPEmbeddingDetach:
+    """
+    DES-LOC adaptation of ``MultiTokenPredictionLayer._get_embeddings``.
+
+    Upstream design (Megatron)
+    --------------------------
+    ``_get_embeddings`` computes the decoder embedding for MTP input tokens
+    and concatenates it with the backbone hidden states.  With
+    ``mtp_detach_heads=True``, Megatron detaches ``decoder_input`` to sever
+    gradient flow to the shared embedding, then ensures ``hidden_states`` has
+    ``requires_grad=True`` for checkpointing compatibility.
+
+    DES-LOC adaptation
+    ------------------
+    In DES-LOC the shared embedding lives on the VERIFY device (H100).  The
+    MTP head executes on a DRAFT device (A6000).  The embedding lookup result
+    crosses PCIe; staging it through the locality cache and detaching it
+    before transfer is both a correctness requirement (no gradient over PCIe)
+    and a bandwidth optimisation.
+
+    This class is a stateless helper; it holds a reference to the manager and
+    is called from the MTP layer's forward method.
+    """
+
+    def __init__(self, manager: HeteroMTPDetachManager) -> None:
+        self._manager = manager
+
+    def apply(
+        self,
+        decoder_input: torch.Tensor,
+        hidden_states: torch.Tensor,
+        src_device: Optional[torch.device] = None,
+        dst_device: Optional[torch.device] = None,
+        cache_key_prefix: str = "emb",
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Apply detach policy to ``decoder_input`` and ``hidden_states``.
+
+        Parameters
+        ----------
+        decoder_input : torch.Tensor
+            Output of the shared embedding for MTP input tokens.
+        hidden_states : torch.Tensor
+            Backbone hidden states for the MTP layer.
+        src_device : torch.device or None
+            Device where embedding was computed (VERIFY/H100 in DES-LOC).
+        dst_device : torch.device or None
+            Device where MTP layer will execute (DRAFT/A6000 in DES-LOC).
+        cache_key_prefix : str
+            Prefix for locality cache keys.
+
+        Returns
+        -------
+        decoder_input : torch.Tensor
+            Detached (when policy active); no grad, no graph to embedding.
+        hidden_states : torch.Tensor
+            Possibly detached and/or transferred; requires_grad=True ensured.
+        """
+        decoder_input = self._manager.detach_decoder_input(
+            decoder_input, device=dst_device or decoder_input.device
+        )
+
+        hidden_states = self._manager.detach_hidden_states(
+            hidden_states,
+            src_device=src_device,
+            dst_device=dst_device,
+            cache_key=f"{cache_key_prefix}_hidden",
+        )
+
+        return decoder_input, hidden_states
+
+
+# ---------------------------------------------------------------------------
+# Hetero-aware block-level hidden-states detach
+# ---------------------------------------------------------------------------
+
+class HeteroMTPBlockDetach:
+    """
+    DES-LOC adaptation of ``MultiTokenPredictionBlock.forward`` hidden-states
+    detach logic.
+
+    Upstream design (Megatron)
+    --------------------------
+    ``MultiTokenPredictionBlock.forward`` slices the concatenated hidden-states
+    tensor into per-offset chunks.  With ``mtp_detach_heads=True``, the chunk
+    for the current MTP offset is detached before being fed to the MTP layers,
+    preventing MTP gradients from flowing back through the backbone's earlier
+    layers.
+
+    DES-LOC adaptation
+    ------------------
+    In addition to the gradient isolation, DES-LOC must handle the physical
+    device transfer.  The chunk for MTP offset ``k`` lives on the VERIFY device
+    (where the backbone ran) but must execute on a DRAFT device.  The detach
+    and PCIe transfer are fused via the locality cache.
+
+    This class is a stateless helper, analogous to ``HeteroMTPEmbeddingDetach``.
+    """
+
+    def __init__(self, manager: HeteroMTPDetachManager) -> None:
+        self._manager = manager
+
+    def apply(
+        self,
+        hidden_states: torch.Tensor,
+        mtp_offset: int,
+        verify_device: torch.device,
+        draft_device: torch.device,
+    ) -> torch.Tensor:
+        """
+        Detach and (optionally) transfer the hidden-state chunk for
+        ``mtp_offset`` from VERIFY to DRAFT device.
+
+        Parameters
+        ----------
+        hidden_states : torch.Tensor
+            Full concatenated tensor on VERIFY device.
+        mtp_offset : int
+            Which chunk to extract.  Matches Megatron's ``offset`` variable.
+        verify_device : torch.device
+            Source device (H100).
+        draft_device : torch.device
+            Destination device (A6000).
+
+        Returns
+        -------
+        torch.Tensor
+            Chunk for ``mtp_offset``, on ``draft_device``, detached from
+            backbone graph, with ``requires_grad=True``.
+        """
+        chunks = list(torch.chunk(hidden_states, 1 + mtp_offset, dim=0))
+        chunk = chunks[mtp_offset]
+
+        detached_chunk = self._manager.detach_hidden_states(
+            chunk,
+            src_device=verify_device,
+            dst_device=draft_device,
+            cache_key=f"block_hidden_offset_{mtp_offset}",
+        )
+        return detached_chunk
+
+
+# ---------------------------------------------------------------------------
+# Lightweight MTP head module for DES-LOC
+# ---------------------------------------------------------------------------
+
+class HeteroMTPDraftHead(nn.Module):
+    """
+    Lightweight MTP speculative head designed for A6000 DRAFT devices.
+
+    This module encapsulates the per-MTP-layer parameters (enorm, hnorm,
+    eh_proj) and the forward pass logic.  It is analogous to the
+    ``MultiTokenPredictionLayer`` in Megatron, but:
+
+      * Explicitly device-aware: constructed on a specific DRAFT device.
+      * Accepts detached inputs from the manager (no grad crossing PCIe).
+      * Returns hidden states ready for loss computation on the same device.
+
+    The design mirrors Megatron's three-parameter MTP layer structure:
+      enorm  — LayerNorm over decoder (embedding) input.
+      hnorm  — LayerNorm over backbone hidden states.
+      eh_proj — Linear projection from 2*hidden to hidden.
+
+    Parameters
+    ----------
+    hidden_size : int
+        Dimension of backbone hidden states.
+    device : torch.device
+        DRAFT device to place parameters on.
+    dtype : torch.dtype
+        Parameter dtype.  Default float32; fp16/bf16 for A6000 inference.
+    layer_idx : int
+        Index of this MTP head (0-indexed).
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        device: torch.device,
+        dtype: torch.dtype = torch.float32,
+        layer_idx: int = 0,
+    ) -> None:
+        super().__init__()
+        self.layer_idx = layer_idx
+        self.hidden_size = hidden_size
+
+        self.enorm = nn.LayerNorm(hidden_size, device=device, dtype=dtype)
+        self.hnorm = nn.LayerNorm(hidden_size, device=device, dtype=dtype)
+        self.eh_proj = nn.Linear(2 * hidden_size, hidden_size, bias=False, device=device)
+
+        logger.debug(
+            "HeteroMTPDraftHead[%d]: hidden_size=%d device=%s dtype=%s",
+            layer_idx, hidden_size, device, dtype,
+        )
+
+    def forward(
+        self,
+        decoder_input: torch.Tensor,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Compute MTP head output.
+
+        Both inputs should already be detached from the backbone graph
+        by the manager before this call.
+
+        Parameters
+        ----------
+        decoder_input : torch.Tensor
+            Embedding output for MTP input tokens.  Shape: [seq, batch, hidden].
+        hidden_states : torch.Tensor
+            Backbone hidden states.  Shape: [seq, batch, hidden].
+            Must have ``requires_grad=True`` (set by manager).
+
+        Returns
+        -------
+        torch.Tensor
+            MTP head output.  Shape: [seq, batch, hidden].
+        """
+        normed_e = self.enorm(decoder_input)
+        normed_h = self.hnorm(hidden_states)
+        concatenated = torch.cat([normed_e, normed_h], dim=-1)
+        projected = self.eh_proj(concatenated)
+        return projected
+
+
+# ---------------------------------------------------------------------------
+# End-to-end DES-LOC MTP speculative decode runner
+# ---------------------------------------------------------------------------
+
+class HeteroMTPSpeculativeRunner:
+    """
+    Orchestrates DES-LOC speculative decoding with heterogeneous MTP heads.
+
+    Responsibilities:
+      1. Receive backbone hidden states from VERIFY device (H100).
+      2. Detach and transfer each MTP chunk to the appropriate DRAFT device.
+      3. Run ``HeteroMTPDraftHead`` on A6000 for each MTP layer.
+      4. Collect draft logits and return to VERIFY device for verification.
+      5. (Training) Compute MTP auxiliary loss via ``hetero_process_mtp_loss``.
+
+    This class does not own the embedding or output_layer modules; those live
+    on the VERIFY device and are passed in at call time, matching DeepSpeed's
+    engine architecture where module references are held centrally.
+
+    Parameters
+    ----------
+    config : HeteroMTPDetachConfig
+    manager : HeteroMTPDetachManager
+    draft_heads : list[HeteroMTPDraftHead]
+        One per MTP layer.  Each head is on a DRAFT device.
+    draft_device_ids : list[int]
+        CUDA ordinals of A6000 DRAFT devices.  Heads are round-robin
+        distributed if fewer devices than heads.
+    verify_device_id : int
+        CUDA ordinal of H100 VERIFY device.
+    """
+
+    def __init__(
+        self,
+        config: HeteroMTPDetachConfig,
+        manager: HeteroMTPDetachManager,
+        draft_heads: List[HeteroMTPDraftHead],
+        draft_device_ids: List[int],
+        verify_device_id: int,
+    ) -> None:
+        self._config = config
+        self._manager = manager
+        self._heads = draft_heads
+        self._draft_device_ids = draft_device_ids
+        self._verify_device = torch.device(f"cuda:{verify_device_id}")
+        self._block_detach = HeteroMTPBlockDetach(manager)
+        self._emb_detach = HeteroMTPEmbeddingDetach(manager)
+
+    def _draft_device_for(self, layer_idx: int) -> torch.device:
+        """Round-robin assignment of MTP layers to DRAFT devices."""
+        idx = self._draft_device_ids[layer_idx % len(self._draft_device_ids)]
+        return torch.device(f"cuda:{idx}")
+
+    def run_draft_heads(
+        self,
+        hidden_states: torch.Tensor,
+        embedding_fn: Callable,
+        input_ids: torch.Tensor,
+        position_ids: torch.Tensor,
+    ) -> List[torch.Tensor]:
+        """
+        Run all MTP draft heads and collect outputs.
+
+        Parameters
+        ----------
+        hidden_states : torch.Tensor
+            Concatenated backbone hidden states on VERIFY device.
+            Shape: ``[(1 + N) * seq_len, batch, hidden]``.
+        embedding_fn : callable
+            ``(input_ids, position_ids) -> decoder_input`` on VERIFY device.
+        input_ids : torch.Tensor
+        position_ids : torch.Tensor
+
+        Returns
+        -------
+        list[torch.Tensor]
+            Per-MTP-layer head outputs.  Each on the VERIFY device (transferred
+            back after computation for downstream verification/loss).
+        """
+        draft_outputs: List[torch.Tensor] = []
+
+        for layer_idx, head in enumerate(self._heads):
+            draft_device = self._draft_device_for(layer_idx)
+
+            # Detach and transfer hidden-state chunk (block-level detach).
+            h_chunk = self._block_detach.apply(
+                hidden_states=hidden_states,
+                mtp_offset=layer_idx,
+                verify_device=self._verify_device,
+                draft_device=draft_device,
+            )
+
+            # Compute embedding on VERIFY, then detach and transfer to DRAFT.
+            with torch.no_grad() if not h_chunk.requires_grad else _nullctx():
+                dec_input = embedding_fn(input_ids, position_ids)
+
+            dec_input_draft, h_chunk = self._emb_detach.apply(
+                decoder_input=dec_input.to(draft_device),
+                hidden_states=h_chunk,
+                src_device=self._verify_device,
+                dst_device=draft_device,
+                cache_key_prefix=f"layer{layer_idx}",
+            )
+
+            # Run draft head on A6000.
+            head_output = head(dec_input_draft, h_chunk)
+
+            # Transfer draft output back to VERIFY device for loss/verification.
+            verify_output = head_output.detach().to(self._verify_device)
+            draft_outputs.append(verify_output)
+
+        return draft_outputs
+
+
+# Context manager no-op used above.
+import contextlib
+
+@contextlib.contextmanager
+def _nullctx():
+    yield
+
+
+# ---------------------------------------------------------------------------
+# DeepSpeed engine integration shim
+# ---------------------------------------------------------------------------
+
+def build_hetero_mtp_components(
+    hidden_size: int,
+    draft_device_ids: List[int],
+    verify_device_id: int,
+    mtp_num_layers: int = 2,
+    mtp_loss_scaling_factor: float = 0.1,
+    locality_cache_capacity_gb: float = 16.0,
+    dtype: torch.dtype = torch.float32,
+) -> Tuple[HeteroMTPDetachConfig, HeteroMTPDetachManager, HeteroMTPSpeculativeRunner]:
+    """
+    Convenience factory for the DES-LOC MTP subsystem.
+
+    Creates the config, manager, draft heads, and runner in one call.
+    Intended to be invoked from the DeepSpeed engine initialisation,
+    replacing the Megatron-style ``mtp_detach_heads`` config field.
+
+    Parameters
+    ----------
+    hidden_size : int
+    draft_device_ids : list[int]
+        e.g. [0, 1] for two A6000s.
+    verify_device_id : int
+        e.g. 2 for H100.
+    mtp_num_layers : int
+    mtp_loss_scaling_factor : float
+    locality_cache_capacity_gb : float
+    dtype : torch.dtype
+
+    Returns
+    -------
+    config : HeteroMTPDetachConfig
+    manager : HeteroMTPDetachManager
+    runner : HeteroMTPSpeculativeRunner
+    """
+    config = HeteroMTPDetachConfig.from_cluster_spec(
+        draft_device_ids=draft_device_ids,
+        verify_device_id=verify_device_id,
+        mtp_num_layers=mtp_num_layers,
+        mtp_loss_scaling_factor=mtp_loss_scaling_factor,
+        locality_cache_capacity_gb=locality_cache_capacity_gb,
+    )
+
+    manager = HeteroMTPDetachManager(config)
+
+    draft_heads: List[HeteroMTPDraftHead] = []
+    for i in range(mtp_num_layers):
+        device_idx = draft_device_ids[i % len(draft_device_ids)]
+        device = torch.device(f"cuda:{device_idx}") if torch.cuda.is_available() else torch.device("cpu")
+        head = HeteroMTPDraftHead(
+            hidden_size=hidden_size,
+            device=device,
+            dtype=dtype,
+            layer_idx=i,
+        )
+        draft_heads.append(head)
+
+    runner = HeteroMTPSpeculativeRunner(
+        config=config,
+        manager=manager,
+        draft_heads=draft_heads,
+        draft_device_ids=draft_device_ids,
+        verify_device_id=verify_device_id,
+    )
+
+    logger.info(
+        "build_hetero_mtp_components: %d MTP heads, draft=%s, verify=%d, "
+        "locality_cache=%.1f GiB",
+        mtp_num_layers,
+        draft_device_ids,
+        verify_device_id,
+        locality_cache_capacity_gb,
+    )
+
+    return config, manager, runner
 
 
 # ---------------------------------------------------------------------------
 # Unit tests
 # ---------------------------------------------------------------------------
 
-
 if __name__ == "__main__":
     import sys
-    import traceback
-    import unittest
-
     logging.basicConfig(
         level=logging.DEBUG,
-        format="%(levelname)s %(name)s %(message)s",
-        stream=sys.stderr,
+        format="%(asctime)s %(name)s %(levelname)s %(message)s",
+        stream=sys.stdout,
     )
 
-    class TestResolvePhase(unittest.TestCase):
-        def test_warmup(self):
-            self.assertEqual(resolve_phase(0, 100, None), SchedulePhase.WARMUP)
-            self.assertEqual(resolve_phase(99, 100, None), SchedulePhase.WARMUP)
+    class _TestHeteroMTPDetachConfig(unittest.TestCase):
 
-        def test_steady(self):
-            self.assertEqual(resolve_phase(100, 100, None), SchedulePhase.STEADY)
-            self.assertEqual(resolve_phase(500, 100, None), SchedulePhase.STEADY)
+        def test_default_config_disable_hetero(self):
+            """Default config with enable_hetero_routing=False reproduces Megatron scalar."""
+            cfg = HeteroMTPDetachConfig(enable_hetero_routing=False, mtp_detach_heads=False)
+            device = torch.device("cpu")
+            policy = cfg.policy_for(device)
+            self.assertFalse(policy.detach_decoder_input)
+            self.assertFalse(policy.detach_hidden_states)
+            self.assertFalse(policy.detach_output_weight)
 
-        def test_finetune(self):
-            self.assertEqual(
-                resolve_phase(1000, 100, 1000), SchedulePhase.FINETUNE
+        def test_default_config_homogeneous_detach_true(self):
+            """With mtp_detach_heads=True and no hetero routing, all detach flags on."""
+            cfg = HeteroMTPDetachConfig(enable_hetero_routing=False, mtp_detach_heads=True)
+            device = torch.device("cpu")
+            policy = cfg.policy_for(device)
+            self.assertTrue(policy.detach_decoder_input)
+            self.assertTrue(policy.detach_hidden_states)
+            self.assertTrue(policy.detach_output_weight)
+            self.assertTrue(policy.ensure_hidden_grad)
+
+        def test_from_cluster_spec_roles(self):
+            """from_cluster_spec assigns roles correctly."""
+            cfg = HeteroMTPDetachConfig.from_cluster_spec(
+                draft_device_ids=[0, 1],
+                verify_device_id=2,
+                mtp_num_layers=2,
             )
-            self.assertEqual(
-                resolve_phase(999, 100, 1000), SchedulePhase.STEADY
+            self.assertEqual(cfg.device_roles[0], HeteroDeviceRole.DRAFT)
+            self.assertEqual(cfg.device_roles[1], HeteroDeviceRole.DRAFT)
+            self.assertEqual(cfg.device_roles[2], HeteroDeviceRole.VERIFY)
+
+        def test_from_cluster_spec_pcie_pairs(self):
+            """All pairs are PCIe crossings in our cluster."""
+            cfg = HeteroMTPDetachConfig.from_cluster_spec(
+                draft_device_ids=[0, 1], verify_device_id=2
             )
+            # Should include (0,2), (2,0), (1,2), (2,1), (0,1), (1,0).
+            self.assertIn((0, 2), cfg.pcie_crossing_device_pairs)
+            self.assertIn((2, 0), cfg.pcie_crossing_device_pairs)
+            self.assertIn((0, 1), cfg.pcie_crossing_device_pairs)
 
-        def test_finetune_none(self):
-            # No finetune_start_step → never enters FINETUNE.
-            self.assertEqual(
-                resolve_phase(99999, 100, None), SchedulePhase.STEADY
+        def test_is_pcie_crossing(self):
+            cfg = HeteroMTPDetachConfig.from_cluster_spec(
+                draft_device_ids=[0, 1], verify_device_id=2
             )
+            self.assertTrue(cfg.is_pcie_crossing(torch.device("cuda:0"), torch.device("cuda:2")))
+            self.assertFalse(cfg.is_pcie_crossing(torch.device("cuda:0"), torch.device("cuda:0")))
 
-    class TestLocalityCacheOracle(unittest.TestCase):
-        def _make_oracle(self, fraction: float = 0.0) -> LocalityCacheOracle:
-            spec = TierSpec(
-                kind=TierKind.A6000,
-                device_ids=(0,),
-                vram_bytes=48 * 1024 ** 3,
-                sm_version=86,
-                cache_bytes=4 * 1024 ** 3,
-                pcie_bw_gbs=24.0,
+        def test_policy_for_draft(self):
+            cfg = HeteroMTPDetachConfig.from_cluster_spec(
+                draft_device_ids=[0], verify_device_id=1
             )
-            o = LocalityCacheOracle(spec)
-            o._inject_occupancy(fraction)
-            return o
+            # Simulate device 0 = DRAFT.
+            policy = cfg.device_policies[HeteroDeviceRole.DRAFT]
+            self.assertTrue(policy.detach_decoder_input)
+            self.assertTrue(policy.detach_hidden_states)
+            self.assertTrue(policy.detach_output_weight)
+            self.assertTrue(policy.ensure_hidden_grad)
+            self.assertTrue(policy.spill_to_locality_cache)
 
-        def test_not_pressured_below_threshold(self):
-            o = self._make_oracle(0.5)
-            self.assertFalse(o.is_pressured)
-
-        def test_pressured_at_threshold(self):
-            o = self._make_oracle(_CACHE_PRESSURE_THRESHOLD)
-            self.assertTrue(o.is_pressured)
-
-        def test_occupancy_fraction(self):
-            o = self._make_oracle(0.3)
-            self.assertAlmostEqual(o.occupancy_fraction, 0.3, places=5)
-
-    class TestTierDetachPolicy(unittest.TestCase):
-        def test_a6000_warmup_all_sites_active(self):
-            policy = TierDetachPolicy.default_for_tier(TierKind.A6000)
-            for site in DetachSite:
-                self.assertTrue(policy.is_active(site, SchedulePhase.WARMUP))
-
-        def test_a6000_steady_only_hidden_states(self):
-            policy = TierDetachPolicy.default_for_tier(TierKind.A6000)
-            self.assertTrue(
-                policy.is_active(DetachSite.HIDDEN_STATES, SchedulePhase.STEADY)
+        def test_policy_for_verify(self):
+            cfg = HeteroMTPDetachConfig.from_cluster_spec(
+                draft_device_ids=[0], verify_device_id=1
             )
-            self.assertFalse(
-                policy.is_active(DetachSite.DECODER_INPUT, SchedulePhase.STEADY)
+            policy = cfg.device_policies[HeteroDeviceRole.VERIFY]
+            self.assertFalse(policy.detach_decoder_input)
+            self.assertFalse(policy.detach_hidden_states)
+            self.assertTrue(policy.detach_output_weight)
+
+        def test_unknown_device_falls_back_to_compat(self):
+            cfg = HeteroMTPDetachConfig(
+                enable_hetero_routing=True,
+                device_roles={},
+                device_policies={},
+                mtp_detach_heads=False,
             )
-            self.assertFalse(
-                policy.is_active(DetachSite.OUTPUT_WEIGHT, SchedulePhase.STEADY)
+            device = torch.device("cpu")
+            policy = cfg.policy_for(device)
+            # Falls through to homogeneous compat with mtp_detach_heads=False.
+            self.assertFalse(policy.detach_hidden_states)
+
+    class _TestLocalityCacheBuffer(unittest.TestCase):
+
+        def _make_cache(self, cap_gb: float = 0.01) -> LocalityCacheBuffer:
+            cap = int(cap_gb * 1024 ** 3)
+            return LocalityCacheBuffer(cap, use_pinned=False)
+
+        def test_stage_and_retrieve_cpu(self):
+            """Stage a CPU tensor and retrieve it on CPU (no CUDA needed)."""
+            cache = self._make_cache()
+            t = torch.randn(4, 2, 8)
+            staged = cache.stage("key1", t)
+            self.assertEqual(staged.shape, t.shape)
+            torch.testing.assert_close(staged, t)
+
+        def test_stage_requires_no_grad(self):
+            cache = self._make_cache()
+            t = torch.randn(4, requires_grad=True).detach()
+            # Should work fine (already detached).
+            staged = cache.stage("k", t)
+            self.assertFalse(staged.requires_grad)
+
+        def test_stage_with_grad_raises(self):
+            cache = self._make_cache()
+            t = torch.randn(4, requires_grad=True)
+            with self.assertRaises(AssertionError):
+                cache.stage("k", t)
+
+        def test_reuse_existing_buffer(self):
+            cache = self._make_cache()
+            t1 = torch.ones(4, 8)
+            t2 = torch.zeros(4, 8)
+            cache.stage("k", t1)
+            buf1_ptr = cache._buffers["k"].data_ptr()
+            cache.stage("k", t2)
+            buf2_ptr = cache._buffers["k"].data_ptr()
+            # Same allocation reused.
+            self.assertEqual(buf1_ptr, buf2_ptr)
+            torch.testing.assert_close(cache._buffers["k"], t2)
+
+        def test_capacity_eviction(self):
+            """Exceeding capacity evicts all buffers."""
+            cache = LocalityCacheBuffer(capacity_bytes=100, use_pinned=False)
+            # Each tensor is 4*4=16 bytes; 7 of them exceed 100 bytes.
+            for i in range(8):
+                t = torch.randn(4, dtype=torch.float32)
+                cache.stage(f"k{i}", t)
+            # After eviction + re-staging, bytes_used should be small.
+            self.assertLess(cache.bytes_used, 100)
+
+        def test_clear(self):
+            cache = self._make_cache()
+            t = torch.randn(4)
+            cache.stage("k", t)
+            cache.clear()
+            self.assertEqual(len(cache._buffers), 0)
+            self.assertEqual(cache.bytes_used, 0)
+
+    class _TestHeteroMTPDetachManager(unittest.TestCase):
+
+        def _make_manager(self, mtp_detach_heads: bool = True) -> HeteroMTPDetachManager:
+            cfg = HeteroMTPDetachConfig(
+                enable_hetero_routing=False,
+                mtp_detach_heads=mtp_detach_heads,
+                locality_cache_capacity_gb=0.01,
             )
+            cache = LocalityCacheBuffer(int(0.01 * 1024 ** 3), use_pinned=False)
+            return HeteroMTPDetachManager(cfg, locality_cache=cache)
 
-        def test_a6000_finetune_nothing_active(self):
-            policy = TierDetachPolicy.default_for_tier(TierKind.A6000)
-            for site in DetachSite:
-                self.assertFalse(policy.is_active(site, SchedulePhase.FINETUNE))
-
-        def test_h100_warmup_only_output_weight(self):
-            policy = TierDetachPolicy.default_for_tier(TierKind.H100)
-            self.assertTrue(
-                policy.is_active(DetachSite.OUTPUT_WEIGHT, SchedulePhase.WARMUP)
-            )
-            self.assertFalse(
-                policy.is_active(DetachSite.HIDDEN_STATES, SchedulePhase.WARMUP)
-            )
-
-        def test_h100_steady_nothing(self):
-            policy = TierDetachPolicy.default_for_tier(TierKind.H100)
-            for site in DetachSite:
-                self.assertFalse(policy.is_active(site, SchedulePhase.STEADY))
-
-        def test_override(self):
-            policy = TierDetachPolicy.default_for_tier(TierKind.A6000)
-            policy.override(SchedulePhase.STEADY, [DetachSite.OUTPUT_WEIGHT])
-            self.assertTrue(
-                policy.is_active(DetachSite.OUTPUT_WEIGHT, SchedulePhase.STEADY)
-            )
-            self.assertFalse(
-                policy.is_active(DetachSite.HIDDEN_STATES, SchedulePhase.STEADY)
-            )
-
-    class TestGradientTrafficEstimator(unittest.TestCase):
-        def test_formula_estimate_positive(self):
-            est = GradientTrafficEstimator(
-                hidden_size=4096, num_heads=32, head_dim=128
-            )
-            self.assertGreater(est.estimate_bytes, 0)
-
-        def test_observed_average(self):
-            est = GradientTrafficEstimator(
-                hidden_size=4096, num_heads=32, head_dim=128
-            )
-            for v in [100, 200, 300]:
-                est.record(v)
-            self.assertAlmostEqual(est.estimate_bytes, 200, delta=1)
-
-        def test_exceeds_budget_true(self):
-            est = GradientTrafficEstimator(
-                hidden_size=4096, num_heads=32, head_dim=128
-            )
-            est.record(10 ** 9)  # 1 GB
-            self.assertTrue(est.exceeds_budget(1.0))
-
-        def test_exceeds_budget_false(self):
-            est = GradientTrafficEstimator(
-                hidden_size=64, num_heads=4, head_dim=16
-            )
-            # Small model → small gradient estimate.
-            self.assertFalse(est.exceeds_budget(10 ** 12))
-
-    class TestHeteroMTPDetachScheduler(unittest.TestCase):
-        def _make_scheduler(
-            self, num_mtp_layers: int = 2, warmup_steps: int = 100
-        ) -> HeteroMTPDetachScheduler:
-            return HeteroMTPDetachScheduler.from_neuron_sp_env(
-                hidden_size=64,
-                num_attention_heads=4,
-                num_mtp_layers=num_mtp_layers,
-                warmup_steps=warmup_steps,
-                finetune_start_step=500,
-            )
-
-        def test_warmup_a6000_detaches_all_sites(self):
-            sched = self._make_scheduler()
-            sched.step(0)  # warmup
-            for site in DetachSite:
-                d = sched.should_detach(site, layer_idx=0)
-                self.assertTrue(
-                    d.should_detach,
-                    f"Expected detach at {site} in WARMUP for A6000",
-                )
-
-        def test_steady_a6000_only_hidden_states(self):
-            sched = self._make_scheduler()
-            sched.step(100)  # steady
-            self.assertTrue(
-                sched.should_detach(DetachSite.HIDDEN_STATES, 0).should_detach
-            )
-            self.assertFalse(
-                sched.should_detach(DetachSite.DECODER_INPUT, 0).should_detach
-            )
-            self.assertFalse(
-                sched.should_detach(DetachSite.OUTPUT_WEIGHT, 0).should_detach
-            )
-
-        def test_finetune_a6000_no_detach(self):
-            sched = self._make_scheduler()
-            sched.step(500)  # finetune
-            for site in DetachSite:
-                d = sched.should_detach(site, layer_idx=0)
-                self.assertFalse(
-                    d.should_detach,
-                    f"Expected no detach at {site} in FINETUNE for A6000",
-                )
-
-        def test_unknown_layer_no_detach(self):
-            sched = self._make_scheduler()
-            sched.step(0)
-            d = sched.should_detach(DetachSite.HIDDEN_STATES, layer_idx=99)
-            self.assertFalse(d.should_detach)
-
-        def test_cache_pressure_promotes_hidden_states(self):
-            sched = self._make_scheduler()
-            sched.step(100)  # steady — normally no detach for DECODER_INPUT
-            # Inject high cache pressure.
-            sched._oracles[TierKind.A6000]._inject_occupancy(0.95)
-            d = sched.should_detach(DetachSite.HIDDEN_STATES, layer_idx=0)
-            self.assertTrue(d.should_detach)
-            self.assertIn("cache_pressure", d.reason)
-
-        def test_cache_pressure_does_not_promote_output_weight(self):
-            sched = self._make_scheduler()
-            sched.step(100)  # steady
-            sched._oracles[TierKind.A6000]._inject_occupancy(0.99)
-            d = sched.should_detach(DetachSite.OUTPUT_WEIGHT, layer_idx=0)
-            # OUTPUT_WEIGHT is excluded from cache-pressure promotion.
-            self.assertFalse(d.should_detach)
-
-        def test_gradient_budget_promotion(self):
-            sched = self._make_scheduler()
-            sched.step(100)  # steady
-            # Inject enormous observed gradient to trigger budget overrun.
-            sched._estimators[0].record(10 ** 12)
-            d = sched.should_detach(DetachSite.DECODER_INPUT, layer_idx=0)
-            self.assertTrue(d.should_detach)
-            self.assertIn("budget", d.reason)
-
-        def test_phase_transition_logging(self):
-            """Transition from WARMUP to STEADY should change decision and log."""
-            sched = self._make_scheduler()
-            sched.step(0)
-            d1 = sched.should_detach(DetachSite.DECODER_INPUT, 0)
-            self.assertTrue(d1.should_detach)
-            sched.step(100)
-            d2 = sched.should_detach(DetachSite.DECODER_INPUT, 0)
-            self.assertFalse(d2.should_detach)
-
-        def test_record_gradient_updates_estimator(self):
-            sched = self._make_scheduler()
-            sched.record_gradient(0, 42)
-            self.assertEqual(sched._estimators[0].estimate_bytes, 42)
-
-        def test_update_cache_occupancy_proxy(self):
-            sched = self._make_scheduler()
-            sched.update_cache_occupancy(TierKind.A6000, 3 * 1024 ** 3)
-            self.assertAlmostEqual(
-                sched._oracles[TierKind.A6000].occupancy_fraction,
-                3 / 4,
-                places=3,
-            )
-
-        def test_repr(self):
-            sched = self._make_scheduler()
-            sched.step(42)
-            r = repr(sched)
-            self.assertIn("42", r)
-
-    class TestApplyDetachHelpers(unittest.TestCase):
-        def _scheduler_at_step(self, step: int) -> HeteroMTPDetachScheduler:
-            sched = HeteroMTPDetachScheduler.from_neuron_sp_env(
-                hidden_size=64,
-                num_attention_heads=4,
-                num_mtp_layers=2,
-                warmup_steps=100,
-            )
-            sched.step(step)
-            return sched
-
-        def test_output_weight_detached_in_warmup(self):
-            sched = self._scheduler_at_step(0)
-            w = torch.nn.Parameter(torch.randn(16, 64))
-            result = apply_detach_at_output_weight(sched, w, None, layer_idx=0)
+        def test_detach_decoder_input_active(self):
+            """Manager severs decoder_input grad when policy active."""
+            mgr = self._make_manager(mtp_detach_heads=True)
+            t = torch.randn(4, 2, 8, requires_grad=True)
+            result = mgr.detach_decoder_input(t, device=torch.device("cpu"))
             self.assertFalse(result.requires_grad)
             self.assertIsNone(result.grad_fn)
 
-        def test_output_weight_not_detached_in_steady(self):
-            sched = self._scheduler_at_step(100)
-            w = torch.nn.Parameter(torch.randn(16, 64))
-            result = apply_detach_at_output_weight(sched, w, None, layer_idx=0)
-            # In steady phase A6000 does not detach OUTPUT_WEIGHT.
+        def test_detach_decoder_input_inactive(self):
+            """Manager preserves decoder_input grad when policy inactive."""
+            mgr = self._make_manager(mtp_detach_heads=False)
+            t = torch.randn(4, 2, 8, requires_grad=True)
+            result = mgr.detach_decoder_input(t, device=torch.device("cpu"))
             self.assertTrue(result.requires_grad)
 
-        def test_output_weight_from_layer_when_none(self):
-            sched = self._scheduler_at_step(100)
+        def test_detach_hidden_states_ensures_grad(self):
+            """After detach, manager re-enables requires_grad."""
+            mgr = self._make_manager(mtp_detach_heads=True)
+            # hidden_states without grad (as after detach upstream).
+            t = torch.randn(4, 2, 8)
+            self.assertFalse(t.requires_grad)
+            result = mgr.detach_hidden_states(t, device=torch.device("cpu"))
+            self.assertTrue(result.requires_grad)
 
-            class _FakeLayer:
-                weight = torch.nn.Parameter(torch.randn(16, 64))
+        def test_detach_hidden_states_inactive_preserves_graph(self):
+            """When policy inactive, hidden_states grad_fn preserved."""
+            mgr = self._make_manager(mtp_detach_heads=False)
+            t = torch.randn(4, 2, 8, requires_grad=True)
+            t2 = t * 2  # has grad_fn
+            result = mgr.detach_hidden_states(t2, device=torch.device("cpu"))
+            self.assertIsNotNone(result.grad_fn)
 
-            result = apply_detach_at_output_weight(sched, None, _FakeLayer(), 0)
-            self.assertIsInstance(result, torch.Tensor)
+        def test_detach_output_weight_severs_grad(self):
+            """Manager detaches output_weight; grad does not flow through it."""
+            mgr = self._make_manager(mtp_detach_heads=True)
+            w = nn.Parameter(torch.randn(16, 8))
+            result = mgr.detach_output_weight(output_weight=w, output_layer=None)
+            self.assertIsNotNone(result)
+            self.assertFalse(result.requires_grad)
+            # Verify no gradient accumulates through the detached weight.
+            loss = (result ** 2).sum()
+            loss.backward()
+            self.assertIsNone(w.grad)
 
-        def test_decoder_input_detached_in_warmup(self):
-            sched = self._scheduler_at_step(0)
-            dec = torch.randn(4, 2, 64, requires_grad=True)
-            hs = torch.randn(4, 2, 64)
-            dec_out, hs_out = apply_detach_at_decoder_input(sched, dec, hs, 0)
+        def test_detach_output_weight_from_layer(self):
+            """Manager extracts weight from output_layer when output_weight is None."""
+            mgr = self._make_manager(mtp_detach_heads=True)
+            layer = nn.Linear(8, 16, bias=False)
+            result = mgr.detach_output_weight(output_weight=None, output_layer=layer)
+            self.assertIsNotNone(result)
+            self.assertFalse(result.requires_grad)
+
+        def test_detach_output_weight_inactive(self):
+            """When policy inactive, output_weight retains grad."""
+            mgr = self._make_manager(mtp_detach_heads=False)
+            w = nn.Parameter(torch.randn(16, 8))
+            result = mgr.detach_output_weight(output_weight=w, output_layer=None)
+            self.assertIsNotNone(result)
+            self.assertTrue(result.requires_grad)
+
+    class _TestHeteroProcessMTPLoss(unittest.TestCase):
+
+        def _make_config_and_manager(
+            self, mtp_num_layers: int = 2, mtp_detach: bool = True
+        ) -> Tuple[HeteroMTPDetachConfig, HeteroMTPDetachManager]:
+            cfg = HeteroMTPDetachConfig(
+                enable_hetero_routing=False,
+                mtp_detach_heads=mtp_detach,
+                mtp_num_layers=mtp_num_layers,
+                mtp_loss_scaling_factor=0.1,
+                locality_cache_capacity_gb=0.0,
+            )
+            cache = LocalityCacheBuffer(1024, use_pinned=False)
+            mgr = HeteroMTPDetachManager(cfg, locality_cache=cache)
+            return cfg, mgr
+
+        def test_mtp_loss_detach_true_no_weight_grad(self):
+            """With detach=True, output_weight.grad is None after backward."""
+            cfg, mgr = self._make_config_and_manager(mtp_detach=True)
+            seq_len, batch, hidden, vocab = 4, 2, 8, 16
+            n = cfg.mtp_num_layers
+            hidden_states = torch.randn((1 + n) * seq_len, batch, hidden, requires_grad=True)
+            labels = torch.randint(0, vocab, (batch, seq_len))
+            loss_mask = torch.ones(batch, seq_len)
+            w = nn.Parameter(torch.randn(vocab, hidden))
+
+            class FakeOutputLayer(nn.Module):
+                def forward(self, h, weight=None, runtime_gather_output=None):
+                    return torch.matmul(h, weight.t()), None
+
+            def fake_loss(lbl, logits):
+                return logits.sum(dim=-1).transpose(0, 1)
+
+            loss, per_layer = hetero_process_mtp_loss(
+                hidden_states=hidden_states,
+                labels=labels,
+                loss_mask=loss_mask,
+                output_layer=FakeOutputLayer(),
+                output_weight=w,
+                compute_language_model_loss=fake_loss,
+                config=cfg,
+                manager=mgr,
+            )
+            loss.backward()
+            self.assertIsNone(w.grad, "output_weight should have no grad when detach=True")
+            self.assertEqual(len(per_layer), n)
+            for i in range(n):
+                self.assertIn(f"mtp_loss_layer_{i}", per_layer)
+
+        def test_mtp_loss_detach_false_weight_grad_exists(self):
+            """With detach=False, output_weight.grad is populated after backward."""
+            cfg, mgr = self._make_config_and_manager(mtp_detach=False)
+            seq_len, batch, hidden, vocab = 4, 2, 8, 16
+            n = cfg.mtp_num_layers
+            hidden_states = torch.randn((1 + n) * seq_len, batch, hidden, requires_grad=True)
+            labels = torch.randint(0, vocab, (batch, seq_len))
+            loss_mask = torch.ones(batch, seq_len)
+            w = nn.Parameter(torch.randn(vocab, hidden))
+
+            class FakeOutputLayer(nn.Module):
+                def forward(self, h, weight=None, runtime_gather_output=None):
+                    return torch.matmul(h, weight.t()), None
+
+            def fake_loss(lbl, logits):
+                return logits.sum(dim=-1).transpose(0, 1)
+
+            loss, _ = hetero_process_mtp_loss(
+                hidden_states=hidden_states,
+                labels=labels,
+                loss_mask=loss_mask,
+                output_layer=FakeOutputLayer(),
+                output_weight=w,
+                compute_language_model_loss=fake_loss,
+                config=cfg,
+                manager=mgr,
+            )
+            loss.backward()
+            self.assertIsNotNone(w.grad)
+
+        def test_loss_scaling_applied(self):
+            """Total MTP loss equals sum of per-layer losses times scaling factor."""
+            cfg, mgr = self._make_config_and_manager(mtp_detach=False)
+            seq_len, batch, hidden, vocab = 2, 1, 4, 8
+            n = cfg.mtp_num_layers
+            hidden_states = torch.randn((1 + n) * seq_len, batch, hidden)
+            labels = torch.zeros(batch, seq_len, dtype=torch.long)
+            loss_mask = torch.ones(batch, seq_len)
+            w = nn.Parameter(torch.eye(vocab, hidden))
+
+            class FakeOutputLayer(nn.Module):
+                def forward(self, h, weight=None, runtime_gather_output=None):
+                    return torch.matmul(h, weight.t()), None
+
+            def fake_loss(lbl, logits):
+                # Return all-ones loss (shape [batch, seq_len]).
+                return torch.ones(batch, seq_len)
+
+            loss, per_layer = hetero_process_mtp_loss(
+                hidden_states=hidden_states,
+                labels=labels,
+                loss_mask=loss_mask,
+                output_layer=FakeOutputLayer(),
+                output_weight=w,
+                compute_language_model_loss=fake_loss,
+                config=cfg,
+                manager=mgr,
+            )
+            # Each layer loss = 1.0 (all-ones / N tokens); total = N * 1.0 * scaling.
+            expected_total = n * 1.0 * cfg.mtp_loss_scaling_factor
+            self.assertAlmostEqual(loss.item(), expected_total, places=5)
+
+    class _TestHeteroMTPDraftHead(unittest.TestCase):
+
+        def test_forward_shape(self):
+            """Draft head output has correct shape."""
+            head = HeteroMTPDraftHead(hidden_size=16, device=torch.device("cpu"))
+            seq, batch = 4, 2
+            dec_in = torch.randn(seq, batch, 16)
+            h = torch.randn(seq, batch, 16, requires_grad=True)
+            out = head(dec_in, h)
+            self.assertEqual(out.shape, (seq, batch, 16))
+
+        def test_gradient_flows_to_head_params(self):
+            """Backward reaches enorm, hnorm, eh_proj."""
+            head = HeteroMTPDraftHead(hidden_size=8, device=torch.device("cpu"))
+            seq, batch = 3, 2
+            dec_in = torch.randn(seq, batch, 8)
+            h = torch.randn(seq, batch, 8, requires_grad=True)
+            out = head(dec_in, h)
+            out.sum().backward()
+            self.assertIsNotNone(head.enorm.weight.grad)
+            self.assertIsNotNone(head.hnorm.weight.grad)
+            self.assertIsNotNone(head.eh_proj.weight.grad)
+
+        def test_gradient_does_not_reach_detached_input(self):
+            """When dec_in is detached, no grad flows back to the 'embedding'."""
+            head = HeteroMTPDraftHead(hidden_size=8, device=torch.device("cpu"))
+            seq, batch = 3, 2
+            emb_param = nn.Parameter(torch.randn(seq, batch, 8))
+            dec_in = emb_param.detach()  # mirrors manager.detach_decoder_input
+            h = torch.randn(seq, batch, 8, requires_grad=True)
+            out = head(dec_in, h)
+            out.sum().backward()
+            self.assertIsNone(emb_param.grad)
+
+    class _TestHeteroMTPEmbeddingDetach(unittest.TestCase):
+
+        def _make(self, detach: bool):
+            cfg = HeteroMTPDetachConfig(
+                enable_hetero_routing=False,
+                mtp_detach_heads=detach,
+                locality_cache_capacity_gb=0.0,
+            )
+            mgr = HeteroMTPDetachManager(
+                cfg, locality_cache=LocalityCacheBuffer(1024, use_pinned=False)
+            )
+            return HeteroMTPEmbeddingDetach(mgr)
+
+        def test_detach_true_severs_decoder_input_grad(self):
+            helper = self._make(detach=True)
+            dec = torch.randn(4, 2, 8, requires_grad=True)
+            h = torch.randn(4, 2, 8)
+            dec_out, h_out = helper.apply(dec, h)
             self.assertFalse(dec_out.requires_grad)
-            # hidden_states on A6000 gets requires_grad forced True.
-            self.assertTrue(hs_out.requires_grad)
+            self.assertIsNone(dec_out.grad_fn)
 
-        def test_decoder_input_not_detached_in_steady(self):
-            sched = self._scheduler_at_step(100)
-            dec = torch.randn(4, 2, 64, requires_grad=True)
-            hs = torch.randn(4, 2, 64)
-            dec_out, _ = apply_detach_at_decoder_input(sched, dec, hs, 0)
-            # Not detached in steady phase.
+        def test_detach_true_ensures_hidden_grad(self):
+            helper = self._make(detach=True)
+            dec = torch.randn(4, 2, 8)
+            h = torch.randn(4, 2, 8)  # no grad
+            _, h_out = helper.apply(dec, h)
+            self.assertTrue(h_out.requires_grad)
+
+        def test_detach_false_preserves_decoder_grad(self):
+            helper = self._make(detach=False)
+            dec = torch.randn(4, 2, 8, requires_grad=True)
+            h = torch.randn(4, 2, 8, requires_grad=True)
+            dec_out, _ = helper.apply(dec, h)
             self.assertTrue(dec_out.requires_grad)
 
-        def test_hidden_states_detached_in_warmup(self):
-            sched = self._scheduler_at_step(0)
-            hs = torch.randn(4, 2, 64, requires_grad=True)
-            hs_out = apply_detach_at_hidden_states(sched, hs, layer_idx=0)
-            self.assertFalse(hs_out.requires_grad)
+    class _TestBuildHeteroMTPComponents(unittest.TestCase):
 
-        def test_hidden_states_detached_in_steady_a6000(self):
-            sched = self._scheduler_at_step(100)
-            hs = torch.randn(4, 2, 64, requires_grad=True)
-            # Layer 0 is on A6000 → HIDDEN_STATES is active in STEADY.
-            hs_out = apply_detach_at_hidden_states(sched, hs, layer_idx=0)
-            self.assertFalse(hs_out.requires_grad)
-
-        def test_hidden_states_not_detached_in_finetune_a6000(self):
-            sched = HeteroMTPDetachScheduler.from_neuron_sp_env(
-                hidden_size=64,
-                num_attention_heads=4,
-                num_mtp_layers=2,
-                warmup_steps=100,
-                finetune_start_step=500,
+        def test_builds_without_cuda(self):
+            """build_hetero_mtp_components succeeds in CPU-only environment."""
+            config, manager, runner = build_hetero_mtp_components(
+                hidden_size=16,
+                draft_device_ids=[0, 1],
+                verify_device_id=2,
+                mtp_num_layers=2,
             )
-            sched.step(500)
-            hs = torch.randn(4, 2, 64, requires_grad=True)
-            hs_out = apply_detach_at_hidden_states(sched, hs, layer_idx=0)
-            # FINETUNE → no detach.
-            self.assertTrue(hs_out.requires_grad)
+            self.assertEqual(config.mtp_num_layers, 2)
+            self.assertEqual(len(runner._heads), 2)
+            self.assertIsInstance(manager, HeteroMTPDetachManager)
 
-    class TestHeteroMTPDetachConfig(unittest.TestCase):
-        def test_disabled_returns_null(self):
-            cfg = HeteroMTPDetachConfig(enabled=False)
-            result = cfg.build_scheduler()
-            self.assertIsNone(result)
-
-        def test_enabled_returns_scheduler(self):
-            cfg = HeteroMTPDetachConfig(
-                enabled=True,
-                hidden_size=64,
-                num_attention_heads=4,
-                num_mtp_layers=2,
+        def test_head_layer_indices(self):
+            _, _, runner = build_hetero_mtp_components(
+                hidden_size=8,
+                draft_device_ids=[0],
+                verify_device_id=1,
+                mtp_num_layers=3,
             )
-            sched = cfg.build_scheduler()
-            self.assertIsInstance(sched, HeteroMTPDetachScheduler)
-
-        def test_get_scheduler_null(self):
-            cfg = HeteroMTPDetachConfig(enabled=False)
-            sched = get_scheduler(cfg)
-            self.assertIsInstance(sched, _NullDetachScheduler)
-
-        def test_get_scheduler_real(self):
-            cfg = HeteroMTPDetachConfig(
-                enabled=True,
-                hidden_size=64,
-                num_attention_heads=4,
-                num_mtp_layers=1,
-            )
-            sched = get_scheduler(cfg)
-            self.assertIsInstance(sched, HeteroMTPDetachScheduler)
-
-        def test_policy_override_applied(self):
-            cfg = HeteroMTPDetachConfig(
-                enabled=True,
-                hidden_size=64,
-                num_attention_heads=4,
-                num_mtp_layers=1,
-                a6000_policy_overrides={
-                    "steady": ["output_weight", "hidden_states"],
-                },
-            )
-            sched = cfg.build_scheduler()
-            sched.step(100)  # steady
-            self.assertTrue(
-                sched.should_detach(DetachSite.OUTPUT_WEIGHT, 0).should_detach
-            )
-
-        def test_invalid_override_ignored(self):
-            cfg = HeteroMTPDetachConfig(
-                enabled=True,
-                hidden_size=64,
-                num_attention_heads=4,
-                num_mtp_layers=1,
-                a6000_policy_overrides={"not_a_phase": ["hidden_states"]},
-            )
-            # Should not raise.
-            sched = cfg.build_scheduler()
-            self.assertIsInstance(sched, HeteroMTPDetachScheduler)
-
-    class TestNullScheduler(unittest.TestCase):
-        def test_always_no_detach(self):
-            for site in DetachSite:
-                d = NULL_SCHEDULER.should_detach(site, layer_idx=0)
-                self.assertFalse(d.should_detach)
-
-        def test_step_noop(self):
-            NULL_SCHEDULER.step(9999)  # no exception
-
-        def test_record_gradient_noop(self):
-            NULL_SCHEDULER.record_gradient(0, 1024)  # no exception
-
-    class TestDeepSpeedMTPDetachHook(unittest.TestCase):
-        def _make_hook(self) -> DeepSpeedMTPDetachHook:
-            cfg = HeteroMTPDetachConfig(
-                enabled=True,
-                hidden_size=64,
-                num_attention_heads=4,
-                num_mtp_layers=2,
-            )
-            sched = cfg.build_scheduler()
-
-            class _FakeEngine:
-                pass
-
-            return DeepSpeedMTPDetachHook(_FakeEngine(), sched)
-
-        def test_on_step_begin_advances_scheduler(self):
-            hook = self._make_hook()
-            hook.on_step_begin(42)
-            with hook._scheduler._lock:
-                self.assertEqual(hook._scheduler._current_step, 42)
-
-        def test_register_grad_hook_records(self):
-            hook = self._make_hook()
-            hook.on_step_begin(0)
-            t = torch.randn(4, 2, 64, requires_grad=True)
-            hook.register_grad_hook(t, layer_idx=0)
-            self.assertEqual(len(hook._grad_hooks), 1)
-            # Trigger backward to fire the hook.
-            t.sum().backward()
-            # Estimator should have received the gradient size.
-            self.assertGreater(
-                len(hook._scheduler._estimators[0]._observed), 0
-            )
-
-        def test_on_step_begin_clears_old_hooks(self):
-            hook = self._make_hook()
-            hook.on_step_begin(0)
-            t = torch.randn(4, requires_grad=True)
-            hook.register_grad_hook(t, layer_idx=0)
-            self.assertEqual(len(hook._grad_hooks), 1)
-            hook.on_step_begin(1)
-            self.assertEqual(len(hook._grad_hooks), 0)
-
-    class TestTensorBytes(unittest.TestCase):
-        def test_float32(self):
-            t = torch.zeros(100, 100)  # float32 = 4 bytes each
-            self.assertEqual(tensor_bytes(t), 100 * 100 * 4)
-
-        def test_bfloat16(self):
-            t = torch.zeros(50, dtype=torch.bfloat16)
-            self.assertEqual(tensor_bytes(t), 50 * 2)
+            for i, head in enumerate(runner._heads):
+                self.assertEqual(head.layer_idx, i)
 
     # Run all tests.
     loader = unittest.TestLoader()
     suite = unittest.TestSuite()
     for cls in [
-        TestResolvePhase,
-        TestLocalityCacheOracle,
-        TestTierDetachPolicy,
-        TestGradientTrafficEstimator,
-        TestHeteroMTPDetachScheduler,
-        TestApplyDetachHelpers,
-        TestHeteroMTPDetachConfig,
-        TestNullScheduler,
-        TestDeepSpeedMTPDetachHook,
-        TestTensorBytes,
+        _TestHeteroMTPDetachConfig,
+        _TestLocalityCacheBuffer,
+        _TestHeteroMTPDetachManager,
+        _TestHeteroProcessMTPLoss,
+        _TestHeteroMTPDraftHead,
+        _TestHeteroMTPEmbeddingDetach,
+        _TestBuildHeteroMTPComponents,
     ]:
         suite.addTests(loader.loadTestsFromTestCase(cls))
 
