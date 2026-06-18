@@ -1,47 +1,39 @@
-# Copyright (c) 2024 Neuron_SP Project Authors.
-# SPDX-License-Identifier: Apache-2.0
-#
-# Mirrors Megatron commit b6b49e7e60777e9bfc0947550c967fd858e33dde
-# "Fix double buffering not working with activation recompute (#2689)"
-#
-# DES-LOC Adaptation: HeteroFSDPDoubleBufferRecompute
-# =======================================================
-# Upstream intent (Megatron):
-#   FSDP double-buffering overlaps all-gather communication with compute.
-#   When activation recomputation (gradient checkpointing) is active the
-#   forward pass re-runs inside PRE_BACKWARD state.  The original code
-#   simply skipped parameter resharding during that re-forward, which
-#   prevented the all-gather pipeline from reclaiming buffer slots and
-#   caused silent OOM on long sequences.  The fix introduces *lazy release*:
-#   buffers are tagged as releasable but not freed until the pipeline is
-#   about to allocate a new slot, preserving weights for the backward pass
-#   while keeping peak memory under control.
-#
-# DES-LOC reinterpretation:
-#   On the Neuron_SP cluster (2× A6000 48 GB + 1× H100 NVL 96 GB, PCIe-only,
-#   1.5 TB CPU DRAM) the three devices have radically different memory
-#   capacities and bandwidth.  The standard lazy-release logic assumes a
-#   homogeneous VRAM budget.  Here we extend it with:
-#
-#   1. HeteroDeviceRegistry – tracks per-device VRAM budgets and SM arch
-#      (SM86 vs SM90).
-#   2. LocalityCache – the "LOC" component of DES-LOC.  Released parameter
-#      buffers are not simply discarded; they are migrated to the device
-#      that will need them soonest (predicted by a lightweight layer-order
-#      tracker) or to CPU pinned memory if no GPU has capacity.
-#   3. DecoupledExecutionScheduler – the "DES" component.  Recompute
-#      re-forward and the main backward are decoupled across the device
-#      heterogeneity: recompute preferentially runs on H100 (fast BF16
-#      engine), while gradient accumulation runs on A6000.
-#   4. DoubleBufferRecomputeManager – top-level orchestrator that wires the
-#      above together and exposes the same hook-registration API expected by
-#      DeepSpeed's ZeRO-3 engine.
-
 """
-hetero_fsdp_double_buffer_recompute.py
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-DES-LOC heterogeneous double-buffer management with activation recompute
-support.  Designed for asymmetric PCIe clusters; does NOT require NVLink.
+DES-LOC Heterogeneous FSDP Double-Buffer Recompute Manager
+===========================================================
+
+上游设计意图 (Megatron commit b6b49e7e):
+    Megatron-FSDP 在 activation recompute（梯度检查点）场景下存在 double-buffering
+    失效 bug：当模块处于 PRE_BACKWARD 状态（即正在执行 recompute forward pass）时，
+    原代码在 `_post_forward` hook 中直接跳过了参数释放，导致 all-gather pipeline
+    的 bucket 缓冲区在 recompute 结束前无法被回收，内存峰值异常升高。
+
+    修复思路：引入 `lazy=True` 参数。当 PRE_BACKWARD 状态被检测到，bucket 不立即
+    释放，而是被标记为 `can_be_released`；在 all-gather pipeline 申请新 buffer 之前
+    调用 `recycle_unused_buckets` 批量回收这些 lazy-marked bucket，从而既保留
+    recompute 所需参数，又不阻塞后续 all-gather 的内存分配。
+
+DES-LOC 适配要点：
+    DES-LOC = Decoupled Execution with Shared LOcality Cache。
+    硬件环境：2× A6000 48GB (SM86, PCIe) + 1× H100 NVL 96GB (SM90, PCIe) + 1.5TB CPU DRAM。
+    无 NVLink，GPU 间通信瓶颈是 PCIe 带宽（~32 GB/s bidirectional per slot）。
+
+    核心挑战：
+    1. **异构设备桶分配**：A6000 和 H100 的显存容量、计算吞吐不同，bucket 大小
+       必须按设备类型分别调优（A6000: 保守 128MB/bucket；H100: 激进 512MB/bucket）。
+    2. **Locality Cache 与 lazy release 交互**：DES-LOC 的 SLoC（Shared Locality Cache）
+       在 CPU DRAM 中维护参数的 pinned-memory 副本，用于在 PCIe 传输前做预取。
+       lazy release 不能简单地释放 GPU 显存，还必须通知 SLoC 该 bucket 进入
+       "可驱逐" 状态，避免 CPU 端的 prefetch 线程在 bucket 已被 GPU 释放后仍
+       向其写入数据造成 UAF。
+    3. **Recompute + PCIe all-gather 流水线**：recompute forward 期间，参数已在
+       GPU 显存，但下一轮 all-gather 需要通过 PCIe 重新聚合。lazy release 窗口
+       就是 PCIe 传输的预取窗口，需要精确控制以隐藏 PCIe 延迟。
+    4. **SM86 vs SM90 架构差异**：H100 支持 FP8 + transformer engine；A6000 不支持。
+       FP8 transpose cache 的释放逻辑需要在异构感知路径下分别处理。
+
+作者: Neuron_SP 项目 (github.com/dylanyunlon/Neuron_SP)
+基于: Megatron commit b6b49e7e60777e9bfc0947550c967fd858e33dde
 """
 
 from __future__ import annotations
@@ -49,1018 +41,1067 @@ from __future__ import annotations
 import enum
 import logging
 import threading
-import time
 import weakref
-from collections import defaultdict, deque
+from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import torch
 import torch.nn as nn
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-
-# SM architecture identifiers
-SM86 = 86   # A6000
-SM90 = 90   # H100 NVL
-
-# Bandwidth estimates (GB/s) used for migration cost heuristic
-_PCIE_BW_GBPS = 16.0          # PCIe Gen4 x16 unidirectional
-_CPU_PIN_BW_GBPS = 32.0        # DDR5 write-to-pinned
-
-# Fraction of device VRAM reserved for activations / gradients (not buffers)
-_VRAM_RESERVE_FRACTION = 0.25
-
 
 # ---------------------------------------------------------------------------
-# Enumerations
+# 枚举 & 常量
 # ---------------------------------------------------------------------------
 
 class BucketStatus(enum.Enum):
-    """Lifecycle states of a parameter bucket."""
-    EMPTY        = "empty"        # buffer slot is free
-    FILLING      = "filling"      # all-gather in flight
-    READY        = "ready"        # all-gathered, usable
-    COMMUNICATING = "communicating" # grad reduce in flight
-    LAZY_RELEASE = "lazy_release"  # tagged; awaiting recycle window
+    """Bucket 生命周期状态机，与 Megatron AllGatherPipeline.BucketStatus 对齐。"""
+    EMPTY = "empty"               # 显存已释放
+    WAITING = "waiting"           # 等待 all-gather 启动
+    COMMUNICATING = "communicating"  # PCIe / NVLink 传输中
+    READY = "ready"               # 参数可用
+    LAZY_RELEASABLE = "lazy_releasable"  # DES-LOC 新增：标记可延迟释放
 
 
-class TrainingState(enum.Enum):
-    """Per-module training state, mirroring Megatron's enum."""
-    IDLE         = "idle"
-    FORWARD      = "forward"
-    PRE_BACKWARD = "pre_backward"   # inside activation recompute re-forward
-    BACKWARD     = "backward"
-
-
-class DeviceRole(enum.Enum):
-    """Logical role assigned to each physical device in DES-LOC."""
-    PRIMARY_RECOMPUTE = "primary_recompute"   # H100: runs recompute fwd
-    GRAD_ACCUMULATE   = "grad_accumulate"     # A6000: accumulates grads
-    OFFLOAD_SINK      = "offload_sink"        # CPU DRAM
+class DeviceClass(enum.Enum):
+    """异构设备类型。"""
+    A6000 = "a6000"   # SM86, 48 GB
+    H100 = "h100"     # SM90, 96 GB
+    CPU = "cpu"       # SLoC 所在地
 
 
 # ---------------------------------------------------------------------------
-# Data classes
+# 硬件拓扑感知
 # ---------------------------------------------------------------------------
 
 @dataclass
-class DeviceSpec:
-    """Metadata for one physical device visible to this rank."""
-    device: torch.device
-    sm_arch: int
-    total_vram_bytes: int
-    role: DeviceRole
-    available_bytes: int = field(init=False)
-
-    def __post_init__(self):
-        self.available_bytes = int(
-            self.total_vram_bytes * (1.0 - _VRAM_RESERVE_FRACTION)
-        )
-
-    @property
-    def free_bytes(self) -> int:
-        """Rough remaining capacity (may lag real allocator state)."""
-        if self.device.type == "cpu":
-            return self.available_bytes
-        try:
-            free, _ = torch.cuda.mem_get_info(self.device)
-            return free
-        except Exception:
-            return self.available_bytes
-
-    def can_fit(self, nbytes: int) -> bool:
-        return self.free_bytes >= nbytes
-
-
-@dataclass
-class BucketRecord:
-    """State record for one FSDP parameter bucket."""
-    bucket_id: int
-    bwd: bool
-    status: BucketStatus = BucketStatus.EMPTY
-    tensor: Optional[torch.Tensor] = None
-    locality_device: Optional[torch.device] = None  # where tensor currently lives
-    lazy_release: bool = False
-    last_used_layer: int = -1       # layer index when bucket was last needed
-    migrate_event: Optional[torch.cuda.Event] = None
-
-    @property
-    def nbytes(self) -> int:
-        if self.tensor is None:
-            return 0
-        return self.tensor.nbytes
-
-
-# ---------------------------------------------------------------------------
-# HeteroDeviceRegistry
-# ---------------------------------------------------------------------------
-
-class HeteroDeviceRegistry:
+class HeteroDeviceProfile:
     """
-    Maintains the set of physical devices available to this rank and assigns
-    DES-LOC roles based on SM architecture.
+    描述单个 GPU 的能力，用于 DES-LOC bucket 调度决策。
 
-    On a 2× A6000 + 1× H100 cluster the policy is:
-      - H100  (SM90, 96 GB)  → PRIMARY_RECOMPUTE
-      - A6000 (SM86, 48 GB)  → GRAD_ACCUMULATE  (one per rank or shared)
-      - CPU DRAM             → OFFLOAD_SINK
-
-    The registry is initialised once per process and consulted by both the
-    LocalityCache and DecoupledExecutionScheduler.
+    Attributes:
+        device_id:      torch device index
+        device_class:   A6000 / H100
+        total_mem_gb:   显存容量（GB）
+        sm_count:       SM 数量（用于估算 kernel 并发度）
+        pcie_bw_gbps:   PCIe 带宽（GB/s，单向）
+        supports_fp8:   是否支持 FP8（SM90+）
+        bucket_size_bytes: 当前设备推荐的 all-gather bucket 大小
     """
+    device_id: int
+    device_class: DeviceClass
+    total_mem_gb: float
+    sm_count: int
+    pcie_bw_gbps: float
+    supports_fp8: bool
+    bucket_size_bytes: int
 
-    def __init__(self):
-        self._specs: List[DeviceSpec] = []
-        self._role_map: Dict[DeviceRole, List[DeviceSpec]] = defaultdict(list)
-        self._lock = threading.Lock()
 
-    def register(self, device: torch.device, sm_arch: int, vram_bytes: int) -> DeviceSpec:
-        """Register a physical device and assign its DES-LOC role."""
-        role = self._infer_role(sm_arch, device)
-        spec = DeviceSpec(
-            device=device,
-            sm_arch=sm_arch,
-            total_vram_bytes=vram_bytes,
-            role=role,
-        )
-        with self._lock:
-            self._specs.append(spec)
-            self._role_map[role].append(spec)
+def _detect_device_profile(device_id: int) -> HeteroDeviceProfile:
+    """
+    运行时自动检测 GPU 规格，生成 HeteroDeviceProfile。
+
+    实现策略：
+    - 通过 torch.cuda.get_device_properties 获取 SM 数量和显存。
+    - 通过 compute capability major.minor 区分 SM86 (A6000) 和 SM90 (H100)。
+    - PCIe 带宽通过经验值估算（无法从 CUDA API 直接查询）。
+    """
+    props = torch.cuda.get_device_properties(device_id)
+    major, minor = props.major, props.minor
+    total_mem_gb = props.total_memory / (1024 ** 3)
+    sm_count = props.multi_processor_count
+
+    if major == 9 and minor == 0:
+        # H100 NVL
+        device_class = DeviceClass.H100
+        pcie_bw_gbps = 64.0   # PCIe 5.0 x16 理论单向峰值
+        supports_fp8 = True
+        bucket_size_bytes = 512 * 1024 * 1024  # 512 MB
         logger.info(
-            "HeteroDeviceRegistry: registered %s sm%d vram=%.1f GB role=%s",
-            device, sm_arch, vram_bytes / 2**30, role.value,
+            "device=%d detected as H100 NVL (SM90), "
+            "mem=%.1f GB, sm=%d, bucket=%d MB",
+            device_id, total_mem_gb, sm_count, bucket_size_bytes >> 20,
         )
-        return spec
-
-    @staticmethod
-    def _infer_role(sm_arch: int, device: torch.device) -> DeviceRole:
-        if device.type == "cpu":
-            return DeviceRole.OFFLOAD_SINK
-        if sm_arch >= SM90:
-            return DeviceRole.PRIMARY_RECOMPUTE
-        return DeviceRole.GRAD_ACCUMULATE
-
-    def get_role(self, role: DeviceRole) -> List[DeviceSpec]:
-        return self._role_map.get(role, [])
-
-    def primary_recompute_device(self) -> Optional[torch.device]:
-        specs = self.get_role(DeviceRole.PRIMARY_RECOMPUTE)
-        return specs[0].device if specs else None
-
-    def grad_accumulate_devices(self) -> List[torch.device]:
-        return [s.device for s in self.get_role(DeviceRole.GRAD_ACCUMULATE)]
-
-    def offload_device(self) -> torch.device:
-        specs = self.get_role(DeviceRole.OFFLOAD_SINK)
-        return specs[0].device if specs else torch.device("cpu")
-
-    def best_fit_device(self, nbytes: int, prefer_role: DeviceRole) -> torch.device:
-        """
-        Return the best device for placing *nbytes* of parameter data.
-
-        Priority:
-          1. Preferred role device(s) that have capacity.
-          2. Any GPU device with capacity.
-          3. CPU offload sink.
-        """
-        candidates = self.get_role(prefer_role)
-        for spec in candidates:
-            if spec.can_fit(nbytes):
-                return spec.device
-        for spec in self._specs:
-            if spec.device.type != "cpu" and spec.can_fit(nbytes):
-                return spec.device
+    elif major == 8 and minor == 6:
+        # A6000
+        device_class = DeviceClass.A6000
+        pcie_bw_gbps = 32.0   # PCIe 4.0 x16 理论单向峰值
+        supports_fp8 = False
+        bucket_size_bytes = 128 * 1024 * 1024  # 128 MB
+        logger.info(
+            "device=%d detected as A6000 (SM86), "
+            "mem=%.1f GB, sm=%d, bucket=%d MB",
+            device_id, total_mem_gb, sm_count, bucket_size_bytes >> 20,
+        )
+    else:
+        # 回退：保守配置
+        device_class = DeviceClass.A6000
+        pcie_bw_gbps = 16.0
+        supports_fp8 = False
+        bucket_size_bytes = 64 * 1024 * 1024
         logger.warning(
-            "best_fit_device: no GPU can fit %d bytes, falling back to CPU offload", nbytes
-        )
-        return self.offload_device()
-
-
-# ---------------------------------------------------------------------------
-# LocalityCache
-# ---------------------------------------------------------------------------
-
-class LocalityCache:
-    """
-    The *LOC* pillar of DES-LOC.
-
-    Instead of unconditionally freeing a parameter buffer after lazy-release
-    tagging, the LocalityCache migrates it to the device most likely to need
-    it next.  This amortises PCIe round-trips when activation recomputation
-    performs a second forward pass: the weights are already on the target
-    device (or in fast pinned CPU memory) rather than re-gathered from shards.
-
-    Migration decisions use a simple *next-use distance* heuristic derived
-    from the layer execution order recorded by the DecoupledExecutionScheduler.
-
-    Thread safety: a per-cache RLock protects the internal tables.  Tensor
-    moves are issued asynchronously via CUDA streams and tracked with Events.
-    """
-
-    def __init__(self, registry: HeteroDeviceRegistry, max_cache_bytes: int = 0):
-        self._registry = registry
-        # max_cache_bytes=0 means use available DRAM heuristic
-        self._max_bytes = max_cache_bytes or int(1.5e12 * 0.40)  # 40% of 1.5 TB
-        self._cache: Dict[Tuple[int, bool], BucketRecord] = {}
-        self._total_bytes = 0
-        self._lock = threading.RLock()
-        # Per-device async copy streams (created lazily)
-        self._streams: Dict[torch.device, torch.cuda.Stream] = {}
-        logger.debug("LocalityCache init: max_bytes=%.1f GB", self._max_bytes / 2**30)
-
-    def _get_stream(self, device: torch.device) -> Optional[torch.cuda.Stream]:
-        if device.type == "cpu":
-            return None
-        if device not in self._streams:
-            self._streams[device] = torch.cuda.Stream(device=device)
-        return self._streams[device]
-
-    def store(self, record: BucketRecord, target_device: torch.device) -> None:
-        """
-        Migrate *record.tensor* to *target_device* and update cache tables.
-
-        If the cache is full, the least-recently-used entry is evicted to the
-        CPU offload sink before the new entry is admitted.
-        """
-        if record.tensor is None:
-            logger.debug("LocalityCache.store: bucket %d has no tensor, skip", record.bucket_id)
-            return
-
-        key = (record.bucket_id, record.bwd)
-        nbytes = record.nbytes
-
-        with self._lock:
-            # Evict LRU entries if needed
-            self._evict_to_fit(nbytes)
-
-            stream = self._get_stream(target_device)
-            ctx = torch.cuda.stream(stream) if stream else _nullctx()
-            with ctx:
-                migrated = record.tensor.to(target_device, non_blocking=True)
-                if stream:
-                    event = torch.cuda.Event()
-                    event.record(stream)
-                    record.migrate_event = event
-
-            record.tensor = migrated
-            record.locality_device = target_device
-            self._cache[key] = record
-            self._total_bytes += nbytes
-
-        logger.debug(
-            "LocalityCache.store: bucket (%d, bwd=%s) migrated to %s (%d MB)",
-            record.bucket_id, record.bwd, target_device, nbytes // 2**20,
+            "device=%d has unknown SM%d%d, falling back to conservative profile",
+            device_id, major, minor,
         )
 
-    def retrieve(self, bucket_id: int, bwd: bool) -> Optional[BucketRecord]:
-        """
-        Retrieve a cached bucket record.  Waits for any in-flight migration
-        event before returning, ensuring tensor is safe to use.
-        """
-        key = (bucket_id, bwd)
-        with self._lock:
-            record = self._cache.get(key)
-            if record is None:
-                return None
-            if record.migrate_event is not None:
-                record.migrate_event.synchronize()
-                record.migrate_event = None
-            return record
-
-    def evict(self, bucket_id: int, bwd: bool) -> None:
-        """Explicitly remove a bucket from the cache and free its memory."""
-        key = (bucket_id, bwd)
-        with self._lock:
-            record = self._cache.pop(key, None)
-            if record is not None:
-                self._total_bytes = max(0, self._total_bytes - record.nbytes)
-                del record.tensor
-                record.tensor = None
-        logger.debug("LocalityCache.evict: bucket (%d, bwd=%s) freed", bucket_id, bwd)
-
-    def _evict_to_fit(self, nbytes: int) -> None:
-        """Evict LRU entries until *nbytes* can be accommodated."""
-        sorted_entries = sorted(
-            self._cache.items(), key=lambda kv: kv[1].last_used_layer
-        )
-        for key, record in sorted_entries:
-            if self._total_bytes + nbytes <= self._max_bytes:
-                break
-            if record.tensor is not None:
-                offload = self._registry.offload_device()
-                if record.locality_device != offload:
-                    stream = None  # CPU copies are synchronous for safety
-                    record.tensor = record.tensor.to(offload)
-                    record.locality_device = offload
-                    logger.debug(
-                        "LocalityCache: LRU evict bucket (%d, %s) to CPU",
-                        record.bucket_id, record.bwd,
-                    )
-                else:
-                    self._total_bytes = max(0, self._total_bytes - record.nbytes)
-                    del record.tensor
-                    record.tensor = None
-                    del self._cache[key]
-
-
-class _nullctx:
-    """Minimal no-op context manager (avoids importing contextlib)."""
-    def __enter__(self): return self
-    def __exit__(self, *a): pass
-
-
-# ---------------------------------------------------------------------------
-# DecoupledExecutionScheduler
-# ---------------------------------------------------------------------------
-
-class DecoupledExecutionScheduler:
-    """
-    The *DES* pillar of DES-LOC.
-
-    Tracks layer execution order and assigns each layer's recompute-forward
-    to the most capable device (H100 when available).  The main backward
-    gradient accumulation is steered to A6000 devices, exploiting their
-    larger aggregate VRAM (2× 48 GB = 96 GB) for gradient tensors.
-
-    The scheduler exposes three hooks that DoubleBufferRecomputeManager
-    installs on each FSDP unit:
-      - on_forward_enter  : record layer order; decide execution device.
-      - on_forward_exit   : trigger lazy-release or immediate release.
-      - on_backward_enter : restore parameters from LocalityCache if needed.
-
-    Design note on PCIe bandwidth:
-      PCIe-only bandwidth (~16 GB/s) is roughly 6× slower than NVLink.  The
-      scheduler therefore tries to *avoid* cross-device weight movement during
-      the recompute window by pre-staging weights via LocalityCache.store()
-      while the previous layer's backward is running (pipeline overlap).
-    """
-
-    def __init__(
-        self,
-        registry: HeteroDeviceRegistry,
-        locality_cache: LocalityCache,
-    ):
-        self._registry = registry
-        self._cache = locality_cache
-        self._layer_order: List[int] = []          # module ids in fwd order
-        self._layer_index: Dict[int, int] = {}     # module_id → layer index
-        self._prefetch_queue: deque = deque()
-        self._lock = threading.Lock()
-
-    # ------------------------------------------------------------------
-    # Layer order recording
-    # ------------------------------------------------------------------
-
-    def record_forward(self, module_id: int) -> int:
-        """Record that *module_id* executed in the forward pass; return its index."""
-        with self._lock:
-            if module_id not in self._layer_index:
-                idx = len(self._layer_order)
-                self._layer_order.append(module_id)
-                self._layer_index[module_id] = idx
-                logger.debug("DES scheduler: layer %d registered (module_id=%d)", idx, module_id)
-            return self._layer_index[module_id]
-
-    def next_layer_index(self, current_idx: int) -> int:
-        return current_idx + 1
-
-    # ------------------------------------------------------------------
-    # Device assignment
-    # ------------------------------------------------------------------
-
-    def recompute_device_for(self, layer_idx: int) -> torch.device:
-        """
-        Assign execution device for recompute forward of *layer_idx*.
-
-        Policy:
-          - H100 (PRIMARY_RECOMPUTE) if available and can fit the layer.
-          - Otherwise first available A6000.
-        """
-        primary = self._registry.primary_recompute_device()
-        if primary is not None:
-            return primary
-        grads = self._registry.grad_accumulate_devices()
-        if grads:
-            return grads[layer_idx % len(grads)]
-        return torch.device("cuda:0")
-
-    def grad_accumulate_device_for(self, layer_idx: int) -> torch.device:
-        """Return the A6000 device responsible for this layer's gradients."""
-        devs = self._registry.grad_accumulate_devices()
-        if not devs:
-            return torch.device("cuda:0")
-        return devs[layer_idx % len(devs)]
-
-    # ------------------------------------------------------------------
-    # Prefetch scheduling
-    # ------------------------------------------------------------------
-
-    def schedule_prefetch(
-        self,
-        bucket_id: int,
-        bwd: bool,
-        target_device: torch.device,
-        record: BucketRecord,
-    ) -> None:
-        """
-        Schedule async prefetch of *bucket_id* to *target_device*.
-
-        Called during the backward of layer N to pre-stage weights for the
-        recompute forward of layer N+1, overlapping PCIe transfer with compute.
-        """
-        with self._lock:
-            self._prefetch_queue.append((bucket_id, bwd, target_device, record))
-        self._drain_prefetch_queue()
-
-    def _drain_prefetch_queue(self) -> None:
-        while True:
-            with self._lock:
-                if not self._prefetch_queue:
-                    break
-                bucket_id, bwd, target_device, record = self._prefetch_queue.popleft()
-            if record.tensor is not None and record.locality_device != target_device:
-                logger.debug(
-                    "DES prefetch: bucket (%d, bwd=%s) → %s", bucket_id, bwd, target_device
-                )
-                self._cache.store(record, target_device)
-
-
-# ---------------------------------------------------------------------------
-# AllGatherPipelineProxy
-# ---------------------------------------------------------------------------
-
-class AllGatherPipelineProxy:
-    """
-    Thin proxy around DeepSpeed's internal all-gather pipeline object.
-
-    Extends release_bucket() with DES-LOC lazy-release and cache-migration
-    semantics.  The real pipeline object is held by weak reference to avoid
-    keeping it alive after ZeRO engine teardown.
-
-    This mirrors Megatron's AllGatherPipeline.release_bucket() changes in
-    param_and_grad_buffer.py with three additions:
-      1. lazy=True tags the bucket instead of releasing immediately.
-      2. recycle_unused_buckets() flushes tagged buckets before new alloc.
-      3. Released tensors are handed to LocalityCache rather than freed.
-    """
-
-    def __init__(
-        self,
-        real_pipeline: Any,
-        locality_cache: LocalityCache,
-        scheduler: DecoupledExecutionScheduler,
-        registry: HeteroDeviceRegistry,
-    ):
-        self._pipeline_ref = weakref.ref(real_pipeline)
-        self._cache = locality_cache
-        self._scheduler = scheduler
-        self._registry = registry
-        # bucket_id → BucketRecord
-        self._records: Dict[Tuple[int, bool], BucketRecord] = {}
-        self._lock = threading.RLock()
-
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
-
-    def _get_or_create_record(self, bucket_id: int, bwd: bool) -> BucketRecord:
-        key = (bucket_id, bwd)
-        if key not in self._records:
-            self._records[key] = BucketRecord(bucket_id=bucket_id, bwd=bwd)
-        return self._records[key]
-
-    # ------------------------------------------------------------------
-    # Public API (mirrors Megatron AllGatherPipeline)
-    # ------------------------------------------------------------------
-
-    def mark_bucket_ready(self, bucket_id: int, bwd: bool, tensor: torch.Tensor) -> None:
-        """Called when an all-gather completes; tensor is the gathered buffer."""
-        with self._lock:
-            record = self._get_or_create_record(bucket_id, bwd)
-            record.tensor = tensor
-            record.status = BucketStatus.READY
-            record.locality_device = tensor.device
-
-    def release_bucket(
-        self,
-        bucket_id: int,
-        bwd: bool,
-        lazy: bool = False,
-        layer_idx: int = -1,
-    ) -> None:
-        """
-        Release (or lazily tag) a parameter bucket after forward/backward use.
-
-        Args:
-            bucket_id: Bucket identifier.
-            bwd:       True if called from the backward pass.
-            lazy:      If True, defer actual release to recycle_unused_buckets().
-                       This matches Megatron's lazy parameter for activation
-                       recompute; here we additionally migrate the tensor to the
-                       LocalityCache for potential reuse on recompute.
-            layer_idx: Layer index hint for DES prefetch scheduling.
-
-        DES-LOC extension vs Megatron:
-            Megatron's lazy path simply marks bucket_can_be_released[key]=True.
-            Here, instead of leaving the tensor in the original VRAM, we migrate
-            it to the device most likely to need it next (recompute device for
-            the same layer index).  This exploits CPU DRAM headroom (1.5 TB)
-            as an intermediary when neither GPU has capacity.
-        """
-        with self._lock:
-            record = self._get_or_create_record(bucket_id, bwd)
-
-            if record.status == BucketStatus.EMPTY:
-                logger.debug("release_bucket: bucket (%d, %s) already empty", bucket_id, bwd)
-                return
-
-            if lazy:
-                record.lazy_release = True
-                record.status = BucketStatus.LAZY_RELEASE
-                record.last_used_layer = layer_idx
-
-                # DES-LOC: migrate to recompute device proactively
-                recompute_dev = self._scheduler.recompute_device_for(layer_idx)
-                if record.tensor is not None:
-                    nbytes = record.nbytes
-                    target = self._registry.best_fit_device(
-                        nbytes, DeviceRole.PRIMARY_RECOMPUTE
-                    )
-                    logger.debug(
-                        "release_bucket lazy: bucket (%d, %s) → LocalityCache on %s",
-                        bucket_id, bwd, target,
-                    )
-                    self._cache.store(record, target)
-                return
-
-            # Immediate release
-            if record.status == BucketStatus.COMMUNICATING:
-                raise ValueError(
-                    f"release_bucket: bucket ({bucket_id}, bwd={bwd}) is "
-                    "communicating and cannot be released."
-                )
-            self._do_release(record)
-
-    def recycle_unused_buckets(self) -> None:
-        """
-        Flush all lazily-tagged buckets.
-
-        Called by AllGatherPipeline just before allocating a new buffer slot
-        (mirrors Megatron's recycle_unused_buckets hook).  Buckets that were
-        pre-migrated to LocalityCache are simply evicted from there; buckets
-        still in VRAM are freed immediately.
-        """
-        with self._lock:
-            lazy_keys = [
-                k for k, r in self._records.items()
-                if r.lazy_release and r.status == BucketStatus.LAZY_RELEASE
-            ]
-        for key in lazy_keys:
-            bid, bwd = key
-            logger.debug("recycle_unused_buckets: releasing (%d, bwd=%s)", bid, bwd)
-            self._cache.evict(bid, bwd)
-            with self._lock:
-                record = self._records.get(key)
-                if record:
-                    self._do_release(record)
-
-    def _do_release(self, record: BucketRecord) -> None:
-        """Free buffer memory and reset record status (must hold self._lock)."""
-        if record.tensor is not None:
-            del record.tensor
-            record.tensor = None
-        record.status = BucketStatus.EMPTY
-        record.lazy_release = False
-        record.locality_device = None
-
-    def get_cached_tensor(
-        self, bucket_id: int, bwd: bool
-    ) -> Optional[torch.Tensor]:
-        """
-        Retrieve a parameter tensor from LocalityCache (for recompute reuse).
-
-        Returns None if the tensor is no longer cached, in which case the
-        caller must issue a fresh all-gather.
-        """
-        cached = self._cache.retrieve(bucket_id, bwd)
-        if cached is None or cached.tensor is None:
-            return None
-        logger.debug(
-            "get_cached_tensor: hit bucket (%d, bwd=%s) on %s",
-            bucket_id, bwd, cached.locality_device,
-        )
-        return cached.tensor
-
-
-# ---------------------------------------------------------------------------
-# DoubleBufferRecomputeManager
-# ---------------------------------------------------------------------------
-
-class DoubleBufferRecomputeManager:
-    """
-    Top-level DES-LOC orchestrator for double-buffered FSDP with activation
-    recompute on heterogeneous hardware.
-
-    Responsibilities
-    ----------------
-    1. Wraps DeepSpeed's ZeRO-3 parameter-buffer management with the extended
-       AllGatherPipelineProxy.
-    2. Installs PyTorch forward/backward hooks on each FSDP unit module to
-       intercept parameter release decisions.
-    3. Enforces the lazy-release semantics during activation recomputation
-       (PRE_BACKWARD state) so that the recompute re-forward can reuse
-       already-gathered parameters from LocalityCache rather than triggering
-       redundant all-gathers over slow PCIe.
-    4. Coordinates the DecoupledExecutionScheduler to route recompute compute
-       to H100 and gradient accumulation to A6000.
-
-    Relationship to Megatron fix (#2689)
-    -------------------------------------
-    The upstream fix adds `lazy=True` to `release_module_parameters()` when
-    `module._training_state == TrainingState.PRE_BACKWARD`, instead of the
-    previous behaviour of returning early without any release.
-
-    DES-LOC goes further: the lazy-released tensor is migrated to a
-    LocalityCache entry on the predicted recompute device, so the second
-    forward pass (inside PRE_BACKWARD) can find the weights already resident
-    on the H100 rather than re-gathering from A6000 shards.
-
-    Usage
-    -----
-    ::
-
-        manager = DoubleBufferRecomputeManager.build_from_cluster_info(
-            local_rank=0,
-            module=model,
-        )
-        manager.register_all_hooks()
-        # … standard DeepSpeed training loop …
-        manager.teardown()
-
-    """
-
-    def __init__(
-        self,
-        registry: HeteroDeviceRegistry,
-        locality_cache: LocalityCache,
-        scheduler: DecoupledExecutionScheduler,
-        pipeline_proxy: AllGatherPipelineProxy,
-        fsdp_unit_modules: List[type],
-    ):
-        self._registry = registry
-        self._cache = locality_cache
-        self._scheduler = scheduler
-        self._proxy = pipeline_proxy
-        self._fsdp_unit_types = tuple(fsdp_unit_modules)
-        self._hook_handles: List[Any] = []
-        self._param_to_bucket: Dict[int, int] = {}   # param data_ptr → bucket_id
-
-    # ------------------------------------------------------------------
-    # Factory
-    # ------------------------------------------------------------------
-
-    @classmethod
-    def build_from_cluster_info(
-        cls,
-        local_rank: int,
-        module: nn.Module,
-        fsdp_unit_modules: Optional[List[type]] = None,
-        max_cache_bytes: int = 0,
-        real_pipeline: Optional[Any] = None,
-    ) -> "DoubleBufferRecomputeManager":
-        """
-        Construct a DoubleBufferRecomputeManager by auto-detecting GPUs.
-
-        For the Neuron_SP cluster topology (2× A6000 + 1× H100):
-          cuda:0 → H100 96 GB  SM90
-          cuda:1 → A6000 48 GB SM86
-          cuda:2 → A6000 48 GB SM86
-        Actual detection uses torch.cuda.get_device_properties().
-        """
-        registry = HeteroDeviceRegistry()
-
-        n_gpus = torch.cuda.device_count()
-        for i in range(n_gpus):
-            dev = torch.device(f"cuda:{i}")
-            props = torch.cuda.get_device_properties(dev)
-            sm = props.major * 10 + props.minor
-            vram = props.total_memory
-            registry.register(dev, sm, vram)
-
-        # Register CPU offload sink
-        import psutil
-        cpu_ram = psutil.virtual_memory().total if _has_psutil() else int(1.5e12)
-        registry.register(torch.device("cpu"), sm_arch=0, vram_bytes=cpu_ram)
-
-        locality_cache = LocalityCache(registry, max_cache_bytes=max_cache_bytes)
-        scheduler = DecoupledExecutionScheduler(registry, locality_cache)
-
-        # Wrap or stub real pipeline
-        stub_pipeline = real_pipeline or _StubPipeline()
-        proxy = AllGatherPipelineProxy(
-            stub_pipeline, locality_cache, scheduler, registry
-        )
-
-        fu_types: List[type] = fsdp_unit_modules or [nn.Linear, nn.LayerNorm]
-
-        mgr = cls(registry, locality_cache, scheduler, proxy, fu_types)
-
-        logger.info(
-            "DoubleBufferRecomputeManager: local_rank=%d, %d GPU(s) registered, "
-            "recompute_device=%s, grad_devices=%s",
-            local_rank,
-            n_gpus,
-            registry.primary_recompute_device(),
-            registry.grad_accumulate_devices(),
-        )
-        return mgr
-
-    # ------------------------------------------------------------------
-    # Hook registration
-    # ------------------------------------------------------------------
-
-    def register_all_hooks(self, root_module: nn.Module) -> None:
-        """
-        Walk *root_module* and install forward/backward hooks on every FSDP
-        unit sub-module.
-        """
-        for name, submod in root_module.named_modules():
-            if isinstance(submod, self._fsdp_unit_types):
-                self._install_hooks(submod, name)
-        logger.info(
-            "DoubleBufferRecomputeManager: %d hook handles registered",
-            len(self._hook_handles),
-        )
-
-    def _install_hooks(self, module: nn.Module, name: str) -> None:
-        module._training_state = TrainingState.IDLE  # type: ignore[attr-defined]
-
-        fwd_pre_h = module.register_forward_pre_hook(self._pre_forward_hook)
-        fwd_h = module.register_forward_hook(self._post_forward_hook)
-        bwd_h = module.register_full_backward_hook(self._backward_hook)
-
-        self._hook_handles.extend([fwd_pre_h, fwd_h, bwd_h])
-        logger.debug("hooks installed on %s (%s)", name, type(module).__name__)
-
-    # ------------------------------------------------------------------
-    # Hooks
-    # ------------------------------------------------------------------
-
-    def _pre_forward_hook(self, module: nn.Module, inputs: Any) -> None:
-        """
-        Pre-forward: record layer index for DES scheduling; attempt to
-        restore parameters from LocalityCache before triggering all-gather.
-
-        If the module is entering recompute (PRE_BACKWARD), we set state here
-        so the post-forward hook can distinguish normal forward from recompute.
-        """
-        mod_id = id(module)
-        layer_idx = self._scheduler.record_forward(mod_id)
-        module._des_layer_idx = layer_idx  # type: ignore[attr-defined]
-
-        # Check if we are in the recompute re-forward context
-        current_state = getattr(module, "_training_state", TrainingState.IDLE)
-        if current_state == TrainingState.PRE_BACKWARD:
-            logger.debug(
-                "pre_forward hook: module %d in PRE_BACKWARD (recompute), "
-                "checking LocalityCache for cached parameters",
-                mod_id,
-            )
-
-    def _post_forward_hook(
-        self, module: nn.Module, inputs: Any, output: Any
-    ) -> Any:
-        """
-        Post-forward: decide whether to release parameters immediately or
-        lazily, mirroring Megatron's fix for activation recompute.
-
-        Key logic (DES-LOC adaptation of Megatron _post_forward):
-          - PRE_BACKWARD  → lazy_release=True  (recompute re-forward; weights
-                            may be needed again; migrate to LocalityCache on
-                            recompute device)
-          - Normal fwd    → lazy_release=False (immediate release; no recompute
-                            needed; recycle VRAM now)
-        """
-        assert isinstance(module, self._fsdp_unit_types), (
-            "_post_forward_hook registered on non-FSDP-unit module"
-        )
-
-        training_state: TrainingState = getattr(
-            module, "_training_state", TrainingState.IDLE
-        )
-        layer_idx: int = getattr(module, "_des_layer_idx", -1)
-
-        if training_state == TrainingState.PRE_BACKWARD:
-            lazy_release = True
-            # Do NOT set IDLE here; backward hook will do it
-            logger.debug(
-                "post_forward: layer %d PRE_BACKWARD → lazy release, "
-                "staging to recompute device",
-                layer_idx,
-            )
-        else:
-            lazy_release = False
-            module._training_state = TrainingState.IDLE  # type: ignore[attr-defined]
-
-        self._release_module_parameters(module, bwd=False, lazy=lazy_release)
-        return output
-
-    def _backward_hook(
-        self,
-        module: nn.Module,
-        grad_input: Any,
-        grad_output: Any,
-    ) -> None:
-        """
-        Backward hook: release parameters post-backward and evict locality
-        cache entries no longer needed.
-        """
-        layer_idx: int = getattr(module, "_des_layer_idx", -1)
-        self._release_module_parameters(module, bwd=True, lazy=False)
-        module._training_state = TrainingState.IDLE  # type: ignore[attr-defined]
-
-        # Recycle lazily-tagged buckets now that backward is complete
-        self._proxy.recycle_unused_buckets()
-        logger.debug("backward_hook: layer %d recycled unused buckets", layer_idx)
-
-    # ------------------------------------------------------------------
-    # Parameter release
-    # ------------------------------------------------------------------
-
-    def _release_module_parameters(
-        self, module: nn.Module, bwd: bool, lazy: bool
-    ) -> None:
-        """
-        Iterate module parameters and release their backing buckets via the
-        AllGatherPipelineProxy.
-
-        This is the DES-LOC equivalent of Megatron's release_module_parameters
-        (megatron_fsdp.py line ~510).  The core change: pass lazy=lazy to
-        proxy.release_bucket() so that activation-recompute paths defer
-        deallocation while still making tensors available in LocalityCache.
-        """
-        layer_idx: int = getattr(module, "_des_layer_idx", -1)
-        for param in module.parameters():
-            ptr = param.data_ptr()
-            bucket_id = self._param_to_bucket.get(ptr)
-            if bucket_id is None:
-                continue
-            try:
-                self._proxy.release_bucket(
-                    bucket_id=bucket_id,
-                    bwd=bwd,
-                    lazy=lazy,
-                    layer_idx=layer_idx,
-                )
-            except ValueError as exc:
-                logger.error(
-                    "_release_module_parameters: %s (bucket=%d, bwd=%s)",
-                    exc, bucket_id, bwd,
-                )
-                raise
-
-    # ------------------------------------------------------------------
-    # Param → bucket registration
-    # ------------------------------------------------------------------
-
-    def register_param_bucket(self, param: torch.Tensor, bucket_id: int) -> None:
-        """Map a parameter tensor to its bucket_id (called during model init)."""
-        self._param_to_bucket[param.data_ptr()] = bucket_id
-
-    # ------------------------------------------------------------------
-    # Teardown
-    # ------------------------------------------------------------------
-
-    def teardown(self) -> None:
-        """Remove all registered hooks and clear caches."""
-        for handle in self._hook_handles:
-            handle.remove()
-        self._hook_handles.clear()
-        logger.info("DoubleBufferRecomputeManager: teardown complete")
-
-
-# ---------------------------------------------------------------------------
-# Stub helpers
-# ---------------------------------------------------------------------------
-
-class _StubPipeline:
-    """Minimal no-op pipeline stub for unit testing without a real cluster."""
-
-    def recycle_unused_buckets(self):
-        pass
-
-
-def _has_psutil() -> bool:
-    try:
-        import psutil  # noqa: F401
-        return True
-    except ImportError:
-        return False
-
-
-# ---------------------------------------------------------------------------
-# DeepSpeed integration shim
-# ---------------------------------------------------------------------------
-
-def patch_deepspeed_zero3_engine(engine: Any, manager: DoubleBufferRecomputeManager) -> None:
-    """
-    Monkey-patch a DeepSpeed ZeRO-3 engine's parameter-gathering pipeline
-    with the DES-LOC AllGatherPipelineProxy.
-
-    This is the integration point for Neuron_SP projects that use:
-        engine = deepspeed.initialize(model=..., config=ds_config)
-    followed by:
-        patch_deepspeed_zero3_engine(engine, manager)
-
-    After patching, the engine's internal `_param_coordinator` will use the
-    extended release semantics.
-
-    NOTE: DeepSpeed internals vary by version.  This shim targets DS ≥ 0.14.
-    If `_param_coordinator` is absent, the patch is a no-op with a warning.
-    """
-    coordinator = getattr(engine, "_param_coordinator", None)
-    if coordinator is None:
-        logger.warning(
-            "patch_deepspeed_zero3_engine: no _param_coordinator found; "
-            "DES-LOC patch not applied.  Check DeepSpeed version."
-        )
-        return
-
-    # Attach proxy so coordinator can call manager._proxy.release_bucket
-    coordinator._des_loc_proxy = manager._proxy
-    logger.info(
-        "patch_deepspeed_zero3_engine: AllGatherPipelineProxy attached to "
-        "ZeRO-3 coordinator."
+    return HeteroDeviceProfile(
+        device_id=device_id,
+        device_class=device_class,
+        total_mem_gb=total_mem_gb,
+        sm_count=sm_count,
+        pcie_bw_gbps=pcie_bw_gbps,
+        supports_fp8=supports_fp8,
+        bucket_size_bytes=bucket_size_bytes,
     )
 
 
 # ---------------------------------------------------------------------------
-# Smoke test
+# SLoC (Shared Locality Cache) 接口
+# ---------------------------------------------------------------------------
+
+class SLocCacheState(enum.Enum):
+    """CPU DRAM 中 SLoC 条目的状态。"""
+    PINNED_PREFETCH = "pinned_prefetch"   # 正在向 GPU 预取
+    RESIDENT = "resident"                  # 参数驻留在 GPU，CPU 副本为 shadow
+    EVICTABLE = "evictable"               # GPU 已释放，CPU 副本可被驱逐
+    EVICTED = "evicted"                   # CPU 副本已被驱逐
+
+
+@dataclass
+class SLocEntry:
+    """
+    SLoC 中单个 bucket 的 CPU 端元数据。
+
+    DES-LOC 设计：CPU DRAM (1.5 TB) 作为 "第三层" 参数存储，
+    在 PCIe 传输前对热点参数做 pinned-memory 预取，以隐藏 PCIe 延迟。
+    """
+    bucket_key: Tuple[int, bool]
+    cpu_buffer: Optional[torch.Tensor] = None   # pinned memory
+    state: SLocCacheState = SLocCacheState.EVICTED
+    prefetch_stream: Optional[torch.cuda.Stream] = None
+    last_access_step: int = 0
+
+
+class SharedLocalityCache:
+    """
+    DES-LOC Shared Locality Cache (SLoC) —— CPU DRAM 参数缓存层。
+
+    职责：
+    1. 维护 pinned-memory CPU 副本，供 all-gather 的 H2D 传输使用。
+    2. 提供 `mark_evictable` 接口，让 lazy-release 逻辑安全地通知 CPU 端。
+    3. 在 `recycle_unused_buckets` 被调用时，批量驱逐 EVICTABLE 条目，
+       释放 CPU DRAM 压力。
+
+    线程安全：所有公开方法持 `_lock` 后操作共享状态。
+    """
+
+    def __init__(self, max_cpu_bytes: int = 32 * 1024 ** 3):
+        """
+        Args:
+            max_cpu_bytes: SLoC 允许使用的最大 CPU DRAM（默认 32 GB）。
+                           相对于 1.5 TB 总 DRAM 非常保守，避免影响 OS。
+        """
+        self._entries: Dict[Tuple[int, bool], SLocEntry] = {}
+        self._lock = threading.Lock()
+        self._max_cpu_bytes = max_cpu_bytes
+        self._used_cpu_bytes = 0
+        self._step = 0
+        logger.debug(
+            "SLoC initialized: max_cpu_bytes=%d GB",
+            max_cpu_bytes >> 30,
+        )
+
+    def register_bucket(
+        self,
+        bucket_key: Tuple[int, bool],
+        param_numel: int,
+        dtype: torch.dtype,
+    ) -> None:
+        """
+        在 SLoC 中注册一个 bucket，分配 pinned-memory CPU 副本。
+
+        Args:
+            bucket_key: (bucket_id, bwd) 复合键
+            param_numel: 参数元素数
+            dtype: 参数数据类型
+        """
+        nbytes = param_numel * torch.finfo(dtype).bits // 8
+        with self._lock:
+            if bucket_key in self._entries:
+                return
+            if self._used_cpu_bytes + nbytes > self._max_cpu_bytes:
+                logger.warning(
+                    "SLoC CPU quota exceeded: used=%d MB, need=%d MB, skipping registration",
+                    self._used_cpu_bytes >> 20, nbytes >> 20,
+                )
+                return
+            cpu_buf = torch.empty(param_numel, dtype=dtype, pin_memory=True)
+            entry = SLocEntry(
+                bucket_key=bucket_key,
+                cpu_buffer=cpu_buf,
+                state=SLocCacheState.EVICTED,
+            )
+            self._entries[bucket_key] = entry
+            self._used_cpu_bytes += nbytes
+            logger.debug(
+                "SLoC registered bucket_key=%s, numel=%d, dtype=%s, cpu_mb=%.1f",
+                bucket_key, param_numel, dtype, nbytes / (1024 ** 2),
+            )
+
+    def mark_evictable(self, bucket_key: Tuple[int, bool]) -> None:
+        """
+        将 bucket 标记为可驱逐状态。
+
+        DES-LOC 关键接口：当 GPU 端执行 lazy release（参数已进入
+        LAZY_RELEASABLE 状态）时，必须调用此函数通知 SLoC，
+        否则预取线程可能向已释放的 GPU 缓冲区写入数据。
+
+        Args:
+            bucket_key: (bucket_id, bwd)
+        """
+        with self._lock:
+            entry = self._entries.get(bucket_key)
+            if entry is None:
+                return
+            if entry.state == SLocCacheState.PINNED_PREFETCH:
+                logger.warning(
+                    "SLoC: bucket_key=%s marked evictable while prefetch in-flight; "
+                    "will evict after prefetch completes.",
+                    bucket_key,
+                )
+                # 预取完成后再驱逐（由 prefetch 完成回调负责）
+                entry.state = SLocCacheState.EVICTABLE
+            else:
+                entry.state = SLocCacheState.EVICTABLE
+                logger.debug("SLoC: bucket_key=%s → EVICTABLE", bucket_key)
+
+    def evict_evictable_buckets(self) -> int:
+        """
+        批量驱逐所有处于 EVICTABLE 状态的 SLoC 条目，释放 CPU DRAM。
+
+        Returns:
+            释放的字节数。
+        """
+        freed = 0
+        with self._lock:
+            for key, entry in list(self._entries.items()):
+                if entry.state == SLocCacheState.EVICTABLE:
+                    if entry.cpu_buffer is not None:
+                        freed += entry.cpu_buffer.nbytes
+                        del entry.cpu_buffer
+                        entry.cpu_buffer = None
+                    entry.state = SLocCacheState.EVICTED
+                    logger.debug("SLoC: evicted bucket_key=%s, freed=%d KB", key, freed >> 10)
+        self._used_cpu_bytes = max(0, self._used_cpu_bytes - freed)
+        return freed
+
+    def get_entry(self, bucket_key: Tuple[int, bool]) -> Optional[SLocEntry]:
+        with self._lock:
+            return self._entries.get(bucket_key)
+
+    def increment_step(self) -> None:
+        with self._lock:
+            self._step += 1
+
+
+# ---------------------------------------------------------------------------
+# 异构 AllGather Pipeline（DES-LOC 适配版）
+# ---------------------------------------------------------------------------
+
+class HeteroAllGatherPipeline:
+    """
+    DES-LOC 异构 All-Gather Pipeline。
+
+    上游对应：megatron/core/distributed/fsdp/src/megatron_fsdp/param_and_grad_buffer.py
+    :: AllGatherPipeline。
+
+    DES-LOC 适配要点：
+    1. **Lazy release**：bucket_can_be_released 字典记录可延迟释放的 bucket，
+       在 `recycle_unused_buckets` 中批量处理，而非逐个立即释放。
+    2. **SLoC 通知**：释放 GPU 显存前，必须先调用 `sloc.mark_evictable`，
+       确保 CPU 端预取线程感知到 bucket 生命周期变化。
+    3. **异构 bucket 大小**：不同设备类型使用不同 bucket_size，
+       通过 `device_profile` 在构造时确定。
+    4. **FP8 transpose cache**：仅 H100 (SM90) 路径下才管理 FP8 transpose cache，
+       A6000 路径跳过以避免无效内存操作。
+    """
+
+    def __init__(
+        self,
+        device_profile: HeteroDeviceProfile,
+        sloc: SharedLocalityCache,
+        num_buckets: int,
+    ):
+        """
+        Args:
+            device_profile: 当前 GPU 的硬件规格
+            sloc:           共享的 SLoC 实例
+            num_buckets:    总 bucket 数量（与模型分片数对应）
+        """
+        self.device_profile = device_profile
+        self.sloc = sloc
+        self.num_buckets = num_buckets
+
+        # bucket 状态字典: (bucket_id, bwd) -> BucketStatus
+        self.bucket_status: Dict[Tuple[int, bool], BucketStatus] = {}
+        # lazy-release 标记：Megatron commit 新增的核心数据结构
+        self.bucket_can_be_released: Dict[Tuple[int, bool], bool] = {}
+        # GPU 显存 buffer（简化表示，实际应为 torch.Storage）
+        self._gpu_buffers: Dict[Tuple[int, bool], Optional[torch.Tensor]] = {}
+        # FP8 transpose cache（仅 H100 路径）
+        self._fp8_transpose_cache: Dict[Tuple[int, bool], Optional[torch.Tensor]] = {}
+        # CUDA stream 用于异步 H2D 传输
+        self._comm_stream = torch.cuda.Stream(device=device_profile.device_id)
+
+        # 初始化所有 bucket 为 EMPTY
+        for bid in range(num_buckets):
+            for bwd in (False, True):
+                key = (bid, bwd)
+                self.bucket_status[key] = BucketStatus.EMPTY
+                self.bucket_can_be_released[key] = False
+                self._gpu_buffers[key] = None
+                self._fp8_transpose_cache[key] = None
+
+        logger.info(
+            "HeteroAllGatherPipeline: device=%d (%s), num_buckets=%d, "
+            "bucket_size=%d MB, fp8=%s",
+            device_profile.device_id,
+            device_profile.device_class.value,
+            num_buckets,
+            device_profile.bucket_size_bytes >> 20,
+            device_profile.supports_fp8,
+        )
+
+    def get_bucket_key(self, bucket_id: int, bwd: bool) -> Tuple[int, bool]:
+        """生成 bucket 复合键。"""
+        return (bucket_id, bwd)
+
+    def wait_bucket_ready(
+        self, bucket_id: int, bwd: bool, empty_ok: bool = False
+    ) -> None:
+        """
+        等待 bucket 完成通信（PCIe all-gather 完成）。
+
+        DES-LOC 说明：由于无 NVLink，通信延迟以 PCIe 带宽为瓶颈。
+        此函数同步 `_comm_stream`，确保 H2D 传输完成后再访问 GPU 缓冲区。
+
+        Args:
+            bucket_id: bucket 索引
+            bwd:       是否为反向 all-gather
+            empty_ok:  允许 bucket 已为 EMPTY 状态
+        """
+        key = self.get_bucket_key(bucket_id, bwd)
+        status = self.bucket_status[key]
+        if status == BucketStatus.EMPTY:
+            if not empty_ok:
+                raise RuntimeError(
+                    f"Bucket {bucket_id} (bwd={bwd}) is EMPTY but empty_ok=False."
+                )
+            return
+        if status == BucketStatus.COMMUNICATING:
+            # 同步 PCIe 传输流
+            logger.debug(
+                "Waiting for PCIe all-gather: bucket=%d bwd=%s device=%d",
+                bucket_id, bwd, self.device_profile.device_id,
+            )
+            torch.cuda.current_stream(
+                self.device_profile.device_id
+            ).wait_stream(self._comm_stream)
+            self.bucket_status[key] = BucketStatus.READY
+            logger.debug(
+                "Bucket %d (bwd=%s) all-gather complete on device %d",
+                bucket_id, bwd, self.device_profile.device_id,
+            )
+
+    def recycle_unused_buckets(self) -> int:
+        """
+        批量回收所有被标记为 LAZY_RELEASABLE 的 bucket。
+
+        上游对应：AllGatherPipeline.recycle_unused_buckets（Megatron commit 新增）。
+
+        DES-LOC 适配：
+        - 回收 GPU 显存之前，先通知 SLoC 将对应 CPU 副本标记为 EVICTABLE。
+        - 对 H100 路径，同时清理 FP8 transpose cache。
+        - 返回回收的 bucket 数量，供调用方决策是否触发 CPU GC。
+
+        Returns:
+            回收的 bucket 数量。
+        """
+        recycled = 0
+        for key, can_release in list(self.bucket_can_be_released.items()):
+            if not can_release:
+                continue
+            if self.bucket_status[key] == BucketStatus.LAZY_RELEASABLE:
+                bucket_id, bwd = key
+                try:
+                    self._do_release_gpu_buffer(bucket_id, bwd)
+                    recycled += 1
+                except Exception as exc:
+                    logger.error(
+                        "Failed to recycle bucket_key=%s: %s", key, exc, exc_info=True
+                    )
+        if recycled:
+            logger.debug(
+                "recycle_unused_buckets: recycled=%d buckets on device=%d",
+                recycled, self.device_profile.device_id,
+            )
+            # 触发 SLoC CPU 端驱逐
+            freed_cpu = self.sloc.evict_evictable_buckets()
+            if freed_cpu:
+                logger.info(
+                    "SLoC evicted %d MB CPU DRAM after GPU bucket recycle",
+                    freed_cpu >> 20,
+                )
+        return recycled
+
+    def _do_release_gpu_buffer(self, bucket_id: int, bwd: bool) -> None:
+        """
+        实际释放 GPU 显存（bucket 不再持有 GPU buffer）。
+
+        内部实现逻辑：
+        1. 先通知 SLoC 标记 EVICTABLE（防止 CPU 预取线程 UAF）。
+        2. H100 路径：若存在 FP8 transpose weight buffer，优先释放它；
+           否则释放 model weight buffer。（与 Megatron 原逻辑一致）
+        3. A6000 路径：直接释放 model weight buffer（无 FP8 路径）。
+        4. 更新 bucket_status → EMPTY，重置 lazy-release 标记。
+        """
+        key = (bucket_id, bwd)
+        # Step 1: 通知 SLoC
+        self.sloc.mark_evictable(key)
+
+        # Step 2/3: 异构感知释放
+        if self.device_profile.supports_fp8 and self._fp8_transpose_cache[key] is not None:
+            # H100 FP8 路径：释放 transpose cache
+            logger.debug(
+                "Releasing FP8 transpose cache for bucket_key=%s on H100", key
+            )
+            del self._fp8_transpose_cache[key]
+            self._fp8_transpose_cache[key] = None
+        else:
+            # 通用路径：释放 model weight buffer
+            if self._gpu_buffers[key] is not None:
+                logger.debug(
+                    "Releasing GPU weight buffer for bucket_key=%s on device=%d",
+                    key, self.device_profile.device_id,
+                )
+                del self._gpu_buffers[key]
+                self._gpu_buffers[key] = None
+
+        # Step 4: 更新状态
+        self.bucket_status[key] = BucketStatus.EMPTY
+        self.bucket_can_be_released[key] = False
+
+    @torch.no_grad()
+    def release_bucket(self, bucket_id: int, bwd: bool, lazy: bool = False) -> None:
+        """
+        释放指定参数 bucket，根据 lazy 参数决定立即释放或延迟释放。
+
+        上游对应：AllGatherPipeline.release_bucket（Megatron commit b6b49e7e 修改）。
+
+        DES-LOC 适配说明：
+        - lazy=False（正常前向/后向结束）：立即同步并释放 GPU 显存，
+          同步通知 SLoC 驱逐 CPU 副本。
+        - lazy=True（activation recompute 的 PRE_BACKWARD 状态）：
+          仅将 bucket 状态切换为 LAZY_RELEASABLE，并同步通知 SLoC 进入
+          EVICTABLE 预备状态；真正的 GPU 显存释放由 `recycle_unused_buckets`
+          在 all-gather pipeline 申请新 buffer 前完成。
+          这样做的好处：recompute forward 完成后，如果 backward 还需要这些参数，
+          它们仍在 GPU 显存中；如果不需要，pipeline 会在下次 all-gather 前
+          批量回收，减少 PCIe 往返次数。
+
+        Args:
+            bucket_id: bucket 索引
+            bwd:       是否为反向 all-gather
+            lazy:      是否启用延迟释放（DES-LOC activation recompute 路径）
+
+        Raises:
+            ValueError: bucket 正在通信中且非 lazy 模式
+        """
+        key = self.get_bucket_key(bucket_id, bwd)
+
+        if self.bucket_status[key] == BucketStatus.EMPTY:
+            logger.debug(
+                "release_bucket: bucket_key=%s already EMPTY, skip", key
+            )
+            return
+
+        if lazy:
+            # Megatron 修复的核心：延迟释放标记
+            # DES-LOC 额外：同步通知 SLoC，防止预取线程 UAF
+            self.bucket_can_be_released[key] = True
+            self.bucket_status[key] = BucketStatus.LAZY_RELEASABLE
+            self.sloc.mark_evictable(key)
+            logger.debug(
+                "release_bucket: bucket_key=%s marked LAZY_RELEASABLE on device=%d",
+                key, self.device_profile.device_id,
+            )
+            return
+
+        # 立即释放路径
+        self.wait_bucket_ready(bucket_id, bwd, empty_ok=True)
+        if self.bucket_status[key] == BucketStatus.COMMUNICATING:
+            raise ValueError(
+                f"Bucket {bucket_id} (bwd={bwd}) is COMMUNICATING and cannot be released immediately. "
+                f"Device={self.device_profile.device_id}"
+            )
+        self._do_release_gpu_buffer(bucket_id, bwd)
+        logger.debug(
+            "release_bucket: bucket_key=%s released immediately on device=%d",
+            key, self.device_profile.device_id,
+        )
+
+    def request_buffer_for_allgather(self, bucket_id: int, bwd: bool) -> torch.Tensor:
+        """
+        在发起 all-gather 前申请 GPU buffer。
+
+        DES-LOC 说明：这是 `recycle_unused_buckets` 的调用点。
+        在申请新 buffer 之前，先批量回收 LAZY_RELEASABLE bucket，
+        确保有足够的显存配额（对 A6000 48 GB 尤其重要）。
+
+        Args:
+            bucket_id: 目标 bucket 索引
+            bwd:       是否为反向 all-gather
+
+        Returns:
+            分配好的 GPU tensor buffer
+        """
+        # 申请前先回收 lazy bucket，释放显存压力
+        recycled = self.recycle_unused_buckets()
+        if recycled:
+            logger.info(
+                "Pre-allgather recycle freed %d buckets on device=%d",
+                recycled, self.device_profile.device_id,
+            )
+
+        key = self.get_bucket_key(bucket_id, bwd)
+        numel = self.device_profile.bucket_size_bytes // 2  # bf16: 2 bytes per element
+        buf = torch.empty(
+            numel,
+            dtype=torch.bfloat16,
+            device=self.device_profile.device_id,
+        )
+        self._gpu_buffers[key] = buf
+        self.bucket_status[key] = BucketStatus.WAITING
+        logger.debug(
+            "Allocated all-gather buffer: bucket_key=%s, numel=%d, device=%d",
+            key, numel, self.device_profile.device_id,
+        )
+        return buf
+
+
+# ---------------------------------------------------------------------------
+# Training State（与 Megatron TrainingState 对齐）
+# ---------------------------------------------------------------------------
+
+class TrainingState(enum.Enum):
+    """
+    模块训练状态机。
+
+    与 Megatron MegatronFSDP._training_state 语义完全一致，
+    在 DES-LOC 中额外用于决定 SLoC 预取策略：
+    - IDLE/FORWARD：SLoC 主动预取下一 bucket 的 CPU 副本到 GPU。
+    - PRE_BACKWARD：SLoC 保持当前 GPU 参数，不触发新的 H2D 传输。
+    - BACKWARD：SLoC 允许后向 all-gather 覆盖前向 buffer。
+    """
+    IDLE = "idle"
+    FORWARD = "forward"
+    PRE_BACKWARD = "pre_backward"
+    BACKWARD = "backward"
+
+
+# ---------------------------------------------------------------------------
+# FP8 Transpose Cache 管理（H100 专用路径）
+# ---------------------------------------------------------------------------
+
+def release_params_fp8_transpose_cache_hetero(
+    parameters, device_profile: HeteroDeviceProfile
+) -> None:
+    """
+    异构感知的 FP8 transpose cache 释放函数。
+
+    上游对应：release_params_fp8_transpose_cache（Megatron）。
+
+    DES-LOC 适配：
+    - 仅在 SM90 (H100) 设备上执行 FP8 cache 清理，A6000 直接跳过。
+    - 避免在 A6000 上调用不存在的 FP8 接口导致运行时错误。
+
+    Args:
+        parameters:     参数迭代器
+        device_profile: 当前设备规格
+    """
+    if not device_profile.supports_fp8:
+        logger.debug(
+            "Skipping FP8 transpose cache release on %s (no FP8 support)",
+            device_profile.device_class.value,
+        )
+        return
+    # H100 路径：清理 FP8 transpose cache
+    for param in parameters:
+        if hasattr(param, '_fp8_transpose_cache'):
+            del param._fp8_transpose_cache
+            param._fp8_transpose_cache = None
+            logger.debug(
+                "Cleared FP8 transpose cache for param shape=%s on H100",
+                tuple(param.shape),
+            )
+
+
+# ---------------------------------------------------------------------------
+# DES-LOC HeteroFSDP 核心模块
+# ---------------------------------------------------------------------------
+
+@dataclass
+class HeteroFSDPConfig:
+    """
+    DES-LOC 异构 FSDP 配置。
+
+    Attributes:
+        keep_fp8_transpose_cache: 是否保留 FP8 transpose cache（H100 路径）
+        sloc_max_cpu_bytes:       SLoC 最大 CPU DRAM 配额
+        lazy_release_on_recompute: 是否在 activation recompute 时启用 lazy release
+                                   （对应 Megatron 的 bugfix）
+        device_ids:               参与训练的 GPU device id 列表
+    """
+    keep_fp8_transpose_cache: bool = False
+    sloc_max_cpu_bytes: int = 32 * 1024 ** 3  # 32 GB
+    lazy_release_on_recompute: bool = True
+    device_ids: List[int] = field(default_factory=lambda: [0, 1, 2])
+
+
+class HeteroFSDPDoubleBufferRecompute:
+    """
+    DES-LOC 异构 FSDP Double-Buffer + Activation Recompute 管理器。
+
+    上游对应：MegatronFSDP（megatron_fsdp.py）中 `_post_forward` hook
+    与 `release_module_parameters` 的修复逻辑（commit b6b49e7e）。
+
+    设计意图（上游）：
+        activation recompute（梯度检查点）会在 PRE_BACKWARD 状态下
+        重新执行前向传播。原代码在此状态下直接 return，跳过参数释放，
+        导致 double-buffering 的内存复用逻辑完全失效（all-gather pipeline
+        无法回收已完成聚合的 bucket）。修复方案是引入 lazy release：
+        recompute forward 完成后将 bucket 标记为可释放，而不是立即释放，
+        从而既不阻断 recompute 的参数访问，又能让 pipeline 在合适时机
+        批量回收。
+
+    DES-LOC 适配（本类职责）：
+        1. 管理多个异构设备（A6000 × 2 + H100 × 1）各自的 AllGatherPipeline。
+        2. 在 `_post_forward_hook` 中实现异构感知的 lazy vs. immediate release。
+        3. 通过 SLoC 接口协调 CPU DRAM 预取与 GPU 显存释放的时序。
+        4. 提供统一的 `register_module` 接口，将 hook 注册到任意 nn.Module。
+
+    典型调用流程：
+        manager = HeteroFSDPDoubleBufferRecompute(config)
+        manager.register_module(transformer_layer)
+
+        # 训练循环中：
+        # forward → _post_forward_hook 自动触发 lazy/immediate release
+        # backward → release_module_parameters(bwd=True) 触发后向 release
+        # 下一 step 前：allgather pipeline 调用 request_buffer_for_allgather
+        #              自动触发 recycle_unused_buckets
+    """
+
+    def __init__(self, config: HeteroFSDPConfig):
+        """
+        Args:
+            config: DES-LOC 异构 FSDP 配置
+        """
+        self.config = config
+
+        # 构建 SLoC（单例，所有设备共享 CPU DRAM 副本）
+        self.sloc = SharedLocalityCache(
+            max_cpu_bytes=config.sloc_max_cpu_bytes
+        )
+
+        # 为每个设备构建异构感知的 AllGather Pipeline
+        self.pipelines: Dict[int, HeteroAllGatherPipeline] = {}
+        self.device_profiles: Dict[int, HeteroDeviceProfile] = {}
+        for dev_id in config.device_ids:
+            profile = _detect_device_profile(dev_id)
+            self.device_profiles[dev_id] = profile
+            # num_buckets 此处为占位符，实际应由 ParamAndGradBuffer 传入
+            pipeline = HeteroAllGatherPipeline(
+                device_profile=profile,
+                sloc=self.sloc,
+                num_buckets=64,  # placeholder
+            )
+            self.pipelines[dev_id] = pipeline
+
+        # 已注册模块的弱引用集合（避免循环引用）
+        self._registered_modules: Set[weakref.ref] = set()
+        # 模块 -> 设备 id 映射
+        self._module_device: Dict[int, int] = {}
+        # 模块 -> 参数 bucket id 列表映射（简化：每模块一个 bucket）
+        self._module_buckets: Dict[int, List[int]] = {}
+
+        logger.info(
+            "HeteroFSDPDoubleBufferRecompute initialized: "
+            "devices=%s, lazy_release=%s, sloc_cpu_gb=%d",
+            config.device_ids,
+            config.lazy_release_on_recompute,
+            config.sloc_max_cpu_bytes >> 30,
+        )
+
+    def _get_pipeline_for_module(self, module: nn.Module) -> HeteroAllGatherPipeline:
+        """根据模块所在设备获取对应的 AllGather Pipeline。"""
+        mod_id = id(module)
+        dev_id = self._module_device.get(mod_id, self.config.device_ids[0])
+        return self.pipelines[dev_id]
+
+    def release_module_parameters(
+        self,
+        module: nn.Module,
+        bwd: bool,
+        lazy: bool = False,
+    ) -> None:
+        """
+        释放模块的参数 bucket。
+
+        上游对应：MegatronFSDP.release_module_parameters（commit b6b49e7e 修改）。
+
+        DES-LOC 适配：
+        - 路由到对应设备的 HeteroAllGatherPipeline。
+        - 传递 lazy 参数给 pipeline.release_bucket。
+        - 异构感知的 FP8 transpose cache 处理。
+
+        Args:
+            module: 要释放参数的模块
+            bwd:    是否为后向释放
+            lazy:   是否延迟释放（activation recompute 路径）
+        """
+        pipeline = self._get_pipeline_for_module(module)
+        profile = self.device_profiles.get(
+            self._module_device.get(id(module), self.config.device_ids[0])
+        )
+        mod_id = id(module)
+        bucket_ids = self._module_buckets.get(mod_id, [0])
+
+        for bucket_id in bucket_ids:
+            pipeline.release_bucket(bucket_id, bwd=bwd, lazy=lazy)
+
+        # FP8 transpose cache 释放（异构感知：仅 H100）
+        if not self.config.keep_fp8_transpose_cache and profile is not None:
+            release_params_fp8_transpose_cache_hetero(
+                module.parameters(), profile
+            )
+
+    def _post_forward_hook(
+        self,
+        module: nn.Module,
+        input: Any,
+        output: Any,
+    ) -> Any:
+        """
+        模块前向传播结束后的 hook。
+
+        上游对应：MegatronFSDP._post_forward（commit b6b49e7e 核心修改点）。
+
+        原始 bug：
+            if module._training_state == TrainingState.PRE_BACKWARD:
+                return output  # ← 完全跳过释放，导致 double-buffer 失效
+
+        修复后（上游 + DES-LOC 联合逻辑）：
+            1. 检测 PRE_BACKWARD（即 activation recompute 正在执行）。
+            2. 若是，启用 lazy_release=True，仅标记 bucket 为 LAZY_RELEASABLE，
+               不立即释放 GPU 显存。
+            3. 若否，立即释放（lazy_release=False），并将模块状态置为 IDLE。
+            4. 所有路径都调用 release_module_parameters，不再有早退路径。
+
+        DES-LOC 额外逻辑：
+            - lazy=True 时，SLoC 同步标记 CPU 副本为 EVICTABLE，
+              避免 H2D 预取线程在 bucket 被 GPU 重用前写入过期数据。
+
+        Args:
+            module: 触发 hook 的模块
+            input:  前向输入（未使用）
+            output: 前向输出（原样返回）
+
+        Returns:
+            原始前向输出（不修改）
+        """
+        training_state: TrainingState = getattr(
+            module, '_training_state', TrainingState.IDLE
+        )
+
+        # 核心逻辑：对应 Megatron commit b6b49e7e 的修复
+        if training_state == TrainingState.PRE_BACKWARD:
+            # Activation recompute forward 正在执行。
+            # 不能立即释放参数（backward 仍需要）。
+            # DES-LOC: 标记 LAZY_RELEASABLE，SLoC 同步收到 EVICTABLE 信号。
+            lazy_release = True
+            logger.debug(
+                "module=%s in PRE_BACKWARD (recompute forward), using lazy_release",
+                module.__class__.__name__,
+            )
+        else:
+            # 正常前向结束，立即释放
+            lazy_release = False
+            module._training_state = TrainingState.IDLE
+            logger.debug(
+                "module=%s forward done, immediate release, state→IDLE",
+                module.__class__.__name__,
+            )
+
+        # 无论 lazy 与否，都调用 release_module_parameters（修复了原代码的 early return）
+        self.release_module_parameters(module, bwd=False, lazy=lazy_release)
+
+        return output
+
+    def register_module(
+        self,
+        module: nn.Module,
+        device_id: Optional[int] = None,
+        bucket_ids: Optional[List[int]] = None,
+    ) -> None:
+        """
+        将模块注册到 DES-LOC HeteroFSDP 管理器，注册 post-forward hook。
+
+        Args:
+            module:     要托管的 nn.Module
+            device_id:  模块所在 GPU（None 则自动推断）
+            bucket_ids: 模块对应的 all-gather bucket id 列表
+        """
+        mod_id = id(module)
+
+        # 自动推断设备
+        if device_id is None:
+            try:
+                param = next(iter(module.parameters()))
+                device_id = param.device.index or self.config.device_ids[0]
+            except StopIteration:
+                device_id = self.config.device_ids[0]
+
+        if device_id not in self.pipelines:
+            logger.warning(
+                "device_id=%d not in registered pipelines %s, using default",
+                device_id, list(self.pipelines.keys()),
+            )
+            device_id = self.config.device_ids[0]
+
+        self._module_device[mod_id] = device_id
+        self._module_buckets[mod_id] = bucket_ids or [mod_id % 64]
+
+        # 初始化模块训练状态
+        module._training_state = TrainingState.IDLE
+
+        # 注册 post-forward hook
+        handle = module.register_forward_hook(self._post_forward_hook)
+        self._registered_modules.add(weakref.ref(module))
+
+        logger.info(
+            "Registered module=%s on device=%d, buckets=%s",
+            module.__class__.__name__, device_id,
+            self._module_buckets[mod_id],
+        )
+
+    def trigger_recycle_all_devices(self) -> Dict[int, int]:
+        """
+        触发所有设备的 lazy bucket 回收。
+
+        在每个 all-gather 发起前或 step 结束时调用，
+        确保 LAZY_RELEASABLE bucket 得到及时回收。
+
+        Returns:
+            {device_id: recycled_count} 字典
+        """
+        results = {}
+        for dev_id, pipeline in self.pipelines.items():
+            recycled = pipeline.recycle_unused_buckets()
+            results[dev_id] = recycled
+            if recycled:
+                logger.info(
+                    "Device %d: recycled %d lazy-released buckets", dev_id, recycled
+                )
+        return results
+
+    def get_memory_summary(self) -> Dict[str, Any]:
+        """
+        返回各设备 GPU 显存使用摘要（用于监控和调试）。
+
+        Returns:
+            包含每设备 active_buckets、sloc_cpu_mb 等信息的字典
+        """
+        summary: Dict[str, Any] = {}
+        for dev_id, pipeline in self.pipelines.items():
+            active = sum(
+                1 for status in pipeline.bucket_status.values()
+                if status not in (BucketStatus.EMPTY,)
+            )
+            lazy_pending = sum(
+                1 for status in pipeline.bucket_status.values()
+                if status == BucketStatus.LAZY_RELEASABLE
+            )
+            if torch.cuda.is_available():
+                try:
+                    alloc_mb = torch.cuda.memory_allocated(dev_id) / (1024 ** 2)
+                    reserved_mb = torch.cuda.memory_reserved(dev_id) / (1024 ** 2)
+                except Exception:
+                    alloc_mb = reserved_mb = -1.0
+            else:
+                alloc_mb = reserved_mb = -1.0
+            summary[f"device_{dev_id}"] = {
+                "device_class": self.device_profiles[dev_id].device_class.value,
+                "active_buckets": active,
+                "lazy_pending_buckets": lazy_pending,
+                "gpu_alloc_mb": alloc_mb,
+                "gpu_reserved_mb": reserved_mb,
+            }
+        summary["sloc_cpu_used_gb"] = self.sloc._used_cpu_bytes / (1024 ** 3)
+        return summary
+
+
+# ---------------------------------------------------------------------------
+# DeepSpeed ZeRO 集成适配层
+# ---------------------------------------------------------------------------
+
+class DESLOCZeroHook:
+    """
+    将 HeteroFSDPDoubleBufferRecompute 集成到 DeepSpeed ZeRO-3 引擎的适配层。
+
+    DeepSpeed ZeRO-3 与 Megatron-FSDP 在参数分片上逻辑类似，
+    但接口不同。此类提供桥接，使 DES-LOC 的 lazy release 逻辑
+    能够挂载到 DeepSpeed 的 pre/post forward 钩子体系中。
+
+    使用方式：
+        engine = deepspeed.initialize(...)
+        hook = DESLOCZeroHook(engine, hetero_manager)
+        hook.install()
+    """
+
+    def __init__(
+        self,
+        ds_engine,  # deepspeed.DeepSpeedEngine
+        hetero_manager: HeteroFSDPDoubleBufferRecompute,
+    ):
+        self.ds_engine = ds_engine
+        self.hetero_manager = hetero_manager
+        self._installed = False
+        logger.info(
+            "DESLOCZeroHook created for DeepSpeed engine, hetero_devices=%s",
+            hetero_manager.config.device_ids,
+        )
+
+    def install(self) -> None:
+        """
+        安装 ZeRO pre/post forward 钩子。
+
+        DeepSpeed ZeRO-3 通过 `_pre_forward_module_hook` 和
+        `_post_forward_module_hook` 管理参数 all-gather，
+        我们在 post-forward 中插入 DES-LOC lazy release 逻辑。
+        """
+        if self._installed:
+            logger.warning("DESLOCZeroHook already installed, skip")
+            return
+
+        # 遍历 ZeRO-3 管理的所有子模块，注册到 hetero_manager
+        if hasattr(self.ds_engine, 'module'):
+            for mod in self.ds_engine.module.modules():
+                if len(list(mod.parameters(recurse=False))) > 0:
+                    self.hetero_manager.register_module(mod)
+
+        self._installed = True
+        logger.info(
+            "DESLOCZeroHook installed: %d modules registered",
+            len(self.hetero_manager._module_device),
+        )
+
+    def on_step_end(self) -> None:
+        """
+        在每个训练 step 结束时调用，触发全设备 lazy bucket 回收。
+
+        建议在 `engine.step()` 之后调用。
+        """
+        summary = self.hetero_manager.trigger_recycle_all_devices()
+        mem = self.hetero_manager.get_memory_summary()
+        logger.info("Step end recycle summary: %s", summary)
+        logger.debug("Memory summary: %s", mem)
+
+
+# ---------------------------------------------------------------------------
+# Smoke Test
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     logging.basicConfig(
-        level=logging.DEBUG,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
 
-    # --- Registry smoke test ---
-    reg = HeteroDeviceRegistry()
-    # Simulate 1× H100 + 2× A6000 (using CPU as stand-in if no GPU)
-    dev_cpu = reg.register(torch.device("cpu"), sm_arch=0, vram_bytes=int(1.5e12))
-    assert dev_cpu.role == DeviceRole.OFFLOAD_SINK, "CPU must be OFFLOAD_SINK"
+    # ---- 1. SLoC 基本功能 ----
+    sloc = SharedLocalityCache(max_cpu_bytes=1 * 1024 ** 3)
+    sloc.register_bucket((0, False), param_numel=1024, dtype=torch.float32)
+    sloc.mark_evictable((0, False))
+    freed = sloc.evict_evictable_buckets()
+    assert freed > 0, "SLoC should have freed memory after eviction"
+    logger.info("SLoC smoke test passed: freed=%d bytes", freed)
 
-    # --- LocalityCache smoke test ---
-    cache = LocalityCache(reg, max_cache_bytes=int(1e9))
-    rec = BucketRecord(bucket_id=0, bwd=False)
-    rec.tensor = torch.randn(1024, dtype=torch.float16)
-    rec.status = BucketStatus.LAZY_RELEASE
-    rec.locality_device = torch.device("cpu")
-    cache.store(rec, torch.device("cpu"))
-    retrieved = cache.retrieve(0, False)
-    assert retrieved is not None, "cache.retrieve must return stored record"
-    assert retrieved.tensor is not None, "tensor must survive round-trip"
-
-    # --- AllGatherPipelineProxy lazy-release test ---
-    stub = _StubPipeline()
-    sched = DecoupledExecutionScheduler(reg, cache)
-    proxy = AllGatherPipelineProxy(stub, cache, sched, reg)
-
-    t = torch.randn(512, dtype=torch.float32)
-    proxy.mark_bucket_ready(bucket_id=1, bwd=False, tensor=t)
-    proxy.release_bucket(bucket_id=1, bwd=False, lazy=True, layer_idx=0)
-    rec1 = proxy._records[(1, False)]
-    assert rec1.status == BucketStatus.LAZY_RELEASE, "lazy release must set LAZY_RELEASE status"
-
-    proxy.recycle_unused_buckets()
-    assert proxy._records[(1, False)].status == BucketStatus.EMPTY, \
-        "recycle must clear LAZY_RELEASE bucket to EMPTY"
-
-    # --- DoubleBufferRecomputeManager hook state test ---
-    class _FakeFSDPUnit(nn.Linear):
-        pass
-
-    mgr = DoubleBufferRecomputeManager(
-        registry=reg,
-        locality_cache=cache,
-        scheduler=sched,
-        pipeline_proxy=proxy,
-        fsdp_unit_modules=[_FakeFSDPUnit],
+    # ---- 2. 设备检测（CPU 回退） ----
+    # 若无 CUDA，_detect_device_profile 会抛出；直接构造 mock profile
+    mock_profile_a6000 = HeteroDeviceProfile(
+        device_id=0, device_class=DeviceClass.A6000,
+        total_mem_gb=48.0, sm_count=84, pcie_bw_gbps=32.0,
+        supports_fp8=False, bucket_size_bytes=128 * 1024 * 1024,
     )
-    layer = _FakeFSDPUnit(4, 4)
-    layer._training_state = TrainingState.PRE_BACKWARD
-    layer._des_layer_idx = 0
-    # Simulate post_forward during recompute: expect no exception
-    out = torch.randn(2, 4)
-    result = mgr._post_forward_hook(layer, None, out)
-    assert result is out, "_post_forward_hook must return output unchanged"
-    # State must remain PRE_BACKWARD (not reset to IDLE during recompute)
-    assert layer._training_state == TrainingState.PRE_BACKWARD, \
-        "training_state must stay PRE_BACKWARD during lazy release"
+    mock_profile_h100 = HeteroDeviceProfile(
+        device_id=2, device_class=DeviceClass.H100,
+        total_mem_gb=96.0, sm_count=132, pcie_bw_gbps=64.0,
+        supports_fp8=True, bucket_size_bytes=512 * 1024 * 1024,
+    )
+    assert mock_profile_a6000.supports_fp8 is False
+    assert mock_profile_h100.supports_fp8 is True
+    logger.info("Device profile smoke test passed")
 
-    logger.info("All smoke tests passed.")
+    # ---- 3. Lazy release 标记流程 ----
+    sloc2 = SharedLocalityCache(max_cpu_bytes=1 * 1024 ** 3)
+    pipeline = HeteroAllGatherPipeline(
+        device_profile=mock_profile_a6000, sloc=sloc2, num_buckets=4
+    )
+    # 模拟 bucket 进入 READY 状态
+    key = (0, False)
+    pipeline.bucket_status[key] = BucketStatus.READY
+    pipeline._gpu_buffers[key] = torch.zeros(16)
+    # lazy release
+    pipeline.release_bucket(0, bwd=False, lazy=True)
+    assert pipeline.bucket_status[key] == BucketStatus.LAZY_RELEASABLE
+    assert pipeline.bucket_can_be_released[key] is True
+    # recycle
+    recycled = pipeline.recycle_unused_buckets()
+    assert recycled == 1
+    assert pipeline.bucket_status[key] == BucketStatus.EMPTY
+    logger.info("Lazy release smoke test passed: recycled=%d", recycled)
+
+    # ---- 4. Post-forward hook PRE_BACKWARD 路径 ----
+    config = HeteroFSDPConfig(
+        device_ids=[],  # 无真实 GPU，跳过 detect
+        lazy_release_on_recompute=True,
+    )
+    # 手动注入 mock pipeline
+    manager = object.__new__(HeteroFSDPDoubleBufferRecompute)
+    manager.config = config
+    manager.sloc = sloc2
+    manager.pipelines = {0: pipeline}
+    manager.device_profiles = {0: mock_profile_a6000}
+    manager._registered_modules = set()
+    manager._module_device = {}
+    manager._module_buckets = {}
+
+    dummy_mod = nn.Linear(4, 4)
+    dummy_mod._training_state = TrainingState.PRE_BACKWARD
+    manager._module_device[id(dummy_mod)] = 0
+    manager._module_buckets[id(dummy_mod)] = [0]
+
+    # 重置 bucket 状态为 READY 以测试 hook
+    pipeline.bucket_status[key] = BucketStatus.READY
+    pipeline._gpu_buffers[key] = torch.zeros(16)
+    pipeline.bucket_can_be_released[key] = False
+
+    out = manager._post_forward_hook(dummy_mod, None, torch.zeros(1))
+    assert pipeline.bucket_status[key] == BucketStatus.LAZY_RELEASABLE, (
+        f"Expected LAZY_RELEASABLE, got {pipeline.bucket_status[key]}"
+    )
+    assert dummy_mod._training_state == TrainingState.PRE_BACKWARD  # 状态不应被改为 IDLE
+    logger.info("PRE_BACKWARD hook smoke test passed")
+
+    logger.info("All smoke tests passed ✓")
