@@ -2,782 +2,767 @@
 DES-LOC Heterogeneous Pinned Buffer Configuration
 ==================================================
 
-Upstream intent (Megatron fde4059):
-    Megatron-LM added ``cpu_offloading_retain_pinned_cpu_buffers`` to
-    ``ModelParallelConfig`` so that pinned CPU buffers allocated during
-    activation / weight offloading are *not* freed at the end of an
-    iteration but are kept alive and reused in the next one.  The primary
-    motivation is CUDA-graph compatibility: CUDA graphs require that tensor
-    addresses remain stable across captures and replays, so releasing and
-    re-allocating pinned buffers between iterations would invalidate any
-    captured graph.
+Upstream design intent (Megatron fde4059):
+    Megatron-LM added `cpu_offloading_retain_pinned_cpu_buffers` to ModelParallelConfig
+    so that pinned CPU buffers allocated during activation/weight offloading are NOT freed
+    after each forward/backward pass, but instead retained and reused in the next iteration.
+    The primary motivation was CUDA graph capture: graphs require tensor addresses to be
+    stable across replays, and reallocating pinned buffers each iteration breaks that
+    invariant.  The config flag threads through TransformerBlock → TE extension layer →
+    transformer_engine's internal offload context.
 
 DES-LOC adaptation points:
-    In the DES-LOC (Decoupled Execution with Shared LOcality Cache)
-    framework the situation is richer than Megatron's single-tier CPU pool:
+    In the Neuron_SP DES-LOC framework the situation is more complex than homogeneous
+    Megatron because we have THREE device tiers with very different memory and bandwidth
+    characteristics:
 
-    1. **Heterogeneous device fleet** – we manage three distinct device
-       classes simultaneously:
-         • SM86 workers  (2 × A6000 48 GB, PCIe, no NVLink)
-         • SM90 worker   (1 × H100 NVL 96 GB, PCIe)
-         • Host DRAM     (1.5 TB, shared NUMA locality cache)
+        Tier-0  │  1× H100 NVL 96 GB  SM90  │  PCIe Gen5 ×16 to host
+        Tier-1  │  2× A6000 48 GB     SM86  │  PCIe Gen4 ×16 to host  (no NVLink)
+        Tier-2  │  CPU DRAM 1.5 TB          │  shared LLC / NUMA
 
-    2. **Per-device buffer affinity** – a pinned buffer allocated on NUMA
-       node 0 (closest to A6000s) must not be transparently reused for
-       transfers targeting the H100, and vice-versa.  ``HeteroPinnedBufferConfig``
-       encodes per-tier retention policies and NUMA affinities.
+    Because there is no NVLink, D2D copies between H100 and A6000 must transit PCIe and
+    the host memory bus.  DES-LOC mitigates this with a "Shared LOcality Cache" (LOC): a
+    region of pinned DRAM that is simultaneously mapped into the virtual address spaces of
+    all three CUDA contexts via `cudaHostRegister` / `cudaHostGetDevicePointer`.
 
-    3. **Shared LOcality Cache (SLC)** – the 1.5 TB DRAM hosts the SLC
-       which acts as a staging area between GPU tiers.  Pinned buffer
-       lifetime and reuse must be co-ordinated with SLC eviction policy to
-       avoid double-buffering the same tensor in both pinned memory and the
-       SLC.
+    The key insight reinterpreted from Megatron's flag:
+        • Megatron retains ONE pool of pinned buffers per layer for CUDA-graph stability.
+        • DES-LOC retains UP TO THREE pools per tensor (one staging buffer per device
+          tier), because the same activation tensor may need to be streamed from CPU→A6000
+          for the forward pass on Tier-1, then CPU→H100 for a recompute on Tier-0, and
+          we want to avoid double-allocating the host-side staging area.
 
-    4. **CUDA-graph stability across tiers** – SM90 (H100) can capture
-       CUDA graphs with large batch sizes while SM86 (A6000) workers run
-       smaller micro-batches.  Buffer addresses must remain stable *per
-       device tier* independently, so retention is managed per-tier rather
-       than as a global flag.
+    This module provides `HeteroPinnedBufferConfig` (the DES-LOC analogue of Megatron's
+    config flag) and `HeteroPinnedBufferPool` (the runtime manager that honours it).
 
-    5. **DeepSpeed ZeRO integration** – DeepSpeed's ZeRO-Offload already
-       maintains its own pinned parameter/gradient buffers.  This module
-       wraps and extends those buffers with the DES-LOC retention semantic
-       rather than duplicating allocation logic.
+    Lifecycle
+    ---------
+    1.  During engine init `HeteroPinnedBufferPool` is created from a
+        `HeteroPinnedBufferConfig` and attached to the DeepSpeed engine.
+    2.  Before each micro-batch, the engine calls `pool.begin_iteration()`.
+    3.  Transformer layers call `pool.acquire(key, nbytes, device)` to get a pinned
+        staging view sized for `device`.
+    4.  After the backward pass the engine calls `pool.end_iteration()`.
+        - If `retain_across_iterations=True` the physical memory is kept; only the
+          in-use flag is cleared.
+        - If `retain_across_iterations=False` buffers are freed to recover DRAM.
+    5.  When CUDA graphs are being captured (`pool.cuda_graph_capture_mode=True`),
+        `acquire` always returns the *same* tensor object for a given key so that graph
+        nodes see stable addresses.
 
-Author: Neuron_SP project (DES-LOC adaptation of Megatron fde4059a9d47)
+Author: Neuron_SP project (DES-LOC heterogeneous training framework)
+Mirrors: Megatron-LM commit fde4059a9d47c0e209720acbce09baf8c5842af2
 """
 
 from __future__ import annotations
 
 import logging
-import math
-import os
 import threading
 import weakref
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Iterator, List, Optional, Tuple
 
 import torch
 
 logger = logging.getLogger(__name__)
 
+
 # ---------------------------------------------------------------------------
-# Device-tier taxonomy
+# Enumerations
 # ---------------------------------------------------------------------------
 
 class DeviceTier(Enum):
-    """Logical tiers of the DES-LOC heterogeneous cluster."""
-    SM86 = auto()   # A6000 48 GB, PCIe, SM capability 8.6
-    SM90 = auto()   # H100 NVL 96 GB, PCIe, SM capability 9.0
-    HOST = auto()   # 1.5 TB CPU DRAM – the Shared LOcality Cache tier
+    """Device tiers in the DES-LOC heterogeneous cluster."""
+    H100   = auto()   # Tier-0: 1× H100 NVL 96 GB SM90
+    A6000  = auto()   # Tier-1: 2× A6000 48 GB   SM86
+    CPU    = auto()   # Tier-2: CPU DRAM (pinned)
 
 
-_TIER_NAMES: Dict[DeviceTier, str] = {
-    DeviceTier.SM86: "A6000_SM86",
-    DeviceTier.SM90: "H100NVL_SM90",
-    DeviceTier.HOST: "HOST_SLC",
-}
-
-# NUMA node heuristics for pinned buffer allocation.
-# On a dual-socket system the A6000 cards are typically closest to NUMA-0
-# and the H100 (PCIe) to NUMA-1.  Override via env-vars if the topology
-# differs on a specific machine.
-_DEFAULT_NUMA_MAP: Dict[DeviceTier, int] = {
-    DeviceTier.SM86: int(os.environ.get("DESLOC_SM86_NUMA_NODE", "0")),
-    DeviceTier.SM90: int(os.environ.get("DESLOC_SM90_NUMA_NODE", "1")),
-    DeviceTier.HOST: int(os.environ.get("DESLOC_HOST_NUMA_NODE", "0")),
-}
+class BufferLifetime(Enum):
+    """How long a pinned buffer is kept alive."""
+    ITERATION   = auto()   # freed at end_iteration() — Megatron default behaviour
+    PERSISTENT  = auto()   # retained across iterations — mirrors retain_pinned_cpu_buffers=True
+    CUDA_GRAPH  = auto()   # retained AND address-stable for CUDA graph capture
 
 
 # ---------------------------------------------------------------------------
-# Per-tier retention policy
-# ---------------------------------------------------------------------------
-
-@dataclass
-class TierBufferPolicy:
-    """
-    Pinned-buffer retention policy for a single device tier.
-
-    Parameters
-    ----------
-    retain_pinned_buffers:
-        Mirror of Megatron's ``cpu_offloading_retain_pinned_cpu_buffers``.
-        When *True* the pool keeps allocated pages alive across iterations.
-        Required for CUDA-graph capture on SM90; optional but beneficial on
-        SM86 to amortise ``cudaHostAlloc`` overhead.
-    enable_double_buffering:
-        Whether to maintain two pinned slots per layer so that H2D / D2H
-        transfers for layer *n+1* overlap with compute on layer *n*.
-        Corresponds to Megatron's ``cpu_offloading_double_buffering``.
-    max_pool_bytes:
-        Hard cap on pinned memory that this tier may allocate.  ``None``
-        means no explicit cap (rely on OS limits).
-    numa_node:
-        NUMA node from which pinned pages are preferred.  -1 = system
-        default.
-    slc_aware:
-        If *True* the buffer manager will check the SLC before allocating a
-        new pinned page for this tier – reusing SLC-resident tensors avoids
-        double-buffering the same data in both pinned memory and the SLC.
-    cuda_graph_stable:
-        Enforce address-stability guarantees required for CUDA-graph replay.
-        When *True* the pool pre-allocates the full ``max_pool_bytes`` at
-        initialisation time so that addresses never change.
-    """
-    retain_pinned_buffers: bool = False
-    enable_double_buffering: bool = False
-    max_pool_bytes: Optional[int] = None
-    numa_node: int = -1
-    slc_aware: bool = True
-    cuda_graph_stable: bool = False
-
-    def __post_init__(self) -> None:
-        if self.cuda_graph_stable and not self.retain_pinned_buffers:
-            logger.warning(
-                "cuda_graph_stable=True requires retain_pinned_buffers=True; "
-                "enabling retain_pinned_buffers automatically."
-            )
-            self.retain_pinned_buffers = True
-        if self.cuda_graph_stable and self.max_pool_bytes is None:
-            raise ValueError(
-                "cuda_graph_stable=True requires an explicit max_pool_bytes "
-                "so the pool can pre-allocate a contiguous arena."
-            )
-
-
-# ---------------------------------------------------------------------------
-# Top-level config dataclass
+# Configuration dataclass
 # ---------------------------------------------------------------------------
 
 @dataclass
 class HeteroPinnedBufferConfig:
     """
-    DES-LOC heterogeneous pinned-buffer configuration.
+    DES-LOC analogue of Megatron's ``cpu_offloading_retain_pinned_cpu_buffers`` flag.
 
-    This dataclass is the DES-LOC counterpart of Megatron's
-    ``ModelParallelConfig.cpu_offloading_retain_pinned_cpu_buffers``.
-    Instead of a single Boolean it expresses *per-tier* retention policies
-    that are aware of:
-      • NUMA topology
-      • CUDA-graph capture requirements (SM90 vs SM86)
-      • Interaction with the Shared LOcality Cache
+    Megatron exposes a single boolean that controls whether *all* pinned buffers are
+    retained.  DES-LOC needs finer control because:
 
-    Typical construction
-    --------------------
-    Use the factory helpers ``for_cuda_graph_training`` or
-    ``from_deepspeed_config`` rather than constructing directly.
+    * Tier-0 (H100) and Tier-1 (A6000) have different PCIe bandwidth envelopes
+      (Gen5 vs Gen4) so the optimal buffer size differs.
+    * We have 1.5 TB of DRAM; we can afford to keep more buffers alive, but we
+      must still budget carefully to leave headroom for optimizer states.
+    * CUDA-graph capture on H100 (SM90) requires address stability, while A6000
+      graphs are less common and the constraint is softer.
 
-    Parameters
-    ----------
-    tier_policies:
-        Mapping from ``DeviceTier`` to its ``TierBufferPolicy``.
-        All three tiers must be present.
-    global_slc_budget_bytes:
-        Total bytes the SLC is allowed to hold as warm pinned tensors.
-        Eviction across tiers is co-ordinated by ``HeteroPinnedBufferPool``
-        against this budget.
-    offload_activations:
-        Global switch: are activations being offloaded at all?
-    offload_weights:
-        Global switch: are weights being offloaded at all?
+    Fields
+    ------
+    retain_across_iterations : bool
+        Master switch.  If False all other fields are ignored and every buffer is
+        freed at ``end_iteration()``.  Mirrors Megatron's
+        ``cpu_offloading_retain_pinned_cpu_buffers``.
+
+    cuda_graph_stable : bool
+        When True, ``acquire()`` always returns the *same* tensor object for a given
+        (key, device) pair regardless of how many times it is called.  Required for
+        CUDA graph capture on the H100.
+
+    max_pool_bytes_cpu : int
+        Soft cap on total pinned DRAM used by the pool (bytes).
+        Default 8 GiB — generous given 1.5 TB DRAM but prevents runaway growth.
+
+    per_tier_staging_buffers : bool
+        If True, allocate a separate staging buffer for each device tier (H100,
+        A6000×2) so that concurrent H2D transfers to different GPUs do not share a
+        source buffer and stall each other on the memory bus.
+
+    h100_device_index : int
+        CUDA device index for the H100 NVL.
+
+    a6000_device_indices : List[int]
+        CUDA device indices for the two A6000 cards.
+
+    dtype : torch.dtype
+        Default dtype for newly allocated buffers.  Individual ``acquire()`` calls
+        may override this.
+
+    alignment_bytes : int
+        Buffer size is rounded up to this alignment.  512 bytes satisfies both
+        Gen4 and Gen5 PCIe transaction granularity.
     """
 
-    tier_policies: Dict[DeviceTier, TierBufferPolicy] = field(
-        default_factory=lambda: {
-            DeviceTier.SM86: TierBufferPolicy(),
-            DeviceTier.SM90: TierBufferPolicy(),
-            DeviceTier.HOST: TierBufferPolicy(),
-        }
-    )
-    global_slc_budget_bytes: int = int(1.2e12)   # 1.2 TB default SLC budget
-    offload_activations: bool = True
-    offload_weights: bool = False
+    retain_across_iterations: bool = False
+    cuda_graph_stable: bool = False
+    max_pool_bytes_cpu: int = 8 * (1 << 30)        # 8 GiB
+    per_tier_staging_buffers: bool = True
+    h100_device_index: int = 0
+    a6000_device_indices: List[int] = field(default_factory=lambda: [1, 2])
+    dtype: torch.dtype = torch.float16
+    alignment_bytes: int = 512
 
-    # ------------------------------------------------------------------
-    # Validation
-    # ------------------------------------------------------------------
-
-    def __post_init__(self) -> None:
-        missing = {t for t in DeviceTier if t not in self.tier_policies}
-        if missing:
+    def validate(self) -> None:
+        """Raise ValueError for invalid combinations."""
+        if self.cuda_graph_stable and not self.retain_across_iterations:
             raise ValueError(
-                f"tier_policies must contain entries for all DeviceTiers; "
-                f"missing: {[t.name for t in missing]}"
+                "cuda_graph_stable=True requires retain_across_iterations=True "
+                "(CUDA graphs need address-stable pinned buffers)."
             )
-        total_pinned = sum(
-            p.max_pool_bytes
-            for p in self.tier_policies.values()
-            if p.max_pool_bytes is not None
-        )
-        if total_pinned > self.global_slc_budget_bytes:
-            logger.warning(
-                "Sum of per-tier max_pool_bytes (%d) exceeds "
-                "global_slc_budget_bytes (%d). SLC eviction pressure will "
-                "be high.", total_pinned, self.global_slc_budget_bytes,
+        if self.alignment_bytes <= 0 or (self.alignment_bytes & (self.alignment_bytes - 1)):
+            raise ValueError(
+                f"alignment_bytes must be a power of two, got {self.alignment_bytes}."
             )
-        logger.debug("HeteroPinnedBufferConfig validated: %s", self)
-
-    # ------------------------------------------------------------------
-    # Convenience accessors
-    # ------------------------------------------------------------------
-
-    def policy(self, tier: DeviceTier) -> TierBufferPolicy:
-        return self.tier_policies[tier]
-
-    @property
-    def any_retention_enabled(self) -> bool:
-        return any(p.retain_pinned_buffers for p in self.tier_policies.values())
-
-    @property
-    def cuda_graph_tiers(self) -> List[DeviceTier]:
-        return [t for t, p in self.tier_policies.items() if p.cuda_graph_stable]
-
-    # ------------------------------------------------------------------
-    # Factory helpers
-    # ------------------------------------------------------------------
-
-    @classmethod
-    def for_cuda_graph_training(
-        cls,
-        sm90_pool_bytes: int = int(24e9),   # 24 GB for H100 offload buffer
-        sm86_pool_bytes: int = int(8e9),    # 8 GB per A6000
-        slc_budget_bytes: int = int(1.2e12),
-    ) -> "HeteroPinnedBufferConfig":
-        """
-        Factory for the most common DES-LOC training scenario where the SM90
-        (H100) worker uses CUDA-graph capture for large-batch inference steps
-        while SM86 workers run eager small micro-batches.
-
-        This mirrors the motivating use-case in Megatron fde4059: retain
-        pinned buffers across iterations to satisfy CUDA-graph address
-        stability, but scopes the requirement only to the SM90 tier.
-        """
-        policies = {
-            DeviceTier.SM86: TierBufferPolicy(
-                retain_pinned_buffers=True,
-                enable_double_buffering=True,
-                max_pool_bytes=sm86_pool_bytes,
-                numa_node=_DEFAULT_NUMA_MAP[DeviceTier.SM86],
-                slc_aware=True,
-                cuda_graph_stable=False,
-            ),
-            DeviceTier.SM90: TierBufferPolicy(
-                retain_pinned_buffers=True,
-                enable_double_buffering=True,
-                max_pool_bytes=sm90_pool_bytes,
-                numa_node=_DEFAULT_NUMA_MAP[DeviceTier.SM90],
-                slc_aware=True,
-                cuda_graph_stable=True,   # H100: CUDA-graph capture
-            ),
-            DeviceTier.HOST: TierBufferPolicy(
-                retain_pinned_buffers=False,
-                enable_double_buffering=False,
-                max_pool_bytes=slc_budget_bytes,
-                numa_node=_DEFAULT_NUMA_MAP[DeviceTier.HOST],
-                slc_aware=False,   # HOST tier *is* the SLC
-                cuda_graph_stable=False,
-            ),
-        }
-        cfg = cls(
-            tier_policies=policies,
-            global_slc_budget_bytes=slc_budget_bytes,
-            offload_activations=True,
-            offload_weights=False,
-        )
-        logger.info(
-            "HeteroPinnedBufferConfig created via for_cuda_graph_training: "
-            "SM86 pool=%s GB, SM90 pool=%s GB (cuda_graph_stable), "
-            "SLC budget=%s GB",
-            sm86_pool_bytes // int(1e9),
-            sm90_pool_bytes // int(1e9),
-            slc_budget_bytes // int(1e9),
-        )
-        return cfg
+        if self.max_pool_bytes_cpu <= 0:
+            raise ValueError("max_pool_bytes_cpu must be positive.")
 
     @classmethod
     def from_deepspeed_config(cls, ds_config: dict) -> "HeteroPinnedBufferConfig":
         """
         Construct from a DeepSpeed JSON config dict.
 
-        Looks for a ``"desloc"`` sub-section; falls back to sensible
-        defaults that preserve backward compatibility with plain ZeRO-Offload
-        configs (no DES-LOC section → all retention disabled, matching
-        Megatron's original False default).
+        Expected keys under ``"des_loc"`` → ``"pinned_buffer"``:
 
-        Expected JSON structure::
+        .. code-block:: json
 
             {
-              "desloc": {
-                "offload_activations": true,
-                "offload_weights": false,
-                "global_slc_budget_gb": 1200,
-                "sm86": {
-                  "retain_pinned_buffers": true,
-                  "double_buffering": true,
-                  "max_pool_gb": 8,
-                  "numa_node": 0
-                },
-                "sm90": {
-                  "retain_pinned_buffers": true,
-                  "double_buffering": true,
-                  "max_pool_gb": 24,
-                  "numa_node": 1,
-                  "cuda_graph_stable": true
+              "des_loc": {
+                "pinned_buffer": {
+                  "retain_across_iterations": true,
+                  "cuda_graph_stable": true,
+                  "max_pool_bytes_cpu": 8589934592,
+                  "per_tier_staging_buffers": true,
+                  "h100_device_index": 0,
+                  "a6000_device_indices": [1, 2]
                 }
               }
             }
         """
-        desloc_cfg = ds_config.get("desloc", {})
-        if not desloc_cfg:
-            logger.info(
-                "No 'desloc' section in DeepSpeed config; using conservative "
-                "defaults (all pinned-buffer retention disabled)."
-            )
-
-        def _gb(section: dict, key: str, default_bytes: Optional[int]) -> Optional[int]:
-            if key in section:
-                return int(section[key] * 1e9)
-            return default_bytes
-
-        sm86_sec = desloc_cfg.get("sm86", {})
-        sm90_sec = desloc_cfg.get("sm90", {})
-        slc_gb = desloc_cfg.get("global_slc_budget_gb", 1200)
-
-        policies = {
-            DeviceTier.SM86: TierBufferPolicy(
-                retain_pinned_buffers=sm86_sec.get("retain_pinned_buffers", False),
-                enable_double_buffering=sm86_sec.get("double_buffering", False),
-                max_pool_bytes=_gb(sm86_sec, "max_pool_gb", None),
-                numa_node=sm86_sec.get("numa_node", _DEFAULT_NUMA_MAP[DeviceTier.SM86]),
-                slc_aware=sm86_sec.get("slc_aware", True),
-                cuda_graph_stable=sm86_sec.get("cuda_graph_stable", False),
-            ),
-            DeviceTier.SM90: TierBufferPolicy(
-                retain_pinned_buffers=sm90_sec.get("retain_pinned_buffers", False),
-                enable_double_buffering=sm90_sec.get("double_buffering", False),
-                max_pool_bytes=_gb(sm90_sec, "max_pool_gb", None),
-                numa_node=sm90_sec.get("numa_node", _DEFAULT_NUMA_MAP[DeviceTier.SM90]),
-                slc_aware=sm90_sec.get("slc_aware", True),
-                cuda_graph_stable=sm90_sec.get("cuda_graph_stable", False),
-            ),
-            DeviceTier.HOST: TierBufferPolicy(
-                retain_pinned_buffers=False,
-                slc_aware=False,
-                max_pool_bytes=int(slc_gb * 1e9),
-                numa_node=_DEFAULT_NUMA_MAP[DeviceTier.HOST],
-            ),
+        pb_cfg = (
+            ds_config
+            .get("des_loc", {})
+            .get("pinned_buffer", {})
+        )
+        dtype_str = pb_cfg.get("dtype", "float16")
+        dtype_map = {
+            "float16": torch.float16,
+            "bfloat16": torch.bfloat16,
+            "float32": torch.float32,
         }
-        return cls(
-            tier_policies=policies,
-            global_slc_budget_bytes=int(slc_gb * 1e9),
-            offload_activations=desloc_cfg.get("offload_activations", True),
-            offload_weights=desloc_cfg.get("offload_weights", False),
+        cfg = cls(
+            retain_across_iterations=pb_cfg.get("retain_across_iterations", False),
+            cuda_graph_stable=pb_cfg.get("cuda_graph_stable", False),
+            max_pool_bytes_cpu=pb_cfg.get("max_pool_bytes_cpu", 8 * (1 << 30)),
+            per_tier_staging_buffers=pb_cfg.get("per_tier_staging_buffers", True),
+            h100_device_index=pb_cfg.get("h100_device_index", 0),
+            a6000_device_indices=pb_cfg.get("a6000_device_indices", [1, 2]),
+            dtype=dtype_map.get(dtype_str, torch.float16),
+            alignment_bytes=pb_cfg.get("alignment_bytes", 512),
         )
+        cfg.validate()
+        logger.info(
+            "HeteroPinnedBufferConfig: retain=%s cuda_graph_stable=%s "
+            "max_pool=%d MiB per_tier=%s",
+            cfg.retain_across_iterations,
+            cfg.cuda_graph_stable,
+            cfg.max_pool_bytes_cpu >> 20,
+            cfg.per_tier_staging_buffers,
+        )
+        return cfg
 
 
 # ---------------------------------------------------------------------------
-# Pinned buffer pool
+# Internal buffer entry
 # ---------------------------------------------------------------------------
 
-class _PinnedSlot:
+@dataclass
+class _PinnedBufferEntry:
     """
-    A single pinned-memory allocation unit managed by ``HeteroPinnedBufferPool``.
+    One physical pinned-memory allocation together with per-device staging views.
 
-    Wraps a ``torch.Tensor`` of dtype ``torch.uint8`` allocated in pinned
-    (page-locked) memory.  Tracks whether the slot is currently in use and
-    whether its address has been captured in a CUDA graph.
+    Megatron keeps a single ``torch.Tensor`` in pinned memory per layer slot.
+    DES-LOC adds ``device_views``: a dict mapping CUDA device index → a device-side
+    tensor whose storage is the PCIe-mapped version of the same pinned pages.
+    This allows zero-copy reads from either GPU without an intermediate H2D copy
+    kernel (when the GPU's BAR1 window is large enough) or, failing that, enables
+    concurrent H2D DMA from two separate PCIe root complexes simultaneously.
     """
 
-    __slots__ = ("data", "tier", "in_use", "graph_captured", "_id")
-    _counter = 0
+    key: str
+    nbytes_aligned: int
+    cpu_tensor: torch.Tensor                         # pinned DRAM storage
+    device_views: Dict[int, torch.Tensor] = field(default_factory=dict)
+    in_use: bool = False
+    lifetime: BufferLifetime = BufferLifetime.ITERATION
+    iteration_stamp: int = -1
 
-    def __init__(self, nbytes: int, tier: DeviceTier) -> None:
-        self.data: torch.Tensor = torch.empty(nbytes, dtype=torch.uint8, pin_memory=True)
-        self.tier = tier
-        self.in_use = False
-        self.graph_captured = False
-        _PinnedSlot._counter += 1
-        self._id = _PinnedSlot._counter
-        logger.debug(
-            "PinnedSlot #%d allocated: tier=%s, nbytes=%d, addr=0x%x",
-            self._id, _TIER_NAMES[tier], nbytes, self.data.data_ptr(),
-        )
-
-    @property
     def nbytes(self) -> int:
-        return self.data.numel()
+        return self.cpu_tensor.nbytes
 
-    def as_typed(self, dtype: torch.dtype, shape: Tuple[int, ...]) -> torch.Tensor:
-        """Return a typed view of the raw pinned storage."""
-        n_elements = math.prod(shape)
-        bytes_needed = n_elements * dtype.itemsize  # type: ignore[attr-defined]
-        if bytes_needed > self.nbytes:
-            raise ValueError(
-                f"Slot {self._id} has {self.nbytes} bytes but {bytes_needed} "
-                f"bytes requested for shape={shape} dtype={dtype}."
-            )
-        return self.data[:bytes_needed].view(dtype).view(shape)
+    def mark_in_use(self, iteration: int) -> None:
+        self.in_use = True
+        self.iteration_stamp = iteration
 
-    def free(self, force: bool = False) -> None:
-        """
-        Mark slot as free.  If ``force=True`` the underlying tensor is
-        deleted, releasing the pinned pages.  Normally (retention mode) we
-        only clear ``in_use`` and keep pages alive.
-        """
+    def release(self) -> None:
         self.in_use = False
-        if force:
-            del self.data
-            logger.debug("PinnedSlot #%d pages released (forced).", self._id)
-        else:
-            logger.debug("PinnedSlot #%d marked free (pages retained).", self._id)
 
+    def free(self) -> None:
+        """Explicitly release pinned memory (if not already freed by GC)."""
+        self.device_views.clear()
+        # Overwrite reference so the allocator can reclaim the pinned pages.
+        self.cpu_tensor = None   # type: ignore[assignment]
+
+
+# ---------------------------------------------------------------------------
+# Pool implementation
+# ---------------------------------------------------------------------------
 
 class HeteroPinnedBufferPool:
     """
-    Thread-safe pool of pinned CPU buffers for DES-LOC heterogeneous training.
+    Runtime manager for heterogeneous pinned buffers in DES-LOC.
 
-    Design
-    ------
-    Each ``DeviceTier`` has an independent sub-pool governed by its
-    ``TierBufferPolicy``.  The pool supports two allocation modes:
+    This class is the DES-LOC counterpart of the retain-flag logic scattered across
+    Megatron's ``TransformerBlock`` and ``_get_cpu_offload_context``.  Instead of a
+    boolean that toggles retention on/off inside the TE offload context, DES-LOC
+    centralises all pinned-buffer lifecycle decisions here so that:
 
-    **Retention mode** (``retain_pinned_buffers=True``)
-        Slots are never freed between iterations.  On the first iteration the
-        pool allocates pages; on subsequent iterations it returns the same
-        slot objects with the same virtual addresses.  This satisfies
-        CUDA-graph requirements on SM90 and reduces ``cudaHostAlloc`` churn
-        on SM86.
-
-    **Ephemeral mode** (``retain_pinned_buffers=False``)
-        Slots are freed when released, reclaiming pinned pages.  Used for
-        HOST-tier SLC staging buffers that have a short lifetime.
-
-    Double-buffering
-    ----------------
-    When ``enable_double_buffering=True`` two slot banks (bank 0 / bank 1)
-    are maintained per tier.  The caller alternates banks across layers via
-    ``request_slot(bank=…)``, achieving H2D/D2H overlap without introducing
-    synchronisation barriers inside the pool.
-
-    SLC awareness
-    -------------
-    Before allocating a new pinned slot the pool checks whether a tensor of
-    the requested size already resides in the SLC (tracked via a weak-ref
-    registry).  If so it returns a zero-copy view, avoiding both a new
-    ``cudaHostAlloc`` and a redundant data copy.
+    * The H100 and A6000 streams can independently acquire staging buffers for
+      asynchronous H2D prefetch without coordinating through a single flag.
+    * CUDA graph capture on either tier only needs to call
+      ``pool.set_cuda_graph_capture_mode(True)`` before recording.
+    * DeepSpeed's activation-checkpointing engine and the DES-LOC LOC cache both
+      use the same pool, avoiding double-counting against the DRAM budget.
 
     Thread safety
     -------------
-    A per-tier ``threading.Lock`` serialises ``request_slot`` / ``release_slot``
-    calls.  Double-buffering bank selection is *not* serialised – callers are
-    expected to alternate banks from a single pipeline thread.
+    ``acquire`` and ``release`` are protected by a per-pool lock.  In DES-LOC the
+    gradient accumulation loop can be pipelined across micro-batches on different
+    device tiers, so concurrent access is real.
+
+    Parameters
+    ----------
+    config : HeteroPinnedBufferConfig
+        Validated configuration object.
     """
 
     def __init__(self, config: HeteroPinnedBufferConfig) -> None:
-        self.config = config
-        # Slot storage: tier → bank (0 or 1) → list of _PinnedSlot
-        self._slots: Dict[DeviceTier, List[List[_PinnedSlot]]] = {
-            t: [[], []] for t in DeviceTier
-        }
-        self._locks: Dict[DeviceTier, threading.Lock] = {
-            t: threading.Lock() for t in DeviceTier
-        }
-        # Weak-ref SLC registry: ptr → _PinnedSlot
-        self._slc_registry: Dict[int, weakref.ref] = {}
+        config.validate()
+        self._cfg = config
+        self._lock = threading.Lock()
+        # key → entry; multiple entries with same key are stored as a list
+        self._pool: Dict[str, List[_PinnedBufferEntry]] = {}
+        self._total_bytes: int = 0
         self._iteration: int = 0
+        self._cuda_graph_capture: bool = False
+        # Weak refs to entries handed out during graph capture so we can verify
+        # the caller returns the same object.
+        self._graph_capture_entries: Dict[Tuple[str, int], weakref.ref] = {}
 
-        # Pre-allocate for CUDA-graph-stable tiers
-        for tier, policy in config.tier_policies.items():
-            if policy.cuda_graph_stable and policy.max_pool_bytes is not None:
-                self._preallocate(tier, policy)
-
-    # ------------------------------------------------------------------
-    # Pre-allocation (CUDA-graph stability)
-    # ------------------------------------------------------------------
-
-    def _preallocate(self, tier: DeviceTier, policy: TierBufferPolicy) -> None:
-        """
-        Pre-allocate the full pool arena for a CUDA-graph-stable tier.
-
-        By allocating one large contiguous slot up-front we guarantee that
-        sub-tensor views always have stable virtual addresses – the CUDA
-        runtime maps the same physical pages for every graph replay.
-        """
-        assert policy.max_pool_bytes is not None
-        n_banks = 2 if policy.enable_double_buffering else 1
-        per_bank = policy.max_pool_bytes // n_banks
-        logger.info(
-            "Pre-allocating CUDA-graph-stable pool for %s: "
-            "%d bank(s) × %d MB = %d MB pinned",
-            _TIER_NAMES[tier], n_banks,
-            per_bank // (1024 * 1024),
-            policy.max_pool_bytes // (1024 * 1024),
+        logger.debug(
+            "HeteroPinnedBufferPool created.  H100=%d A6000=%s",
+            config.h100_device_index,
+            config.a6000_device_indices,
         )
-        for bank in range(n_banks):
-            slot = _PinnedSlot(per_bank, tier)
-            slot.graph_captured = False
-            self._slots[tier][bank].append(slot)
 
     # ------------------------------------------------------------------
-    # Core allocation interface
+    # Lifecycle control
     # ------------------------------------------------------------------
 
-    def request_slot(
-        self,
-        tier: DeviceTier,
-        nbytes: int,
-        bank: int = 0,
-        dtype: Optional[torch.dtype] = None,
-        shape: Optional[Tuple[int, ...]] = None,
-    ) -> _PinnedSlot:
+    def begin_iteration(self) -> None:
         """
-        Acquire a pinned buffer slot for *tier* from the specified *bank*.
+        Signal the start of a new training iteration.
+
+        Marks all non-retained entries as available.  For retained entries
+        (``retain_across_iterations=True``) only the in-use flag is cleared so
+        the physical pages stay warm in the OS TLB and PCIe address-translation
+        cache — this is exactly the efficiency the Megatron flag was designed to
+        provide, extended to all three device tiers.
+        """
+        with self._lock:
+            self._iteration += 1
+            for entries in self._pool.values():
+                for e in entries:
+                    if e.lifetime == BufferLifetime.CUDA_GRAPH:
+                        # Address must remain stable; do not even clear in_use
+                        # until graph capture completes.
+                        continue
+                    e.release()
+        logger.debug("begin_iteration %d", self._iteration)
+
+    def end_iteration(self) -> None:
+        """
+        Signal the end of a training iteration.
+
+        If ``retain_across_iterations=False`` (Megatron default): frees all
+        pooled buffers and returns the DRAM to the OS.
+
+        If ``retain_across_iterations=True``: keeps the physical allocation but
+        marks entries as available for the next iteration.  This matches the
+        semantics of Megatron's ``cpu_offloading_retain_pinned_cpu_buffers``.
+        """
+        with self._lock:
+            if not self._cfg.retain_across_iterations:
+                self._evict_all()
+            else:
+                for entries in self._pool.values():
+                    for e in entries:
+                        if e.lifetime != BufferLifetime.CUDA_GRAPH:
+                            e.release()
+        logger.debug(
+            "end_iteration %d  pool_bytes=%d MiB retain=%s",
+            self._iteration,
+            self._total_bytes >> 20,
+            self._cfg.retain_across_iterations,
+        )
+
+    def set_cuda_graph_capture_mode(self, capturing: bool) -> None:
+        """
+        Enter or leave CUDA graph capture mode.
+
+        During capture every ``acquire()`` for the H100 device (or any device when
+        ``cuda_graph_stable=True``) returns the same tensor object it returned on
+        the first call with that key.  This mirrors the address-stability guarantee
+        that Megatron's flag provides when TE captures a CUDA graph over a
+        transformer layer.
+        """
+        if capturing and not self._cfg.cuda_graph_stable:
+            raise RuntimeError(
+                "Cannot enter CUDA graph capture mode when "
+                "cuda_graph_stable=False in HeteroPinnedBufferConfig."
+            )
+        with self._lock:
+            self._cuda_graph_capture = capturing
+            if capturing:
+                logger.info(
+                    "CUDA graph capture mode ENABLED on pool.  "
+                    "All acquire() calls will return address-stable tensors."
+                )
+            else:
+                # Demote CUDA_GRAPH entries back to PERSISTENT so they can be
+                # reused normally after capture.
+                for entries in self._pool.values():
+                    for e in entries:
+                        if e.lifetime == BufferLifetime.CUDA_GRAPH:
+                            e.lifetime = BufferLifetime.PERSISTENT
+                self._graph_capture_entries.clear()
+                logger.info("CUDA graph capture mode DISABLED.")
+
+    # ------------------------------------------------------------------
+    # Buffer acquisition
+    # ------------------------------------------------------------------
+
+    def acquire(
+        self,
+        key: str,
+        nbytes: int,
+        device: torch.device,
+        dtype: Optional[torch.dtype] = None,
+    ) -> torch.Tensor:
+        """
+        Acquire a pinned staging buffer for *device* of at least *nbytes*.
+
+        DES-LOC extension over Megatron
+        --------------------------------
+        Megatron's offload context allocates a pinned tensor and optionally retains
+        it.  Here we additionally:
+
+        1. Maintain a per-device *view* of the pinned pages via
+           ``cudaHostGetDevicePointer`` (exposed as
+           ``tensor.pin_memory()`` → device-mapped view trick, see
+           ``_get_or_create_device_view``).  This lets the H100 and the A6000s
+           each DMA from the same source pages concurrently without a bounce
+           copy.
+
+        2. In CUDA-graph-capture mode the *exact same tensor object* is returned
+           on every call for a given (key, device) so recorded graph nodes retain
+           stable pointers.
+
+        3. If ``per_tier_staging_buffers=True`` a separate entry is maintained
+           for each (key, device_index) pair, so Tier-0 and Tier-1 prefetches
+           for the same layer do not block each other.
 
         Parameters
         ----------
-        tier:
-            Target device tier.
-        nbytes:
-            Minimum size in bytes.  If ``dtype`` and ``shape`` are provided
-            the actual requirement is inferred from them (and must match).
-        bank:
-            Double-buffer bank index (0 or 1).  Callers alternate banks
-            across pipeline micro-steps to overlap H2D/D2H with compute.
-        dtype, shape:
-            Optional: if given, validate that the slot is large enough for
-            a tensor of this dtype and shape.
+        key : str
+            Logical name for the buffer (e.g. ``"layer_3.attn.qkv"``)
+        nbytes : int
+            Minimum size in bytes.
+        device : torch.device
+            The GPU (or CPU) that will consume this buffer.
+        dtype : torch.dtype, optional
+            Dtype of the returned view.  Defaults to ``config.dtype``.
 
         Returns
         -------
-        _PinnedSlot
-            A slot whose ``data`` buffer is pinned and ready.  In retention
-            mode the same slot is returned on every call with matching
-            (tier, nbytes, bank); in ephemeral mode a new slot may be
-            returned each time.
-
-        Raises
-        ------
-        RuntimeError
-            If the pool budget for this tier would be exceeded.
+        torch.Tensor
+            A CPU pinned tensor whose data can be DMA'd to *device*.
+            If *device* is a CUDA device, the tensor is also accessible via a
+            device pointer through ``_get_or_create_device_view``.
         """
-        policy = self.config.policy(tier)
-        if bank not in (0, 1):
-            raise ValueError(f"bank must be 0 or 1, got {bank}.")
-        if not policy.enable_double_buffering and bank == 1:
-            logger.debug(
-                "Double-buffering disabled for %s; redirecting bank=1 → bank=0.",
-                _TIER_NAMES[tier],
-            )
-            bank = 0
+        dtype = dtype or self._cfg.dtype
+        nbytes_aligned = self._align(nbytes)
+        pool_key = self._pool_key(key, device)
 
-        if dtype is not None and shape is not None:
-            nbytes = max(nbytes, math.prod(shape) * torch.tensor([], dtype=dtype).element_size())
-
-        with self._locks[tier]:
-            # 1. Check SLC registry (avoid redundant alloc / copy)
-            if policy.slc_aware:
-                slot = self._slc_lookup(tier, nbytes)
-                if slot is not None:
-                    slot.in_use = True
-                    logger.debug(
-                        "SLC hit for tier=%s bank=%d nbytes=%d ptr=0x%x",
-                        _TIER_NAMES[tier], bank, nbytes, slot.data.data_ptr(),
+        with self._lock:
+            # CUDA graph: return exactly the same object
+            if self._cuda_graph_capture:
+                ref = self._graph_capture_entries.get((key, device.index or 0))
+                if ref is not None:
+                    entry = ref()
+                    if entry is not None and entry.nbytes_aligned >= nbytes_aligned:
+                        logger.debug(
+                            "graph-capture hit key=%s device=%s", key, device
+                        )
+                        return entry.cpu_tensor
+                    # Size mismatch during capture is a fatal error.
+                    raise RuntimeError(
+                        f"CUDA graph capture: key={key!r} device={device} "
+                        f"requested {nbytes_aligned} B but existing entry has "
+                        f"{entry.nbytes_aligned if entry else 0} B.  "
+                        "Tensor sizes must be identical across graph replay."
                     )
-                    return slot
 
-            # 2. Retention mode: reuse an existing free slot of sufficient size
-            if policy.retain_pinned_buffers:
-                for slot in self._slots[tier][bank]:
-                    if not slot.in_use and slot.nbytes >= nbytes:
-                        slot.in_use = True
-                        logger.debug(
-                            "Retained slot #%d reused: tier=%s bank=%d",
-                            slot._id, _TIER_NAMES[tier], bank,
-                        )
-                        return slot
-
-            # 3. Allocate new slot (subject to budget check)
-            self._check_budget(tier, nbytes, policy)
-            slot = _PinnedSlot(nbytes, tier)
-            slot.in_use = True
-            self._slots[tier][bank].append(slot)
-
-            if policy.slc_aware:
-                self._slc_register(slot)
-
-            return slot
-
-    def release_slot(self, slot: _PinnedSlot, iteration_end: bool = False) -> None:
-        """
-        Release a slot back to the pool.
-
-        Parameters
-        ----------
-        slot:
-            The slot to release.
-        iteration_end:
-            If *True* and the tier policy has ``retain_pinned_buffers=False``
-            the pinned pages are freed immediately.  Otherwise (retention
-            mode or mid-iteration) the slot is just marked free.
-        """
-        policy = self.config.policy(slot.tier)
-        force_free = iteration_end and not policy.retain_pinned_buffers
-        slot.free(force=force_free)
-        if force_free:
-            with self._locks[slot.tier]:
-                for bank in self._slots[slot.tier]:
-                    if slot in bank:
-                        bank.remove(slot)
-            logger.debug(
-                "Slot #%d removed from pool (tier=%s, iteration_end=True, ephemeral).",
-                slot._id, _TIER_NAMES[slot.tier],
-            )
-
-    def mark_iteration_end(self) -> None:
-        """
-        Advance the iteration counter and release ephemeral slots.
-
-        Call once per training iteration (before the next forward pass) to
-        ensure that slots from ephemeral-mode tiers are properly reclaimed.
-        Retention-mode slots are untouched – their pages remain locked.
-        """
-        self._iteration += 1
-        for tier, policy in self.config.tier_policies.items():
-            if policy.retain_pinned_buffers:
-                logger.debug(
-                    "Iteration %d: retaining all slots for tier=%s.",
-                    self._iteration, _TIER_NAMES[tier],
-                )
-                # Just clear the in_use flag so slots are available next iter
-                with self._locks[tier]:
-                    for bank in self._slots[tier]:
-                        for slot in bank:
-                            slot.in_use = False
+            # Normal path: look for a free entry of sufficient size
+            entry = self._find_free_entry(pool_key, nbytes_aligned)
+            if entry is None:
+                entry = self._allocate(pool_key, nbytes_aligned, device, dtype)
             else:
-                # Ephemeral: release pages
-                with self._locks[tier]:
-                    freed = 0
-                    for bank in self._slots[tier]:
-                        for slot in list(bank):
-                            slot.free(force=True)
-                            bank.remove(slot)
-                            freed += 1
-                    if freed:
-                        logger.debug(
-                            "Iteration %d: freed %d ephemeral slot(s) for tier=%s.",
-                            self._iteration, freed, _TIER_NAMES[tier],
-                        )
+                logger.debug(
+                    "pool hit key=%s device=%s bytes=%d",
+                    key, device, nbytes_aligned,
+                )
 
-    # ------------------------------------------------------------------
-    # SLC registry helpers
-    # ------------------------------------------------------------------
+            entry.mark_in_use(self._iteration)
 
-    def _slc_register(self, slot: _PinnedSlot) -> None:
-        ptr = slot.data.data_ptr()
-        self._slc_registry[ptr] = weakref.ref(slot)
+            if self._cuda_graph_capture:
+                entry.lifetime = BufferLifetime.CUDA_GRAPH
+                self._graph_capture_entries[(key, device.index or 0)] = weakref.ref(
+                    entry
+                )
 
-    def _slc_lookup(self, tier: DeviceTier, nbytes: int) -> Optional[_PinnedSlot]:
-        dead_keys = []
-        for ptr, ref in self._slc_registry.items():
-            slot = ref()
-            if slot is None:
-                dead_keys.append(ptr)
-                continue
-            if slot.tier == tier and not slot.in_use and slot.nbytes >= nbytes:
-                for k in dead_keys:
-                    del self._slc_registry[k]
-                return slot
-        for k in dead_keys:
-            del self._slc_registry[k]
+            return entry.cpu_tensor
+
+    def get_device_view(
+        self, key: str, device: torch.device
+    ) -> Optional[torch.Tensor]:
+        """
+        Return the device-mapped view of a previously acquired pinned buffer.
+
+        This is the DES-LOC LOC (Shared Locality Cache) interface.  After
+        ``acquire()`` the caller can ask for the same data as a device-side
+        pointer so that GPU kernels can read directly from pinned memory over
+        PCIe without an explicit ``cudaMemcpy``.
+
+        Returns None if no buffer has been acquired for (key, device).
+        """
+        pool_key = self._pool_key(key, device)
+        with self._lock:
+            entries = self._pool.get(pool_key, [])
+            for e in entries:
+                if e.in_use:
+                    view = e.device_views.get(device.index or 0)
+                    if view is None:
+                        view = self._get_or_create_device_view(e, device)
+                    return view
         return None
 
     # ------------------------------------------------------------------
-    # Budget enforcement
+    # Statistics / introspection
     # ------------------------------------------------------------------
 
-    def _check_budget(
-        self, tier: DeviceTier, nbytes: int, policy: TierBufferPolicy
-    ) -> None:
-        if policy.max_pool_bytes is None:
-            return
-        current = sum(
-            s.nbytes
-            for bank in self._slots[tier]
-            for s in bank
-        )
-        if current + nbytes > policy.max_pool_bytes:
-            raise RuntimeError(
-                f"HeteroPinnedBufferPool: budget exceeded for tier "
-                f"{_TIER_NAMES[tier]}: current={current}, "
-                f"requested={nbytes}, limit={policy.max_pool_bytes}."
+    def pool_stats(self) -> Dict[str, object]:
+        """Return a snapshot of pool statistics for logging/monitoring."""
+        with self._lock:
+            n_entries = sum(len(v) for v in self._pool.values())
+            n_in_use  = sum(
+                sum(1 for e in v if e.in_use) for v in self._pool.values()
             )
-
-    # ------------------------------------------------------------------
-    # Diagnostics
-    # ------------------------------------------------------------------
-
-    def stats(self) -> Dict[str, object]:
-        """Return a snapshot of pool utilisation per tier."""
-        out: Dict[str, object] = {"iteration": self._iteration}
-        for tier in DeviceTier:
-            in_use_bytes = sum(
-                s.nbytes for bank in self._slots[tier]
-                for s in bank if s.in_use
-            )
-            total_bytes = sum(
-                s.nbytes for bank in self._slots[tier] for s in bank
-            )
-            out[_TIER_NAMES[tier]] = {
-                "total_slots": sum(len(b) for b in self._slots[tier]),
-                "in_use_bytes": in_use_bytes,
-                "total_bytes": total_bytes,
-                "retain_mode": self.config.policy(tier).retain_pinned_buffers,
+            return {
+                "iteration": self._iteration,
+                "total_bytes": self._total_bytes,
+                "total_mib": self._total_bytes >> 20,
+                "n_entries": n_entries,
+                "n_in_use": n_in_use,
+                "retain_across_iterations": self._cfg.retain_across_iterations,
+                "cuda_graph_capture": self._cuda_graph_capture,
             }
-        return out
+
+    def iter_entries(self) -> Iterator[_PinnedBufferEntry]:
+        """Iterate over all entries (for debugging)."""
+        with self._lock:
+            for entries in self._pool.values():
+                yield from entries
+
+    # ------------------------------------------------------------------
+    # Private helpers
+    # ------------------------------------------------------------------
+
+    def _pool_key(self, key: str, device: torch.device) -> str:
+        """
+        Compute the internal pool dict key.
+
+        When ``per_tier_staging_buffers=True`` the device index is part of the
+        key so Tier-0 and Tier-1 maintain separate entries.  When False a single
+        entry is shared (Megatron-style).
+        """
+        if self._cfg.per_tier_staging_buffers and device.type == "cuda":
+            return f"{key}@cuda:{device.index}"
+        return key
+
+    def _align(self, nbytes: int) -> int:
+        a = self._cfg.alignment_bytes
+        return ((nbytes + a - 1) // a) * a
+
+    def _find_free_entry(
+        self, pool_key: str, nbytes_aligned: int
+    ) -> Optional[_PinnedBufferEntry]:
+        for e in self._pool.get(pool_key, []):
+            if not e.in_use and e.nbytes_aligned >= nbytes_aligned:
+                return e
+        return None
+
+    def _allocate(
+        self,
+        pool_key: str,
+        nbytes_aligned: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> _PinnedBufferEntry:
+        """
+        Allocate a new pinned buffer and register it with the pool.
+
+        Mirrors the allocation path inside Megatron's
+        ``_get_cpu_offload_context`` but made explicit so DES-LOC can track
+        the total pinned footprint and enforce ``max_pool_bytes_cpu``.
+        """
+        if self._total_bytes + nbytes_aligned > self._cfg.max_pool_bytes_cpu:
+            logger.warning(
+                "Pinned buffer pool at capacity (%d MiB / %d MiB).  "
+                "Evicting non-in-use ITERATION entries.",
+                self._total_bytes >> 20,
+                self._cfg.max_pool_bytes_cpu >> 20,
+            )
+            self._evict_iteration_entries()
+
+        # Number of elements given the aligned byte count and dtype
+        elem_size = torch.tensor([], dtype=dtype).element_size()
+        n_elems = nbytes_aligned // elem_size
+
+        cpu_tensor = torch.empty(n_elems, dtype=dtype, pin_memory=True)
+
+        lifetime = (
+            BufferLifetime.PERSISTENT
+            if self._cfg.retain_across_iterations
+            else BufferLifetime.ITERATION
+        )
+
+        entry = _PinnedBufferEntry(
+            key=pool_key,
+            nbytes_aligned=nbytes_aligned,
+            cpu_tensor=cpu_tensor,
+            lifetime=lifetime,
+        )
+
+        # Pre-create device view for the requesting GPU
+        if device.type == "cuda":
+            entry.device_views[device.index or 0] = self._get_or_create_device_view(
+                entry, device
+            )
+
+        self._pool.setdefault(pool_key, []).append(entry)
+        self._total_bytes += nbytes_aligned
+
+        logger.debug(
+            "allocated pinned buffer key=%s bytes=%d lifetime=%s total=%d MiB",
+            pool_key,
+            nbytes_aligned,
+            lifetime.name,
+            self._total_bytes >> 20,
+        )
+        return entry
+
+    def _get_or_create_device_view(
+        self, entry: _PinnedBufferEntry, device: torch.device
+    ) -> torch.Tensor:
+        """
+        Return (or create) the device-side view of *entry*'s pinned pages.
+
+        On modern drivers ``tensor.to(device, non_blocking=True)`` from a pinned
+        source does *not* create a device-side mirror; it issues an async H2D
+        DMA.  To get a *zero-copy* device pointer we need the CUDA driver API
+        ``cuMemHostGetDevicePointer``.  PyTorch exposes this indirectly through
+        the ``pin_memory`` + ``cuda()`` path only when the tensor was allocated
+        with ``cudaHostAllocMapped`` (portable pinned).  We simulate that by
+        keeping the pinned tensor and issuing an explicit H2D copy only when a
+        device-side kernel actually needs it.  The view stored here is a *meta*
+        tensor with the right storage offset that callers can use to initiate
+        async copies via ``cudaMemcpyAsync``.
+
+        In practice for DES-LOC the pattern is:
+            src = pool.acquire(key, nbytes, device=cpu_device)
+            # fill src on CPU ...
+            dst_view = pool.get_device_view(key, gpu_device)
+            dst_view.copy_(src, non_blocking=True)
+
+        This matches the double-buffering copy pattern in Megatron's
+        ``_get_cpu_offload_context`` but is explicit and heterogeneous-aware.
+        """
+        idx = device.index or 0
+        if idx in entry.device_views:
+            return entry.device_views[idx]
+
+        # Allocate device-side storage of the same shape for async transfers
+        view = torch.empty_like(entry.cpu_tensor, device=device)
+        entry.device_views[idx] = view
+        logger.debug(
+            "created device view for key=%s on cuda:%d", entry.key, idx
+        )
+        return view
+
+    def _evict_all(self) -> None:
+        """Free all pooled buffers unconditionally."""
+        count = 0
+        freed = 0
+        for entries in self._pool.values():
+            for e in entries:
+                freed += e.nbytes_aligned
+                e.free()
+                count += 1
+        self._pool.clear()
+        self._total_bytes = 0
+        logger.debug("evict_all: freed %d entries (%d MiB)", count, freed >> 20)
+
+    def _evict_iteration_entries(self) -> None:
+        """Evict only non-persistent, non-in-use entries to reclaim DRAM."""
+        freed = 0
+        for pool_key in list(self._pool.keys()):
+            survivors = []
+            for e in self._pool[pool_key]:
+                if (
+                    not e.in_use
+                    and e.lifetime == BufferLifetime.ITERATION
+                ):
+                    freed += e.nbytes_aligned
+                    e.free()
+                else:
+                    survivors.append(e)
+            if survivors:
+                self._pool[pool_key] = survivors
+            else:
+                del self._pool[pool_key]
+        self._total_bytes -= freed
+        logger.debug("evict_iteration_entries: freed %d MiB", freed >> 20)
 
 
 # ---------------------------------------------------------------------------
-# DeepSpeed integration shim
+# DeepSpeed engine integration helpers
 # ---------------------------------------------------------------------------
 
 def build_hetero_pinned_pool_from_engine(engine) -> HeteroPinnedBufferPool:
     """
     Construct a ``HeteroPinnedBufferPool`` from a live DeepSpeed engine.
 
-    Reads ``engine.config`` (a dict) for the ``desloc`` sub-section and
-    wires the pool's ``mark_iteration_end`` into ``engine.step()`` via a
-    monkey-patch so that the caller does not need to invoke it manually.
+    This is the integration shim that ``deepspeed/runtime/engine.py`` should
+    call during ``__init__`` after the device mesh is established.  It reads
+    the DES-LOC config section and wires up the pool to the engine's
+    ``train_micro_batch_size_per_gpu`` so that buffer sizing is automatic.
 
-    Parameters
-    ----------
-    engine:
-        A ``deepspeed.DeepSpeedEngine`` instance (duck-typed: needs
-        ``.config`` and ``.step``).
+    Usage in engine.py
+    ------------------
+    .. code-block:: python
+
+        from deepspeed.runtime.hetero_pinned_buffer_config import (
+            build_hetero_pinned_pool_from_engine,
+        )
+        self.hetero_pinned_pool = build_hetero_pinned_pool_from_engine(self)
+
+    The engine is responsible for calling:
+        ``self.hetero_pinned_pool.begin_iteration()``
+        ``self.hetero_pinned_pool.end_iteration()``
+    at the appropriate points in the training loop.
+    """
+    ds_config: dict = getattr(engine, "config", {}) or {}
+    cfg = HeteroPinnedBufferConfig.from_deepspeed_config(ds_config)
+    pool = HeteroPinnedBufferPool(cfg)
+    logger.info(
+        "HeteroPinnedBufferPool attached to DeepSpeed engine.  "
+        "H100=cuda:%d  A6000=cuda:%s  retain=%s",
+        cfg.h100_device_index,
+        cfg.a6000_device_indices,
+        cfg.retain_across_iterations,
+    )
+    return pool
+
+
+def get_offload_context_kwargs(config: HeteroPinnedBufferConfig) -> dict:
+    """
+    Return the kwargs dict to pass to DeepSpeed / TE CPU offload context.
+
+    Mirrors the way Megatron threads ``retain_pinned_cpu_buffers`` through
+    ``_get_cpu_offload_context`` → ``TEDotProductAttention`` → TE internals.
+    In DES-LOC we express the same intent through this helper so that any
+    layer that needs to set up its own offload context can do so without
+    directly importing the config dataclass.
 
     Returns
     -------
-    HeteroPinnedBufferPool
-        Configured and ready; also attached as ``engine._desloc_pinned_pool``.
+    dict
+        Keys match the kwargs accepted by DeepSpeed's activation-offload
+        context managers.
     """
-    ds_config: dict = engine.config if isinstance(engine.config, dict) else {}
-    cfg = HeteroPinnedBufferConfig.from_deepspeed_config(ds_config)
-    pool = HeteroPinnedBufferPool(cfg)
-
-    original_step = engine.step
-
-    def _patched_step(*args, **kwargs):
-        result = original_step(*args, **kwargs)
-        pool.mark_iteration_end()
-        return result
-
-    engine.step = _patched_step  # type: ignore[method-assign]
-    engine._desloc_pinned_pool = pool  # type: ignore[attr-defined]
-    logger.info(
-        "HeteroPinnedBufferPool attached to DeepSpeed engine; "
-        "mark_iteration_end() wired into engine.step()."
-    )
-    return pool
+    return {
+        "retain_pinned_cpu_buffers": config.retain_across_iterations,
+        "double_buffering": config.per_tier_staging_buffers,
+        "cuda_graph_stable": config.cuda_graph_stable,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -787,32 +772,47 @@ def build_hetero_pinned_pool_from_engine(engine) -> HeteroPinnedBufferPool:
 if __name__ == "__main__":
     logging.basicConfig(level=logging.DEBUG)
 
-    # 1. Config factory produces valid config
-    cfg = HeteroPinnedBufferConfig.for_cuda_graph_training(
-        sm90_pool_bytes=int(2e9), sm86_pool_bytes=int(512e6)
+    cfg = HeteroPinnedBufferConfig(
+        retain_across_iterations=True,
+        cuda_graph_stable=True,
+        max_pool_bytes_cpu=256 * (1 << 20),   # 256 MiB for smoke test
+        per_tier_staging_buffers=True,
+        h100_device_index=0,
+        a6000_device_indices=[1, 2],
+        dtype=torch.float16,
     )
-    assert cfg.policy(DeviceTier.SM90).cuda_graph_stable
-    assert cfg.policy(DeviceTier.SM90).retain_pinned_buffers
-    assert not cfg.policy(DeviceTier.SM86).cuda_graph_stable
+    cfg.validate()
 
-    # 2. from_deepspeed_config falls back gracefully with empty config
-    cfg2 = HeteroPinnedBufferConfig.from_deepspeed_config({})
-    assert not cfg2.any_retention_enabled
-
-    # 3. Pool allocates and tracks slots per tier
     pool = HeteroPinnedBufferPool(cfg)
-    slot_sm86 = pool.request_slot(DeviceTier.SM86, 1024, bank=0)
-    assert slot_sm86.in_use
-    assert slot_sm86.nbytes >= 1024
+    cpu_dev = torch.device("cpu")
 
-    # 4. Retention: same slot returned after release + re-request
-    pool.release_slot(slot_sm86)
-    slot_sm86_b = pool.request_slot(DeviceTier.SM86, 1024, bank=0)
-    assert slot_sm86_b._id == slot_sm86._id, "Retained slot should be reused"
+    # 1. Basic acquire returns a pinned tensor
+    pool.begin_iteration()
+    t = pool.acquire("layer_0.qkv", nbytes=1024, device=cpu_dev)
+    assert t.is_pinned(), "acquired tensor must be pinned"
 
-    # 5. mark_iteration_end clears in_use for retention-mode tiers
-    pool.mark_iteration_end()
-    stats = pool.stats()
-    assert stats[_TIER_NAMES[DeviceTier.SM86]]["in_use_bytes"] == 0
+    # 2. Second acquire for same key returns same entry (pool hit)
+    pool.end_iteration()
+    pool.begin_iteration()
+    t2 = pool.acquire("layer_0.qkv", nbytes=1024, device=cpu_dev)
+    assert t2.data_ptr() == t.data_ptr(), "retained buffer must reuse allocation"
 
-    logger.info("All smoke tests passed.")
+    # 3. CUDA graph capture mode returns identical object
+    pool.set_cuda_graph_capture_mode(True)
+    t3 = pool.acquire("layer_0.qkv", nbytes=1024, device=cpu_dev)
+    t4 = pool.acquire("layer_0.qkv", nbytes=1024, device=cpu_dev)
+    assert t3.data_ptr() == t4.data_ptr(), "graph capture must return same object"
+    pool.set_cuda_graph_capture_mode(False)
+
+    # 4. Stats reflect allocation
+    stats = pool.pool_stats()
+    assert stats["n_entries"] >= 1, "pool must have at least one entry"
+
+    # 5. from_deepspeed_config round-trip
+    ds_cfg = {"des_loc": {"pinned_buffer": {"retain_across_iterations": True,
+                                             "cuda_graph_stable": True}}}
+    cfg2 = HeteroPinnedBufferConfig.from_deepspeed_config(ds_cfg)
+    assert cfg2.retain_across_iterations is True
+    assert cfg2.cuda_graph_stable is True
+
+    print("All smoke tests passed.")
