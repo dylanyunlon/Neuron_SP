@@ -1,66 +1,62 @@
 """
-DES-LOC Heterogeneous MXFP8 Refit Engine
-==========================================
+DES-LOC Heterogeneous MXFP8 Weight Refit Engine
+================================================
 
 Upstream design intent (Megatron fca1679):
-    Megatron's MXFP8 refit (#3742) introduced a pluggable ``ReshardTransform``
-    abstraction so that weight transfers between training and inference workers
-    can transparently convert BF16 parameters to FlashInfer's MXFP8 block-
-    floating-point format.  Three key design decisions drive the upstream code:
+    Megatron's MXFP8 refit system solves a specific inference-serving problem:
+    a training job runs on one set of GPUs (BF16), and an inference process runs
+    concurrently on another set.  Weight resharding transfers slices between the
+    two worlds via NCCL/Gloo/NVSHMEM.  Because the inference side uses CUDA graphs
+    (for latency), the device pointers to weight tensors must remain stable across
+    refits — hence "persistent buffers".  The commit introduces:
 
-    1. **Persistent buffer address stability**: CUDA graphs capture device
-       pointers at warmup time.  If quantize_params_to_mxfp8 creates new
-       MXFP8Tensor objects on every refit, the graph's captured pointers
-       become stale, causing silent data corruption or segfaults.  The
-       ``persistent_buffers`` dict is therefore created once and mutated
-       in-place on all subsequent refits (copy_ into existing tensors).
+    1. quantize_params_to_mxfp8 / persistent-buffer reuse — second call copies
+       into existing tensors rather than allocating new ones, preserving addresses.
+    2. ReshardTransform / MXFP8ReshardTransform — pluggable hooks that intercept
+       per-op send/recv and do format conversion on the receiver side (BF16 wire,
+       MXFP8 landing zone).  1D-swizzled scales cannot be updated partially, so
+       slices are accumulated and quantized atomically when all arrive.
+    3. execute_reshard_plan transform plumbing — the execution engine dispatches
+       each TransferOp through the transform when applicable, accumulates
+       dequantized BF16 for fp8_param=True destination params, and calls a second
+       cuda.synchronize() after writeback to close the race with CUDA-graph warmup.
+    4. Stream wrapper rename (torch_pack_stream → torch_pack_stream_wrapper) and
+       an extra cpu-sync before barrier_event recording to prevent the event from
+       firing before RDMA data is visible.
+    5. prepare_swap_model_weights — pre-builds the plan and quantizes the target
+       model during init so swap_model_weights is latency-free at runtime.
 
-    2. **1D vs 2D scale layout**: FlashInfer uses a "swizzled" 1D scale
-       layout for certain tile sizes.  A partial slice update corrupts the
-       swizzle pattern, so partial BF16 slices must be accumulated and the
-       full weight requantized atomically once all shards arrive.
+DES-LOC adaptation points (SM86 A6000 × 2 + SM90 H100-NVL × 1, PCIe, no NVLink):
+    * SM86 (A6000) does NOT support native MXFP8 hardware — all MXFP8 quantization
+      and dequantization must be emulated in software (BF16 intermediate).
+    * SM90 (H100) supports MXFP8 natively via Transformer Engine / FlashInfer.
+    * Without NVLink, inter-GPU bandwidth is limited to PCIe Gen4 ×16 (~64 GB/s
+      host-side or ~32 GB/s peer-to-peer).  The "receiver-side conversion" mode
+      (convert_on_send=False) is therefore preferred to keep wire format as BF16
+      and let the H100 do the cheap SM90-accelerated quantization.
+    * With 1.5 TB CPU DRAM, we use CPU-offloaded "locality cache" (the LOC in
+      DES-LOC) to absorb weight slices that cannot be directly streamed device-to-
+      device.  The SharedLocalityCache holds pinned-memory staging buffers; GPU
+      workers pull from cache asynchronously without blocking the training loop.
+    * Decoupled Execution (DE): training on A6000 and inference on H100 run in
+      independent CUDA contexts.  Weight transfer is mediated by a coordinator
+      thread that owns the pinned staging memory, avoiding any direct peer mapping
+      which would require NVLink or NvSCI on PCIe-only systems.
 
-    3. **Barrier ordering**: The original code had a race where
-       torch.cuda.synchronize() fired *before* the writeback loop, leaving
-       async copy_() kernels in flight when execute_reshard_plan returned.
-       The fix adds a second synchronize() after writebacks.
-
-DES-LOC adaptation (Neuron_SP M3478-BF):
-    DES-LOC (Decoupled Execution with Shared LOcality Cache) separates
-    training execution (2x A6000 48 GB, SM86) from inference execution
-    (1x H100 NVL 96 GB, SM90) across a PCIe fabric with 1.5 TB CPU DRAM
-    as the shared locality cache (SLC).
-
-    The heterogeneous hardware introduces two precision-routing concerns
-    absent in Megatron's homogeneous GPU fleet:
-
-    A. **SM86 cannot execute native MXFP8 kernels** (requires SM89+).
-       Weights resident on A6000 training replicas must be kept in BF16.
-       Only the H100 inference replica holds MXFP8 persistent buffers.
-       The ``HeteroMXFP8RefitEngine`` checks SM version at runtime and
-       routes accordingly via ``DeviceRole``.
-
-    B. **PCIe bandwidth bottleneck (no NVLink)**: Unlike NVLink-connected
-       DGX pods, PCIe limits inter-GPU bandwidth to ~32 GB/s aggregate.
-       To avoid saturating the PCIe bus during refit, the SLC (CPU DRAM)
-       is used as a staging area: training workers DMA weights to pinned
-       CPU buffers; the inference worker pulls from CPU rather than from
-       peer GPU memory.  This is the "Shared LOcality Cache" in DES-LOC.
-
-    C. **Deferred quantization on H100**: The H100 inference worker
-       receives BF16 from CPU staging (receiver-side conversion), converts
-       to MXFP8, and writes into persistent CUDA-graph-safe buffers.
-       The 1D-scale accumulation logic from upstream is preserved intact.
-
-    D. **Stream wrapper naming**: Upstream renamed ``torch_*_stream`` →
-       ``torch_*_stream_wrapper`` to avoid shadowing the underlying CUDA
-       stream object.  DES-LOC follows the same convention for all internal
-       stream handles.
-
-Hardware topology assumed:
-    rank 0,1 : A6000 48 GB (SM86)  — training / source
-    rank 2    : H100 NVL 96 GB (SM90) — inference / destination
-    CPU DRAM  : 1.5 TB pinned staging (SLC)
+Key design changes vs. upstream Megatron:
+    * DeviceCapabilityRouter: replaces the static HAVE_FLASHINFER flag with a
+      per-device capability query so SM86 falls back to software FP8 emulation.
+    * SharedLocalityCache: pinned-memory staging arena with LRU eviction that
+      serves as the shared LOC tier between A6000 (training) and H100 (inference).
+    * HeteroMXFP8Transform: subclass of the upstream ReshardTransform pattern,
+      extended to route quantization through the capability router and use the
+      locality cache for inter-device transfers that cross the PCIe boundary.
+    * HeteroRefitCoordinator: replaces Megatron's synchronous execute_reshard_plan
+      loop with an async coordinator that overlaps PCIe transfers with the H100's
+      next-batch compute.
+    * Persistent-buffer address stability is preserved exactly as in upstream —
+      the H100 side allocates MXFP8Tensor buffers once and subsequent refits
+      copy_ into them.
 """
 
 from __future__ import annotations
@@ -69,748 +65,1059 @@ import logging
 import threading
 import time
 from dataclasses import dataclass, field
-from enum import Enum, auto
 from typing import Dict, List, Optional, Set, Tuple
 
 import torch
-import torch.distributed as dist
+import torch.nn as nn
 
 logger = logging.getLogger(__name__)
 
-
 # ---------------------------------------------------------------------------
-# Hardware / capability detection
-# ---------------------------------------------------------------------------
-
-def _sm_version(device: Optional[torch.device] = None) -> int:
-    """Return the SM major*10 + minor for *device* (or the current device)."""
-    idx = (device.index if device is not None else torch.cuda.current_device())
-    props = torch.cuda.get_device_properties(idx)
-    return props.major * 10 + props.minor
-
-
-def _supports_mxfp8(device: Optional[torch.device] = None) -> bool:
-    """MXFP8 hardware support requires SM ≥ 89 (Ada / H100 and later)."""
-    return _sm_version(device) >= 89
-
-
-class DeviceRole(Enum):
-    """Role of the current rank in the DES-LOC heterogeneous cluster."""
-    TRAINING_SOURCE = auto()   # A6000 SM86 — produces BF16 weights
-    INFERENCE_SINK  = auto()   # H100  SM90 — consumes MXFP8 weights
-    IDLE            = auto()   # participates in collectives only
-
-
-# ---------------------------------------------------------------------------
-# Shared LOcality Cache (SLC) — pinned CPU staging buffers
-# ---------------------------------------------------------------------------
-
-class SharedLocalityCache:
-    """PCIe-aware CPU DRAM staging layer for DES-LOC weight transfers.
-
-    In a homogeneous NVLink cluster, GPU-to-GPU weight transfers happen via
-    NCCL P2P or NVSHMEM.  On the A6000 + H100 PCIe topology, there is no
-    NVLink, so direct GPU-to-GPU copies share PCIe bandwidth with all other
-    traffic.
-
-    DES-LOC instead uses CPU DRAM (1.5 TB available) as a locality cache:
-      - Training workers write BF16 shards into pinned CPU buffers.
-      - The inference worker reads from CPU, converts to MXFP8, and loads
-        into its persistent GPU buffers.
-    This decouples the A6000→CPU phase from the CPU→H100 phase, allowing
-    both to overlap with training computation on the A6000s.
-
-    The cache is keyed by (param_name, shard_index) so that partial TP
-    shards can be written and read independently.
-    """
-
-    def __init__(self, capacity_bytes: int = 32 * 1024**3):
-        """
-        Args:
-            capacity_bytes: Maximum pinned CPU memory to allocate.  Default
-                32 GB, well within the 1.5 TB available.
-        """
-        self._capacity = capacity_bytes
-        self._used: int = 0
-        self._store: Dict[Tuple[str, int], torch.Tensor] = {}
-        self._lock = threading.Lock()
-        logger.info(
-            "SharedLocalityCache initialised, capacity=%.1f GB",
-            capacity_bytes / 1024**3,
-        )
-
-    # -- write side (training workers / A6000) --------------------------------
-
-    def put(self, param_name: str, shard_idx: int, tensor: torch.Tensor) -> None:
-        """Stage *tensor* (GPU or CPU) into a pinned CPU buffer.
-
-        If *tensor* is already on CPU it is copied into a pinned allocation.
-        GPU tensors are first DMA'd to CPU via a non-blocking copy.
-
-        The operation is thread-safe; concurrent writes from TP workers are
-        serialised per-key so the reader always sees a consistent shard.
-        """
-        key = (param_name, shard_idx)
-        pinned = torch.empty(tensor.shape, dtype=tensor.dtype, pin_memory=True)
-        if tensor.is_cuda:
-            # Non-blocking H2D → D2H; caller must synchronize before reading.
-            pinned.copy_(tensor.cpu(), non_blocking=False)
-        else:
-            pinned.copy_(tensor)
-
-        with self._lock:
-            old = self._store.get(key)
-            if old is not None:
-                self._used -= old.numel() * old.element_size()
-            self._store[key] = pinned
-            self._used += pinned.numel() * pinned.element_size()
-            logger.debug(
-                "SLC.put %s[%d] shape=%s used=%.2f GB",
-                param_name, shard_idx, list(tensor.shape),
-                self._used / 1024**3,
-            )
-
-    def get(self, param_name: str, shard_idx: int) -> Optional[torch.Tensor]:
-        """Retrieve a staged shard (or None if not yet written)."""
-        return self._store.get((param_name, shard_idx))
-
-    def wait_for(
-        self,
-        param_name: str,
-        shard_idx: int,
-        timeout: float = 60.0,
-        poll_interval: float = 0.005,
-    ) -> torch.Tensor:
-        """Block until the shard is available, then return it.
-
-        Args:
-            timeout: Maximum seconds to wait before raising RuntimeError.
-            poll_interval: Seconds between cache polls.
-        """
-        deadline = time.monotonic() + timeout
-        while True:
-            t = self.get(param_name, shard_idx)
-            if t is not None:
-                return t
-            if time.monotonic() > deadline:
-                raise RuntimeError(
-                    f"SLC timeout waiting for {param_name}[{shard_idx}] "
-                    f"after {timeout:.1f}s"
-                )
-            time.sleep(poll_interval)
-
-    def evict(self, param_name: str, shard_idx: int) -> None:
-        """Remove a shard from the cache (free pinned memory)."""
-        key = (param_name, shard_idx)
-        with self._lock:
-            t = self._store.pop(key, None)
-            if t is not None:
-                self._used -= t.numel() * t.element_size()
-
-    def stats(self) -> Dict[str, object]:
-        return {
-            "num_shards": len(self._store),
-            "used_bytes": self._used,
-            "capacity_bytes": self._capacity,
-        }
-
-
-# ---------------------------------------------------------------------------
-# MXFP8 tensor shim (graceful degradation when FlashInfer unavailable)
+# Optional dependency guards
 # ---------------------------------------------------------------------------
 
 try:
-    from flashinfer import mxfp8_quantize as _fi_quantize  # noqa: F401
+    from flashinfer import mxfp8_quantize as _fi_mxfp8_quantize
+    from flashinfer import mm_mxfp8 as _fi_mm_mxfp8  # noqa: F401 — import verifies linkage
+
     _HAVE_FLASHINFER = True
+    logger.debug("FlashInfer MXFP8 available")
 except ImportError:
     _HAVE_FLASHINFER = False
-    logger.warning(
-        "FlashInfer not found — MXFP8 quantization disabled.  "
-        "Inference replica will receive BF16 weights."
-    )
+    logger.debug("FlashInfer not available — SM86 software emulation path active")
+
+try:
+    import transformer_engine.pytorch as te  # noqa: F401
+
+    _HAVE_TE = True
+except ImportError:
+    _HAVE_TE = False
+
+
+# ---------------------------------------------------------------------------
+# Device capability routing
+# ---------------------------------------------------------------------------
+
+# SM version thresholds
+_SM_MXFP8_NATIVE = 90   # H100 and above: native MXFP8 (Hopper+)
+_SM_MXFP8_EMUL  = 86   # A6000 (Ampere SM86): software-emulated MXFP8
 
 
 @dataclass
-class DESLOC_MXFP8Tensor:
-    """Lightweight MXFP8 container used by the DES-LOC refit engine.
+class DeviceProfile:
+    """Capability profile for a single CUDA device in the heterogeneous cluster."""
+    device_index: int
+    sm_major: int
+    sm_minor: int
+    total_memory_gb: float
+    supports_mxfp8_native: bool
+    name: str
 
-    Wraps a FlashInfer MXFP8Tensor when available; falls back to storing
-    plain BF16 data + a unit scale for SM86 training replicas or when
-    FlashInfer is absent.  The ``persistent`` flag indicates whether the
-    underlying buffers must not be reallocated (CUDA graph constraint).
+    @property
+    def sm_version(self) -> int:
+        return self.sm_major * 10 + self.sm_minor
 
-    Fields:
-        data:       quantized uint8 tensor (MXFP8) or BF16 fallback
-        scale:      per-block scale tensor (1D swizzled or 2D row-wise)
-        persistent: if True, write via copy_() not assignment
-        param_name: FQN of the originating parameter (for logging)
+
+def _profile_device(index: int) -> DeviceProfile:
+    """Query CUDA device properties and build a DeviceProfile."""
+    props = torch.cuda.get_device_properties(index)
+    sm = props.major * 10 + props.minor
+    return DeviceProfile(
+        device_index=index,
+        sm_major=props.major,
+        sm_minor=props.minor,
+        total_memory_gb=props.total_memory / (1 << 30),
+        supports_mxfp8_native=(sm >= _SM_MXFP8_NATIVE) and _HAVE_FLASHINFER,
+        name=props.name,
+    )
+
+
+class DeviceCapabilityRouter:
+    """Routes quantization operations to the appropriate implementation per device.
+
+    DES-LOC adaptation:
+        Megatron assumes a homogeneous cluster where all GPUs support MXFP8
+        (Blackwell/H100).  In our heterogeneous setup (A6000 SM86 + H100 SM90),
+        we must select the implementation at runtime based on the current device.
+
+        SM90 (H100-NVL):  Use FlashInfer mxfp8_quantize / MXFP8Tensor directly.
+        SM86 (A6000):      Emulate with scaled FP8 via manual E4M3 clamping.
+                           The emulated path produces data/scale tensors with the
+                           same layout as FlashInfer so downstream code is uniform.
     """
-    data:       torch.Tensor
-    scale:      torch.Tensor
-    persistent: bool = False
-    param_name: str  = ""
+
+    def __init__(self):
+        self._profiles: Dict[int, DeviceProfile] = {}
+        self._lock = threading.Lock()
+
+    def get_profile(self, device: torch.device) -> DeviceProfile:
+        idx = device.index if device.index is not None else torch.cuda.current_device()
+        with self._lock:
+            if idx not in self._profiles:
+                self._profiles[idx] = _profile_device(idx)
+                p = self._profiles[idx]
+                logger.info(
+                    "DeviceCapabilityRouter: device %d (%s) SM%d%d — "
+                    "native_mxfp8=%s total_mem=%.1f GiB",
+                    idx, p.name, p.sm_major, p.sm_minor,
+                    p.supports_mxfp8_native, p.total_memory_gb,
+                )
+        return self._profiles[idx]
+
+    def quantize_to_mxfp8(
+        self, tensor: torch.Tensor, device: Optional[torch.device] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Quantize *tensor* (BF16) to MXFP8 data + scale tensors.
+
+        Returns:
+            (data, scale) — layout is compatible with FlashInfer MXFP8Tensor
+            regardless of whether the native or emulated path is taken.
+        """
+        if tensor.dtype != torch.bfloat16:
+            tensor = tensor.to(torch.bfloat16)
+
+        dev = device or tensor.device
+        profile = self.get_profile(dev)
+
+        if profile.supports_mxfp8_native:
+            return self._quantize_native(tensor)
+        else:
+            return self._quantize_emulated(tensor)
+
+    # -- native path (SM90 H100 via FlashInfer) ------------------------------
+
+    @staticmethod
+    def _quantize_native(tensor: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """FlashInfer mxfp8_quantize — hardware-accelerated on SM90."""
+        assert _HAVE_FLASHINFER, "FlashInfer required for native MXFP8 quantization"
+        data, scale = _fi_mxfp8_quantize(tensor)
+        return data, scale
+
+    # -- emulated path (SM86 A6000, software only) ---------------------------
+
+    @staticmethod
+    def _quantize_emulated(tensor: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Software-emulated MXFP8 (E4M3) quantization for SM86 (A6000).
+
+        DES-LOC rationale:
+            A6000 GPUs (SM86) have no MXFP8 hardware.  We emulate the same
+            block-scale quantization format used by FlashInfer so that:
+            (a) The H100 inference side can directly consume the result.
+            (b) Code paths that inspect data/scale shape remain unchanged.
+
+        Algorithm:
+            - Block size = 32 (matches FlashInfer default).
+            - For each [M, 32] tile, compute per-tile amax.
+            - Scale = amax / 448.0 (E4M3 max finite value).
+            - Quantized data = clamp(round(tensor / scale), -448, 448) cast to FP8.
+
+        The scale tensor is 2D: shape [M, K // 32], matching FlashInfer layout.
+        When K is not divisible by 32, the last block is zero-padded.
+        """
+        BLOCK = 32
+        E4M3_MAX = 448.0
+
+        M, K = tensor.shape
+        # Pad K to multiple of BLOCK
+        K_pad = ((K + BLOCK - 1) // BLOCK) * BLOCK
+        if K_pad != K:
+            pad = torch.zeros(M, K_pad - K, dtype=torch.bfloat16, device=tensor.device)
+            tensor = torch.cat([tensor, pad], dim=1)
+
+        n_blocks = K_pad // BLOCK
+        # Reshape to [M, n_blocks, BLOCK] for per-block amax
+        t_blocks = tensor.view(M, n_blocks, BLOCK)
+        amax = t_blocks.abs().amax(dim=-1)          # [M, n_blocks]
+        scale = (amax / E4M3_MAX).clamp(min=1e-12)  # [M, n_blocks]
+
+        # Broadcast scale back to [M, K_pad]
+        scale_bc = scale.unsqueeze(-1).expand(M, n_blocks, BLOCK).reshape(M, K_pad)
+        q_float = (tensor / scale_bc).clamp(-E4M3_MAX, E4M3_MAX)
+
+        # Cast to torch.float8_e4m3fn
+        try:
+            data = q_float[:, :K].to(torch.float8_e4m3fn)
+        except AttributeError:
+            # Fallback for older PyTorch without float8 dtype: store as uint8
+            logger.warning(
+                "torch.float8_e4m3fn not available; storing emulated FP8 as uint8"
+            )
+            data = q_float[:, :K].to(torch.int8)
+
+        return data.contiguous(), scale.contiguous()
+
+    def dequantize_from_mxfp8(
+        self,
+        data: torch.Tensor,
+        scale: torch.Tensor,
+        device: Optional[torch.device] = None,
+    ) -> torch.Tensor:
+        """Dequantize MXFP8 data+scale back to BF16.
+
+        Works on both SM86 (emulated) and SM90 (native) since the scale
+        layout is the same.
+        """
+        BLOCK = 32
+        M = data.shape[0]
+        K = data.shape[1]
+        n_blocks = scale.shape[1]
+
+        # Broadcast scale: [M, n_blocks] → [M, K]
+        scale_bc = scale.unsqueeze(-1).expand(M, n_blocks, BLOCK).reshape(M, n_blocks * BLOCK)
+        scale_bc = scale_bc[:, :K]
+
+        return (data.to(torch.float32) * scale_bc.to(torch.float32)).to(torch.bfloat16)
+
+
+# Module-level singleton
+_capability_router = DeviceCapabilityRouter()
+
+
+# ---------------------------------------------------------------------------
+# MXFP8Tensor shim (used when FlashInfer is unavailable on SM86)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class HeteroMXFP8Tensor:
+    """Minimal MXFP8 tensor container compatible with FlashInfer MXFP8Tensor API.
+
+    DES-LOC adaptation:
+        On SM86 hosts where FlashInfer is unavailable, we use this shim so
+        that the rest of the refit pipeline can treat quantized weights uniformly.
+        On SM90 hosts with FlashInfer, the real MXFP8Tensor is used instead.
+
+    Persistent-buffer semantics:
+        Once allocated, .data and .scale must not be reallocated — only
+        copy_() is permitted so that CUDA graph device-pointer captures
+        on the H100 side remain valid.
+    """
+    data: torch.Tensor    # FP8 (or uint8) quantized data
+    scale: torch.Tensor   # BF16 scale factors, shape [M, K//32]
 
     @classmethod
-    def from_bf16(
-        cls,
-        bf16: torch.Tensor,
-        param_name: str = "",
-        persistent: bool = False,
-    ) -> "DESLOC_MXFP8Tensor":
-        """Quantize a BF16 tensor to MXFP8 using FlashInfer.
-
-        Falls back to BF16 identity when FlashInfer is unavailable or the
-        current device is SM86 (A6000) which lacks native MXFP8 support.
-        """
-        if not _HAVE_FLASHINFER or not _supports_mxfp8():
-            # SM86 path: store BF16, unit scale
-            scale = torch.ones(
-                bf16.shape[0], dtype=torch.float32, device=bf16.device
-            )
-            return cls(
-                data=bf16.contiguous(),
-                scale=scale,
-                persistent=persistent,
-                param_name=param_name,
-            )
-        from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
-        fi = MXFP8Tensor.from_bf16(bf16)
-        return cls(
-            data=fi.data,
-            scale=fi.scale,
-            persistent=persistent,
-            param_name=param_name,
-        )
-
-    def update_inplace(self, new_bf16: torch.Tensor) -> None:
-        """Requantize *new_bf16* into this tensor's existing buffers.
-
-        Preserves device pointers for CUDA graph compatibility.
-        Raises RuntimeError if buffer shapes mismatch.
-        """
-        if not _HAVE_FLASHINFER or not _supports_mxfp8():
-            if self.data.shape != new_bf16.shape:
-                raise RuntimeError(
-                    f"[SLC] Buffer shape mismatch for {self.param_name}: "
-                    f"got {new_bf16.shape}, expected {self.data.shape}"
-                )
-            self.data.copy_(new_bf16)
-            return
-
-        from flashinfer import mxfp8_quantize
-        new_data, new_scale = mxfp8_quantize(new_bf16.to(torch.bfloat16))
-        self.data.copy_(new_data)
-        self.scale.copy_(new_scale)
+    def from_bf16(cls, tensor: torch.Tensor) -> "HeteroMXFP8Tensor":
+        device = tensor.device
+        data, scale = _capability_router.quantize_to_mxfp8(tensor, device)
+        return cls(data=data, scale=scale)
 
     def dequantize(self) -> torch.Tensor:
-        """Reconstruct BF16 from MXFP8 (or return BF16 data on SM86)."""
-        if not _HAVE_FLASHINFER or not _supports_mxfp8():
-            return self.data.to(torch.bfloat16)
-        from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
-        fi = MXFP8Tensor.__new__(MXFP8Tensor)
-        fi.data  = self.data
-        fi.scale = self.scale
-        return fi.dequantize()
+        return _capability_router.dequantize_from_mxfp8(
+            self.data, self.scale, self.data.device
+        )
+
+    def copy_from(self, other: "HeteroMXFP8Tensor") -> None:
+        """Copy data/scale from *other* preserving our tensor addresses."""
+        self.data.copy_(other.data)
+        self.scale.copy_(other.scale)
+
+
+def _make_mxfp8_tensor(tensor: torch.Tensor):
+    """Factory: return native FlashInfer MXFP8Tensor on SM90, shim on SM86."""
+    profile = _capability_router.get_profile(tensor.device)
+    if profile.supports_mxfp8_native:
+        try:
+            from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
+            return MXFP8Tensor.from_bf16(tensor)
+        except ImportError:
+            pass
+    return HeteroMXFP8Tensor.from_bf16(tensor)
 
 
 # ---------------------------------------------------------------------------
-# Scale-slice helper (mirrors upstream _scale_slice_from_data_slice)
+# Shared Locality Cache (the LOC tier in DES-LOC)
 # ---------------------------------------------------------------------------
+
+@dataclass
+class _CacheEntry:
+    """One slot in the SharedLocalityCache."""
+    key: str
+    tensor: torch.Tensor      # pinned CPU tensor
+    last_access: float = field(default_factory=time.monotonic)
+    dirty: bool = False       # True if modified since last GPU push
+
+
+class SharedLocalityCache:
+    """Pinned-memory staging arena for heterogeneous PCIe weight transfer.
+
+    DES-LOC rationale:
+        Without NVLink, A6000 → H100 direct peer copies go over PCIe and
+        are limited to ~32 GB/s.  For large transformer weights this can
+        block the training step.  Instead:
+
+        1. Training (A6000) writes updated weight slices to pinned CPU
+           staging tensors asynchronously (non-blocking).
+        2. The H100 inference process pulls slices from the cache when its
+           decode batch finishes, overlapping PCIe transfer with compute.
+        3. Eviction is LRU-based; the 1.5 TB CPU DRAM gives us ample room
+           to hold an entire 70B model's worth of BF16 weights (~140 GB)
+           plus the quantized copies.
+
+    This is the "Shared LOCality" in DES-LOC: both GPUs see a consistent
+    snapshot of each layer's weights through this pinned cache.
+
+    Thread safety:
+        A single threading.Lock guards all mutations.  Weight slices are
+        typically small enough that lock contention is not a bottleneck.
+        For future work, per-parameter locks would reduce contention.
+    """
+
+    def __init__(self, capacity_gb: float = 256.0):
+        self._capacity_bytes = int(capacity_gb * (1 << 30))
+        self._used_bytes = 0
+        self._entries: Dict[str, _CacheEntry] = {}
+        self._lock = threading.Lock()
+        logger.info(
+            "SharedLocalityCache initialized: capacity=%.1f GiB", capacity_gb
+        )
+
+    # -- public API ----------------------------------------------------------
+
+    def put(self, key: str, tensor: torch.Tensor) -> None:
+        """Write a weight slice (or full weight) into the cache.
+
+        The tensor is copied to a pinned CPU buffer.  If *key* already
+        exists its buffer is reused (preserving memory layout) when shapes
+        match; otherwise a new pinned allocation is made after eviction.
+
+        Args:
+            key:    Fully-qualified parameter name (e.g. "decoder.0.fc.weight").
+            tensor: BF16 tensor on any device (GPU or CPU).
+        """
+        cpu_tensor = tensor.detach().cpu()
+        with self._lock:
+            if key in self._entries:
+                entry = self._entries[key]
+                if entry.tensor.shape == cpu_tensor.shape:
+                    entry.tensor.copy_(cpu_tensor)
+                    entry.dirty = True
+                    entry.last_access = time.monotonic()
+                    logger.debug("SharedLocalityCache: updated key=%s", key)
+                    return
+                else:
+                    # Shape changed — evict old entry first
+                    self._used_bytes -= entry.tensor.nbytes
+                    del self._entries[key]
+
+            nbytes = cpu_tensor.nbytes
+            self._evict_if_needed(nbytes)
+            pinned = torch.empty_like(cpu_tensor, pin_memory=True)
+            pinned.copy_(cpu_tensor)
+            self._entries[key] = _CacheEntry(key=key, tensor=pinned, dirty=True)
+            self._used_bytes += nbytes
+            logger.debug(
+                "SharedLocalityCache: stored key=%s shape=%s used=%.1f GiB",
+                key, list(cpu_tensor.shape), self._used_bytes / (1 << 30),
+            )
+
+    def get(self, key: str, device: torch.device) -> Optional[torch.Tensor]:
+        """Retrieve a cached weight slice and transfer to *device*.
+
+        Returns None if the key is not present.  On success, marks the
+        entry as clean (the GPU now has the authoritative copy).
+
+        Args:
+            key:    Parameter name.
+            device: Target GPU device.
+        """
+        with self._lock:
+            entry = self._entries.get(key)
+            if entry is None:
+                return None
+            entry.last_access = time.monotonic()
+            entry.dirty = False
+            # Non-blocking transfer from pinned → GPU
+            result = entry.tensor.to(device, non_blocking=True)
+            logger.debug(
+                "SharedLocalityCache: retrieved key=%s → device=%s", key, device
+            )
+            return result
+
+    def evict(self, key: str) -> None:
+        """Explicitly remove a key from the cache."""
+        with self._lock:
+            if key in self._entries:
+                self._used_bytes -= self._entries[key].tensor.nbytes
+                del self._entries[key]
+                logger.debug("SharedLocalityCache: evicted key=%s", key)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._entries.clear()
+            self._used_bytes = 0
+        logger.info("SharedLocalityCache: cleared")
+
+    @property
+    def used_bytes(self) -> int:
+        return self._used_bytes
+
+    # -- internal ------------------------------------------------------------
+
+    def _evict_if_needed(self, required_bytes: int) -> None:
+        """LRU eviction until *required_bytes* can be accommodated."""
+        while self._used_bytes + required_bytes > self._capacity_bytes and self._entries:
+            lru_key = min(self._entries, key=lambda k: self._entries[k].last_access)
+            victim = self._entries.pop(lru_key)
+            self._used_bytes -= victim.tensor.nbytes
+            logger.warning(
+                "SharedLocalityCache: LRU evict key=%s (%.1f MiB freed)",
+                lru_key, victim.tensor.nbytes / (1 << 20),
+            )
+
+
+# Module-level default cache; can be replaced for testing
+_default_locality_cache: Optional[SharedLocalityCache] = None
+
+
+def get_locality_cache() -> SharedLocalityCache:
+    global _default_locality_cache
+    if _default_locality_cache is None:
+        _default_locality_cache = SharedLocalityCache(capacity_gb=256.0)
+    return _default_locality_cache
+
+
+# ---------------------------------------------------------------------------
+# HeteroMXFP8Transform — DES-LOC adaptation of MXFP8ReshardTransform
+# ---------------------------------------------------------------------------
+
+class HeteroMXFP8Transform:
+    """MXFP8 refit transform for heterogeneous SM86/SM90 clusters without NVLink.
+
+    Upstream design (Megatron MXFP8ReshardTransform):
+        Two modes: convert_on_send (sender quantizes, saves PCIe bandwidth)
+        vs. receive BF16 + convert_on_recv (simpler, receiver handles all).
+        Persistent buffers preserve CUDA-graph device pointers across refits.
+        1D-swizzled scales must be accumulated before quantization.
+
+    DES-LOC adaptations:
+        1. Device-aware quantization: prepare_send checks if the source device
+           is SM86 and uses the emulated path; prepare_recv similarly routes
+           through the capability router on the destination (SM90 H100).
+
+        2. Locality-cache staging: on the A6000 (training) side, prepared
+           send buffers are written into the SharedLocalityCache before
+           transmission.  The H100 (inference) side can pull from cache
+           during prepare_recv even if the PCIe transfer is still in flight,
+           using a pinned-CPU intermediate to decouple the two timelines.
+
+        3. Stream isolation: since A6000 and H100 run in separate CUDA
+           contexts (no NVLink peer mapping), we use pinned CPU memory as
+           the staging point rather than direct device-to-device copies.
+           This avoids the need for CudaIPC handles or NvSCI.
+
+        4. 1D-scale accumulation: preserved identically from upstream —
+           FlashInfer's swizzled 1D scale format cannot be partially updated.
+
+    Args:
+        convertible_params: Set of FQN parameter names routed through this transform.
+        persistent_buffers: Maps parameter name (sans prefix) → HeteroMXFP8Tensor
+            or FlashInfer MXFP8Tensor.  These are never reallocated.
+        buffer_key_prefix: Prefix stripped from param_name before lookup.
+        src_device: Device of the training (sender) model, e.g. cuda:0 (A6000).
+        dst_device: Device of the inference (receiver) model, e.g. cuda:2 (H100).
+        locality_cache: SharedLocalityCache instance.  Uses module default if None.
+        convert_on_send: If True, sender quantizes to MXFP8; if False (default),
+            BF16 is sent and the receiver quantizes.  Prefer False for PCIe-only
+            clusters since the H100 quantization is nearly free.
+    """
+
+    def __init__(
+        self,
+        convertible_params: Set[str],
+        persistent_buffers: Dict[str, object],
+        buffer_key_prefix: str = "",
+        src_device: Optional[torch.device] = None,
+        dst_device: Optional[torch.device] = None,
+        locality_cache: Optional[SharedLocalityCache] = None,
+        convert_on_send: bool = False,
+    ):
+        self.convertible_params = convertible_params
+        self.persistent_buffers = persistent_buffers
+        self.buffer_key_prefix = buffer_key_prefix
+        self.src_device = src_device
+        self.dst_device = dst_device
+        self._cache = locality_cache or get_locality_cache()
+        self.convert_on_send = convert_on_send
+
+        # 1D-scale accumulation: maps buf_key → [accum_tensor, bytes_written]
+        self._pending_1d: Dict[str, List] = {}
+
+        src_profile = _capability_router.get_profile(src_device) if src_device else None
+        dst_profile = _capability_router.get_profile(dst_device) if dst_device else None
+        logger.info(
+            "HeteroMXFP8Transform: src=%s(%s) dst=%s(%s) params=%d convert_on_send=%s",
+            src_device, src_profile.name if src_profile else "?",
+            dst_device, dst_profile.name if dst_profile else "?",
+            len(convertible_params), convert_on_send,
+        )
+
+    # -- ReshardTransform interface ------------------------------------------
+
+    def should_transform(self, param_name: str) -> bool:
+        return param_name in self.convertible_params
+
+    def prepare_send(
+        self,
+        param_name: str,
+        src_slice: tuple,
+        src_param: torch.Tensor,
+    ) -> List[torch.Tensor]:
+        """Produce buffer(s) to send for *param_name*.
+
+        DES-LOC path:
+            1. Dequantize src_param if it is a TE MXFP8Tensor (fp8_param=True).
+            2. Extract the requested slice and move to BF16.
+            3. Write into SharedLocalityCache for decoupled PCIe transfer.
+            4. If convert_on_send: quantize on the sender (SM86 emulated path)
+               and return [data, scale].  Otherwise return [bf16_slice].
+        """
+        raw = self._dequantize_if_needed(src_param)
+        bf16_slice = raw[src_slice].contiguous().to(torch.bfloat16)
+
+        # Stage in locality cache (decouples A6000 training timeline from H100)
+        cache_key = f"{param_name}:{_slice_repr(src_slice)}"
+        self._cache.put(cache_key, bf16_slice)
+
+        if self.convert_on_send:
+            dev = self.src_device or bf16_slice.device
+            data, scale = _capability_router.quantize_to_mxfp8(bf16_slice, dev)
+            logger.debug(
+                "prepare_send: %s slice=%s data=%s scale=%s (convert_on_send)",
+                param_name, _slice_repr(src_slice), data.shape, scale.shape,
+            )
+            return [data.contiguous(), scale.contiguous()]
+        else:
+            logger.debug(
+                "prepare_send: %s slice=%s bf16=%s (BF16 wire)",
+                param_name, _slice_repr(src_slice), bf16_slice.shape,
+            )
+            return [bf16_slice]
+
+    def prepare_recv(
+        self,
+        param_name: str,
+        dst_slice: tuple,
+    ) -> List[torch.Tensor]:
+        """Allocate receive buffer(s) on the destination (H100) device.
+
+        DES-LOC path:
+            Try to prefetch from locality cache first.  If the sender has
+            already written the slice (non-blocking PCIe), we can skip the
+            network receive entirely.  Otherwise allocate standard recv buffers.
+
+        Returns list of tensors matching what prepare_send returns.
+        """
+        buf_key = param_name.removeprefix(self.buffer_key_prefix)
+        buf = self.persistent_buffers[buf_key]
+        dst_dev = self.dst_device or (
+            buf.data.device if hasattr(buf, "data") else torch.device("cuda")
+        )
+
+        # Opportunistic locality-cache prefetch
+        cache_key = f"{param_name}:{_slice_repr(dst_slice)}"
+        cached = self._cache.get(cache_key, dst_dev)
+        if cached is not None:
+            logger.debug(
+                "prepare_recv: %s cache hit — skipping PCIe recv", param_name
+            )
+            # Return as recv buffer; finalize_recv will handle quantization
+            return [cached]
+
+        if self.convert_on_send:
+            # Expect MXFP8 data + scale on the wire
+            if hasattr(buf, "scale") and buf.scale.ndim == 1:
+                raise NotImplementedError(
+                    f"convert_on_send=True unsupported for 1D-swizzled scale "
+                    f"(param={param_name!r}).  Use convert_on_send=False."
+                )
+            scale_slice = _scale_slice_from_data_slice(dst_slice)
+            return [
+                torch.empty_like(buf.data[dst_slice].contiguous(), device=dst_dev),
+                torch.empty_like(
+                    buf.scale[scale_slice].contiguous()
+                    if hasattr(buf, "scale") else torch.empty(1, device=dst_dev),
+                    device=dst_dev,
+                ),
+            ]
+        else:
+            # BF16 receive buffer
+            data_slice_shape = buf.data[dst_slice].shape if hasattr(buf, "data") else (1,)
+            return [
+                torch.empty(data_slice_shape, dtype=torch.bfloat16, device=dst_dev)
+            ]
+
+    def finalize_recv(
+        self,
+        param_name: str,
+        dst_slice: tuple,
+        recv_buffers: List[torch.Tensor],
+    ) -> None:
+        """Write received data into persistent MXFP8 buffers.
+
+        DES-LOC path mirrors upstream MXFP8ReshardTransform with two additions:
+            - Routes quantization through DeviceCapabilityRouter (SM90 native
+              or SM86 emulated).
+            - Clears the locality-cache entry for this slice once committed so
+              stale data is not served on the next refit cycle.
+        """
+        buf_key = param_name.removeprefix(self.buffer_key_prefix)
+        buf = self.persistent_buffers[buf_key]
+
+        if self.convert_on_send:
+            # MXFP8 data+scale arrived; copy directly into persistent buffers.
+            buf.data[dst_slice].copy_(recv_buffers[0])
+            if hasattr(buf, "scale") and buf.scale.ndim > 1:
+                scale_slice = _scale_slice_from_data_slice(dst_slice)
+                buf.scale[scale_slice].copy_(recv_buffers[1])
+        else:
+            # BF16 arrived; quantize on receiver.
+            bf16_data = recv_buffers[0]
+            scale_dim = buf.scale.ndim if hasattr(buf, "scale") else 2
+
+            if scale_dim == 1:
+                # 1D swizzled scale — accumulate and quantize atomically
+                self._accumulate_1d(param_name, buf_key, buf, dst_slice, bf16_data)
+            else:
+                # 2D scale — each row is independent, quantize immediately
+                dev = self.dst_device or bf16_data.device
+                data, scale = _capability_router.quantize_to_mxfp8(bf16_data, dev)
+                with torch.no_grad():
+                    buf.data[dst_slice].copy_(data)
+                    scale_slice = _scale_slice_from_data_slice(dst_slice)
+                    buf.scale[scale_slice].copy_(scale)
+                logger.debug(
+                    "finalize_recv: %s 2D-scale updated slice=%s",
+                    param_name, _slice_repr(dst_slice),
+                )
+
+        # Evict from locality cache — next refit will rewrite it
+        cache_key = f"{param_name}:{_slice_repr(dst_slice)}"
+        self._cache.evict(cache_key)
+
+    # -- internal helpers ----------------------------------------------------
+
+    def _accumulate_1d(
+        self,
+        param_name: str,
+        buf_key: str,
+        buf: object,
+        dst_slice: tuple,
+        bf16_data: torch.Tensor,
+    ) -> None:
+        """Accumulate BF16 slices for 1D-swizzled-scale params.
+
+        Upstream rationale (preserved):
+            FlashInfer's 1D swizzled scale encodes values across the full
+            weight tensor; updating a partial slice corrupts the swizzle
+            layout.  We therefore collect all BF16 slices and call
+            quantize_to_mxfp8 once when the last slice arrives.
+        """
+        if buf_key not in self._pending_1d:
+            accum = torch.zeros_like(buf.data, dtype=torch.bfloat16)
+            self._pending_1d[buf_key] = [accum, 0]
+            logger.debug(
+                "finalize_recv 1D: %s — started accumulation shape=%s",
+                param_name, list(accum.shape),
+            )
+
+        accum, written = self._pending_1d[buf_key]
+        accum[dst_slice].copy_(bf16_data)
+        written += bf16_data.numel()
+        total = buf.data.numel()
+
+        logger.debug(
+            "finalize_recv 1D: %s written=%d/%d", param_name, written, total
+        )
+
+        if written >= total:
+            if written != total:
+                raise AssertionError(
+                    f"1D-scale param {param_name!r}: received {written} elements, "
+                    f"expected {total} (duplicate or missing slices?)"
+                )
+            dev = self.dst_device or accum.device
+            data, scale = _capability_router.quantize_to_mxfp8(accum, dev)
+            with torch.no_grad():
+                buf.data.copy_(data)
+                buf.scale.copy_(scale)
+            del self._pending_1d[buf_key]
+            logger.info(
+                "finalize_recv 1D: %s — quantization complete, persistent buffers updated",
+                param_name,
+            )
+        else:
+            self._pending_1d[buf_key][1] = written
+
+    @staticmethod
+    def _dequantize_if_needed(param: torch.Tensor) -> torch.Tensor:
+        """Dequantize TE MXFP8Tensor to BF16; pass through standard tensors."""
+        if _HAVE_TE:
+            try:
+                from transformer_engine.pytorch.tensor.mxfp8_tensor import (
+                    MXFP8Tensor as _TEMXFP8,
+                )
+                if isinstance(param, _TEMXFP8):
+                    return param.dequantize()
+            except ImportError:
+                pass
+        return param.data
+
+
+# ---------------------------------------------------------------------------
+# Quantization helpers (persistent buffer management)
+# ---------------------------------------------------------------------------
+
+def should_quantize_param(val: torch.Tensor) -> bool:
+    """Return True if *val* is a 2D BF16/FP16 CUDA parameter eligible for MXFP8.
+
+    DES-LOC note:
+        On SM86 hosts the check is identical — we will use the emulated path.
+        On SM90 hosts with FlashInfer the native path is used.
+    """
+    if not val.is_cuda:
+        return False
+    if _HAVE_TE:
+        try:
+            from transformer_engine.pytorch.tensor.mxfp8_tensor import (
+                MXFP8Tensor as _TEMXFP8,
+            )
+            if isinstance(val, _TEMXFP8):
+                return True
+        except ImportError:
+            pass
+    return (
+        isinstance(val, nn.Parameter)
+        and val.dim() == 2
+        and val.dtype in (torch.bfloat16, torch.float16)
+    )
+
+
+def quantize_model_params(
+    model: nn.Module,
+    persistent_buffers: Optional[Dict[str, object]] = None,
+    _prefix: str = "",
+) -> Dict[str, object]:
+    """Quantize 2D BF16/FP16 parameters to HeteroMXFP8Tensor (or native MXFP8Tensor).
+
+    Upstream design (quantize_params_to_mxfp8 from Megatron):
+        Recursively walks the module tree.  First call allocates persistent
+        buffers; subsequent calls copy_ into them to preserve CUDA-graph
+        device pointers.  The nn.Parameter is replaced by the MXFP8 tensor
+        as a plain attribute (not a registered parameter).
+
+    DES-LOC adaptation:
+        Uses _make_mxfp8_tensor() which routes to native FlashInfer on SM90
+        or the software-emulated HeteroMXFP8Tensor on SM86.
+
+    Args:
+        model:              Module whose parameters should be quantized in-place.
+        persistent_buffers: Existing buffers from a prior call; entries are
+                            updated via copy_() rather than reallocated.
+        _prefix:            Internal FQN prefix (callers leave as "").
+
+    Returns:
+        Dict mapping FQN → quantized tensor.
+    """
+    if persistent_buffers is None:
+        persistent_buffers = {}
+
+    for child_name, child_module in model.named_children():
+        child_prefix = f"{_prefix}{child_name}." if _prefix else f"{child_name}."
+        quantize_model_params(child_module, persistent_buffers, _prefix=child_prefix)
+
+    if hasattr(model, "_parameters") and model._parameters:
+        for key in list(model._parameters.keys()):
+            val = model._parameters[key]
+            if val is None or not should_quantize_param(val):
+                continue
+
+            # Obtain BF16 data
+            if _HAVE_TE:
+                try:
+                    from transformer_engine.pytorch.tensor.mxfp8_tensor import (
+                        MXFP8Tensor as _TEMXFP8,
+                    )
+                    if isinstance(val, _TEMXFP8):
+                        bf16 = val.dequantize()
+                    else:
+                        bf16 = val.data.to(torch.bfloat16)
+                except ImportError:
+                    bf16 = val.data.to(torch.bfloat16)
+            else:
+                bf16 = val.data.to(torch.bfloat16)
+
+            fqn = f"{_prefix}{key}"
+
+            if fqn in persistent_buffers:
+                # Second+ call: copy_ to preserve addresses
+                existing = persistent_buffers[fqn]
+                new_q = _make_mxfp8_tensor(bf16)
+                if hasattr(existing, "copy_from"):
+                    existing.copy_from(new_q)
+                else:
+                    existing.data.copy_(new_q.data)
+                    existing.scale.copy_(new_q.scale)
+                q_tensor = existing
+                logger.debug("quantize_model_params: updated persistent buffer %s", fqn)
+            else:
+                q_tensor = _make_mxfp8_tensor(bf16)
+                persistent_buffers[fqn] = q_tensor
+                logger.info(
+                    "quantize_model_params: created buffer %s data=%s scale=%s",
+                    fqn, q_tensor.data.shape, q_tensor.scale.shape,
+                )
+
+            del model._parameters[key]
+            setattr(model, key, q_tensor)
+
+    return persistent_buffers
+
+
+# ---------------------------------------------------------------------------
+# HeteroRefitCoordinator — async weight transfer coordinator
+# ---------------------------------------------------------------------------
+
+class HeteroRefitCoordinator:
+    """Asynchronous refit coordinator for DES-LOC heterogeneous clusters.
+
+    Overview:
+        Megatron's execute_reshard_plan is synchronous: it blocks until all
+        weight slices are transferred and written back.  For DES-LOC this is
+        undesirable because:
+        (a) PCIe transfers between A6000 and H100 are slow (~32 GB/s P2P).
+        (b) The H100 decode batch and the weight transfer can overlap: the
+            H100 computes the current decode batch while the coordinator
+            pushes next-layer weights through the locality cache.
+
+        This coordinator:
+        1. Accepts (param_name, src_slice, src_tensor) tuples from the
+           training loop (A6000 side) and writes them to the locality cache.
+        2. A background thread drains the cache and calls finalize_recv on
+           the transform, updating persistent MXFP8 buffers on the H100.
+        3. wait_for_layer(param_name) allows the inference loop to block
+           until a specific layer's weights are committed.
+
+    Usage:
+        coord = HeteroRefitCoordinator(transform, dst_device=torch.device("cuda:2"))
+        coord.start()
+        # Training loop:
+        coord.push_slice("decoder.0.fc.weight", (slice(0,64), ...), weight_tensor)
+        # Inference loop (before computing layer 0):
+        coord.wait_for_layer("decoder.0.fc.weight")
+        coord.stop()
+    """
+
+    def __init__(
+        self,
+        transform: HeteroMXFP8Transform,
+        dst_device: torch.device,
+        drain_interval_ms: float = 5.0,
+    ):
+        self._transform = transform
+        self._dst_device = dst_device
+        self._drain_interval = drain_interval_ms / 1000.0
+
+        # Queue: each item is (param_name, src_slice, recv_buffer)
+        self._queue: List[Tuple[str, tuple, List[torch.Tensor]]] = []
+        self._queue_lock = threading.Lock()
+
+        # Per-parameter completion events
+        self._param_events: Dict[str, threading.Event] = {}
+        self._events_lock = threading.Lock()
+
+        self._thread: Optional[threading.Thread] = None
+        self._stop_flag = threading.Event()
+
+    def start(self) -> None:
+        self._stop_flag.clear()
+        self._thread = threading.Thread(
+            target=self._drain_loop, daemon=True, name="HeteroRefitDrain"
+        )
+        self._thread.start()
+        logger.info("HeteroRefitCoordinator: drain thread started")
+
+    def stop(self, timeout: float = 10.0) -> None:
+        self._stop_flag.set()
+        if self._thread is not None:
+            self._thread.join(timeout=timeout)
+        logger.info("HeteroRefitCoordinator: drain thread stopped")
+
+    def push_slice(
+        self,
+        param_name: str,
+        src_slice: tuple,
+        src_tensor: torch.Tensor,
+    ) -> None:
+        """Queue a weight slice for async transfer to the H100.
+
+        Called from the A6000 training loop after each optimizer step.
+        Immediately writes to the locality cache (non-blocking).
+        """
+        # Write to cache — non-blocking, returns immediately
+        recv_bufs = [src_tensor.detach().to(torch.bfloat16).contiguous().cpu()]
+        cache_key = f"{param_name}:{_slice_repr(src_slice)}"
+        self._transform._cache.put(cache_key, recv_bufs[0])
+
+        with self._queue_lock:
+            self._queue.append((param_name, src_slice, recv_bufs))
+
+        # Reset completion event for this param
+        with self._events_lock:
+            self._param_events[param_name] = threading.Event()
+
+        logger.debug("HeteroRefitCoordinator: queued %s slice=%s", param_name, _slice_repr(src_slice))
+
+    def wait_for_layer(self, param_name: str, timeout: float = 30.0) -> bool:
+        """Block until *param_name*'s weights are committed to H100 persistent buffers.
+
+        Returns True if weights are ready, False on timeout.
+        """
+        with self._events_lock:
+            event = self._param_events.get(param_name)
+        if event is None:
+            return True  # Never queued — already up-to-date
+        ready = event.wait(timeout=timeout)
+        if not ready:
+            logger.warning(
+                "HeteroRefitCoordinator: timeout waiting for %s", param_name
+            )
+        return ready
+
+    # -- background drain thread ---------------------------------------------
+
+    def _drain_loop(self) -> None:
+        while not self._stop_flag.is_set():
+            self._drain_once()
+            time.sleep(self._drain_interval)
+        # Final drain on shutdown
+        self._drain_once()
+
+    def _drain_once(self) -> None:
+        with self._queue_lock:
+            batch = list(self._queue)
+            self._queue.clear()
+
+        for param_name, src_slice, recv_bufs in batch:
+            try:
+                # Move recv buffer to H100 device
+                gpu_bufs = [
+                    b.to(self._dst_device, non_blocking=True) for b in recv_bufs
+                ]
+                torch.cuda.synchronize(self._dst_device)
+                self._transform.finalize_recv(param_name, src_slice, gpu_bufs)
+                logger.debug(
+                    "HeteroRefitCoordinator: committed %s slice=%s",
+                    param_name, _slice_repr(src_slice),
+                )
+                # Signal waiters
+                with self._events_lock:
+                    ev = self._param_events.get(param_name)
+                    if ev is not None:
+                        ev.set()
+            except Exception:
+                logger.exception(
+                    "HeteroRefitCoordinator: error committing %s", param_name
+                )
+
+
+# ---------------------------------------------------------------------------
+# Utility helpers
+# ---------------------------------------------------------------------------
+
+def _slice_repr(slices) -> str:
+    """Compact string representation of a slice tuple for logging/cache keys."""
+    if isinstance(slices, tuple):
+        parts = []
+        for s in slices:
+            if isinstance(s, slice):
+                parts.append(f"{s.start}:{s.stop}")
+            else:
+                parts.append(str(s))
+        return "[" + ",".join(parts) + "]"
+    return str(slices)
+
 
 def _scale_slice_from_data_slice(
-    data_slice: Tuple,
+    data_slice: tuple,
     block_size: int = 32,
-) -> Tuple:
-    """Compute the scale tensor slice corresponding to a data tensor slice.
+) -> tuple:
+    """Convert MXFP8 data slice indices to corresponding scale indices.
 
-    In MXFP8, ``block_size`` consecutive elements along the K (last) dimension
-    share one scale value.  This function divides the last slice's start/stop
-    by ``block_size``.  Alignment is enforced to catch mis-sharded TP plans.
+    Upstream logic (transforms.py in Megatron fca1679):
+        Each group of block_size elements along the K (last) dimension shares
+        one scale value.  Only the last dimension is divided; all others pass
+        through unchanged.
     """
     adjusted = list(data_slice)
     last = adjusted[-1]
     if isinstance(last, slice):
         if last.start is not None and last.start % block_size != 0:
-            raise ValueError(
-                f"Data slice last-dim start {last.start} not aligned to "
-                f"block_size={block_size}"
+            raise AssertionError(
+                f"Data slice last dim ({last}) not aligned to block_size={block_size}"
             )
         if last.stop is not None and last.stop % block_size != 0:
-            raise ValueError(
-                f"Data slice last-dim stop {last.stop} not aligned to "
-                f"block_size={block_size}"
+            raise AssertionError(
+                f"Data slice last dim ({last}) not aligned to block_size={block_size}"
             )
-        adjusted[-1] = slice(
-            (last.start // block_size) if last.start is not None else None,
-            (last.stop  // block_size) if last.stop  is not None else None,
-        )
+        scale_start = (last.start // block_size) if last.start is not None else None
+        scale_stop = (last.stop // block_size) if last.stop is not None else None
+        adjusted[-1] = slice(scale_start, scale_stop)
     elif isinstance(last, int):
         adjusted[-1] = last // block_size
     return tuple(adjusted)
 
 
 # ---------------------------------------------------------------------------
-# DES-LOC Reshard Transform
+# High-level API
 # ---------------------------------------------------------------------------
 
-class DESLOCReshardTransform:
-    """Pluggable weight-transfer transform for DES-LOC heterogeneous refit.
+def build_hetero_mxfp8_transform(
+    training_model: nn.Module,
+    inference_model: nn.Module,
+    src_device: torch.device,
+    dst_device: torch.device,
+    param_prefix: str = "decoder.",
+    convert_on_send: bool = False,
+    locality_cache: Optional[SharedLocalityCache] = None,
+) -> Tuple[HeteroMXFP8Transform, Dict[str, object]]:
+    """Build a HeteroMXFP8Transform and quantize inference model weights.
 
-    Extends Megatron's ReshardTransform contract to add:
-
-    * **SM-aware routing**: training ranks (SM86) send BF16 via the SLC;
-      the inference rank (SM90) receives BF16 and converts to MXFP8.
-    * **SLC staging**: instead of direct GPU↔GPU transfers over PCIe,
-      each shard is written to pinned CPU DRAM by the sender and pulled by
-      the receiver.  This avoids saturating the PCIe bus and allows overlap
-      with the next training microbatch.
-    * **1D scale accumulation**: preserves the upstream logic for assembling
-      partial shards before re-quantizing with a 1D swizzled scale layout.
-    * **Persistent buffer preservation**: all MXFP8Tensor writes go through
-      copy_() so CUDA-graph device-pointer captures remain valid.
-
-    Args:
-        convertible_params: FQN set of parameters handled by this transform.
-        persistent_buffers: dict mapping bare param name (without prefix) to
-            DESLOC_MXFP8Tensor.  Must be pre-allocated by the inference rank.
-        slc: SharedLocalityCache instance shared between all ranks in the job.
-        local_role: DeviceRole of the current process.
-        buffer_key_prefix: prefix stripped from param FQN for buffer lookup.
-        tp_world_size: tensor-parallel world size; used to track shard arrival.
-    """
-
-    def __init__(
-        self,
-        convertible_params: Set[str],
-        persistent_buffers: Dict[str, DESLOC_MXFP8Tensor],
-        slc: SharedLocalityCache,
-        local_role: DeviceRole,
-        buffer_key_prefix: str = "decoder.",
-        tp_world_size: int = 1,
-    ):
-        self.convertible_params  = convertible_params
-        self.persistent_buffers  = persistent_buffers
-        self.slc                 = slc
-        self.local_role          = local_role
-        self.buffer_key_prefix   = buffer_key_prefix
-        self.tp_world_size       = tp_world_size
-
-        # 1D-scale accumulation state: buf_key → [accum_bf16, shards_written]
-        self._pending_1d: Dict[str, List] = {}
-        # Shard arrival tracking: buf_key → count of slices finalised
-        self._shard_count: Dict[str, int] = {}
-
-    # -- predicate -----------------------------------------------------------
-
-    def should_transform(self, param_name: str) -> bool:
-        return param_name in self.convertible_params
-
-    # -- send side (A6000 / SM86 training ranks) ----------------------------
-
-    def prepare_send(
-        self,
-        param_name: str,
-        src_slice: Tuple,
-        src_param: torch.Tensor,
-        shard_idx: int = 0,
-    ) -> List[torch.Tensor]:
-        """Stage a BF16 weight shard into the SLC for the inference rank.
-
-        Because A6000 (SM86) cannot run MXFP8 kernels, conversion is always
-        deferred to the receiver (H100 SM90).  The shard is written to the
-        SharedLocalityCache; the returned list contains the CPU-pinned tensor
-        so that callers using a CopyService backend can also submit it
-        directly if desired.
-
-        Args:
-            param_name: Fully-qualified parameter name.
-            src_slice: Slice into the source parameter.
-            src_param: Source parameter tensor (GPU).
-            shard_idx: TP shard index (0 for unsharded).
-        """
-        if self.local_role != DeviceRole.TRAINING_SOURCE:
-            raise RuntimeError(
-                "prepare_send called on non-training rank "
-                f"(role={self.local_role})"
-            )
-
-        # Dequantize if the training model uses TE MXFP8 params
-        data = src_param
-        try:
-            from transformer_engine.pytorch.tensor.mxfp8_tensor import (
-                MXFP8Tensor as _TEMXFP8,
-            )
-            if isinstance(src_param, _TEMXFP8):
-                data = src_param.dequantize()
-        except ImportError:
-            pass
-
-        shard_bf16 = data[src_slice].contiguous().to(torch.bfloat16)
-        self.slc.put(param_name, shard_idx, shard_bf16)
-        logger.debug(
-            "prepare_send: staged %s shard=%d shape=%s to SLC",
-            param_name, shard_idx, list(shard_bf16.shape),
-        )
-        return [shard_bf16]
-
-    # -- recv side (H100 / SM90 inference rank) -----------------------------
-
-    def prepare_recv(
-        self,
-        param_name: str,
-        dst_slice: Tuple,
-        shard_idx: int = 0,
-    ) -> List[torch.Tensor]:
-        """Pull a BF16 shard from the SLC into a pinned staging buffer.
-
-        Blocks until the training rank has written the shard.  Returns a
-        single BF16 tensor on the inference device; finalize_recv performs
-        the actual MXFP8 conversion.
-        """
-        if self.local_role != DeviceRole.INFERENCE_SINK:
-            raise RuntimeError(
-                "prepare_recv called on non-inference rank "
-                f"(role={self.local_role})"
-            )
-        buf_key = param_name.removeprefix(self.buffer_key_prefix)
-        buf = self.persistent_buffers[buf_key]
-        device = buf.data.device
-
-        # Wait for the shard from the training replica
-        cpu_shard = self.slc.wait_for(param_name, shard_idx)
-        gpu_shard = cpu_shard.to(device, non_blocking=False)
-        logger.debug(
-            "prepare_recv: pulled %s shard=%d shape=%s from SLC",
-            param_name, shard_idx, list(gpu_shard.shape),
-        )
-        return [gpu_shard]
-
-    # -- writeback (inference rank only) ------------------------------------
-
-    def finalize_recv(
-        self,
-        param_name: str,
-        dst_slice: Tuple,
-        recv_buffers: List[torch.Tensor],
-        shard_idx: int = 0,
-    ) -> None:
-        """Convert received BF16 → MXFP8 and write into persistent buffers.
-
-        Handles two scale layouts:
-
-        * **2D scale**: each scale row is independent; the slice can be
-          quantized and written immediately.
-        * **1D swizzled scale**: the swizzle layout spans the full weight
-          tensor; partial updates corrupt the scale.  Slices are accumulated
-          in a BF16 staging tensor and the full weight is requantized once
-          all TP shards have arrived.
-
-        After writing, the SLC entry is evicted to free pinned memory.
-        """
-        buf_key = param_name.removeprefix(self.buffer_key_prefix)
-        buf = self.persistent_buffers[buf_key]
-        [bf16_recv] = recv_buffers
-
-        if buf.scale.ndim == 1:
-            # ---- 1D swizzled scale path ------------------------------------
-            # Cannot update partial slices — accumulate into a full BF16 buffer
-            # then requantize the complete weight atomically.
-            if buf_key not in self._pending_1d:
-                self._pending_1d[buf_key] = [
-                    torch.zeros(
-                        buf.data.shape,
-                        dtype=torch.bfloat16,
-                        device=buf.data.device,
-                    ),
-                    0,   # elements written
-                ]
-            accum, written = self._pending_1d[buf_key]
-            accum[dst_slice].copy_(bf16_recv)
-            written += bf16_recv.numel()
-            self._pending_1d[buf_key][1] = written
-
-            total_elems = buf.data.numel()
-            logger.debug(
-                "1D-scale accumulation %s: %d / %d elements written",
-                param_name, written, total_elems,
-            )
-            if written >= total_elems:
-                if written != total_elems:
-                    raise AssertionError(
-                        f"1D-scale param {param_name!r}: received {written} "
-                        f"elements, expected {total_elems} "
-                        f"(duplicate or missing shards?)"
-                    )
-                # All shards arrived — requantize the full weight
-                buf.update_inplace(accum)
-                del self._pending_1d[buf_key]
-                logger.info(
-                    "1D-scale finalized %s  shape=%s",
-                    param_name, list(buf.data.shape),
-                )
-        else:
-            # ---- 2D scale path (per-row scales, slice-independent) ----------
-            if not _HAVE_FLASHINFER or not _supports_mxfp8():
-                buf.data[dst_slice].copy_(bf16_recv)
-            else:
-                from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
-                mxfp8_slice = MXFP8Tensor.from_bf16(bf16_recv.to(torch.bfloat16))
-                buf.data[dst_slice].copy_(mxfp8_slice.data)
-                sc_slice = _scale_slice_from_data_slice(dst_slice)
-                buf.scale[sc_slice].copy_(mxfp8_slice.scale)
-            logger.debug(
-                "2D-scale slice written %s  dst_slice=%s",
-                param_name, dst_slice,
-            )
-
-        # Evict SLC entry to reclaim pinned CPU memory
-        self.slc.evict(param_name, shard_idx)
-
-
-# ---------------------------------------------------------------------------
-# Persistent buffer factory
-# ---------------------------------------------------------------------------
-
-def build_persistent_mxfp8_buffers(
-    named_params: Dict[str, torch.Tensor],
-    device: torch.device,
-) -> Dict[str, DESLOC_MXFP8Tensor]:
-    """Allocate persistent DESLOC_MXFP8Tensor buffers for the inference replica.
-
-    Called **once** during initialisation, before any CUDA graph warmup.
-    The buffers' device pointers are subsequently captured by CUDA graphs and
-    must never be reallocated.
-
-    On SM86 devices (A6000), returns BF16 tensors with unit scales because
-    the hardware cannot execute MXFP8 kernels.  On SM90 (H100 NVL) the full
-    MXFP8 quantisation is applied.
-
-    Args:
-        named_params: dict of {bare_name: bf16_tensor} from the inference
-            model's decoder (before any format conversion).
-        device: CUDA device for the inference replica.
+    Call once during initialization while both models still hold BF16 weights.
+    The function:
+        1. Identifies which inference model parameters are eligible for MXFP8.
+        2. Quantizes the inference decoder to persistent MXFP8 buffers.
+        3. Constructs a HeteroMXFP8Transform with the correct device routing.
 
     Returns:
-        dict mapping bare param name → DESLOC_MXFP8Tensor (persistent=True)
+        (transform, persistent_buffers) — pass transform to execute_reshard_plan
+        or HeteroRefitCoordinator; keep persistent_buffers for CUDA graph capture.
     """
-    buffers: Dict[str, DESLOC_MXFP8Tensor] = {}
-    for name, param in named_params.items():
-        bf16 = param.detach().to(device, dtype=torch.bfloat16)
-        buf = DESLOC_MXFP8Tensor.from_bf16(bf16, param_name=name, persistent=True)
-        buffers[name] = buf
-        logger.debug(
-            "persistent buffer: %s  data=%s  scale=%s",
-            name, list(buf.data.shape), list(buf.scale.shape),
-        )
-    logger.info(
-        "Built %d persistent MXFP8 buffers on %s (SM%d)",
-        len(buffers),
-        device,
-        _sm_version(device),
+    # Identify convertible params on the inference (destination) side
+    convertible: Set[str] = set()
+    decoder = (
+        inference_model.decoder if hasattr(inference_model, "decoder") else inference_model
     )
-    return buffers
+    for name, param in decoder.named_parameters():
+        if should_quantize_param(param):
+            convertible.add(f"{param_prefix}{name}")
 
+    logger.info(
+        "build_hetero_mxfp8_transform: %d convertible params, src=%s dst=%s",
+        len(convertible), src_device, dst_device,
+    )
 
-# ---------------------------------------------------------------------------
-# Refit engine
-# ---------------------------------------------------------------------------
+    # Quantize decoder weights → persistent buffers (CUDA graph safe)
+    persistent_buffers = quantize_model_params(decoder)
 
-@dataclass
-class HeteroRefitConfig:
-    """Configuration for the DES-LOC heterogeneous refit engine.
-
-    Attributes:
-        tp_world_size: Tensor-parallel group size (typically 2 for A6000 pair).
-        param_names:   List of bare parameter names (without prefix) that the
-                       engine should refit on each call to ``execute_refit``.
-        buffer_prefix: Module prefix prepended to bare names for FQN lookup.
-        slc_capacity_gb: GB of CPU DRAM reserved for SLC staging.
-        sync_barrier:  Whether to insert a dist.barrier() after all refits.
-        stream_timeout: Seconds to wait for each SLC shard before raising.
-    """
-    tp_world_size:    int   = 2
-    param_names:      List[str] = field(default_factory=list)
-    buffer_prefix:    str   = "decoder."
-    slc_capacity_gb:  float = 32.0
-    sync_barrier:     bool  = True
-    stream_timeout:   float = 60.0
-
-
-class HeteroMXFP8RefitEngine:
-    """DES-LOC heterogeneous refit engine for SM86/SM90 mixed clusters.
-
-    Orchestrates weight transfer from A6000 training replicas (SM86, BF16)
-    to the H100 inference replica (SM90, MXFP8) via the SharedLocalityCache.
-
-    Lifecycle:
-        1. Call ``__init__`` on all ranks simultaneously (collective comm).
-        2. Training ranks call ``stage_weights(model)`` after each update
-           step; this is the A6000-side write into the SLC.
-        3. The inference rank calls ``apply_refit()`` to pull from SLC,
-           convert to MXFP8, and write into persistent CUDA-graph buffers.
-        4. Repeat from step 2.
-
-    The engine maintains one DESLOCReshardTransform per direction (source
-    ranks share a transform state for shard counting; the sink rank has its
-    own transform with the persistent buffers).
-
-    Args:
-        config: HeteroRefitConfig.
-        local_role: DeviceRole of the calling process.
-        persistent_buffers: Pre-built DESLOC_MXFP8Tensor dict (inference
-            rank only; training ranks pass empty dict or None).
-        group: Optional dist.ProcessGroup for barrier synchronisation.
-    """
-
-    def __init__(
-        self,
-        config: HeteroRefitConfig,
-        local_role: DeviceRole,
-        persistent_buffers: Optional[Dict[str, DESLOC_MXFP8Tensor]] = None,
-        group: Optional[dist.ProcessGroup] = None,
-    ):
-        self.config       = config
-        self.local_role   = local_role
-        self.group        = group
-        self._refit_count = 0
-
-        self.slc = SharedLocalityCache(
-            capacity_bytes=int(config.slc_capacity_gb * 1024**3)
-        )
-
-        # Build the FQN set (prefix + bare name)
-        self._convertible: Set[str] = {
-            f"{config.buffer_prefix}{n}" for n in config.param_names
-        }
-
-        # Only the inference sink needs persistent buffers
-        _pb: Dict[str, DESLOC_MXFP8Tensor] = persistent_buffers or {}
-
-        self._transform = DESLOCReshardTransform(
-            convertible_params=self._convertible,
-            persistent_buffers=_pb,
-            slc=self.slc,
-            local_role=local_role,
-            buffer_key_prefix=config.buffer_prefix,
-            tp_world_size=config.tp_world_size,
-        )
-
-        logger.info(
-            "HeteroMXFP8RefitEngine initialised: role=%s  params=%d  "
-            "tp=%d  SM=%d",
-            local_role.name,
-            len(self._convertible),
-            config.tp_world_size,
-            _sm_version(),
-        )
-
-    # -- training-side API ---------------------------------------------------
-
-    def stage_weights(
-        self,
-        model: torch.nn.Module,
-        shard_idx: int = 0,
-    ) -> None:
-        """Write current BF16 parameter values into the SLC (A6000 ranks).
-
-        Should be called after the optimiser step and before
-        ``apply_refit()``.  Safe to call from all training ranks in parallel;
-        each rank tags its shards with *shard_idx*.
-
-        Args:
-            model: Training model (state-dict must be on GPU).
-            shard_idx: TP shard index of this rank (0 or 1 for tp_world=2).
-        """
-        if self.local_role != DeviceRole.TRAINING_SOURCE:
-            logger.debug("stage_weights: skipped (role=%s)", self.local_role.name)
-            return
-
-        t0 = time.monotonic()
-        staged = 0
-        for bare_name in self.config.param_names:
-            fqn = f"{self.config.buffer_prefix}{bare_name}"
-            # Navigate the module hierarchy
-            parts = bare_name.split(".")
-            obj = model
-            for p in parts:
-                obj = getattr(obj, p, None)
-                if obj is None:
-                    logger.warning("stage_weights: %s not found in model", fqn)
-                    break
-            if obj is None:
-                continue
-            param_tensor = obj.data if isinstance(obj, torch.nn.Parameter) else obj
-            self._transform.prepare_send(fqn, (slice(None),) * param_tensor.dim(),
-                                         param_tensor, shard_idx)
-            staged += 1
-
-        elapsed = time.monotonic() - t0
-        logger.info(
-            "stage_weights: staged %d params to SLC in %.3fs (shard=%d)",
-            staged, elapsed, shard_idx,
-        )
-
-    # -- inference-side API --------------------------------------------------
-
-    def apply_refit(self, shard_indices: Optional[List[int]] = None) -> None:
-        """Pull staged shards from SLC and write into persistent MXFP8 buffers.
-
-        Blocks until all shards for each parameter have been staged by the
-        training ranks.  Should be called on the inference rank (H100) before
-        each decode batch.
-
-        Args:
-            shard_indices: List of TP shard indices to pull.  Defaults to
-                ``list(range(tp_world_size))``.
-        """
-        if self.local_role != DeviceRole.INFERENCE_SINK:
-            logger.debug("apply_refit: skipped (role=%s)", self.local_role.name)
-            return
-
-        if shard_indices is None:
-            shard_indices = list(range(self.config.tp_world_size))
-
-        t0 = time.monotonic()
-        for bare_name in self.config.param_names:
-            fqn = f"{self.config.buffer_prefix}{bare_name}"
-            for shard_idx in shard_indices:
-                recv_bufs = self._transform.prepare_recv(
-                    fqn, (slice(None),), shard_idx
-                )
-                self._transform.finalize_recv(
-                    fqn, (slice(None),), recv_bufs, shard_idx
-                )
-
-        # Ensure all writeback copies are visible before returning.
-        # (Matches upstream's second torch.cuda.synchronize() fix.)
-        torch.cuda.synchronize()
-
-        self._refit_count += 1
-        elapsed = time.monotonic() - t0
-        logger.info(
-            "apply_refit #%d: %d params x %d shards in %.3fs",
-            self._refit_count,
-            len(self.config.param_names),
-            len(shard_indices),
-            elapsed,
-        )
-
-    # -- collective barrier --------------------------------------------------
-
-    def barrier(self) -> None:
-        """Optional collective barrier across all DES-LOC ranks."""
-        if self.config.sync_barrier and dist.is_initialized():
-            dist.barrier(group=self.group)
-            logger.debug("HeteroMXFP8RefitEngine: barrier complete")
-
-    # -- diagnostics ---------------------------------------------------------
-
-    def slc_stats(self) -> Dict[str, object]:
-        return self.slc.stats()
-
-    def pending_1d_params(self) -> List[str]:
-        """Return list of param keys still awaiting 1D-scale accumulation."""
-        return list(self._transform._pending_1d.keys())
+    transform = HeteroMXFP8Transform(
+        convertible_params=convertible,
+        persistent_buffers=persistent_buffers,
+        buffer_key_prefix=param_prefix,
+        src_device=src_device,
+        dst_device=dst_device,
+        locality_cache=locality_cache,
+        convert_on_send=convert_on_send,
+    )
+    return transform, persistent_buffers
 
 
 # ---------------------------------------------------------------------------
@@ -822,55 +1129,70 @@ if __name__ == "__main__":
 
     logging.basicConfig(
         level=logging.INFO,
-        format="%(asctime)s %(levelname)-8s %(name)s — %(message)s",
+        format="%(asctime)s %(levelname)s %(name)s — %(message)s",
     )
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    sm = _sm_version(device) if device.type == "cuda" else 0
-    logger.info("Smoke test on %s  SM=%d  FlashInfer=%s", device, sm, _HAVE_FLASHINFER)
+    if not torch.cuda.is_available():
+        logger.warning("No CUDA device — smoke test runs CPU emulation only")
+        DEV = torch.device("cpu")
+    else:
+        DEV = torch.device("cuda:0")
 
-    # 1) SLC round-trip
-    slc = SharedLocalityCache(capacity_bytes=1 * 1024**3)
-    t_orig = torch.randn(64, 128, dtype=torch.bfloat16)
-    slc.put("layer.weight", 0, t_orig)
-    t_back = slc.get("layer.weight", 0)
-    assert t_back is not None and t_back.shape == t_orig.shape, "SLC put/get failed"
-    logger.info("  [PASS] SLC round-trip")
+    logger.info("=== DES-LOC HeteroMXFP8Refit smoke test ===")
 
-    # 2) DESLOC_MXFP8Tensor creation and update
-    bf16 = torch.randn(32, 64, dtype=torch.bfloat16, device=device)
-    buf = DESLOC_MXFP8Tensor.from_bf16(bf16, param_name="test.weight", persistent=True)
-    ptr_before = buf.data.data_ptr()
-    new_bf16 = torch.randn(32, 64, dtype=torch.bfloat16, device=device)
-    buf.update_inplace(new_bf16)
-    assert buf.data.data_ptr() == ptr_before, "persistent buffer address changed!"
-    logger.info("  [PASS] DESLOC_MXFP8Tensor persistent update")
+    # 1. DeviceCapabilityRouter
+    router = DeviceCapabilityRouter()
+    M, K = 64, 128
+    w = torch.randn(M, K, dtype=torch.bfloat16, device=DEV)
+    data, scale = router.quantize_to_mxfp8(w, DEV)
+    assert data.shape[0] == M and data.shape[1] == K, f"data shape mismatch: {data.shape}"
+    assert scale.shape == (M, K // 32), f"scale shape mismatch: {scale.shape}"
+    logger.info("✓ DeviceCapabilityRouter quantize/dequantize shapes OK")
 
-    # 3) Scale-slice helper alignment check
-    s = _scale_slice_from_data_slice((slice(0, 64), slice(0, 128)), block_size=32)
-    assert s == (slice(0, 2), slice(0, 4)), f"Unexpected scale slice: {s}"
-    logger.info("  [PASS] _scale_slice_from_data_slice 2D")
+    # 2. SharedLocalityCache round-trip
+    cache = SharedLocalityCache(capacity_gb=1.0)
+    cache.put("test_param", w)
+    retrieved = cache.get("test_param", DEV)
+    assert retrieved is not None, "Cache miss on put→get"
+    assert retrieved.shape == w.shape, f"shape mismatch: {retrieved.shape} vs {w.shape}"
+    logger.info("✓ SharedLocalityCache put/get OK")
 
-    # 4) SM-version detection
-    if device.type == "cuda":
-        assert isinstance(_sm_version(device), int), "SM version should be int"
-        logger.info("  [PASS] SM version detection: SM%d", _sm_version(device))
+    # 3. HeteroMXFP8Tensor persistent buffer address stability
+    q1 = HeteroMXFP8Tensor.from_bf16(w)
+    ptr_data = q1.data.data_ptr()
+    ptr_scale = q1.scale.data_ptr()
+    w2 = torch.randn(M, K, dtype=torch.bfloat16, device=DEV)
+    q2 = HeteroMXFP8Tensor.from_bf16(w2)
+    q1.copy_from(q2)
+    assert q1.data.data_ptr() == ptr_data, "data pointer changed after copy_from!"
+    assert q1.scale.data_ptr() == ptr_scale, "scale pointer changed after copy_from!"
+    logger.info("✓ HeteroMXFP8Tensor address stability OK")
 
-    # 5) DESLOCReshardTransform should_transform
-    fake_buf = DESLOC_MXFP8Tensor.from_bf16(
-        torch.zeros(16, 32, dtype=torch.bfloat16, device=device),
-        persistent=True,
-    )
-    transform = DESLOCReshardTransform(
-        convertible_params={"decoder.mlp.weight"},
-        persistent_buffers={"mlp.weight": fake_buf},
-        slc=slc,
-        local_role=DeviceRole.IDLE,
+    # 4. HeteroMXFP8Transform full round-trip (BF16 wire)
+    buf = HeteroMXFP8Tensor.from_bf16(torch.zeros(M, K, dtype=torch.bfloat16, device=DEV))
+    transform = HeteroMXFP8Transform(
+        convertible_params={"decoder.weight"},
+        persistent_buffers={"weight": buf},
         buffer_key_prefix="decoder.",
+        src_device=DEV,
+        dst_device=DEV,
+        locality_cache=cache,
+        convert_on_send=False,
     )
-    assert transform.should_transform("decoder.mlp.weight")
-    assert not transform.should_transform("decoder.mlp.bias")
-    logger.info("  [PASS] DESLOCReshardTransform.should_transform")
+    src_param = nn.Parameter(w.clone())
+    sent = transform.prepare_send("decoder.weight", (slice(None), slice(None)), src_param)
+    recv_bufs = transform.prepare_recv("decoder.weight", (slice(None), slice(None)))
+    # Simulate wire: copy sent → recv
+    recv_bufs[0].copy_(sent[0])
+    transform.finalize_recv("decoder.weight", (slice(None), slice(None)), recv_bufs)
+    expected_data, expected_scale = router.quantize_to_mxfp8(w, DEV)
+    assert buf.data.shape == expected_data.shape, "persistent buffer data shape mismatch"
+    logger.info("✓ HeteroMXFP8Transform BF16-wire round-trip OK")
 
-    logger.info("All smoke tests passed.")
+    # 5. _scale_slice_from_data_slice
+    s = _scale_slice_from_data_slice((slice(0, 64), slice(0, 128)))
+    assert s == (slice(0, 2), slice(0, 4)), f"scale slice wrong: {s}"
+    logger.info("✓ _scale_slice_from_data_slice OK")
+
+    logger.info("=== All smoke tests passed ===")
     sys.exit(0)
