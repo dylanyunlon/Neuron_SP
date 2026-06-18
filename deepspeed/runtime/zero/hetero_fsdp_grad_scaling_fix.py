@@ -1,772 +1,780 @@
 """
-DES-LOC Heterogeneous FSDP Gradient Scaling Fix
-================================================
+HeteroFSDPGradScalingFix — DES-LOC Heterogeneous FSDP Gradient Scaling Pipeline
+=================================================================================
 
-Upstream Design Intent (Megatron ba456fd):
-    In Megatron-FSDP's GradReducePipeline, gradient scaling was applied to
-    `gbuf.data` (the entire gradient buffer) rather than `bucket.data` (the
-    specific bucket being reduced). This caused incorrect gradient scaling when
-    a GradBuffer contained multiple buckets with different data distributions,
-    because the scaling factor was broadcast over stale or out-of-scope memory
-    rather than the live reduction target.
+上游设计意图 (Megatron ba456fd):
+    Megatron-FSDP 的 GradReducePipeline 在执行梯度规约时，错误地将 gbuf.data
+    (整个梯度缓冲区的全局视图) 传入 gradient_reduce_preprocessing，而非
+    bucket.data (当前分桶的局部视图)。这导致梯度缩放因子被应用到错误的张量
+    范围，造成数值不稳定甚至梯度爆炸。修复方式：将目标从 gbuf.data 替换为
+    bucket.data，确保每个分桶独立缩放。
 
-    The fix is surgical: replace `gbuf.data` with `bucket.data` so that
-    `gradient_reduce_preprocessing` operates on precisely the tensor that will
-    be all-reduced or scatter-reduced in this pipeline step.
+DES-LOC 适配点:
+    DES-LOC (Decoupled Execution with Shared LOcality Cache) 在异构硬件
+    (2x A6000 SM86 + 1x H100 NVL SM90, PCIe 互联, 1.5TB CPU DRAM) 上引入
+    额外复杂性：
 
-DES-LOC Adaptation Points:
-    In DES-LOC (Decoupled Execution with Shared LOcality Cache), the gradient
-    buffer lives in a *heterogeneous* memory space:
+    1. 分桶异构驻留 (Bucket Heterogeneous Residency):
+       同一 GradBuffer 的不同 bucket 可能驻留在不同设备
+       (A6000-0 / A6000-1 / H100 / CPU DRAM)，bucket.data 与 gbuf.data
+       不再同设备，必须在正确设备上执行缩放。
 
-      - A6000 (SM86, 48 GB, PCIe)  ← compute shards for fp16/bf16 activations
-      - H100 NVL (SM90, 96 GB, PCIe) ← parameter master copies + optimizer state
-      - CPU DRAM (1.5 TB)           ← locality cache (LOC) for offloaded buckets
+    2. SM 架构感知缩放 (SM-Aware Scaling):
+       SM86 (A6000) 与 SM90 (H100) 的 BF16/FP32 累加精度不同；
+       H100 NVL 的 TF32 路径默认启用，需在缩放前显式 guard。
 
-    This creates three new failure modes absent in Megatron's homogeneous setup:
+    3. PCIe 带宽节流下的延迟缩放 (Deferred Scaling under PCIe Throttle):
+       跨设备 all-reduce 前，将缩放操作推迟到数据已在目标设备就绪后执行，
+       避免额外 D2D 拷贝。LOC-Cache 负责跟踪 bucket 的当前物理位置。
 
-    1. **Buffer/Bucket device mismatch** – `gbuf.data` may reside on a different
-       device than `bucket.data` when the bucket has been migrated to the LOC
-       (CPU DRAM) between the alloc and reduce phases. Scaling `gbuf.data` on
-       device A then reducing `bucket.data` on device B silently produces wrong
-       gradients with no exception.
+    4. CPU DRAM Offload 路径:
+       当 bucket 被 offload 到 CPU DRAM 时，缩放在 CPU 上用 torch.float32
+       完成后再异步 prefetch 回 GPU，与 DES 调度器的 prefetch 流水线对齐。
 
-    2. **Dtype promotion across SM generations** – A6000 (SM86) does not natively
-       accelerate fp8; H100 (SM90) does. If a bucket has been dtype-promoted
-       during the LOC round-trip, scaling must happen *after* promotion, on the
-       bucket tensor, not before on the original gbuf dtype.
-
-    3. **Partial-bucket LOC eviction** – Under memory pressure the LOC may evict
-       only part of a GradBuffer (one or more buckets) to CPU. Scaling gbuf.data
-       as a whole would require the entire buffer to be resident, defeating the
-       purpose of the LOC.
-
-    This module implements `HeteroFSDPGradScaler`, a drop-in replacement for
-    DeepSpeed ZeRO's gradient reduction preprocessing that:
-      - Resolves the bucket's physical location (GPU0/GPU1/CPU LOC) at call time.
-      - Applies the scaling factor on the bucket's resident device.
-      - Handles dtype promotion for SM90-capable buckets.
-      - Integrates with DeepSpeed's `GradientBuffer` and `PartitionedParameterCoordinator`.
-
-References:
-    Megatron-LM commit ba456fdad991b085ca4f19dea11f7ed886d73ce8
-    Neuron_SP project: github.com/dylanyunlon/Neuron_SP
+作者: Neuron_SP Project (dylanyunlon/Neuron_SP)
+上游参考: github.com/NVIDIA/Megatron-LM commit ba456fdad991b085ca4f19dea11f7ed886d73ce8
 """
+
+from __future__ import annotations
 
 import logging
 import math
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
+from torch import Tensor
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-
-# SM capability thresholds
-_SM86_CAPABILITY = (8, 6)   # A6000
-_SM90_CAPABILITY = (9, 0)   # H100 NVL
-
-# DES-LOC memory tier identifiers
-class MemoryTier(Enum):
-    GPU_COMPUTE   = auto()   # A6000 x2 – forward/backward compute shards
-    GPU_MASTER    = auto()   # H100 NVL – param master copies + optimizer state
-    CPU_LOC       = auto()   # CPU DRAM locality cache
-
 
 # ---------------------------------------------------------------------------
-# Device registry: maps physical devices to DES-LOC tiers
+# 枚举 & 常量
 # ---------------------------------------------------------------------------
 
-def _build_device_tier_map() -> Dict[torch.device, MemoryTier]:
-    """
-    Probe available CUDA devices and classify them by SM capability into
-    DES-LOC memory tiers.
-
-    Returns
-    -------
-    dict[torch.device, MemoryTier]
-        Mapping from each visible CUDA device to its DES-LOC role.
-    """
-    tier_map: Dict[torch.device, MemoryTier] = {}
-    for idx in range(torch.cuda.device_count()):
-        dev = torch.device("cuda", idx)
-        major, minor = torch.cuda.get_device_capability(dev)
-        cap = (major, minor)
-        if cap >= _SM90_CAPABILITY:
-            tier = MemoryTier.GPU_MASTER
-            logger.debug("Device cuda:%d (SM%d%d) → GPU_MASTER tier", idx, major, minor)
-        else:
-            tier = MemoryTier.GPU_COMPUTE
-            logger.debug("Device cuda:%d (SM%d%d) → GPU_COMPUTE tier", idx, major, minor)
-        tier_map[dev] = tier
-    # CPU is always the LOC tier
-    tier_map[torch.device("cpu")] = MemoryTier.CPU_LOC
-    return tier_map
+class DeviceClass(Enum):
+    """DES-LOC 支持的设备类别，对应 Neuron_SP 硬件拓扑。"""
+    A6000_SM86 = auto()   # 2x A6000 48 GB, SM86
+    H100_SM90  = auto()   # 1x H100 NVL 96 GB, SM90
+    CPU_DRAM   = auto()   # 1.5 TB host DRAM (offload tier)
 
 
-_DEVICE_TIER_MAP: Dict[torch.device, MemoryTier] = {}
-
-
-def get_device_tier(device: torch.device) -> MemoryTier:
-    """Return the DES-LOC memory tier for *device*, building the map lazily."""
-    global _DEVICE_TIER_MAP
-    if not _DEVICE_TIER_MAP:
-        _DEVICE_TIER_MAP = _build_device_tier_map()
-    # Normalise: cuda:0 and cuda(index=0) must compare equal
-    normalised = torch.device(device.type, device.index if device.index is not None else 0)
-    return _DEVICE_TIER_MAP.get(normalised, MemoryTier.CPU_LOC)
+# SM90 默认开启 TF32，会影响 FP32 梯度累加精度
+_SM90_TF32_GUARD_REQUIRED = True
+# PCIe gen4 x16 理论带宽 ~32 GB/s；保守阈值用于决策是否推迟跨设备缩放
+_PCIE_BW_THRESHOLD_BYTES_PER_SEC: float = 28.0 * 1024 ** 3
 
 
 # ---------------------------------------------------------------------------
-# Bucket location descriptor
+# 辅助数据结构
 # ---------------------------------------------------------------------------
 
 @dataclass
-class BucketLocation:
+class BucketDescriptor:
     """
-    Describes where a gradient bucket physically lives at a given moment.
+    描述一个梯度分桶的物理位置与元信息。
 
-    Attributes
-    ----------
-    device : torch.device
-        The current resident device of `bucket.data`.
-    tier : MemoryTier
-        DES-LOC tier classification.
-    dtype : torch.dtype
-        Current dtype of the bucket tensor (may differ from gbuf dtype after
-        SM90 dtype promotion).
-    is_loc_resident : bool
-        True when the bucket has been offloaded to CPU LOC and has not yet
-        been fetched back to any GPU.
+    在 DES-LOC 中，LOC-Cache 维护每个 bucket 的当前驻留位置；
+    调度器在 prefetch / evict 时更新 ``current_device``。
     """
-    device: torch.device
-    tier: MemoryTier
-    dtype: torch.dtype
-    is_loc_resident: bool
+    bucket_id: int
+    data: Tensor                        # 分桶梯度张量（可能在任意设备上）
+    numel: int
+    gradient_scaling_factor: float
+    current_device: DeviceClass
+    is_offloaded: bool = False          # 是否已 offload 到 CPU DRAM
+    scaling_deferred: bool = False      # 是否已推迟缩放（PCIe 节流路径）
+    _scaled: bool = False               # 内部标记：缩放是否已完成
+
+    def mark_scaled(self) -> None:
+        self._scaled = True
+        self.scaling_deferred = False
+
+    @property
+    def needs_scaling(self) -> bool:
+        return not self._scaled
 
 
-def resolve_bucket_location(bucket_data: torch.Tensor) -> BucketLocation:
+@dataclass
+class GradBufferDescriptor:
     """
-    Inspect *bucket_data* and return a :class:`BucketLocation` descriptor.
+    对应 Megatron GradBuffer 的 DES-LOC 表示。
 
-    This is the central probe that replaces the implicit assumption in the
-    original Megatron code that ``gbuf.data`` and ``bucket.data`` share the
-    same device.
-
-    Parameters
-    ----------
-    bucket_data : torch.Tensor
-        The ``data`` attribute of the gradient bucket that is about to be
-        all-reduced or scatter-reduced.
-
-    Returns
-    -------
-    BucketLocation
+    ``buckets`` 列表顺序与 Megatron bucket 索引对齐，
+    但每个 bucket 可独立驻留在不同设备上。
     """
-    dev = bucket_data.device
-    if dev.type == "cpu":
-        return BucketLocation(
-            device=dev,
-            tier=MemoryTier.CPU_LOC,
-            dtype=bucket_data.dtype,
-            is_loc_resident=True,
+    gbuf_id: int
+    buckets: List[BucketDescriptor]
+    ddp_config: Dict                    # 透传 Megatron ddp_config 语义
+    is_data_distributed: bool = True    # FSDP scatter 模式
+    dtype: torch.dtype = torch.bfloat16
+
+    # 整体梯度缓冲区的全局数据视图（仅用于非分布式 all-reduce 路径）
+    global_data: Optional[Tensor] = None
+
+
+# ---------------------------------------------------------------------------
+# SM 架构感知工具
+# ---------------------------------------------------------------------------
+
+def _detect_device_class(device: torch.device) -> DeviceClass:
+    """
+    根据 CUDA device index 推断 DeviceClass。
+
+    假设 Neuron_SP 硬件拓扑固定为:
+        device 0 → A6000 SM86
+        device 1 → A6000 SM86
+        device 2 → H100 NVL SM90
+
+    生产环境可通过 ``torch.cuda.get_device_properties`` 动态检测。
+    """
+    if device.type == "cpu":
+        return DeviceClass.CPU_DRAM
+    props = torch.cuda.get_device_properties(device)
+    sm = props.major * 10 + props.minor   # e.g. 86, 90
+    if sm >= 90:
+        return DeviceClass.H100_SM90
+    return DeviceClass.A6000_SM86
+
+
+def _enter_tf32_guard(device_class: DeviceClass) -> bool:
+    """
+    若设备为 SM90 且 TF32 guard 已启用，临时禁用 TF32 以保证
+    梯度缩放的数值精度。返回原始 allow_tf32 状态供恢复使用。
+    """
+    if device_class == DeviceClass.H100_SM90 and _SM90_TF32_GUARD_REQUIRED:
+        orig = torch.backends.cuda.matmul.allow_tf32
+        torch.backends.cuda.matmul.allow_tf32 = False
+        logger.debug("[DES-LOC] SM90 TF32 guard: disabled tf32 for gradient scaling")
+        return orig
+    return torch.backends.cuda.matmul.allow_tf32
+
+
+def _exit_tf32_guard(orig_state: bool) -> None:
+    torch.backends.cuda.matmul.allow_tf32 = orig_state
+
+
+# ---------------------------------------------------------------------------
+# 核心修复：bucket 级梯度缩放（对应 Megatron ba456fd 的 bucket.data 修正）
+# ---------------------------------------------------------------------------
+
+def _scale_bucket_data_inplace(
+    bucket: BucketDescriptor,
+    scaling_factor: float,
+    stream: Optional[torch.cuda.Stream] = None,
+) -> None:
+    """
+    **核心修复函数** — 对应 Megatron ba456fd: ``bucket.data`` 替代 ``gbuf.data``。
+
+    在 DES-LOC 中，``bucket.data`` 与 ``gbuf.global_data`` 可能驻留在不同设备，
+    因此缩放必须在 ``bucket.data.device`` 上就地执行，不能使用全局缓冲区视图。
+
+    参数
+    ----
+    bucket:
+        当前分桶描述符；缩放目标是 ``bucket.data``，而非全局缓冲区。
+    scaling_factor:
+        梯度缩放因子（来自 GradBuffer，但作用域限定于本桶）。
+    stream:
+        可选 CUDA 流；若提供则在该流上异步执行缩放。
+    """
+    if not bucket.needs_scaling:
+        logger.debug(
+            "[DES-LOC] bucket %d already scaled, skipping", bucket.bucket_id
         )
-    canonical_dev = torch.device("cuda", dev.index if dev.index is not None else 0)
-    tier = get_device_tier(canonical_dev)
-    return BucketLocation(
-        device=canonical_dev,
-        tier=tier,
-        dtype=bucket_data.dtype,
-        is_loc_resident=False,
-    )
+        return
+
+    target = bucket.data
+    device_class = _detect_device_class(target.device)
+
+    orig_tf32 = _enter_tf32_guard(device_class)
+    try:
+        ctx = torch.cuda.stream(stream) if (
+            stream is not None and target.device.type == "cuda"
+        ) else _null_context()
+
+        with ctx:
+            if device_class == DeviceClass.CPU_DRAM:
+                # CPU DRAM offload 路径：强制 float32 以避免 BF16 下溢
+                target_f32 = target.float()
+                target_f32.mul_(scaling_factor)
+                target.copy_(target_f32.to(target.dtype))
+                logger.debug(
+                    "[DES-LOC] bucket %d: CPU DRAM scaling (f32 round-trip), "
+                    "factor=%.6e, numel=%d",
+                    bucket.bucket_id, scaling_factor, bucket.numel,
+                )
+            else:
+                # GPU 路径（SM86 or SM90）：直接就地缩放
+                target.mul_(scaling_factor)
+                logger.debug(
+                    "[DES-LOC] bucket %d: GPU scaling on %s (%s), "
+                    "factor=%.6e, numel=%d",
+                    bucket.bucket_id, target.device, device_class.name,
+                    scaling_factor, bucket.numel,
+                )
+    finally:
+        _exit_tf32_guard(orig_tf32)
+
+    bucket.mark_scaled()
 
 
 # ---------------------------------------------------------------------------
-# DES-LOC dtype promotion policy
+# PCIe 节流感知：延迟缩放决策
 # ---------------------------------------------------------------------------
 
-def _should_promote_dtype(loc: BucketLocation, ddp_config) -> bool:
+def _should_defer_scaling(
+    bucket: BucketDescriptor,
+    target_reduce_device: torch.device,
+    estimated_transfer_bytes: int,
+) -> bool:
     """
-    Decide whether the bucket should be dtype-promoted before scaling.
+    判断是否应将缩放推迟到数据迁移完成后。
 
-    Policy:
-      - Buckets resident on GPU_MASTER (SM90/H100) may be promoted to bf16
-        for communication efficiency; fp8 is reserved for future work.
-      - Buckets on GPU_COMPUTE (SM86/A6000) stay in their original dtype.
-      - CPU LOC buckets are never promoted (no accelerator to exploit).
+    逻辑：
+        若 bucket 当前设备 ≠ reduce 目标设备，且估算传输量超过
+        PCIe 节流阈值（单次传输 >256 MB 视为大传输），则推迟缩放，
+        以避免：缩放 → D2D 拷贝 → 再次访问 的双重带宽消耗。
 
-    Parameters
-    ----------
-    loc : BucketLocation
-    ddp_config : object
-        DeepSpeed / Megatron DDP config with at least a
-        ``communication_dtype`` attribute (optional).
+    返回 True 表示推迟（由调用方在数据就位后补调 _scale_bucket_data_inplace）。
     """
-    if loc.tier != MemoryTier.GPU_MASTER:
-        return False
-    comm_dtype = getattr(ddp_config, "communication_dtype", None)
-    if comm_dtype is None:
-        return False
-    # Only promote if current dtype is lower precision than comm_dtype
-    _dtype_rank = {
-        torch.float32: 4,
-        torch.bfloat16: 2,
-        torch.float16: 2,
-        torch.float8_e4m3fn: 1,
-    }
-    return _dtype_rank.get(comm_dtype, 0) > _dtype_rank.get(loc.dtype, 0)
+    src_device = bucket.data.device
+    if src_device == target_reduce_device:
+        return False  # 同设备无需考虑 PCIe
 
-
-def maybe_promote_bucket_dtype(
-    bucket_data: torch.Tensor,
-    loc: BucketLocation,
-    ddp_config,
-) -> Tuple[torch.Tensor, bool]:
-    """
-    Optionally promote *bucket_data* dtype for SM90 communication acceleration.
-
-    Returns
-    -------
-    (tensor, was_promoted) : Tuple[torch.Tensor, bool]
-        *tensor* is either the original or a dtype-cast view.
-        *was_promoted* signals whether the caller must cast back after reduce.
-    """
-    if not _should_promote_dtype(loc, ddp_config):
-        return bucket_data, False
-    target_dtype = getattr(ddp_config, "communication_dtype", bucket_data.dtype)
-    logger.debug(
-        "DES-LOC dtype promotion: %s → %s on %s (SM90 path)",
-        bucket_data.dtype, target_dtype, loc.device,
-    )
-    return bucket_data.to(dtype=target_dtype), True
+    large_transfer = estimated_transfer_bytes > 256 * 1024 * 1024
+    if large_transfer:
+        logger.info(
+            "[DES-LOC] Deferring scaling for bucket %d: "
+            "src=%s, dst=%s, transfer=%.1f MB",
+            bucket.bucket_id, src_device, target_reduce_device,
+            estimated_transfer_bytes / 1024 ** 2,
+        )
+        bucket.scaling_deferred = True
+        return True
+    return False
 
 
 # ---------------------------------------------------------------------------
-# LOC fetch: bring an offloaded bucket back to the correct GPU tier
+# gradient_reduce_preprocessing 的 DES-LOC 版本
 # ---------------------------------------------------------------------------
 
-def fetch_bucket_from_loc(
-    bucket_data: torch.Tensor,
-    target_device: torch.device,
-    non_blocking: bool = True,
-) -> torch.Tensor:
+def hetero_gradient_reduce_preprocessing(
+    bucket: BucketDescriptor,
+    gbuf: GradBufferDescriptor,
+    target_reduce_device: torch.device,
+    reduce_stream: Optional[torch.cuda.Stream] = None,
+) -> Optional[Tensor]:
     """
-    Fetch a CPU-LOC-resident bucket to *target_device* for in-place scaling.
+    DES-LOC 版 ``gradient_reduce_preprocessing``。
 
-    In DES-LOC, gradient buckets can be evicted to CPU DRAM (the LOC) during
-    the forward pass to free GPU memory for activations.  Before we can apply
-    a CUDA-accelerated scaling kernel, we must bring the bucket back.
+    对应 Megatron ba456fd 的修复逻辑，但扩展为处理异构设备场景：
 
-    The fetch is *always* to the bucket's *natural* GPU tier:
-      - If the bucket's originating parameter shard lives on GPU_MASTER
-        (H100), fetch to GPU_MASTER.
-      - Otherwise fetch to the calling rank's primary GPU_COMPUTE device.
+        1. 使用 ``bucket.data``（而非 ``gbuf.global_data``）作为缩放目标。
+        2. 根据 bucket 的物理驻留位置决定缩放策略。
+        3. 若检测到 PCIe 大传输，推迟缩放并返回 None（延迟路径）。
+        4. 返回处理后的 ``bucket.data`` 供后续 all-reduce / reduce-scatter。
 
-    Parameters
-    ----------
-    bucket_data : torch.Tensor
-        CPU-resident bucket tensor.
-    target_device : torch.device
-        Destination GPU device.
-    non_blocking : bool
-        Use non-blocking host→device copy where possible.
+    参数
+    ----
+    bucket:
+        当前分桶；缩放发生在 ``bucket.data`` 上。
+    gbuf:
+        父梯度缓冲区；提供 ``gradient_scaling_factor`` 和 ``ddp_config``。
+    target_reduce_device:
+        all-reduce / reduce-scatter 将在哪个设备上执行。
+    reduce_stream:
+        可选 CUDA 流，用于异步流水线。
 
-    Returns
-    -------
-    torch.Tensor
-        GPU-resident clone of *bucket_data*.
+    返回
+    ----
+    处理后的 ``bucket.data`` 张量；若进入延迟路径则返回 None。
     """
-    if bucket_data.device.type != "cpu":
-        return bucket_data  # Already on GPU, no-op
-    logger.debug(
-        "DES-LOC LOC fetch: cpu → %s, shape=%s, dtype=%s",
-        target_device, bucket_data.shape, bucket_data.dtype,
-    )
-    return bucket_data.to(device=target_device, non_blocking=non_blocking)
+    scaling_factor = bucket.gradient_scaling_factor
+
+    # --- PCIe 延迟缩放决策 ---
+    estimated_bytes = bucket.numel * bucket.data.element_size()
+    if _should_defer_scaling(bucket, target_reduce_device, estimated_bytes):
+        # 调用方负责在数据迁移完成后调用 flush_deferred_scaling
+        return None
+
+    # --- 核心修复：在 bucket.data 上执行缩放（而非 gbuf.global_data）---
+    _scale_bucket_data_inplace(bucket, scaling_factor, stream=reduce_stream)
+
+    # --- 跨设备迁移（如有必要）---
+    result = bucket.data
+    if result.device != target_reduce_device:
+        logger.debug(
+            "[DES-LOC] Moving bucket %d: %s → %s",
+            bucket.bucket_id, result.device, target_reduce_device,
+        )
+        if reduce_stream is not None and result.device.type == "cuda":
+            with torch.cuda.stream(reduce_stream):
+                result = result.to(target_reduce_device, non_blocking=True)
+        else:
+            result = result.to(target_reduce_device)
+
+    return result
 
 
 # ---------------------------------------------------------------------------
-# Core: HeteroFSDPGradScaler
+# GradReducePipeline — DES-LOC 异构实现
 # ---------------------------------------------------------------------------
 
-class HeteroFSDPGradScaler:
+class HeteroFSDPGradScalingFix:
     """
-    Heterogeneous FSDP gradient scaling for DES-LOC.
+    DES-LOC 版 GradReducePipeline，修复 Megatron ba456fd 的梯度缩放目标错误。
 
-    Replaces the direct call to ``gradient_reduce_preprocessing(gbuf.data, ...)``
-    with a device-aware pipeline that:
+    设计目标
+    --------
+    - 正确性：每个 bucket 使用自身的 ``bucket.data`` 作为缩放目标，
+      消除 Megatron 原始 bug（误用 ``gbuf.data`` 导致的错误缩放范围）。
+    - 异构感知：根据 bucket 的物理驻留设备（A6000/H100/CPU）选择合适的
+      缩放精度和执行路径。
+    - 流水线友好：支持 ``reduce_stream`` 异步流水线，与 DES 调度器集成。
+    - LOC-Cache 兼容：通过 ``BucketDescriptor.current_device`` 跟踪位置，
+      供 LOC-Cache 的 prefetch/evict 策略使用。
 
-    1. Resolves the *bucket*'s physical location (not the buffer's).
-    2. Optionally fetches the bucket from CPU LOC to the correct GPU tier.
-    3. Applies the scaling factor *on the bucket tensor* (fixing the upstream
-       Megatron bug: ba456fd).
-    4. Handles SM90 dtype promotion for H100-resident buckets.
-    5. Returns a ``ReduceOp`` descriptor compatible with DeepSpeed's all-reduce
-       and scatter-reduce entry points.
+    异构硬件拓扑
+    ------------
+    ::
 
-    Parameters
-    ----------
-    process_group : dist.ProcessGroup
-        The communication group for gradient reduction.
-    overlap_comm : bool
-        If True, scaling and collective communication are pipelined.
-    loc_eviction_threshold_mb : float
-        Buckets larger than this (in MiB) that arrive from CPU LOC are
-        fetched asynchronously.  Smaller buckets use synchronous copy.
+        A6000-0 (SM86, 48GB) ─┐
+                               ├─ PCIe ─ CPU DRAM (1.5TB)
+        A6000-1 (SM86, 48GB) ─┤
+                               │
+        H100 NVL (SM90, 96GB) ─┘
+
+    注意：无 NVLink，设备间通信全部经 PCIe，带宽为瓶颈。
     """
 
     def __init__(
         self,
-        process_group: dist.ProcessGroup,
-        overlap_comm: bool = True,
-        loc_eviction_threshold_mb: float = 256.0,
+        grad_buffers: List[GradBufferDescriptor],
+        process_group: Optional[dist.ProcessGroup] = None,
+        reduce_stream: Optional[torch.cuda.Stream] = None,
+        default_reduce_device: Optional[torch.device] = None,
     ) -> None:
+        """
+        初始化 HeteroFSDPGradScalingFix。
+
+        参数
+        ----
+        grad_buffers:
+            所有 GradBuffer 的描述符列表，包含其 bucket 拓扑。
+        process_group:
+            分布式通信组；None 时假设单机多卡场景。
+        reduce_stream:
+            CUDA 流，用于异步梯度规约流水线。
+        default_reduce_device:
+            默认 reduce 目标设备；None 时选择 H100（SM90）作为主 reduce 设备
+            （H100 有更大显存和更高带宽，适合作为 reduce 协调者）。
+        """
+        self.grad_buffers = grad_buffers
         self.process_group = process_group
-        self.overlap_comm = overlap_comm
-        self.loc_eviction_threshold_mb = loc_eviction_threshold_mb
+        self.reduce_stream = reduce_stream
 
-        self._world_size: int = dist.get_world_size(process_group)
-        self._fetch_stream: Optional[torch.cuda.Stream] = None
-        self._scale_stream: Optional[torch.cuda.Stream] = None
-        self._stats: Dict[str, int] = {
-            "buckets_scaled": 0,
-            "loc_fetches": 0,
-            "dtype_promotions": 0,
-            "skipped_scaling": 0,
-        }
+        if default_reduce_device is None:
+            # H100 NVL 作为默认 reduce 设备（device index 2）
+            self.default_reduce_device = torch.device("cuda:2")
+        else:
+            self.default_reduce_device = default_reduce_device
 
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
-
-    def _get_or_create_streams(self, device: torch.device):
-        """Lazily create CUDA streams pinned to *device*."""
-        if self._fetch_stream is None:
-            with torch.cuda.device(device):
-                self._fetch_stream = torch.cuda.Stream(device=device)
-                self._scale_stream = torch.cuda.Stream(device=device)
-            logger.debug("DES-LOC streams created on %s", device)
-
-    def _tensor_size_mb(self, t: torch.Tensor) -> float:
-        return t.numel() * t.element_size() / (1024 ** 2)
-
-    def _select_target_device_for_loc_bucket(
-        self,
-        gbuf_device: Optional[torch.device],
-    ) -> torch.device:
-        """
-        Choose where to bring a LOC-resident bucket.
-
-        Strategy:
-          - If *gbuf_device* is a known GPU (i.e. the buffer was allocated on
-            a GPU before eviction), return that device.
-          - Otherwise return the current default CUDA device.
-        """
-        if gbuf_device is not None and gbuf_device.type == "cuda":
-            return gbuf_device
-        return torch.device("cuda", torch.cuda.current_device())
-
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
-
-    def scale_bucket_gradients(
-        self,
-        bucket_data: torch.Tensor,
-        scaling_factor: float,
-        ddp_config,
-        gbuf_device: Optional[torch.device] = None,
-        is_data_distributed: bool = True,
-    ) -> Tuple[torch.Tensor, Optional[dist.ReduceOp]]:
-        """
-        Apply *scaling_factor* to *bucket_data* with full DES-LOC awareness.
-
-        This is the authoritative replacement for::
-
-            reduce_op = gradient_reduce_preprocessing(
-                gbuf.data, scaling_factor, gbuf.ddp_config   # ← BUG
-            )
-
-        which should be::
-
-            reduce_op = gradient_reduce_preprocessing(
-                bucket.data, scaling_factor, gbuf.ddp_config  # ← FIX (ba456fd)
-            )
-
-        In DES-LOC we go further: ``bucket.data`` may not even reside on the
-        same device as ``gbuf.data``, so we probe, fetch, scale, and promote
-        in one coherent pipeline.
-
-        Parameters
-        ----------
-        bucket_data : torch.Tensor
-            The gradient bucket's data tensor (NOT the whole GradBuffer).
-        scaling_factor : float
-            Pre-computed gradient scaling factor from ``gbuf.gradient_scaling_factor``.
-        ddp_config : object
-            DDP/FSDP configuration carrying ``communication_dtype``,
-            ``average_in_collective``, etc.
-        gbuf_device : torch.device, optional
-            The device on which the parent GradBuffer was originally allocated.
-            Used to guide LOC fetch destination.
-        is_data_distributed : bool
-            If True, a scatter-reduce will be used; otherwise all-reduce.
-
-        Returns
-        -------
-        (scaled_bucket_data, reduce_op) : Tuple[torch.Tensor, Optional[dist.ReduceOp]]
-            *scaled_bucket_data* is ready for collective communication.
-            *reduce_op* is the ``dist.ReduceOp`` to pass to the collective.
-        """
-        # --- Step 1: Resolve bucket location ---
-        loc = resolve_bucket_location(bucket_data)
-        logger.debug(
-            "Bucket location: device=%s tier=%s dtype=%s loc_resident=%s size=%.1fMB",
-            loc.device, loc.tier.name, loc.dtype, loc.is_loc_resident,
-            self._tensor_size_mb(bucket_data),
+        self._deferred_buckets: List[Tuple[GradBufferDescriptor, BucketDescriptor]] = []
+        logger.info(
+            "[DES-LOC] HeteroFSDPGradScalingFix initialized: "
+            "%d grad_buffers, reduce_device=%s",
+            len(grad_buffers), self.default_reduce_device,
         )
 
-        # --- Step 2: Fetch from LOC if necessary ---
-        if loc.is_loc_resident:
-            target_dev = self._select_target_device_for_loc_bucket(gbuf_device)
-            large = self._tensor_size_mb(bucket_data) > self.loc_eviction_threshold_mb
-            self._get_or_create_streams(target_dev)
-            if large and self.overlap_comm:
-                with torch.cuda.stream(self._fetch_stream):
-                    bucket_data = fetch_bucket_from_loc(
-                        bucket_data, target_dev, non_blocking=True
-                    )
-                # Ensure scale stream waits for fetch to complete
-                self._scale_stream.wait_stream(self._fetch_stream)
-            else:
-                bucket_data = fetch_bucket_from_loc(
-                    bucket_data, target_dev, non_blocking=False
-                )
-            # Re-resolve after fetch
-            loc = resolve_bucket_location(bucket_data)
-            self._stats["loc_fetches"] += 1
+    # ------------------------------------------------------------------
+    # 主入口：运行梯度规约流水线
+    # ------------------------------------------------------------------
+
+    def run(self) -> None:
+        """
+        执行完整的梯度缩放与规约流水线。
+
+        流程：
+            1. 遍历所有 GradBuffer 的所有 bucket。
+            2. 对每个 bucket 调用 hetero_gradient_reduce_preprocessing。
+            3. 根据 ``gbuf.is_data_distributed`` 选择 reduce-scatter 或 all-reduce。
+            4. 处理所有延迟缩放的 bucket（flush_deferred_scaling）。
+        """
+        logger.info("[DES-LOC] GradReducePipeline: starting run()")
+        self._deferred_buckets.clear()
+
+        for gbuf in self.grad_buffers:
+            self._process_grad_buffer(gbuf)
+
+        # 处理 PCIe 延迟路径
+        if self._deferred_buckets:
             logger.info(
-                "DES-LOC LOC fetch complete → %s (%.1f MB)",
-                loc.device, self._tensor_size_mb(bucket_data),
+                "[DES-LOC] Flushing %d deferred buckets", len(self._deferred_buckets)
             )
+            self.flush_deferred_scaling()
 
-        # --- Step 3: Dtype promotion (SM90 path) ---
-        original_dtype = bucket_data.dtype
-        bucket_data, was_promoted = maybe_promote_bucket_dtype(
-            bucket_data, loc, ddp_config
-        )
-        if was_promoted:
-            self._stats["dtype_promotions"] += 1
+        logger.info("[DES-LOC] GradReducePipeline: run() complete")
 
-        # --- Step 4: Apply scaling factor on the bucket tensor ---
-        # This is the core fix from ba456fd: scale bucket.data, not gbuf.data.
-        # We also account for distributed averaging here.
-        if math.isclose(scaling_factor, 1.0):
-            logger.debug("Scaling factor is 1.0, skipping in-place scale.")
-            self._stats["skipped_scaling"] += 1
-        else:
-            average_in_collective = getattr(
-                ddp_config, "average_in_collective", False
-            )
-            if average_in_collective:
-                # DeepSpeed will divide by world_size inside the collective;
-                # we only need to apply any external loss scale here.
-                effective_scale = scaling_factor
-            else:
-                # We are responsible for the full scaling (including 1/world_size
-                # for gradient averaging when not using ReduceOp.AVG).
-                effective_scale = scaling_factor
-            logger.debug(
-                "Scaling bucket.data in-place: factor=%.6f device=%s",
-                effective_scale, loc.device,
-            )
-            if loc.device.type == "cuda" and self.overlap_comm:
-                self._get_or_create_streams(loc.device)
-                with torch.cuda.stream(self._scale_stream):
-                    bucket_data.mul_(effective_scale)
-            else:
-                bucket_data.mul_(effective_scale)
-            self._stats["buckets_scaled"] += 1
-
-        # --- Step 5: Select ReduceOp ---
-        reduce_op = self._select_reduce_op(ddp_config, is_data_distributed)
-
+    def _process_grad_buffer(self, gbuf: GradBufferDescriptor) -> None:
+        """处理单个 GradBuffer 的所有 bucket。"""
         logger.debug(
-            "Scale pipeline done: out_dtype=%s reduce_op=%s",
-            bucket_data.dtype, reduce_op,
-        )
-        return bucket_data, reduce_op
-
-    def _select_reduce_op(
-        self,
-        ddp_config,
-        is_data_distributed: bool,
-    ) -> Optional[dist.ReduceOp]:
-        """
-        Map DDP config flags to the appropriate ``dist.ReduceOp``.
-
-        DES-LOC note: H100-resident buckets can use ``ReduceOp.AVG`` because
-        NCCL on SM90 supports it natively and it avoids the explicit
-        ``1/world_size`` pre-scale that would otherwise be applied to
-        ``gbuf.data`` (another source of the original bug).
-        """
-        average_in_collective = getattr(ddp_config, "average_in_collective", False)
-        if average_in_collective:
-            return dist.ReduceOp.AVG
-        return dist.ReduceOp.SUM
-
-    def report_stats(self) -> Dict[str, int]:
-        """Return a snapshot of internal scaling statistics."""
-        return dict(self._stats)
-
-
-# ---------------------------------------------------------------------------
-# GradReducePipeline adapter: DES-LOC drop-in for Megatron's pipeline loop
-# ---------------------------------------------------------------------------
-
-@dataclass
-class HeteroGradBuffer:
-    """
-    Minimal interface matching what GradReducePipeline.reduce_grad_buffer
-    expects from a GradBuffer object, extended with DES-LOC fields.
-
-    Attributes
-    ----------
-    data : torch.Tensor
-        The full gradient buffer tensor (may be on any device or CPU LOC).
-    gradient_scaling_factor : float
-        Pre-computed scaling factor (loss scale / world_size, etc.).
-    ddp_config : object
-        DDP/FSDP config object.
-    is_data_distributed : bool
-        True ↔ scatter-reduce; False ↔ all-reduce.
-    original_device : torch.device
-        The device the buffer was originally allocated on (before any LOC
-        eviction). Used to guide fetch destination.
-    buckets : List[torch.Tensor]
-        List of bucket data tensors.  Each may independently be on GPU or LOC.
-    """
-    data: torch.Tensor
-    gradient_scaling_factor: float
-    ddp_config: object
-    is_data_distributed: bool
-    original_device: torch.device
-    buckets: List[torch.Tensor] = field(default_factory=list)
-
-
-def hetero_reduce_grad_buffer(
-    gbuf: HeteroGradBuffer,
-    scaler: HeteroFSDPGradScaler,
-    process_group: dist.ProcessGroup,
-) -> None:
-    """
-    DES-LOC replacement for ``GradReducePipeline``'s inner bucket-reduce loop.
-
-    Megatron's original (buggy) loop (simplified)::
-
-        for bucket in gbuf.buckets:
-            reduce_op = gradient_reduce_preprocessing(
-                gbuf.data,          # ← wrong: entire buffer, not this bucket
-                gbuf.gradient_scaling_factor,
-                gbuf.ddp_config,
-            )
-            all_reduce(bucket.data, op=reduce_op, group=pg)
-
-    DES-LOC corrected loop::
-
-        for bucket in gbuf.buckets:
-            scaled_data, reduce_op = scaler.scale_bucket_gradients(
-                bucket.data,        # ← correct: this specific bucket
-                gbuf.gradient_scaling_factor,
-                gbuf.ddp_config,
-                gbuf_device=gbuf.original_device,
-                is_data_distributed=gbuf.is_data_distributed,
-            )
-            all_reduce / reduce_scatter(scaled_data, op=reduce_op, group=pg)
-
-    Parameters
-    ----------
-    gbuf : HeteroGradBuffer
-        The gradient buffer whose buckets are to be reduced.
-    scaler : HeteroFSDPGradScaler
-        The heterogeneous scaler instance.
-    process_group : dist.ProcessGroup
-        Communication group.
-    """
-    world_size = dist.get_world_size(process_group)
-    logger.info(
-        "hetero_reduce_grad_buffer: %d buckets, world_size=%d, "
-        "is_data_distributed=%s",
-        len(gbuf.buckets), world_size, gbuf.is_data_distributed,
-    )
-
-    for bucket_idx, bucket_data in enumerate(gbuf.buckets):
-        logger.debug("Processing bucket %d / %d", bucket_idx, len(gbuf.buckets))
-
-        scaled_data, reduce_op = scaler.scale_bucket_gradients(
-            bucket_data=bucket_data,
-            scaling_factor=gbuf.gradient_scaling_factor,
-            ddp_config=gbuf.ddp_config,
-            gbuf_device=gbuf.original_device,
-            is_data_distributed=gbuf.is_data_distributed,
+            "[DES-LOC] Processing GradBuffer %d (%d buckets, distributed=%s)",
+            gbuf.gbuf_id, len(gbuf.buckets), gbuf.is_data_distributed,
         )
 
-        # Ensure tensor is contiguous before collective
-        if not scaled_data.is_contiguous():
-            scaled_data = scaled_data.contiguous()
-
-        if gbuf.is_data_distributed:
-            # Scatter-reduce: each rank accumulates its own shard
-            logger.debug("Bucket %d: reduce_scatter, op=%s", bucket_idx, reduce_op)
-            output = torch.zeros_like(scaled_data[: scaled_data.numel() // world_size])
-            dist.reduce_scatter_tensor(
-                output, scaled_data, op=reduce_op, group=process_group
+        for bucket in gbuf.buckets:
+            reduce_device = self._select_reduce_device(bucket)
+            preprocessed = hetero_gradient_reduce_preprocessing(
+                bucket=bucket,
+                gbuf=gbuf,
+                target_reduce_device=reduce_device,
+                reduce_stream=self.reduce_stream,
             )
-            # Write back the reduced shard in-place into the bucket view
-            shard_size = scaled_data.numel() // world_size
-            rank = dist.get_rank(process_group)
-            bucket_data.view(-1)[rank * shard_size : (rank + 1) * shard_size].copy_(output)
+
+            if preprocessed is None:
+                # 进入延迟路径
+                self._deferred_buckets.append((gbuf, bucket))
+                continue
+
+            self._launch_collective(gbuf, bucket, preprocessed, reduce_device)
+
+    def _select_reduce_device(self, bucket: BucketDescriptor) -> torch.device:
+        """
+        为 bucket 选择 reduce 目标设备。
+
+        策略：
+        - 若 bucket 当前在 H100（SM90），直接在本地 reduce（避免不必要迁移）。
+        - 若 bucket 在 A6000，迁移到 H100 reduce（利用 H100 的高带宽显存）。
+        - 若 bucket 在 CPU DRAM 且体积小（<64MB），迁移到最近的 A6000。
+        - 若 bucket 在 CPU DRAM 且体积大，留在 CPU 执行 reduce（避免 PCIe 饱和）。
+        """
+        dclass = bucket.current_device
+        numel_bytes = bucket.numel * bucket.data.element_size()
+
+        if dclass == DeviceClass.H100_SM90:
+            return self.default_reduce_device
+
+        if dclass == DeviceClass.A6000_SM86:
+            return self.default_reduce_device  # 迁移到 H100
+
+        # CPU DRAM
+        if numel_bytes < 64 * 1024 * 1024:
+            # 小 bucket：迁移到 A6000-0
+            return torch.device("cuda:0")
         else:
-            # All-reduce: every rank gets the full gradient
-            logger.debug("Bucket %d: all_reduce, op=%s", bucket_idx, reduce_op)
-            dist.all_reduce(scaled_data, op=reduce_op, group=process_group)
-            bucket_data.copy_(scaled_data)
+            # 大 bucket：CPU reduce
+            return torch.device("cpu")
 
-    stats = scaler.report_stats()
-    logger.info("Scaling stats after reduce pass: %s", stats)
+    def _launch_collective(
+        self,
+        gbuf: GradBufferDescriptor,
+        bucket: BucketDescriptor,
+        data: Tensor,
+        reduce_device: torch.device,
+    ) -> None:
+        """
+        在 ``reduce_device`` 上发起分布式通信原语。
+
+        对应 Megatron GradReducePipeline 中的两路分支：
+        - ``is_data_distributed=True``：reduce-scatter（FSDP 模式）
+        - ``is_data_distributed=False``：all-reduce
+        """
+        if self.process_group is None or not dist.is_initialized():
+            logger.debug(
+                "[DES-LOC] No process group; skipping collective for bucket %d",
+                bucket.bucket_id,
+            )
+            return
+
+        stream_ctx = (
+            torch.cuda.stream(self.reduce_stream)
+            if self.reduce_stream and reduce_device.type == "cuda"
+            else _null_context()
+        )
+        with stream_ctx:
+            if gbuf.is_data_distributed:
+                # FSDP reduce-scatter
+                output_size = data.numel() // dist.get_world_size(self.process_group)
+                output = torch.empty(
+                    output_size, dtype=data.dtype, device=reduce_device
+                )
+                dist.reduce_scatter_tensor(
+                    output, data,
+                    group=self.process_group,
+                    async_op=False,
+                )
+                logger.debug(
+                    "[DES-LOC] bucket %d: reduce-scatter done, output numel=%d",
+                    bucket.bucket_id, output.numel(),
+                )
+            else:
+                # 非分布式：all-reduce
+                dist.all_reduce(data, group=self.process_group, async_op=False)
+                logger.debug(
+                    "[DES-LOC] bucket %d: all-reduce done", bucket.bucket_id
+                )
+
+    # ------------------------------------------------------------------
+    # 延迟缩放刷新
+    # ------------------------------------------------------------------
+
+    def flush_deferred_scaling(self) -> None:
+        """
+        处理所有因 PCIe 节流而推迟缩放的 bucket。
+
+        在 DES-LOC 调度器完成 prefetch（数据已就位于目标设备）后调用。
+        此时可安全执行缩放 + collective，无需额外 D2D 拷贝。
+        """
+        for gbuf, bucket in self._deferred_buckets:
+            logger.info(
+                "[DES-LOC] flush_deferred_scaling: bucket %d, device=%s",
+                bucket.bucket_id, bucket.data.device,
+            )
+            # 数据已就位，直接缩放（不再检查 PCIe 阈值）
+            _scale_bucket_data_inplace(
+                bucket,
+                bucket.gradient_scaling_factor,
+                stream=self.reduce_stream,
+            )
+            reduce_device = self._select_reduce_device(bucket)
+            data = bucket.data
+            if data.device != reduce_device:
+                data = data.to(reduce_device)
+            self._launch_collective(gbuf, bucket, data, reduce_device)
+
+        self._deferred_buckets.clear()
+
+    # ------------------------------------------------------------------
+    # LOC-Cache 集成接口
+    # ------------------------------------------------------------------
+
+    def notify_bucket_moved(
+        self,
+        gbuf_id: int,
+        bucket_id: int,
+        new_device: torch.device,
+        new_data: Tensor,
+    ) -> None:
+        """
+        LOC-Cache 通知接口：当调度器将 bucket 迁移到新设备时调用。
+
+        更新 ``BucketDescriptor`` 的 ``data`` 和 ``current_device``，
+        确保后续缩放在正确的设备上执行。
+        """
+        gbuf = next((g for g in self.grad_buffers if g.gbuf_id == gbuf_id), None)
+        if gbuf is None:
+            logger.warning("[DES-LOC] notify_bucket_moved: gbuf_id %d not found", gbuf_id)
+            return
+        bucket = next((b for b in gbuf.buckets if b.bucket_id == bucket_id), None)
+        if bucket is None:
+            logger.warning("[DES-LOC] notify_bucket_moved: bucket_id %d not found", bucket_id)
+            return
+
+        old_device = bucket.data.device
+        bucket.data = new_data
+        bucket.current_device = _detect_device_class(new_device)
+        bucket.is_offloaded = (bucket.current_device == DeviceClass.CPU_DRAM)
+
+        logger.info(
+            "[DES-LOC] bucket (%d, %d) moved: %s → %s (%s)",
+            gbuf_id, bucket_id, old_device, new_device, bucket.current_device.name,
+        )
 
 
 # ---------------------------------------------------------------------------
-# Utility: build a scaler from a DeepSpeed engine config
+# 工厂函数：从 DeepSpeed ZeRO 参数构建异构 GradBuffer 拓扑
 # ---------------------------------------------------------------------------
 
-def build_hetero_grad_scaler_from_ds_config(
-    ds_config: dict,
-    process_group: dist.ProcessGroup,
-) -> HeteroFSDPGradScaler:
+def build_hetero_grad_buffers(
+    param_groups: List[List[torch.nn.Parameter]],
+    bucket_size_mb: float = 128.0,
+    dtype: torch.dtype = torch.bfloat16,
+    device_assignment: Optional[Dict[int, torch.device]] = None,
+) -> List[GradBufferDescriptor]:
     """
-    Construct a :class:`HeteroFSDPGradScaler` from a DeepSpeed config dict.
+    从参数组构建异构 GradBuffer 拓扑。
 
-    Expected keys under ``des_loc`` sub-dict (all optional):
+    将参数按 ``bucket_size_mb`` 分组，并根据 ``device_assignment`` 将
+    每个 bucket 分配到合适的设备（A6000-0/1, H100, CPU DRAM）。
 
-    .. code-block:: json
+    参数
+    ----
+    param_groups:
+        参数组列表，每组对应一个 GradBuffer。
+    bucket_size_mb:
+        每个分桶的目标大小（MB）。
+    dtype:
+        梯度数据类型；DES-LOC 默认 BF16。
+    device_assignment:
+        bucket_id → device 的手动映射；None 时使用默认拓扑策略。
 
-        {
-          "des_loc": {
-            "overlap_comm": true,
-            "loc_eviction_threshold_mb": 256.0
-          }
-        }
-
-    Parameters
-    ----------
-    ds_config : dict
-        The parsed DeepSpeed JSON config.
-    process_group : dist.ProcessGroup
-
-    Returns
-    -------
-    HeteroFSDPGradScaler
+    返回
+    ----
+    ``GradBufferDescriptor`` 列表，可直接传入 ``HeteroFSDPGradScalingFix``。
     """
-    des_loc_cfg = ds_config.get("des_loc", {})
-    overlap_comm = des_loc_cfg.get("overlap_comm", True)
-    threshold_mb = des_loc_cfg.get("loc_eviction_threshold_mb", 256.0)
-    logger.info(
-        "Building HeteroFSDPGradScaler: overlap_comm=%s, threshold_mb=%.1f",
-        overlap_comm, threshold_mb,
-    )
-    return HeteroFSDPGradScaler(
-        process_group=process_group,
-        overlap_comm=overlap_comm,
-        loc_eviction_threshold_mb=threshold_mb,
-    )
+    bucket_size_bytes = int(bucket_size_mb * 1024 * 1024)
+    elem_bytes = torch.finfo(dtype).bits // 8
+
+    grad_buffers: List[GradBufferDescriptor] = []
+
+    for gbuf_id, params in enumerate(param_groups):
+        buckets: List[BucketDescriptor] = []
+        bucket_id = 0
+        current_params: List[torch.nn.Parameter] = []
+        current_numel = 0
+
+        def _flush_bucket(params_list: List[torch.nn.Parameter], bid: int) -> BucketDescriptor:
+            total = sum(p.numel() for p in params_list)
+            if device_assignment and bid in device_assignment:
+                dev = device_assignment[bid]
+            else:
+                # 默认策略：偶数桶放 A6000-0，奇数桶放 A6000-1，大桶放 H100
+                if total * elem_bytes > 256 * 1024 * 1024:
+                    dev = torch.device("cuda:2")  # H100
+                elif bid % 2 == 0:
+                    dev = torch.device("cuda:0")
+                else:
+                    dev = torch.device("cuda:1")
+
+            data = torch.zeros(total, dtype=dtype, device=dev)
+            dclass = _detect_device_class(dev)
+            logger.debug(
+                "[DES-LOC] GradBuffer %d, bucket %d: numel=%d, device=%s (%s)",
+                gbuf_id, bid, total, dev, dclass.name,
+            )
+            return BucketDescriptor(
+                bucket_id=bid,
+                data=data,
+                numel=total,
+                gradient_scaling_factor=1.0,
+                current_device=dclass,
+            )
+
+        for p in params:
+            if current_numel * elem_bytes + p.numel() * elem_bytes > bucket_size_bytes and current_params:
+                buckets.append(_flush_bucket(current_params, bucket_id))
+                bucket_id += 1
+                current_params = []
+                current_numel = 0
+            current_params.append(p)
+            current_numel += p.numel()
+
+        if current_params:
+            buckets.append(_flush_bucket(current_params, bucket_id))
+
+        grad_buffers.append(GradBufferDescriptor(
+            gbuf_id=gbuf_id,
+            buckets=buckets,
+            ddp_config={"gradient_as_bucket_view": True},
+            dtype=dtype,
+        ))
+        logger.info(
+            "[DES-LOC] GradBuffer %d: %d buckets created", gbuf_id, len(buckets)
+        )
+
+    return grad_buffers
 
 
 # ---------------------------------------------------------------------------
-# Smoke test
+# 内部工具
+# ---------------------------------------------------------------------------
+
+class _null_context:
+    """空上下文管理器，用于统一 GPU/CPU 路径的 with 语句。"""
+    def __enter__(self): return self
+    def __exit__(self, *_): pass
+
+
+# ---------------------------------------------------------------------------
+# Smoke Test
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    import os
-
     logging.basicConfig(
         level=logging.DEBUG,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        format="%(asctime)s %(levelname)s %(name)s — %(message)s",
     )
 
-    # --- Bootstrap a minimal CPU-only process group for smoke testing ---
-    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-    os.environ.setdefault("MASTER_PORT", "29501")
-    os.environ.setdefault("RANK", "0")
-    os.environ.setdefault("WORLD_SIZE", "1")
-    dist.init_process_group(backend="gloo", init_method="env://")
-    pg = dist.group.WORLD
+    # --- 构造最小 GradBuffer 拓扑（CPU 模式，不依赖多 GPU）---
+    dev_cpu = torch.device("cpu")
 
-    # 1. Device tier classification
-    cpu_tier = get_device_tier(torch.device("cpu"))
-    assert cpu_tier == MemoryTier.CPU_LOC, f"Expected CPU_LOC, got {cpu_tier}"
-    logger.info("PASS: CPU tier = CPU_LOC")
-
-    # 2. BucketLocation resolution for a CPU tensor
-    t_cpu = torch.randn(64, 64)
-    loc = resolve_bucket_location(t_cpu)
-    assert loc.is_loc_resident, "CPU tensor should be LOC-resident"
-    assert loc.tier == MemoryTier.CPU_LOC
-    logger.info("PASS: CPU bucket resolved as LOC-resident")
-
-    # 3. Scaling factor correctly applied to bucket (not a ghost buffer)
-    class _FakeDDPConfig:
-        average_in_collective = False
-        communication_dtype = None
-
-    scaler = HeteroFSDPGradScaler(process_group=pg, overlap_comm=False)
-    bucket = torch.ones(16, dtype=torch.float32)
-    buf    = torch.ones(128, dtype=torch.float32) * 99.0  # decoy
-    scaled, _ = scaler.scale_bucket_gradients(
-        bucket_data=bucket,
-        scaling_factor=0.5,
-        ddp_config=_FakeDDPConfig(),
-        gbuf_device=torch.device("cpu"),
+    b0 = BucketDescriptor(
+        bucket_id=0,
+        data=torch.ones(1024, dtype=torch.bfloat16, device=dev_cpu) * 2.0,
+        numel=1024,
+        gradient_scaling_factor=0.5,
+        current_device=DeviceClass.CPU_DRAM,
     )
-    assert torch.allclose(scaled, torch.full_like(scaled, 0.5)), \
-        f"Expected 0.5, got {scaled.mean()}"
-    # Decoy buffer must be untouched (the core bug fix)
-    assert buf.mean().item() == 99.0, "gbuf.data was mutated — bug re-introduced!"
-    logger.info("PASS: Bucket scaled correctly; gbuf decoy untouched (ba456fd fix verified)")
-
-    # 4. Stats tracking
-    stats = scaler.report_stats()
-    assert stats["buckets_scaled"] >= 1, "Expected at least one scaled bucket"
-    logger.info("PASS: Stats: %s", stats)
-
-    # 5. HeteroGradBuffer end-to-end with hetero_reduce_grad_buffer
-    bucket_a = torch.full((8,), 2.0)
-    bucket_b = torch.full((8,), 4.0)
-
-    class _SimpleDDP:
-        average_in_collective = False
-        communication_dtype = None
-
-    gbuf = HeteroGradBuffer(
-        data=torch.cat([bucket_a, bucket_b]),
+    b1 = BucketDescriptor(
+        bucket_id=1,
+        data=torch.ones(512, dtype=torch.bfloat16, device=dev_cpu) * 4.0,
+        numel=512,
         gradient_scaling_factor=0.25,
-        ddp_config=_SimpleDDP(),
-        is_data_distributed=False,  # all-reduce path
-        original_device=torch.device("cpu"),
-        buckets=[bucket_a, bucket_b],
+        current_device=DeviceClass.CPU_DRAM,
     )
-    hetero_reduce_grad_buffer(gbuf, scaler, pg)
-    # After all-reduce with world_size=1 and scale=0.25: 2.0*0.25=0.5, 4.0*0.25=1.0
-    assert torch.allclose(bucket_a, torch.full_like(bucket_a, 0.5)), \
-        f"bucket_a wrong: {bucket_a}"
-    assert torch.allclose(bucket_b, torch.full_like(bucket_b, 1.0)), \
-        f"bucket_b wrong: {bucket_b}"
-    logger.info("PASS: End-to-end hetero_reduce_grad_buffer (all-reduce, world_size=1)")
+    gbuf = GradBufferDescriptor(
+        gbuf_id=0,
+        buckets=[b0, b1],
+        ddp_config={"gradient_as_bucket_view": True},
+        dtype=torch.bfloat16,
+    )
 
-    dist.destroy_process_group()
-    logger.info("All smoke tests passed.")
+    # --- 测试1：bucket 级缩放（核心修复验证）---
+    _scale_bucket_data_inplace(b0, b0.gradient_scaling_factor)
+    assert b0._scaled, "bucket 0 应标记为已缩放"
+    expected_b0 = torch.ones(1024, dtype=torch.float32) * 2.0 * 0.5
+    actual_b0 = b0.data.float()
+    assert torch.allclose(actual_b0, expected_b0, atol=1e-3), (
+        f"bucket 0 缩放结果错误: mean={actual_b0.mean():.4f}, expected={expected_b0.mean():.4f}"
+    )
+    logger.info("✓ Test 1 passed: bucket-level scaling correct (ba456fd fix)")
+
+    # --- 测试2：不重复缩放 ---
+    val_before = b0.data.clone()
+    _scale_bucket_data_inplace(b0, b0.gradient_scaling_factor)  # 应跳过
+    assert torch.allclose(b0.data, val_before), "已缩放的 bucket 不应被重复缩放"
+    logger.info("✓ Test 2 passed: no double-scaling guard")
+
+    # --- 测试3：hetero_gradient_reduce_preprocessing 返回正确张量 ---
+    result = hetero_gradient_reduce_preprocessing(
+        bucket=b1,
+        gbuf=gbuf,
+        target_reduce_device=dev_cpu,
+    )
+    assert result is not None, "非 PCIe 延迟路径应返回 tensor"
+    assert b1._scaled, "preprocessing 应触发 bucket 1 缩放"
+    expected_b1_val = 4.0 * 0.25
+    assert abs(result.float().mean().item() - expected_b1_val) < 1e-3, (
+        f"bucket 1 preprocessing 结果错误: {result.float().mean().item():.4f} vs {expected_b1_val}"
+    )
+    logger.info("✓ Test 3 passed: hetero_gradient_reduce_preprocessing correctness")
+
+    # --- 测试4：notify_bucket_moved 更新设备元数据 ---
+    pipeline = HeteroFSDPGradScalingFix(
+        grad_buffers=[gbuf],
+        process_group=None,
+        reduce_stream=None,
+        default_reduce_device=dev_cpu,
+    )
+    new_data = torch.zeros(1024, dtype=torch.bfloat16, device=dev_cpu)
+    pipeline.notify_bucket_moved(0, 0, dev_cpu, new_data)
+    assert gbuf.buckets[0].current_device == DeviceClass.CPU_DRAM
+    assert gbuf.buckets[0].data is new_data
+    logger.info("✓ Test 4 passed: notify_bucket_moved updates BucketDescriptor")
+
+    # --- 测试5：_should_defer_scaling 小体积不推迟 ---
+    b_small = BucketDescriptor(
+        bucket_id=99,
+        data=torch.zeros(16, dtype=torch.bfloat16),
+        numel=16,
+        gradient_scaling_factor=1.0,
+        current_device=DeviceClass.CPU_DRAM,
+    )
+    defer = _should_defer_scaling(b_small, torch.device("cuda:0"), 16 * 2)
+    assert not defer, "16 元素 bucket 不应触发 PCIe 延迟"
+    logger.info("✓ Test 5 passed: small bucket bypass PCIe deferral")
+
+    logger.info("All smoke tests passed — HeteroFSDPGradScalingFix ready.")
