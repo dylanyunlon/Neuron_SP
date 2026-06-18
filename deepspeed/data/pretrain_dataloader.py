@@ -1,142 +1,162 @@
 """
-Neuron_SP Project — Pretraining DataLoader
-Supports: JSONL (RedPajama/SlimPajama), Parquet, plain TXT
-Tokenizer: tiktoken cl100k_base (fallback: byte-level BPE)
-Strategy: PackedPretrainDataset — zero-padding packing across documents
+deepspeed/data/pretrain_dataloader.py
+
+Production pretrain data pipeline with sequence packing for DES-LOC (Neuron_SP).
+Supports JSONL, Parquet, and plain TXT formats with zero-padding-free packing.
+
+COMMIT_MSG: production pretrain data pipeline with sequence packing for DES-LOC
 """
 
 from __future__ import annotations
 
 import io
 import os
-import sys
 import glob
-import json
-import random
-import struct
-import warnings
+import logging
 from pathlib import Path
-from typing import Iterator, List, Optional, Sequence, Union
+from typing import Iterator, List, Optional, Union
 
 import torch
 from torch.utils.data import DataLoader, IterableDataset
 
+logger = logging.getLogger(__name__)
+
 # ---------------------------------------------------------------------------
-# Tokenizer — tiktoken preferred, byte-level fallback
+# SimpleTokenizer
 # ---------------------------------------------------------------------------
 
-class _ByteLevelTokenizer:
-    """Minimal byte-level tokenizer used as fallback when tiktoken is absent."""
+class SimpleTokenizer:
+    """
+    Thin wrapper: tries tiktoken cl100k_base first, falls back to raw-bytes.
+    Interface: encode(text) -> List[int], decode(ids) -> str, vocab_size -> int
+    """
 
-    bos_id: int = 256
-    eos_id: int = 257
-    vocab_size: int = 258
+    def __init__(self) -> None:
+        self._backend: str
+        try:
+            import tiktoken
+            self._enc = tiktoken.get_encoding("cl100k_base")
+            self._backend = "tiktoken"
+            logger.info("[SimpleTokenizer] Using tiktoken cl100k_base.")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[SimpleTokenizer] tiktoken unavailable (%s); falling back to bytes.", exc
+            )
+            self._enc = None
+            self._backend = "bytes"
 
+    # ------------------------------------------------------------------
     def encode(self, text: str) -> List[int]:
+        if self._backend == "tiktoken":
+            return self._enc.encode_ordinary(text)
+        # Bytes fallback: each byte → token id in [0, 255]
         return list(text.encode("utf-8", errors="replace"))
 
     def decode(self, ids: List[int]) -> str:
-        return bytes([i for i in ids if i < 256]).decode("utf-8", errors="replace")
+        if self._backend == "tiktoken":
+            return self._enc.decode(ids)
+        return bytes(i & 0xFF for i in ids).decode("utf-8", errors="replace")
 
+    @property
+    def vocab_size(self) -> int:
+        if self._backend == "tiktoken":
+            return self._enc.n_vocab
+        return 256
 
-def _build_tokenizer():
-    try:
-        import tiktoken
-        enc = tiktoken.get_encoding("cl100k_base")
-
-        class _TikTokenWrapper:
-            bos_id = enc.encode("<|endoftext|>", allowed_special="all")[0]
-            eos_id = enc.encode("<|endoftext|>", allowed_special="all")[0]
-            vocab_size = enc.n_vocab
-
-            def encode(self, text: str) -> List[int]:
-                return enc.encode(text, allowed_special="all")
-
-            def decode(self, ids: List[int]) -> str:
-                return enc.decode(ids)
-
-        return _TikTokenWrapper()
-    except ImportError:
-        warnings.warn("tiktoken not found — falling back to byte-level tokenizer.", stacklevel=2)
-        return _ByteLevelTokenizer()
-
-
-# Module-level singleton
-_TOKENIZER = None
-
-def get_tokenizer():
-    global _TOKENIZER
-    if _TOKENIZER is None:
-        _TOKENIZER = _build_tokenizer()
-    return _TOKENIZER
+    @property
+    def eot_token(self) -> int:
+        """End-of-text separator inserted between packed documents."""
+        if self._backend == "tiktoken":
+            return self._enc.eot_token  # 100257 for cl100k_base
+        return 0  # '\x00' as EOT in bytes mode
 
 
 # ---------------------------------------------------------------------------
-# File readers — generators yielding raw text strings
+# Raw-text iterators per file format
 # ---------------------------------------------------------------------------
 
-def _read_jsonl(path: Union[str, Path]) -> Iterator[str]:
-    """Yield text strings from {"text": "..."} JSONL (RedPajama/SlimPajama format)."""
-    with open(path, "r", encoding="utf-8", errors="replace") as f:
-        for line_no, line in enumerate(f, 1):
+def _iter_jsonl(path: str) -> Iterator[str]:
+    """Yield text strings from a JSONL file with {"text": "..."} records."""
+    import json
+
+    with open(path, "r", encoding="utf-8", errors="replace") as fh:
+        for lineno, line in enumerate(fh, 1):
             line = line.strip()
             if not line:
                 continue
             try:
                 obj = json.loads(line)
-                # Support both "text" and "content" keys
-                text = obj.get("text") or obj.get("content") or ""
+                text = obj.get("text", "")
                 if text:
                     yield text
-            except json.JSONDecodeError as e:
-                warnings.warn(f"{path}:{line_no} — JSON decode error: {e}", stacklevel=2)
+            except json.JSONDecodeError as exc:
+                logger.debug("JSONL parse error at %s:%d – %s", path, lineno, exc)
 
 
-def _read_parquet(path: Union[str, Path]) -> Iterator[str]:
-    """Yield text strings from a Parquet file (expects a 'text' or 'content' column)."""
+def _iter_parquet(path: str) -> Iterator[str]:
+    """Yield text strings from a Parquet file (expects a 'text' column)."""
     try:
         import pyarrow.parquet as pq
-    except ImportError as e:
-        raise ImportError("pyarrow is required to read Parquet files.  pip install pyarrow") from e
+    except ImportError as exc:
+        raise ImportError(
+            "pyarrow is required to read Parquet files. "
+            "Install it with: pip install pyarrow"
+        ) from exc
 
-    table = pq.read_table(str(path))
-    col_name = None
-    for candidate in ("text", "content", "body", "document"):
-        if candidate in table.column_names:
-            col_name = candidate
-            break
-    if col_name is None:
-        raise ValueError(f"No known text column in {path}. Columns: {table.column_names}")
-
-    col = table.column(col_name)
-    for chunk in col.chunks:
-        for val in chunk:
+    table = pq.read_table(path, columns=["text"])
+    for batch in table.to_batches():
+        col = batch.column("text")
+        for val in col:
             text = val.as_py()
             if text:
-                yield str(text)
+                yield text
 
 
-def _read_txt(path: Union[str, Path]) -> Iterator[str]:
-    """Yield whole file as a single text string (suitable for large plain-text corpora)."""
-    with open(path, "r", encoding="utf-8", errors="replace") as f:
-        text = f.read()
-    if text.strip():
-        yield text
+def _iter_txt(path: str) -> Iterator[str]:
+    """Yield non-empty lines from a plain text file."""
+    with open(path, "r", encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            line = line.rstrip("\n")
+            if line:
+                yield line
 
 
-def _file_reader(path: Union[str, Path]) -> Iterator[str]:
-    """Dispatch to the correct reader based on file extension."""
-    path = Path(path)
-    suffix = path.suffix.lower()
-    if suffix in (".jsonl", ".json"):
-        yield from _read_jsonl(path)
-    elif suffix == ".parquet":
-        yield from _read_parquet(path)
-    elif suffix in (".txt", ".text", ""):
-        yield from _read_txt(path)
+def _iter_file(path: str) -> Iterator[str]:
+    """Dispatch to the correct iterator based on file extension."""
+    ext = Path(path).suffix.lower()
+    if ext in (".jsonl", ".json"):
+        yield from _iter_jsonl(path)
+    elif ext in (".parquet", ".pq"):
+        yield from _iter_parquet(path)
+    elif ext in (".txt", ".text", ""):
+        yield from _iter_txt(path)
     else:
-        warnings.warn(f"Unknown extension '{suffix}' for {path} — trying JSONL.", stacklevel=2)
-        yield from _read_jsonl(path)
+        logger.warning("Unknown extension '%s' for %s; treating as TXT.", ext, path)
+        yield from _iter_txt(path)
+
+
+def _resolve_paths(paths: List[str]) -> List[str]:
+    """
+    Expand glob patterns and directories into a flat list of file paths.
+    Directories are searched one level deep for supported extensions.
+    """
+    supported_exts = {".jsonl", ".json", ".parquet", ".pq", ".txt", ".text"}
+    resolved: List[str] = []
+    for p in paths:
+        expanded = glob.glob(p, recursive=True)
+        if not expanded:
+            expanded = [p]  # treat as literal even if glob found nothing
+        for ep in expanded:
+            ep_path = Path(ep)
+            if ep_path.is_dir():
+                for child in sorted(ep_path.iterdir()):
+                    if child.suffix.lower() in supported_exts:
+                        resolved.append(str(child))
+            elif ep_path.exists():
+                resolved.append(str(ep_path))
+            else:
+                logger.warning("Path does not exist and will be skipped: %s", ep)
+    return resolved
 
 
 # ---------------------------------------------------------------------------
@@ -145,181 +165,159 @@ def _file_reader(path: Union[str, Path]) -> Iterator[str]:
 
 class PackedPretrainDataset(IterableDataset):
     """
-    Iterable dataset that packs tokenised documents back-to-back into
-    fixed-length chunks of size `max_seq_len`.  Absolutely zero padding waste.
+    IterableDataset that streams tokens from multiple files and packs them into
+    fixed-length chunks of `max_seq_len` tokens with *zero padding*.
 
-    Each yielded item is a dict:
-        {"input_ids": LongTensor[max_seq_len]}
-    Labels = input_ids (shifted inside the model).
+    Each yielded sample is a dict:
+        {
+            "input_ids":  LongTensor [max_seq_len],
+            "labels":     LongTensor [max_seq_len],   # same as input_ids (CLM)
+            "attention_mask": LongTensor [max_seq_len],  # all-ones (no padding)
+        }
 
-    Documents are separated by <EOS> token.  The dataset loops infinitely
-    when `infinite=True` (default for pretraining).
+    Documents are separated by the tokenizer's EOT token.
     """
 
     def __init__(
         self,
-        file_paths: Sequence[Union[str, Path]],
+        paths: List[str],
+        tokenizer: SimpleTokenizer,
         max_seq_len: int = 2048,
-        tokenizer=None,
-        shuffle_files: bool = True,
+        shuffle_files: bool = False,
         seed: int = 42,
-        infinite: bool = True,
-    ):
+    ) -> None:
         super().__init__()
-        self.file_paths   = list(file_paths)
-        self.max_seq_len  = max_seq_len
-        self.tokenizer    = tokenizer or get_tokenizer()
+        self.paths = _resolve_paths(paths)
+        if not self.paths:
+            raise ValueError("PackedPretrainDataset received an empty file list.")
+        self.tokenizer = tokenizer
+        self.max_seq_len = max_seq_len
         self.shuffle_files = shuffle_files
-        self.seed         = seed
-        self.infinite     = infinite
+        self.seed = seed
+
+        logger.info(
+            "[PackedPretrainDataset] %d file(s), max_seq_len=%d, eot=%d",
+            len(self.paths),
+            max_seq_len,
+            tokenizer.eot_token,
+        )
 
     # ------------------------------------------------------------------
-    # Worker-aware iteration split
-    # ------------------------------------------------------------------
-
-    def _get_file_shard(self) -> List[Path]:
+    def _token_stream(self) -> Iterator[int]:
+        """
+        Yield individual token IDs across all files.
+        Appends an EOT token at the end of every document.
+        Handles multi-worker sharding transparently.
+        """
         worker_info = torch.utils.data.get_worker_info()
-        paths = list(self.file_paths)
-        if worker_info is None:
-            return paths
-        # Shard files across workers
-        total   = worker_info.num_workers
-        rank    = worker_info.id
-        return [p for i, p in enumerate(paths) if i % total == rank]
+        file_list = list(self.paths)
 
-    # ------------------------------------------------------------------
-    # Core generator
-    # ------------------------------------------------------------------
-
-    def _token_stream(self, paths: List[Path]) -> Iterator[int]:
-        """Yield individual token ids from all files, with EOS between docs."""
-        eos = self.tokenizer.eos_id
-        for path in paths:
-            for text in _file_reader(path):
-                ids = self.tokenizer.encode(text)
-                if ids:
-                    yield from ids
-                    yield eos
-
-    def __iter__(self) -> Iterator[dict]:
-        paths = self._get_file_shard()
         if self.shuffle_files:
+            import random
             rng = random.Random(self.seed)
-            rng.shuffle(paths)
+            rng.shuffle(file_list)
 
-        buffer: List[int] = []
-        epoch = 0
+        # Shard files across DataLoader workers to avoid duplicate samples.
+        if worker_info is not None:
+            num_workers = worker_info.num_workers
+            worker_id = worker_info.id
+            file_list = [f for i, f in enumerate(file_list) if i % num_workers == worker_id]
+            logger.debug(
+                "[Worker %d/%d] assigned %d files.", worker_id, num_workers, len(file_list)
+            )
 
-        while True:
-            for token_id in self._token_stream(paths):
-                buffer.append(token_id)
-                if len(buffer) >= self.max_seq_len:
-                    chunk = buffer[:self.max_seq_len]
-                    buffer = buffer[self.max_seq_len:]
-                    yield {"input_ids": torch.tensor(chunk, dtype=torch.long)}
+        eot = self.tokenizer.eot_token
+        for path in file_list:
+            try:
+                for text in _iter_file(path):
+                    ids = self.tokenizer.encode(text)
+                    if ids:
+                        yield from ids
+                        yield eot
+            except Exception as exc:  # noqa: BLE001
+                logger.error("Error reading %s: %s", path, exc)
 
-            epoch += 1
-            if not self.infinite:
-                # Yield partial last chunk with padding
-                if buffer:
-                    pad = self.max_seq_len - len(buffer)
-                    chunk = buffer + [self.tokenizer.eos_id] * pad
-                    yield {"input_ids": torch.tensor(chunk[:self.max_seq_len], dtype=torch.long)}
-                break
+    # ------------------------------------------------------------------
+    def __iter__(self) -> Iterator[dict]:
+        buf: List[int] = []
+        for token_id in self._token_stream():
+            buf.append(token_id)
+            if len(buf) == self.max_seq_len:
+                yield self._make_sample(buf)
+                buf = []
+        # Drop the last incomplete chunk (zero-padding-free guarantee).
 
-            # Re-shuffle on each epoch for infinite training
-            if self.shuffle_files:
-                self.seed += 1
-                rng = random.Random(self.seed)
-                rng.shuffle(paths)
-
-
-# ---------------------------------------------------------------------------
-# NUMA-aware pin_memory
-# ---------------------------------------------------------------------------
-
-def _numa_aware_pin(tensor: torch.Tensor) -> torch.Tensor:
-    """Pin memory with NUMA awareness when available (Linux + libnuma)."""
-    try:
-        return tensor.pin_memory()
-    except RuntimeError:
-        return tensor
-
-
-class _PinMemoryCollate:
-    def __call__(self, batch: List[dict]) -> dict:
-        input_ids = torch.stack([b["input_ids"] for b in batch])
-        if torch.cuda.is_available():
-            input_ids = _numa_aware_pin(input_ids)
-        return {"input_ids": input_ids}
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _make_sample(ids: List[int]) -> dict:
+        t = torch.tensor(ids, dtype=torch.long)
+        return {
+            "input_ids": t,
+            "labels": t.clone(),
+            "attention_mask": torch.ones_like(t),
+        }
 
 
 # ---------------------------------------------------------------------------
-# Factory function
+# Factory
 # ---------------------------------------------------------------------------
 
 def create_pretrain_dataloader(
-    data_paths: Union[str, Sequence[str]],
-    max_seq_len: int = 2048,
-    micro_batch_size: int = 4,
-    num_workers: int = 4,
-    tokenizer=None,
-    shuffle_files: bool = True,
+    paths: List[str],
+    tokenizer: Optional[SimpleTokenizer] = None,
+    seq_len: int = 2048,
+    batch_size: int = 4,
+    num_workers: int = 2,
+    shuffle_files: bool = False,
     seed: int = 42,
-    infinite: bool = True,
+    pin_memory: bool = True,
     prefetch_factor: int = 2,
 ) -> DataLoader:
     """
-    Build a ready-to-use DataLoader for pretraining.
+    Factory that wires together tokenizer, dataset, and DataLoader.
 
     Args:
-        data_paths: glob pattern string OR list of file paths.
-                    Supports .jsonl, .parquet, .txt
-        max_seq_len: sequence length (tokens) per sample
-        micro_batch_size: local batch size per GPU
-        num_workers: DataLoader worker processes
-        tokenizer: optional pre-built tokenizer; builds default if None
-        shuffle_files: randomise file ordering each epoch
-        seed: RNG seed
-        infinite: loop dataset indefinitely (True for pretraining)
-        prefetch_factor: batches to prefetch per worker
+        paths:          List of file paths / glob patterns / directories.
+        tokenizer:      Optional pre-built SimpleTokenizer; created if None.
+        seq_len:        Token sequence length per sample (no padding).
+        batch_size:     Samples per batch.
+        num_workers:    DataLoader worker processes.
+        shuffle_files:  Randomise file order each epoch.
+        seed:           RNG seed for file shuffling.
+        pin_memory:     Enable CUDA pinned memory.
+        prefetch_factor: Batches prefetched per worker (ignored when workers=0).
 
     Returns:
-        torch.utils.data.DataLoader yielding {"input_ids": Tensor[B, T]}
+        A configured DataLoader instance.
     """
-    # Resolve glob patterns
-    if isinstance(data_paths, str):
-        resolved = sorted(glob.glob(data_paths, recursive=True))
-        if not resolved:
-            raise FileNotFoundError(f"No files matched glob pattern: {data_paths}")
-    else:
-        resolved = []
-        for p in data_paths:
-            matched = sorted(glob.glob(str(p), recursive=True))
-            resolved.extend(matched if matched else [str(p)])
-
-    if not resolved:
-        raise FileNotFoundError(f"No data files resolved from: {data_paths}")
-
-    tok = tokenizer or get_tokenizer()
+    if tokenizer is None:
+        tokenizer = SimpleTokenizer()
 
     dataset = PackedPretrainDataset(
-        file_paths=resolved,
-        max_seq_len=max_seq_len,
-        tokenizer=tok,
+        paths=paths,
+        tokenizer=tokenizer,
+        max_seq_len=seq_len,
         shuffle_files=shuffle_files,
         seed=seed,
-        infinite=infinite,
     )
 
-    loader = DataLoader(
-        dataset,
-        batch_size=micro_batch_size,
+    loader_kwargs: dict = dict(
+        batch_size=batch_size,
         num_workers=num_workers,
-        collate_fn=_PinMemoryCollate(),
-        pin_memory=False,          # already handled in collate
-        prefetch_factor=prefetch_factor if num_workers > 0 else None,
-        persistent_workers=(num_workers > 0),
+        pin_memory=pin_memory and torch.cuda.is_available(),
+        drop_last=True,  # keeps batch sizes uniform (important for DeepSpeed)
+    )
+    if num_workers > 0:
+        loader_kwargs["prefetch_factor"] = prefetch_factor
+        loader_kwargs["persistent_workers"] = True
+
+    loader = DataLoader(dataset, **loader_kwargs)
+    logger.info(
+        "[create_pretrain_dataloader] batch=%d seq_len=%d workers=%d pin=%s",
+        batch_size,
+        seq_len,
+        num_workers,
+        loader_kwargs["pin_memory"],
     )
     return loader
 
@@ -329,36 +327,86 @@ def create_pretrain_dataloader(
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    import tempfile, textwrap
+    import json
+    import tempfile
 
-    print("=== PackedPretrainDataset smoke test ===")
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(message)s")
 
-    # Create a tiny JSONL file
+    # ── 1. Build temp corpus ──────────────────────────────────────────────
     with tempfile.TemporaryDirectory() as tmpdir:
-        jsonl_path = os.path.join(tmpdir, "test.jsonl")
-        with open(jsonl_path, "w") as f:
-            for i in range(200):
-                f.write(json.dumps({"text": f"Hello world sample number {i}. " * 10}) + "\n")
+        tmp = Path(tmpdir)
 
-        tok = get_tokenizer()
-        print(f"Tokenizer: {type(tok).__name__}  vocab_size={tok.vocab_size}")
+        # JSONL
+        jsonl_path = tmp / "corpus.jsonl"
+        with jsonl_path.open("w") as f:
+            for i in range(200):
+                f.write(json.dumps({"text": f"Neuron_SP sample document number {i}. " * 8}) + "\n")
+
+        # TXT
+        txt_path = tmp / "corpus.txt"
+        with txt_path.open("w") as f:
+            for i in range(100):
+                f.write(f"Plain text line {i}: The quick brown fox jumps over the lazy dog.\n")
+
+        # Parquet (optional – skipped if pyarrow absent)
+        parquet_path: Optional[Path] = None
+        try:
+            import pyarrow as pa
+            import pyarrow.parquet as pq
+
+            table = pa.table(
+                {"text": [f"Parquet record {i}: {'token ' * 20}" for i in range(50)]}
+            )
+            parquet_path = tmp / "corpus.parquet"
+            pq.write_table(table, str(parquet_path))
+            logger.info("Parquet file written: %s", parquet_path)
+        except ImportError:
+            logger.warning("pyarrow not installed – skipping Parquet smoke test.")
+
+        # ── 2. Tokenizer ──────────────────────────────────────────────────
+        tok = SimpleTokenizer()
+        logger.info("Backend: %s | vocab_size: %d", tok._backend, tok.vocab_size)
+
+        sample_enc = tok.encode("Hello, Neuron_SP!")
+        logger.info("Encode test → %s", sample_enc[:10])
+        logger.info("Decode test → %r", tok.decode(sample_enc))
+
+        # ── 3. Dataloader ─────────────────────────────────────────────────
+        all_paths = [str(jsonl_path), str(txt_path)]
+        if parquet_path:
+            all_paths.append(str(parquet_path))
+
+        SEQ_LEN = 128
+        BATCH = 2
 
         loader = create_pretrain_dataloader(
-            data_paths=jsonl_path,
-            max_seq_len=128,
-            micro_batch_size=2,
-            num_workers=0,
+            paths=all_paths,
             tokenizer=tok,
-            infinite=False,
+            seq_len=SEQ_LEN,
+            batch_size=BATCH,
+            num_workers=0,   # 0 = main process (safe in __main__)
+            shuffle_files=True,
+            seed=1337,
         )
 
-        total_tokens = 0
-        for step, batch in enumerate(loader):
-            ids = batch["input_ids"]
-            assert ids.shape == (2, 128), f"Unexpected shape: {ids.shape}"
-            total_tokens += ids.numel()
-            if step == 0:
-                print(f"  Batch 0 shape : {ids.shape}  dtype={ids.dtype}")
+        seen_batches = 0
+        for batch in loader:
+            input_ids = batch["input_ids"]
+            labels = batch["labels"]
+            attn_mask = batch["attention_mask"]
 
-        print(f"  Total tokens seen : {total_tokens:,}")
-        print("pretrain_dataloader.py — OK")
+            assert input_ids.shape == (BATCH, SEQ_LEN), f"Shape mismatch: {input_ids.shape}"
+            assert (attn_mask == 1).all(), "Expected all-ones attention mask (no padding)!"
+            assert (input_ids == labels).all(), "input_ids and labels must match for CLM!"
+
+            if seen_batches == 0:
+                logger.info(
+                    "First batch – input_ids[0,:16]: %s", input_ids[0, :16].tolist()
+                )
+
+            seen_batches += 1
+            if seen_batches >= 5:
+                break
+
+        logger.info("✓ Smoke test passed: %d batches verified (shape=%s).",
+                    seen_batches, (BATCH, SEQ_LEN))
