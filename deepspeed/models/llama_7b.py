@@ -1,207 +1,354 @@
 """
-LLaMA-7B Model Definition for DES-LOC Heterogeneous Training
-=============================================================
-
-Pure PyTorch implementation of LLaMA-7B (6.74B params):
-- 32 TransformerBlocks, d_model=4096, 32 heads, intermediate=11008
-- RMSNorm, SwiGLU activation, Rotary Position Embeddings (RoPE)
-- No dependency on HuggingFace transformers
-
-Supports pipeline-parallel slicing via get_layer_groups().
+Neuron_SP Project — LLaMA-7B Architecture
+Pure PyTorch, zero HuggingFace dependency.
+Supports GQA-ready attention, RoPE, SwiGLU, RMSNorm.
 """
 
+from __future__ import annotations
+
 import math
+from dataclasses import dataclass, field
+from typing import Optional, List, Tuple
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from dataclasses import dataclass
-from typing import Optional, List, Tuple
 
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
 
 @dataclass
-class LLaMA7BConfig:
+class LLaMAConfig:
     vocab_size: int = 32000
     hidden_size: int = 4096
+    num_hidden_layers: int = 32
+    num_attention_heads: int = 32
+    num_key_value_heads: int = 32          # set < num_attention_heads for GQA
     intermediate_size: int = 11008
-    num_layers: int = 32
-    num_heads: int = 32
-    num_kv_heads: int = 32       # GQA: set < num_heads for grouped query
-    max_seq_len: int = 2048
+    max_position_embeddings: int = 4096
     rms_norm_eps: float = 1e-6
+    initializer_range: float = 0.02
     rope_theta: float = 10000.0
     tie_word_embeddings: bool = False
-    dtype: torch.dtype = torch.bfloat16
+    pad_token_id: int = 0
+    # derived
+    head_dim: int = field(init=False)
 
+    def __post_init__(self):
+        assert self.hidden_size % self.num_attention_heads == 0, \
+            "hidden_size must be divisible by num_attention_heads"
+        assert self.num_attention_heads % self.num_key_value_heads == 0, \
+            "num_attention_heads must be divisible by num_key_value_heads"
+        object.__setattr__(self, "head_dim", self.hidden_size // self.num_attention_heads)
+
+
+# ---------------------------------------------------------------------------
+# RMSNorm
+# ---------------------------------------------------------------------------
 
 class RMSNorm(nn.Module):
-    def __init__(self, dim: int, eps: float = 1e-6):
+    """Root Mean Square Layer Normalization (no mean subtraction, no bias)."""
+
+    def __init__(self, hidden_size: int, eps: float = 1e-6):
         super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
         self.eps = eps
-        self.weight = nn.Parameter(torch.ones(dim))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        norm = x.float().pow(2).mean(-1, keepdim=True).add(self.eps).rsqrt()
-        return (x.float() * norm).type_as(x) * self.weight
+        # cast to float32 for numerical stability, then back
+        orig_dtype = x.dtype
+        x = x.float()
+        rms = torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+        return (x * rms).to(orig_dtype) * self.weight
 
+
+# ---------------------------------------------------------------------------
+# Rotary Positional Embedding (RoPE)
+# ---------------------------------------------------------------------------
 
 class RotaryEmbedding(nn.Module):
-    def __init__(self, dim: int, max_seq_len: int = 2048, theta: float = 10000.0):
-        super().__init__()
-        inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2).float() / dim))
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
-        self._max_seq = max_seq_len
+    """
+    RoPE with cached inverse-frequency table.
+    Supports arbitrary sequence lengths (cache is extended on demand).
+    """
 
-    def forward(self, x: torch.Tensor, seq_len: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        t = torch.arange(seq_len, device=x.device, dtype=self.inv_freq.dtype)
-        freqs = torch.outer(t, self.inv_freq)
-        emb = torch.cat((freqs, freqs), dim=-1)
-        return emb.cos(), emb.sin()
+    def __init__(self, dim: int, max_position_embeddings: int = 4096,
+                 base: float = 10000.0, device=None):
+        super().__init__()
+        self.dim = dim
+        self.max_position_embeddings = max_position_embeddings
+        self.base = base
+
+        inv_freq = 1.0 / (
+            base ** (torch.arange(0, dim, 2, dtype=torch.float32, device=device) / dim)
+        )
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self._build_cache(max_position_embeddings, device=device)
+
+    def _build_cache(self, seq_len: int, device=None, dtype=torch.float32):
+        self.max_seq_cached = seq_len
+        t = torch.arange(seq_len, device=device or self.inv_freq.device, dtype=dtype)
+        freqs = torch.outer(t, self.inv_freq)          # [seq, dim/2]
+        emb = torch.cat([freqs, freqs], dim=-1)        # [seq, dim]
+        self.register_buffer("cos_cached", emb.cos(), persistent=False)
+        self.register_buffer("sin_cached", emb.sin(), persistent=False)
+
+    def forward(self, x: torch.Tensor, seq_len: int):
+        if seq_len > self.max_seq_cached:
+            self._build_cache(seq_len, device=x.device, dtype=x.dtype)
+        return (
+            self.cos_cached[:seq_len].to(x.dtype),
+            self.sin_cached[:seq_len].to(x.dtype),
+        )
 
 
 def rotate_half(x: torch.Tensor) -> torch.Tensor:
+    """Rotate the second half of the last dimension."""
     x1, x2 = x.chunk(2, dim=-1)
-    return torch.cat((-x2, x1), dim=-1)
+    return torch.cat([-x2, x1], dim=-1)
 
 
-def apply_rotary_pos_emb(q, k, cos, sin):
-    cos = cos.unsqueeze(0).unsqueeze(0)  # [1, 1, seq, dim]
+def apply_rotary_pos_emb(q: torch.Tensor, k: torch.Tensor,
+                          cos: torch.Tensor, sin: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    # cos/sin: [seq_len, head_dim] → unsqueeze for broadcast over batch/heads
+    cos = cos.unsqueeze(0).unsqueeze(0)   # [1, 1, seq, head_dim]
     sin = sin.unsqueeze(0).unsqueeze(0)
-    q_embed = q * cos + rotate_half(q) * sin
-    k_embed = k * cos + rotate_half(k) * sin
-    return q_embed, k_embed
+    q_rot = (q * cos) + (rotate_half(q) * sin)
+    k_rot = (k * cos) + (rotate_half(k) * sin)
+    return q_rot, k_rot
 
 
-class SwiGLU(nn.Module):
-    def __init__(self, hidden_size: int, intermediate_size: int):
+# ---------------------------------------------------------------------------
+# Attention (GQA-ready, uses F.scaled_dot_product_attention → FlashAttn)
+# ---------------------------------------------------------------------------
+
+class LLaMAAttention(nn.Module):
+
+    def __init__(self, config: LLaMAConfig):
         super().__init__()
-        self.gate_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
-        self.up_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
-        self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=False)
+        self.config = config
+        self.hidden_size = config.hidden_size
+        self.num_heads = config.num_attention_heads
+        self.num_kv_heads = config.num_key_value_heads
+        self.head_dim = config.head_dim
+        self.num_kv_groups = self.num_heads // self.num_kv_heads
+
+        self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False)
+        self.k_proj = nn.Linear(self.hidden_size, self.num_kv_heads * self.head_dim, bias=False)
+        self.v_proj = nn.Linear(self.hidden_size, self.num_kv_heads * self.head_dim, bias=False)
+        self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
+
+        self.rotary_emb = RotaryEmbedding(
+            self.head_dim,
+            max_position_embeddings=config.max_position_embeddings,
+            base=config.rope_theta,
+        )
+
+    def _repeat_kv(self, x: torch.Tensor) -> torch.Tensor:
+        """Expand KV heads to match Q heads for GQA."""
+        if self.num_kv_groups == 1:
+            return x
+        bsz, num_kv_heads, seq_len, head_dim = x.shape
+        x = x[:, :, None, :, :].expand(bsz, num_kv_heads, self.num_kv_groups, seq_len, head_dim)
+        return x.reshape(bsz, num_kv_heads * self.num_kv_groups, seq_len, head_dim)
+
+    def forward(self, hidden_states: torch.Tensor,
+                attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        bsz, seq_len, _ = hidden_states.shape
+
+        q = self.q_proj(hidden_states).view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(hidden_states).view(bsz, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(hidden_states).view(bsz, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
+
+        cos, sin = self.rotary_emb(q, seq_len=seq_len)
+        q, k = apply_rotary_pos_emb(q, k, cos, sin)
+
+        k = self._repeat_kv(k)
+        v = self._repeat_kv(v)
+
+        # F.scaled_dot_product_attention dispatches to FlashAttention when available
+        attn_output = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=attention_mask,
+            dropout_p=0.0,
+            is_causal=(attention_mask is None),
+        )
+
+        attn_output = attn_output.transpose(1, 2).contiguous().view(bsz, seq_len, self.hidden_size)
+        return self.o_proj(attn_output)
+
+
+# ---------------------------------------------------------------------------
+# SwiGLU Feed-Forward
+# ---------------------------------------------------------------------------
+
+class LLaMAMLP(nn.Module):
+    """SwiGLU: gate_proj + up_proj → SiLU(gate) * up → down_proj."""
+
+    def __init__(self, config: LLaMAConfig):
+        super().__init__()
+        self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
+        self.up_proj   = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
+        self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
-class Attention(nn.Module):
-    def __init__(self, config: LLaMA7BConfig):
+# ---------------------------------------------------------------------------
+# Transformer Block
+# ---------------------------------------------------------------------------
+
+class LLaMADecoderLayer(nn.Module):
+
+    def __init__(self, config: LLaMAConfig):
         super().__init__()
-        self.num_heads = config.num_heads
-        self.num_kv_heads = config.num_kv_heads
-        self.head_dim = config.hidden_size // config.num_heads
-        self.num_groups = self.num_heads // self.num_kv_heads
+        self.input_layernorm    = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.self_attn          = LLaMAAttention(config)
+        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.mlp               = LLaMAMLP(config)
 
-        self.q_proj = nn.Linear(config.hidden_size, config.num_heads * self.head_dim, bias=False)
-        self.k_proj = nn.Linear(config.hidden_size, config.num_kv_heads * self.head_dim, bias=False)
-        self.v_proj = nn.Linear(config.hidden_size, config.num_kv_heads * self.head_dim, bias=False)
-        self.o_proj = nn.Linear(config.num_heads * self.head_dim, config.hidden_size, bias=False)
+    def forward(self, hidden_states: torch.Tensor,
+                attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        # Pre-norm attention
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states = self.self_attn(hidden_states, attention_mask=attention_mask)
+        hidden_states = residual + hidden_states
 
-        self.rotary = RotaryEmbedding(self.head_dim, config.max_seq_len, config.rope_theta)
+        # Pre-norm MLP
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        hidden_states = residual + hidden_states
 
-    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        B, S, _ = x.shape
-
-        q = self.q_proj(x).view(B, S, self.num_heads, self.head_dim).transpose(1, 2)
-        k = self.k_proj(x).view(B, S, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        v = self.v_proj(x).view(B, S, self.num_kv_heads, self.head_dim).transpose(1, 2)
-
-        cos, sin = self.rotary(q, S)
-        q, k = apply_rotary_pos_emb(q, k, cos, sin)
-
-        # GQA: expand kv heads
-        if self.num_groups > 1:
-            k = k.repeat_interleave(self.num_groups, dim=1)
-            v = v.repeat_interleave(self.num_groups, dim=1)
-
-        # Scaled dot-product attention (uses FlashAttention when available)
-        attn = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, is_causal=(mask is None))
-        attn = attn.transpose(1, 2).contiguous().view(B, S, -1)
-        return self.o_proj(attn)
+        return hidden_states
 
 
-class TransformerBlock(nn.Module):
-    def __init__(self, config: LLaMA7BConfig, layer_idx: int):
+# ---------------------------------------------------------------------------
+# Full LLaMA Model
+# ---------------------------------------------------------------------------
+
+class LLaMAModel(nn.Module):
+    """Decoder-only transformer trunk (no LM head)."""
+
+    def __init__(self, config: LLaMAConfig):
         super().__init__()
-        self.layer_idx = layer_idx
-        self.input_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
-        self.self_attn = Attention(config)
-        self.post_attention_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
-        self.mlp = SwiGLU(config.hidden_size, config.intermediate_size)
-
-    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        x = x + self.self_attn(self.input_layernorm(x), mask)
-        x = x + self.mlp(self.post_attention_layernorm(x))
-        return x
-
-
-class LLaMA7B(nn.Module):
-    """
-    Full LLaMA-7B model.
-
-    Parameter count breakdown:
-      - embed_tokens:  32000 * 4096       =  131M
-      - 32 x TransformerBlock:
-          - q/k/v/o proj: 4 * 4096^2      =   67M  (x32 = 2.15B)
-          - SwiGLU: 3 * 4096 * 11008      =  135M  (x32 = 4.33B)
-          - norms: negligible
-      - lm_head:       4096 * 32000       =  131M
-      Total: ~6.74B parameters
-    """
-
-    def __init__(self, config: Optional[LLaMA7BConfig] = None):
-        super().__init__()
-        if config is None:
-            config = LLaMA7BConfig()
         self.config = config
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size,
+                                         padding_idx=config.pad_token_id)
+        self.layers = nn.ModuleList([LLaMADecoderLayer(config)
+                                      for _ in range(config.num_hidden_layers)])
+        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self._init_weights()
 
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
-        self.layers = nn.ModuleList([
-            TransformerBlock(config, i) for i in range(config.num_layers)
-        ])
-        self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
+    def _init_weights(self):
+        std = self.config.initializer_range
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.normal_(module.weight, mean=0.0, std=std)
+            elif isinstance(module, nn.Embedding):
+                nn.init.normal_(module.weight, mean=0.0, std=std)
+                if module.padding_idx is not None:
+                    module.weight.data[module.padding_idx].zero_()
+
+    def forward(self, input_ids: torch.Tensor,
+                attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        hidden_states = self.embed_tokens(input_ids)
+        for layer in self.layers:
+            hidden_states = layer(hidden_states, attention_mask=attention_mask)
+        return self.norm(hidden_states)
+
+
+class LLaMAForCausalLM(nn.Module):
+    """LLaMA with language-model head for causal pretraining."""
+
+    def __init__(self, config: LLaMAConfig):
+        super().__init__()
+        self.config = config
+        self.model  = LLaMAModel(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
         if config.tie_word_embeddings:
-            self.lm_head.weight = self.embed_tokens.weight
-
-        self.apply(self._init_weights)
-
-    def _init_weights(self, module):
-        if isinstance(module, nn.Linear):
-            nn.init.normal_(module.weight, mean=0.0, std=0.02)
-            if module.bias is not None:
-                nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.Embedding):
-            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            self.lm_head.weight = self.model.embed_tokens.weight
 
     def forward(self, input_ids: torch.Tensor,
-                mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        x = self.embed_tokens(input_ids)
-        for layer in self.layers:
-            x = layer(x, mask)
-        x = self.norm(x)
-        return self.lm_head(x)
+                attention_mask: Optional[torch.Tensor] = None,
+                labels: Optional[torch.Tensor] = None):
+        hidden_states = self.model(input_ids, attention_mask=attention_mask)
+        logits = self.lm_head(hidden_states)               # [B, T, vocab]
+
+        loss = None
+        if labels is not None:
+            # Shift for next-token prediction
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            loss = F.cross_entropy(
+                shift_logits.view(-1, self.config.vocab_size),
+                shift_labels.view(-1),
+                ignore_index=-100,
+            )
+        return loss, logits
+
+    # ------------------------------------------------------------------
+    # Pipeline-parallel helpers
+    # ------------------------------------------------------------------
 
     def get_layer_groups(self) -> List[nn.Module]:
-        """Return sliceable layer groups for pipeline parallelism."""
-        groups = [self.embed_tokens]
-        groups.extend(self.layers)
-        groups.append(nn.Sequential(self.norm, self.lm_head))
+        """
+        Return a flat list of pipeline-splittable segments.
+        DeepSpeed Pipeline Engine assigns each rank a contiguous slice.
+
+        Segments:
+          [0]       embedding
+          [1..32]   decoder layers 0-31
+          [33]      final norm + lm_head
+        """
+        groups: List[nn.Module] = [self.model.embed_tokens]
+        groups.extend(self.model.layers)
+        groups.append(nn.Sequential(self.model.norm, self.lm_head))
         return groups
+
+    # ------------------------------------------------------------------
+    # Utility
+    # ------------------------------------------------------------------
 
     def count_parameters(self) -> int:
         return sum(p.numel() for p in self.parameters())
 
+    def count_trainable_parameters(self) -> int:
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+
+# ---------------------------------------------------------------------------
+# Factory
+# ---------------------------------------------------------------------------
+
+def build_llama_7b(config: Optional[LLaMAConfig] = None) -> LLaMAForCausalLM:
+    if config is None:
+        config = LLaMAConfig()
+    return LLaMAForCausalLM(config)
+
+
+# ---------------------------------------------------------------------------
+# Quick sanity check
+# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    config = LLaMA7BConfig()
-    model = LLaMA7B(config)
-    n_params = model.count_parameters()
-    print(f"LLaMA-7B: {n_params:,} parameters ({n_params/1e9:.2f}B)")
-    assert 6.5e9 < n_params < 7.5e9, f"Expected ~6.7B, got {n_params/1e9:.2f}B"
+    cfg = LLaMAConfig()
+    model = build_llama_7b(cfg)
+    total = model.count_parameters()
+    print(f"Total parameters : {total:,}  ({total/1e9:.3f}B)")
+    assert 6.5e9 < total < 7.0e9, f"Unexpected param count: {total}"
 
-    # Smoke test forward pass (CPU, small input)
-    x = torch.randint(0, config.vocab_size, (1, 16))
-    with torch.no_grad():
-        logits = model(x)
-    print(f"Forward OK: input {x.shape} → logits {logits.shape}")
-    assert logits.shape == (1, 16, config.vocab_size)
+    # Forward pass smoke test
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = model.to(device)
+    ids = torch.randint(0, cfg.vocab_size, (2, 128), device=device)
+    labels = ids.clone()
+    loss, logits = model(ids, labels=labels)
+    print(f"Loss  : {loss.item():.4f}")
+    print(f"Logits: {logits.shape}")   # [2, 128, 32000]
+    print("llama_7b.py — OK")
