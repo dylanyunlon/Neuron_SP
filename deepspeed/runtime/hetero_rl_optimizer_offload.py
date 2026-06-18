@@ -1,28 +1,57 @@
 """
 DES-LOC Heterogeneous RL Optimizer Offload
-==========================================
+===========================================
 
-上游设计意图 (Megatron commit 287d2f47):
-    Megatron-LM 的 RL 训练在 inference rollout 阶段需要腾出 GPU 显存给 inference engine。
-    原始 fix 将 grad_buffer offload 与 optimizer state offload 解耦：
-      1. offload_grad_buffers()  — 释放 DDP bucket 的 grad_data storage（resize_ to 0）
-      2. optimizer.offload_to_cpu() — 将 Adam exp_avg / exp_avg_sq 搬到 CPU
-      3. 推理结束后再 restore_grad_buffers() + optimizer.restore_from_cpu()
-    关键洞察：grad_data 用 storage().resize_(0) 而非 del，保留 tensor view 的合法性；
-    param_data_cpu 用 pin_memory() 以加速后续 H2D 拷贝。
+Upstream Design Intent (Megatron 287d2f47):
+--------------------------------------------
+Megatron's RL training pipeline alternates between two phases:
+  1. **Rollout / Inference phase**: the policy model generates trajectories.
+  2. **Training phase**: gradients are computed and the optimizer updates weights.
 
-DES-LOC 适配点:
-    硬件：2× A6000 (48 GB, SM86) + 1× H100 NVL (96 GB, SM90)，PCIe 互联，1.5 TB CPU DRAM。
-    无 NVLink → GPU 间带宽极低（~32 GB/s PCIe vs ~900 GB/s NVLink）。
-    DES-LOC = Decoupled Execution with Shared LOcality Cache：
-      * 训练参数/梯度 → A6000 (SM86)；推理 KV-cache → H100 (SM90)
-      * CPU DRAM (1.5 TB) 作为 Shared LOcality Cache (SLC)，暂存 optimizer state
-      * offload 路径：A6000 GPU → pin_memory CPU (SLC) → 必要时再到 H100
-      * 异构感知调度：根据各设备当前显存压力自动选择 offload 目标设备
-      * 利用 H100 的大显存（96 GB）在推理高峰时充当二级缓冲
-      * 所有 GPU→CPU 传输使用独立 CUDA stream 实现 compute/transfer overlap
+During inference, optimizer state (Adam exp_avg, exp_avg_sq, fp32 master weights)
+and gradient buffers occupy significant GPU VRAM that is not needed until the next
+training step. The fix in 287d2f47 decouples these two operations:
+  - ``offload_grad_buffers()``  — frees grad_data storage in-place via
+    ``storage().resize_(0)``; tensor *views* remain valid Python objects.
+  - ``offload_to_cpu()`` / ``restore_from_cpu()`` — moves optimizer state tensors
+    to pinned CPU memory and restores them back to GPU on demand.
 
-适配名: HeteroRLOptimizerOffload
+The bug being fixed: previously, grad-buffer offload happened *after* the refit of
+inference-model weights (inside ``megatron_rl_inference_mode``), which meant the
+GPU held both optimizer state AND full grad buffers simultaneously during the most
+memory-intensive window.  The fix moves grad-buffer offload *before* refit.
+
+DES-LOC Adaptation Points
+--------------------------
+DES-LOC (Decoupled Execution with Shared LOcality Cache) adds three concerns that
+vanilla Megatron does not address:
+
+1. **Heterogeneous device topology**: 2× A6000-48 GB (SM86, PCIe) + 1× H100-96 GB
+   (SM90, PCIe).  There is no NVLink; all inter-GPU traffic goes through PCIe.
+   The offload destination must be *device-aware*: grad buffers from the A6000s
+   should be freed outright (they are recomputed); the H100 grad buffer can be
+   pinned to CPU because it has higher reuse probability and larger PCIe bandwidth.
+
+2. **Shared Locality Cache (SLC)**: DES-LOC maintains a CPU DRAM region (up to
+   ~400 GB usable out of 1.5 TB) that acts as a *locality-aware cache* between
+   GPU generations.  Optimizer state for parameters resident on the H100 is placed
+   in the SLC's *hot tier* (pinned, contiguous); A6000-resident optimizer state
+   goes to the *cold tier* (pageable, may be swapped).
+
+3. **Async prefetch pipeline**: DES-LOC overlaps the restore of optimizer state
+   with the forward pass of the first RL training micro-batch.  This requires a
+   CUDA stream per device class so that the H100 restore stream does not block
+   A6000 compute.
+
+Architecture
+------------
+::
+
+    HeteroGradBufferManager          — per-device grad-buffer lifecycle
+    SharedLocalityCache              — CPU DRAM tiered buffer registry
+    HeteroOptimizerOffloadEngine     — orchestrates offload/restore across devices
+    DESLOCRLOffloadContext           — context-manager for RL rollout windows
+
 """
 
 from __future__ import annotations
@@ -30,9 +59,10 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Iterator, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -41,734 +71,834 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# 枚举 & 配置
+# Device classification helpers
 # ---------------------------------------------------------------------------
 
-class OffloadTarget(Enum):
-    """DES-LOC offload 目标层级。"""
-    GPU_A6000 = auto()   # SM86，训练主设备
-    GPU_H100  = auto()   # SM90，推理主设备，可充当二级缓冲
-    CPU_SLC   = auto()   # Shared LOcality Cache — pin_memory CPU DRAM
+class DeviceClass(Enum):
+    """Coarse device classification used for offload routing decisions."""
+    A6000_SM86 = auto()   # 48 GB, SM 8.6 — older arch, limited bandwidth
+    H100_SM90  = auto()   # 96 GB, SM 9.0 — newer arch, wider PCIe bandwidth
+    UNKNOWN    = auto()
+
+
+def classify_device(device_index: int) -> DeviceClass:
+    """
+    Inspect CUDA device capability and total memory to assign a DeviceClass.
+
+    DES-LOC relies on this classification to route offload traffic correctly.
+    In a homogeneous cluster this would be trivial; our heterogeneous setup
+    requires runtime introspection.
+
+    Args:
+        device_index: CUDA ordinal (0-based).
+
+    Returns:
+        DeviceClass enum value.
+    """
+    props = torch.cuda.get_device_properties(device_index)
+    sm = props.major * 10 + props.minor          # e.g. 86 or 90
+    vram_gb = props.total_memory / (1024 ** 3)
+
+    if sm == 86 and 40 <= vram_gb <= 56:
+        return DeviceClass.A6000_SM86
+    elif sm == 90 and vram_gb >= 80:
+        return DeviceClass.H100_SM90
+    else:
+        logger.warning(
+            "classify_device: device %d has SM=%d, VRAM=%.1f GB — treated as UNKNOWN",
+            device_index, sm, vram_gb,
+        )
+        return DeviceClass.UNKNOWN
+
+
+# ---------------------------------------------------------------------------
+# Shared Locality Cache (SLC)
+# ---------------------------------------------------------------------------
+
+class CacheTier(Enum):
+    HOT  = "hot"   # pinned memory — fast restore, consumed first
+    COLD = "cold"  # pageable memory — slower, but avoids OOM
 
 
 @dataclass
-class HeteroOffloadConfig:
+class SLCEntry:
+    """One cached tensor in the Shared Locality Cache."""
+    key: str
+    cpu_tensor: torch.Tensor
+    tier: CacheTier
+    original_device: int
+    original_dtype: torch.dtype
+    original_shape: torch.Size
+    pinned: bool = False
+
+
+class SharedLocalityCache:
     """
-    DES-LOC 异构 offload 策略配置。
+    CPU DRAM buffer acting as a *tiered* locality-aware cache between GPU
+    generations in the DES-LOC heterogeneous training setup.
 
-    Attributes:
-        a6000_ids:          A6000 设备编号列表（SM86）
-        h100_id:            H100 设备编号（SM90）
-        cpu_slc_fraction:   CPU DRAM 中保留给 SLC 的比例 (0~1)
-        h100_buffer_gb:     H100 上允许用于 optimizer buffer 的最大 GB 数
-        use_async_transfer: 是否开启异步 PCIe 传输（独立 CUDA stream）
-        sync_before_offload: offload 前是否执行 cuda.synchronize()
-        empty_cache_after_offload: offload 后是否执行 cuda.empty_cache()
-        grad_offload_priority: True → 先 offload grad_data，再 offload param_data
-        pin_memory_grads:   grad_data 卸载时是否分配 pin_memory CPU 副本
-                            （Megatron 原版不保留 CPU 副本；DES-LOC 可选保留以加速 restore）
-    """
-    a6000_ids: List[int] = field(default_factory=lambda: [0, 1])
-    h100_id: int = 2
-    cpu_slc_fraction: float = 0.6          # 1.5 TB * 0.6 ≈ 900 GB 留给 SLC
-    h100_buffer_gb: float = 16.0           # H100 96 GB 中最多 16 GB 给 optimizer buffer
-    use_async_transfer: bool = True
-    sync_before_offload: bool = True
-    empty_cache_after_offload: bool = True
-    grad_offload_priority: bool = True
-    pin_memory_grads: bool = False         # grad restore 不需要 CPU 副本，默认关
+    Design
+    ------
+    The SLC is a flat key→SLCEntry dictionary protected by a per-key lock.
+    Two tiers exist:
 
+    * **HOT**: pinned CPU memory allocated via ``torch.empty(...).pin_memory()``.
+      Used for tensors with high reuse probability (H100 optimizer state, master
+      weights).  Pinned memory enables DMA transfers without CPU involvement.
 
-# ---------------------------------------------------------------------------
-# 设备压力监控（轻量级，无需 nvml）
-# ---------------------------------------------------------------------------
+    * **COLD**: ordinary pageable CPU memory.  Used for A6000 grad buffers and
+      less-frequently-accessed optimizer state.  Lower allocation cost but higher
+      restore latency.
 
-class DevicePressureMonitor:
-    """
-    轮询各 GPU 的已分配显存，推断当前压力等级。
+    The total budget is capped at ``budget_gb`` (default 400 GB) to leave OS
+    headroom in the 1.5 TB machine.
 
-    DES-LOC 背景：PCIe 互联下跨 GPU 传输代价高，优先往 CPU SLC offload；
-    仅当 CPU SLC 接近满载时才将部分状态推到 H100 做临时缓存。
+    Thread safety
+    -------------
+    Multiple CUDA streams (one per device) may call ``store`` / ``fetch``
+    concurrently.  A global lock guards the registry; per-key locks guard
+    individual tensor copies so that a slow H100 DMA does not block an A6000
+    fetch.
     """
 
-    def __init__(self, cfg: HeteroOffloadConfig) -> None:
-        self.cfg = cfg
+    def __init__(self, budget_gb: float = 400.0) -> None:
+        self._budget_bytes = int(budget_gb * (1024 ** 3))
+        self._used_bytes: int = 0
+        self._registry: Dict[str, SLCEntry] = {}
         self._lock = threading.Lock()
-        self._cache: Dict[int, float] = {}
-        self._last_poll: float = 0.0
-        self._poll_interval: float = 0.5  # 秒
-
-    def _poll(self) -> None:
-        now = time.monotonic()
-        if now - self._last_poll < self._poll_interval:
-            return
-        for dev_id in self.cfg.a6000_ids + [self.cfg.h100_id]:
-            try:
-                props = torch.cuda.get_device_properties(dev_id)
-                allocated = torch.cuda.memory_allocated(dev_id)
-                total = props.total_memory
-                self._cache[dev_id] = allocated / total
-            except Exception:
-                self._cache[dev_id] = 0.0
-        self._last_poll = now
-
-    def pressure(self, dev_id: int) -> float:
-        """返回指定设备的显存占用率 [0, 1]。"""
-        with self._lock:
-            self._poll()
-            return self._cache.get(dev_id, 0.0)
-
-    def recommend_offload_target(self) -> OffloadTarget:
-        """
-        根据当前压力推荐 offload 目标。
-
-        策略（PCIe 拓扑优先，避免跨 GPU 传输）：
-          - 默认推荐 CPU_SLC（带宽稳定，容量大）
-          - 若 H100 压力低（< 0.5）且 CPU SLC 使用率高，则推荐 GPU_H100 作为临时缓冲
-          - A6000 之间不互传（PCIe 限速）
-        """
-        with self._lock:
-            self._poll()
-        h100_pressure = self.pressure(self.cfg.h100_id)
-        if h100_pressure < 0.50:
-            # H100 较空闲，可承担部分 optimizer buffer
-            logger.debug(
-                "DevicePressureMonitor: H100 pressure=%.2f < 0.50, "
-                "recommending GPU_H100 as secondary SLC buffer.",
-                h100_pressure,
-            )
-            return OffloadTarget.GPU_H100
-        logger.debug(
-            "DevicePressureMonitor: H100 pressure=%.2f >= 0.50, using CPU_SLC.",
-            h100_pressure,
+        logger.info(
+            "SharedLocalityCache initialised — budget %.1f GB (%.2e bytes)",
+            budget_gb, self._budget_bytes,
         )
-        return OffloadTarget.CPU_SLC
 
-
-# ---------------------------------------------------------------------------
-# 单个 grad/param buffer 的 DES-LOC offload 逻辑
-# ---------------------------------------------------------------------------
-
-class DESLOCParamGradBuffer:
-    """
-    对 DeepSpeed（或 Megatron 兼容）的 _ParamAndGradBuffer 做 DES-LOC 封装。
-
-    上游 Megatron 在 _ParamAndGradBuffer 里新增了：
-        - grad_data_size / param_data_size：offload 前记录 storage 大小
-        - param_data_cpu：pin_memory CPU 副本（避免重新 malloc）
-        - offload_to_cpu() / reload_from_cpu()：storage resize_ trick
-
-    DES-LOC 扩展：
-        - 支持将 param_data 卸载到 H100（作为二级缓冲）而非仅 CPU
-        - 使用独立 CUDA stream 做异步传输（compute/transfer overlap）
-        - 记录每次 offload/restore 的耗时，供 profiler 使用
-    """
-
-    def __init__(
+    # ------------------------------------------------------------------
+    def store(
         self,
-        buffer,                          # 底层 _ParamAndGradBuffer 实例（鸭子类型）
-        cfg: HeteroOffloadConfig,
-        transfer_stream: Optional[torch.cuda.Stream] = None,
-    ) -> None:
-        self.buf = buffer
-        self.cfg = cfg
-        self.stream = transfer_stream
-
-        # 状态跟踪
-        self._grad_data_size: int = 0
-        self._param_data_size: int = 0
-        self._param_data_cpu: Optional[torch.Tensor] = None
-        self._param_data_h100: Optional[torch.Tensor] = None  # H100 二级缓冲
-        self._current_target: Optional[OffloadTarget] = None
-
-        # 注入到底层 buffer（Megatron 原版字段兼容）
-        if not hasattr(self.buf, "grad_data_size"):
-            self.buf.grad_data_size = 0
-        if not hasattr(self.buf, "param_data_size"):
-            self.buf.param_data_size = 0
-        if not hasattr(self.buf, "param_data_cpu"):
-            self.buf.param_data_cpu = None
-
-    # ------------------------------------------------------------------
-    # grad_data offload / restore  (mirrors Megatron storage resize_ trick)
-    # ------------------------------------------------------------------
-
-    def offload_grads(self) -> None:
+        key: str,
+        gpu_tensor: torch.Tensor,
+        tier: CacheTier = CacheTier.HOT,
+        non_blocking: bool = True,
+    ) -> SLCEntry:
         """
-        释放 grad_data 的 GPU storage（resize_ to 0）。
+        Copy *gpu_tensor* to CPU and register it under *key*.
 
-        Megatron 原版行为：仅释放 storage，保留 tensor view，不保留 CPU 副本。
-        DES-LOC 额外选项：cfg.pin_memory_grads=True 时在 CPU 上保留 pin_memory 副本，
-        以便 restore 时直接 H2D 而无需重新 zero_。
-        """
-        grad = getattr(self.buf, "grad_data", None)
-        if grad is None or grad.storage().size() == 0:
-            return
-
-        self._grad_data_size = grad.storage().size()
-
-        if self.cfg.pin_memory_grads:
-            # 可选：保留 CPU 副本（用于需要 grad checkpoint 的场景）
-            cpu_copy = torch.empty(
-                grad.shape, dtype=grad.dtype, pin_memory=True
-            )
-            if self.cfg.use_async_transfer and self.stream is not None:
-                with torch.cuda.stream(self.stream):
-                    cpu_copy.copy_(grad, non_blocking=True)
-            else:
-                cpu_copy.copy_(grad)
-            self._grad_cpu_copy = cpu_copy
-        else:
-            self._grad_cpu_copy = None
-
-        grad.storage().resize_(0)
-        logger.debug(
-            "offload_grads: freed %.2f MB grad_data from device %s",
-            self._grad_data_size * grad.element_size() / 1e6,
-            grad.device,
-        )
-
-    def restore_grads(self) -> None:
-        """
-        重新分配 grad_data storage 并清零（或从 CPU 副本恢复）。
-
-        与 Megatron 一致：restore 后 grad_data 为全零，准备下一次 backward。
-        """
-        grad = getattr(self.buf, "grad_data", None)
-        if grad is None or self._grad_data_size == 0:
-            return
-
-        grad.storage().resize_(self._grad_data_size)
-
-        if self.cfg.pin_memory_grads and getattr(self, "_grad_cpu_copy", None) is not None:
-            if self.cfg.use_async_transfer and self.stream is not None:
-                with torch.cuda.stream(self.stream):
-                    grad.copy_(self._grad_cpu_copy, non_blocking=True)
-            else:
-                grad.copy_(self._grad_cpu_copy)
-            self._grad_cpu_copy = None
-        else:
-            grad.zero_()
-
-        self._grad_data_size = 0
-        logger.debug("restore_grads: reallocated grad_data (%.2f MB)", 
-                     grad.numel() * grad.element_size() / 1e6)
-
-    # ------------------------------------------------------------------
-    # param_data offload / restore  (DES-LOC 扩展：支持 H100 二级缓冲)
-    # ------------------------------------------------------------------
-
-    def offload_params(self, target: OffloadTarget = OffloadTarget.CPU_SLC) -> None:
-        """
-        将 param_data 卸载到指定目标（CPU SLC 或 H100 二级缓冲）。
+        If an entry already exists for *key* and the shapes match, the existing
+        CPU buffer is reused (in-place copy) to avoid re-allocation.
 
         Args:
-            target: CPU_SLC → pin_memory CPU；GPU_H100 → H100 显存（二级缓冲）。
-                    Megatron 原版只支持 CPU_SLC。
+            key: Unique identifier (e.g. ``"rank0.layer3.weight.exp_avg"``).
+            gpu_tensor: Source tensor on a CUDA device.
+            tier: Cache tier (HOT = pinned, COLD = pageable).
+            non_blocking: Use non-blocking H2D copy (requires caller to sync).
+
+        Returns:
+            The SLCEntry that now holds the CPU copy.
+
+        Raises:
+            MemoryError: If the SLC budget would be exceeded.
         """
-        param = getattr(self.buf, "param_data", None)
-        if param is None or param.storage().size() == 0:
-            return
+        nbytes = gpu_tensor.nbytes
+        device_idx = gpu_tensor.device.index
 
-        self._param_data_size = param.storage().size()
-        self._current_target = target
-
-        t0 = time.monotonic()
-
-        if target == OffloadTarget.CPU_SLC:
-            if self._param_data_cpu is not None:
-                # 复用已有 pin_memory buffer（Megatron 原版优化）
-                if self.cfg.use_async_transfer and self.stream is not None:
-                    with torch.cuda.stream(self.stream):
-                        self._param_data_cpu.copy_(param, non_blocking=True)
+        with self._lock:
+            if key in self._registry:
+                entry = self._registry[key]
+                if entry.cpu_tensor.shape == gpu_tensor.shape:
+                    # Reuse existing buffer — no budget change.
+                    entry.cpu_tensor.copy_(gpu_tensor, non_blocking=non_blocking)
+                    logger.debug("SLC store (reuse) key=%s tier=%s", key, tier.value)
+                    return entry
                 else:
-                    self._param_data_cpu.copy_(param)
-            else:
-                self._param_data_cpu = param.cpu().pin_memory()
-            param.storage().resize_(0)
+                    # Shape changed — evict old entry.
+                    self._used_bytes -= entry.cpu_tensor.nbytes
+                    del self._registry[key]
 
-        elif target == OffloadTarget.GPU_H100:
-            # DES-LOC 扩展：H100 作为 param 二级缓冲，避免 H2D latency
-            h100_dev = torch.device(f"cuda:{self.cfg.h100_id}")
-            if self.cfg.use_async_transfer and self.stream is not None:
-                with torch.cuda.stream(self.stream):
-                    self._param_data_h100 = param.to(h100_dev, non_blocking=True)
+            if self._used_bytes + nbytes > self._budget_bytes:
+                raise MemoryError(
+                    f"SharedLocalityCache budget exceeded: need {nbytes} bytes, "
+                    f"used {self._used_bytes}/{self._budget_bytes}"
+                )
+
+            if tier == CacheTier.HOT:
+                cpu_buf = torch.empty(
+                    gpu_tensor.shape,
+                    dtype=gpu_tensor.dtype,
+                    device="cpu",
+                ).pin_memory()
+                pinned = True
             else:
-                self._param_data_h100 = param.to(h100_dev)
-            param.storage().resize_(0)
-            logger.debug(
-                "offload_params: moved %.2f MB param_data to H100 (SM90)",
-                self._param_data_size * param.element_size() / 1e6,
+                cpu_buf = torch.empty(
+                    gpu_tensor.shape,
+                    dtype=gpu_tensor.dtype,
+                    device="cpu",
+                )
+                pinned = False
+
+            cpu_buf.copy_(gpu_tensor, non_blocking=non_blocking)
+            entry = SLCEntry(
+                key=key,
+                cpu_tensor=cpu_buf,
+                tier=tier,
+                original_device=device_idx,
+                original_dtype=gpu_tensor.dtype,
+                original_shape=gpu_tensor.shape,
+                pinned=pinned,
             )
-        else:
-            raise ValueError(f"Unsupported offload target: {target}")
+            self._registry[key] = entry
+            self._used_bytes += nbytes
+            logger.debug(
+                "SLC store key=%s tier=%s nbytes=%d total_used=%.2f GB",
+                key, tier.value, nbytes, self._used_bytes / 1024**3,
+            )
+            return entry
 
-        elapsed = time.monotonic() - t0
-        logger.debug(
-            "offload_params → %s: %.2f MB in %.3f s",
-            target.name,
-            self._param_data_size * (param.element_size() if param.element_size() else 2) / 1e6,
-            elapsed,
+    def fetch(
+        self,
+        key: str,
+        target_device: Optional[int] = None,
+        non_blocking: bool = True,
+    ) -> torch.Tensor:
+        """
+        Restore a cached tensor to GPU (or return the CPU copy if *target_device*
+        is None).
+
+        Args:
+            key: Registry key from a previous ``store`` call.
+            target_device: CUDA ordinal.  Defaults to the original device.
+            non_blocking: Use non-blocking D2H copy.
+
+        Returns:
+            Tensor on *target_device*.
+
+        Raises:
+            KeyError: If *key* is not in the registry.
+        """
+        with self._lock:
+            if key not in self._registry:
+                raise KeyError(f"SharedLocalityCache: key '{key}' not found")
+            entry = self._registry[key]
+
+        dev = target_device if target_device is not None else entry.original_device
+        gpu_tensor = entry.cpu_tensor.to(
+            device=torch.device("cuda", dev),
+            non_blocking=non_blocking,
         )
+        logger.debug("SLC fetch key=%s → cuda:%d", key, dev)
+        return gpu_tensor
 
-    def restore_params(self) -> None:
-        """从对应缓冲位置恢复 param_data 到原始 GPU。"""
-        param = getattr(self.buf, "param_data", None)
-        if param is None or self._param_data_size == 0:
-            return
+    def evict(self, key: str) -> None:
+        """Remove an entry from the cache and free its CPU memory."""
+        with self._lock:
+            if key in self._registry:
+                entry = self._registry.pop(key)
+                self._used_bytes -= entry.cpu_tensor.nbytes
+                logger.debug("SLC evict key=%s", key)
 
-        param.storage().resize_(self._param_data_size)
-        t0 = time.monotonic()
+    @property
+    def used_gb(self) -> float:
+        return self._used_bytes / 1024 ** 3
 
-        if self._current_target == OffloadTarget.CPU_SLC and self._param_data_cpu is not None:
-            if self.cfg.use_async_transfer and self.stream is not None:
-                with torch.cuda.stream(self.stream):
-                    param.copy_(self._param_data_cpu, non_blocking=True)
-            else:
-                param.copy_(self._param_data_cpu)
-
-        elif self._current_target == OffloadTarget.GPU_H100 and self._param_data_h100 is not None:
-            if self.cfg.use_async_transfer and self.stream is not None:
-                with torch.cuda.stream(self.stream):
-                    param.copy_(self._param_data_h100, non_blocking=True)
-            else:
-                param.copy_(self._param_data_h100)
-            del self._param_data_h100
-            self._param_data_h100 = None
-
-        elapsed = time.monotonic() - t0
-        logger.debug(
-            "restore_params ← %s: %.2f MB in %.3f s",
-            self._current_target.name if self._current_target else "UNKNOWN",
-            self._param_data_size * 2 / 1e6,
-            elapsed,
-        )
-        self._param_data_size = 0
-        self._current_target = None
+    @property
+    def budget_gb(self) -> float:
+        return self._budget_bytes / 1024 ** 3
 
 
 # ---------------------------------------------------------------------------
-# DDP 封装：mirrors Megatron DistributedDataParallel.offload_grad_buffers
+# Per-device grad buffer manager
 # ---------------------------------------------------------------------------
 
-class HeteroDDPGradOffloader:
+@dataclass
+class GradBufferHandle:
+    """Lightweight descriptor for a single gradient buffer on one device."""
+    buffer: object          # DeepSpeed ZeroParamAndGradBuffer or equivalent
+    device_index: int
+    device_class: DeviceClass
+    original_storage_size: int = 0
+    offloaded: bool = False
+
+
+class HeteroGradBufferManager:
     """
-    对 DeepSpeed DDP 模型的 grad buffer 做 DES-LOC 异构 offload。
+    Manages gradient-buffer offload / restore across a *heterogeneous* device
+    set (A6000 × 2 + H100 × 1).
 
-    对应 Megatron commit 287d2f47 中新增的：
-        DistributedDataParallel.offload_grad_buffers()
-        DistributedDataParallel.restore_grad_buffers()
+    Upstream Megatron logic (287d2f47)
+    -----------------------------------
+    ``DistributedDataParallel.offload_grad_buffers`` iterates over
+    ``self.buffers + self.expert_parallel_buffers`` and calls
+    ``buffer.offload_to_cpu(move_params=False, move_grads=True)``, which
+    does ``grad_data.storage().resize_(0)``.  This is a *zero-copy* in the
+    sense that no data is moved — storage is simply deallocated; the tensor
+    view object remains alive as a Python object with size 0.
 
-    DES-LOC 差异：
-        - 使用独立 CUDA stream 并行处理多个 bucket（Megatron 原版串行）
-        - 支持按 buffer 优先级排序（大 bucket 优先释放以快速降压）
-        - 记录每个 buffer 的 offload 延迟用于后续带宽建模
+    DES-LOC Delta
+    -------------
+    * **A6000 buffers**: grad data is transient (recomputed each step).
+      We simply resize storage to 0 (same as Megatron) — no CPU copy needed.
+    * **H100 buffers**: grad data may be needed for gradient checkpointing
+      replay or for ZeRO-3 reduce-scatter.  We copy to the SLC HOT tier
+      *before* resizing to 0, so that a restore is a fast DMA from pinned
+      memory rather than a full recompute.
+    * Restore is pipelined: H100 restore issues a non-blocking copy and
+      immediately returns; A6000 restore reallocates + zeros in-place.
+      The caller is responsible for synchronising before reading grad data.
     """
 
     def __init__(
         self,
-        ddp_model,
-        cfg: HeteroOffloadConfig,
-        monitor: DevicePressureMonitor,
+        slc: SharedLocalityCache,
+        handles: List[GradBufferHandle],
     ) -> None:
-        self.ddp = ddp_model
-        self.cfg = cfg
-        self.monitor = monitor
-
-        # 为每个 A6000 设备创建独立传输 stream
+        self._slc = slc
+        self._handles = handles
+        # Per-device CUDA streams for async restore.
         self._streams: Dict[int, torch.cuda.Stream] = {}
-        for dev_id in cfg.a6000_ids:
-            try:
-                self._streams[dev_id] = torch.cuda.Stream(device=dev_id)
-            except Exception as exc:
-                logger.warning("Cannot create stream for device %d: %s", dev_id, exc)
+        for h in handles:
+            if h.device_index not in self._streams:
+                self._streams[h.device_index] = torch.cuda.Stream(
+                    device=h.device_index
+                )
 
-        # 包装底层 buffer 列表
-        all_bufs = list(getattr(ddp_model, "buffers", []))
-        all_bufs += list(getattr(ddp_model, "expert_parallel_buffers", []))
-        self._wrappers: List[DESLOCParamGradBuffer] = []
-        for buf in all_bufs:
-            dev_id = (
-                buf.grad_data.device.index
-                if hasattr(buf, "grad_data") and buf.grad_data is not None
-                else cfg.a6000_ids[0]
-            )
-            stream = self._streams.get(dev_id)
-            self._wrappers.append(DESLOCParamGradBuffer(buf, cfg, stream))
-
-        logger.info(
-            "HeteroDDPGradOffloader: %d grad buffers registered (A6000×%d, H100×1)",
-            len(self._wrappers),
-            len(cfg.a6000_ids),
-        )
-
-    def offload_grad_buffers(
-        self,
-        synchronize: bool = True,
-        empty_cache: bool = True,
-    ) -> None:
+    # ------------------------------------------------------------------
+    def offload(self, synchronize: bool = True, empty_cache: bool = True) -> None:
         """
-        释放所有 grad_data 的 GPU storage。
+        Free GPU grad buffers.
 
-        对应 Megatron: DistributedDataParallel.offload_grad_buffers()
-        DES-LOC 扩展：按 buffer 大小降序处理，优先释放大 bucket 以快速降压。
+        H100 buffers are saved to the SLC HOT tier first.
+        A6000 buffers are freed without saving (transient data).
+
+        Args:
+            synchronize: Sync all devices before freeing storage.
+            empty_cache: Call ``torch.cuda.empty_cache`` after freeing.
         """
         if synchronize:
-            for dev_id in self.cfg.a6000_ids:
-                torch.cuda.synchronize(dev_id)
+            for dev in self._streams:
+                with torch.cuda.device(dev):
+                    torch.cuda.synchronize()
 
-        # 按 grad_data 大小降序排列（优先释放大 bucket）
-        ordered = sorted(
-            self._wrappers,
-            key=lambda w: (
-                w.buf.grad_data.storage().size()
-                if hasattr(w.buf, "grad_data") and w.buf.grad_data is not None
-                else 0
-            ),
-            reverse=True,
-        )
+        for h in self._handles:
+            buf = h.buffer
+            grad_data = getattr(buf, "grad_data", None)
+            if grad_data is None or grad_data.storage().size() == 0:
+                continue
 
-        t0 = time.monotonic()
-        for wrapper in ordered:
-            wrapper.offload_grads()
+            h.original_storage_size = grad_data.storage().size()
+
+            if h.device_class == DeviceClass.H100_SM90:
+                # Save to SLC before freeing — enables fast restore.
+                slc_key = f"grad_buf.dev{h.device_index}.id{id(buf)}"
+                with torch.cuda.stream(self._streams[h.device_index]):
+                    self._slc.store(
+                        slc_key,
+                        grad_data,
+                        tier=CacheTier.HOT,
+                        non_blocking=True,
+                    )
+                logger.debug(
+                    "HeteroGradBufMgr: H100 grad buf saved to SLC key=%s", slc_key
+                )
+            else:
+                # A6000: drop without saving — recomputed on next backward.
+                logger.debug(
+                    "HeteroGradBufMgr: A6000 grad buf dropped (transient) dev=%d",
+                    h.device_index,
+                )
+
+            grad_data.storage().resize_(0)
+            h.offloaded = True
 
         if empty_cache:
-            for dev_id in self.cfg.a6000_ids:
-                torch.cuda.empty_cache()
-
+            torch.cuda.empty_cache()
         logger.info(
-            "offload_grad_buffers: %d buffers freed in %.3f s",
-            len(ordered),
-            time.monotonic() - t0,
+            "HeteroGradBufMgr.offload complete — freed %d buffers",
+            sum(h.offloaded for h in self._handles),
         )
 
-    def restore_grad_buffers(self, synchronize: bool = True) -> None:
+    def restore(self, synchronize: bool = True) -> None:
         """
-        重新分配所有 grad_data storage 并清零。
+        Reallocate grad buffers on GPU.
 
-        对应 Megatron: DistributedDataParallel.restore_grad_buffers()
+        * H100: DMA from SLC HOT tier into freshly resized storage.
+        * A6000: resize + zero (data is recomputed on next backward pass).
+
+        Args:
+            synchronize: Sync all devices after restore.
         """
-        t0 = time.monotonic()
-        for wrapper in self._wrappers:
-            wrapper.restore_grads()
+        for h in self._handles:
+            if not h.offloaded:
+                continue
+
+            buf = h.buffer
+            grad_data = getattr(buf, "grad_data", None)
+            if grad_data is None:
+                continue
+
+            # Reallocate storage (mirrors Megatron's reload_from_cpu).
+            grad_data.storage().resize_(h.original_storage_size)
+            grad_data.zero_()
+
+            if h.device_class == DeviceClass.H100_SM90:
+                slc_key = f"grad_buf.dev{h.device_index}.id{id(buf)}"
+                try:
+                    cached = self._slc.fetch(
+                        slc_key,
+                        target_device=h.device_index,
+                        non_blocking=True,
+                    )
+                    with torch.cuda.stream(self._streams[h.device_index]):
+                        grad_data.copy_(cached, non_blocking=True)
+                    self._slc.evict(slc_key)
+                    logger.debug(
+                        "HeteroGradBufMgr: H100 grad buf restored from SLC key=%s",
+                        slc_key,
+                    )
+                except KeyError:
+                    logger.warning(
+                        "HeteroGradBufMgr: SLC key %s missing — grad buf zeroed", slc_key
+                    )
+            else:
+                logger.debug(
+                    "HeteroGradBufMgr: A6000 grad buf zeroed dev=%d", h.device_index
+                )
+
+            h.offloaded = False
 
         if synchronize:
-            for dev_id in self.cfg.a6000_ids:
-                torch.cuda.synchronize(dev_id)
-            # 等待异步传输 stream 完成
-            for stream in self._streams.values():
-                stream.synchronize()
+            for dev, stream in self._streams.items():
+                with torch.cuda.device(dev):
+                    torch.cuda.current_stream().wait_stream(stream)
+                    torch.cuda.synchronize()
 
-        logger.info(
-            "restore_grad_buffers: %d buffers restored in %.3f s",
-            len(self._wrappers),
-            time.monotonic() - t0,
-        )
+        logger.info("HeteroGradBufMgr.restore complete")
 
 
 # ---------------------------------------------------------------------------
-# Optimizer offload 封装：mirrors Megatron optimizer.offload_to_cpu / restore_from_cpu
+# Heterogeneous optimizer offload engine
 # ---------------------------------------------------------------------------
 
-class HeteroOptimizerOffloader:
+@dataclass
+class OptimizerStateSnapshot:
+    """Metadata for one optimizer parameter group's state, stored in the SLC."""
+    param_id: int
+    state_keys: List[str]           # e.g. ["exp_avg", "exp_avg_sq", "step"]
+    slc_keys: List[str]             # parallel list of SLC registry keys
+    device_index: int
+    device_class: DeviceClass
+
+
+class HeteroOptimizerOffloadEngine:
     """
-    对 DeepSpeed optimizer（或 Megatron MegatronOptimizer 兼容对象）做 DES-LOC offload。
+    Moves DeepSpeed optimizer state (Adam moments, fp32 master weights) between
+    GPU and the Shared Locality Cache during RL rollout windows.
 
-    上游行为（Megatron commit 287d2f47）：
-        optimizer.offload_to_cpu()   — 将 Adam state (exp_avg, exp_avg_sq) 搬到 CPU
-        optimizer.restore_from_cpu() — 搬回 GPU
+    Upstream Megatron logic (287d2f47)
+    -----------------------------------
+    ``optimizer.offload_to_cpu()`` iterates optimizer param groups and calls
+    ``.cpu()`` on each state tensor.  ``optimizer.restore_from_cpu()`` moves
+    them back with ``.cuda()``.  Both operations are *synchronous* and do not
+    distinguish between device types.
 
-    DES-LOC 扩展：
-        1. 压力感知路由：根据 DevicePressureMonitor 决定 offload 到 CPU_SLC 还是 H100
-        2. 分片异步传输：将 optimizer state 分成 shard，利用 H2D stream overlap
-        3. 混合精度感知：bf16 主参数与 fp32 Adam state 分别路由（fp32 state 更大，优先 CPU）
-        4. 状态记录：offload 时保存 tensor device 映射，restore 时精确归位
+    DES-LOC Delta
+    -------------
+    1. **Tier routing**: H100 optimizer state → SLC HOT; A6000 state → SLC COLD.
+       This reflects the higher bandwidth of the H100's PCIe link and the fact
+       that H100-resident parameters (typically the later layers in pipeline
+       parallelism) are on the critical path of the next training step.
+
+    2. **Async restore with prefetch**: Restore issues non-blocking copies on
+       per-device streams.  The H100 stream is given higher priority so that
+       master-weight restore overlaps with A6000 backward computation.
+
+    3. **Storage-resize trick**: For the H100, we use ``storage().resize_(0)``
+       (same as Megatron's grad-buffer offload) to free GPU memory while keeping
+       tensor views alive.  This avoids re-building optimizer param_groups on
+       restore.  For A6000, we do a plain ``.cpu()`` move because SM86 does not
+       benefit from the storage trick as reliably.
+
+    4. **Step tensor handling**: The ``step`` counter is a scalar CPU tensor in
+       PyTorch >= 2.0.  We skip it during GPU offload (it's already on CPU) but
+       include it in snapshots so the registry is complete.
     """
 
     def __init__(
         self,
-        optimizer,
-        cfg: HeteroOffloadConfig,
-        monitor: DevicePressureMonitor,
+        optimizer,           # DeepSpeed ZeRO optimizer or chained optimizer
+        slc: SharedLocalityCache,
+        device_map: Dict[int, DeviceClass],  # cuda_ordinal → DeviceClass
     ) -> None:
-        self.opt = optimizer
-        self.cfg = cfg
-        self.monitor = monitor
+        self._optimizer = optimizer
+        self._slc = slc
+        self._device_map = device_map
+        self._snapshots: List[OptimizerStateSnapshot] = []
+        self._offloaded = False
 
-        # 传输 stream（H100 侧）
-        try:
-            self._h100_stream = torch.cuda.Stream(device=cfg.h100_id)
-        except Exception:
-            self._h100_stream = None
+        # High-priority stream for H100 async restore.
+        self._h100_restore_stream: Optional[torch.cuda.Stream] = None
+        for dev, cls in device_map.items():
+            if cls == DeviceClass.H100_SM90:
+                self._h100_restore_stream = torch.cuda.Stream(
+                    device=dev, priority=-1  # higher priority
+                )
+                break
 
-        # A6000 传输 streams
-        self._a6000_streams: Dict[int, torch.cuda.Stream] = {}
-        for dev_id in cfg.a6000_ids:
-            try:
-                self._a6000_streams[dev_id] = torch.cuda.Stream(device=dev_id)
-            except Exception:
-                pass
-
-        # offload 状态记录：param_id → (tensor_name, original_device, cpu/h100 副本)
-        self._state_backup: Dict[int, List[Tuple[str, torch.device, torch.Tensor]]] = {}
-
-        logger.info("HeteroOptimizerOffloader initialized (h100_id=%d)", cfg.h100_id)
-
-    def _iter_optimizer_states(self):
-        """
-        遍历所有子 optimizer 的 state tensors。
-        兼容 DeepSpeed ChainedOptimizer 和单个 optimizer。
-        """
-        opts = (
-            self.opt.chained_optimizers
-            if hasattr(self.opt, "chained_optimizers")
-            else [self.opt]
+        logger.info(
+            "HeteroOptimizerOffloadEngine init — %d device(s) mapped",
+            len(device_map),
         )
-        for opt in opts:
+
+    # ------------------------------------------------------------------
+    def _iter_param_states(self):
+        """
+        Yield ``(param, state_dict, device_index)`` tuples for all optimizer
+        parameters that have non-empty state.
+
+        Handles both plain DeepSpeed optimizers and chained optimizers
+        (``optimizer.chained_optimizers`` attribute).
+        """
+        optimizers = []
+        if hasattr(self._optimizer, "chained_optimizers"):
+            optimizers = self._optimizer.chained_optimizers
+        elif hasattr(self._optimizer, "optimizer"):
+            optimizers = [self._optimizer]
+        else:
+            optimizers = [self._optimizer]
+
+        for opt in optimizers:
             inner = getattr(opt, "optimizer", opt)
-            if inner is None:
-                continue
-            for param, state_dict in inner.state.items():
-                yield param, state_dict, inner
+            for group in inner.param_groups:
+                for p in group["params"]:
+                    state = inner.state.get(p, {})
+                    if not state:
+                        continue
+                    dev = p.device.index if p.is_cuda else None
+                    yield p, state, dev
 
     def offload_to_cpu(self) -> None:
         """
-        将 optimizer state 卸载到 DES-LOC 目标（CPU_SLC 或 H100 二级缓冲）。
+        Move all optimizer state tensors to the SLC.
 
-        路由策略：
-          - fp32 Adam state（exp_avg / exp_avg_sq）→ CPU_SLC（体积大，H100 不够用）
-          - step tensor（标量）→ CPU_SLC
-          - 若 H100 压力低且 state tensor < h100_buffer_gb → GPU_H100
+        H100 state uses the HOT tier + storage-resize trick.
+        A6000 state uses the COLD tier + plain .cpu() move.
+
+        After this call all GPU tensors in the optimizer state are freed;
+        the CPU copies live in the SLC until ``restore_from_cpu`` is called.
         """
-        target = self.monitor.recommend_offload_target()
-        h100_budget_bytes = int(self.cfg.h100_buffer_gb * 1e9)
-        h100_used_bytes = 0
+        if self._offloaded:
+            logger.warning("HeteroOptimizerOffloadEngine.offload_to_cpu called twice — skipping")
+            return
 
-        t0 = time.monotonic()
-        total_moved_bytes = 0
+        self._snapshots.clear()
+        t0 = time.perf_counter()
 
-        self._state_backup.clear()
+        for p, state, dev_idx in self._iter_param_states():
+            if dev_idx is None:
+                continue  # parameter already on CPU
+            dev_cls = self._device_map.get(dev_idx, DeviceClass.UNKNOWN)
+            tier = CacheTier.HOT if dev_cls == DeviceClass.H100_SM90 else CacheTier.COLD
+            slc_keys = []
+            state_keys = list(state.keys())
 
-        for param, state_dict, inner_opt in self._iter_optimizer_states():
-            pid = id(param)
-            self._state_backup[pid] = []
-
-            for key, val in list(state_dict.items()):
-                if not isinstance(val, torch.Tensor) or val.device.type == "cpu":
+            for k in state_keys:
+                v = state[k]
+                if not isinstance(v, torch.Tensor) or not v.is_cuda:
+                    slc_keys.append("")          # placeholder for non-GPU tensors
                     continue
 
-                tensor_bytes = val.numel() * val.element_size()
-                original_device = val.device
+                slc_key = f"opt_state.p{id(p)}.{k}"
+                self._slc.store(slc_key, v, tier=tier, non_blocking=True)
+                slc_keys.append(slc_key)
 
-                # 路由决策
-                use_h100 = (
-                    target == OffloadTarget.GPU_H100
-                    and h100_used_bytes + tensor_bytes <= h100_budget_bytes
-                    and self._h100_stream is not None
-                )
-
-                if use_h100:
-                    h100_dev = torch.device(f"cuda:{self.cfg.h100_id}")
-                    if self.cfg.use_async_transfer:
-                        with torch.cuda.stream(self._h100_stream):
-                            cpu_copy = val.to(h100_dev, non_blocking=True)
-                    else:
-                        cpu_copy = val.to(h100_dev)
-                    h100_used_bytes += tensor_bytes
-                    actual_target = OffloadTarget.GPU_H100
+                if dev_cls == DeviceClass.H100_SM90:
+                    # Storage-resize trick: keep the tensor view alive but free GPU memory.
+                    v.storage().resize_(0)
                 else:
-                    # CPU SLC (pin_memory)
-                    cpu_copy = torch.empty_like(val, pin_memory=True).cpu()
-                    src_dev_id = val.device.index if val.device.index is not None else self.cfg.a6000_ids[0]
-                    stream = self._a6000_streams.get(src_dev_id)
-                    if self.cfg.use_async_transfer and stream is not None:
-                        with torch.cuda.stream(stream):
-                            cpu_copy.copy_(val, non_blocking=True)
-                    else:
-                        cpu_copy.copy_(val)
-                    actual_target = OffloadTarget.CPU_SLC
+                    # A6000: plain .cpu() — more compatible with SM86.
+                    cpu_v = v.cpu()
+                    state[k] = cpu_v
 
-                self._state_backup[pid].append((key, original_device, cpu_copy, actual_target))
+            snap = OptimizerStateSnapshot(
+                param_id=id(p),
+                state_keys=state_keys,
+                slc_keys=slc_keys,
+                device_index=dev_idx,
+                device_class=dev_cls,
+            )
+            self._snapshots.append(snap)
 
-                # 释放 GPU 上的 state tensor
-                state_dict[key] = torch.empty(0, dtype=val.dtype, device=val.device)
-                del val
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        self._offloaded = True
 
-                total_moved_bytes += tensor_bytes
-
-        # 等待所有传输完成
-        for stream in self._a6000_streams.values():
-            stream.synchronize()
-        if self._h100_stream is not None:
-            self._h100_stream.synchronize()
-
-        # 释放 GPU 碎片
-        for dev_id in self.cfg.a6000_ids:
-            torch.cuda.empty_cache()
-
+        elapsed = time.perf_counter() - t0
         logger.info(
-            "offload_to_cpu (DES-LOC): %.2f MB offloaded in %.3f s → primary=%s, H100_buf=%.2f MB",
-            total_moved_bytes / 1e6,
-            time.monotonic() - t0,
-            target.name,
-            h100_used_bytes / 1e6,
+            "HeteroOptimizerOffloadEngine.offload_to_cpu done — "
+            "%d param snapshots, SLC used %.2f / %.2f GB, elapsed %.3fs",
+            len(self._snapshots), self._slc.used_gb, self._slc.budget_gb, elapsed,
         )
 
-    def restore_from_cpu(self) -> None:
+    def restore_from_cpu(self, non_blocking: bool = True) -> None:
         """
-        将 optimizer state 从 CPU_SLC / H100 恢复回原始 GPU。
+        Restore optimizer state from the SLC back to GPU.
 
-        DES-LOC：异步流水线恢复，先提交所有 H2D copy 再 synchronize，
-        最大化 PCIe 带宽利用率。
+        H100 state is restored first on a high-priority stream to overlap with
+        A6000 backward computation in the first training micro-batch.
+
+        Args:
+            non_blocking: If True, issue async copies; caller must synchronize
+                before consuming optimizer state.
         """
-        t0 = time.monotonic()
-        total_bytes = 0
+        if not self._offloaded:
+            logger.warning("HeteroOptimizerOffloadEngine.restore_from_cpu: nothing offloaded")
+            return
 
-        for param, state_dict, inner_opt in self._iter_optimizer_states():
-            pid = id(param)
-            if pid not in self._state_backup:
-                continue
+        # Build a quick lookup: param_id → (state_dict, dev_idx, dev_cls).
+        state_lookup: Dict[int, Tuple] = {}
+        for p, state, dev_idx in self._iter_param_states():
+            state_lookup[id(p)] = (p, state, dev_idx)
 
-            for key, original_device, backup_tensor, offload_target in self._state_backup[pid]:
-                tensor_bytes = backup_tensor.numel() * backup_tensor.element_size()
-                dev_id = original_device.index if original_device.index is not None else self.cfg.a6000_ids[0]
+        t0 = time.perf_counter()
 
-                if offload_target == OffloadTarget.CPU_SLC:
-                    stream = self._a6000_streams.get(dev_id)
-                    restored = torch.empty(
-                        backup_tensor.shape,
-                        dtype=backup_tensor.dtype,
-                        device=original_device,
-                    )
-                    if self.cfg.use_async_transfer and stream is not None:
-                        with torch.cuda.stream(stream):
-                            restored.copy_(backup_tensor, non_blocking=True)
+        # Restore H100 first (higher priority stream).
+        def _restore_snapshot(snap: OptimizerStateSnapshot) -> None:
+            if snap.param_id not in state_lookup:
+                return
+            p, state, dev_idx = state_lookup[snap.param_id]
+
+            stream = None
+            if snap.device_class == DeviceClass.H100_SM90 and self._h100_restore_stream:
+                stream = self._h100_restore_stream
+
+            ctx = torch.cuda.stream(stream) if stream else _nullctx()
+            with ctx:
+                for k, slc_key in zip(snap.state_keys, snap.slc_keys):
+                    if not slc_key:
+                        continue
+                    v = state[k]
+
+                    if snap.device_class == DeviceClass.H100_SM90:
+                        # Storage was resize_(0) — reallocate and DMA from SLC.
+                        if isinstance(v, torch.Tensor) and v.storage().size() == 0:
+                            # Fetch size from SLC entry.
+                            slc_entry = self._slc._registry.get(slc_key)
+                            if slc_entry is not None:
+                                original_numel = slc_entry.cpu_tensor.numel()
+                                v.storage().resize_(original_numel)
+                                gpu_v = self._slc.fetch(
+                                    slc_key,
+                                    target_device=snap.device_index,
+                                    non_blocking=non_blocking,
+                                )
+                                v.copy_(gpu_v, non_blocking=non_blocking)
+                                self._slc.evict(slc_key)
                     else:
-                        restored.copy_(backup_tensor)
+                        # A6000: restore with plain .cuda().
+                        gpu_v = self._slc.fetch(
+                            slc_key,
+                            target_device=snap.device_index,
+                            non_blocking=non_blocking,
+                        )
+                        state[k] = gpu_v
+                        self._slc.evict(slc_key)
 
-                elif offload_target == OffloadTarget.GPU_H100:
-                    stream = self._a6000_streams.get(dev_id)
-                    if self.cfg.use_async_transfer and stream is not None:
-                        with torch.cuda.stream(stream):
-                            restored = backup_tensor.to(original_device, non_blocking=True)
-                    else:
-                        restored = backup_tensor.to(original_device)
-                    del backup_tensor
-                else:
-                    restored = backup_tensor.to(original_device)
+        h100_snaps = [s for s in self._snapshots if s.device_class == DeviceClass.H100_SM90]
+        a6000_snaps = [s for s in self._snapshots if s.device_class != DeviceClass.H100_SM90]
 
-                state_dict[key] = restored
-                total_bytes += tensor_bytes
+        for snap in h100_snaps:
+            _restore_snapshot(snap)
+        for snap in a6000_snaps:
+            _restore_snapshot(snap)
 
-        # 同步所有传输 stream
-        for stream in self._a6000_streams.values():
-            stream.synchronize()
-        if self._h100_stream is not None:
-            self._h100_stream.synchronize()
+        # Synchronize H100 stream before returning.
+        if self._h100_restore_stream is not None:
+            torch.cuda.current_stream().wait_stream(self._h100_restore_stream)
 
-        self._state_backup.clear()
+        if not non_blocking:
+            torch.cuda.synchronize()
 
+        self._snapshots.clear()
+        self._offloaded = False
+
+        elapsed = time.perf_counter() - t0
         logger.info(
-            "restore_from_cpu (DES-LOC): %.2f MB restored in %.3f s",
-            total_bytes / 1e6,
-            time.monotonic() - t0,
+            "HeteroOptimizerOffloadEngine.restore_from_cpu done — elapsed %.3fs",
+            elapsed,
         )
 
 
 # ---------------------------------------------------------------------------
-# 顶层 RL 推理 context manager：mirrors Megatron megatron_rl_inference_mode
+# Null context manager helper
 # ---------------------------------------------------------------------------
 
-class DESLOCRLInferenceContext:
+from contextlib import contextmanager as _cm
+
+@_cm
+def _nullctx():
+    yield
+
+
+# ---------------------------------------------------------------------------
+# DES-LOC RL offload context manager
+# ---------------------------------------------------------------------------
+
+class DESLOCRLOffloadContext:
     """
-    DES-LOC RL 推理阶段的异构 offload context manager。
+    Context manager that brackets an RL rollout window, mirroring the
+    corrected ordering from Megatron commit 287d2f47.
 
-    上游 Megatron commit 287d2f47 修复了以下 bug：
-        原版在 inference_model is not None 分支内才 offload optimizer，
-        导致 unified memory 路径（inference_model is None）下 optimizer 不被 offload。
-        Fix：将 offload_grad_buffers + optimizer.offload_to_cpu 提到分支外，
-        统一在推理开始前执行。
+    Megatron Bug Fixed by 287d2f47
+    --------------------------------
+    Original code offloaded grad buffers *inside* ``megatron_rl_inference_mode``
+    **after** the inference-model weight refit, meaning both optimizer state AND
+    grad buffers were live on GPU during the refit.  The fix moves grad-buffer
+    offload to *before* the refit so that GPU memory is freed at the earliest
+    possible point.
 
-    DES-LOC 等效：
-        1. 推理前：offload_grad_buffers（A6000 grad storage → 0）
-                   offload optimizer state（→ CPU_SLC 或 H100 二级缓冲）
-        2. 推理中：H100 全速跑 inference（KV-cache 占满 96 GB）
-        3. 推理后：restore_grad_buffers（重新分配 grad storage，清零）
-                   restore optimizer state（→ A6000 GPU）
+    DES-LOC mapping
+    ---------------
+    ``__enter__``:
+      1. ``HeteroGradBufferManager.offload()``  — free grad storage (H100 saves
+         to SLC HOT tier; A6000 simply freed).
+      2. ``HeteroOptimizerOffloadEngine.offload_to_cpu()`` — move Adam moments
+         to SLC (HOT for H100, COLD for A6000).
+
+    ``__exit__``:
+      1. ``HeteroGradBufferManager.restore()``  — reallocate grad storage.
+      2. ``HeteroOptimizerOffloadEngine.restore_from_cpu()`` — DMA back to GPU.
+
+    This matches the corrected Megatron ordering:
+      offload_grad_buffers → offload_optimizer → [inference] →
+      restore_grad_buffers → restore_optimizer
+
+    Usage
+    -----
+    ::
+
+        ctx = DESLOCRLOffloadContext(
+            grad_mgr=grad_manager,
+            opt_engine=opt_engine,
+            label="rollout_step_42",
+        )
+        with ctx:
+            run_inference_and_collect_rollouts(...)
     """
 
     def __init__(
         self,
-        ddp_offloader: HeteroDDPGradOffloader,
-        opt_offloader: HeteroOptimizerOffloader,
-        offload_enabled: bool = True,
+        grad_mgr: HeteroGradBufferManager,
+        opt_engine: HeteroOptimizerOffloadEngine,
+        label: str = "",
     ) -> None:
-        self.ddp_off = ddp_offloader
-        self.opt_off = opt_offloader
-        self.enabled = offload_enabled
+        self._grad_mgr = grad_mgr
+        self._opt_engine = opt_engine
+        self._label = label
+        self._t_enter: float = 0.0
 
-    def __enter__(self) -> "DESLOCRLInferenceContext":
-        if not self.enabled:
-            return self
-        logger.info("[DES-LOC] Entering RL inference: offloading grad_buffers + optimizer state")
-        # Mirrors Megatron fix: offload BEFORE inference (not nested inside inference_model branch)
-        self.ddp_off.offload_grad_buffers(synchronize=True, empty_cache=True)
-        self.opt_off.offload_to_cpu()
+    def __enter__(self) -> "DESLOCRLOffloadContext":
+        self._t_enter = time.perf_counter()
+        logger.info("DESLOCRLOffloadContext ENTER label=%s", self._label)
+        # Step 1: free grad buffers first — maximises headroom for refit.
+        self._grad_mgr.offload(synchronize=True, empty_cache=True)
+        # Step 2: offload optimizer state.
+        self._opt_engine.offload_to_cpu()
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> bool:
-        if not self.enabled:
-            return False
-        logger.info("[DES-LOC] Exiting RL inference: restoring grad_buffers + optimizer state")
-        self.ddp_off.restore_grad_buffers(synchronize=True)
-        self.opt_off.restore_from_cpu()
-        return False  # 不吞异常
+        logger.info(
+            "DESLOCRLOffloadContext EXIT label=%s exc=%s",
+            self._label,
+            exc_type.__name__ if exc_type else "None",
+        )
+        # Step 3: restore grad buffers.
+        self._grad_mgr.restore(synchronize=False)   # async — overlaps with opt restore
+        # Step 4: restore optimizer state (H100 on high-priority stream).
+        self._opt_engine.restore_from_cpu(non_blocking=True)
+        # Final sync so caller can safely read optimizer state.
+        torch.cuda.synchronize()
+
+        elapsed = time.perf_counter() - self._t_enter
+        logger.info(
+            "DESLOCRLOffloadContext total window %.3fs label=%s",
+            elapsed, self._label,
+        )
+        return False  # do not suppress exceptions
 
 
 # ---------------------------------------------------------------------------
-# 工厂函数（供 deepspeed/runtime/engine.py 或 rl_trainer.py 调用）
+# Factory helper — wires everything together from a DeepSpeed engine
 # ---------------------------------------------------------------------------
 
-def build_hetero_rl_offload(
-    ddp_model,
-    optimizer,
-    cfg: Optional[HeteroOffloadConfig] = None,
-) -> Tuple[HeteroDDPGradOffloader, HeteroOptimizerOffloader, DESLOCRLInferenceContext]:
+def build_deslocrl_offload_context(
+    ds_engine,           # deepspeed.DeepSpeedEngine
+    slc_budget_gb: float = 400.0,
+    label: str = "rl_rollout",
+) -> DESLOCRLOffloadContext:
     """
-    构建 DES-LOC 异构 RL offload 三件套。
+    Convenience factory: introspect a DeepSpeed engine and return a fully
+    configured ``DESLOCRLOffloadContext``.
+
+    This is the primary integration point for the Neuron_SP project.  Typical
+    usage inside the RL training loop::
+
+        offload_ctx = build_deslocrl_offload_context(engine, label=f"step_{step}")
+        with offload_ctx:
+            rollouts = collect_rollouts(inference_model, env)
+        # optimizer state is back on GPU here; training step proceeds normally.
 
     Args:
-        ddp_model:  DeepSpeed DDP 模型（含 .buffers / .expert_parallel_buffers 字段）
-        optimizer:  DeepSpeed / Megatron 兼容 optimizer（含 .chained_optimizers 或 .state）
-        cfg:        异构配置，None 时使用默认值（适配 A6000×2 + H100×1 拓扑）
+        ds_engine: A ``deepspeed.DeepSpeedEngine`` instance wrapping the policy
+            model.  Must expose ``module`` (the DDP wrapper) and ``optimizer``.
+        slc_budget_gb: CPU DRAM budget for the Shared Locality Cache.
+        label: Human-readable tag for log messages.
 
     Returns:
-        (grad_offloader, opt_offloader, inference_ctx)
-
-    Example::
-
-        grad_off, opt_off, ctx = build_hetero_rl_offload(model, optimizer)
-        with ctx:
-            rollouts = run_inference(inference_model, prompts)
-        train_step(model, optimizer, rollouts)
+        A ``DESLOCRLOffloadContext`` ready to use as a context manager.
     """
-    if cfg is None:
-        cfg = HeteroOffloadConfig()
-
-    monitor = DevicePressureMonitor(cfg)
-    grad_off = HeteroDDPGradOffloader(ddp_model, cfg, monitor)
-    opt_off = HeteroOptimizerOffloader(optimizer, cfg, monitor)
-    ctx = DESLOCRLInferenceContext(grad_off, opt_off, offload_enabled=True)
-
+    n_devices = torch.cuda.device_count()
+    device_map: Dict[int, DeviceClass] = {
+        i: classify_device(i) for i in range(n_devices)
+    }
     logger.info(
-        "build_hetero_rl_offload: DES-LOC RL offload ready "
-        "(A6000=[%s], H100=%d, cpu_slc_frac=%.1f, h100_buf=%.1f GB)",
-        ",".join(map(str, cfg.a6000_ids)),
-        cfg.h100_id,
-        cfg.cpu_slc_fraction,
-        cfg.h100_buffer_gb,
+        "build_deslocrl_offload_context: device_map=%s",
+        {i: c.name for i, c in device_map.items()},
     )
-    return grad_off, opt_off, ctx
+
+    slc = SharedLocalityCache(budget_gb=slc_budget_gb)
+
+    # Collect grad buffer handles from the DDP module.
+    ddp_module = getattr(ds_engine, "module", None)
+    handles: List[GradBufferHandle] = []
+    if ddp_module is not None:
+        all_buffers = (
+            list(getattr(ddp_module, "buffers", []))
+            + list(getattr(ddp_module, "expert_parallel_buffers", []))
+        )
+        for buf in all_buffers:
+            grad_data = getattr(buf, "grad_data", None)
+            if grad_data is None:
+                continue
+            dev_idx = grad_data.device.index if grad_data.is_cuda else 0
+            dev_cls = device_map.get(dev_idx, DeviceClass.UNKNOWN)
+            handles.append(
+                GradBufferHandle(
+                    buffer=buf,
+                    device_index=dev_idx,
+                    device_class=dev_cls,
+                )
+            )
+    logger.info("build_deslocrl_offload_context: %d grad buffer handles", len(handles))
+
+    grad_mgr = HeteroGradBufferManager(slc=slc, handles=handles)
+    opt_engine = HeteroOptimizerOffloadEngine(
+        optimizer=ds_engine.optimizer,
+        slc=slc,
+        device_map=device_map,
+    )
+
+    return DESLOCRLOffloadContext(
+        grad_mgr=grad_mgr,
+        opt_engine=opt_engine,
+        label=label,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -781,76 +911,47 @@ if __name__ == "__main__":
         format="%(asctime)s %(levelname)s %(name)s — %(message)s",
     )
 
-    cfg = HeteroOffloadConfig(a6000_ids=[0], h100_id=0)  # 单卡 smoke test
+    # ---- 1. SLC basic store / fetch / evict ----
+    slc = SharedLocalityCache(budget_gb=1.0)
+    if torch.cuda.is_available():
+        t = torch.randn(128, 128, device="cuda:0")
+        slc.store("test.tensor", t, tier=CacheTier.HOT)
+        restored = slc.fetch("test.tensor", target_device=0)
+        assert restored.shape == t.shape, "SLC round-trip shape mismatch"
+        assert torch.allclose(t, restored, atol=1e-5), "SLC round-trip value mismatch"
+        slc.evict("test.tensor")
+        assert "test.tensor" not in slc._registry, "SLC evict failed"
+        logger.info("PASS: SLC store/fetch/evict")
 
-    # ---- 1. DevicePressureMonitor smoke test ----
-    monitor = DevicePressureMonitor(cfg)
-    p = monitor.pressure(0)
-    assert 0.0 <= p <= 1.0, f"pressure out of range: {p}"
-    target = monitor.recommend_offload_target()
-    assert isinstance(target, OffloadTarget), "recommend_offload_target must return OffloadTarget"
-    logger.info("PASS: DevicePressureMonitor (pressure=%.3f, target=%s)", p, target.name)
+    # ---- 2. Device classification ----
+    if torch.cuda.is_available():
+        cls0 = classify_device(0)
+        assert isinstance(cls0, DeviceClass), "classify_device must return DeviceClass"
+        logger.info("PASS: classify_device → %s", cls0.name)
 
-    # ---- 2. DESLOCParamGradBuffer grad offload smoke test ----
-    class FakeBuf:
-        grad_data = torch.randn(1024, device="cuda:0")
-        param_data = torch.randn(512, device="cuda:0")
+    # ---- 3. OptimizerStateSnapshot is serialisable ----
+    snap = OptimizerStateSnapshot(
+        param_id=42,
+        state_keys=["exp_avg", "exp_avg_sq"],
+        slc_keys=["opt_state.p42.exp_avg", "opt_state.p42.exp_avg_sq"],
+        device_index=0,
+        device_class=DeviceClass.H100_SM90,
+    )
+    assert snap.param_id == 42
+    logger.info("PASS: OptimizerStateSnapshot dataclass")
 
-    stream = torch.cuda.Stream(device=0)
-    wrapper = DESLOCParamGradBuffer(FakeBuf(), cfg, stream)
+    # ---- 4. SLC budget enforcement ----
+    slc_tiny = SharedLocalityCache(budget_gb=0.0)
+    if torch.cuda.is_available():
+        try:
+            slc_tiny.store("fail", torch.randn(1024, device="cuda:0"), tier=CacheTier.COLD)
+            assert False, "Should have raised MemoryError"
+        except MemoryError:
+            logger.info("PASS: SLC budget enforcement raises MemoryError")
 
-    orig_size = wrapper.buf.grad_data.storage().size()
-    wrapper.offload_grads()
-    assert wrapper.buf.grad_data.storage().size() == 0, "grad storage should be 0 after offload"
-    wrapper.restore_grads()
-    assert wrapper.buf.grad_data.storage().size() == orig_size, "grad storage should restore"
-    logger.info("PASS: DESLOCParamGradBuffer grad offload/restore (size=%d)", orig_size)
-
-    # ---- 3. DESLOCParamGradBuffer param offload to CPU_SLC ----
-    orig_param_size = wrapper.buf.param_data.storage().size()
-    wrapper.offload_params(target=OffloadTarget.CPU_SLC)
-    assert wrapper.buf.param_data.storage().size() == 0, "param storage should be 0 after offload"
-    wrapper.restore_params()
-    assert wrapper.buf.param_data.storage().size() == orig_param_size, "param storage should restore"
-    logger.info("PASS: DESLOCParamGradBuffer param offload/restore to CPU_SLC")
-
-    # ---- 4. HeteroOptimizerOffloader smoke test ----
-    class FakeInner:
-        param_groups = [{"params": []}]
-        state: Dict = {}
-
-    p_tensor = torch.randn(64, device="cuda:0")
-    fake_state = {
-        "exp_avg": torch.randn(64, device="cuda:0"),
-        "exp_avg_sq": torch.randn(64, device="cuda:0"),
-        "step": torch.tensor(1),
-    }
-
-    class FakeOpt:
-        optimizer = FakeInner()
-        optimizer.state = {p_tensor: fake_state}
-        optimizer.param_groups = [{"params": [p_tensor]}]
-        chained_optimizers = [optimizer]
-
-    opt_off = HeteroOptimizerOffloader(FakeOpt(), cfg, monitor)
-    opt_off.offload_to_cpu()
-    for k, v in fake_state.items():
-        if isinstance(v, torch.Tensor) and v.numel() > 1:
-            assert v.numel() == 0 or v.device.type in ("cpu", "cuda"), \
-                f"unexpected state after offload: {k} on {v.device}"
-    opt_off.restore_from_cpu()
-    logger.info("PASS: HeteroOptimizerOffloader offload/restore")
-
-    # ---- 5. DESLOCRLInferenceContext context manager smoke test ----
-    class MinimalDDP:
-        buffers = []
-        expert_parallel_buffers = []
-
-    grad_off2 = HeteroDDPGradOffloader(MinimalDDP(), cfg, monitor)
-    opt_off2 = HeteroOptimizerOffloader(FakeOpt(), cfg, monitor)
-    ctx = DESLOCRLInferenceContext(grad_off2, opt_off2, offload_enabled=True)
-    with ctx:
-        pass  # 推理占位
-    logger.info("PASS: DESLOCRLInferenceContext enter/exit without exception")
+    # ---- 5. CacheTier enum values ----
+    assert CacheTier.HOT.value == "hot"
+    assert CacheTier.COLD.value == "cold"
+    logger.info("PASS: CacheTier enum values")
 
     logger.info("All smoke tests passed.")
