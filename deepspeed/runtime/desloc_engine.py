@@ -41,6 +41,18 @@ import torch.distributed as dist
 
 logger = logging.getLogger(__name__)
 
+# Lazy import of hetero registry (avoids circular deps)
+_registry = None
+def _get_registry():
+    global _registry
+    if _registry is None:
+        try:
+            from deepspeed.runtime.hetero_registry import get_registry
+            _registry = get_registry()
+        except ImportError:
+            logger.warning("hetero_registry not available; modules won't be loaded")
+    return _registry
+
 
 # ---------------------------------------------------------------------------
 # 1. Tier Discovery
@@ -440,6 +452,28 @@ class DESLOCEngine:
 
         # Step 3: Communication
         self.comm = PCIeAwareCommManager(self.tiers)
+
+        # Step 3.5: Load hetero modules via registry
+        reg = _get_registry()
+        if reg is not None:
+            # Load runtime modules (optimizers, schedulers, grad management)
+            reg.load_subsystem("runtime")
+            reg.load_subsystem("zero")
+            reg.load_subsystem("comm")
+            reg.load_subsystem("checkpoint")
+
+            # Wire specific modules if available
+            sched_cls = reg.get_class("HeteroStepBatchScheduler")
+            if sched_cls is not None:
+                logger.info("Loaded HeteroStepBatchScheduler from registry")
+
+            optim_cls = reg.get_class("HeteroEmergingOptimizers")
+            if optim_cls is not None:
+                logger.info("Loaded HeteroEmergingOptimizers from registry")
+
+            ckpt_cls = reg.get_class("HeteroAsyncCheckpointSave")
+            if ckpt_cls is not None:
+                logger.info("Loaded HeteroAsyncCheckpointSave from registry")
 
         # Step 4: ZeRO config
         self.zero_config = HeteroZeROConfig(self.tiers)
