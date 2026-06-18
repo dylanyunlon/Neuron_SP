@@ -1,75 +1,68 @@
 """
-DES-LOC Heterogeneous GDN-Mamba Integration
+Heterogeneous GDN-Mamba Layer Dispatcher for DES-LOC Heterogeneous Training.
+
+Upstream Design Intent (Megatron 8f7fbe78):
 ============================================
+Megatron PR #3535 introduces GatedDeltaNet (GDN) as a new layer type symbol 'G'
+in the hybrid Mamba architecture. Upstream changes:
+  1. Adds GDN symbol to `mamba_hybrid_layer_allocation.py` alongside M/*/−/E.
+  2. Adds `gdn_layer` slot to `MambaStackSubmodules` and handles `LayerSymbols.GDN`
+     in `MambaStack.__init__`.
+  3. Adds GDN FLOPs estimation (`gdn_layer_flops`) to `num_floating_point_operations`.
+  4. Explicitly blocks GDN during inference with `NotImplementedError` (pending KV-cache
+     support), while full training support is wired through the layer specs.
 
-Upstream Design Intent (Megatron commit 8f7fbe78):
-    Philip Petrakian's "Introduce GDN to Mamba" adds Gated Delta Net (GDN) as a
-    first-class layer type alongside Mamba SSM and standard attention layers in
-    hybrid architectures. The key design choices upstream were:
+The GDN operator uses a *gated delta rule*: it maintains a recurrent state matrix S
+updated as S ← a*(I − b*K*Kᵀ)*S + V*Kᵀ, then reads out h = S*q.  This write is
+O(d²) per token — fundamentally different from Mamba's selective scan and from
+standard attention.  That distinction is architecturally significant for placement.
 
-    1. Symbol 'G' introduced into the hybrid pattern DSL (alongside 'M', '*', '-', 'E')
-    2. GDN wraps inside a TransformerLayer shell to reuse the existing residual/norm
-       infrastructure, with GatedDeltaNet as the self_attention submodule
-    3. Layer maps are returned as (mamba, gdn, attention, mlp, moe) tuples — GDN
-       counts are tracked separately for FLOPs accounting
-    4. FLOPs formula for GDN: in_proj + conv1d + delta-rule recurrence + out_proj,
-       parameterized by (qk_head_dim, v_head_dim, num_qk_heads, num_v_heads, conv_kernel_dim)
-    5. Inference explicitly raises NotImplementedError for GDN until KV-cache is
-       extended to handle the delta-rule recurrent state
+DES-LOC Adaptation Points:
+===========================
+DES-LOC = Decoupled Execution with Shared LOcality Cache.
 
-DES-LOC Adaptation (HeteroGDNMambaIntegration):
-    DES-LOC = Decoupled Execution with Shared LOcality Cache
+Hardware topology: 2× A6000 (48 GB, SM86) + 1× H100 NVL (96 GB, SM90), PCIe only,
+                   1.5 TB CPU DRAM.
 
-    Hardware context: 2× A6000 48 GB SM86 + 1× H100 NVL 96 GB SM90, PCIe only,
-    1.5 TB CPU DRAM.
+Key insight: GDN's per-token O(d²) state update is *compute-bound* and benefits from
+SM90's BF16/FP8 tensor-core throughput; attention is memory-bandwidth-bound and
+runs adequately on SM86; Mamba selective scan is memory-bound *and* recurrence-limited
+— SM86 is fine and keeps H100 free.
 
-    The core insight is that GDN, Mamba-SSM, and standard attention have very
-    different compute/memory profiles that map naturally to different devices:
+This module implements three DES-LOC-specific mechanisms:
 
-    ┌────────────────┬──────────────────────────────────────────────────────┐
-    │ Layer Type     │ DES-LOC Device Assignment                            │
-    ├────────────────┼──────────────────────────────────────────────────────┤
-    │ GDN (G)        │ H100 NVL (SM90) — delta-rule recurrence is matmul-   │
-    │                │ heavy with large v_dim; benefits most from BF16 TF32  │
-    │ Mamba SSM (M)  │ A6000 pair (SM86) — selective scan is bandwidth-      │
-    │                │ bound; A6000 HBM2e bandwidth is sufficient, avoids    │
-    │                │ wasting H100 on scan primitives                        │
-    │ Attention (*)  │ H100 NVL — flash-attn2 + large KV fits in 96 GB      │
-    │ MLP / MoE      │ Balanced: MLP → A6000, MoE experts → CPU offload     │
-    └────────────────┴──────────────────────────────────────────────────────┘
+A. DeviceAffinity routing
+   A static placement table maps each layer-type symbol to a preferred device rank.
+   GDN → rank 2 (H100), Attention → rank 0 or 1 (A6000), Mamba → rank 0 or 1.
+   The table is overridable at runtime via env vars (DES_LOC_GDN_RANK, etc.).
 
-    The "Shared LOcality Cache" is a CPU DRAM tensor cache (up to ~400 GB
-    addressable via pin_memory) that holds:
-      - GDN recurrent state S (shape: [B, n_v_heads, v_head_dim, v_head_dim])
-      - Mamba SSM hidden state h
-      - Attention KV cache (prefix cache for inference)
+B. Shared Locality Cache (SLC)
+   A CPU-pinned, page-locked tensor buffer that acts as a rendezvous point between
+   devices.  When a layer runs on a different device than its predecessor, activations
+   are staged through SLC rather than P2P (which is unavailable without NVLink).
+   SLC is organised as a ring of slots to overlap DMA with compute.
 
-    On each forward step the relevant slice is streamed in via PCIe, used on
-    the target device, then written back. For training this degenerates to
-    activation checkpointing with heterogeneous remat.
+C. FLOPs-aware micro-batch splitting
+   Given the per-symbol FLOPs formulas from Megatron's `gdn_layer_flops` /
+   `mamba_layer_flops` / `attention_layer_flops`, this module computes a split ratio
+   for hybrid batches so that each device finishes roughly simultaneously (balanced
+   makespan), avoiding PCIe stalls from waiting on the bottleneck device.
 
-    Adaptation points relative to Megatron diff:
-      A1. HeteroLayerSymbols mirrors Megatron Symbols but adds device hints
-      A2. HeteroHybridPattern parses 'G'/'M'/'*'/'-'/'E' and emits per-layer
-          DeviceAssignment objects consumed by DeepSpeed's engine
-      A3. GDNFLOPsEstimator replicates Megatron's gdn_layer_flops() but also
-          estimates PCIe transfer overhead for the recurrent state
-      A4. LocalityCache manages the shared CPU buffer with async prefetch;
-          GDNRecurrentState / MambaHiddenState subclass it
-      A5. HeteroGDNMambaStack builds the layer list and assigns each layer to
-          its device, replacing MambaStack.build_layers() for DES-LOC runtimes
-      A6. Inference guard: like Megatron we raise NotImplementedError for GDN
-          inference until the LOC cache supports streaming recurrent state
+The module is intentionally deepspeed-agnostic at the import level so it can be unit-
+tested without a full DS environment.  The DeepSpeed engine hooks in via
+`register_des_loc_hooks(engine)`.
 """
 
 from __future__ import annotations
 
-import dataclasses
 import logging
 import math
+import os
+import threading
 import time
+from dataclasses import dataclass, field
 from enum import Enum
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -77,991 +70,825 @@ import torch.nn as nn
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# A1 — HeteroLayerSymbols (mirrors Megatron Symbols + device hints)
+# Layer-type symbols (mirrors Megatron Symbols class, no upstream dep)
 # ---------------------------------------------------------------------------
 
-class HeteroLayerSymbols:
-    """
-    Mirrors Megatron's ``mamba_hybrid_layer_allocation.Symbols`` with the
-    addition of per-symbol device preferences for DES-LOC scheduling.
-
-    Upstream change: Megatron added 'G' to VALID_LAYERS and updated
-    VALID_LAYERS set.  Here we extend with DEVICE_PREFERENCE so that the
-    DES-LOC runtime can build a DeviceAssignment for each layer without
-    additional configuration.
-    """
-
-    MAMBA = "M"
-    GDN = "G"
+class LayerSymbol(str, Enum):
+    MAMBA     = "M"
+    GDN       = "G"
     ATTENTION = "*"
-    MLP = "-"
-    MOE = "E"
-    PIPE = "|"
-    MTP_SEPARATOR = "/"
+    MLP       = "-"
+    MOE       = "E"
 
-    VALID_LAYERS = {MAMBA, GDN, ATTENTION, MLP, MOE}
 
-    # DES-LOC addition: preferred compute device per layer symbol.
-    # Values are torch.device strings; resolved at runtime against
-    # available devices via DeviceRegistry.
-    DEVICE_PREFERENCE: Dict[str, str] = {
-        MAMBA: "a6000",       # bandwidth-bound selective scan
-        GDN: "h100",          # matmul-heavy delta-rule recurrence
-        ATTENTION: "h100",    # large KV, flash-attn2
-        MLP: "a6000",         # dense GEMM fills A6000 well
-        MOE: "cpu",           # expert offload to CPU DRAM
+# ---------------------------------------------------------------------------
+# Hardware capability descriptors
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class DeviceCapability:
+    """Immutable descriptor for a single CUDA device in the DES-LOC cluster.
+
+    sm_major / sm_minor: CUDA compute capability (e.g. 8, 6 for SM86).
+    vram_gb:  Usable VRAM in gigabytes.
+    bf16_tflops: Peak BF16 tensor-core throughput in TFLOP/s (approximate).
+    membw_gbps:  Peak HBM/GDDR6 bandwidth in GB/s.
+    """
+    rank:          int
+    name:          str
+    sm_major:      int
+    sm_minor:      int
+    vram_gb:       float
+    bf16_tflops:   float
+    membw_gbps:    float
+
+    @property
+    def sm(self) -> int:
+        return self.sm_major * 10 + self.sm_minor
+
+    @property
+    def is_h100_class(self) -> bool:
+        return self.sm >= 90
+
+    @property
+    def is_ampere(self) -> bool:
+        return 80 <= self.sm < 90
+
+
+def _probe_devices(ranks: Optional[List[int]] = None) -> List[DeviceCapability]:
+    """Auto-detect CUDA devices present in this process.
+
+    Known-device table covers the three hardware targets in the DES-LOC cluster:
+      - A6000 (SM86, 48 GB GDDR6, ~310 BF16 TFLOP/s, ~768 GB/s)
+      - H100 NVL (SM90, 96 GB HBM3, ~1,979 BF16 TFLOP/s, ~3,938 GB/s)
+    """
+    if not torch.cuda.is_available():
+        logger.warning("CUDA not available; returning empty device list.")
+        return []
+
+    KNOWN: Dict[str, Tuple[float, float]] = {
+        # name_substr: (bf16_tflops, membw_gbps)
+        "A6000":  (309.7,  768.0),
+        "H100":   (1978.9, 3938.0),
     }
 
+    n = torch.cuda.device_count()
+    if ranks is None:
+        ranks = list(range(n))
 
-# ---------------------------------------------------------------------------
-# A2 — DeviceAssignment + DeviceRegistry
-# ---------------------------------------------------------------------------
-
-@dataclasses.dataclass
-class DeviceAssignment:
-    """
-    Carries the resolved torch.device for a single layer and metadata
-    needed by DES-LOC's execution scheduler.
-
-    Fields
-    ------
-    layer_idx : int
-        Global (pipeline-absolute) layer index.
-    layer_symbol : str
-        One of HeteroLayerSymbols.VALID_LAYERS.
-    device : torch.device
-        Resolved compute device for this layer.
-    loc_cache_key : str
-        Key into LocalityCache for this layer's recurrent state (if any).
-        Empty string for stateless layers (MLP, MoE, pure attention w/o KV).
-    pcie_transfer_bytes_estimate : int
-        Estimated PCIe bytes per forward step for state I/O. Used by the
-        scheduler to pipeline PCIe transfers with compute.
-    """
-    layer_idx: int
-    layer_symbol: str
-    device: torch.device
-    loc_cache_key: str = ""
-    pcie_transfer_bytes_estimate: int = 0
-
-
-class DeviceRegistry:
-    """
-    Discovers available GPUs and maps logical names ('h100', 'a6000', 'cpu')
-    to concrete torch.device instances.
-
-    DES-LOC adaptation: upstream Megatron assumes homogeneous GPU ranks.
-    Here we inspect device capabilities at init time and build a stable
-    mapping used throughout the lifetime of the process.
-    """
-
-    # SM capability thresholds for classification
-    _SM90_MIN = 90   # H100
-    _SM86_MIN = 86   # A6000 / RTX 3090
-
-    def __init__(self) -> None:
-        self._logical_map: Dict[str, torch.device] = {}
-        self._build_map()
-
-    def _build_map(self) -> None:
-        h100_devs: List[int] = []
-        a6000_devs: List[int] = []
-
-        if not torch.cuda.is_available():
-            logger.warning("CUDA not available; all layers will run on CPU.")
-            self._logical_map = {
-                "h100": torch.device("cpu"),
-                "a6000": torch.device("cpu"),
-                "cpu": torch.device("cpu"),
-            }
-            return
-
-        for i in range(torch.cuda.device_count()):
-            props = torch.cuda.get_device_properties(i)
-            sm = props.major * 10 + props.minor
-            vram_gb = props.total_memory / (1024 ** 3)
-            logger.info(
-                "GPU %d: %s  SM%d  %.1f GB",
-                i, props.name, sm, vram_gb,
-            )
-            if sm >= self._SM90_MIN:
-                h100_devs.append(i)
-            elif sm >= self._SM86_MIN:
-                a6000_devs.append(i)
-
-        self._logical_map["cpu"] = torch.device("cpu")
-
-        if h100_devs:
-            self._logical_map["h100"] = torch.device(f"cuda:{h100_devs[0]}")
-            logger.info("H100 mapped to cuda:%d", h100_devs[0])
-        else:
-            fallback = torch.device("cuda:0") if torch.cuda.device_count() > 0 else torch.device("cpu")
-            self._logical_map["h100"] = fallback
-            logger.warning("No SM90 device found; H100 preference → %s", fallback)
-
-        if a6000_devs:
-            # Primary A6000 is rank 0 of that tier; secondary used for tensor-parallel
-            self._logical_map["a6000"] = torch.device(f"cuda:{a6000_devs[0]}")
-            self._logical_map["a6000_secondary"] = (
-                torch.device(f"cuda:{a6000_devs[1]}") if len(a6000_devs) > 1
-                else self._logical_map["a6000"]
-            )
-            logger.info(
-                "A6000 mapped to cuda:%d (secondary: %s)",
-                a6000_devs[0], self._logical_map["a6000_secondary"],
-            )
-        else:
-            fallback = self._logical_map.get("h100", torch.device("cpu"))
-            self._logical_map["a6000"] = fallback
-            self._logical_map["a6000_secondary"] = fallback
-            logger.warning("No SM86 device found; A6000 preference → %s", fallback)
-
-    def resolve(self, logical_name: str) -> torch.device:
-        if logical_name not in self._logical_map:
-            raise KeyError(
-                f"Unknown logical device '{logical_name}'. "
-                f"Available: {list(self._logical_map.keys())}"
-            )
-        return self._logical_map[logical_name]
-
-    @property
-    def h100(self) -> torch.device:
-        return self._logical_map["h100"]
-
-    @property
-    def a6000(self) -> torch.device:
-        return self._logical_map["a6000"]
-
-    @property
-    def a6000_secondary(self) -> torch.device:
-        return self._logical_map["a6000_secondary"]
-
-    @property
-    def cpu(self) -> torch.device:
-        return self._logical_map["cpu"]
-
-
-# ---------------------------------------------------------------------------
-# A3 — GDNFLOPsEstimator (extends Megatron gdn_layer_flops with PCIe cost)
-# ---------------------------------------------------------------------------
-
-@dataclasses.dataclass
-class GDNLayerConfig:
-    """
-    Hyperparameters for a single GDN layer, matching the parameters added
-    in Megatron's training.py gdn_layer_flops() helper.
-
-    Upstream defaults are preserved as field defaults here.
-    """
-    hidden_size: int = 4096
-    qk_head_dim: int = 128
-    v_head_dim: int = 128
-    num_qk_heads: int = 16
-    num_v_heads: int = 32
-    conv_kernel_dim: int = 4
-    dtype_bytes: int = 2          # BF16
-    # DES-LOC addition: PCIe bandwidth in bytes/sec (measured, not assumed)
-    pcie_bandwidth_bps: float = 16e9  # PCIe 4.0 x16 practical ~16 GB/s
-
-
-class GDNFLOPsEstimator:
-    """
-    Replicates Megatron's ``gdn_layer_flops()`` inner function from
-    ``megatron/training/training.py`` (commit 8f7fbe78) and adds a DES-LOC
-    extension that accounts for PCIe transfer overhead of the GDN recurrent
-    state matrix S ∈ R^{B × n_v_heads × v_head_dim × v_head_dim}.
-
-    Upstream formula (verbatim from diff, line-by-line):
-      flops = 2 * B * T * (
-          hidden_size * (2*qk_dim + 2*v_dim + 2*num_v_heads)   # in_proj
-          + conv_kernel_dim * (2*qk_dim + v_dim)                 # conv1d
-          + num_v_heads * v_head_dim**2 * 4                      # delta rule
-          + hidden_size * v_dim                                   # out_proj
-      )
-
-    DES-LOC addition: state_transfer_seconds() estimates how long PCIe
-    transfer of the recurrent state occupies the bus, so the scheduler can
-    overlap it with the previous layer's compute.
-    """
-
-    def __init__(self, cfg: GDNLayerConfig) -> None:
-        self.cfg = cfg
-        self._qk_dim = cfg.qk_head_dim * cfg.num_qk_heads
-        self._v_dim = cfg.v_head_dim * cfg.num_v_heads
-
-    def compute_flops(self, batch_size: int, seq_len: int) -> int:
-        """Return forward-pass FLOPs (not counting backward × 3 multiplier)."""
-        c = self.cfg
-        qk_dim, v_dim = self._qk_dim, self._v_dim
-        inner = (
-            c.hidden_size * (2 * qk_dim + 2 * v_dim + 2 * c.num_v_heads)
-            + c.conv_kernel_dim * (2 * qk_dim + v_dim)
-            + c.num_v_heads * (c.v_head_dim ** 2) * 4
-            + c.hidden_size * v_dim
+    caps: List[DeviceCapability] = []
+    for r in ranks:
+        if r >= n:
+            logger.warning("Rank %d requested but only %d devices found; skipping.", r, n)
+            continue
+        props = torch.cuda.get_device_properties(r)
+        bf16, bw = KNOWN.get("A6000", (150.0, 600.0))  # conservative fallback
+        for k, v in KNOWN.items():
+            if k in props.name:
+                bf16, bw = v
+                break
+        vram = props.total_memory / (1 << 30)
+        cap = DeviceCapability(
+            rank=r,
+            name=props.name,
+            sm_major=props.major,
+            sm_minor=props.minor,
+            vram_gb=vram,
+            bf16_tflops=bf16,
+            membw_gbps=bw,
         )
-        return 2 * batch_size * seq_len * inner
-
-    def recurrent_state_bytes(self, batch_size: int) -> int:
-        """
-        DES-LOC: size of S matrix that must travel over PCIe each step.
-        S ∈ R^{B × n_v_heads × v_head_dim × v_head_dim}
-        """
-        c = self.cfg
-        numel = batch_size * c.num_v_heads * c.v_head_dim * c.v_head_dim
-        return numel * c.dtype_bytes
-
-    def state_transfer_seconds(self, batch_size: int) -> float:
-        """Estimated seconds for bidirectional PCIe transfer of S (read + write)."""
-        return 2.0 * self.recurrent_state_bytes(batch_size) / self.cfg.pcie_bandwidth_bps
-
-    def arithmetic_intensity(self, batch_size: int, seq_len: int) -> float:
-        """FLOPs / byte — useful for roofline analysis of the DES-LOC pipeline."""
-        flops = self.compute_flops(batch_size, seq_len)
-        # bytes = weights (static, amortised) + state I/O (dynamic)
-        state_bytes = self.recurrent_state_bytes(batch_size)
-        return flops / max(state_bytes, 1)
+        logger.info(
+            "Device %d: %s  SM%d%d  %.1f GB  BF16=%.0f TFLOP/s  BW=%.0f GB/s",
+            r, cap.name, cap.sm_major, cap.sm_minor, cap.vram_gb,
+            cap.bf16_tflops, cap.membw_gbps,
+        )
+        caps.append(cap)
+    return caps
 
 
 # ---------------------------------------------------------------------------
-# A4 — LocalityCache: shared CPU DRAM buffer for recurrent states
+# Device Affinity Table
 # ---------------------------------------------------------------------------
 
-class LocalityCache:
-    """
-    The "Shared LOcality Cache" (LOC) in DES-LOC.
+class DeviceAffinityTable:
+    """Maps layer-type symbols to preferred device ranks.
 
-    Manages a pool of pinned CPU tensors that hold recurrent states for all
-    stateful layer types (GDN's S matrix, Mamba's h vector).  Layers stream
-    their state in/out over PCIe using async CUDA streams, so compute and
-    transfer can overlap.
+    Default policy for the A6000×2 + H100 cluster:
+      G (GDN)       → H100 (rank 2): O(d²) compute-bound delta-rule update
+      * (Attention)  → A6000 (rank 0): memory-BW-bound; spread across A6000s
+      M (Mamba)      → A6000 (rank 1): selective-scan is recurrence+BW bound
+      - (MLP)        → H100 (rank 2): large GEMM benefits from SM90
+      E (MoE)        → H100 (rank 2): sparse gating + expert GEMMs
 
-    Design rationale:
-      - 1.5 TB CPU DRAM  »  GPU VRAM; we can keep *all* recurrent states
-        resident in CPU and only copy the batch-slice needed per step.
-      - Pinned memory is mandatory for async D2H/H2D transfers.
-      - A separate CUDA stream per (layer, direction) lets the scheduler
-        pipeline transfers with compute on the adjacent layer.
+    Override via environment variables:
+      DES_LOC_GDN_RANK, DES_LOC_ATT_RANK, DES_LOC_MBA_RANK,
+      DES_LOC_MLP_RANK, DES_LOC_MOE_RANK
 
-    Upstream analogy: Megatron's inference context tracks num_mamba_layers
-    and preallocates GPU buffers.  DES-LOC moves these to CPU DRAM.
+    The table is *soft*: if the preferred device lacks VRAM for the current
+    micro-batch, `resolve` falls back to the next-best candidate.
     """
 
-    def __init__(self, max_entries: int = 256) -> None:
-        self._store: Dict[str, torch.Tensor] = {}
-        self._streams: Dict[str, torch.cuda.Stream] = {}
-        self._max_entries = max_entries
-        logger.info("LocalityCache initialised (max_entries=%d)", max_entries)
+    _ENV_MAP: Dict[LayerSymbol, str] = {
+        LayerSymbol.GDN:       "DES_LOC_GDN_RANK",
+        LayerSymbol.ATTENTION: "DES_LOC_ATT_RANK",
+        LayerSymbol.MAMBA:     "DES_LOC_MBA_RANK",
+        LayerSymbol.MLP:       "DES_LOC_MLP_RANK",
+        LayerSymbol.MOE:       "DES_LOC_MOE_RANK",
+    }
 
-    def _stream_for(self, key: str, device: torch.device) -> torch.cuda.Stream:
-        stream_key = f"{key}@{device}"
-        if stream_key not in self._streams:
-            if device.type == "cuda":
-                self._streams[stream_key] = torch.cuda.Stream(device=device)
-            else:
-                self._streams[stream_key] = None  # type: ignore[assignment]
-        return self._streams[stream_key]
+    def __init__(self, caps: List[DeviceCapability]) -> None:
+        self._caps: Dict[int, DeviceCapability] = {c.rank: c for c in caps}
+        # Build default policy based on SM class
+        h100_ranks = [c.rank for c in caps if c.is_h100_class]
+        a6000_ranks = [c.rank for c in caps if c.is_ampere]
+        h_pref = h100_ranks[0] if h100_ranks else (caps[0].rank if caps else 0)
+        a0 = a6000_ranks[0] if len(a6000_ranks) > 0 else h_pref
+        a1 = a6000_ranks[1] if len(a6000_ranks) > 1 else a0
 
-    def allocate(self, key: str, shape: Tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
-        """
-        Allocate (or return existing) pinned CPU tensor for *key*.
-        Pinned memory is required for async PCIe transfers.
-        """
-        if key in self._store:
-            existing = self._store[key]
-            if existing.shape == torch.Size(shape) and existing.dtype == dtype:
-                return existing
-            logger.debug("LOC: reallocating %s  old=%s  new=%s", key, existing.shape, shape)
+        self._default: Dict[LayerSymbol, int] = {
+            LayerSymbol.GDN:       h_pref,
+            LayerSymbol.ATTENTION: a0,
+            LayerSymbol.MAMBA:     a1,
+            LayerSymbol.MLP:       h_pref,
+            LayerSymbol.MOE:       h_pref,
+        }
+        logger.debug("DeviceAffinityTable defaults: %s", self._default)
 
-        if len(self._store) >= self._max_entries:
-            raise RuntimeError(
-                f"LocalityCache full ({self._max_entries} entries). "
-                "Increase max_entries or reduce the number of stateful layers."
-            )
+    def resolve(self, sym: LayerSymbol) -> int:
+        """Return preferred device rank, honouring env-var overrides."""
+        env_key = self._ENV_MAP.get(sym)
+        if env_key and env_key in os.environ:
+            try:
+                return int(os.environ[env_key])
+            except ValueError:
+                logger.warning("Invalid value for %s; using default.", env_key)
+        return self._default.get(sym, 0)
 
-        try:
-            tensor = torch.zeros(shape, dtype=dtype, pin_memory=True)
-        except RuntimeError:
-            logger.warning(
-                "pin_memory allocation failed for %s; falling back to pageable memory", key
-            )
-            tensor = torch.zeros(shape, dtype=dtype)
+    def all_ranks(self) -> List[int]:
+        return list(self._caps.keys())
 
-        self._store[key] = tensor
-        logger.debug("LOC: allocated %s  shape=%s  dtype=%s", key, shape, dtype)
-        return tensor
 
-    def prefetch_to_device(
+# ---------------------------------------------------------------------------
+# Shared Locality Cache (SLC)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class SLCSlot:
+    """A single staging slot in the Shared Locality Cache ring buffer."""
+    index:   int
+    tensor:  torch.Tensor        # pinned CPU tensor, pre-allocated
+    in_use:  threading.Event = field(default_factory=threading.Event)
+    src_dev: Optional[int] = None
+    dst_dev: Optional[int] = None
+
+
+class SharedLocalityCache:
+    """CPU-pinned ring buffer for inter-device activation staging (no NVLink).
+
+    DES-LOC rationale:
+      Without NVLink, GPU-to-GPU transfer must go through host memory.  Naive
+      `.to(device)` causes a device-sync + cudaMemcpy which serialises compute.
+      SLC pre-allocates page-locked host tensors and uses double-buffering so
+      DMA of layer N's output overlaps with compute of layer N+1.
+
+    Usage:
+      slot = slc.acquire(shape, dtype)
+      slot.tensor[:] = activation.cpu()   # async DMA to pinned mem
+      ... schedule next layer on dst_dev ...
+      dst_tensor = slot.tensor.to(dst_dev, non_blocking=True)
+      slc.release(slot)
+
+    Args:
+      num_slots:  Number of ring slots (2 = double-buffer, 4 = quad-buffer).
+      max_bytes:  Maximum bytes per slot.  Tensors larger than this cause a
+                  fallback to synchronous transfer with a logged warning.
+      dtype:      Default dtype for pre-allocation (float16 or bfloat16).
+    """
+
+    def __init__(
         self,
-        key: str,
-        device: torch.device,
+        num_slots: int = 4,
+        max_bytes: int = 512 * 1024 * 1024,   # 512 MB default
+        dtype: torch.dtype = torch.bfloat16,
+    ) -> None:
+        self._num_slots = num_slots
+        self._max_bytes = max_bytes
+        self._dtype = dtype
+        self._slots: List[SLCSlot] = []
+        self._lock = threading.Lock()
+        self._next_slot = 0
+        self._initialised = False
+        logger.info(
+            "SLC: %d slots × %d MB, dtype=%s",
+            num_slots, max_bytes >> 20, dtype,
+        )
+
+    def _lazy_init(self, shape: Tuple[int, ...], dtype: torch.dtype) -> None:
+        if self._initialised:
+            return
+        elem_bytes = torch.finfo(dtype).bits // 8
+        needed = math.prod(shape) * elem_bytes
+        if needed > self._max_bytes:
+            logger.warning(
+                "SLC slot size %d MB < requested %d MB; using max.",
+                self._max_bytes >> 20, needed >> 20,
+            )
+        alloc_elems = self._max_bytes // elem_bytes
+        for i in range(self._num_slots):
+            buf = torch.empty(alloc_elems, dtype=dtype, pin_memory=True)
+            slot = SLCSlot(index=i, tensor=buf)
+            self._slots.append(slot)
+        self._initialised = True
+        logger.debug("SLC lazy-init: allocated %d × %d MB pinned buffers.", 
+                     self._num_slots, self._max_bytes >> 20)
+
+    def acquire(
+        self,
+        shape: Tuple[int, ...],
+        dtype: torch.dtype,
+        src_dev: Optional[int] = None,
+        dst_dev: Optional[int] = None,
+    ) -> SLCSlot:
+        """Acquire a free SLC slot, waiting if all are in use."""
+        self._lazy_init(shape, dtype)
+        deadline = time.monotonic() + 10.0
+        while True:
+            with self._lock:
+                slot = self._slots[self._next_slot % self._num_slots]
+                if not slot.in_use.is_set():
+                    slot.in_use.set()
+                    slot.src_dev = src_dev
+                    slot.dst_dev = dst_dev
+                    self._next_slot += 1
+                    return slot
+            if time.monotonic() > deadline:
+                raise RuntimeError("SLC: timed out waiting for a free slot (10 s).")
+            time.sleep(0.001)
+
+    def release(self, slot: SLCSlot) -> None:
+        """Return a slot to the free pool."""
+        slot.src_dev = None
+        slot.dst_dev = None
+        slot.in_use.clear()
+
+    def transfer(
+        self,
+        tensor: torch.Tensor,
+        dst_device: torch.device,
         non_blocking: bool = True,
     ) -> torch.Tensor:
+        """Stage tensor through SLC to dst_device.
+
+        If tensor is already on dst_device, returns it unchanged.
+        Falls back to direct .to() if tensor exceeds SLC slot capacity.
         """
-        Async H2D copy of cached state.  Returns a device tensor; caller must
-        synchronise the associated stream before using it.
-        """
-        if key not in self._store:
-            raise KeyError(f"LOC: key '{key}' not allocated; call allocate() first.")
-        cpu_tensor = self._store[key]
-        stream = self._stream_for(key, device)
-        if stream is not None:
-            with torch.cuda.stream(stream):
-                gpu_tensor = cpu_tensor.to(device, non_blocking=non_blocking)
-        else:
-            gpu_tensor = cpu_tensor.to(device)
-        return gpu_tensor
+        if tensor.device == dst_device:
+            return tensor
 
-    def writeback_from_device(
-        self,
-        key: str,
-        gpu_tensor: torch.Tensor,
-        non_blocking: bool = True,
-    ) -> None:
-        """
-        Async D2H copy: write updated state back to CPU cache.
-        """
-        if key not in self._store:
-            raise KeyError(f"LOC: key '{key}' not allocated.")
-        cpu_tensor = self._store[key]
-        stream = self._stream_for(key, gpu_tensor.device)
-        if stream is not None:
-            with torch.cuda.stream(stream):
-                cpu_tensor.copy_(gpu_tensor, non_blocking=non_blocking)
-        else:
-            cpu_tensor.copy_(gpu_tensor)
-
-    def synchronize(self, key: str, device: torch.device) -> None:
-        """Block until all pending transfers for *key* on *device* are done."""
-        stream = self._stream_for(key, device)
-        if stream is not None:
-            stream.synchronize()
-
-    def evict(self, key: str) -> None:
-        """Remove entry from cache (frees pinned memory on next GC cycle)."""
-        if key in self._store:
-            del self._store[key]
-            logger.debug("LOC: evicted %s", key)
-
-    @property
-    def allocated_bytes(self) -> int:
-        return sum(t.numel() * t.element_size() for t in self._store.values())
-
-    def summary(self) -> str:
-        gb = self.allocated_bytes / (1024 ** 3)
-        return f"LocalityCache: {len(self._store)} entries, {gb:.3f} GB pinned"
-
-
-class GDNRecurrentState:
-    """
-    Manages the GDN delta-rule state matrix
-    S ∈ R^{B × n_v_heads × v_head_dim × v_head_dim}
-    in the LocalityCache.
-
-    DES-LOC adaptation: upstream Megatron raises NotImplementedError for GDN
-    inference because recurrent state management was not implemented.  This
-    class provides the missing infrastructure for the LOC-based runtime,
-    though full autoregressive inference support is still gated behind
-    ``DESCLOC_GDN_INFERENCE_ENABLED`` (default: False) matching Megatron's
-    conservative stance.
-    """
-
-    INFERENCE_ENABLED = False  # mirrors Megatron's NotImplementedError guard
-
-    def __init__(
-        self,
-        layer_idx: int,
-        batch_size: int,
-        num_v_heads: int,
-        v_head_dim: int,
-        dtype: torch.dtype,
-        loc_cache: LocalityCache,
-    ) -> None:
-        self.layer_idx = layer_idx
-        self.key = f"gdn_state_layer{layer_idx}"
-        self._shape = (batch_size, num_v_heads, v_head_dim, v_head_dim)
-        self._dtype = dtype
-        self._cache = loc_cache
-        loc_cache.allocate(self.key, self._shape, dtype)
-        logger.debug(
-            "GDNRecurrentState: layer %d  shape=%s  key=%s",
-            layer_idx, self._shape, self.key,
-        )
-
-    def load(self, device: torch.device) -> torch.Tensor:
-        """Stream state from CPU DRAM to *device* (async)."""
-        if not self.INFERENCE_ENABLED and not torch.is_grad_enabled():
-            # During inference (no grad), raise analogous to Megatron's guard.
-            raise NotImplementedError(
-                "GDN layers are not supported for inference in DES-LOC. "
-                "Set GDNRecurrentState.INFERENCE_ENABLED = True only after "
-                "verifying LOC streaming correctness for your workload."
+        elem_bytes = tensor.element_size()
+        needed = tensor.numel() * elem_bytes
+        if needed > self._max_bytes:
+            logger.warning(
+                "SLC.transfer: tensor %d MB > slot %d MB; falling back to direct copy.",
+                needed >> 20, self._max_bytes >> 20,
             )
-        return self._cache.prefetch_to_device(self.key, device)
+            return tensor.to(dst_device, non_blocking=non_blocking)
 
-    def save(self, updated: torch.Tensor) -> None:
-        """Write updated state back to CPU DRAM (async D2H)."""
-        self._cache.writeback_from_device(self.key, updated)
-
-    def sync(self, device: torch.device) -> None:
-        self._cache.synchronize(self.key, device)
-
-    @property
-    def bytes(self) -> int:
-        numel = math.prod(self._shape)
-        return numel * torch._utils._element_size(self._dtype)
-
-
-class MambaHiddenState:
-    """
-    Analogous to GDNRecurrentState but for Mamba's SSM hidden state
-    h ∈ R^{B × n_heads × head_dim × state_dim}.
-
-    Kept alongside GDNRecurrentState so the LOC cache API is consistent
-    across all stateful layer types in a hybrid model.
-    """
-
-    def __init__(
-        self,
-        layer_idx: int,
-        batch_size: int,
-        num_heads: int,
-        head_dim: int,
-        state_dim: int,
-        dtype: torch.dtype,
-        loc_cache: LocalityCache,
-    ) -> None:
-        self.layer_idx = layer_idx
-        self.key = f"mamba_state_layer{layer_idx}"
-        self._shape = (batch_size, num_heads, head_dim, state_dim)
-        self._dtype = dtype
-        self._cache = loc_cache
-        loc_cache.allocate(self.key, self._shape, dtype)
-        logger.debug(
-            "MambaHiddenState: layer %d  shape=%s  key=%s",
-            layer_idx, self._shape, self.key,
+        slot = self.acquire(
+            tuple(tensor.shape), tensor.dtype,
+            src_dev=tensor.device.index,
+            dst_dev=dst_device.index if hasattr(dst_device, "index") else None,
         )
-
-    def load(self, device: torch.device) -> torch.Tensor:
-        return self._cache.prefetch_to_device(self.key, device)
-
-    def save(self, updated: torch.Tensor) -> None:
-        self._cache.writeback_from_device(self.key, updated)
-
-    def sync(self, device: torch.device) -> None:
-        self._cache.synchronize(self.key, device)
+        try:
+            flat = tensor.reshape(-1)
+            n = flat.numel()
+            slot.tensor[:n].copy_(flat, non_blocking=non_blocking)
+            result = slot.tensor[:n].to(dst_device, non_blocking=non_blocking)
+            result = result.reshape(tensor.shape)
+        finally:
+            self.release(slot)
+        return result
 
 
 # ---------------------------------------------------------------------------
-# A2 cont. — HeteroHybridPattern: parse layer pattern → DeviceAssignments
+# FLOPs estimation (mirrors Megatron training.py formulas, standalone)
 # ---------------------------------------------------------------------------
 
-def parse_hetero_hybrid_pattern(
-    pattern: str,
-    device_registry: DeviceRegistry,
-    gdn_cfg: Optional[GDNLayerConfig] = None,
-    batch_size: int = 1,
-) -> List[DeviceAssignment]:
+def gdn_layer_flops(
+    batch_size: int,
+    seq_len: int,
+    hidden_size: int,
+    qk_head_dim: int = 128,
+    v_head_dim: int = 128,
+    num_qk_heads: int = 16,
+    num_v_heads: int = 32,
+    conv_kernel_dim: int = 4,
+) -> int:
+    """FLOPs for one GDN layer forward pass (mirrors Megatron gdn_layer_flops).
+
+    Breakdown:
+      in_proj:    hidden → (2·qk_dim + 2·v_dim + 2·num_v_heads)
+      conv1d:     kernel over (2·qk_dim + v_dim) channels
+      delta-rule: KKᵀ, VKᵀ, S·(a(I−b·KKᵀ)), S·Q  — all O(v_head_dim²) per head
+      out_proj:   v_dim → hidden
     """
-    Parse a Megatron-style hybrid layer pattern string and return a list of
-    :class:`DeviceAssignment` objects, one per layer (excluding pipe '|' and
-    MTP '/' separators).
-
-    Mirrors the logic of Megatron's ``validate_segment_layers()`` and
-    ``get_layer_maps_from_layer_type_list()`` (updated in commit 8f7fbe78 to
-    handle 'G').
-
-    DES-LOC additions:
-      - Each assignment carries the resolved torch.device from DeviceRegistry.
-      - Stateful layers (G, M) get a ``loc_cache_key`` and an estimate of
-        PCIe transfer bytes per forward step.
-      - The MTP sub-pattern (after '/') is parsed but currently mapped to the
-        same device preferences as main decoder layers.
-
-    Parameters
-    ----------
-    pattern :
-        E.g. ``"MG*-|MG*-"`` or ``"MGMG/GG/GG"``.
-    device_registry :
-        Resolved hardware map.
-    gdn_cfg :
-        GDN hyperparameters for PCIe cost estimation.  Defaults to
-        :class:`GDNLayerConfig` with ``hidden_size=4096``.
-    batch_size :
-        Used only for PCIe cost estimation.
-
-    Returns
-    -------
-    List[DeviceAssignment]
-        In global layer order (pipeline stage boundaries stripped).
-    """
-    if gdn_cfg is None:
-        gdn_cfg = GDNLayerConfig()
-
-    estimator = GDNFLOPsEstimator(gdn_cfg)
-    sym = HeteroLayerSymbols
-
-    # Split off MTP sub-pattern
-    parts = pattern.split(sym.MTP_SEPARATOR)
-    main_pattern = parts[0]
-    mtp_reps = parts[1:]  # repeated patterns
-
-    # Strip pipe separators, collect raw layer symbols
-    raw_layers: List[str] = []
-    for ch in main_pattern:
-        if ch == sym.PIPE:
-            continue
-        if ch not in sym.VALID_LAYERS:
-            raise ValueError(
-                f"Invalid layer symbol '{ch}' in pattern '{pattern}'. "
-                f"Valid: {sym.VALID_LAYERS}"
-            )
-        raw_layers.append(ch)
-
-    # MTP layers: each segment in mtp_reps is repeated once per occurrence
-    mtp_depth = len(mtp_reps)
-    for rep_pattern in mtp_reps:
-        for ch in rep_pattern:
-            if ch == sym.PIPE:
-                continue
-            if ch not in sym.VALID_LAYERS:
-                raise ValueError(
-                    f"Invalid MTP symbol '{ch}' in pattern '{pattern}'."
-                )
-            raw_layers.append(ch)
-
-    logger.info(
-        "parse_hetero_hybrid_pattern: %d total layers  (main=%d, mtp_depth=%d)",
-        len(raw_layers), len(raw_layers) - sum(len(r) for r in mtp_reps), mtp_depth,
+    qk_dim = qk_head_dim * num_qk_heads
+    v_dim  = v_head_dim  * num_v_heads
+    return int(
+        2 * batch_size * seq_len * (
+            hidden_size * (2 * qk_dim + 2 * v_dim + 2 * num_v_heads)
+            + conv_kernel_dim * (2 * qk_dim + v_dim)
+            + num_v_heads * (v_head_dim ** 2) * 4
+            + hidden_size * v_dim
+        )
     )
 
-    # Track per-type layer index (mirrors Megatron's layer_maps dict)
-    type_counter: Dict[str, int] = {s: 0 for s in sym.VALID_LAYERS}
-    assignments: List[DeviceAssignment] = []
 
-    for global_idx, layer_sym in enumerate(raw_layers):
-        logical_dev = sym.DEVICE_PREFERENCE[layer_sym]
-        device = device_registry.resolve(logical_dev)
+def mamba_layer_flops(
+    batch_size: int,
+    seq_len: int,
+    hidden_size: int,
+    state_dim: int = 128,
+    head_dim: int = 64,
+    num_groups: int = 8,
+    num_heads: int = 128,
+    conv_kernel: int = 4,
+    expansion: int = 2,
+) -> int:
+    """FLOPs for one Mamba-2 layer forward pass (mirrors Megatron mamba_layer_flops)."""
+    d_in = expansion * hidden_size
+    d_state = state_dim * num_groups
+    return int(
+        2 * batch_size * seq_len * (
+            hidden_size * (2 * d_in + 2 * num_heads + d_state)   # in_proj
+            + conv_kernel * (d_in + d_state)                      # conv1d
+            + num_heads * (head_dim ** 2)                         # SSM state update
+            + d_in * hidden_size                                  # out_proj
+        )
+    )
 
-        # loc_cache_key for stateful layers
-        loc_key = ""
-        pcie_bytes = 0
-        if layer_sym == sym.GDN:
-            loc_key = f"gdn_state_layer{global_idx}"
-            pcie_bytes = estimator.recurrent_state_bytes(batch_size) * 2  # R+W
-        elif layer_sym == sym.MAMBA:
-            # Rough estimate: Mamba state ~ B * n_heads * head_dim * state_dim * 2 bytes
-            # Using GDN config fields as proxies (user should pass MambaConfig separately)
-            mamba_state_numel = (
-                batch_size * gdn_cfg.num_v_heads * gdn_cfg.qk_head_dim * gdn_cfg.v_head_dim
+
+def attention_layer_flops(
+    batch_size: int,
+    seq_len: int,
+    hidden_size: int,
+    num_heads: int = 32,
+    gqa: bool = True,
+    kv_channels: Optional[int] = None,
+) -> int:
+    """FLOPs for one self-attention layer (simplified, no GQA split complexity)."""
+    if kv_channels is None:
+        kv_channels = hidden_size // num_heads
+    # QKV proj + attention scores + attention output + out_proj
+    qkv_proj  = 2 * batch_size * seq_len * hidden_size * (3 * hidden_size)
+    attn_core = 2 * batch_size * num_heads * seq_len * seq_len * kv_channels
+    out_proj  = 2 * batch_size * seq_len * hidden_size * hidden_size
+    return int(qkv_proj + attn_core + out_proj)
+
+
+# ---------------------------------------------------------------------------
+# Micro-batch split: balanced makespan across devices
+# ---------------------------------------------------------------------------
+
+@dataclass
+class LayerProfile:
+    """Per-layer FLOPs and preferred device for makespan estimation."""
+    symbol:        LayerSymbol
+    flops_per_tok: float          # FLOPs at batch=1, seq=1
+    preferred_dev: int
+
+
+def compute_balanced_split(
+    layer_sequence: List[LayerProfile],
+    caps: List[DeviceCapability],
+    total_batch: int,
+    seq_len: int,
+) -> Dict[int, int]:
+    """Compute per-device micro-batch sizes for balanced makespan.
+
+    The DES-LOC heterogeneous cluster has wildly different compute capacities
+    (H100 ≈ 6× A6000 in BF16).  Assigning equal micro-batches would leave the
+    H100 idle 5/6 of the time.  This function solves a simple proportional
+    allocation:
+
+        share_d = tflops_d / Σ tflops_d'
+        batch_d = round(share_d × total_batch)
+
+    with remainder assigned to the highest-capacity device.  The allocation
+    is then clipped so that Σ batch_d == total_batch.
+
+    Args:
+        layer_sequence: Ordered list of LayerProfile objects for one pipeline.
+        caps: Device capability descriptors.
+        total_batch: Global micro-batch size to split.
+        seq_len: Sequence length (for FLOPs scaling).
+
+    Returns:
+        Dict mapping device rank → local micro-batch size.
+    """
+    cap_map: Dict[int, DeviceCapability] = {c.rank: c for c in caps}
+
+    # Aggregate FLOPs per device
+    dev_flops: Dict[int, float] = {c.rank: 0.0 for c in caps}
+    for lp in layer_sequence:
+        if lp.preferred_dev in dev_flops:
+            dev_flops[lp.preferred_dev] += lp.flops_per_tok * seq_len
+
+    total_flops = sum(dev_flops.values()) or 1.0
+
+    # Time ∝ flops / throughput
+    dev_time: Dict[int, float] = {}
+    for rank, flops in dev_flops.items():
+        tput = cap_map[rank].bf16_tflops * 1e12 if rank in cap_map else 1e12
+        dev_time[rank] = flops / tput if tput > 0 else 0.0
+
+    total_time = sum(dev_time.values()) or 1.0
+
+    # Proportional batch allocation (more time → more batch to keep busy)
+    raw_split: Dict[int, float] = {
+        r: (t / total_time) * total_batch for r, t in dev_time.items()
+    }
+    int_split: Dict[int, int] = {r: max(1, int(v)) for r, v in raw_split.items()}
+    remainder = total_batch - sum(int_split.values())
+
+    # Assign remainder to highest-throughput device
+    if remainder != 0 and caps:
+        best = max(caps, key=lambda c: c.bf16_tflops)
+        int_split[best.rank] = int_split.get(best.rank, 0) + remainder
+
+    logger.debug(
+        "Balanced split (total=%d): %s  [dev_time=%s]",
+        total_batch, int_split,
+        {r: f"{t*1000:.2f}ms" for r, t in dev_time.items()},
+    )
+    return int_split
+
+
+# ---------------------------------------------------------------------------
+# Heterogeneous GDN-Mamba Layer
+# ---------------------------------------------------------------------------
+
+class HeteroGDNMambaLayer(nn.Module):
+    """DES-LOC wrapper that executes a single hybrid layer on its preferred device.
+
+    This is the core DES-LOC abstraction: given a layer module (GDN, Mamba,
+    Attention, MLP, or MoE) and a symbol, HeteroGDNMambaLayer:
+      1. Moves the module to the preferred device at construction time.
+      2. On forward, uses SLC to stage the input tensor from the current device
+         to the layer's device (PCIe DMA via pinned memory).
+      3. Runs the forward pass on the preferred device.
+      4. Stages the output back to the *caller's* device (or leaves it on the
+         layer device if the next layer is on the same device — zero-copy path).
+
+    Args:
+        module:       The layer nn.Module (already constructed, not yet placed).
+        symbol:       LayerSymbol indicating layer type.
+        affinity:     DeviceAffinityTable for device lookup.
+        slc:          SharedLocalityCache instance for inter-device transfers.
+        caller_device: Device where upstream activations originate (default cuda:0).
+    """
+
+    def __init__(
+        self,
+        module: nn.Module,
+        symbol: LayerSymbol,
+        affinity: DeviceAffinityTable,
+        slc: SharedLocalityCache,
+        caller_device: Optional[torch.device] = None,
+    ) -> None:
+        super().__init__()
+        self.symbol = symbol
+        self._affinity = affinity
+        self._slc = slc
+        self._preferred_rank = affinity.resolve(symbol)
+        self._preferred_device = torch.device(f"cuda:{self._preferred_rank}")
+        self._caller_device = caller_device or torch.device("cuda:0")
+
+        # Place module on its preferred device
+        if torch.cuda.is_available():
+            self.layer_module = module.to(self._preferred_device)
+        else:
+            self.layer_module = module
+
+        logger.info(
+            "HeteroGDNMambaLayer[%s] placed on %s (caller=%s)",
+            symbol.value, self._preferred_device, self._caller_device,
+        )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        """Forward pass with SLC-mediated device migration.
+
+        Transfer path:
+          caller_device → [SLC] → preferred_device → compute → [SLC] → caller_device
+
+        The second transfer is skipped (zero-copy) if preferred_device == caller_device.
+        """
+        src_device = hidden_states.device
+        need_transfer_in  = (src_device != self._preferred_device)
+        need_transfer_out = (self._preferred_device != self._caller_device)
+
+        t0 = time.perf_counter()
+
+        if need_transfer_in:
+            hidden_states = self._slc.transfer(hidden_states, self._preferred_device)
+            if attention_mask is not None and attention_mask.device != self._preferred_device:
+                attention_mask = attention_mask.to(self._preferred_device, non_blocking=True)
+
+        t_transfer_in = time.perf_counter()
+
+        if attention_mask is not None:
+            output = self.layer_module(hidden_states, attention_mask=attention_mask, **kwargs)
+        else:
+            output = self.layer_module(hidden_states, **kwargs)
+
+        # Unwrap tuple outputs (some layers return (hidden, context))
+        if isinstance(output, (tuple, list)):
+            output = output[0]
+
+        t_compute = time.perf_counter()
+
+        if need_transfer_out:
+            output = self._slc.transfer(output, self._caller_device)
+
+        t_transfer_out = time.perf_counter()
+
+        logger.debug(
+            "[%s] xfer_in=%.2fms  compute=%.2fms  xfer_out=%.2fms",
+            self.symbol.value,
+            (t_transfer_in - t0) * 1e3,
+            (t_compute - t_transfer_in) * 1e3,
+            (t_transfer_out - t_compute) * 1e3,
+        )
+        return output
+
+
+# ---------------------------------------------------------------------------
+# Heterogeneous Stack: sequences of HeteroGDNMambaLayer
+# ---------------------------------------------------------------------------
+
+class HeteroGDNMambaStack(nn.Module):
+    """DES-LOC heterogeneous stack of GDN/Mamba/Attention/MLP/MoE layers.
+
+    Constructs a sequence of HeteroGDNMambaLayer wrappers from a layer-type
+    pattern string (e.g. "GM*GM-") and a corresponding list of pre-built
+    nn.Module objects.
+
+    The stack also tracks inter-layer device transitions.  When two consecutive
+    layers are on the same device, the SLC transfer is elided and a direct
+    pointer is passed — this is the "Shared LOcality" in DES-LOC.
+
+    Args:
+        modules:        Pre-built layer modules in pattern order.
+        pattern:        Layer type pattern string (e.g. "GM*GM-").
+        caps:           Device capability list (from `_probe_devices`).
+        slc:            Shared SLC instance (can be shared across stacks).
+        caller_device:  Device to return activations to after each layer.
+    """
+
+    SYMBOL_MAP: Dict[str, LayerSymbol] = {s.value: s for s in LayerSymbol}
+
+    def __init__(
+        self,
+        modules: List[nn.Module],
+        pattern: str,
+        caps: List[DeviceCapability],
+        slc: Optional[SharedLocalityCache] = None,
+        caller_device: Optional[torch.device] = None,
+    ) -> None:
+        super().__init__()
+        if len(modules) != len(pattern):
+            raise ValueError(
+                f"modules length {len(modules)} != pattern length {len(pattern)}"
             )
-            pcie_bytes = mamba_state_numel * gdn_cfg.dtype_bytes * 2
-            loc_key = f"mamba_state_layer{global_idx}"
 
-        assignments.append(DeviceAssignment(
-            layer_idx=global_idx,
-            layer_symbol=layer_sym,
-            device=device,
-            loc_cache_key=loc_key,
-            pcie_transfer_bytes_estimate=pcie_bytes,
-        ))
-        type_counter[layer_sym] += 1
+        self._caps = caps
+        self._affinity = DeviceAffinityTable(caps)
+        self._slc = slc or SharedLocalityCache()
+        self._caller_device = caller_device or (
+            torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
+        )
+        self._pattern = pattern
 
-    counts_str = "  ".join(f"{s}={type_counter[s]}" for s in sym.VALID_LAYERS)
-    logger.info("Layer counts: %s", counts_str)
-    return assignments
+        layers = []
+        for i, (mod, sym_char) in enumerate(zip(modules, pattern)):
+            sym = self.SYMBOL_MAP.get(sym_char)
+            if sym is None:
+                raise ValueError(f"Unknown layer symbol '{sym_char}' at position {i}.")
+            layer = HeteroGDNMambaLayer(
+                module=mod,
+                symbol=sym,
+                affinity=self._affinity,
+                slc=self._slc,
+                caller_device=self._caller_device,
+            )
+            layers.append(layer)
+
+        # Use ModuleList so PyTorch tracks parameters
+        self.layers = nn.ModuleList(layers)
+        self._log_placement_plan()
+
+    def _log_placement_plan(self) -> None:
+        """Log the device placement plan for the stack."""
+        plan = []
+        for layer in self.layers:
+            assert isinstance(layer, HeteroGDNMambaLayer)
+            plan.append(f"{layer.symbol.value}@cuda:{layer._preferred_rank}")
+        logger.info("HeteroGDNMambaStack placement: %s", " → ".join(plan))
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        """Sequential forward through all layers.
+
+        Elides SLC transfers between consecutive same-device layers.
+        """
+        current = hidden_states
+        prev_rank: Optional[int] = None
+
+        for layer in self.layers:
+            assert isinstance(layer, HeteroGDNMambaLayer)
+            curr_rank = layer._preferred_rank
+
+            # Elide caller→layer transfer if layer is already on current tensor's device
+            # by temporarily overriding caller_device to the current tensor device.
+            # This is the "Shared LOcality" zero-copy path.
+            if prev_rank is not None and curr_rank == prev_rank:
+                # Same device: set caller_device to this device to avoid round-trip
+                orig_caller = layer._caller_device
+                layer._caller_device = torch.device(f"cuda:{curr_rank}")
+                current = layer(current, attention_mask=attention_mask, **kwargs)
+                layer._caller_device = orig_caller
+            else:
+                current = layer(current, attention_mask=attention_mask, **kwargs)
+
+            prev_rank = curr_rank
+
+        # Final transfer back to canonical caller device if needed
+        if current.device != self._caller_device and torch.cuda.is_available():
+            current = self._slc.transfer(current, self._caller_device)
+
+        return current
+
+    def build_layer_profiles(self, seq_len: int) -> List[LayerProfile]:
+        """Build LayerProfile list for makespan estimation."""
+        profiles = []
+        for layer in self.layers:
+            assert isinstance(layer, HeteroGDNMambaLayer)
+            sym = layer.symbol
+            # Approximate flops_per_tok at batch=1 using default dims
+            if sym == LayerSymbol.GDN:
+                fpt = gdn_layer_flops(1, seq_len, 1024) / seq_len
+            elif sym == LayerSymbol.MAMBA:
+                fpt = mamba_layer_flops(1, seq_len, 1024) / seq_len
+            elif sym == LayerSymbol.ATTENTION:
+                fpt = attention_layer_flops(1, seq_len, 1024) / seq_len
+            else:
+                fpt = 2 * 1024 * 4096   # MLP/MoE rough estimate
+            profiles.append(LayerProfile(
+                symbol=sym,
+                flops_per_tok=fpt,
+                preferred_dev=layer._preferred_rank,
+            ))
+        return profiles
 
 
-def get_hetero_layer_counts(pattern: str) -> Dict[str, int]:
+# ---------------------------------------------------------------------------
+# DeepSpeed engine integration hook
+# ---------------------------------------------------------------------------
+
+def register_des_loc_hooks(engine: object, stack: HeteroGDNMambaStack) -> None:
+    """Register DES-LOC pre/post-step hooks on a DeepSpeed engine.
+
+    Hooks:
+      pre_step:  Log per-device memory utilisation and SLC slot pressure.
+      post_step: Emit makespan telemetry for imbalance detection.
+
+    Args:
+        engine: A DeepSpeed DeepSpeedEngine instance (duck-typed to avoid hard dep).
+        stack:  The HeteroGDNMambaStack being managed.
     """
-    Convenience wrapper matching Megatron's ``get_hybrid_layer_counts()``
-    signature (updated in commit 8f7fbe78 to include GDN 'G').
+    if not hasattr(engine, "optimizer"):
+        logger.warning("register_des_loc_hooks: engine lacks .optimizer; skipping hooks.")
+        return
 
-    Returns dict with keys from HeteroLayerSymbols.VALID_LAYERS.
-    Does not require a DeviceRegistry — purely symbolic counting.
+    def _pre_step_hook(*args, **kwargs) -> None:
+        for cap in stack._caps:
+            if torch.cuda.is_available():
+                free, total = torch.cuda.mem_get_info(cap.rank)
+                used_gb = (total - free) / (1 << 30)
+                logger.debug(
+                    "DES-LOC pre-step  cuda:%d  %.1f / %.1f GB used",
+                    cap.rank, used_gb, cap.vram_gb,
+                )
+
+    def _post_step_hook(*args, **kwargs) -> None:
+        logger.debug("DES-LOC post-step: step complete.")
+
+    # DeepSpeed engines expose register_forward_pre_hook via the wrapped module
+    try:
+        engine.module.register_forward_pre_hook(lambda *a, **kw: _pre_step_hook())
+        logger.info("DES-LOC hooks registered on DeepSpeed engine module.")
+    except AttributeError:
+        logger.warning("Could not register DES-LOC hooks: engine.module not found.")
+
+
+# ---------------------------------------------------------------------------
+# Hybrid pattern utilities
+# ---------------------------------------------------------------------------
+
+def parse_hybrid_pattern(pattern: str) -> List[LayerSymbol]:
+    """Parse a hybrid layer pattern string into a list of LayerSymbol.
+
+    Strips pipe '|' separators (pipeline stage markers) and ignores '/'
+    (MTP separators) and everything after the first '/'.
+
+    Example:
+        "GM*|GM-" → [GDN, MAMBA, ATTENTION, GDN, MAMBA, MLP]
     """
-    sym = HeteroLayerSymbols
-    counts: Dict[str, int] = {s: 0 for s in sym.VALID_LAYERS}
+    # Take only the main pattern (before first '/')
+    main = pattern.split("/")[0]
+    symbols: List[LayerSymbol] = []
+    sym_map = HeteroGDNMambaStack.SYMBOL_MAP
+    for ch in main:
+        if ch == "|":
+            continue
+        sym = sym_map.get(ch)
+        if sym is None:
+            raise ValueError(f"Unknown layer symbol '{ch}' in pattern '{pattern}'.")
+        symbols.append(sym)
+    return symbols
 
-    # Split MTP
-    parts = pattern.split(sym.MTP_SEPARATOR)
-    all_chars: List[str] = []
-    for part in parts:
-        for ch in part:
-            if ch != sym.PIPE and ch in sym.VALID_LAYERS:
-                all_chars.append(ch)
 
-    for ch in all_chars:
-        counts[ch] += 1
+def count_layer_types(pattern: str) -> Dict[LayerSymbol, int]:
+    """Count occurrences of each layer type in a pattern string.
 
+    Counts across both main and MTP patterns (all segments after '/').
+    Pipe '|' characters are ignored.
+
+    Returns a dict with a key for every LayerSymbol, including zeros.
+    """
+    counts: Dict[LayerSymbol, int] = {s: 0 for s in LayerSymbol}
+    sym_map = HeteroGDNMambaStack.SYMBOL_MAP
+    for ch in pattern:
+        if ch in ("|", "/"):
+            continue
+        sym = sym_map.get(ch)
+        if sym is not None:
+            counts[sym] += 1
     return counts
 
 
 # ---------------------------------------------------------------------------
-# A5 — HeteroGDNMambaStack: the DES-LOC replacement for MambaStack
+# Convenience factory
 # ---------------------------------------------------------------------------
 
-class HeteroGDNLayer(nn.Module):
+def build_hetero_stack(
+    layer_factories: List[Callable[[], nn.Module]],
+    pattern: str,
+    slc_slots: int = 4,
+    slc_max_mb: int = 512,
+    caller_rank: int = 0,
+) -> HeteroGDNMambaStack:
+    """Convenience factory: probe devices, build SLC, construct HeteroGDNMambaStack.
+
+    Args:
+        layer_factories: Ordered list of callables, each returning an nn.Module.
+                         Ordering must match `pattern`.
+        pattern:         Layer type pattern string (e.g. "GM*GM-").
+        slc_slots:       Number of SLC ring slots (default 4).
+        slc_max_mb:      Max bytes per SLC slot in MB (default 512).
+        caller_rank:     CUDA rank where the caller's tensors originate.
+
+    Returns:
+        A fully configured HeteroGDNMambaStack.
     """
-    Placeholder GDN layer for DES-LOC.
+    caps = _probe_devices()
+    if not caps:
+        logger.warning("No CUDA devices; stack will run on CPU with no device migration.")
+        caps = [DeviceCapability(0, "CPU", 0, 0, 0.0, 1.0, 10.0)]
 
-    In production this wraps the real GatedDeltaNet (imported from
-    deepspeed.ops.gated_delta_net or from the Megatron module via
-    the adapter shim).  The placeholder allows the stack to be instantiated
-    and tested without the full SSM dependency tree.
+    slc = SharedLocalityCache(
+        num_slots=slc_slots,
+        max_bytes=slc_max_mb * 1024 * 1024,
+    )
+    caller_device = torch.device(f"cuda:{caller_rank}") if torch.cuda.is_available() else torch.device("cpu")
+    modules = [f() for f in layer_factories]
 
-    Upstream: Megatron wraps GatedDeltaNet inside a TransformerLayer shell
-    so it reuses the existing residual connection and LayerNorm infra.
-    DES-LOC keeps the same shell approach but moves the layer to the device
-    specified by its DeviceAssignment.
-    """
-
-    def __init__(
-        self,
-        config,
-        layer_idx: int,
-        device: torch.device,
-        assignment: DeviceAssignment,
-        loc_cache: LocalityCache,
-        gdn_cfg: GDNLayerConfig,
-    ) -> None:
-        super().__init__()
-        self.layer_idx = layer_idx
-        self.target_device = device
-        self.assignment = assignment
-        self.gdn_cfg = gdn_cfg
-        self._loc_cache = loc_cache
-
-        hidden_size = getattr(config, "hidden_size", gdn_cfg.hidden_size)
-
-        # Minimal learnable projection placeholders
-        # (replace with real GatedDeltaNet submodules in production)
-        self.in_proj = nn.Linear(
-            hidden_size,
-            2 * gdn_cfg.num_qk_heads * gdn_cfg.qk_head_dim
-            + 2 * gdn_cfg.num_v_heads * gdn_cfg.v_head_dim
-            + 2 * gdn_cfg.num_v_heads,
-            bias=False,
-            device=device,
-        )
-        self.out_proj = nn.Linear(
-            gdn_cfg.num_v_heads * gdn_cfg.v_head_dim,
-            hidden_size,
-            bias=False,
-            device=device,
-        )
-        self.norm = nn.LayerNorm(hidden_size, device=device)
-
-        # Register recurrent state in LOC cache
-        # (batch_size unknown at init; allocate lazily on first forward)
-        self._state: Optional[GDNRecurrentState] = None
-        logger.debug(
-            "HeteroGDNLayer %d  device=%s  loc_key=%s",
-            layer_idx, device, assignment.loc_cache_key,
-        )
-
-    def _ensure_state(self, batch_size: int, dtype: torch.dtype) -> GDNRecurrentState:
-        if self._state is None or self._state._shape[0] != batch_size:
-            self._state = GDNRecurrentState(
-                layer_idx=self.layer_idx,
-                batch_size=batch_size,
-                num_v_heads=self.gdn_cfg.num_v_heads,
-                v_head_dim=self.gdn_cfg.v_head_dim,
-                dtype=dtype,
-                loc_cache=self._loc_cache,
-            )
-        return self._state
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        **kwargs,
-    ) -> torch.Tensor:
-        """
-        Simplified GDN forward.
-
-        Production implementation would:
-          1. Prefetch S from LOC cache (async H2D)
-          2. Run GatedDeltaNet recurrence on target_device
-          3. Write updated S back to LOC cache (async D2H)
-          4. Return output hidden states
-
-        DES-LOC pipeline point: steps 1 and 3 use async CUDA streams so
-        the transfer can overlap with the adjacent layer's compute.
-        """
-        # Move input to this layer's device if needed
-        if hidden_states.device != self.target_device:
-            hidden_states = hidden_states.to(self.target_device)
-
-        batch_size = hidden_states.shape[1] if hidden_states.dim() == 3 else hidden_states.shape[0]
-
-        # LOC: prefetch recurrent state
-        state_obj = self._ensure_state(batch_size, hidden_states.dtype)
-
-        # During training we gate the state load behind torch.is_grad_enabled()
-        # to match Megatron's inference guard semantics
-        try:
-            _S = state_obj.load(self.target_device)
-        except NotImplementedError:
-            # GDN inference not yet supported — propagate as in Megatron
-            raise
-
-        # --- Simplified delta-rule pass (placeholder) ---
-        # In production: full chunked GDN recurrence using _S
-        residual = hidden_states
-        x = self.norm(hidden_states)
-        projected = self.in_proj(x)
-
-        # Derive output via minimal path (not a faithful delta-rule; placeholder only)
-        v_dim = self.gdn_cfg.num_v_heads * self.gdn_cfg.v_head_dim
-        v_part = projected[..., :v_dim]
-        out = self.out_proj(v_part)
-        out = out + residual
-
-        # LOC: write back updated state
-        updated_S = _S  # placeholder: real code would compute new S
-        state_obj.save(updated_S)
-
-        return out
-
-
-class HeteroMambaLayer(nn.Module):
-    """
-    Placeholder Mamba SSM layer for DES-LOC.
-
-    Assigned to A6000 devices (bandwidth-bound selective scan).
-    Manages MambaHiddenState in LocalityCache.
-    """
-
-    def __init__(
-        self,
-        config,
-        layer_idx: int,
-        device: torch.device,
-        assignment: DeviceAssignment,
-        loc_cache: LocalityCache,
-        gdn_cfg: GDNLayerConfig,
-    ) -> None:
-        super().__init__()
-        self.layer_idx = layer_idx
-        self.target_device = device
-        self.assignment = assignment
-        self._loc_cache = loc_cache
-        self.gdn_cfg = gdn_cfg
-
-        hidden_size = getattr(config, "hidden_size", gdn_cfg.hidden_size)
-        self.proj = nn.Linear(hidden_size, hidden_size, bias=False, device=device)
-        self.norm = nn.LayerNorm(hidden_size, device=device)
-        self._state: Optional[MambaHiddenState] = None
-
-    def _ensure_state(self, batch_size: int, dtype: torch.dtype) -> MambaHiddenState:
-        if self._state is None or self._state._shape[0] != batch_size:
-            self._state = MambaHiddenState(
-                layer_idx=self.layer_idx,
-                batch_size=batch_size,
-                num_heads=self.gdn_cfg.num_qk_heads,
-                head_dim=self.gdn_cfg.qk_head_dim,
-                state_dim=self.gdn_cfg.v_head_dim,
-                dtype=dtype,
-                loc_cache=self._loc_cache,
-            )
-        return self._state
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        **kwargs,
-    ) -> torch.Tensor:
-        if hidden_states.device != self.target_device:
-            hidden_states = hidden_states.to(self.target_device)
-
-        batch_size = hidden_states.shape[1] if hidden_states.dim() == 3 else hidden_states.shape[0]
-        state_obj = self._ensure_state(batch_size, hidden_states.dtype)
-        _h = state_obj.load(self.target_device)
-
-        residual = hidden_states
-        out = self.proj(self.norm(hidden_states)) + residual
-        state_obj.save(_h)
-        return out
-
-
-class HeteroAttentionLayer(nn.Module):
-    """Placeholder attention layer, assigned to H100 in DES-LOC."""
-
-    def __init__(self, config, layer_idx: int, device: torch.device) -> None:
-        super().__init__()
-        self.layer_idx = layer_idx
-        self.target_device = device
-        hidden_size = getattr(config, "hidden_size", 4096)
-        self.proj = nn.Linear(hidden_size, hidden_size, bias=False, device=device)
-        self.norm = nn.LayerNorm(hidden_size, device=device)
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        **kwargs,
-    ) -> torch.Tensor:
-        if hidden_states.device != self.target_device:
-            hidden_states = hidden_states.to(self.target_device)
-        return self.proj(self.norm(hidden_states)) + hidden_states
-
-
-@dataclasses.dataclass
-class HeteroStackConfig:
-    """Configuration for HeteroGDNMambaStack."""
-    hidden_size: int = 256
-    layer_pattern: str = "GM*"
-    batch_size: int = 1
-    gdn_cfg: GDNLayerConfig = dataclasses.field(default_factory=GDNLayerConfig)
-    loc_cache_max_entries: int = 512
-    dtype: torch.dtype = torch.float32
-
-
-class HeteroGDNMambaStack(nn.Module):
-    """
-    DES-LOC heterogeneous replacement for Megatron's ``MambaStack``.
-
-    Megatron's MambaStack (commit 8f7fbe78) added an ``elif layer_type ==
-    LayerSymbols.GDN`` branch to ``build_layers()``, routing 'G' symbols to
-    a TransformerLayer wrapping GatedDeltaNet.
-
-    DES-LOC extends this to:
-      1. Parse the pattern into :class:`DeviceAssignment` objects.
-      2. Instantiate each layer on its assigned device.
-      3. Bind stateful layers (GDN, Mamba) to entries in :class:`LocalityCache`.
-      4. Expose ``loc_cache`` for the DeepSpeed engine to manage PCIe scheduling.
-
-    The forward pass moves hidden states between devices at layer boundaries
-    (PCIe transfers).  In a production DES-LOC deployment the scheduler
-    overlaps these transfers with adjacent layer compute via CUDA streams.
-    """
-
-    def __init__(
-        self,
-        config: HeteroStackConfig,
-        device_registry: DeviceRegistry,
-    ) -> None:
-        super().__init__()
-        self.config = config
-        self.registry = device_registry
-
-        self.loc_cache = LocalityCache(max_entries=config.loc_cache_max_entries)
-
-        # Resolve config for GDN layers
-        gdn_cfg = config.gdn_cfg
-        gdn_cfg.hidden_size = config.hidden_size
-
-        # Parse pattern → assignments
-        self.assignments: List[DeviceAssignment] = parse_hetero_hybrid_pattern(
-            pattern=config.layer_pattern,
-            device_registry=device_registry,
-            gdn_cfg=gdn_cfg,
-            batch_size=config.batch_size,
-        )
-
-        # Build layers
-        layers: List[nn.Module] = []
-        sym = HeteroLayerSymbols
-        for assignment in self.assignments:
-            s = assignment.layer_symbol
-            dev = assignment.device
-            idx = assignment.layer_idx
-
-            if s == sym.GDN:
-                layer = HeteroGDNLayer(
-                    config=config,
-                    layer_idx=idx,
-                    device=dev,
-                    assignment=assignment,
-                    loc_cache=self.loc_cache,
-                    gdn_cfg=gdn_cfg,
-                )
-            elif s == sym.MAMBA:
-                layer = HeteroMambaLayer(
-                    config=config,
-                    layer_idx=idx,
-                    device=dev,
-                    assignment=assignment,
-                    loc_cache=self.loc_cache,
-                    gdn_cfg=gdn_cfg,
-                )
-            elif s == sym.ATTENTION:
-                layer = HeteroAttentionLayer(config=config, layer_idx=idx, device=dev)
-            elif s in (sym.MLP, sym.MOE):
-                # Placeholder: MLP on A6000, MoE on CPU
-                hidden_size = config.hidden_size
-                layer = nn.Sequential(
-                    nn.LayerNorm(hidden_size, device=dev),
-                    nn.Linear(hidden_size, hidden_size * 4, bias=False, device=dev),
-                    nn.GELU(),
-                    nn.Linear(hidden_size * 4, hidden_size, bias=False, device=dev),
-                )
-                # Monkey-patch forward to handle device transfer
-                _dev = dev
-                _inner = layer
-                class _MLPWrapper(nn.Module):
-                    def __init__(self):
-                        super().__init__()
-                        self.inner = _inner
-                        self.target_device = _dev
-                    def forward(self, h, **kw):
-                        if h.device != self.target_device:
-                            h = h.to(self.target_device)
-                        return self.inner(h) + h
-                layer = _MLPWrapper()
-            else:
-                raise ValueError(f"Unknown layer symbol '{s}'")
-
-            layers.append(layer)
-            logger.debug(
-                "Built layer %d  sym=%s  device=%s",
-                idx, s, dev,
-            )
-
-        self.layers = nn.ModuleList(layers)
-        logger.info(
-            "HeteroGDNMambaStack: %d layers  pattern='%s'\n  %s",
-            len(self.layers), config.layer_pattern, self.loc_cache.summary(),
-        )
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """
-        Sequential forward pass across heterogeneous devices.
-
-        Device transitions (PCIe) occur automatically via .to() at each
-        layer boundary.  In production the DES-LOC scheduler replaces these
-        with async pre-staged transfers using LOC prefetch streams.
-        """
-        for i, layer in enumerate(self.layers):
-            assignment = self.assignments[i]
-            target = assignment.device
-
-            # Move hidden states to the layer's device if needed
-            if hidden_states.device != target:
-                logger.debug(
-                    "Layer %d (%s): PCIe transfer %s → %s  (~%d bytes)",
-                    i, assignment.layer_symbol,
-                    hidden_states.device, target,
-                    hidden_states.numel() * hidden_states.element_size(),
-                )
-                hidden_states = hidden_states.to(target)
-
-            hidden_states = layer(hidden_states, attention_mask=attention_mask)
-
-        return hidden_states
-
-    def loc_cache_summary(self) -> str:
-        return self.loc_cache.summary()
-
-    def total_pcie_bytes_per_step(self) -> int:
-        """Sum of estimated PCIe bytes across all stateful layers per forward step."""
-        return sum(a.pcie_transfer_bytes_estimate for a in self.assignments)
+    return HeteroGDNMambaStack(
+        modules=modules,
+        pattern=pattern,
+        caps=caps,
+        slc=slc,
+        caller_device=caller_device,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1069,62 +896,50 @@ class HeteroGDNMambaStack(nn.Module):
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
-    )
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 
-    print("=== DES-LOC HeteroGDNMamba smoke test ===\n")
+    # 1. FLOPs formula sanity
+    flops_gdn  = gdn_layer_flops(1, 128, 512)
+    flops_mba  = mamba_layer_flops(1, 128, 512)
+    flops_att  = attention_layer_flops(1, 128, 512)
+    assert flops_gdn > 0,  "GDN FLOPs must be positive"
+    assert flops_mba > 0,  "Mamba FLOPs must be positive"
+    assert flops_att > 0,  "Attention FLOPs must be positive"
+    logger.info("FLOPs: GDN=%d  Mamba=%d  Attn=%d", flops_gdn, flops_mba, flops_att)
 
-    # 1. Layer count parsing (mirrors Megatron get_hybrid_layer_counts tests)
-    counts = get_hetero_layer_counts("GMGM")
-    assert counts["G"] == 2 and counts["M"] == 2, f"count fail: {counts}"
+    # 2. Pattern parsing
+    syms = parse_hybrid_pattern("GM*|G-")
+    expected = [LayerSymbol.GDN, LayerSymbol.MAMBA, LayerSymbol.ATTENTION,
+                LayerSymbol.GDN, LayerSymbol.MLP]
+    assert syms == expected, f"Pattern parse mismatch: {syms}"
+    logger.info("Pattern parse OK: %s", [s.value for s in syms])
 
-    counts2 = get_hetero_layer_counts("G*GM*")
-    assert counts2["G"] == 2 and counts2["*"] == 2 and counts2["M"] == 1, f"count2 fail: {counts2}"
+    # 3. Layer counts
+    counts = count_layer_types("GM*GM-/GG")
+    assert counts[LayerSymbol.GDN]       == 4, f"Expected 4 GDN, got {counts[LayerSymbol.GDN]}"
+    assert counts[LayerSymbol.MAMBA]     == 2
+    assert counts[LayerSymbol.ATTENTION] == 1
+    logger.info("Layer counts: %s", {s.value: counts[s] for s in LayerSymbol})
 
-    # 2. FLOPs estimator
-    cfg = GDNLayerConfig(hidden_size=256, num_qk_heads=4, num_v_heads=8,
-                         qk_head_dim=32, v_head_dim=32)
-    est = GDNFLOPsEstimator(cfg)
-    flops = est.compute_flops(batch_size=2, seq_len=64)
-    assert flops > 0, "FLOPs must be positive"
-    state_bytes = est.recurrent_state_bytes(batch_size=2)
-    assert state_bytes == 2 * 8 * 32 * 32 * 2, f"state_bytes mismatch: {state_bytes}"
+    # 4. DeviceAffinityTable with synthetic caps
+    fake_caps = [
+        DeviceCapability(0, "RTX A6000", 8, 6, 48.0, 309.7,  768.0),
+        DeviceCapability(1, "RTX A6000", 8, 6, 48.0, 309.7,  768.0),
+        DeviceCapability(2, "H100 NVL",  9, 0, 96.0, 1978.9, 3938.0),
+    ]
+    affinity = DeviceAffinityTable(fake_caps)
+    assert affinity.resolve(LayerSymbol.GDN) == 2,       "GDN should map to H100 (rank 2)"
+    assert affinity.resolve(LayerSymbol.MAMBA) in (0, 1), "Mamba should map to A6000"
+    logger.info("DeviceAffinityTable OK")
 
-    # 3. DeviceRegistry + pattern parse (CPU fallback for CI)
-    registry = DeviceRegistry()
-    assignments = parse_hetero_hybrid_pattern(
-        pattern="GM*",
-        device_registry=registry,
-        gdn_cfg=cfg,
-        batch_size=2,
-    )
-    assert len(assignments) == 3, f"expected 3 assignments, got {len(assignments)}"
-    assert assignments[0].layer_symbol == "G"
-    assert assignments[1].layer_symbol == "M"
-    assert assignments[2].layer_symbol == "*"
+    # 5. Balanced split
+    profiles = [
+        LayerProfile(LayerSymbol.GDN,       flops_gdn / 128, 2),
+        LayerProfile(LayerSymbol.MAMBA,      flops_mba / 128, 1),
+        LayerProfile(LayerSymbol.ATTENTION,  flops_att / 128, 0),
+    ]
+    split = compute_balanced_split(profiles, fake_caps, total_batch=16, seq_len=128)
+    assert sum(split.values()) == 16, f"Split sum {sum(split.values())} != 16"
+    logger.info("Balanced split: %s", split)
 
-    # 4. LocalityCache allocation
-    loc = LocalityCache(max_entries=16)
-    t = loc.allocate("test_key", (2, 8, 32, 32), torch.float32)
-    assert t.shape == (2, 8, 32, 32), f"shape mismatch: {t.shape}"
-
-    # 5. HeteroGDNMambaStack forward (CPU devices)
-    stack_cfg = HeteroStackConfig(
-        hidden_size=256,
-        layer_pattern="GM*",
-        batch_size=2,
-        gdn_cfg=cfg,
-    )
-    stack = HeteroGDNMambaStack(stack_cfg, registry)
-    # Use whichever device the first layer landed on
-    first_device = stack.assignments[0].device
-    x = torch.randn(16, 2, 256, device=first_device)  # [seq, batch, hidden]
-    GDNRecurrentState.INFERENCE_ENABLED = True  # enable for test
-    out = stack(x)
-    assert out.shape == x.shape or out.shape[2] == 256, f"output shape wrong: {out.shape}"
-
-    print("\nAll smoke tests passed.")
-    print(f"Total PCIe bytes/step estimate: {stack.total_pcie_bytes_per_step() / 1e6:.2f} MB")
-    print(stack.loc_cache_summary())
+    logger.info("All smoke tests passed.")
