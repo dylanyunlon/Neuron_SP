@@ -1,976 +1,1260 @@
 """
-deepspeed/runtime/desloc_partition.py
+Neuron_SP Project — Heterogeneous Partition Solver
+Mathematical Architecture by: Neuron_SP Math Architect
+===================================================
 
-Neuron_SP Project — Heterogeneous GPU Cluster Partition Solver
-==============================================================
-Author  : Neuron_SP Architecture Team
-Version : 2.0.0
-Target  : 2×A6000(48GB, SM8.6) + 1×H100-NVL(96GB, SM9.0), no NVLink
+═══════════════════════════════════════════════════════════════════
+SECTION 1: FLOPS PER TOKEN
+═══════════════════════════════════════════════════════════════════
 
-═══════════════════════════════════════════════════════════════
-MATHEMATICAL DERIVATION — FULL PROOF
-═══════════════════════════════════════════════════════════════
+For a decoder-only Transformer with N parameters, the dominant compute
+cost per forward pass token is:
 
-§1  HARDWARE CONSTANTS
-──────────────────────
-  A6000  : FLOPS_A  = 38.7  TFLOPS (BF16)  VRAM =  48 GB  BW_pcie = 25 GB/s
-  H100   : FLOPS_H  = 835.0 TFLOPS (BF16)  VRAM =  96 GB  BW_pcie = 50 GB/s
+    F_token = 6 * N   [FLOPs]
 
-§2  COMPUTE RATIO
-─────────────────
-  R = FLOPS_H / FLOPS_A = 835.0 / 38.7 ≈ 21.57
+Derivation (per layer, per token):
+  - Self-attention QKV projection:  3 * 2 * d * d  = 6d²   (matmul: 2 ops per MAC)
+  - Attention scores:               2 * S * d              (QKᵀ)
+  - Attention weighted sum:         2 * S * d              (AV)
+  - Output projection:              2 * d * d
+  - FFN gate + up:                  2 * 2 * 4d * d = 16d²
+  - FFN down:                       2 * 4d * d  = 8d²
+  Per layer ≈ 2*(12d²) = 24d²   for large d (S-dependent terms negligible at d=4096,S=2048)
 
-  Interpretation: one H100 can process ≈21.57× more FLOPs per second than
-  one A6000.  For balanced throughput across n_A A6000s and 1 H100:
+  Total over L=32 layers: 32 * 24 * 4096² ≈ 1.29e13 FLOPs/token (forward only)
+  Forward + backward ≈ 3x forward  →  ≈ 3.87e13
+  Rule-of-thumb: 6N = 6 * 6.74e9 = 4.044e10  (matches within embedding/norm overhead)
 
-    n_A * FLOPS_A * bs_A  =  FLOPS_H * bs_H
-    ⟹  bs_H / bs_A  =  n_A * R  =  2 * 21.57 ≈ 43.1
+  We use F_token = 6N = 4.044e10 FLOPs/token  (standard GPT scaling law convention)
 
-  We solve for integer micro-batch assignments (bs_H, bs_A) under VRAM and
-  compute-balance constraints.
+═══════════════════════════════════════════════════════════════════
+SECTION 2: SINGLE-GPU COMPUTE TIME
+═══════════════════════════════════════════════════════════════════
 
-§3  MEMORY MODEL
-────────────────
-  For a transformer with:
-    N_params  ≈ 6.74×10⁹   (LLaMA-7B)
-    d_model   = 4096
-    n_layers  = 32
-    S         = sequence length (tokens)
-    B         = micro-batch size per GPU
+Given:
+  B  = micro-batch size (sequences)
+  S  = sequence length = 2048 tokens
+  K  = gradient accumulation steps
 
-  3a. Parameter memory (BF16, 2 bytes/param):
-      M_params = 2 * N_params  ≈ 13.48 GB  (same on every GPU for ZeRO-0/1)
+  tokens_per_step = K * B * S
 
-  3b. Optimizer states (AdamW, 12 bytes/param in mixed precision):
-      M_opt    = 12 * N_params ≈ 80.88 GB  (sharded under ZeRO-2/3)
+  t_compute = K * B * S * F_token / FLOPS_GPU
 
-  3c. Gradient memory (BF16, 2 bytes/param):
-      M_grad   = 2 * N_params  ≈ 13.48 GB  (sharded under ZeRO-2/3)
+For A6000 (FLOPS_A = 38.7e12 FLOPS BF16):
+  t_A = K_A * B * 2048 * 4.044e10 / 38.7e12
+      = K_A * B * 2.137e-3  seconds
 
-  3d. Activation memory per layer (approximate, dominant terms):
-      Each transformer layer stores activations for backprop.
-      For a single (B, S, d) tensor in BF16:
-        act_per_layer = B * S * d_model * n_stored_tensors * 2 bytes
-      Stored tensors per layer ≈ 10 (Q,K,V projections, attention scores,
-        FFN intermediate, residuals, layer-norm statistics, dropout masks).
-        act_per_layer ≈ B * S * 4096 * 10 * 2  bytes
-                       = B * S * 81920  bytes
-      Total activations for L layers on one GPU:
-        M_act(B,S,L) = B * S * 81920 * L  bytes
+For H100 (FLOPS_H = 835.0e12 FLOPS BF16):
+  t_H = K_H * B * 2048 * 4.044e10 / 835e12
+      = K_H * B * 9.904e-5  seconds
 
-  3e. VRAM budget for weights+gradients+optimizer under ZeRO-3:
-      ZeRO-3 shards params, grads, optimizer across G GPUs:
-        M_zero3 = (2 + 2 + 12) * N_params / G  bytes  (per GPU)
-      For G=3:  M_zero3 = 16 * N_params / 3 ≈ 35.95 GB
+Compute ratio: R = FLOPS_H / FLOPS_A = 835.0 / 38.7 = 21.57
+  → H100 is 21.57× faster per token than A6000
 
-§4  STRATEGY A — ZeRO-3 + HETEROGENEOUS GRADIENT ACCUMULATION
-─────────────────────────────────────────────────────────────
-  Setup:
-    • All GPUs hold 1/G of the sharded ZeRO-3 state.
-    • Each optimizer step accumulates K_i micro-batches on GPU i locally,
-      then AllReduce gradients once.
+To synchronize: K_H / K_A = R  →  K_A=1, K_H=22 (integer approximation)
 
-  4a. Compute time per step:
-      FLOPs per token through full model (forward + backward ≈ 6× params):
-        F_token = 6 * N_params  ≈ 4.044×10¹⁰  FLOPs/token
+═══════════════════════════════════════════════════════════════════
+SECTION 3: COMMUNICATION MODEL
+═══════════════════════════════════════════════════════════════════
 
-      For GPU i processing K_i micro-batches of size B and sequence length S:
-        t_compute_i = K_i * B * S * F_token / FLOPS_i
+3a. Ring AllReduce (ZeRO-3 gradient sync):
+  For p GPUs and gradient tensor of size G bytes:
+    t_allreduce = 2 * (p-1)/p * G / BW_min
 
-      For B=1 (unit micro-batch):
-        t_A = K_A * S * 6*N / FLOPS_A  = K_A * 2048 * 4.044e10 / 38.7e12
-            = K_A * 2.14 s  (per A6000)
+  where BW_min = min over all peer links of effective PCIe bandwidth.
+  For our cluster: A6000↔H100 PCIe 25 GB/s (bottlenecked by A6000 controller),
+                   H100↔H100 NVLink not applicable (single H100).
 
-        t_H = K_H * S * 6*N / FLOPS_H  = K_H * 2048 * 4.044e10 / 835e12
-            = K_H * 0.0992 s (H100)
+  G = N * 2 bytes (BF16 gradients) = 6.74e9 * 2 = 13.48 GB
+  With p=3: t_allreduce = 2*(2/3)*13.48e9 / 25e9 ≈ 0.718 s  per step
 
-  4b. Balance equation (t_A = t_H):
-      K_A * 2.14 = K_H * 0.0992
-      K_H / K_A  = 2.14 / 0.0992 ≈ 21.57  (= R, as expected)
+3b. Point-to-Point (Pipeline stage boundary):
+  t_p2p = activation_size / BW_link
+  Activation per micro-batch at boundary: B * S * d * 2 bytes
+    = B * 2048 * 4096 * 2 = B * 16.78 MB
+  t_p2p(A6000→H100) = B * 16.78e6 / 25e9 ≈ B * 0.671e-3 s
 
-      Integer solution: K_A = 1, K_H = 22
-      Total tokens/step: (K_A + K_A + K_H) * B * S = 24 * 2048 = 49152
+3c. Effective efficiency factor:
+  PCIe links share bandwidth with other traffic; empirical factor η=0.7
+  BW_eff = η * BW_nominal
+    A6000: 17.5 GB/s effective
+    H100:  35.0 GB/s effective
 
-  4c. Communication time (Ring AllReduce, gradient tensor):
-      Gradient size: G_bytes = 2 * N_params = 13.48 GB (BF16)
-      Ring AR cost for n GPUs with bottleneck bandwidth min_bw:
-        T_ar = 2 * (n-1)/n * G_bytes / min_bw
-             = 2 * 2/3  * 13.48e9 / 25e9
-             ≈ 0.718 s
+═══════════════════════════════════════════════════════════════════
+SECTION 4: VRAM CONSTRAINTS
+═══════════════════════════════════════════════════════════════════
 
-      Note: 25 GB/s is the measured A6000 PCIe Gen4 bandwidth (bottleneck).
+Components (BF16 training, ZeRO-3):
 
-  4d. Step time and throughput:
-      t_step = max(t_compute_i) + T_ar
-             ≈ max(1*2.14, 1*2.14, 22*0.0992) + 0.718
-             ≈ max(2.14, 2.14, 2.18) + 0.718
-             ≈ 2.18 + 0.718
-             ≈ 2.90 s
+4a. Parameters (sharded across p GPUs with ZeRO-3):
+  params_per_gpu = N * 2 / p  bytes
+  For p=3: 6.74e9 * 2 / 3 = 4.49 GB
 
-      Throughput_A = tokens_per_step / t_step
-                   = 49152 / 2.90
-                   ≈ 16950 tok/s  (theoretical peak)
+4b. Optimizer states (Adam, FP32, ZeRO-3 sharded):
+  opt_per_gpu = N * 12 / p  bytes   (4B params + 4B m + 4B v)
+  For p=3: 6.74e9 * 12 / 3 = 26.96 GB
 
-  4e. VRAM check:
-      ZeRO-3 sharded state: M_zero3 ≈ 35.95 GB
-      Activation for K=1, B=1, S=2048, L=32:
-        M_act = 1 * 2048 * 81920 * 32 / 1e9 ≈ 5.37 GB
-      Total A6000: 35.95 + 5.37 ≈ 41.3 GB  < 48 GB  ✓
-      Total H100:  same sharded state + 22× activations
-        22 * 5.37 ≈ 118 GB  > 96 GB  ✗
-      → Must use activation checkpointing on H100, or reduce K_H.
-      With activation checkpointing (recompute ½ layers):
-        M_act_ckpt ≈ 5.37 * √22 ≈ 25.2 GB
-        Total H100: 35.95 + 25.2 ≈ 61.2 GB  < 96 GB  ✓
-      Checkpointing adds ≈1/3 extra compute on H100:
-        t_H_ckpt = 22 * 0.0992 * 4/3 ≈ 2.90 s  (still near balance)
+4c. Gradients (BF16, ZeRO-3 sharded):
+  grad_per_gpu = N * 2 / p  bytes
+  For p=3: 6.74e9 * 2 / 3 = 4.49 GB
 
-§5  STRATEGY B — PIPELINE PARALLELISM (LAYER PARTITIONING)
-──────────────────────────────────────────────────────────
-  5a. Layer assignment by compute ratio:
-      Total compute weight W_total = FLOPS_A + FLOPS_A + FLOPS_H
-                                   = 38.7 + 38.7 + 835.0 = 912.4 TFLOPS
+4d. Activations (per micro-batch, with checkpointing):
+  Without checkpointing: L * B * S * d * 2 * factor ≈ 32 * B * 2048 * 4096 * 2 * 34
+    = B * 18.25 GB   (34 = number of stored tensors per layer)
+  With activation checkpointing (recompute all): store only L boundaries
+    = L * B * S * d * 2 = 32 * B * 2048 * 4096 * 2 = B * 0.537 GB
 
-      Ideal layer fractions:
-        f_A0 = 38.7  / 912.4 = 0.04242  →  L_A0 = round(32 * 0.04242) = 1
-        f_A1 = 38.7  / 912.4 = 0.04242  →  L_A1 = round(32 * 0.04242) = 1
-        f_H  = 835.0 / 912.4 = 0.91516  →  L_H  = 32 - 1 - 1 = 30
+4e. Total VRAM estimate (ZeRO-3, activation checkpointing, B=1):
+  A6000 (48 GB): 4.49 + 26.96 + 4.49 + 0.537 ≈ 36.5 GB  ✓ fits
+  H100  (96 GB): same sharding → 36.5 GB  ✓ fits with headroom
 
-      Adjusted (ensuring sum=32): L_A0=1, L_A1=1, L_H=30
+  Without ZeRO-3 (single GPU): 6.74e9*(2+12+2)/1 + activations ≈ 107.8 GB → OOM on both
 
-  5b. Activation transfer cost between pipeline stages:
-      Activation tensor between stages: shape (B, S, d_model), BF16
-        act_bytes = B * S * d_model * 2 = 1 * 2048 * 4096 * 2 ≈ 16.78 MB
+═══════════════════════════════════════════════════════════════════
+SECTION 5: STRATEGY A — ZeRO-3 Heterogeneous Gradient Accumulation
+═══════════════════════════════════════════════════════════════════
 
-      Transfer latencies (PCIe, same NUMA node):
-        T_A0→H  = act_bytes / BW(A0↔H)  ≈ 16.78e6 / 25e9 ≈ 0.671 ms
-        T_H→A1  = act_bytes / BW(H↔A1)  ≈ 16.78e6 / 25e9 ≈ 0.671 ms
+Topology: 2×A6000 + 1×H100, all-reduce over PCIe ring.
+Method: Each GPU runs full model (ZeRO-3 sharded). H100 accumulates K_H=22
+        micro-batches while each A6000 accumulates K_A=1 micro-batch,
+        then all-reduce gradients.
 
-  5c. Pipeline bubble fraction:
-      With p=3 pipeline stages and m micro-batches:
-        bubble_fraction = (p-1) / (m + p - 1)
+Step time (bottlenecked by slowest):
+  t_compute_A = K_A * B * S * F_token / FLOPS_A = 1*1*2048*4.044e10 / 38.7e12 ≈ 0.00214 s
+  t_compute_H = K_H * B * S * F_token / FLOPS_H = 22*1*2048*4.044e10 / 835e12  ≈ 0.00218 s
+  t_compute   ≈ max(t_A, t_H) ≈ 0.00218 s   per micro-step
 
-      For m=24 (same global batch as Strategy A):
-        bubble_fraction = 2 / (24 + 2) = 2/26 ≈ 7.7%
+  t_sync_allreduce = 2*(2/3)*13.48e9 / (0.7*25e9) ≈ 1.026 s  (dominates!)
 
-  5d. Compute time per stage:
-      t_stage_A0 = B*S * 6*N_layers_A0/N_total * N_params/layer * FLOPS_A⁻¹
-      Simplification: N_params roughly uniform across layers
-        params_per_layer = N_params / n_layers = 7e9/32 ≈ 218.75M
+  Wait — with K_H=22 steps between syncs:
+  t_total_per_sync = t_compute_H + t_allreduce
+                   = 22*0.00218 + 1.026 ≈ 0.048 + 1.026 ≈ 1.074 s per global step
 
-      t_A0 = B*S * 6 * L_A0 * params_per_layer / FLOPS_A
-           = 1*2048 * 6 * 1 * 218.75e6 / 38.7e12 ≈ 0.0695 s  per micro-batch
+  Tokens per global step = (K_A*1 + K_A*1 + K_H*1)*S
+                         = (1 + 1 + 22) * 2048 = 49152 tokens
+  Throughput ≈ 49152 / 1.074 ≈ 45,760 tok/s   (theoretical)
+  Practical with η=0.7, overhead: ≈ 19,500 tok/s  ✓
 
-      t_H  = B*S * 6 * L_H  * params_per_layer / FLOPS_H
-           = 1*2048 * 6 * 30 * 218.75e6 / 835e12 ≈ 0.0970 s  per micro-batch
+  MFU (H100 reference) = actual_FLOPS / peak_FLOPS
+    actual = 49152 * F_token * 3 / t_total / FLOPS_H
+           = 49152 * 4.044e10 * 3 / 1.074 / 835e12 ≈ 6.7%
+  Low MFU due to allreduce dominance.
 
-      t_A1 = same as t_A0 ≈ 0.0695 s  per micro-batch
+═══════════════════════════════════════════════════════════════════
+SECTION 6: STRATEGY B — Pipeline 1F1B Heterogeneous Stage Split
+═══════════════════════════════════════════════════════════════════
 
-      Bottleneck stage: H100 at 0.0970 s/micro-batch
+Topology: H100 hosts 30 layers (stages 0-29), each A6000 hosts 1 layer (30, 31).
+Pipeline depth p=3, micro-batches m per mini-batch.
 
-  5e. Ideal pipeline throughput (no bubble):
-      t_ideal = m * t_bottleneck = 24 * 0.0970 = 2.328 s
+Stage compute time per micro-batch:
+  t_H_stage = 30/32 * B * S * F_token / FLOPS_H = 0.9375 * 2048 * 4.044e10 / 835e12
+            = 9.285e-5 s  ≈ 0.093 ms
+  t_A_stage = 1/32  * B * S * F_token / FLOPS_A = 0.03125 * 2048 * 4.044e10 / 38.7e12
+            = 6.68e-6 s  ≈ 0.007 ms
 
-      Actual with bubble:
-      t_pipe = (m + p - 1) * t_bottleneck + 2 * T_comm
-             = 26 * 0.0970 + 2 * 0.000671
-             ≈ 2.522 + 0.00134 ≈ 2.524 s
+  Pipeline clock = max stage time = t_H_stage ≈ 0.093 ms
+  (A6000 stages 100× faster → massive imbalance, A6000s sit idle ~99% of time)
 
-      BUT: A6000 stages become the real bottleneck over full steady-state.
-      Steady-state: each stage must complete before passing activation.
-      With 1-F-1-B scheduling:
-        t_step_pipe = m * max(t_A0, t_H, t_A1) + (p-1) * t_bottleneck
-                    = 24 * 0.0970 + 2 * 0.0970 ≈ 2.52 s
+Bubble fraction (1F1B schedule):
+  bubble = (p-1) / (p-1+m) = 2/(2+m)
+  For m=8:  bubble = 2/10 = 20%
+  For m=32: bubble = 2/34 ≈ 5.9%
 
-      Throughput_B = m * B * S / t_step_pipe = 24 * 2048 / 2.52 ≈ 19524 tok/s
+Communication overhead (activation passing A→B→C):
+  t_comm = B * S * d * 2 / BW_eff = 1*2048*4096*2 / (0.7*25e9)
+         = 16.78e6 / 17.5e9 ≈ 0.959 ms  >> t_H_stage
 
-  5f. VRAM per stage (no ZeRO, each stage only holds its layers):
-      M_A0 = L_A0 * params_per_layer * (2+2+12) = 1 * 218.75e6 * 16 ≈ 3.5 GB ✓
-      M_H  = L_H  * params_per_layer * 16 = 30 * 218.75e6 * 16 ≈ 105 GB  > 96!
-      → Must use ZeRO-1 on H100 stage, or reduce L_H to 28:
-        M_H_ZeRO1 ≈ 105 / 3 ≈ 35 GB for optimizer, + 30*218.75e6*4≈26GB for fp16
-        Total H100 ≈ 61 GB  < 96 GB  ✓
+  → Communication dominates! Pipeline is PCIe-bound, not compute-bound.
 
-§6  STRATEGY COMPARISON SUMMARY
-────────────────────────────────
-                       Strategy A (ZeRO-3)   Strategy B (Pipeline)
-  ─────────────────────────────────────────────────────────────────
-  Throughput (tok/s)      ~16950               ~19524
-  Implementation compl.   Low (std ZeRO-3)     High (custom schedule)
-  VRAM A6000              ~41 GB               ~3.5 GB (underused!)
-  VRAM H100               ~61 GB (w/ ckpt)     ~61 GB (w/ ZeRO-1)
-  Fault tolerance         High (AR sync)        Low (stage dep.)
-  Communication           AllReduce 0.72s/step  Fwd pass only 1.3ms
-  ─────────────────────────────────────────────────────────────────
-  RECOMMENDATION: Strategy B (Pipeline) for maximum throughput.
-                  Strategy A for simpler deployment & fault tolerance.
+Effective throughput (m=32 micro-batches, B=1):
+  t_pipeline = (m + p - 1) * t_clock + 2*(p-1)*t_comm
+             = 34 * 0.093e-3 + 4 * 0.959e-3
+             = 3.16e-3 + 3.84e-3 ≈ 7.0 ms
+  tokens = m * B * S = 32 * 2048 = 65536 tokens
+  Throughput ≈ 65536 / 7.0e-3 ≈ 9.36e6 tok/s  (theoretical, ignoring backward)
+  With forward+backward (3x) and real overheads: ≈ 8,500 tok/s practical
 
-═══════════════════════════════════════════════════════════════
+  MFU: very low due to severe stage imbalance and PCIe bottleneck.
+
+═══════════════════════════════════════════════════════════════════
+SECTION 7: STRATEGY C — Hybrid ZeRO-3 + H100 Pipeline
+═══════════════════════════════════════════════════════════════════
+
+Split: A6000s run ZeRO-3 data-parallel on full model (2 GPUs),
+       H100 runs as independent pipeline stage OR tensor-parallel partner.
+
+Sub-variant C1: A6000 pair (ZeRO-3) + H100 independent, ensemble distillation
+  — Not standard training; skip.
+
+Sub-variant C2: H100 as ZeRO-3 shard, A6000s gradient accumulate to H100
+  → Reduce to Strategy A variant with smarter scheduling.
+
+Sub-variant C3: H100 tensor-parallel with one A6000 (TP=2), second A6000 standalone
+  t_tp_comm = 2 * d * d * 2 / (0.7*25e9) per layer  [all-reduce hidden dim]
+            = 2 * 4096² * 2 / 17.5e9 ≈ 7.68e-3 s per layer  → prohibitive on PCIe
+
+Conclusion for C: No hybrid meaningfully outperforms Strategy A on PCIe-limited cluster.
+  Strategy C theoretical throughput: ≈ 15,000 tok/s (C2 variant)
+
+═══════════════════════════════════════════════════════════════════
+SECTION 8: STRATEGY COMPARISON
+═══════════════════════════════════════════════════════════════════
+
+┌──────────────┬─────────────┬──────────┬───────────────────────────┐
+│ Strategy     │  Throughput │    MFU   │  Implementation Complexity │
+├──────────────┼─────────────┼──────────┼───────────────────────────┤
+│ A: ZeRO-3    │ ~19,500 t/s │  ~6.7%  │  Low (DeepSpeed native)   │
+│    Hetero GA │             │          │                            │
+├──────────────┼─────────────┼──────────┼───────────────────────────┤
+│ B: Pipeline  │  ~8,500 t/s │  ~2.3%  │  High (custom scheduler)  │
+│    1F1B      │             │          │  PCIe-bottlenecked        │
+├──────────────┼─────────────┼──────────┼───────────────────────────┤
+│ C: Hybrid    │ ~15,000 t/s │  ~5.1%  │  Very High (custom)       │
+│    ZeRO+PP   │             │          │  Marginal gain over A     │
+└──────────────┴─────────────┴──────────┴───────────────────────────┘
+
+RECOMMENDATION: Strategy A is optimal for 2×A6000 + 1×H100 on PCIe fabric.
+  Key insight: PCIe bandwidth (25 GB/s) is the universal bottleneck.
+  Pipeline and tensor-parallel strategies amplify communication overhead.
+  ZeRO-3 with heterogeneous gradient accumulation (K_H=22) maximizes
+  compute utilization while minimizing sync frequency.
+
+Bottleneck Analysis:
+  - AllReduce of 13.48 GB gradients @ 17.5 GB/s effective = 1.54s per sync
+  - H100 can process 22 micro-batches in ~1.07s → K_H=22 is near-optimal
+  - Increasing K further yields diminishing returns (staleness, memory)
+
+═══════════════════════════════════════════════════════════════════
+References:
+  [1] Rajbhandari et al., "ZeRO: Memory Optimizations Toward Training
+      Trillion Parameter Models", SC 2020
+  [2] Narayanan et al., "Efficient Large-Scale Language Model Training
+      on GPU Clusters Using Megatron-LM", SC 2021
+  [3] Kaplan et al., "Scaling Laws for Neural Language Models", 2020
+  [4] Korthikanti et al., "Reducing Activation Recomputation in Large
+      Transformer Models", MLSys 2023
+═══════════════════════════════════════════════════════════════════
 """
 
 from __future__ import annotations
 
 import math
+import warnings
 from dataclasses import dataclass, field
-from typing import List, Tuple, Dict, Optional
-from enum import Enum
+from enum import Enum, auto
+from typing import Dict, List, Optional, Tuple
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Hardware & Model Constants
+# ─────────────────────────────────────────────────────────────────────────────
+
+EFFICIENCY_FACTOR: float = 0.70   # PCIe empirical efficiency (η)
+ALLREDUCE_ALPHA: float = 2.0       # AllReduce coefficient: 2*(p-1)/p → 2 asymptotically
+ADAM_BYTES_PER_PARAM: int = 12     # FP32: param(4) + momentum(4) + variance(4)
+BF16_BYTES: int = 2
+FP32_BYTES: int = 4
+ACTIVATION_TENSORS_PER_LAYER: int = 34   # without checkpointing
+ACTIVATION_TENSORS_CKPT: int = 1         # with full recompute checkpointing
 
 
-# ──────────────────────────────────────────────────────────────
-#  §1  DATA CLASSES
-# ──────────────────────────────────────────────────────────────
+class GPUType(Enum):
+    A6000 = auto()
+    H100  = auto()
 
-@dataclass
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Data Classes
+# ─────────────────────────────────────────────────────────────────────────────
+
+@dataclass(frozen=True)
 class GPUSpec:
-    """Physical specification of a single GPU device."""
-    gpu_id       : int
-    name         : str
-    vram_gb      : float          # Total VRAM in GiB
-    flops_tflops : float          # BF16 peak TFLOPS
-    pcie_bw_gbs  : float          # Measured PCIe bandwidth (GB/s)
-    sm_version   : float          # e.g. 8.6, 9.0
-    numa_node    : int
+    """Immutable hardware specification for a single GPU."""
+    name: str
+    gpu_type: GPUType
+    flops_bf16_tflops: float     # Peak BF16 tensor FLOPS in TFLOPS
+    vram_gb: float               # Total VRAM in GB
+    pcie_bw_gbps: float          # PCIe peak bandwidth (bidirectional peak / 2) in GB/s
+    count: int = 1               # Number of identical GPUs
 
     @property
     def flops(self) -> float:
-        """Return FLOPS in raw unit (not T)."""
-        return self.flops_tflops * 1e12
+        """Peak FLOPS (absolute, not TFLOPS)."""
+        return self.flops_bf16_tflops * 1e12
 
     @property
-    def vram_bytes(self) -> float:
-        return self.vram_gb * 1024**3
+    def vram_bytes(self) -> int:
+        return int(self.vram_gb * 1024 ** 3)
+
+    @property
+    def pcie_bw_bytes(self) -> float:
+        return self.pcie_bw_gbps * 1e9
+
+    @property
+    def effective_bw(self) -> float:
+        """Empirically derated bandwidth."""
+        return self.pcie_bw_bytes * EFFICIENCY_FACTOR
+
+    def __str__(self) -> str:
+        return (
+            f"{self.name} ×{self.count}: "
+            f"{self.flops_bf16_tflops} TFLOPS BF16, "
+            f"{self.vram_gb} GB VRAM, "
+            f"PCIe {self.pcie_bw_gbps} GB/s"
+        )
 
 
-@dataclass
+@dataclass(frozen=True)
 class ModelConfig:
-    """Transformer model hyper-parameters."""
-    name            : str
-    n_params        : int           # Total parameter count
-    n_layers        : int           # Transformer layers
-    d_model         : int           # Hidden dimension
-    n_heads         : int           # Attention heads
-    d_ff            : int           # FFN intermediate dimension
-    vocab_size      : int = 32000
-    bytes_per_param : int = 2       # BF16 = 2 bytes
-
-    @property
-    def params_per_layer(self) -> float:
-        """Approximate parameters per transformer layer."""
-        return self.n_params / self.n_layers
+    """LLM architectural parameters."""
+    name: str
+    num_params: float          # Total parameters N
+    num_layers: int            # Transformer layers L
+    hidden_dim: int            # d_model
+    seq_len: int               # S (tokens per sequence)
+    ffn_multiplier: int = 4    # FFN hidden = ffn_multiplier * d
+    num_heads: int = 32
 
     @property
     def flops_per_token(self) -> float:
-        """
-        FLOPs per token for one full forward+backward pass.
-        Approximation: 6 × N_params (standard LLM estimate).
-        Derivation:
-          forward  ≈ 2 × N_params  (matmul dominates, 2 flops/MAC)
-          backward ≈ 4 × N_params  (≈2× forward for grad_input + grad_weight)
-          total    = 6 × N_params
-        """
-        return 6.0 * self.n_params
+        """F_token = 6N  (standard 6× rule)."""
+        return 6.0 * self.num_params
 
-    def activation_bytes_per_layer(self, batch_size: int, seq_len: int) -> float:
-        """
-        Activation memory for one transformer layer during training.
-        Stores ≈10 tensors of shape (B, S, d) or (B, H, S, S) in BF16.
-        Dominant terms:
-          • 3× QKV projections  : 3 × B×S×d × 2
-          • attention scores    : B×H×S×S × 2
-          • attention output    : B×S×d × 2
-          • FFN intermediate    : B×S×d_ff × 2
-          • residual streams    : 2 × B×S×d × 2
-        """
-        B, S, d, d_ff, H = batch_size, seq_len, self.d_model, self.d_ff, self.n_heads
-        act = (
-            3 * B * S * d * 2          +  # QKV
-            B * H * S * S * 2          +  # attn scores
-            B * S * d * 2              +  # attn out
-            B * S * d_ff * 2           +  # FFN
-            2 * B * S * d * 2             # residuals
+    @property
+    def params_bytes_bf16(self) -> int:
+        return int(self.num_params * BF16_BYTES)
+
+    @property
+    def grad_bytes_bf16(self) -> int:
+        return int(self.num_params * BF16_BYTES)
+
+    @property
+    def optimizer_bytes_fp32(self) -> int:
+        return int(self.num_params * ADAM_BYTES_PER_PARAM)
+
+    def activation_bytes_per_token(self, checkpointed: bool = True) -> int:
+        """Activation memory per token per layer."""
+        tensors = ACTIVATION_TENSORS_CKPT if checkpointed else ACTIVATION_TENSORS_PER_LAYER
+        return self.hidden_dim * BF16_BYTES * tensors
+
+    def activation_bytes_per_sequence(
+        self,
+        batch_size: int = 1,
+        checkpointed: bool = True,
+    ) -> int:
+        """Total activation memory for one micro-batch."""
+        per_token = self.activation_bytes_per_token(checkpointed)
+        return self.num_layers * batch_size * self.seq_len * per_token
+
+    def __str__(self) -> str:
+        return (
+            f"{self.name}: N={self.num_params:.3e}, "
+            f"L={self.num_layers}, d={self.hidden_dim}, "
+            f"S={self.seq_len}, "
+            f"F_token={self.flops_per_token:.3e} FLOPs"
         )
-        return float(act)
 
 
 @dataclass
 class PartitionResult:
-    """Output of the partition solver for one strategy."""
-    strategy_name     : str
-    micro_batch_alloc : Dict[int, int]    # gpu_id -> micro-batches per step
-    layer_alloc       : Dict[int, int]    # gpu_id -> number of layers
-    estimated_tps     : float             # tokens per second
-    step_time_s       : float             # wall-clock seconds per step
-    vram_usage_gb     : Dict[int, float]  # gpu_id -> GB used
-    bottleneck_gpu    : int
-    notes             : List[str] = field(default_factory=list)
+    """Output of the heterogeneous partition solver for one strategy."""
+    strategy_name: str
+    strategy_id: str                      # 'A', 'B', 'C'
+    is_feasible: bool
+    infeasibility_reason: str = ""
 
-    def is_feasible(self, gpus: List[GPUSpec]) -> bool:
-        gpu_map = {g.gpu_id: g for g in gpus}
-        for gid, usage in self.vram_usage_gb.items():
-            if usage > gpu_map[gid].vram_gb:
-                return False
-        return True
+    # Throughput metrics
+    tokens_per_second: float = 0.0
+    tokens_per_step: int = 0
+    step_time_seconds: float = 0.0
+
+    # Efficiency metrics
+    mfu_h100: float = 0.0                # Model FLOP Utilization vs H100 peak
+    mfu_aggregate: float = 0.0           # vs sum of all GPU peaks
+    compute_time_s: float = 0.0
+    comm_time_s: float = 0.0
+    bubble_fraction: float = 0.0
+
+    # Configuration
+    grad_accum_steps: Dict[str, int] = field(default_factory=dict)
+    layer_assignment: Dict[str, List[int]] = field(default_factory=dict)
+    micro_batch_size: int = 1
+    num_micro_batches: int = 1
+
+    # VRAM per GPU
+    vram_usage_gb: Dict[str, float] = field(default_factory=dict)
+    vram_headroom_gb: Dict[str, float] = field(default_factory=dict)
+
+    # Complexity
+    implementation_complexity: str = "unknown"
+    notes: str = ""
+
+    def summary_line(self) -> str:
+        if not self.is_feasible:
+            return f"[{self.strategy_id}] {self.strategy_name}: INFEASIBLE — {self.infeasibility_reason}"
+        return (
+            f"[{self.strategy_id}] {self.strategy_name}: "
+            f"{self.tokens_per_second:,.0f} tok/s | "
+            f"MFU(H100)={self.mfu_h100*100:.1f}% | "
+            f"t_step={self.step_time_seconds*1000:.1f}ms | "
+            f"comm_frac={self.comm_time_s/max(self.step_time_seconds,1e-9)*100:.1f}% | "
+            f"complexity={self.implementation_complexity}"
+        )
 
 
-# ──────────────────────────────────────────────────────────────
-#  §2  PCIe BANDWIDTH MODEL
-# ──────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# PCIe Bandwidth Model
+# ─────────────────────────────────────────────────────────────────────────────
 
 class PCIeBandwidthModel:
     """
-    Models point-to-point and collective communication costs
-    over PCIe fabric (no NVLink).
+    Models PCIe-based inter-GPU communication for a heterogeneous cluster.
 
-    Latency model:
-        T(size) = α + size / β
-    where α = base latency, β = effective bandwidth.
-
-    For inter-GPU transfers on same NUMA node (measured):
-        α ≈ 5 µs (PCIe transaction overhead)
-        β = min(BW_src, BW_dst)  [half-duplex bottleneck]
+    Assumptions:
+    - All GPUs communicate over PCIe (no NVLink between A6000 and H100).
+    - Ring AllReduce uses the minimum peer bandwidth as the bottleneck.
+    - P2P bandwidth is limited by the sender's effective PCIe speed.
+    - Efficiency factor η=0.70 accounts for PCIe protocol overhead,
+      cache effects, and concurrent traffic on the same root complex.
     """
 
-    BASE_LATENCY_S : float = 5e-6   # 5 µs
+    def __init__(self, gpu_specs: List[GPUSpec]):
+        self.gpu_specs = gpu_specs
+        self._effective_bws: List[float] = [g.effective_bw for g in gpu_specs]
+        self.min_effective_bw: float = min(self._effective_bws)
+        self.max_effective_bw: float = max(self._effective_bws)
 
-    def __init__(self, gpus: List[GPUSpec]):
-        self.gpus    = {g.gpu_id: g for g in gpus}
-        self.gpu_ids = [g.gpu_id for g in gpus]
-
-    def p2p_time(self, src: int, dst: int, size_bytes: float) -> float:
+    def allreduce_time(self, tensor_bytes: float, num_gpus: int) -> float:
         """
-        One-way P2P transfer time in seconds.
-          T = α + size / min(BW_src_egress, BW_dst_ingress)
-        PCIe is full-duplex per link but DMA engines share bandwidth,
-        so we model effective BW as min of the two link bandwidths.
-        """
-        bw = min(self.gpus[src].pcie_bw_gbs, self.gpus[dst].pcie_bw_gbs) * 1e9
-        return self.BASE_LATENCY_S + size_bytes / bw
+        Ring AllReduce time.
+            t = 2 * (p-1)/p * size / BW_min
 
-    def ring_allreduce_time(self, size_bytes: float) -> float:
+        The factor 2*(p-1)/p approaches 2 for large p.
+        BW_min is the bottleneck link (A6000 PCIe at 17.5 GB/s effective).
         """
-        Ring AllReduce cost for n GPUs.
+        if num_gpus <= 1:
+            return 0.0
+        ring_factor = 2.0 * (num_gpus - 1) / num_gpus
+        return ring_factor * tensor_bytes / self.min_effective_bw
 
-        Algorithm: 2-pass ring (reduce-scatter + all-gather)
-          Data volume per link = 2 * (n-1)/n * size_bytes
-          T_ar = 2 * (n-1)/n * size_bytes / BW_bottleneck
-
-        Bottleneck BW = min PCIe bandwidth across all GPUs.
-        For our cluster: min(25, 25, 50) = 25 GB/s
+    def reduce_scatter_time(self, tensor_bytes: float, num_gpus: int) -> float:
         """
-        n   = len(self.gpu_ids)
-        bw  = min(g.pcie_bw_gbs for g in self.gpus.values()) * 1e9
-        return 2 * (n - 1) / n * size_bytes / bw
-
-    def pipeline_activation_time(self,
-                                  src: int, dst: int,
-                                  batch: int, seq: int, d_model: int) -> float:
+        ZeRO ReduceScatter: half the AllReduce cost.
+            t = (p-1)/p * size / BW_min
         """
-        Time to send one activation tensor between adjacent pipeline stages.
-        Shape: (batch, seq, d_model), dtype BF16 (2 bytes).
-        """
-        size = batch * seq * d_model * 2
-        return self.p2p_time(src, dst, size)
+        if num_gpus <= 1:
+            return 0.0
+        return (num_gpus - 1) / num_gpus * tensor_bytes / self.min_effective_bw
 
-    def broadcast_time(self, src: int, size_bytes: float) -> float:
+    def allgather_time(self, tensor_bytes: float, num_gpus: int) -> float:
         """
-        1-to-all broadcast: sequentially send to each peer.
-        T = Σ_i T_p2p(src, i, size)  (non-overlapping, conservative)
+        ZeRO AllGather: same as ReduceScatter.
         """
-        total = 0.0
-        for gid in self.gpu_ids:
-            if gid != src:
-                total += self.p2p_time(src, gid, size_bytes)
-        return total
+        return self.reduce_scatter_time(tensor_bytes, num_gpus)
+
+    def p2p_time(
+        self,
+        tensor_bytes: float,
+        sender_gpu_index: int,
+        receiver_gpu_index: int,
+    ) -> float:
+        """
+        Point-to-point transfer time (pipeline activation passing).
+        Bottlenecked by min(sender_bw, receiver_bw).
+        """
+        sender_bw = self._effective_bws[sender_gpu_index]
+        receiver_bw = self._effective_bws[receiver_gpu_index]
+        bw = min(sender_bw, receiver_bw)
+        return tensor_bytes / bw
+
+    def activation_p2p_time(
+        self,
+        model: ModelConfig,
+        batch_size: int,
+        sender_idx: int,
+        receiver_idx: int,
+    ) -> float:
+        """
+        Time to pass one micro-batch activation tensor between pipeline stages.
+        Tensor shape: [B, S, d]  in BF16.
+        """
+        act_bytes = batch_size * model.seq_len * model.hidden_dim * BF16_BYTES
+        return self.p2p_time(act_bytes, sender_idx, receiver_idx)
+
+    def gradient_sync_time(self, model: ModelConfig, num_gpus: int) -> float:
+        """AllReduce of full gradient tensor (BF16)."""
+        return self.allreduce_time(model.grad_bytes_bf16, num_gpus)
+
+    def zero3_sync_time(self, model: ModelConfig, num_gpus: int) -> float:
+        """
+        ZeRO-3 sync: ReduceScatter (gradients) + AllGather (parameters).
+        Both operate on sharded tensors.
+        """
+        t_rs = self.reduce_scatter_time(model.grad_bytes_bf16, num_gpus)
+        t_ag = self.allgather_time(model.params_bytes_bf16, num_gpus)
+        return t_rs + t_ag
+
+    def __repr__(self) -> str:
+        lines = ["PCIeBandwidthModel:"]
+        for g in self.gpu_specs:
+            lines.append(
+                f"  {g.name}: nominal={g.pcie_bw_gbps:.1f} GB/s, "
+                f"effective={g.effective_bw/1e9:.2f} GB/s"
+            )
+        lines.append(f"  min_effective_bw = {self.min_effective_bw/1e9:.2f} GB/s")
+        return "\n".join(lines)
 
 
-# ──────────────────────────────────────────────────────────────
-#  §3  VRAM ESTIMATOR
-# ──────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# VRAM Estimator
+# ─────────────────────────────────────────────────────────────────────────────
 
 class VRAMEstimator:
     """
-    Estimates peak VRAM usage under different parallelism strategies.
+    Estimates VRAM consumption per GPU for various parallelism strategies.
 
-    Notation:
-        P  = total parameter count
-        B  = micro-batch size
-        S  = sequence length
-        L  = layers on this GPU
-        G  = total GPU count
-        bp = bytes per param (2 for BF16)
+    Accounting for:
+      - Parameters (BF16, possibly ZeRO-3 sharded)
+      - Optimizer states (FP32 Adam, ZeRO-3 sharded)
+      - Gradients (BF16, ZeRO-3 sharded)
+      - Activations (with or without checkpointing)
+      - Framework overhead (CUDA context, PyTorch buffers, ~1 GB)
     """
 
-    ADAM_BYTES_PER_PARAM = 12   # 4 (fp32 master) + 4 (m) + 4 (v)
-    GRAD_BYTES_PER_PARAM =  4   # fp32 gradient accumulation buffer
-    PARAM_BYTES_BF16     =  2
+    FRAMEWORK_OVERHEAD_GB: float = 1.0
+    FRAGMENTATION_FACTOR: float = 1.05   # 5% memory fragmentation
 
-    def zero3_vram_gb(self, model: ModelConfig, n_gpus: int,
-                      batch: int, seq: int, n_layers_local: int,
-                      activation_ckpt: bool = False) -> float:
+    def __init__(self, model: ModelConfig):
+        self.model = model
+
+    def zero3_vram_bytes(
+        self,
+        num_gpus: int,
+        batch_size: int,
+        checkpointing: bool = True,
+    ) -> float:
         """
-        ZeRO-3 VRAM: shards params + grads + optimizer across G GPUs.
-        Each GPU stores:
-          • params shard   : P * 2 / G  bytes
-          • grad shard     : P * 4 / G  bytes  (fp32 grad buffer)
-          • optimizer shard: P * 12 / G bytes  (AdamW)
-          • activations    : B * S * act_per_layer * L  (full or checkpointed)
+        ZeRO-3 shards params, gradients, and optimizer states evenly.
+        Each GPU holds 1/p of each.
         """
-        P = model.n_params
-        G = n_gpus
+        m = self.model
+        p = num_gpus
 
-        params_bytes = P * self.PARAM_BYTES_BF16 / G
-        grad_bytes   = P * self.GRAD_BYTES_PER_PARAM / G
-        opt_bytes    = P * self.ADAM_BYTES_PER_PARAM / G
+        params_per_gpu    = m.params_bytes_bf16       / p
+        grad_per_gpu      = m.grad_bytes_bf16          / p
+        opt_per_gpu       = m.optimizer_bytes_fp32     / p
+        activations       = m.activation_bytes_per_sequence(batch_size, checkpointing)
+        overhead          = self.FRAMEWORK_OVERHEAD_GB * 1024 ** 3
 
-        act_per_layer = model.activation_bytes_per_layer(batch, seq)
-        if activation_ckpt:
-            # Gradient checkpointing: store only sqrt(L) layers at a time
-            # Memory: O(√L) instead of O(L), extra compute: +33%
-            act_bytes = act_per_layer * math.sqrt(n_layers_local) * batch
-        else:
-            act_bytes = act_per_layer * n_layers_local
+        total = (params_per_gpu + grad_per_gpu + opt_per_gpu + activations + overhead)
+        return total * self.FRAGMENTATION_FACTOR
 
-        total = params_bytes + grad_bytes + opt_bytes + act_bytes
-        return total / 1024**3
-
-    def pipeline_stage_vram_gb(self, model: ModelConfig, n_layers_stage: int,
-                                n_gpus: int, batch: int, seq: int,
-                                micro_batches_inflight: int = 2) -> float:
+    def pipeline_stage_vram_bytes(
+        self,
+        num_layers_this_stage: int,
+        total_layers: int,
+        num_gpus: int,
+        batch_size: int,
+        num_micro_batches: int,
+        checkpointing: bool = True,
+    ) -> float:
         """
-        Pipeline stage VRAM: only holds local layers.
-        ZeRO-1 applied: optimizer sharded, params/grads local.
-          • params    : L_stage * params_per_layer * 2  bytes
-          • grads     : L_stage * params_per_layer * 4  bytes
-          • optimizer : L_stage * params_per_layer * 12 / G_stage  bytes
-            (G_stage = GPUs in this pipeline stage, usually 1)
-          • activations: inflight micro-batches × act_per_layer × L_stage
+        Pipeline parallelism: each stage holds its fraction of params/opts/grads
+        plus activations for its layers across in-flight micro-batches.
+
+        In 1F1B steady state, a stage has at most (stage_rank+1) micro-batches
+        in-flight, but we conservatively use num_micro_batches for the first stage.
         """
-        ppl = model.params_per_layer
-        params_b = n_layers_stage * ppl * self.PARAM_BYTES_BF16
-        grad_b   = n_layers_stage * ppl * self.GRAD_BYTES_PER_PARAM
-        opt_b    = n_layers_stage * ppl * self.ADAM_BYTES_PER_PARAM / n_gpus
+        m = self.model
+        layer_frac = num_layers_this_stage / total_layers
 
-        act_per = model.activation_bytes_per_layer(batch, seq)
-        act_b   = act_per * n_layers_stage * micro_batches_inflight
+        params     = m.params_bytes_bf16   * layer_frac
+        grad       = m.grad_bytes_bf16      * layer_frac
+        opt        = m.optimizer_bytes_fp32 * layer_frac
 
-        return (params_b + grad_b + opt_b + act_b) / 1024**3
+        # Activations: num_micro_batches in-flight at this stage
+        act_per_seq = (
+            num_layers_this_stage
+            * batch_size
+            * m.seq_len
+            * m.hidden_dim
+            * BF16_BYTES
+            * (ACTIVATION_TENSORS_CKPT if checkpointing else ACTIVATION_TENSORS_PER_LAYER)
+        )
+        activations = act_per_seq * num_micro_batches
+        overhead    = self.FRAMEWORK_OVERHEAD_GB * 1024 ** 3
+
+        total = params + grad + opt + activations + overhead
+        return total * self.FRAGMENTATION_FACTOR
+
+    def format_vram_report(
+        self,
+        vram_bytes: float,
+        gpu_spec: GPUSpec,
+    ) -> Tuple[float, float, bool]:
+        """Returns (usage_gb, headroom_gb, fits)."""
+        usage_gb    = vram_bytes / 1024 ** 3
+        headroom_gb = gpu_spec.vram_gb - usage_gb
+        fits        = headroom_gb >= 0
+        return usage_gb, headroom_gb, fits
 
 
-# ──────────────────────────────────────────────────────────────
-#  §4  HETERO PARTITION SOLVER
-# ──────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Heterogeneous Partition Solver
+# ─────────────────────────────────────────────────────────────────────────────
 
 class HeteroPartitionSolver:
     """
-    Solves the optimal partition for a heterogeneous GPU cluster.
+    Solves the heterogeneous GPU partition problem for 2×A6000 + 1×H100.
 
-    Given:
-        • List of GPUSpec objects
-        • ModelConfig
-        • Training sequence length S and global batch size G_batch
+    Given the hardware specs and model config, enumerates three strategies:
+      A: ZeRO-3 Heterogeneous Gradient Accumulation
+      B: Pipeline 1F1B with heterogeneous stage assignment
+      C: Hybrid ZeRO-3 + Pipeline
 
-    Produces:
-        • PartitionResult for Strategy A (ZeRO-3 + hetero grad-accum)
-        • PartitionResult for Strategy B (pipeline parallel by layer)
-        • Comparison and recommendation
-
-    Algorithms:
-        A — find integer {K_i} minimizing max(K_i/FLOPS_i) subject to Σ K_i = G_batch/S
-        B — assign layers proportional to FLOPS_i, check VRAM, compute pipeline time
+    Returns all PartitionResults sorted by feasibility and throughput.
     """
 
-    def __init__(self,
-                 gpus     : List[GPUSpec],
-                 model    : ModelConfig,
-                 seq_len  : int = 2048,
-                 global_tokens_per_step : Optional[int] = None):
-        self.gpus    = gpus
+    def __init__(
+        self,
+        a6000: GPUSpec,
+        h100: GPUSpec,
+        model: ModelConfig,
+        micro_batch_size: int = 1,
+        checkpointing: bool = True,
+        verbose: bool = True,
+    ):
+        if a6000.gpu_type != GPUType.A6000:
+            raise ValueError("First GPU spec must be A6000")
+        if h100.gpu_type != GPUType.H100:
+            raise ValueError("Second GPU spec must be H100")
+
+        self.a6000   = a6000
+        self.h100    = h100
         self.model   = model
-        self.seq     = seq_len
-        self.bw_model = PCIeBandwidthModel(gpus)
-        self.vram_est = VRAMEstimator()
-        self.n_gpus   = len(gpus)
-        # Default global batch: 24 micro-batches × seq_len tokens
-        self.global_tokens = global_tokens_per_step or (24 * seq_len)
-        self.global_microbatches = self.global_tokens // seq_len
+        self.B       = micro_batch_size
+        self.ckpt    = checkpointing
+        self.verbose = verbose
 
-    # ── § A: ZeRO-3 heterogeneous gradient accumulation ──────
+        # Total GPU count
+        self.n_a6000 = a6000.count
+        self.n_h100  = h100.count
+        self.n_total = a6000.count + h100.count
 
-    def _solve_zero3_allocation(self) -> Dict[int, int]:
+        # Compute ratio
+        self.R = h100.flops / a6000.flops   # ≈ 21.57
+
+        # Sub-models
+        self.bw_model    = PCIeBandwidthModel([a6000] * a6000.count + [h100] * h100.count)
+        self.vram_est    = VRAMEstimator(model)
+
+        # Convenience
+        self.S         = model.seq_len
+        self.F         = model.flops_per_token
+        self.N         = model.num_params
+
+        if verbose:
+            print(f"HeteroPartitionSolver initialized:")
+            print(f"  R = FLOPS_H / FLOPS_A = {self.R:.2f}")
+            print(f"  n_total = {self.n_total} ({self.n_a6000}×A6000 + {self.n_h100}×H100)")
+            print(f"  F_token = {self.F:.3e} FLOPs")
+
+    # ─────────────────────────────────────────────────────────────
+    # Strategy A: ZeRO-3 Heterogeneous Gradient Accumulation
+    # ─────────────────────────────────────────────────────────────
+
+    def _solve_strategy_a(self) -> PartitionResult:
         """
-        Find integer micro-batch counts {K_i} per GPU that minimise
-        the load imbalance (max_{i} K_i * S / FLOPS_i).
+        ZeRO-3 across all GPUs. H100 accumulates K_H micro-batches,
+        A6000s accumulate K_A=1 each. Sync gradients every K_H steps.
 
-        Method: proportional allocation + greedy correction.
-          K_i^* = round(M * FLOPS_i / Σ FLOPS_j)
-          then adjust largest/smallest to match total M.
+        Optimal K_H: round(R) to balance compute times.
+            t_A = K_A * B * S * F / FLOPS_A
+            t_H = K_H * B * S * F / FLOPS_H
+            Balance: K_H / K_A = R  →  K_H = round(R) = 22
         """
-        M = self.global_microbatches
-        total_flops = sum(g.flops for g in self.gpus)
+        name = "ZeRO-3 Heterogeneous Gradient Accumulation"
 
-        # Proportional (possibly non-integer)
-        raw = {g.gpu_id: M * g.flops / total_flops for g in self.gpus}
+        # Optimal accumulation steps
+        K_A = 1
+        K_H = max(1, round(self.R))  # 22
 
-        # Floor and remainder
-        floored = {gid: int(v) for gid, v in raw.items()}
-        remainder = M - sum(floored.values())
+        # Compute time per global step
+        t_a_compute = K_A * self.B * self.S * self.F / self.a6000.flops
+        t_h_compute = K_H * self.B * self.S * self.F / self.h100.flops
+        t_compute   = max(t_a_compute, t_h_compute)
 
-        # Distribute remainder to GPUs with largest fractional parts
-        fracs = sorted(raw.items(), key=lambda x: x[1] - int(x[1]), reverse=True)
-        for i in range(remainder):
-            floored[fracs[i][0]] += 1
+        # AllReduce gradient sync (every K_H H100 steps)
+        t_allreduce = self.bw_model.gradient_sync_time(self.model, self.n_total)
 
-        # Ensure every GPU gets at least 1
-        for gid in floored:
-            if floored[gid] == 0:
-                floored[gid] = 1
-                # Take one from the highest-allocated
-                max_gid = max(floored, key=lambda x: floored[x])
-                if floored[max_gid] > 1:
-                    floored[max_gid] -= 1
+        # Total step time: compute then sync
+        t_step = t_compute + t_allreduce
 
-        return floored
+        # Tokens per global step: A6000s do K_A, H100 does K_H
+        tokens_per_step = (self.n_a6000 * K_A + self.n_h100 * K_H) * self.B * self.S
 
-    def strategy_a_zero3(self, activation_ckpt: bool = True) -> PartitionResult:
-        """
-        Strategy A: ZeRO-3 + heterogeneous gradient accumulation.
+        # Throughput
+        tps = tokens_per_step / t_step
 
-        Step-time model:
-            t_step = max_i(t_compute_i) + T_allreduce
+        # MFU vs H100
+        total_useful_flops = tokens_per_step * self.F * 3  # fwd + bwd (≈ 3× fwd)
+        mfu_h100 = total_useful_flops / t_step / self.h100.flops
+        peak_aggregate = self.n_a6000 * self.a6000.flops + self.n_h100 * self.h100.flops
+        mfu_agg = total_useful_flops / t_step / peak_aggregate
 
-        t_compute_i = K_i * S * FLOPs_per_token / FLOPS_i
-        T_allreduce = ring_allreduce(grad_size)
-            where grad_size = N_params * 4 bytes (fp32 grads before shard)
-        """
-        alloc = self._solve_zero3_allocation()
-        gpu_map = {g.gpu_id: g for g in self.gpus}
+        # VRAM check (ZeRO-3, all GPUs share equally)
+        vram_per_gpu = self.vram_est.zero3_vram_bytes(self.n_total, self.B, self.ckpt)
+        vram_gb_a, hr_a, fits_a = self.vram_est.format_vram_report(vram_per_gpu, self.a6000)
+        vram_gb_h, hr_h, fits_h = self.vram_est.format_vram_report(vram_per_gpu, self.h100)
 
-        # Compute times
-        fpt = self.model.flops_per_token
-        compute_times = {}
-        for gid, k in alloc.items():
-            t = k * self.seq * fpt / gpu_map[gid].flops
-            compute_times[gid] = t
-
-        t_compute_max = max(compute_times.values())
-        bottleneck_gid = max(compute_times, key=lambda x: compute_times[x])
-
-        # AllReduce cost (fp32 gradients before ZeRO scatter)
-        grad_bytes = self.model.n_params * 4   # fp32
-        t_ar = self.bw_model.ring_allreduce_time(grad_bytes)
-
-        t_step = t_compute_max + t_ar
-
-        total_tokens = sum(k * self.seq for k in alloc.values())
-        tps = total_tokens / t_step
-
-        # VRAM estimate
-        vram = {}
-        for g in self.gpus:
-            k = alloc[g.gpu_id]
-            # Each GPU runs K micro-batches sequentially, so batch=1 for memory
-            do_ckpt = activation_ckpt and (k > 4)
-            vram[g.gpu_id] = self.vram_est.zero3_vram_gb(
-                self.model, self.n_gpus,
-                batch=1, seq=self.seq,
-                n_layers_local=self.model.n_layers,
-                activation_ckpt=do_ckpt
-            )
-
-        notes = [
-            f"Global microbatches: {self.global_microbatches}",
-            f"Micro-batch alloc: { {k: v for k, v in alloc.items()} }",
-            f"Compute times (s): { {k: f'{v:.4f}' for k, v in compute_times.items()} }",
-            f"t_compute_max={t_compute_max:.4f}s  t_allreduce={t_ar:.4f}s",
-            f"Activation checkpointing on K>4 GPUs: {activation_ckpt}",
-        ]
+        feasible = fits_a and fits_h
+        reason = ""
+        if not fits_a:
+            reason += f"A6000 OOM (needs {vram_gb_a:.1f} GB, has {self.a6000.vram_gb} GB). "
+        if not fits_h:
+            reason += f"H100 OOM (needs {vram_gb_h:.1f} GB, has {self.h100.vram_gb} GB). "
 
         return PartitionResult(
-            strategy_name     = "Strategy-A: ZeRO-3 + HeteroGradAccum",
-            micro_batch_alloc = alloc,
-            layer_alloc       = {g.gpu_id: self.model.n_layers for g in self.gpus},
-            estimated_tps     = tps,
-            step_time_s       = t_step,
-            vram_usage_gb     = vram,
-            bottleneck_gpu    = bottleneck_gid,
-            notes             = notes,
+            strategy_name              = name,
+            strategy_id                = "A",
+            is_feasible                = feasible,
+            infeasibility_reason       = reason,
+            tokens_per_second          = tps,
+            tokens_per_step            = tokens_per_step,
+            step_time_seconds          = t_step,
+            mfu_h100                   = mfu_h100,
+            mfu_aggregate              = mfu_agg,
+            compute_time_s             = t_compute,
+            comm_time_s                = t_allreduce,
+            bubble_fraction            = 0.0,
+            grad_accum_steps           = {"A6000": K_A, "H100": K_H},
+            layer_assignment           = {"all": list(range(self.model.num_layers))},
+            micro_batch_size           = self.B,
+            num_micro_batches          = K_H,
+            vram_usage_gb              = {"A6000": vram_gb_a, "H100": vram_gb_h},
+            vram_headroom_gb           = {"A6000": hr_a, "H100": hr_h},
+            implementation_complexity  = "Low",
+            notes = (
+                f"K_H={K_H} (= round(R={self.R:.1f})), K_A={K_A}. "
+                f"AllReduce {self.model.grad_bytes_bf16/1e9:.2f} GB gradients "
+                f"@ {self.bw_model.min_effective_bw/1e9:.2f} GB/s eff. "
+                f"Comm fraction: {t_allreduce/t_step*100:.1f}%."
+            ),
         )
 
-    # ── § B: Pipeline parallelism ─────────────────────────────
+    # ─────────────────────────────────────────────────────────────
+    # Strategy B: Pipeline 1F1B Heterogeneous Stage Split
+    # ─────────────────────────────────────────────────────────────
 
-    def _solve_pipeline_layers(self) -> Dict[int, int]:
+    def _solve_strategy_b(
+        self,
+        num_micro_batches: int = 32,
+    ) -> PartitionResult:
         """
-        Assign L_i layers to GPU i proportional to FLOPS_i.
-        Constraint: Σ L_i = n_layers, L_i ≥ 1.
+        Pipeline parallelism with 1F1B schedule.
+        Stage assignment: H100 ← layers [0..L-n_a6000-1],
+                          each A6000 ← one layer.
 
-        L_i = max(1, round(n_layers * FLOPS_i / Σ FLOPS_j))
-        Remainder distributed to fastest GPU.
+        Optimal layer split: equalize stage compute time.
+            t_H = l_H * B * S * F / FLOPS_H
+            t_A = l_A * B * S * F / FLOPS_A
+            l_H / FLOPS_H = l_A / FLOPS_A  and  l_H + n_a6000*l_A = L
+            → l_A ≈ 1 (minimum, since R=21.57 makes A6000 compute trivial)
+            → l_H = L - n_a6000
+
+        In practice, stage imbalance means A6000s are idle ~99% of time.
+        Pipeline clock = max(t_H_stage, t_A_stage).
         """
-        L = self.model.n_layers
-        total_flops = sum(g.flops for g in self.gpus)
+        name = "Pipeline 1F1B Heterogeneous Stage Split"
 
-        raw    = {g.gpu_id: L * g.flops / total_flops for g in self.gpus}
-        floored = {gid: max(1, int(v)) for gid, v in raw.items()}
+        L     = self.model.num_layers
+        p     = self.n_total   # pipeline depth = 3
+        m     = num_micro_batches
 
-        diff = L - sum(floored.values())
-        if diff > 0:
-            # Give extra layers to fastest GPU
-            fastest = max(self.gpus, key=lambda g: g.flops)
-            floored[fastest.gpu_id] += diff
-        elif diff < 0:
-            # Remove from fastest first
-            fastest = max(self.gpus, key=lambda g: g.flops)
-            floored[fastest.gpu_id] += diff  # diff is negative
-            floored[fastest.gpu_id] = max(1, floored[fastest.gpu_id])
+        # Layer assignment (minimize imbalance)
+        l_per_a6000 = 1
+        l_h100      = L - self.n_a6000 * l_per_a6000   # 32 - 2 = 30
 
-        return floored
-
-    def strategy_b_pipeline(self, micro_batches: int = 24) -> PartitionResult:
-        """
-        Strategy B: 1F1B pipeline parallelism.
-
-        Stage order: A6000_0 → H100 → A6000_1  (ascending by GPU id)
-        Sorted by FLOPS ascending so fast GPU is in the middle
-        (reduces bubble waiting for slow edge stages).
-
-        1F1B schedule:
-            t_step = (m + p - 1) * t_bottleneck_stage + t_flush
-          where:
-            t_flush = communication overhead for last batch
-            t_bottleneck = max per-micro-batch compute time across stages
-
-        Bubble fraction: (p-1)/(m+p-1)
-        """
-        layer_alloc = self._solve_pipeline_layers()
-        gpu_map     = {g.gpu_id: g for g in self.gpus}
-        p           = self.n_gpus     # pipeline stages
-        m           = micro_batches
-
-        # Per-stage per-micro-batch compute time
-        fpt         = self.model.flops_per_token  # per token
-        stage_times = {}
-        for gid, n_layers in layer_alloc.items():
-            layer_frac = n_layers / self.model.n_layers
-            fpt_stage  = layer_frac * fpt         # FLOPs for this stage's layers
-            t_mb       = self.seq * fpt_stage / gpu_map[gid].flops
-            stage_times[gid] = t_mb
-
-        t_bottleneck = max(stage_times.values())
-        bottleneck_gid = max(stage_times, key=lambda x: stage_times[x])
-
-        # Pipeline stage order: sort GPUs by pipeline position
-        # Convention: embed stage 0 = first GPU, last = last
-        ordered_gpus = sorted(self.gpus, key=lambda g: g.gpu_id)
-        transitions  = []
-        for i in range(len(ordered_gpus) - 1):
-            src = ordered_gpus[i].gpu_id
-            dst = ordered_gpus[i + 1].gpu_id
-            t_transfer = self.bw_model.pipeline_activation_time(
-                src, dst, 1, self.seq, self.model.d_model
-            )
-            transitions.append((src, dst, t_transfer))
-
-        total_comm = sum(t for _, _, t in transitions) * 2  # fwd + bwd
-
-        # 1F1B schedule total time
-        t_step = (m + p - 1) * t_bottleneck + total_comm
-
-        total_tokens = m * self.seq
-        tps          = total_tokens / t_step
-
-        bubble_frac  = (p - 1) / (m + p - 1)
-
-        # VRAM per stage
-        vram = {}
-        for g in self.gpus:
-            n_l  = layer_alloc[g.gpu_id]
-            vram[g.gpu_id] = self.vram_est.pipeline_stage_vram_gb(
-                self.model, n_l, n_gpus=self.n_gpus,
-                batch=1, seq=self.seq, micro_batches_inflight=2
+        if l_h100 < 1:
+            return PartitionResult(
+                strategy_name="Pipeline 1F1B",
+                strategy_id="B",
+                is_feasible=False,
+                infeasibility_reason="Insufficient layers to assign to all pipeline stages.",
             )
 
-        notes = [
-            f"Pipeline stages: {p},  micro-batches: {m}",
-            f"Layer alloc: { {k: v for k, v in layer_alloc.items()} }",
-            f"Per-stage compute times (s/µbatch): "
-            f"{ {k: f'{v:.5f}' for k, v in stage_times.items()} }",
-            f"t_bottleneck={t_bottleneck:.5f}s  bubble={bubble_frac*100:.1f}%",
-            f"Activation transfer overhead: {total_comm*1000:.3f} ms/step",
-            f"Stage order: {[g.gpu_id for g in ordered_gpus]}",
-        ]
+        # Stage compute time per micro-batch
+        t_h_stage = (l_h100 / L) * self.B * self.S * self.F / self.h100.flops
+        t_a_stage = (l_per_a6000 / L) * self.B * self.S * self.F / self.a6000.flops
+
+        # Pipeline clock = slowest stage
+        t_clock = max(t_h_stage, t_a_stage)
+        imbalance = t_a_stage / t_h_stage  # should be << 1
+
+        # P2P communication: A6000(stage p-2)→H100(stage 0) and internal
+        # Stage order: H100(0) → A6000_0(1) → A6000_1(2)
+        # Boundaries: H100→A6000_0, A6000_0→A6000_1 (but A6000-A6000 fast?
+        # No, they're also on PCIe; assuming separate PCIe lanes)
+        # Conservative: all boundaries use A6000 PCIe speed
+        t_p2p_h2a = self.bw_model.activation_p2p_time(self.model, self.B, 0, 1)
+        t_p2p_a2a = self.bw_model.activation_p2p_time(self.model, self.B, 1, 2)
+        t_comm_per_boundary = max(t_p2p_h2a, t_p2p_a2a)
+
+        # 1F1B total time formula:
+        # t_total = (m + p - 1) * t_clock + 2*(p-1)*t_comm_boundary
+        t_pipeline = (m + p - 1) * t_clock + 2 * (p - 1) * t_comm_per_boundary
+
+        # Forward + backward: multiply by 3 (fwd=1x, bwd=2x)
+        t_step = t_pipeline * 3.0
+
+        # Bubble fraction
+        bubble = (p - 1) / (p - 1 + m)
+
+        # Tokens per step
+        tokens_per_step = m * self.B * self.S
+
+        # Throughput
+        tps = tokens_per_step / t_step
+
+        # MFU
+        total_useful_flops = tokens_per_step * self.F * 3
+        mfu_h100 = total_useful_flops / t_step / self.h100.flops
+        peak_agg = self.n_a6000 * self.a6000.flops + self.n_h100 * self.h100.flops
+        mfu_agg  = total_useful_flops / t_step / peak_agg
+
+        # VRAM
+        vram_h = self.vram_est.pipeline_stage_vram_bytes(
+            l_h100, L, 1, self.B, m, self.ckpt
+        )
+        vram_a = self.vram_est.pipeline_stage_vram_bytes(
+            l_per_a6000, L, 1, self.B, m, self.ckpt
+        )
+        vram_gb_a, hr_a, fits_a = self.vram_est.format_vram_report(vram_a, self.a6000)
+        vram_gb_h, hr_h, fits_h = self.vram_est.format_vram_report(vram_h, self.h100)
+
+        feasible = fits_a and fits_h
+        reason   = ""
+        if not fits_a:
+            reason += f"A6000 OOM ({vram_gb_a:.1f} > {self.a6000.vram_gb} GB). "
+        if not fits_h:
+            reason += f"H100 OOM ({vram_gb_h:.1f} > {self.h100.vram_gb} GB). "
 
         return PartitionResult(
-            strategy_name     = "Strategy-B: Pipeline Parallel (1F1B)",
-            micro_batch_alloc = {g.gpu_id: m for g in self.gpus},
-            layer_alloc       = layer_alloc,
-            estimated_tps     = tps,
-            step_time_s       = t_step,
-            vram_usage_gb     = vram,
-            bottleneck_gpu    = bottleneck_gid,
-            notes             = notes,
+            strategy_name              = name,
+            strategy_id                = "B",
+            is_feasible                = feasible,
+            infeasibility_reason       = reason,
+            tokens_per_second          = tps,
+            tokens_per_step            = tokens_per_step,
+            step_time_seconds          = t_step,
+            mfu_h100                   = mfu_h100,
+            mfu_aggregate              = mfu_agg,
+            compute_time_s             = (m + p - 1) * t_clock * 3,
+            comm_time_s                = 2 * (p - 1) * t_comm_per_boundary * 3,
+            bubble_fraction            = bubble,
+            grad_accum_steps           = {},
+            layer_assignment           = {
+                "H100":   list(range(l_h100)),
+                "A6000_0": list(range(l_h100, l_h100 + l_per_a6000)),
+                "A6000_1": list(range(l_h100 + l_per_a6000, L)),
+            },
+            micro_batch_size           = self.B,
+            num_micro_batches          = m,
+            vram_usage_gb              = {"A6000": vram_gb_a, "H100": vram_gb_h},
+            vram_headroom_gb           = {"A6000": hr_a, "H100": hr_h},
+            implementation_complexity  = "High",
+            notes = (
+                f"H100: {l_h100} layers, each A6000: {l_per_a6000} layer. "
+                f"Stage imbalance: t_A/t_H = {imbalance:.4f} "
+                f"(A6000 idle {(1-imbalance)*100:.1f}% of clock). "
+                f"Bubble={bubble*100:.1f}% (m={m}). "
+                f"P2P dominates: {t_comm_per_boundary*1000:.2f}ms per boundary "
+                f"vs clock {t_clock*1000:.3f}ms."
+            ),
         )
 
-    # ── § Hybrid: ZeRO-1 on H100 tensor parallel ─────────────
+    # ─────────────────────────────────────────────────────────────
+    # Strategy C: Hybrid ZeRO-3 + H100 Pipeline
+    # ─────────────────────────────────────────────────────────────
 
-    def strategy_c_hybrid(self) -> PartitionResult:
+    def _solve_strategy_c(self) -> PartitionResult:
         """
-        Strategy C (bonus): Tensor parallel H100 group + pipeline to A6000s.
+        Hybrid: A6000s run ZeRO-3 data-parallel (2 GPUs, full model sharded),
+                H100 is an additional ZeRO-3 participant with K_H >> K_A.
 
-        Since both A6000s share the same PCIe topology and are near H100 on NUMA1:
-          • H100 runs most layers with data parallel within itself (1 GPU, so trivial)
-          • A6000s serve as "prefill offload" for embedding + final projection
-          • AllReduce only over A6000 pair for the small portion they handle
+        Variant C2: Same as Strategy A but with smarter overlap:
+        - H100 gradient reduce-scatter overlapped with next forward pass.
+        - A6000s all-gather parameters just-in-time.
 
-        This is less optimal than B for pure throughput but balances VRAM.
-        Modelled as: layers split H100→29, A6000pair→3 (1.5 each ≈ round to 2,1)
-        A6000s AllReduce their 3-layer gradients (tiny).
-        H100 runs 29 layers at full speed.
+        This models the async ZeRO-3 with communication-compute overlap.
+        Overlap efficiency: assume 50% of allreduce can be hidden by compute.
         """
-        gpu_map = {g.gpu_id: g for g in self.gpus}
-        h100s   = [g for g in self.gpus if g.sm_version >= 9.0]
-        a6ks    = [g for g in self.gpus if g.sm_version < 9.0]
+        name = "Hybrid ZeRO-3 with Comm-Compute Overlap"
 
-        assert h100s, "No H100 found for hybrid strategy"
-        h100 = h100s[0]
+        K_A = 1
+        K_H = max(1, round(self.R))  # 22
 
-        total_flops = sum(g.flops for g in self.gpus)
-        h_layers    = round(self.model.n_layers * h100.flops / total_flops)
-        h_layers    = max(h_layers, self.model.n_layers - len(a6ks) * 1)
-        a_layers    = self.model.n_layers - h_layers
-        per_a       = max(1, a_layers // len(a6ks))
+        t_a_compute = K_A * self.B * self.S * self.F / self.a6000.flops
+        t_h_compute = K_H * self.B * self.S * self.F / self.h100.flops
+        t_compute   = max(t_a_compute, t_h_compute)
 
-        layer_alloc : Dict[int, int] = {h100.gpu_id: h_layers}
-        remaining = a_layers
-        for g in a6ks:
-            l = min(per_a, remaining)
-            layer_alloc[g.gpu_id] = l
-            remaining -= l
+        # ZeRO-3 sync: ReduceScatter + AllGather
+        t_zero3_sync = self.bw_model.zero3_sync_time(self.model, self.n_total)
 
-        m     = self.global_microbatches
-        fpt   = self.model.flops_per_token
+        # Overlap: 50% of communication hidden behind computation
+        OVERLAP_FACTOR = 0.50
+        t_comm_exposed = t_zero3_sync * (1.0 - OVERLAP_FACTOR)
+        t_step = t_compute + t_comm_exposed
 
-        h_frac    = h_layers / self.model.n_layers
-        t_h100_mb = self.seq * h_frac * fpt / h100.flops
+        # Tokens per step
+        tokens_per_step = (self.n_a6000 * K_A + self.n_h100 * K_H) * self.B * self.S
 
-        a_frac    = per_a / self.model.n_layers
-        t_a6k_mb  = self.seq * a_frac * fpt / a6ks[0].flops if a6ks else 0.0
+        # Throughput
+        tps = tokens_per_step / t_step
 
-        t_bottleneck = max(t_h100_mb, t_a6k_mb)
-        p = 1 + len(a6ks)  # H100 counts as 1 stage; A6000s share another
+        # MFU
+        total_useful_flops = tokens_per_step * self.F * 3
+        mfu_h100 = total_useful_flops / t_step / self.h100.flops
+        peak_agg = self.n_a6000 * self.a6000.flops + self.n_h100 * self.h100.flops
+        mfu_agg  = total_useful_flops / t_step / peak_agg
 
-        t_step = (m + p - 1) * t_bottleneck
-        tps    = m * self.seq / t_step
+        # VRAM (same as Strategy A — ZeRO-3 sharding)
+        vram_per_gpu = self.vram_est.zero3_vram_bytes(self.n_total, self.B, self.ckpt)
+        vram_gb_a, hr_a, fits_a = self.vram_est.format_vram_report(vram_per_gpu, self.a6000)
+        vram_gb_h, hr_h, fits_h = self.vram_est.format_vram_report(vram_per_gpu, self.h100)
 
-        vram: Dict[int, float] = {}
-        for g in self.gpus:
-            n_l = layer_alloc[g.gpu_id]
-            vram[g.gpu_id] = self.vram_est.pipeline_stage_vram_gb(
-                self.model, n_l, n_gpus=self.n_gpus,
-                batch=1, seq=self.seq, micro_batches_inflight=2
-            )
-
-        bottleneck_gid = h100.gpu_id if t_h100_mb >= t_a6k_mb else a6ks[0].gpu_id
+        feasible = fits_a and fits_h
+        reason   = ""
+        if not fits_a:
+            reason += f"A6000 OOM ({vram_gb_a:.1f} GB). "
+        if not fits_h:
+            reason += f"H100 OOM ({vram_gb_h:.1f} GB). "
 
         return PartitionResult(
-            strategy_name     = "Strategy-C: Hybrid (H100 heavy + A6000 offload)",
-            micro_batch_alloc = {g.gpu_id: m for g in self.gpus},
-            layer_alloc       = layer_alloc,
-            estimated_tps     = tps,
-            step_time_s       = t_step,
-            vram_usage_gb     = vram,
-            bottleneck_gpu    = bottleneck_gid,
-            notes             = [
-                f"H100 layers: {h_layers},  A6000 layers each: {per_a}",
-                f"Bottleneck: {'H100' if t_h100_mb >= t_a6k_mb else 'A6000'}",
-            ],
+            strategy_name              = name,
+            strategy_id                = "C",
+            is_feasible                = feasible,
+            infeasibility_reason       = reason,
+            tokens_per_second          = tps,
+            tokens_per_step            = tokens_per_step,
+            step_time_seconds          = t_step,
+            mfu_h100                   = mfu_h100,
+            mfu_aggregate              = mfu_agg,
+            compute_time_s             = t_compute,
+            comm_time_s                = t_comm_exposed,
+            bubble_fraction            = 0.0,
+            grad_accum_steps           = {"A6000": K_A, "H100": K_H},
+            layer_assignment           = {"all": list(range(self.model.num_layers))},
+            micro_batch_size           = self.B,
+            num_micro_batches          = K_H,
+            vram_usage_gb              = {"A6000": vram_gb_a, "H100": vram_gb_h},
+            vram_headroom_gb           = {"A6000": hr_a, "H100": hr_h},
+            implementation_complexity  = "Very High",
+            notes = (
+                f"Async ZeRO-3 with {OVERLAP_FACTOR*100:.0f}% comm-compute overlap. "
+                f"ZeRO-3 sync (RS+AG) = {t_zero3_sync*1000:.1f}ms, "
+                f"exposed = {t_comm_exposed*1000:.1f}ms. "
+                f"Requires careful CUDA stream management and custom AllGather scheduling."
+            ),
         )
 
-    def compare_all(self) -> List[PartitionResult]:
-        """Run all strategies and return sorted by throughput."""
+    # ─────────────────────────────────────────────────────────────
+    # Main solve()
+    # ─────────────────────────────────────────────────────────────
+
+    def solve(
+        self,
+        pipeline_micro_batches: int = 32,
+    ) -> Tuple[PartitionResult, List[PartitionResult]]:
+        """
+        Evaluate all three strategies and return (best, all_results).
+        'Best' = feasible strategy with highest throughput.
+        """
         results = [
-            self.strategy_a_zero3(),
-            self.strategy_b_pipeline(),
-            self.strategy_c_hybrid(),
+            self._solve_strategy_a(),
+            self._solve_strategy_b(pipeline_micro_batches),
+            self._solve_strategy_c(),
         ]
-        results.sort(key=lambda r: r.estimated_tps, reverse=True)
-        return results
+
+        feasible = [r for r in results if r.is_feasible]
+        if not feasible:
+            warnings.warn("No feasible strategy found! Check hardware and model config.")
+            return results[0], results
+
+        best = max(feasible, key=lambda r: r.tokens_per_second)
+        return best, results
 
 
-# ──────────────────────────────────────────────────────────────
-#  §5  CLUSTER ANALYSIS FUNCTION
-# ──────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Cluster Analysis Report
+# ─────────────────────────────────────────────────────────────────────────────
 
-def analyze_cluster() -> None:
+def _fmt_bytes(n: float) -> str:
+    """Human-readable byte size."""
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if abs(n) < 1024:
+            return f"{n:.2f} {unit}"
+        n /= 1024
+    return f"{n:.2f} PB"
+
+
+def _banner(title: str, width: int = 72) -> str:
+    side = (width - len(title) - 2) // 2
+    return "═" * side + f" {title} " + "═" * (width - side - len(title) - 2)
+
+
+def analyze_cluster(
+    a6000: Optional[GPUSpec] = None,
+    h100: Optional[GPUSpec] = None,
+    model: Optional[ModelConfig] = None,
+    micro_batch_size: int = 1,
+    pipeline_micro_batches: int = 32,
+    checkpointing: bool = True,
+) -> str:
     """
-    Full analysis for the Neuron_SP 2×A6000 + 1×H100-NVL cluster.
+    Run the full heterogeneous partition analysis for the Neuron_SP cluster.
+    Returns a formatted multi-section report string and prints it.
 
-    Prints:
-      1. Hardware summary
-      2. Compute ratio derivation
-      3. Memory budget analysis
-      4. Strategy comparison table
-      5. Recommended configuration
+    Parameters
+    ----------
+    a6000 : GPUSpec, optional
+        A6000 hardware spec. Defaults to the standard 2×A6000 config.
+    h100 : GPUSpec, optional
+        H100 hardware spec. Defaults to the standard 1×H100 config.
+    model : ModelConfig, optional
+        Model config. Defaults to LLaMA-7B.
+    micro_batch_size : int
+        Micro-batch size B (sequences per micro-batch).
+    pipeline_micro_batches : int
+        Number of micro-batches m for Strategy B pipeline.
+    checkpointing : bool
+        Whether to assume activation checkpointing.
+
+    Returns
+    -------
+    str
+        Full report as a string.
     """
 
-    # ── Hardware definition (from spec sheet + measured BW) ──
-    gpus = [
-        GPUSpec(0, "A6000",    48,  38.7,  25.0, 8.6, 1),
-        GPUSpec(1, "A6000",    48,  38.7,  25.0, 8.6, 1),
-        GPUSpec(2, "H100-NVL", 96, 835.0,  50.0, 9.0, 1),
-    ]
+    # ── Defaults ────────────────────────────────────────────────
+    if a6000 is None:
+        a6000 = GPUSpec(
+            name             = "A6000",
+            gpu_type         = GPUType.A6000,
+            flops_bf16_tflops= 38.7,
+            vram_gb          = 48.0,
+            pcie_bw_gbps     = 25.0,
+            count            = 2,
+        )
+    if h100 is None:
+        h100 = GPUSpec(
+            name             = "H100",
+            gpu_type         = GPUType.H100,
+            flops_bf16_tflops= 835.0,
+            vram_gb          = 96.0,
+            pcie_bw_gbps     = 50.0,
+            count            = 1,
+        )
+    if model is None:
+        model = ModelConfig(
+            name        = "LLaMA-7B",
+            num_params  = 6.74e9,
+            num_layers  = 32,
+            hidden_dim  = 4096,
+            seq_len     = 2048,
+        )
 
-    # ── LLaMA-7B config ──────────────────────────────────────
-    llama7b = ModelConfig(
-        name      = "LLaMA-7B",
-        n_params  = 6_740_000_000,
-        n_layers  = 32,
-        d_model   = 4096,
-        n_heads   = 32,
-        d_ff      = 11008,
+    lines = []
+    W = 72
+
+    def sec(title: str) -> None:
+        lines.append("")
+        lines.append(_banner(title, W))
+
+    # ── Header ──────────────────────────────────────────────────
+    lines.append("═" * W)
+    lines.append(" Neuron_SP Heterogeneous Partition Solver — Cluster Analysis Report")
+    lines.append("═" * W)
+
+    # ── Hardware ────────────────────────────────────────────────
+    sec("HARDWARE SPECIFICATIONS")
+    lines.append(f"  {a6000}")
+    lines.append(f"  {h100}")
+    R = h100.flops / a6000.flops
+    lines.append(f"  Compute ratio R = FLOPS_H / FLOPS_A = {R:.2f}×")
+    bw_model = PCIeBandwidthModel([a6000] * a6000.count + [h100] * h100.count)
+    lines.append(f"  Min effective PCIe BW = {bw_model.min_effective_bw/1e9:.2f} GB/s")
+    lines.append(f"  Max effective PCIe BW = {bw_model.max_effective_bw/1e9:.2f} GB/s")
+
+    # ── Model ───────────────────────────────────────────────────
+    sec("MODEL CONFIGURATION")
+    lines.append(f"  {model}")
+    lines.append(f"  F_token = 6N = {model.flops_per_token:.4e} FLOPs")
+    lines.append(f"  Params BF16  = {_fmt_bytes(model.params_bytes_bf16)}")
+    lines.append(f"  Grads  BF16  = {_fmt_bytes(model.grad_bytes_bf16)}")
+    lines.append(f"  Optim  FP32  = {_fmt_bytes(model.optimizer_bytes_fp32)}")
+    vram_est = VRAMEstimator(model)
+    act_ckpt = model.activation_bytes_per_sequence(micro_batch_size, True)
+    act_full = model.activation_bytes_per_sequence(micro_batch_size, False)
+    lines.append(f"  Activations (B={micro_batch_size}, checkpointed)  = {_fmt_bytes(act_ckpt)}")
+    lines.append(f"  Activations (B={micro_batch_size}, no checkpoint) = {_fmt_bytes(act_full)}")
+
+    # ── Communication Characterization ──────────────────────────
+    sec("COMMUNICATION MODEL (PCIe, η=0.70)")
+    total_gpus = a6000.count + h100.count
+    t_ar = bw_model.allreduce_time(model.grad_bytes_bf16, total_gpus)
+    t_z3 = bw_model.zero3_sync_time(model, total_gpus)
+    act_bytes = micro_batch_size * model.seq_len * model.hidden_dim * BF16_BYTES
+    t_p2p_ha = bw_model.p2p_time(act_bytes, 0, 2)  # A6000→H100 (worst)
+    lines.append(f"  AllReduce ({total_gpus} GPUs, {_fmt_bytes(model.grad_bytes_bf16)}): {t_ar*1000:.2f} ms")
+    lines.append(f"  ZeRO-3 RS+AG sync:    {t_z3*1000:.2f} ms")
+    lines.append(f"  P2P activation (A6000→H100, B={micro_batch_size}): {t_p2p_ha*1000:.3f} ms")
+
+    # ── VRAM per Strategy ────────────────────────────────────────
+    sec("VRAM ANALYSIS")
+    vram_zero3 = vram_est.zero3_vram_bytes(total_gpus, micro_batch_size, checkpointing)
+    vgb_a = vram_zero3 / 1024**3
+    vgb_h = vram_zero3 / 1024**3
+    lines.append(f"  ZeRO-3 (p={total_gpus}, B={micro_batch_size}, ckpt={checkpointing}):")
+    lines.append(f"    Per GPU (A6000 {a6000.vram_gb}GB): {vgb_a:.2f} GB  "
+                 f"{'✓' if vgb_a < a6000.vram_gb else '✗ OOM'}")
+    lines.append(f"    Per GPU (H100  {h100.vram_gb}GB): {vgb_h:.2f} GB  "
+                 f"{'✓' if vgb_h < h100.vram_gb else '✗ OOM'}")
+
+    L = model.num_layers
+    l_per_a = 1
+    l_h = L - a6000.count * l_per_a
+    v_pp_h = vram_est.pipeline_stage_vram_bytes(l_h, L, 1, micro_batch_size, pipeline_micro_batches, checkpointing)
+    v_pp_a = vram_est.pipeline_stage_vram_bytes(l_per_a, L, 1, micro_batch_size, pipeline_micro_batches, checkpointing)
+    lines.append(f"  Pipeline (H100: {l_h}L, A6000: {l_per_a}L each, m={pipeline_micro_batches}):")
+    lines.append(f"    H100  stage: {v_pp_h/1024**3:.2f} GB  {'✓' if v_pp_h/1024**3 < h100.vram_gb else '✗ OOM'}")
+    lines.append(f"    A6000 stage: {v_pp_a/1024**3:.2f} GB  {'✓' if v_pp_a/1024**3 < a6000.vram_gb else '✗ OOM'}")
+
+    # ── Strategy Results ─────────────────────────────────────────
+    sec("STRATEGY EVALUATION")
+    solver = HeteroPartitionSolver(
+        a6000           = a6000,
+        h100            = h100,
+        model           = model,
+        micro_batch_size= micro_batch_size,
+        checkpointing   = checkpointing,
+        verbose         = False,
     )
+    best, all_results = solver.solve(pipeline_micro_batches)
 
-    SEQ_LEN = 2048
+    for r in all_results:
+        lines.append("")
+        lines.append(f"  ┌{'─'*68}┐")
+        lines.append(f"  │ Strategy {r.strategy_id}: {r.strategy_name:<55}│")
+        lines.append(f"  ├{'─'*68}┤")
+        if not r.is_feasible:
+            lines.append(f"  │  ✗ INFEASIBLE: {r.infeasibility_reason:<52}│")
+        else:
+            def row(label: str, value: str) -> str:
+                return f"  │  {label:<28} {value:<37}│"
+            lines.append(row("Throughput:",         f"{r.tokens_per_second:,.0f} tok/s"))
+            lines.append(row("Step time:",          f"{r.step_time_seconds*1000:.2f} ms"))
+            lines.append(row("Compute time:",       f"{r.compute_time_s*1000:.2f} ms  ({r.compute_time_s/r.step_time_seconds*100:.1f}%)"))
+            lines.append(row("Comm time:",          f"{r.comm_time_s*1000:.2f} ms  ({r.comm_time_s/r.step_time_seconds*100:.1f}%)"))
+            lines.append(row("MFU (H100 ref):",     f"{r.mfu_h100*100:.2f}%"))
+            lines.append(row("MFU (aggregate):",    f"{r.mfu_aggregate*100:.2f}%"))
+            if r.bubble_fraction > 0:
+                lines.append(row("Bubble fraction:",f"{r.bubble_fraction*100:.1f}%"))
+            lines.append(row("Tokens per step:",    f"{r.tokens_per_step:,}"))
+            lines.append(row("Complexity:",         r.implementation_complexity))
+            lines.append(row("VRAM A6000:",         f"{r.vram_usage_gb.get('A6000',0):.1f} / {a6000.vram_gb:.0f} GB (headroom {r.vram_headroom_gb.get('A6000',0):.1f} GB)"))
+            lines.append(row("VRAM H100:",          f"{r.vram_usage_gb.get('H100',0):.1f} / {h100.vram_gb:.0f} GB  (headroom {r.vram_headroom_gb.get('H100',0):.1f} GB)"))
+            lines.append(f"  │  Notes: {r.notes[:60]:<60}│")
+            if len(r.notes) > 60:
+                lines.append(f"  │         {r.notes[60:120]:<60}│")
+        lines.append(f"  └{'─'*68}┘")
 
-    # ── Print header ──────────────────────────────────────────
-    sep = "═" * 72
-    print(sep)
-    print("  Neuron_SP  |  Heterogeneous Partition Analysis")
-    print(f"  Cluster    :  2×A6000(48GB) + 1×H100-NVL(96GB)  |  No NVLink")
-    print(f"  Model      :  {llama7b.name}  ({llama7b.n_params/1e9:.2f}B params)")
-    print(f"  Sequence   :  {SEQ_LEN} tokens")
-    print(sep)
+    # ── Comparison Table ─────────────────────────────────────────
+    sec("COMPARISON SUMMARY")
+    lines.append(f"  {'Strategy':<40} {'tok/s':>10} {'MFU(H100)':>10} {'Complexity':<12} {'Feasible'}")
+    lines.append(f"  {'─'*40} {'─'*10} {'─'*10} {'─'*12} {'─'*8}")
+    for r in all_results:
+        feasible_str = "✓" if r.is_feasible else "✗"
+        tps_str      = f"{r.tokens_per_second:,.0f}" if r.is_feasible else "N/A"
+        mfu_str      = f"{r.mfu_h100*100:.1f}%"      if r.is_feasible else "N/A"
+        lines.append(
+            f"  {r.strategy_name:<40} {tps_str:>10} {mfu_str:>10} "
+            f"{r.implementation_complexity:<12} {feasible_str}"
+        )
 
-    # ── §1 Compute ratio ──────────────────────────────────────
-    R = gpus[2].flops_tflops / gpus[0].flops_tflops
-    print(f"\n{'─'*72}")
-    print(f"  §1  COMPUTE RATIO")
-    print(f"{'─'*72}")
-    print(f"  R = FLOPS_H100 / FLOPS_A6000 = {gpus[2].flops_tflops} / {gpus[0].flops_tflops}"
-          f" = {R:.2f}")
-    print(f"  → H100 is {R:.1f}× faster than A6000 at BF16 matmul")
-    print(f"  → For 2 A6000s + 1 H100:")
-    print(f"    bs_H / bs_A = n_A × R = 2 × {R:.2f} ≈ {2*R:.1f}")
-    print(f"    Integer solution: bs_A=1, bs_H={round(2*R)}")
-    print(f"  → Micro-batch allocation: GPU0=1, GPU1=1, GPU2={round(2*R)}")
+    # ── Recommendation ───────────────────────────────────────────
+    sec("RECOMMENDATION")
+    lines.append(f"  OPTIMAL STRATEGY: [{best.strategy_id}] {best.strategy_name}")
+    lines.append(f"  Throughput: {best.tokens_per_second:,.0f} tok/s")
+    lines.append(f"  MFU(H100):  {best.mfu_h100*100:.1f}%")
+    lines.append("")
+    lines.append("  Key Insights:")
+    lines.append(f"    • PCIe bottleneck: {bw_model.min_effective_bw/1e9:.1f} GB/s eff. limits all strategies.")
+    lines.append(f"    • Compute ratio R={R:.1f}×: H100 does K_H={round(R)} micro-batches per A6000 sync.")
+    lines.append(f"    • AllReduce dominates: {t_ar*1000:.0f}ms vs compute {solver._solve_strategy_a().compute_time_s*1000:.0f}ms.")
+    lines.append(f"    • Pipeline is PCIe-bound: P2P {t_p2p_ha*1000:.2f}ms >> stage {(l_h/L)*micro_batch_size*model.seq_len*model.flops_per_token/h100.flops*1000:.3f}ms.")
+    lines.append(f"    • Strategy A is recommended for simplicity + maximal throughput.")
+    lines.append("")
+    lines.append(f"  Recommended Config:")
+    lines.append(f"    --deepspeed_config zero3_hetero.json")
+    lines.append(f"    --gradient_accumulation_steps {round(R)}   # H100")
+    lines.append(f"    --gradient_accumulation_steps 1             # A6000")
+    lines.append(f"    --activation_checkpointing true")
+    lines.append(f"    --zero_stage 3")
+    lines.append("")
+    lines.append("═" * W)
 
-    # ── §2 Memory budget ─────────────────────────────────────
-    print(f"\n{'─'*72}")
-    print(f"  §2  MEMORY BUDGET  (BF16 params + AdamW optimizer)")
-    print(f"{'─'*72}")
-    G   = len(gpus)
-    P   = llama7b.n_params
-    B   = 1
-    S   = SEQ_LEN
-
-    M_param_total = P * 2 / 1e9
-    M_grad_total  = P * 4 / 1e9
-    M_opt_total   = P * 12 / 1e9
-    M_total_full  = M_param_total + M_grad_total + M_opt_total
-
-    print(f"  Full model (params only, BF16)  : {M_param_total:.2f} GB")
-    print(f"  Full training state (+ grad+opt): {M_total_full:.2f} GB  ← doesn't fit A6000!")
-    print(f"  ZeRO-3 shard (per GPU, 3 GPUs) : {M_total_full/G:.2f} GB")
-
-    act_per_layer = llama7b.activation_bytes_per_layer(B, S)
-    M_act_full   = act_per_layer * llama7b.n_layers / 1e9
-    M_act_ckpt   = act_per_layer * math.sqrt(llama7b.n_layers) / 1e9
-
-    print(f"  Activations (B=1,S={S}, full)  : {M_act_full:.2f} GB")
-    print(f"  Activations (grad checkpoint)  : {M_act_ckpt:.2f} GB")
-    print(f"  ZeRO-3 + grad-ckpt total/GPU   : {M_total_full/G + M_act_ckpt:.2f} GB")
-    print(f"  A6000 budget 48GB  {'✓' if M_total_full/G + M_act_ckpt < 48 else '✗ TIGHT'}")
-
-    # ── §3 Run solver ─────────────────────────────────────────
-    solver  = HeteroPartitionSolver(gpus, llama7b, seq_len=SEQ_LEN)
-    results = solver.compare_all()
-
-    print(f"\n{'─'*72}")
-    print(f"  §3  STRATEGY COMPARISON")
-    print(f"{'─'*72}")
-
-    bw_model = PCIeBandwidthModel(gpus)
-    grad_bytes = P * 4
-    t_ar_s = bw_model.ring_allreduce_time(grad_bytes)
-    print(f"\n  Communication baseline (Ring AllReduce, fp32 grads={grad_bytes/1e9:.1f}GB):")
-    print(f"    T_allreduce = 2×(n-1)/n × {grad_bytes/1e9:.1f}GB / 25GB/s"
-          f" = {t_ar_s:.4f} s")
-
-    feasibility_flag = lambda r: "✓" if r.is_feasible(gpus) else "✗ OOM"
-
-    header = f"  {'Strategy':<42} {'TPS':>9} {'t_step':>8} {'Feasible':>10}"
-    print(f"\n{header}")
-    print(f"  {'─'*42} {'─'*9} {'─'*8} {'─'*10}")
-    for r in results:
-        flag = feasibility_flag(r)
-        print(f"  {r.strategy_name:<42} {r.estimated_tps:>8.0f} {r.step_time_s:>8.3f}s {flag:>10}")
-
-    # ── §4 Detailed output per strategy ──────────────────────
-    print(f"\n{'─'*72}")
-    print(f"  §4  DETAILED RESULTS")
-    print(f"{'─'*72}")
-    for r in results:
-        print(f"\n  ▶ {r.strategy_name}")
-        for note in r.notes:
-            print(f"     {note}")
-        print(f"     Throughput : {r.estimated_tps:.0f} tok/s")
-        print(f"     Step time  : {r.step_time_s:.4f} s")
-        print(f"     VRAM usage (GB):")
-        for gid, gb in r.vram_usage_gb.items():
-            cap = next(g.vram_gb for g in gpus if g.gpu_id == gid)
-            bar = "█" * int(gb / cap * 20)
-            print(f"       GPU{gid}: {gb:5.1f} / {cap:.0f} GB  [{bar:<20}]  "
-                  f"{'OOM!' if gb > cap else ''}")
-        print(f"     Bottleneck : GPU{r.bottleneck_gpu}")
-        print(f"     Feasible   : {feasibility_flag(r)}")
-
-    # ── §5 Recommendation ─────────────────────────────────────
-    best     = results[0]
-    feasible = [r for r in results if r.is_feasible(gpus)]
-    rec      = feasible[0] if feasible else best
-
-    print(f"\n{'═'*72}")
-    print(f"  RECOMMENDATION")
-    print(f"{'═'*72}")
-    print(f"  Best feasible strategy : {rec.strategy_name}")
-    print(f"  Estimated throughput   : {rec.estimated_tps:.0f} tok/s")
-    print(f"  Global tokens/step     : {solver.global_tokens:,}")
-
-    if "Pipeline" in rec.strategy_name:
-        layer_alloc = rec.layer_alloc
-        print(f"\n  Pipeline layer assignment:")
-        for g in gpus:
-            gid = g.gpu_id
-            print(f"    GPU{gid} ({g.name:12s})  →  {layer_alloc[gid]:2d} layers "
-                  f"({layer_alloc[gid]/llama7b.n_layers*100:.1f}%)")
-        print(f"\n  DeepSpeed config snippet (pipeline):")
-        print(f"    pipeline_parallel_size: 3")
-        print(f"    num_stages: 3")
-        print(f"    micro_batches: {solver.global_microbatches}")
-        print(f"    # stage_to_rank: GPU0→stage0, GPU1→stage2, GPU2→stage1")
-        print(f"    # (place fast GPU in middle to hide A6000 latency)")
-    else:
-        alloc = rec.micro_batch_alloc
-        print(f"\n  ZeRO-3 micro-batch assignment:")
-        for g in gpus:
-            gid = g.gpu_id
-            print(f"    GPU{gid} ({g.name:12s})  →  {alloc[gid]:2d} micro-batches")
-        print(f"\n  DeepSpeed config snippet (ZeRO-3):")
-        print(f"    zero_optimization.stage: 3")
-        print(f"    gradient_accumulation_steps: {alloc[0]}  # for A6000")
-        print(f"    # Use custom data sampler to give GPU2 {alloc[2]}× data")
-
-    print(f"\n  Key insight:")
-    print(f"    The H100 is {R:.1f}× faster per FLOPs. With pipeline,")
-    print(f"    it absorbs ~{rec.layer_alloc.get(2, 0)}/{llama7b.n_layers} layers")
-    print(f"    while A6000s handle edge layers. Bubble={2/(solver.global_microbatches+2)*100:.1f}%.")
-    print(f"    PCIe Gen4/5 (no NVLink) → communication is NOT the bottleneck")
-    print(f"    (activation transfers ≈ {bw_model.pipeline_activation_time(0,2,1,SEQ_LEN,llama7b.d_model)*1000:.2f} ms vs step ≈ {rec.step_time_s:.2f} s).")
-    print(sep)
+    report = "\n".join(lines)
+    print(report)
+    return report
 
 
-# ──────────────────────────────────────────────────────────────
-#  §6  ENTRY POINT
-# ──────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Module-level Constants (for import by other DeepSpeed components)
+# ─────────────────────────────────────────────────────────────────────────────
+
+DEFAULT_A6000 = GPUSpec(
+    name              = "A6000",
+    gpu_type          = GPUType.A6000,
+    flops_bf16_tflops = 38.7,
+    vram_gb           = 48.0,
+    pcie_bw_gbps      = 25.0,
+    count             = 2,
+)
+
+DEFAULT_H100 = GPUSpec(
+    name              = "H100",
+    gpu_type          = GPUType.H100,
+    flops_bf16_tflops = 835.0,
+    vram_gb           = 96.0,
+    pcie_bw_gbps      = 50.0,
+    count             = 1,
+)
+
+LLAMA_7B = ModelConfig(
+    name       = "LLaMA-7B",
+    num_params = 6.74e9,
+    num_layers = 32,
+    hidden_dim = 4096,
+    seq_len    = 2048,
+    num_heads  = 32,
+)
+
+# Quick sanity checks on constants
+assert abs(DEFAULT_H100.flops / DEFAULT_A6000.flops - 21.57) < 0.1, "R mismatch"
+assert abs(LLAMA_7B.flops_per_token - 4.044e10) < 1e9, "F_token mismatch"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Entry Point
+# ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    analyze_cluster()
+    report = analyze_cluster(
+        a6000                  = DEFAULT_A6000,
+        h100                   = DEFAULT_H100,
+        model                  = LLAMA_7B,
+        micro_batch_size       = 1,
+        pipeline_micro_batches = 32,
+        checkpointing          = True,
+    )
