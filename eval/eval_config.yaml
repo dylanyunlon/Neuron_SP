@@ -1,0 +1,48 @@
+# DES-LOC CodeGen Eval Configuration (M821-M835)
+# Used by eval/run_eval.py and the periodic eval hook
+
+eval:
+  # Benchmarks to run; disable by removing from list
+  benchmarks:
+    - humaneval
+    - mbpp
+    - commit
+
+  humaneval:
+    samples_per_task: 10      # number of completions per problem (for pass@k)
+    k_values: [1, 5, 10]      # which pass@k variants to report
+    max_new_tokens: 512
+    temperature: 0.8
+
+  mbpp:
+    max_new_tokens: 256
+    temperature: 0.2
+
+  commit_prediction:
+    n_samples: 1000           # pull 1000 test items from CommitPackFT
+    max_new_tokens: 64
+    temperature: 0.1
+    metrics: [bleu, rouge_l, exact_match]
+
+  output_dir: desloc_results/eval_runs
+
+# Periodic eval during training
+periodic:
+  enabled: true
+  eval_interval_steps: 500      # run eval every N steps
+  device: h100                  # only run on H100 node
+  # Other GPUs continue data-prep for next epoch while H100 runs eval
+  # Integration snippet for training loop:
+  #
+  #   from eval.run_eval import run_periodic_eval
+  #   if step % cfg.periodic.eval_interval_steps == 0 and is_h100_rank():
+  #       run_periodic_eval(
+  #           model_path=save_dir,
+  #           step=step,
+  #           output_dir=cfg.eval.output_dir,
+  #       )
+
+# Paths
+data:
+  commitpack_split: test
+  commitpack_n: 1000
