@@ -36,6 +36,12 @@ from torch.nn.utils import clip_grad_norm_
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
 
+from deepspeed.runtime.hetero_gdn_selective_recompute import (
+    build_neuron_sp_config,
+    DeviceClass,
+    HeteroRecomputeConfig,
+)
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -894,6 +900,74 @@ class DesLocEngine:
         # Optionally resume from checkpoint
         if config.resume_from is not None:
             self.load_checkpoint(config.resume_from)
+
+        # --- Phase 7: Neuron_SP heterogeneous recompute config ---
+        self.neuron_sp_config: HeteroRecomputeConfig = build_neuron_sp_config()
+        logger.info(
+            "Neuron_SP recompute config built (granularity=%s, attention=%s).",
+            self.neuron_sp_config.granularity,
+            self.neuron_sp_config.attention_variant,
+        )
+
+        # Apply torch.utils.checkpoint selectively based on device class.
+        # A6000 layers (48 GB HBM) → recompute norm_out to save memory.
+        # H100/Blackwell layers (96 GB HBM) → no recompute needed.
+        #
+        # Strategy: inspect the partition plan's tier_layer_map to assign each
+        # layer its device index, then classify via HeteroDeviceMap.
+        import torch.utils.checkpoint as _torch_ckpt  # noqa: PLC0415
+
+        # Build layer → device_index mapping from the partition plan.
+        layer_device_map: Dict[int, int] = {}
+        for dev_idx, layer_indices in self.plan.tier_layer_map.items():
+            for li in layer_indices:
+                layer_device_map[li] = dev_idx
+
+        # Support both MiniTransformer (.blocks) and standard models (.layers).
+        block_list = getattr(self.model, "blocks", None) or getattr(
+            self.model, "layers", None
+        )
+
+        if block_list is not None:
+            print("[Neuron_SP] Per-layer recompute strategy:")
+            for layer_idx, block in enumerate(block_list):
+                dev_idx = layer_device_map.get(layer_idx, primary_idx)
+                if dev_idx < 0:
+                    dev_class = DeviceClass.UNKNOWN
+                else:
+                    dev_class = self.neuron_sp_config.device_map.get(dev_idx)
+
+                recompute_modules = self.neuron_sp_config.modules_per_device.get(
+                    dev_class, set()
+                )
+                should_recompute = bool(recompute_modules)
+
+                if should_recompute:
+                    original_fwd = block.forward
+
+                    def _make_ckpt_fwd(fwd):
+                        def _ckpt_fwd(*args, **kwargs):
+                            return _torch_ckpt.checkpoint(
+                                fwd, *args, use_reentrant=False, **kwargs
+                            )
+                        return _ckpt_fwd
+
+                    block.forward = _make_ckpt_fwd(original_fwd)
+                    print(
+                        f"  Layer {layer_idx:3d} -> GPU{dev_idx} "
+                        f"({dev_class.name}): recompute=ON  "
+                        f"modules={recompute_modules}"
+                    )
+                else:
+                    print(
+                        f"  Layer {layer_idx:3d} -> GPU{dev_idx} "
+                        f"({dev_class.name}): recompute=OFF"
+                    )
+        else:
+            print(
+                "[Neuron_SP] WARNING: model exposes no .blocks/.layers; "
+                "per-layer recompute wrapping skipped."
+            )
 
         logger.info("Engine ready. Starting from step %d.", self.global_step)
 
