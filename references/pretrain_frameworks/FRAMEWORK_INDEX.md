@@ -11,16 +11,16 @@
 | 3 | `metaseq_opt/` | Meta (Facebook) | OPT-175B | 2022 | github.com/facebookresearch/metaseq |
 | 4 | `bloom_megatron_ds/` | BigScience/HuggingFace | BLOOM-176B | 2022 | github.com/bigscience-workshop/Megatron-DeepSpeed |
 
-## 需远程参考（未拉取完整代码）
+## 已拉取 key files (Phase 6 补充)
 
-| # | 公司/组织 | 模型/框架 | 年份 | 仓库 |
-|---|---------|---------|------|------|
-| 5 | Google | PaLM (t5x框架) | 2022 | github.com/google-research/t5x |
-| 6 | Salesforce | CodeGen | 2022 | github.com/salesforce/CodeGen |
-| 7 | Microsoft | DeepSpeed (ZeRO系列) | 2020→ | github.com/microsoft/DeepSpeed (=本仓库上游) |
-| 8 | 智谱/清华 | GLM-130B → ChatGLM | 2022 | github.com/THUDM/GLM-130B |
-| 9 | DeepMind | Chinchilla/Gopher (Scaling Laws) | 2022 | github.com/google-deepmind/jax |
-| 10 | HPC-AI Tech | ColossalAI | 2021-2022 | github.com/hpcaitech/ColossalAI |
+| # | 目录 | 公司/组织 | 模型/框架 | 年份 | 上游仓库 |
+|---|------|---------|---------|------|---------|
+| 5 | `google_t5x/` | Google | PaLM (t5x框架) | 2022 | github.com/google-research/t5x |
+| 6 | `salesforce_codegen/` | Salesforce | CodeGen-16B | 2022 | github.com/salesforce/CodeGen |
+| 7 | (本仓库自身) | Microsoft | DeepSpeed (ZeRO系列) | 2020→ | github.com/microsoft/DeepSpeed |
+| 8 | `glm130b/` | 智谱/清华 | GLM-130B → ChatGLM | 2022 | github.com/THUDM/GLM-130B |
+| 9 | (参考 t5x partitioning) | DeepMind | Chinchilla Scaling Laws | 2022 | (论文驱动，无独立代码) |
+| 10 | `colossalai/` | HPC-AI Tech | ColossalAI Gemini | 2021-2022 | github.com/hpcaitech/ColossalAI |
 
 ## 对 DES-LOC 的参考价值
 
@@ -40,3 +40,24 @@
 ## 数据集对照
 
 详见 `../../datasets/bigcode/DATASETS.md`
+
+### ColossalAI Gemini (HPC-AI Tech)
+- `colossalai/gemini_ddp.py`: GPU↔CPU 参数搬运，按 chunk 动态管理
+- `colossalai/gemini_mgr.py`: StatefulTensorMgr — 访问模式驱动的内存调度
+- **关键参考**: 异构显存 (49GB vs 96GB) 的 asymmetric chunk allocation
+
+### Google t5x (Google Research / PaLM)
+- `google_t5x/partitioning.py`: PjitPartitioner — JAX 声明式并行分区
+- `google_t5x/trainer.py`: Flax 训练循环，learning rate schedule
+- **关键参考**: PaLM 的 mesh 概念可迁移到 DES-LOC 异构 mesh
+
+### GLM-130B (智谱AI / 清华)
+- `glm130b/quantization_layers.py`: INT4/INT8 量化层
+- `glm130b/configs/`: 含 V100 配置 (A6000 算力近似 V100×2)
+- **关键参考**: bidirectional + causal 混合训练目标
+
+### Salesforce CodeGen
+- `salesforce_codegen/train_deepspeed.py`: **直接用 DeepSpeed 训练**! 可对标
+- `salesforce_codegen/modeling_codegen.py`: GPT-J 变体 (rotary embedding)
+- `salesforce_codegen/mtpb_*.py`: 多轮编程评估基准
+- **关键参考**: 代码预训练 NL+PL 数据混合策略
