@@ -142,3 +142,46 @@ bash run_13B_ags1.sh
 # 续传 (截断后)
 CONV_ID=<uuid> bash claude_hk_chat.sh "Continue"
 ```
+
+---
+
+## Phase 5: 数据 Pipeline + 框架对标 + 论文完善 (M536-M685)
+
+> 招聘 10 个子 Claude，分 3 条线并行推进
+
+### 数据线 (Claude 7/8/10/12)
+| Claude | 里程碑 | 任务 | 依赖 | 状态 |
+|--------|--------|------|------|------|
+| Claude-7 | M536-M550 | BigCode commit pipeline → DES-LOC 数据格式 | 无 | 🟡 待派发 |
+| Claude-8 | M551-M565 | MinHash 去重集成 | Claude-7 | 🟡 待派发 |
+| Claude-10 | M581-M595 | PII 检测 pipeline | Claude-7 | 🟡 待派发 |
+| Claude-12 | M611-M625 | GHArchive event 提取器 | 无 | 🟡 待派发 |
+
+### 框架线 (Claude 9/11/14/15)
+| Claude | 里程碑 | 任务 | 依赖 | 状态 |
+|--------|--------|------|------|------|
+| Claude-9 | M566-M580 | Megatron PP 调度器对标 → 异构 bubble 优化 | 无 | 🟡 待派发 |
+| Claude-11 | M596-M610 | 异构 Tensor Parallel 跨设备分片 | 无 | 🟡 待派发 |
+| Claude-14 | M641-M655 | 异构 Memory Profiler | 无 | 🟡 待派发 |
+| Claude-15 | M656-M670 | 2022 框架 benchmark 复现 | ags1 服务器 | 🟡 待派发 |
+
+### 论文线 (Claude 13/16)
+| Claude | 里程碑 | 任务 | 依赖 | 状态 |
+|--------|--------|------|------|------|
+| Claude-13 | M626-M640 | DES-LOC 收敛性理论证明 | 无 | 🟡 待派发 |
+| Claude-16 | M671-M685 | NeurIPS 论文 Related Work + Experiment | Phase 4 数据 | 🟡 待派发 |
+
+### 依赖图 (可并行执行的)
+```
+独立启动 (第一批, 同时派发):
+  Claude-7  (commit pipeline)     ─┬→ Claude-8  (dedup)
+  Claude-9  (PP调度)               │  Claude-10 (PII)
+  Claude-11 (异构TP)               │
+  Claude-12 (GHArchive)            │
+  Claude-13 (理论证明)             │
+  Claude-14 (Memory profiler)      │
+                                    │
+第二批 (依赖第一批):              │
+  Claude-15 (benchmark, 需服务器)  │
+  Claude-16 (论文, 需 Phase 4 数据)│
+```
