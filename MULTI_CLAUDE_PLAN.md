@@ -226,3 +226,25 @@ CONV_ID=<uuid> bash claude_hk_chat.sh "Continue"
 [依赖全部] Claude-25 (Scaling Law) — 需要训练基础设施 + 数据管线就绪
 [依赖模型] Claude-26 (Eval) — 需要至少一个模型训练完成
 ```
+
+---
+
+## Phase 7: Wiring — 将已有 hetero 模块接入训练循环 (M836-M985)
+
+### 问题
+66个 hetero_*.py 模块 (7789+ 行) 已实现所有异构训练功能,但 `DesLocEngine.train()` 是个普通 forward-backward-step 循环,没有调用它们。
+
+### 10 位 Sub-Claude 接线任务
+
+| Claude | 里程碑 | 接什么 | 改哪个文件 |
+|--------|--------|--------|-----------|
+| 27 | M836-M850 | `build_neuron_sp_config()` → activation checkpointing | `desloc_engine.py` |
+| 28 | M851-M865 | `setup_hetero_mimo_training()` → 三阶段入口 | `train_three_stage.py` |
+| 29 | M866-M880 | `integrate_with_deepspeed_engine()` → grad norm skip | `desloc_engine.py` |
+| 30 | M881-M895 | `HeteroFP32GradAccumManager` → backward pass | `desloc_engine.py` |
+| 31 | M896-M910 | `HeteroStepBatchScheduler` → 动态 micro-batch | `desloc_engine.py` |
+| 32 | M911-M925 | `CommitSequencePacker` + `HeteroBatchSampler` → data | `train_three_stage.py` |
+| 33 | M926-M940 | `PCIeP2PCommunicator` → pipeline boundaries | `hetero_mimo_training_loop.py` |
+| 34 | M941-M955 | `SharedLocalityCache` → NUMA activation offload | `hetero_mimo_training_loop.py` |
+| 35 | M956-M970 | 删玩具 engine_bridge, 用真 LLaMA + MIMO | `train_three_stage.py` |
+| 36 | M971-M985 | 集成 smoke test | `smoke_test.py` |
