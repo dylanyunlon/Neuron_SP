@@ -171,78 +171,173 @@ def load_stage1_data(tokenizer, seq_len, batch_size, data_path=None):
 
 
 def load_stage2_data(tokenizer, seq_len, batch_size, data_path=None):
-    """Stage 2: CommitPack diff 序列 (streaming)."""
-    from torch.utils.data import DataLoader, IterableDataset
+    """Stage 2: CommitPack diff 序列 — uses CommitSequencePacker + HeteroBatchSampler."""
+    import json as _json
+    from torch.utils.data import DataLoader, Dataset
+    from datasets.bigcode.commit_packing import (
+        CommitSequencePacker, HeteroBatchSampler, compute_packing_stats,
+    )
 
-    class CommitDataset(IterableDataset):
-        def __init__(self, tok, sl):
-            self.tok = tok
-            self.sl = sl
+    # ── 1. 收集原始 commit 样本 ──────────────────────────────────────────
+    sample_file = "datasets/bigcode/commitpack/python_sample_10k.jsonl"
+    if not os.path.exists(sample_file):
+        sample_file = "datasets/bigcode/commitpackft/python.jsonl"
 
-        def __iter__(self):
-            import json as _json
-            # 用已下载的 CommitPack 样本
-            sample_file = "datasets/bigcode/commitpack/python_sample_10k.jsonl"
-            if not os.path.exists(sample_file):
-                # Fallback: 用 CommitPackFT
-                sample_file = "datasets/bigcode/commitpackft/python.jsonl"
+    raw_samples = []
+    with open(sample_file) as fh:
+        for line in fh:
+            d = _json.loads(line)
+            old = d.get("old_contents", "")
+            new = d.get("new_contents", "")
+            msg = d.get("subject", d.get("message", ""))
+            text = (
+                f"<commit_before>\n{old}\n"
+                f"<commit_msg>\n{msg}\n"
+                f"<commit_after>\n{new}"
+            )
+            raw_samples.append({"text": text})
 
-            for line in open(sample_file):
-                d = _json.loads(line)
-                old = d.get("old_contents", "")
-                new = d.get("new_contents", "")
-                msg = d.get("subject", d.get("message", ""))
+    # ── 2. CommitSequencePacker: 替代手动 tokenize+pad ──────────────────
+    pad_id = getattr(tokenizer, "eos_token_id", 0) or 0
+    packer = CommitSequencePacker(tokenizer=tokenizer, seq_len=seq_len, pad_token_id=pad_id)
+    packed = packer.pack_dataset(iter(raw_samples))
 
-                if hasattr(self.tok, "encode_commit"):
-                    ids = self.tok.encode_commit(old, new, msg)
-                else:
-                    text = f"<|diff_start|><|old|>{old}<|new|>{new}<|commit_msg|>{msg}<|diff_end|>"
-                    ids = self.tok.encode(text, add_special_tokens=False)
+    # ── 3. 验证 padding ratio < 5% ──────────────────────────────────────
+    stats = compute_packing_stats(packed)
+    print(f"[stage2] packing stats: {stats}")
+    if not stats.get("meets_5pct_target", True):
+        print(
+            f"[stage2] WARNING: padding_ratio={stats['padding_ratio']:.3%} "
+            f"exceeds 5% target. Check commit length distribution."
+        )
 
-                ids = ids[:self.sl]
-                if len(ids) < 32:
-                    continue
-                if len(ids) < self.sl:
-                    ids += [self.tok.eos_token_id] * (self.sl - len(ids))
-                t = torch.tensor(ids, dtype=torch.long)
-                yield {"input_ids": t, "labels": t}
+    # ── 4. 封装成 Dataset ────────────────────────────────────────────────
+    class PackedDataset(Dataset):
+        def __init__(self, sequences):
+            self.sequences = sequences
 
-    ds = CommitDataset(tokenizer, seq_len)
-    return DataLoader(ds, batch_size=batch_size)
+        def __len__(self):
+            return len(self.sequences)
+
+        def __getitem__(self, idx):
+            tokens = torch.tensor(self.sequences[idx].tokens, dtype=torch.long)
+            return {"input_ids": tokens, "labels": tokens}
+
+    ds = PackedDataset(packed)
+
+    # ── 5. HeteroBatchSampler: 按 GPU 显存比例分配 batch ─────────────────
+    gpu_tiers = detect_gpu_tiers()  # {rank: vram_gb}
+    hetero_sampler = HeteroBatchSampler(
+        sequences=packed,
+        gpu_mem_map=gpu_tiers if gpu_tiers else {0: 96, 1: 49},
+        base_batch=batch_size,
+        verbose=True,
+    )
+
+    # DataLoader wraps the hetero sampler; collation handled per-batch
+    def _collate(items):
+        input_ids = torch.stack([i["input_ids"] for i in items])
+        return {"input_ids": input_ids, "labels": input_ids}
+
+    return DataLoader(ds, batch_size=batch_size, sampler=None,
+                      collate_fn=_collate,
+                      batch_sampler=_HeteroBatchSamplerAdapter(hetero_sampler, ds))
+
+
+class _HeteroBatchSamplerAdapter:
+    """Bridge HeteroBatchSampler (yields {rank: [PackedSequence]}) to a flat
+    index-based batch_sampler that PyTorch DataLoader expects (yields [int])."""
+
+    def __init__(self, hetero_sampler, dataset):
+        self._sampler = hetero_sampler
+        self._dataset = dataset
+        # Build a reverse index: PackedSequence id → dataset index
+        self._seq_to_idx = {id(seq): i for i, seq in enumerate(dataset.sequences)}
+
+    def __iter__(self):
+        for batch_per_rank in self._sampler:
+            indices = []
+            for seqs in batch_per_rank.values():
+                for seq in seqs:
+                    idx = self._seq_to_idx.get(id(seq))
+                    if idx is not None:
+                        indices.append(idx)
+            if indices:
+                yield indices
+
+    def __len__(self):
+        return len(self._sampler)
 
 
 def load_stage3_data(tokenizer, seq_len, batch_size, data_path=None):
-    """Stage 3: CommitPackFT instruction tuning."""
-    from torch.utils.data import DataLoader, IterableDataset
+    """Stage 3: CommitPackFT instruction tuning — uses CommitSequencePacker + HeteroBatchSampler."""
+    import json as _json, glob
+    from torch.utils.data import DataLoader, Dataset
+    from datasets.bigcode.commit_packing import (
+        CommitSequencePacker, HeteroBatchSampler, compute_packing_stats,
+    )
 
-    class InstructDataset(IterableDataset):
-        def __init__(self, tok, sl):
-            self.tok = tok
-            self.sl = sl
+    # ── 1. 收集指令格式 commit 样本 ─────────────────────────────────────
+    files = sorted(glob.glob("datasets/bigcode/commitpackft/*.jsonl"))
+    raw_samples = []
+    for f in files:
+        for line in open(f):
+            d = _json.loads(line)
+            old = d.get("old_contents", "")[:1000]
+            new = d.get("new_contents", "")[:1000]
+            msg = d.get("subject", "")
+            # Instruction format wrapped as single text for packer
+            text = (
+                f"<commit_before>\n{old}\n"
+                f"<commit_msg>\n{msg}\n"
+                f"<commit_after>\n{new}"
+            )
+            raw_samples.append({"text": text})
 
-        def __iter__(self):
-            import json as _json, glob
-            files = sorted(glob.glob("datasets/bigcode/commitpackft/*.jsonl"))
-            for f in files:
-                for line in open(f):
-                    d = _json.loads(line)
-                    # Instruction format: [INST] given diff, what's the commit message? [/INST]
-                    old = d.get("old_contents", "")[:1000]
-                    new = d.get("new_contents", "")[:1000]
-                    msg = d.get("subject", "")
-                    prompt = f"<|diff_start|><|old|>{old}<|new|>{new}<|diff_end|>"
-                    response = f"<|commit_msg|>{msg}"
-                    full = prompt + response
-                    ids = self.tok.encode(full, add_special_tokens=False)[:self.sl]
-                    if len(ids) < 32:
-                        continue
-                    if len(ids) < self.sl:
-                        ids += [self.tok.eos_token_id] * (self.sl - len(ids))
-                    t = torch.tensor(ids, dtype=torch.long)
-                    yield {"input_ids": t, "labels": t}
+    # ── 2. CommitSequencePacker: 替代手动 tokenize+pad ──────────────────
+    pad_id = getattr(tokenizer, "eos_token_id", 0) or 0
+    packer = CommitSequencePacker(tokenizer=tokenizer, seq_len=seq_len, pad_token_id=pad_id)
+    packed = packer.pack_dataset(iter(raw_samples))
 
-    ds = InstructDataset(tokenizer, seq_len)
-    return DataLoader(ds, batch_size=batch_size)
+    # ── 3. 验证 padding ratio < 5% ──────────────────────────────────────
+    stats = compute_packing_stats(packed)
+    print(f"[stage3] packing stats: {stats}")
+    if not stats.get("meets_5pct_target", True):
+        print(
+            f"[stage3] WARNING: padding_ratio={stats['padding_ratio']:.3%} "
+            f"exceeds 5% target. Check commit length distribution."
+        )
+
+    # ── 4. 封装成 Dataset ────────────────────────────────────────────────
+    class PackedDataset(Dataset):
+        def __init__(self, sequences):
+            self.sequences = sequences
+
+        def __len__(self):
+            return len(self.sequences)
+
+        def __getitem__(self, idx):
+            tokens = torch.tensor(self.sequences[idx].tokens, dtype=torch.long)
+            return {"input_ids": tokens, "labels": tokens}
+
+    ds = PackedDataset(packed)
+
+    # ── 5. HeteroBatchSampler: 按 GPU 显存比例分配 batch ─────────────────
+    gpu_tiers = detect_gpu_tiers()  # {rank: vram_gb}
+    hetero_sampler = HeteroBatchSampler(
+        sequences=packed,
+        gpu_mem_map=gpu_tiers if gpu_tiers else {0: 96, 1: 49},
+        base_batch=batch_size,
+        verbose=True,
+    )
+
+    def _collate(items):
+        input_ids = torch.stack([i["input_ids"] for i in items])
+        return {"input_ids": input_ids, "labels": input_ids}
+
+    return DataLoader(ds, batch_size=batch_size, sampler=None,
+                      collate_fn=_collate,
+                      batch_sampler=_HeteroBatchSamplerAdapter(hetero_sampler, ds))
 
 
 # ── 单阶段训练循环 ──
