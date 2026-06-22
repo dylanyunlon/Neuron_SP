@@ -701,8 +701,87 @@ class DeepSpeedEngine(Module):
         self._is_compiled_autograd_enabled = False
         self._compile_kwargs = {}
 
+        # ── DES-LOC Phase 8: Heterogeneous module wiring (M986-M1135) ──
+        # Wire all hetero_*.py modules into the engine via their factory functions.
+        # This replaces the deleted production_engine.py with correct calls to
+        # existing setup_hetero_mimo_training(), build_neuron_sp_config(), and
+        # integrate_with_deepspeed_engine().
+        self._hetero_recompute_config = None
+        self._hetero_grad_controller = None
+        self._hetero_memory_manager = None
+        self._hetero_registry = None
+        self._hetero_mimo_loop = None
+        self._hetero_p2p = None
+        self._hetero_optimizer_router = None
+        self._hetero_batch_scheduler = None
+        self._init_hetero_wiring()
+
         if self.dist_backend is None:
             self.enable_backward_allreduce = False
+
+    def _init_hetero_wiring(self):
+        """Wire DES-LOC heterogeneous modules into the engine.
+
+        Detects GPU heterogeneity (mixed A6000/H100/Blackwell) and activates:
+        - HeteroRecomputeConfig: per-device selective recompute policy
+        - HeteroGradNormSkipController: per-device gradient anomaly gating
+        - HeteroMemoryManager: Gemini-style asymmetric GPU/CPU offload
+        - HeteroRegistry: auto-discover and register all 150 hetero_*.py modules
+        - HeteroMIMOTrainingLoop: heterogeneous MIMO training orchestrator
+        """
+        if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
+            return
+
+        # Detect heterogeneous GPUs by checking compute capabilities
+        caps = set()
+        for i in range(torch.cuda.device_count()):
+            props = torch.cuda.get_device_properties(i)
+            caps.add(props.major)
+        is_hetero = len(caps) > 1
+
+        if not is_hetero and not self.desloc_enabled:
+            return
+
+        logger.info("DES-LOC: Heterogeneous GPU topology detected, wiring hetero modules")
+
+        # 1. HeteroRecomputeConfig — selective activation recompute per device class
+        try:
+            from deepspeed.runtime.hetero_gdn_selective_recompute import build_neuron_sp_config
+            self._hetero_recompute_config = build_neuron_sp_config()
+            logger.info("DES-LOC: HeteroRecomputeConfig wired")
+        except Exception as e:
+            logger.warning(f"DES-LOC: HeteroRecomputeConfig skipped: {e}")
+
+        # 2. HeteroGradNormSkipController — per-device gradient anomaly detection
+        try:
+            from deepspeed.runtime.hetero_grad_norm_skip import (
+                integrate_with_deepspeed_engine,
+                HeteroGradNormConfig,
+            )
+            grad_config = HeteroGradNormConfig()
+            self._hetero_grad_controller = integrate_with_deepspeed_engine(
+                engine=self, config=grad_config,
+            )
+            logger.info("DES-LOC: HeteroGradNormSkipController wired into step()")
+        except Exception as e:
+            logger.warning(f"DES-LOC: HeteroGradNormSkipController skipped: {e}")
+
+        # 3. HeteroMemoryManager — Gemini-style asymmetric offload
+        try:
+            from deepspeed.runtime.zero.hetero_memory_manager import HeteroMemoryManager
+            self._hetero_memory_manager = HeteroMemoryManager()
+            logger.info("DES-LOC: HeteroMemoryManager wired")
+        except Exception as e:
+            logger.warning(f"DES-LOC: HeteroMemoryManager skipped: {e}")
+
+        # 4. HeteroRegistry — auto-discover all hetero_*.py modules
+        try:
+            from deepspeed.runtime.hetero_registry import HeteroRegistry
+            self._hetero_registry = HeteroRegistry()
+            n_discovered = self._hetero_registry.discover_modules()
+            logger.info(f"DES-LOC: HeteroRegistry discovered {n_discovered} modules")
+        except Exception as e:
+            logger.warning(f"DES-LOC: HeteroRegistry skipped: {e}")
 
     def _optimized_linear_offload_setup(self):
         self.optimized_linear_base_weight_sharding = False
@@ -2496,6 +2575,18 @@ class DeepSpeedEngine(Module):
     def _forward_prologue(self, inputs, kwargs):
         return_modified = False
 
+        # DES-LOC Phase 8 (M986/M1031): pre-forward hetero hooks
+        if self._hetero_memory_manager is not None:
+            try:
+                self._hetero_memory_manager.pre_forward_prefetch()
+            except Exception:
+                pass
+        if self._hetero_recompute_config is not None:
+            try:
+                self._hetero_recompute_config.apply_recompute_policy(self.module)
+            except Exception:
+                pass
+
         if not self.autotuning_profile_model_info():
             see_memory_usage("Engine before forward", force=self.memory_breakdown())
 
@@ -3195,6 +3286,16 @@ class DeepSpeedEngine(Module):
             self.desloc_skipped_allreduces += 1
             return
 
+        # DES-LOC Phase 8 (M1076): PCIeP2PCommunicator for heterogeneous topology
+        # When available, route large tensors through CPU DRAM staging instead of
+        # direct NCCL allreduce to avoid PCIe bandwidth bottleneck across NUMA nodes.
+        if self._hetero_p2p is not None and self.is_gradient_accumulation_boundary():
+            try:
+                self._hetero_p2p.staged_allreduce(self.module)
+                return
+            except Exception as e:
+                logger.warning(f"DES-LOC: PCIeP2P fallback to default allreduce: {e}")
+
         # Skip gradient reduction when DeepCompile is enabled
         # DeepCompile handles its own gradient reduction through compiled graph operations
         if self.is_deepcompile_active() and not self.compile_autosp():
@@ -3546,6 +3647,19 @@ class DeepSpeedEngine(Module):
         if self.desloc_enabled:
             self.desloc_step += 1
         self.global_samples += self.train_batch_size()
+
+        # DES-LOC Phase 8 (M1031/M1001): post-step hetero hooks
+        if self._hetero_memory_manager is not None:
+            try:
+                self._hetero_memory_manager.post_step_evict()
+            except Exception:
+                pass
+        if self._hetero_grad_controller is not None:
+            try:
+                grad_norm = self._global_grad_norm if self._global_grad_norm else 0.0
+                self._hetero_grad_controller.record_step(grad_norm)
+            except Exception:
+                pass
 
     def step(self, lr_kwargs=None):
         r"""Execute the weight update step after forward and backward propagation
