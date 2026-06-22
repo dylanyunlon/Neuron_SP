@@ -139,6 +139,16 @@ class PipelineConfig:
     # Legacy
     decoder_seq_length: int = None
 
+    # DES-LOC M730: position encoding A/B comparison framework
+    # Selects the position encoding applied across all pipeline stages.
+    #   'rotary'  — NeoX RoPE (M686, deepspeed/runtime/pipe/rotary.py)
+    #   'alibi'   — BLOOM ALiBi (M716, deepspeed/runtime/pipe/alibi.py)
+    #   'learned' — classic learned absolute embeddings (pre-M686 default)
+    # This switch is read by PipelineModule and the transformer block builder;
+    # only one encoding is active per run. Changing this requires re-init of
+    # the model (slopes / freqs are computed at construction time).
+    position_encoding_type: str = "learned"
+
     def __post__init__(self):
         if self.pipeline_dtype is None:
             raise ValueError("When using pipeline parallelism, pipeline_dtype must be specified")
@@ -164,3 +174,12 @@ class PipelineConfig:
         print('[M1506] PipelineConfig.__post__init__: overlap_p2p_comm=%s '
               'batch_p2p_comm=%s batch_p2p_sync=%s' % (
                   self.overlap_p2p_comm, self.batch_p2p_comm, self.batch_p2p_sync))
+        # DES-LOC M730: validate position_encoding_type for A/B comparison
+        _valid_pe = {'rotary', 'alibi', 'learned'}
+        if self.position_encoding_type not in _valid_pe:
+            raise ValueError(
+                f"position_encoding_type must be one of {sorted(_valid_pe)}, "
+                f"got '{self.position_encoding_type}' (Neuron_SP M730)."
+            )
+        print('[M730] PipelineConfig.__post__init__: position_encoding_type=%s' % (
+            self.position_encoding_type))

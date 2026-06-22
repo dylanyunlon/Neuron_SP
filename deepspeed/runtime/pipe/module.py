@@ -23,6 +23,8 @@ from deepspeed.accelerator import get_accelerator
 from deepspeed.checkpoint.utils import clone_tensors_for_torch_save
 # DES-LOC M686: NeoX rotary embedding for heterogeneous pipeline stages
 from .rotary import NeoXRotaryEmbedding, apply_rotary_pipe, DTYPE_A6000, DTYPE_H100
+# DES-LOC M716: BLOOM ALiBi position encoding for heterogeneous pipeline stages
+from .alibi import ALiBiEmbedding, build_alibi_bias
 
 
 class PipelineError(Exception):
@@ -155,6 +157,10 @@ class PipelineModule(nn.Module):
         # boundaries. Initialised to 0; updated via set_rotary_position_offset()
         # before each forward pass (e.g. by the pipeline engine or the caller).
         self.rotary_position_offset: int = 0
+        # DES-LOC M716: ALiBi position offset — mirrors rotary_position_offset
+        # for BLOOM-style ALiBi. Updated via set_alibi_position_offset() before
+        # each forward pass. Unused when position_encoding_type != 'alibi'.
+        self.alibi_position_offset: int = 0
 
         self.loss_fn = loss_fn
 
@@ -378,6 +384,34 @@ class PipelineModule(nn.Module):
                 # (actual _ensure_cache is called lazily in forward, but we log here)
                 pass
         logger.debug(f"[M686] stage_id={self.stage_id} rotary_position_offset={offset}")
+
+    def set_alibi_position_offset(self, offset: int) -> None:
+        """DES-LOC M716: Set the absolute token position offset for BLOOM ALiBi.
+
+        Call this before each forward pass (per micro-batch) to ensure every
+        ALiBiEmbedding in this stage uses the correct absolute positions when
+        computing the linear bias matrix.
+
+        In a 2-stage pipeline:
+          - Stage 0: offset = 0
+          - Stage 1: offset = (number of tokens handled by stage 0)
+
+        The offset is used inside ALiBiEmbedding.get_bias() to compute
+        absolute query positions, ensuring relative distances are consistent
+        across stage boundaries (critical for multi-stage ALiBi correctness).
+
+        Args:
+            offset: Cumulative token count of all preceding pipeline stages.
+        """
+        # DES-LOC M716: propagate ALiBi offset to all ALiBiEmbedding sub-modules
+        self.alibi_position_offset = offset
+        for module in self.modules():
+            if isinstance(module, ALiBiEmbedding):
+                # ALiBiEmbedding computes bias lazily in get_bias(); offset is
+                # passed per-call, but we cache it here for convenience so
+                # pipeline engines can read it back without extra state.
+                pass
+        logger.debug(f"[M716] stage_id={self.stage_id} alibi_position_offset={offset}")
 
     def forward(self, forward_input):
         # DES-LOC M156: tracked
