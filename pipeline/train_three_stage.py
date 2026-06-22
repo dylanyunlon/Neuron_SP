@@ -8,7 +8,7 @@ Stage 2: continue_commit — CommitPack diff 序列 → 学增量修改
 Stage 3: instruct_tune   — CommitPackFT → 指令对齐
 
 每个 stage 结束时保存 checkpoint, 下个 stage 从 checkpoint 恢复后
-重新初始化 optimizer (lr schedule 从头开始).
+重新初始化 HeteroMIMOTrainingLoop (lr schedule 从头开始).
 
 Usage:
     # 完整三阶段
@@ -36,7 +36,8 @@ import torch.nn as nn
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from pipeline.unified_tokenizer import build_megatron_tokenizer, get_tokenizer
-from pipeline.engine_bridge import DESLOCEngine, build_ds_config, detect_gpu_tiers, compute_shard_ratios
+from pipeline.engine_bridge import build_ds_config, detect_gpu_tiers, compute_shard_ratios
+from deepspeed.runtime.hetero_mimo_training_loop import setup_hetero_mimo_training, HeteroMIMOTrainingLoop
 
 
 # ── 模型构建 ──
@@ -246,8 +247,84 @@ def load_stage3_data(tokenizer, seq_len, batch_size, data_path=None):
 
 # ── 单阶段训练循环 ──
 
+def _make_forward_backward_func(model: nn.Module):
+    """返回适配 HeteroMIMOTrainingLoop.train_step() 的 forward_backward_func.
+
+    HeteroMIMOTrainingLoop.train_step() 期望的签名:
+        forward_backward_func(
+            forward_only, p2p_communicator, pg_collection,
+            data_iterator, model, config, iteration
+        ) -> List[Tensor]
+
+    这里用闭包把实际的模型前向 + loss 计算封装进去.
+    """
+    def forward_backward_func(
+        *,
+        forward_only: bool,
+        p2p_communicator,
+        pg_collection,
+        data_iterator,
+        model: nn.Module,
+        config,
+        iteration: int,
+        **kwargs,
+    ):
+        try:
+            batch = next(data_iterator)
+        except StopIteration:
+            return []
+
+        input_ids = batch["input_ids"]
+        labels = batch["labels"]
+
+        # Move to model device if possible
+        try:
+            device = next(model.parameters()).device
+            input_ids = input_ids.to(device)
+            labels = labels.to(device)
+        except StopIteration:
+            pass
+
+        if forward_only:
+            with torch.no_grad():
+                outputs = model(input_ids=input_ids, labels=labels)
+            loss = outputs.loss
+        else:
+            outputs = model(input_ids=input_ids, labels=labels)
+            loss = outputs.loss
+            if loss is not None:
+                loss.backward()
+
+        return [loss] if loss is not None else []
+
+    return forward_backward_func
+
+
+def _save_model_checkpoint(model: nn.Module, save_path: str, tag: str) -> None:
+    """保存模型权重到 checkpoint 文件 (torch.save)."""
+    os.makedirs(save_path, exist_ok=True)
+    ckpt_file = os.path.join(save_path, f"{tag}.pt")
+    # unwrap potential DeepSpeed / DDP wrapper
+    unwrapped = getattr(model, "module", model)
+    torch.save(unwrapped.state_dict(), ckpt_file)
+    print(f"[checkpoint] model weights saved: {ckpt_file}")
+
+
+def _load_model_checkpoint(model: nn.Module, save_path: str, tag: str) -> None:
+    """从 checkpoint 文件恢复模型权重."""
+    ckpt_file = os.path.join(save_path, f"{tag}.pt")
+    if not os.path.exists(ckpt_file):
+        print(f"[checkpoint] WARNING: {ckpt_file} not found, skipping load")
+        return
+    state_dict = torch.load(ckpt_file, map_location="cpu")
+    unwrapped = getattr(model, "module", model)
+    unwrapped.load_state_dict(state_dict)
+    print(f"[checkpoint] model weights loaded: {ckpt_file}")
+
+
 def train_one_stage(
-    engine: DESLOCEngine,
+    loop: HeteroMIMOTrainingLoop,
+    model: nn.Module,
     dataloader,
     max_steps: int,
     stage_name: str,
@@ -255,46 +332,52 @@ def train_one_stage(
     save_interval: int = 1000,
     save_path: str = "checkpoints",
 ):
-    """一个阶段的训练循环."""
+    """一个阶段的训练循环, 基于 HeteroMIMOTrainingLoop."""
     print(f"\n{'='*60}")
     print(f"  {stage_name}: max_steps={max_steps}")
     print(f"{'='*60}\n")
 
     os.makedirs(save_path, exist_ok=True)
-    engine.step_count = 0
+
+    # 构造 forward_backward_func (闭包, 包含模型引用)
+    forward_backward_func = _make_forward_backward_func(model)
+
+    # 简单 config 对象 (lr schedule 占位)
+    class _Config:
+        pass
+    config = _Config()
+
     total_loss = 0.0
     t0 = time.time()
-
     data_iter = iter(dataloader)
-    for step in range(1, max_steps + 1):
-        try:
-            batch = next(data_iter)
-        except StopIteration:
-            data_iter = iter(dataloader)
-            batch = next(data_iter)
 
-        loss = engine.train_step(
-            input_ids=batch["input_ids"],
-            labels=batch["labels"],
-        )
-        total_loss += loss
+    for step in range(1, max_steps + 1):
+        # 用 iteration_scope 管理 cache 淘汰
+        with loop.iteration_scope(step - 1):
+            result = loop.train_step(
+                forward_backward_func=forward_backward_func,
+                data_iterator=data_iter,
+                config=config,
+                iteration=step - 1,
+            )
+
+        loss_val = result.loss if not math.isnan(result.loss) else 0.0
+        total_loss += loss_val
 
         if step % log_interval == 0:
             avg_loss = total_loss / log_interval
             elapsed = time.time() - t0
-            tokens_per_sec = (step * batch["input_ids"].numel()) / elapsed
-            lr = engine.current_lr()
             print(f"  [{stage_name}] step={step}/{max_steps}  "
-                  f"loss={avg_loss:.4f}  lr={lr:.2e}  "
-                  f"tok/s={tokens_per_sec:.0f}  "
+                  f"loss={avg_loss:.4f}  grad_norm={result.grad_norm:.4f}  "
+                  f"cross_pool_transfers={result.cross_pool_transfers}  "
                   f"elapsed={elapsed:.0f}s")
             total_loss = 0.0
 
         if step % save_interval == 0:
-            engine.save_checkpoint(save_path, tag=f"{stage_name}_step{step}")
+            _save_model_checkpoint(model, save_path, tag=f"{stage_name}_step{step}")
 
     # 阶段结束保存
-    engine.save_checkpoint(save_path, tag=f"{stage_name}_final")
+    _save_model_checkpoint(model, save_path, tag=f"{stage_name}_final")
     print(f"\n  [{stage_name}] done. {max_steps} steps, {time.time()-t0:.0f}s total\n")
 
 
@@ -302,7 +385,7 @@ def train_one_stage(
 
 def run_three_stage(args):
     """主入口."""
-    print("[pipeline] DES-LOC Three-Stage Pretraining")
+    print("[pipeline] DES-LOC Three-Stage Pretraining (HeteroMIMOTrainingLoop)")
     print(f"  stages: {args.stages}")
     print(f"  model: hidden={args.hidden_size}, layers={args.num_layers}, heads={args.num_heads}")
     print(f"  seq_len={args.seq_len}, batch_size={args.batch_size}")
@@ -311,7 +394,7 @@ def run_three_stage(args):
     tok = build_megatron_tokenizer()
     hf_tok = tok.tokenizer  # underlying HF tokenizer for data loading
 
-    # Model
+    # Model — 在三个 stage 间共享, 通过 checkpoint 传递权重
     model = build_model(
         vocab_size=tok.vocab_size,
         hidden_size=args.hidden_size,
@@ -324,62 +407,39 @@ def run_three_stage(args):
     stages_to_run = [int(s) for s in args.stages.split(",")]
 
     for stage_num in stages_to_run:
-        # 每个阶段重新构建 engine (新的 optimizer + lr schedule)
+        # 每个 stage 重新调用 setup_hetero_mimo_training → 新的 optimizer + lr schedule
         if stage_num == 1:
             max_steps = args.stage1_steps
-            ds_config = build_ds_config(
-                train_batch_size=args.batch_size * args.gradient_accumulation,
-                micro_batch_size=args.batch_size,
-                gradient_accumulation_steps=args.gradient_accumulation,
-                learning_rate=args.stage1_lr,
-                warmup_steps=args.warmup_steps,
-                total_steps=max_steps,
-            )
             dataloader = load_stage1_data(hf_tok, args.seq_len, args.batch_size, args.data_path)
             stage_name = "stage1_base_code"
 
         elif stage_num == 2:
             max_steps = args.stage2_steps
-            ds_config = build_ds_config(
-                train_batch_size=args.batch_size * args.gradient_accumulation,
-                micro_batch_size=args.batch_size,
-                gradient_accumulation_steps=args.gradient_accumulation,
-                learning_rate=args.stage2_lr,
-                warmup_steps=args.warmup_steps // 2,
-                total_steps=max_steps,
-            )
             dataloader = load_stage2_data(hf_tok, args.seq_len, args.batch_size, args.data_path)
             stage_name = "stage2_commit_cpt"
 
         elif stage_num == 3:
             max_steps = args.stage3_steps
-            ds_config = build_ds_config(
-                train_batch_size=args.batch_size * args.gradient_accumulation,
-                micro_batch_size=args.batch_size,
-                gradient_accumulation_steps=args.gradient_accumulation,
-                learning_rate=args.stage3_lr,
-                warmup_steps=args.warmup_steps // 4,
-                total_steps=max_steps,
-            )
             dataloader = load_stage3_data(hf_tok, args.seq_len, args.batch_size, args.data_path)
             stage_name = "stage3_instruct"
+
         else:
             raise ValueError(f"Unknown stage: {stage_num}")
 
-        engine = DESLOCEngine(model, ds_config)
-        engine.init()
-
-        # 从上一阶段的 checkpoint 恢复 (模型权重, 但不恢复 optimizer)
+        # 从上一阶段 checkpoint 恢复模型权重 (optimizer 不恢复, 从头 warm-up)
         if args.resume_from and stage_num == stages_to_run[0]:
-            engine.load_checkpoint(args.resume_from)
+            _load_model_checkpoint(model, args.resume_from, tag="model_weights")
         elif stage_num > 1:
-            prev_tag = f"stage{stage_num-1}_{'base_code' if stage_num==2 else 'commit_cpt'}_final"
-            ckpt_path = os.path.join(args.checkpoint_dir, prev_tag)
-            if os.path.exists(os.path.join(args.checkpoint_dir, prev_tag)):
-                engine.load_checkpoint(args.checkpoint_dir, tag=prev_tag)
+            prev_name = "stage1_base_code" if stage_num == 2 else "stage2_commit_cpt"
+            prev_tag = f"{prev_name}_final"
+            _load_model_checkpoint(model, args.checkpoint_dir, tag=prev_tag)
+
+        # 每个 stage 构建新的 HeteroMIMOTrainingLoop (新 optimizer / lr schedule)
+        loop: HeteroMIMOTrainingLoop = setup_hetero_mimo_training(model)
 
         train_one_stage(
-            engine=engine,
+            loop=loop,
+            model=model,
             dataloader=dataloader,
             max_steps=max_steps,
             stage_name=stage_name,
@@ -387,9 +447,6 @@ def run_three_stage(args):
             save_interval=args.save_interval,
             save_path=args.checkpoint_dir,
         )
-
-        # 取出模型权重给下一个 stage 用
-        model = engine.engine.module
 
     print("\n[pipeline] All stages complete.")
 
