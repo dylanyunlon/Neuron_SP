@@ -23,7 +23,7 @@ cat MULTI_CLAUDE_PLAN.md
 5. **不用 v2/v3/port/alt/bak 等后缀**
 6. **改的是算法** — 不改字符串/docstring/str_replace 表面功夫
 7. **Signed-off-by** — 所有 commit 必须 `--signoff`
-8. **作者信息**: dylanyunlong <dylanyunlong@gmail.com>
+8. **作者信息**: dylanyunlon <dogechat@163.com>
 9. **push 方式**:
    ```bash
    git remote set-url origin https://x-access-token:$GIT_TOKEN@github.com/dylanyunlon/Neuron_SP.git
