@@ -47,6 +47,11 @@ from megatron.core.datasets.commit_dataset import (
     CommitDatasetConfig,
     build_commit_datasets,
 )
+from megatron.core.datasets.commitpack_streaming_dataset import (
+    CommitPackStreamingDataset,
+    CommitPackStreamingConfig,
+    build_commitpack_dataloader,
+)
 from megatron.training.utils import (
     get_batch_on_this_cp_rank,
     get_batch_on_this_tp_rank,
@@ -213,6 +218,61 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
     return train_ds, valid_ds, test_ds
 
 
+def train_valid_test_datasets_provider_streaming(train_val_test_num_samples):
+    """
+    Build CommitPack streaming datasets for train/valid/test.
+
+    Used when --commitpack-streaming is set.  Returns an IterableDataset
+    for train and falls back to the static CommitDataset for valid/test
+    (streaming validation is not yet supported by Megatron's eval loop).
+    """
+    args = get_args()
+    rank = parallel_state.get_data_parallel_rank()
+    world_size = parallel_state.get_data_parallel_world_size()
+
+    languages_str = getattr(args, 'commitpack_languages', 'python')
+    languages = [l.strip() for l in languages_str.split(',')]
+
+    resume_path = getattr(args, 'commitpack_resume_path', None)
+    tokenizer_name = getattr(args, 'commitpack_tokenizer', 'gpt2')
+
+    print_rank_0(
+        f"> building CommitPack streaming dataset: "
+        f"langs={languages}, rank={rank}/{world_size}"
+    )
+
+    train_config = CommitPackStreamingConfig(
+        languages=languages,
+        split="train",
+        seq_length=args.seq_length,
+        micro_batch_size=args.micro_batch_size,
+        rank=rank,
+        world_size=world_size,
+        tokenizer_name=tokenizer_name,
+        resume_path=resume_path,
+        prefetch_batches=getattr(args, 'commitpack_prefetch_batches', 8),
+        tokenizer_workers=getattr(args, 'commitpack_tokenizer_workers', 8),
+        numa_aware=getattr(args, 'commitpack_numa_aware', True),
+    )
+    train_ds = CommitPackStreamingDataset(train_config)
+
+    # valid / test: reuse static CommitDataset if commit_data_path available
+    commit_data_path = getattr(args, 'commit_data_path', None)
+    if commit_data_path:
+        _, valid_ds, test_ds = build_commit_datasets(
+            data_path=commit_data_path,
+            seq_length=args.seq_length,
+            tokenizer=None,
+            seed=args.seed,
+        )
+    else:
+        # Minimal dummy datasets so Megatron eval loop doesn't crash
+        valid_ds = train_ds
+        test_ds = train_ds
+
+    return train_ds, valid_ds, test_ds
+
+
 def add_commit_args(parser):
     """Add commit-specific arguments."""
     group = parser.add_argument_group(title='commit pretraining')
@@ -220,7 +280,7 @@ def add_commit_args(parser):
         '--commit-data-path',
         type=str,
         default=None,
-        help='Path to formatted commit corpus (file or directory)',
+        help='Path to formatted commit corpus for static dataset (file or directory)',
     )
     group.add_argument(
         '--fim-rate',
@@ -234,6 +294,52 @@ def add_commit_args(parser):
         default=0.5,
         help='Loss weight for <CTX> (context) lines in diffs',
     )
+    # ── CommitPack streaming 参数 ─────────────────────────────────────────────
+    group.add_argument(
+        '--commitpack-streaming',
+        action='store_true',
+        default=False,
+        help='Use CommitPack 4TB HuggingFace streaming dataset instead of local files',
+    )
+    group.add_argument(
+        '--commitpack-languages',
+        type=str,
+        default='python',
+        help='Comma-separated list of CommitPack language subsets, e.g. "python,javascript,typescript"',
+    )
+    group.add_argument(
+        '--commitpack-tokenizer',
+        type=str,
+        default='gpt2',
+        help='HuggingFace tokenizer name or local path for CommitPack streaming',
+    )
+    group.add_argument(
+        '--commitpack-resume-path',
+        type=str,
+        default=None,
+        help='Base path for CommitPack resume JSON files (suffix _rankN.json added automatically)',
+    )
+    group.add_argument(
+        '--commitpack-prefetch-batches',
+        type=int,
+        default=8,
+        dest='commitpack_prefetch_batches',
+        help='Number of batches to prefetch asynchronously into GPU memory',
+    )
+    group.add_argument(
+        '--commitpack-tokenizer-workers',
+        type=int,
+        default=8,
+        dest='commitpack_tokenizer_workers',
+        help='Number of CPU threads for parallel tokenization (default: 8, EPYC can handle 32+)',
+    )
+    group.add_argument(
+        '--commitpack-numa-aware',
+        action='store_true',
+        default=True,
+        dest='commitpack_numa_aware',
+        help='Pin prefetch threads to NUMA node matching each GPU (default: True)',
+    )
     return parser
 
 
@@ -242,8 +348,18 @@ if __name__ == "__main__":
     from megatron.training.arguments import parse_args
     extra_args_provider = add_commit_args
 
+    # Select dataset provider based on --commitpack-streaming flag
+    import sys
+    use_streaming = '--commitpack-streaming' in sys.argv
+
+    dataset_provider = (
+        train_valid_test_datasets_provider_streaming
+        if use_streaming
+        else train_valid_test_datasets_provider
+    )
+
     pretrain(
-        train_valid_test_datasets_provider,
+        dataset_provider,
         model_provider,
         ModelType.encoder_or_decoder,
         forward_step,
