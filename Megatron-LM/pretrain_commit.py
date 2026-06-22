@@ -344,12 +344,22 @@ def add_commit_args(parser):
 
 
 if __name__ == "__main__":
+    # ── Pipeline mode: 三阶段训练 ──
+    import sys
+    if '--pipeline-mode' in sys.argv:
+        sys.argv.remove('--pipeline-mode')
+        # 使用 pipeline/ 的三阶段编排器
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+        from pipeline.train_three_stage import main as pipeline_main
+        pipeline_main()
+        sys.exit(0)
+
+    # ── Legacy mode: 原有 Megatron 单阶段训练 ──
     # Register custom args
     from megatron.training.arguments import parse_args
     extra_args_provider = add_commit_args
 
     # Select dataset provider based on --commitpack-streaming flag
-    import sys
     use_streaming = '--commitpack-streaming' in sys.argv
 
     dataset_provider = (

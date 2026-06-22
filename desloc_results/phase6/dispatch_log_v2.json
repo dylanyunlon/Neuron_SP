@@ -1,0 +1,30 @@
+{
+  "org": "1614c06d-0d73-4976-93bf-39f726707f8b",
+  "time": "2026-06-22T07:49:22Z",
+  "convs": {
+    "claude-17": {
+      "conv_id": "2be3697e-a56a-471e-92f9-c10bc31d920f",
+      "status": "send_429"
+    },
+    "claude-18": {
+      "conv_id": "a6e00edc-01e7-428a-8210-f7e535b44027",
+      "status": "ok"
+    },
+    "claude-19": {
+      "conv_id": "8071e9ef-a8a7-44f8-980b-fa64ac9b0a2f",
+      "status": "ok"
+    },
+    "claude-20": {
+      "conv_id": "be136448-5e4f-437b-a88e-a44a4fb20125",
+      "status": "send_429"
+    },
+    "claude-23": {
+      "conv_id": "87f39c52-1f02-439f-88b3-a6cc3673af76",
+      "status": "send_429"
+    },
+    "claude-24": {
+      "conv_id": "ffd99eb0-05a3-4630-8ddf-41225e60023c",
+      "status": "send_429"
+    }
+  }
+}
