@@ -1,0 +1,28 @@
+{
+  "task": "M731-M745",
+  "session": "Claude-20",
+  "dataset": "commitpackft",
+  "lang": "python",
+  "seq_len": 2048,
+  "max_samples": 100,
+  "num_sequences": 26,
+  "total_real_tokens": 53248,
+  "total_pad_tokens": 0,
+  "total_slots": 53248,
+  "padding_ratio": 0.0,
+  "meets_5pct_target": true,
+  "commits_packed": 100,
+  "avg_commits_per_seq": 3.85,
+  "real_token_stats": {
+    "mean": 2048.0,
+    "min": 2048,
+    "max": 2048
+  },
+  "hetero_batch_config": {
+    "H100_rank0_vram_gb": 96,
+    "A6000_rank1_vram_gb": 49,
+    "ratio_H100_vs_A6000": "~2x",
+    "base_batch": 1
+  },
+  "notes": "Validated on CommitPackFT Python subset (100 samples). Padding ratio 0.0% << 5% target. Short commits (<=256 tok) merged; long commits (>2048 tok) slid with stride=1024."
+}
