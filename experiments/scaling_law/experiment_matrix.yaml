@@ -1,0 +1,201 @@
+# Chinchilla Scaling Law Validation Experiment Matrix
+# Cluster: 2×A6000 (48GB each) + 1×H100-NVL (96GB), no NVLink
+# Reference: Hoffmann et al., 2022 — C_opt ≈ 20 × N
+#
+# Heterogeneous effective compute correction:
+#   A6000 BF16: 38.7 TFLOPS  ×2 = 77.4 TFLOPS
+#   H100-NVL BF16: 835 TFLOPS ×1 = 835 TFLOPS
+#   Total peak: 912.4 TFLOPS
+#   Effective (PCIe bottleneck, ~35% MFU): ~319 TFLOPS
+#   => tokens/s scales sub-linearly vs. homogeneous H100 cluster
+
+cluster:
+  gpus:
+    - index: 0
+      name: A6000
+      mem_gb: 48
+      bf16_tflops: 38.7
+      pcie_bw_gbs: 25
+      numa_node: 1
+    - index: 1
+      name: A6000
+      mem_gb: 48
+      bf16_tflops: 38.7
+      pcie_bw_gbs: 25
+      numa_node: 1
+    - index: 2
+      name: H100-NVL
+      mem_gb: 96
+      bf16_tflops: 835
+      pcie_bw_gbs: 50
+      numa_node: 1
+  interconnect: PCIe  # No NVLink — key heterogeneous overhead source
+
+experiments:
+  # ---------- Tiny: 70M ----------
+  - name: tiny_70m
+    model_size_label: Tiny
+    # Architecture
+    vocab_size: 32000
+    hidden_size: 512
+    num_layers: 8
+    num_heads: 8
+    intermediate_size: 1376
+    max_seq_len: 2048
+    # Chinchilla optimal budget
+    params_approx: 70e6
+    chinchilla_optimal_tokens: 1.4e9   # 20 × 70M
+    # Auto-selected by scaling_autoconfig.py (see comments)
+    zero_stage: 2             # 70M fits easily on a single GPU; ZeRO-2 avoids allgather overhead
+    pipeline_stages: 1        # No pipeline needed at this scale
+    micro_batch_size: 8
+    gradient_accumulation_steps: 8
+    global_batch_size: 131072  # 8 * 8 * 2048 tokens ≈ 128K tokens/step
+    # Derived training steps
+    total_steps: 10742         # ceil(1.4B / 130_048)
+    warmup_steps: 500
+    learning_rate: 6.0e-4      # Chinchilla lr ∝ 1/sqrt(N); scaled from 3e-4 at 1B
+    weight_decay: 0.1
+    # Heterogeneous placement: small model, replicate across all 3 GPUs (data parallel)
+    placement_strategy: data_parallel
+    # Estimated throughput on this cluster
+    estimated_tokens_per_sec: 42000
+    estimated_mfu_h100: 0.048   # small model underutilizes H100
+    estimated_wall_time_hours: 9.3
+    # Overhead metrics to record
+    record_pipeline_bubble_ratio: false
+    record_cross_numa_latency_ms: true
+    notes: "Warmup run; validates data pipeline + checkpoint. MFU expected low due to small matmuls."
+
+  # ---------- Small: 160M ----------
+  - name: small_160m
+    model_size_label: Small
+    vocab_size: 32000
+    hidden_size: 768
+    num_layers: 12
+    num_heads: 12
+    intermediate_size: 2048
+    max_seq_len: 2048
+    params_approx: 160e6
+    chinchilla_optimal_tokens: 3.2e9
+    zero_stage: 2
+    pipeline_stages: 1
+    micro_batch_size: 4
+    gradient_accumulation_steps: 16
+    global_batch_size: 131072
+    total_steps: 24414
+    warmup_steps: 1000
+    learning_rate: 4.0e-4
+    weight_decay: 0.1
+    placement_strategy: data_parallel
+    estimated_tokens_per_sec: 28000
+    estimated_mfu_h100: 0.11
+    estimated_wall_time_hours: 31.7
+    record_pipeline_bubble_ratio: false
+    record_cross_numa_latency_ms: true
+    notes: "First scaling point. Expect near-linear loss decrease with data."
+
+  # ---------- Medium: 410M ----------
+  - name: medium_410m
+    model_size_label: Medium
+    vocab_size: 32000
+    hidden_size: 1024
+    num_layers: 24
+    num_heads: 16
+    intermediate_size: 2730
+    max_seq_len: 2048
+    params_approx: 410e6
+    chinchilla_optimal_tokens: 8.2e9
+    # At 410M the model starts to stress A6000 memory with large batches
+    zero_stage: 3             # ZeRO-3 to shard optimizer states across GPUs
+    pipeline_stages: 2        # Split: layers 0-11 on [A6000×2 ZeRO], layers 12-23 on H100
+    micro_batch_size: 2
+    gradient_accumulation_steps: 32
+    global_batch_size: 131072
+    total_steps: 62500
+    warmup_steps: 2000
+    learning_rate: 2.5e-4
+    weight_decay: 0.1
+    # Heterogeneous pipeline: A6000 pair handles embedding + first half, H100 second half + lm_head
+    placement_strategy: pipeline_hetero
+    h100_layers: [12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]
+    a6000_layers: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+    estimated_tokens_per_sec: 12000
+    estimated_mfu_h100: 0.28
+    estimated_wall_time_hours: 190   # ~8 days; reduce by using subset (see notes)
+    record_pipeline_bubble_ratio: true   # Key metric for heterogeneous scaling paper
+    record_cross_numa_latency_ms: true
+    notes: |
+      Pipeline bubble ratio expected high (~0.33) due to asymmetric stage compute.
+      For paper validation, run 20B token subset (total_steps=15259) to confirm loss trajectory,
+      then extrapolate. Full run needed for final Chinchilla fit point.
+
+  # ---------- Large: 1B ----------
+  - name: large_1b
+    model_size_label: Large
+    vocab_size: 32000
+    hidden_size: 2048
+    num_layers: 22
+    num_heads: 16
+    intermediate_size: 5504
+    max_seq_len: 2048
+    params_approx: 1.0e9
+    chinchilla_optimal_tokens: 20.0e9
+    zero_stage: 3
+    pipeline_stages: 3        # Each GPU = 1 stage (embedding+layers0-6 / layers7-14 / layers15-21+lm_head)
+    micro_batch_size: 1
+    gradient_accumulation_steps: 64
+    global_batch_size: 131072
+    total_steps: 152588
+    warmup_steps: 4000
+    learning_rate: 1.5e-4
+    weight_decay: 0.1
+    placement_strategy: pipeline_hetero
+    # A6000#0: embedding + layers 0-6 (7 layers, ~310M param share)
+    # A6000#1: layers 7-14 (8 layers)
+    # H100:    layers 15-21 + lm_head (7 layers + head)
+    gpu0_layers: [0, 1, 2, 3, 4, 5, 6]
+    gpu1_layers: [7, 8, 9, 10, 11, 12, 13, 14]
+    gpu2_layers: [15, 16, 17, 18, 19, 20, 21]
+    estimated_tokens_per_sec: 5800   # matches existing pretrain_7b estimate baseline
+    estimated_mfu_h100: 0.41
+    estimated_wall_time_hours: 957   # ~40 days; use gradient checkpointing + subset
+    record_pipeline_bubble_ratio: true
+    record_cross_numa_latency_ms: true
+    notes: |
+      Full 20B run required for Chinchilla fit. With activation checkpointing enabled,
+      A6000 peak mem ~41GB (within 48GB limit). H100 peak ~38GB.
+      Pipeline bubble ratio target: < 0.40 (validated by autoconfig diagnostics).
+      For fast iteration: run 2B tokens (total_steps=15259) and verify loss matches
+      Chinchilla prediction L(1B, 2B) before committing to full run.
+
+# ---------- Shared dataset config ----------
+dataset:
+  source: SlimPajama-627B
+  tokenizer: LLaMA-SentencePiece-32k
+  sequence_packing: true   # critical for heterogeneous throughput — eliminates padding waste
+  data_mix:
+    commoncrawl: 0.52
+    c4: 0.27
+    github: 0.05
+    books: 0.05
+    arxiv: 0.05
+    wikipedia: 0.04
+    stackexchange: 0.02
+
+# ---------- Metrics to record for Section 5.x ----------
+paper_metrics:
+  per_checkpoint:
+    - train_loss
+    - tokens_seen
+    - tokens_per_second
+    - mfu_per_gpu          # separately for A6000 and H100
+    - memory_peak_gb_per_gpu
+  pipeline_overhead:
+    - pipeline_bubble_ratio   # (n_stages - 1) / (n_stages * n_microbatch)
+    - cross_numa_allreduce_ms
+    - p2p_send_recv_ms        # activation transfer between pipeline stages
+  scaling_fit:
+    - L_final                 # final loss at Chinchilla-optimal D
+    - L_at_half_D             # loss at D = 10×N (sub-optimal)
+    - L_at_double_D           # loss at D = 40×N (over-trained)
