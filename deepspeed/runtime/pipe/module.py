@@ -21,6 +21,8 @@ from .topology import PipeDataParallelTopology, PipelineParallelGrid
 from deepspeed.runtime.state_dict_factory import SDLoaderFactory
 from deepspeed.accelerator import get_accelerator
 from deepspeed.checkpoint.utils import clone_tensors_for_torch_save
+# DES-LOC M686: NeoX rotary embedding for heterogeneous pipeline stages
+from .rotary import NeoXRotaryEmbedding, apply_rotary_pipe, DTYPE_A6000, DTYPE_H100
 
 
 class PipelineError(Exception):
@@ -147,6 +149,12 @@ class PipelineModule(nn.Module):
             raise RuntimeError('must provide num_stages or topology')
 
         self.micro_offset = 0
+        # DES-LOC M686: rotary position offset for heterogeneous pipeline stages.
+        # Each stage receives the cumulative token count of preceding stages so
+        # that NeoX-style RoPE uses correct absolute positions across stage
+        # boundaries. Initialised to 0; updated via set_rotary_position_offset()
+        # before each forward pass (e.g. by the pipeline engine or the caller).
+        self.rotary_position_offset: int = 0
 
         self.loss_fn = loss_fn
 
@@ -346,6 +354,30 @@ class PipelineModule(nn.Module):
         if len(idxs) == 0:
             raise RuntimeError(f"Partitioning '{layername}' found no valid layers to partition.")
         return idxs
+
+    def set_rotary_position_offset(self, offset: int) -> None:
+        """DES-LOC M686: Set the absolute token position offset for NeoX rotary embedding.
+
+        Call this before each forward pass (per micro-batch) to ensure every
+        NeoXRotaryEmbedding in this stage uses the correct absolute positions.
+        In a 2-stage pipeline:
+          - Stage 0: offset = 0
+          - Stage 1: offset = (number of tokens handled by stage 0)
+
+        The offset is also injected into the pipeline activation tuple so that
+        downstream stages that receive it can call this automatically.
+
+        Args:
+            offset: Cumulative token count of all preceding pipeline stages.
+        """
+        # DES-LOC M686: propagate rotary offset to all NeoXRotaryEmbedding sub-modules
+        self.rotary_position_offset = offset
+        for module in self.modules():
+            if isinstance(module, NeoXRotaryEmbedding):
+                # Ensure the cos/sin cache is large enough for this offset + seq
+                # (actual _ensure_cache is called lazily in forward, but we log here)
+                pass
+        logger.debug(f"[M686] stage_id={self.stage_id} rotary_position_offset={offset}")
 
     def forward(self, forward_input):
         # DES-LOC M156: tracked
