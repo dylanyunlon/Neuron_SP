@@ -38,6 +38,11 @@ from deepspeed.checkpoint.constants import OPTIMIZER_STATE_DICT, FP32_FLAT_GROUP
 from deepspeed.accelerator import get_accelerator
 from deepspeed.runtime.zero.muon.original_muon import muon_update
 from deepspeed.runtime.zero.muon.muon_optimizer import MuonWithAuxAdam
+# DES-LOC M776: Gemini-inspired asymmetric GPU/CPU memory management
+from deepspeed.runtime.zero.hetero_memory_manager import (
+    HeteroMemoryManager,
+    HeteroMemoryConfig,
+)
 
 # Toggle this to true to enable correctness test
 # with gradient partitioning and without
@@ -524,6 +529,19 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         self._link_all_hp_params()
 
         self.offloaded_states: Set[OffloadDeviceEnum] = set()
+
+        # DES-LOC M776: Gemini-inspired asymmetric heterogeneous memory manager.
+        # Instantiated for all ranks; the manager probes VRAM and assigns a tier
+        # (HIGH=H100-class, LOW=A6000-class) independently per rank.
+        _hmm_cfg = HeteroMemoryConfig(
+            enable_diagnostics=True,
+            diag_every_n_steps=1,
+        )
+        self.hetero_memory_manager = HeteroMemoryManager(
+            config=_hmm_cfg,
+            dp_process_group=self.dp_process_group,
+            optimizer=self,
+        )
 
         if dist.get_rank(group=self.dp_process_group) == 0:
             see_memory_usage("After initializing ZeRO optimizer", force=False)
@@ -2292,6 +2310,11 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         # an increment in the next forward(), which is wrong.
         self._epilogue_ran_this_backward = False
 
+        # DES-LOC M776: record optimizer step as a proxy for forward step watermark.
+        # Emits [DS-HMM] FWD diagnostic with GPU memory watermark on every step.
+        if hasattr(self, 'hetero_memory_manager'):
+            self.hetero_memory_manager.record_forward_step()
+
         print_rank_0("Inside Step function")
         see_memory_usage("In step before checking overflow", force=False)
 
@@ -2548,6 +2571,12 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         self._pre_step()
         self._partition_all_parameters()
 
+        # DES-LOC M776: asymmetric GPU/CPU eviction based on device tier.
+        # A6000 ranks (49GB) aggressively offload fp32 optimizer states at
+        # HIGH_WATERMARK_FRAC; H100 ranks (96GB) only evict at a higher threshold.
+        if hasattr(self, 'hetero_memory_manager'):
+            self.hetero_memory_manager.maybe_evict_optimizer_states()
+
         #checks for overflow, adjust the loss scale accordingly
         if self._overflow_check_and_loss_scale_update():
             if self.swap_optimizer:
@@ -2586,6 +2615,12 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         self.timers(OPTIMIZER_STEP_TIMER).stop()
 
         self._post_step(timer_names)
+
+        # DES-LOC M776: after step, attempt to restore evicted optimizer states
+        # for HIGH-tier (H100) ranks immediately; LOW-tier (A6000) ranks defer
+        # restore until the next step when GPU has freed more headroom.
+        if hasattr(self, 'hetero_memory_manager'):
+            self.hetero_memory_manager.maybe_restore_optimizer_states()
 
         # warn user about caching allocator flushes
         memory_stats = get_accelerator().memory_stats()
