@@ -13,6 +13,10 @@ Usage:
 """
 
 from .unified_tokenizer import get_tokenizer, TOKENIZER_NAME
-from .engine_bridge import DESLOCEngine
+
+try:
+    from .engine_bridge import DESLOCEngine
+except ImportError:
+    DESLOCEngine = None  # deepspeed not installed, bridge unavailable
 
 __all__ = ["get_tokenizer", "TOKENIZER_NAME", "DESLOCEngine"]

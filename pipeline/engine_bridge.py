@@ -26,8 +26,12 @@ import json
 import torch
 from typing import Optional, Dict, Any, List
 
-import deepspeed
-import deepspeed.comm as dist
+try:
+    import deepspeed
+    import deepspeed.comm as dist
+    _HAS_DEEPSPEED = True
+except ImportError:
+    _HAS_DEEPSPEED = False
 
 
 # ── GPU tier 自动检测 ──

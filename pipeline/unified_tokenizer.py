@@ -34,11 +34,19 @@ def get_tokenizer(
     """Load tokenizer, add commit special tokens, return with metadata."""
     from transformers import AutoTokenizer
 
-    tok = AutoTokenizer.from_pretrained(
-        name_or_path,
-        cache_dir=cache_dir,
-        trust_remote_code=True,
-    )
+    try:
+        tok = AutoTokenizer.from_pretrained(
+            name_or_path,
+            cache_dir=cache_dir,
+            trust_remote_code=True,
+        )
+    except (OSError, Exception) as e:
+        # Fallback to GPT-2 tokenizer if StarCoder is gated/unavailable
+        fallback = "gpt2"
+        print(f"[tokenizer] {name_or_path} unavailable ({type(e).__name__}), "
+              f"falling back to {fallback}")
+        tok = AutoTokenizer.from_pretrained(fallback, cache_dir=cache_dir)
+        tok.pad_token = tok.eos_token
 
     if add_commit_tokens:
         existing = set(tok.get_vocab().keys())
