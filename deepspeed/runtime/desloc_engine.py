@@ -44,6 +44,11 @@ from deepspeed.runtime.hetero_gdn_selective_recompute import (
 
 logger = logging.getLogger(__name__)
 
+from deepspeed.runtime.hetero_grad_norm_skip import (  # noqa: E402
+    HeteroGradNormConfig,
+    integrate_with_deepspeed_engine,
+)
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -989,6 +994,11 @@ class DesLocEngine:
         logger.info("Training start: %d steps, grad_accum=%d",
                     cfg.total_steps, self.grad_accum)
 
+        # Wire HeteroGradNormSkipController into this engine.
+        _hetero_config = HeteroGradNormConfig()
+        _skip_controller = integrate_with_deepspeed_engine(self, _hetero_config)
+        _skip_count = 0
+
         loss_accum = 0.0
         t0 = time.time()
 
@@ -1022,9 +1032,19 @@ class DesLocEngine:
             # Gradient clipping
             gnorm = clip_grad_norm_(self.model.parameters(), cfg.grad_clip)
 
-            # Optimizer + scheduler step
-            self.optimizer.step()
-            self.scheduler.step()
+            # HeteroGradNorm skip decision
+            _should_skip = _skip_controller.should_skip()
+            print(
+                f"[hetero_grad] step={step} grad_norm={gnorm:.6f} "
+                f"skip={_should_skip} total_skips={_skip_count}"
+            )
+            if _should_skip:
+                _skip_count += 1
+                print(f"[hetero_grad] SKIP step={step} (cumulative skips={_skip_count})")
+            else:
+                # Optimizer + scheduler step
+                self.optimizer.step()
+                self.scheduler.step()
 
             # Accounting
             self.global_step = step + 1
