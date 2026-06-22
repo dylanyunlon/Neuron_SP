@@ -1,0 +1,6 @@
+# Large dataset files - download via pull_all_datasets.sh on ags1
+commitpackft/*.jsonl
+commitpack/*.jsonl
+starcoderdata_commits/*.jsonl
+*_cache/
+*.parquet

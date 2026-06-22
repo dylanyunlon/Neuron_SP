@@ -1,0 +1,26 @@
+{
+  "id": "bigcode/the-stack-v2",
+  "downloads": 21833,
+  "likes": 585,
+  "tags": [
+    "task_categories:text-generation",
+    "language_creators:crowdsourced",
+    "language_creators:expert-generated",
+    "multilinguality:multilingual",
+    "language:code",
+    "license:other",
+    "size_categories:1B<n<10B",
+    "format:parquet",
+    "modality:tabular",
+    "modality:text",
+    "library:datasets",
+    "library:dask",
+    "library:mlcroissant",
+    "library:polars",
+    "arxiv:2402.19173",
+    "arxiv:2107.03374",
+    "arxiv:2207.14157",
+    "region:us"
+  ],
+  "gated": "auto"
+}
