@@ -52,11 +52,70 @@ bash pull_all_datasets.sh    # 在 ags1 上执行
 
 ---
 
-## 完整数据集矩阵 (更新: Phase 6)
+## Stack v2 PR/commit 适配器 (M761-M775)
+
+新增模块: `datasets/bigcode/the_stack_v2/`
+
+| 文件 | 功能 |
+|------|------|
+| `stackv2_commits.py` | Stack v2 → DES-LOC 格式化、过滤、PII 清理 |
+| `megatron_indexed.py` | 写出 Megatron `.bin`/`.idx` indexed dataset |
+
+### 输出格式 (DES-LOC diff tokens)
+```
+<|diff_start|>
+<|lang|>python
+<|file_path|> src/foo.py
+<|old|>
+<old content>
+<|new|>
+<new content>
+<|msg|> fix: handle edge case
+<|diff_end|>
+```
+
+### 过滤规则
+- 丢弃 merge commit (`Merge pull request / branch`)
+- 丢弃 changed lines < 10 的无意义 diff
+- 丢弃超过 100K 字符的样本
+- `directory_id` hash 去重 (Stack v2 论文策略)
+- PII 清除: email / IPv4 / hex secret / AWS key → `<REDACTED>`
+
+### 使用示例
+```python
+from datasets.bigcode.the_stack_v2.stackv2_commits import StackV2CommitAdapter
+from datasets.bigcode.the_stack_v2.megatron_indexed import MegatronIndexedWriter
+
+adapter = StackV2CommitAdapter()
+
+# HF Hub (需先 huggingface-cli login 并接受协议)
+for sample in adapter.stream_hf(max_samples=10000):
+    print(sample["text"][:200])
+
+# 本地 parquet
+for sample in adapter.stream_parquet("/data/stackv2_commits/*.parquet"):
+    ...
+
+# 写 Megatron indexed dataset
+writer = MegatronIndexedWriter("/data/stackv2_megatron", tokenizer)
+writer.write_from_adapter(adapter.stream_parquet("/data/*.parquet"))
+writer.finalize()
+# → /data/stackv2_megatron.bin  +  /data/stackv2_megatron.idx
+```
+
+### Smoke test
+```bash
+python datasets/bigcode/the_stack_v2/stackv2_commits.py --samples 5 --source dummy
+python datasets/bigcode/the_stack_v2/megatron_indexed.py --dummy --output /tmp/test_sv2
+```
+
+---
+
+## 完整数据集矩阵 (更新: Phase 7 / M761-M775)
 
 | 数据集 | 规模 | 来源 | HuggingFace ID | 用途 |
 |--------|------|------|---------------|------|
 | StarCoder commits | 32 GB / 64 GB | BigQuery | `bigcode/starcoderdata` (data_dir="git-commits") | 预训练 code diff |
 | CommitPack | 4 TB | GHArchive + GitHub API 爬取 | `bigcode/commitpack` | 大规模预训练 |
 | CommitPackFT | 2 GB (高质量子集) | GPT-4 筛选 | `bigcode/commitpackft` | 指令微调 |
-| The Stack v2 (PR/commit) | 未公开总量 | GHArchive + Software Heritage | `bigcode/the-stack-v2` | 全量预训练语料 |
+| The Stack v2 (PR/commit) | 未公开总量 | GHArchive + Software Heritage | `bigcode/the-stack-v2` | 全量预训练语料 (M761-M775 适配完成) |
