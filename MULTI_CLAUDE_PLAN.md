@@ -248,3 +248,31 @@ CONV_ID=<uuid> bash claude_hk_chat.sh "Continue"
 | 34 | M941-M955 | `SharedLocalityCache` → NUMA activation offload | `hetero_mimo_training_loop.py` |
 | 35 | M956-M970 | 删玩具 engine_bridge, 用真 LLaMA + MIMO | `train_three_stage.py` |
 | 36 | M971-M985 | 集成 smoke test | `smoke_test.py` |
+
+---
+
+## Phase 8: Wiring Layer — 把 150 个 hetero 模块接入 DesLocEngine (M986-M1135)
+
+> **核心方向**: production_engine.py 已删除。正确做法是改 `engine.py` (DeepSpeedEngine) 和
+> `pipeline/train_three_stage.py`，调用仓库里已有的 `setup_hetero_mimo_training()`、
+> `build_neuron_sp_config()`、`integrate_with_deepspeed_engine()`。不重写这些组件。
+
+### 任务分派
+
+| Claude # | 里程碑 | 任务 | 目标文件 |
+|----------|--------|------|----------|
+| 37 | M986-M1000 | wire `build_neuron_sp_config()` → `__init__` + `forward()` | engine.py |
+| 38 | M1001-M1015 | wire `integrate_with_deepspeed_engine()` → `step()` | engine.py |
+| 39 | M1016-M1030 | wire `HeteroFP32GradAccumManager` → ZeRO backward | deepspeed/runtime/zero/stage*.py |
+| 40 | M1031-M1045 | wire `HeteroMemoryManager` → CPU offload lifecycle | engine.py |
+| 41 | M1046-M1060 | wire `HeteroRegistry.discover_and_register()` | engine.py |
+| 42 | M1061-M1075 | wire `HeteroOptimizerRouter` → `_configure_optimizer()` | engine.py |
+| 43 | M1076-M1090 | wire `PCIeP2PCommunicator` → `allreduce_gradients()` | engine.py |
+| 44 | M1091-M1105 | wire `HeteroStepBatchScheduler` → DataLoader | deepspeed/runtime/dataloader.py |
+| 45 | M1106-M1120 | wire `SharedLocalityCache` → checkpoint save/load | engine.py |
+| 46 | M1121-M1135 | Integration smoke test 验证所有 wiring | pipeline/smoke_test.py |
+
+### 依赖顺序
+- 37, 38, 39, 40, 41, 42, 43, 44, 45 可并行（改不同方法/文件）
+- 46 必须在所有前面完成后执行
+- 所有 Claude push 前必须 `git pull --rebase origin main`
