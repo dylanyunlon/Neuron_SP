@@ -1,0 +1,18 @@
+{
+  "phase": 6,
+  "dispatch_time": "2026-06-22T07:28:33Z",
+  "conversations": {
+    "claude-17": {"conv_id": "83fbac98-2b85-4680-92a1-cb19aff5207d", "task": "Rotary Embedding → DES-LOC Pipeline", "status": "dispatched", "ref": "GPT-NeoX"},
+    "claude-18": {"conv_id": "8ce82a55-3ff2-4427-b3f7-f7ee9a619e50", "task": "FSDP→ZeRO-3 异构分片", "status": "dispatched", "ref": "Metaseq OPT"},
+    "claude-19": {"conv_id": "882db845-5ae3-4036-88a9-8194121de49a", "task": "ALiBi 位置编码集成", "status": "dispatched", "ref": "BLOOM"},
+    "claude-20": {"conv_id": "966d7ced-0187-45f7-8e06-7bdb7e88149b", "task": "StarCoder Commit Sequence Packing", "status": "dispatched", "ref": "BigCode"},
+    "claude-23": {"conv_id": "53a99695-e087-4a2d-ac14-7695c94dc1da", "task": "ColossalAI Gemini 异构内存", "status": "dispatched", "ref": "ColossalAI"},
+    "claude-24": {"conv_id": "d67a9779-3160-4433-ad68-15142b172f0a", "task": "GLM-130B 多任务预训练", "status": "dispatched", "ref": "GLM-130B"}
+  },
+  "pending": {
+    "claude-21": {"task": "CommitPack 4TB 流式加载器", "depends_on": "claude-20"},
+    "claude-22": {"task": "The Stack v2 格式适配", "depends_on": "claude-21"},
+    "claude-25": {"task": "Chinchilla Scaling Law 验证", "depends_on": "all"},
+    "claude-26": {"task": "CodeGen 评估框架", "depends_on": "model_trained"}
+  }
+}
