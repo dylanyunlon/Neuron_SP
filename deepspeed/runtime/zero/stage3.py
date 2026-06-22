@@ -195,11 +195,15 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         enable_sanity_checks=False,
         cpuadam_cores_perc=0.8,
         save_muon_momentum_buffer_in_memory=False,
+        hetero_shard_ratio=None,
     ):
         self._desloc_z3_step = 0
         self._desloc_z3_enabled = False
         self._desloc_z3_Kx = 32
         self._desloc_z3_skipped_bytes = 0
+        # DES-LOC M701: hetero ZeRO-3 shard ratios for mixed GPU clusters
+        # e.g. hetero_shard_ratio=[1.0, 1.0, 2.0] means rank-2 (H100) gets 2x params vs A6000 ranks
+        self._hetero_shard_ratio = hetero_shard_ratio  # list[float] or None
         see_memory_usage("Stage 3 initialize beginning", force=False)
 
         print_rank_0(f"initialized {__class__.__name__} with args: {locals()}", force=False)
@@ -351,6 +355,19 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         self.zero_quantized_nontrainable_weights = zero_quantized_nontrainable_weights
 
         self.partition_count = dist.get_world_size(group=self.dp_process_group)
+
+        # DES-LOC M701: validate and normalize hetero_shard_ratio
+        # Ratios express relative param capacity per rank (e.g. [1,1,2] for 2xA6000 + 1xH100)
+        if self._hetero_shard_ratio is not None:
+            assert len(self._hetero_shard_ratio) == self.partition_count, (
+                f"hetero_shard_ratio length ({len(self._hetero_shard_ratio)}) must match "
+                f"partition_count ({self.partition_count})"
+            )
+            ratio_sum = sum(self._hetero_shard_ratio)
+            # Normalize to fractions that sum to 1.0
+            self._hetero_shard_fracs = [r / ratio_sum for r in self._hetero_shard_ratio]
+        else:
+            self._hetero_shard_fracs = None
 
         self.zeropp_loco_param = zeropp_loco_param
 
@@ -2033,16 +2050,39 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
 
         total_num_elements = tensor.numel()
 
-        base_size = total_num_elements // dp
-        remaining = total_num_elements % dp
+        # DES-LOC M701: hetero shard ratio — assign param slices proportional to GPU memory capacity
+        if self._hetero_shard_fracs is not None:
+            # Compute per-rank sizes from fractional weights; distribute leftover elements to larger ranks
+            raw_sizes = [int(total_num_elements * frac) for frac in self._hetero_shard_fracs]
+            allocated = sum(raw_sizes)
+            remainder = total_num_elements - allocated
+            # Give leftover elements to ranks with higher fractions first
+            order = sorted(range(dp), key=lambda i: self._hetero_shard_fracs[i], reverse=True)
+            for i in range(remainder):
+                raw_sizes[order[i]] += 1
+            start = 0
+            for id in range(dp):
+                partition_size = raw_sizes[id]
+                partitions.append(tensor.narrow(0, start, partition_size))
+                start += partition_size
+            # Diagnostic: print per-GPU actual param shard counts on first call
+            if not getattr(self, '_hetero_shard_diag_printed', False):
+                self._hetero_shard_diag_printed = True
+                rank = dist.get_rank()
+                for r in range(dp):
+                    print(f"[DES-LOC M701] rank={r} hetero_shard_params={raw_sizes[r]} "
+                          f"frac={self._hetero_shard_fracs[r]:.4f} total={total_num_elements}")
+        else:
+            base_size = total_num_elements // dp
+            remaining = total_num_elements % dp
 
-        start = 0
-        for id in range(dp):
-            partition_size = base_size
-            if id < remaining:
-                partition_size = partition_size + 1
-            partitions.append(tensor.narrow(0, start, partition_size))
-            start = start + partition_size
+            start = 0
+            for id in range(dp):
+                partition_size = base_size
+                if id < remaining:
+                    partition_size = partition_size + 1
+                partitions.append(tensor.narrow(0, start, partition_size))
+                start = start + partition_size
         return partitions
 
     def get_partition_info(self, tensor_list, partition_size, partition_id):
