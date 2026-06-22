@@ -185,3 +185,44 @@ CONV_ID=<uuid> bash claude_hk_chat.sh "Continue"
   Claude-15 (benchmark, 需服务器)  │
   Claude-16 (论文, 需 Phase 4 数据)│
 ```
+
+---
+
+## Phase 6: 预训练框架集成 + 数据管线 (M686-M835)
+
+### 参考框架已拉取
+- `references/pretrain_frameworks/gpt_neox/` — EleutherAI GPT-NeoX-20B
+- `references/pretrain_frameworks/metaseq_opt/` — Meta OPT-175B
+- `references/pretrain_frameworks/bloom_megatron_ds/` — BigScience BLOOM-176B
+- 完整索引: `references/pretrain_frameworks/FRAMEWORK_INDEX.md`
+
+### 数据集 (4 个 BigCode commit 数据集)
+- StarCoder commits (32GB) / CommitPack (4TB) / CommitPackFT (2GB) / The Stack v2
+- 详见: `datasets/bigcode/DATASETS.md`
+
+### 10 位 Sub-Claude 任务分配
+
+| Claude | 里程碑 | 任务 | 参考源 | 状态 |
+|--------|--------|------|--------|------|
+| Claude-17 | M686-M700 | Rotary Embedding 迁移到 DES-LOC Pipeline | GPT-NeoX | ⬜ 待认领 |
+| Claude-18 | M701-M715 | FSDP→ZeRO-3 异构分片适配 | Metaseq OPT | ⬜ 待认领 |
+| Claude-19 | M716-M730 | ALiBi 位置编码集成 | BLOOM Megatron-DS | ⬜ 待认领 |
+| Claude-20 | M731-M745 | StarCoder Commit Sequence Packing 优化 | BigCode data | ⬜ 待认领 |
+| Claude-21 | M746-M760 | CommitPack 4TB 流式加载器 | BigCode data | ⬜ 待认领 |
+| Claude-22 | M761-M775 | The Stack v2 PR/Commit 格式适配 | BigCode data | ⬜ 待认领 |
+| Claude-23 | M776-M790 | ColossalAI Gemini 异构内存管理 | ColossalAI | ⬜ 待认领 |
+| Claude-24 | M791-M805 | GLM-130B 多任务预训练格式 | GLM-130B | ⬜ 待认领 |
+| Claude-25 | M806-M820 | Chinchilla Scaling Law 异构验证实验 | DeepMind | ⬜ 待认领 |
+| Claude-26 | M821-M835 | CodeGen 代码生成评估框架 | Salesforce | ⬜ 待认领 |
+
+### 任务依赖关系
+```
+[独立] Claude-17 (Rotary) ──┐
+[独立] Claude-19 (ALiBi)  ──┴──→ A/B 对比 (需两者都完成)
+[独立] Claude-18 (ZeRO异构) ────→ 基础设施
+[顺序] Claude-20 (Packing) → Claude-21 (Streaming) → Claude-22 (Stack v2)
+[独立] Claude-23 (Gemini内存)
+[独立] Claude-24 (GLM多任务)
+[依赖全部] Claude-25 (Scaling Law) — 需要训练基础设施 + 数据管线就绪
+[依赖模型] Claude-26 (Eval) — 需要至少一个模型训练完成
+```

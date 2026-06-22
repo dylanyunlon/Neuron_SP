@@ -49,3 +49,14 @@ bash pull_all_datasets.sh    # 在 ags1 上执行
 | 指令微调 | CommitPackFT (2GB) | 高质量，GPT-4 筛选，格式规整 |
 | 大规模预训练 | The Stack v2 | 需要 HF 协议，但覆盖最全 |
 | 消融实验 | CommitPackFT Python subset | 小而精，快速迭代 |
+
+---
+
+## 完整数据集矩阵 (更新: Phase 6)
+
+| 数据集 | 规模 | 来源 | HuggingFace ID | 用途 |
+|--------|------|------|---------------|------|
+| StarCoder commits | 32 GB / 64 GB | BigQuery | `bigcode/starcoderdata` (data_dir="git-commits") | 预训练 code diff |
+| CommitPack | 4 TB | GHArchive + GitHub API 爬取 | `bigcode/commitpack` | 大规模预训练 |
+| CommitPackFT | 2 GB (高质量子集) | GPT-4 筛选 | `bigcode/commitpackft` | 指令微调 |
+| The Stack v2 (PR/commit) | 未公开总量 | GHArchive + Software Heritage | `bigcode/the-stack-v2` | 全量预训练语料 |
