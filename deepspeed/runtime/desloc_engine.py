@@ -42,6 +42,13 @@ from deepspeed.runtime.hetero_gdn_selective_recompute import (
     HeteroRecomputeConfig,
 )
 
+from deepspeed.runtime.hetero_step_batch_scheduler import (
+    HeteroStepBatchScheduler,
+    DeviceProfile,
+    MicrobatchAllocation,
+    DEFAULT_DES_LOC_DEVICE_PROFILES,
+)
+
 logger = logging.getLogger(__name__)
 
 from deepspeed.runtime.hetero_grad_norm_skip import (  # noqa: E402
@@ -177,6 +184,13 @@ class TrainingConfig:
 
     # Strategy override (None = auto-select)
     strategy_override: Optional[PartitionStrategy] = None
+
+    # HeteroStepBatchScheduler config
+    # Format: "0:32 90B:64 180B:128" (THRESHOLD:BATCH_SIZE, token or sample units)
+    # If None, scheduler uses a single constant entry based on global_batch_size
+    batch_schedule: Optional[str] = None
+    # If provided, schedule thresholds are interpreted as token counts (÷ seq_len → samples)
+    batch_schedule_seq_length: Optional[int] = None
 
 
 # ---------------------------------------------------------------------------
@@ -897,6 +911,47 @@ class DesLocEngine:
         )
         logger.info("Effective grad_accum_steps on primary: %d", self.grad_accum)
 
+        # --- Phase 7: HeteroStepBatchScheduler ---
+        # Build device profiles from discovered tiers (or fall back to defaults)
+        if self.tiers:
+            max_tflops = max(s.bf16_tflops for s in self.tiers)
+            device_profiles = []
+            for spec in self.tiers:
+                weight = round(spec.bf16_tflops / max_tflops, 2)
+                max_mbs = config.micro_batch_size * (
+                    2 if spec.tier == TierClass.H100 else 1
+                )
+                device_profiles.append(DeviceProfile(
+                    device_id=spec.device_index,
+                    sm_arch=spec.sm_major * 10 + spec.sm_minor,
+                    vram_gb=spec.total_mem_gb,
+                    capacity_weight=weight,
+                    max_micro_batch_size=max_mbs,
+                ))
+        else:
+            device_profiles = DEFAULT_DES_LOC_DEVICE_PROFILES
+
+        dp_size = max(len(self.tiers), 1)
+        schedule_str = config.batch_schedule or f"0:{config.global_batch_size}"
+        seq_len_for_schedule = config.batch_schedule_seq_length
+
+        self.hetero_scheduler = HeteroStepBatchScheduler(
+            rank=0,
+            micro_batch_size=config.micro_batch_size,
+            data_parallel_size=dp_size,
+            schedule=schedule_str,
+            device_profiles=device_profiles,
+            seq_length=seq_len_for_schedule,
+        )
+        logger.info(
+            "HeteroStepBatchScheduler initialized: schedule='%s', dp_size=%d, "
+            "device_profiles=%d devices",
+            schedule_str, dp_size, len(device_profiles),
+        )
+
+        # consumed_samples tracks total samples processed (for scheduler stepping)
+        self.consumed_samples = 0
+
         # State
         self.global_step = 0
         self.tokens_seen = 0
@@ -1006,7 +1061,22 @@ class DesLocEngine:
             self.optimizer.zero_grad(set_to_none=True)
             step_loss = 0.0
 
-            for micro in range(self.grad_accum):
+            # --- HeteroStepBatchScheduler: decide num_microbatches for this step ---
+            allocation: MicrobatchAllocation = self.hetero_scheduler.update(
+                consumed_samples=self.consumed_samples,
+                consistency_check=False,
+            )
+            num_microbatches = allocation.num_microbatches
+            # Log scheduler step events (batch size change or LOC cache hint)
+            if allocation.loc_cache_hint:
+                logger.info(
+                    "step=%d | scheduler step: gbs=%d, num_microbatches=%d, "
+                    "per_device=%s",
+                    step, allocation.global_batch_size,
+                    num_microbatches, allocation.per_device_assignment,
+                )
+
+            for micro in range(num_microbatches):
                 input_ids, labels = next(self.data_iter)
                 input_ids = input_ids.to(self.primary_device, non_blocking=True)
                 labels = labels.to(self.primary_device, non_blocking=True)
@@ -1023,7 +1093,7 @@ class DesLocEngine:
                     shift_logits = logits[:, :-1, :].contiguous().reshape(-1, V)
                     shift_labels = labels[:, :T - 1].contiguous().reshape(-1)
                     loss = F.cross_entropy(shift_logits, shift_labels)
-                    scaled_loss = loss / self.grad_accum
+                    scaled_loss = loss / num_microbatches
 
                 # Backward
                 scaled_loss.backward()
@@ -1049,11 +1119,13 @@ class DesLocEngine:
             # Accounting
             self.global_step = step + 1
             tokens_this_step = (
-                self.grad_accum * cfg.micro_batch_size * cfg.seq_len
+                num_microbatches * cfg.micro_batch_size * cfg.seq_len
             )
             self.tokens_seen += tokens_this_step
+            # Update consumed_samples for next scheduler query
+            self.consumed_samples += allocation.global_batch_size
 
-            avg_loss = step_loss / self.grad_accum
+            avg_loss = step_loss / num_microbatches
             loss_accum += avg_loss
 
             # Logging
