@@ -263,3 +263,90 @@ class DESLOCEngine:
         if self.lr_scheduler:
             return self.lr_scheduler.get_last_lr()[0]
         return self.ds_config.get("optimizer", {}).get("params", {}).get("lr", 0)
+
+
+# ── HeteroMIMO runtime bridge (used by train_three_stage.py) ──
+
+def build_neuron_sp_runtime(
+    model: torch.nn.Module,
+    lr: float,
+    cache_max_gb: float = 192.0,
+    grad_clip: float = 1.0,
+):
+    """Build the per-stage hetero runtime (recompute config + MIMO loop).
+
+    This wires the two already-existing hetero entry points so each stage of
+    ``train_three_stage.py`` gets a freshly-initialised training loop with the
+    correct learning rate and a Neuron_SP-targeted recompute policy.
+
+    Returns
+    -------
+    (loop, recompute_config) : Tuple[HeteroMIMOTrainingLoop, HeteroRecomputeConfig]
+    """
+    from deepspeed.runtime.hetero_gdn_selective_recompute import build_neuron_sp_config
+    from deepspeed.runtime.hetero_mimo_training_loop import (
+        setup_hetero_mimo_training,
+        PerModuleOptimizerConfig,
+    )
+
+    # 1) Recompute / activation-offload policy tuned for the target cluster.
+    #    Auto-detects A6000 vs H100 indices when possible; falls back to defaults.
+    try:
+        tiers = detect_gpu_tiers()
+        a6000_idx = tuple(t["index"] for t in tiers if t["is_ampere"])
+        h100_idx_list = [t["index"] for t in tiers if t["is_hopper"]]
+        if a6000_idx and h100_idx_list:
+            recompute_config = build_neuron_sp_config(
+                a6000_indices=a6000_idx, h100_index=h100_idx_list[0],
+            )
+        else:
+            recompute_config = build_neuron_sp_config()
+    except Exception as err:  # noqa: BLE001
+        print(f"[bridge] GPU auto-detect failed ({err}); using default Neuron_SP config")
+        recompute_config = build_neuron_sp_config()
+
+    # 2) Hetero MIMO training loop with stage-specific LR.
+    optimizer_config = PerModuleOptimizerConfig(lr=lr)
+    loop = setup_hetero_mimo_training(
+        model,
+        optimizer_config=optimizer_config,
+        cache_max_gb=cache_max_gb,
+        grad_clip=grad_clip,
+    )
+    print(f"[bridge] HeteroMIMOTrainingLoop ready (lr={lr}, cache_max_gb={cache_max_gb})")
+    return loop, recompute_config
+
+
+def teardown_hetero_runtime(loop) -> None:
+    """Tear down a HeteroMIMOTrainingLoop between training stages.
+
+    Clears the shared locality cache, drops optimizer state references, and
+    frees CUDA memory so the next stage's ``setup_hetero_mimo_training`` call
+    starts from a clean slate (fresh optimizers + lr schedule, no stale cached
+    activations from the previous stage).
+    """
+    if loop is None:
+        return
+    try:
+        cache = getattr(loop, "locality_cache", None)
+        if cache is not None and hasattr(cache, "clear"):
+            cache.clear()
+            print("[bridge] cleared SharedLocalityCache")
+    except Exception as err:  # noqa: BLE001
+        print(f"[bridge] locality_cache.clear() warning: {err}")
+
+    # Drop per-module optimizers held by the router so their state is GC'd.
+    try:
+        router = getattr(loop, "optimizer_router", None)
+        for attr in ("module_optimizers", "_module_optimizers", "optimizers"):
+            if router is not None and hasattr(router, attr):
+                store = getattr(router, attr)
+                if hasattr(store, "clear"):
+                    store.clear()
+    except Exception as err:  # noqa: BLE001
+        print(f"[bridge] optimizer router teardown warning: {err}")
+
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+    print("[bridge] hetero runtime torn down")

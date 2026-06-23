@@ -36,12 +36,20 @@ import torch.nn as nn
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from pipeline.unified_tokenizer import build_megatron_tokenizer, get_tokenizer
-from pipeline.engine_bridge import build_ds_config, detect_gpu_tiers, compute_shard_ratios, DESLOCEngine
+from pipeline.engine_bridge import (
+    build_ds_config,
+    detect_gpu_tiers,
+    compute_shard_ratios,
+    DESLOCEngine,
+    build_neuron_sp_runtime,
+    teardown_hetero_runtime,
+)
 from deepspeed.runtime.hetero_mimo_training_loop import (
     setup_hetero_mimo_training,
     HeteroMIMOTrainingLoop,
     PerModuleOptimizerConfig,
 )
+from deepspeed.runtime.hetero_gdn_selective_recompute import build_neuron_sp_config
 
 
 # ── 模型构建 ──
@@ -514,6 +522,10 @@ def run_three_stage(args):
 
     stages_to_run = [int(s) for s in args.stages.split(",")]
 
+    # Track the previous stage's hetero runtime so we can tear it down before
+    # building a new one (fresh optimizer state + lr schedule + clean cache).
+    prev_loop: Optional[HeteroMIMOTrainingLoop] = None
+
     for stage_num in stages_to_run:
         # 每个 stage 重新调用 setup_hetero_mimo_training → 新的 optimizer + lr schedule
         if stage_num == 1:
@@ -542,15 +554,27 @@ def run_three_stage(args):
             prev_tag = f"{prev_name}_final"
             _load_model_checkpoint(model, args.checkpoint_dir, tag=prev_tag)
 
-        # 每个 stage 构建新的 HeteroMIMOTrainingLoop (新 optimizer / lr schedule).
+        # Tear down the previous stage's hetero runtime (clears locality cache,
+        # drops optimizer state, frees CUDA mem) before re-initialising.
+        if prev_loop is not None:
+            print(f"[pipeline] tearing down hetero runtime before {stage_name} ...")
+            teardown_hetero_runtime(prev_loop)
+            prev_loop = None
+
+        # Each stage builds a fresh hetero runtime: recompute policy via
+        # build_neuron_sp_config() and training loop via setup_hetero_mimo_training().
         # PerModuleOptimizerConfig carries the stage-specific LR so the router
         # initialises each device-pool's optimizer with the correct learning rate
         # rather than the global default (1e-4).
         stage_lr_map = {1: args.stage1_lr, 2: args.stage2_lr, 3: args.stage3_lr}
-        engine_config = PerModuleOptimizerConfig(lr=stage_lr_map[stage_num])
-        loop: HeteroMIMOTrainingLoop = setup_hetero_mimo_training(
-            engine.engine, optimizer_config=engine_config,
+        print(f"[pipeline] initialising hetero runtime for {stage_name} "
+              f"(lr={stage_lr_map[stage_num]}) ...")
+        loop, recompute_config = build_neuron_sp_runtime(
+            model=engine.engine,
+            lr=stage_lr_map[stage_num],
         )
+        print(f"[pipeline] recompute policy: granularity={recompute_config.granularity}, "
+              f"modules_per_device={ {str(k): v for k, v in recompute_config.modules_per_device.items()} }")
 
         train_one_stage(
             loop=loop,
@@ -562,6 +586,14 @@ def run_three_stage(args):
             save_interval=args.save_interval,
             save_path=args.checkpoint_dir,
         )
+
+        # Remember this stage's loop so the next iteration can tear it down.
+        prev_loop = loop
+
+    # Final teardown after the last stage.
+    if prev_loop is not None:
+        teardown_hetero_runtime(prev_loop)
+        prev_loop = None
 
     print("\n[pipeline] All stages complete.")
 
