@@ -1349,11 +1349,13 @@ class DesLocEngine:
             )
             _dp_group = dist.group.WORLD
 
+        # Each rank allocates FP32 grad buffer on its own device, not on primary_device
+        _local_device = torch.device(f"cuda:{torch.cuda.current_device()}")
         self.fp32_grad_manager = HeteroFP32GradAccumManager(
             config=_fp32_config,
             model=self.model,
             data_parallel_group=_dp_group,
-            device=self.primary_device,
+            device=_local_device,
             param_dtype=_DEFAULT_DTYPE,
             grad_dtype=_DEFAULT_DTYPE,
         )
