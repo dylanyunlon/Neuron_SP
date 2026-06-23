@@ -467,6 +467,49 @@ class CommitTokenizer:
 
         return ''.join(parts)
 
+    def add_special_tokens(self, hf_tokenizer) -> int:
+        """Register all commit special tokens into an HuggingFace-compatible
+        tokenizer (e.g. the StarCoder BPE tokenizer used by unified_tokenizer).
+
+        This is the bridge between CommitTokenizer's token vocabulary and
+        Megatron's tokenizer system.  It mirrors the behaviour of
+        transformers' ``add_special_tokens`` so that every token in
+        ``COMMIT_SPECIAL_TOKENS`` ends up with a stable integer ID inside
+        the HF tokenizer, which Megatron then picks up through
+        ``MegatronTokenizerWrapper``.
+
+        Args:
+            hf_tokenizer: A HuggingFace ``PreTrainedTokenizer`` (or
+                tokenizer-fast) instance that has already been loaded.
+
+        Returns:
+            Number of *new* tokens that were added (0 if all already
+            present).
+        """
+        existing = set(hf_tokenizer.get_vocab().keys())
+        new_tokens = [t for t in self.special_tokens if t not in existing]
+        if not new_tokens:
+            print(f"[CommitTokenizer] all {len(self.special_tokens)} commit "
+                  "special tokens already registered — no changes needed")
+            return 0
+
+        added = hf_tokenizer.add_special_tokens(
+            {"additional_special_tokens": new_tokens}
+        )
+        print(f"[CommitTokenizer] registered {added} new commit special tokens "
+              f"(total vocab now {len(hf_tokenizer)})")
+
+        # Keep our own id map in sync with the HF tokenizer's assignments so
+        # that self.encode() / self.decode() stay consistent.
+        for token in self.special_tokens:
+            tid = hf_tokenizer.convert_tokens_to_ids(token)
+            if tid is not None and tid != hf_tokenizer.unk_token_id:
+                self.special_token_ids[token] = tid
+                self._token_to_id[token] = tid
+                self._id_to_token[tid] = token
+
+        return added
+
     def save(self, path: str):
         """Save tokenizer config and special tokens."""
         config = {
@@ -502,6 +545,92 @@ class CommitTokenizer:
             tokenizer._id_to_token[tid] = token
 
         return tokenizer
+
+
+# ===========================================================================
+# Token Validation Helper
+# ===========================================================================
+
+# The six primary structural tokens that MUST be present for the commit
+# pretraining task to work correctly.
+CORE_COMMIT_TOKENS = ["<COMMIT>", "<MSG>", "<FILE>", "<ADD>", "<DEL>", "<CTX>"]
+
+
+def validate_commit_tokens(tokenizer) -> bool:
+    """Verify that all core commit special tokens are correctly registered.
+
+    This function works with *any* tokenizer that exposes a
+    ``convert_tokens_to_ids`` method — including Megatron's
+    ``MegatronTokenizerWrapper`` (via its inner ``._tok`` attribute) and
+    plain HuggingFace tokenizers.
+
+    Checks performed
+    ----------------
+    1. Every token in ``CORE_COMMIT_TOKENS`` resolves to a valid integer ID.
+    2. None of those IDs collides with the unknown-token ID of the base
+       tokenizer (which would mean the token was never actually registered).
+    3. Round-trip consistency: ``id → token → id`` is stable.
+
+    Args:
+        tokenizer: A HuggingFace ``PreTrainedTokenizer`` *or* a
+            ``MegatronTokenizerWrapper`` instance.  When a wrapper is
+            passed its inner ``._tok`` is used automatically.
+
+    Returns:
+        ``True`` if every core token passes all checks; ``False`` otherwise
+        (details printed to stdout).
+
+    Example::
+
+        from pipeline.unified_tokenizer import build_megatron_tokenizer
+        from Megatron-LM.megatron.training.tokenizer.commit_tokenizer import (
+            validate_commit_tokens,
+        )
+        wrapper = build_megatron_tokenizer()
+        assert validate_commit_tokens(wrapper)
+    """
+    # Unwrap MegatronTokenizerWrapper if needed
+    hf_tok = getattr(tokenizer, "_tok", tokenizer)
+    unk_id = getattr(hf_tok, "unk_token_id", None)
+
+    all_ok = True
+    print("[validate_commit_tokens] checking core commit tokens ...")
+
+    for token in CORE_COMMIT_TOKENS:
+        tid = hf_tok.convert_tokens_to_ids(token)
+
+        # Check 1: resolved to a real integer
+        if not isinstance(tid, int):
+            print(f"  FAIL  {token!r:20s} → not an integer ({tid!r})")
+            all_ok = False
+            continue
+
+        # Check 2: not mapped to <unk>
+        if unk_id is not None and tid == unk_id:
+            print(f"  FAIL  {token!r:20s} → mapped to unk_id ({unk_id})")
+            all_ok = False
+            continue
+
+        # Check 3: round-trip id → token string
+        back = hf_tok.convert_ids_to_tokens(tid)
+        if back != token:
+            print(f"  FAIL  {token!r:20s} id={tid} round-trips to {back!r}")
+            all_ok = False
+            continue
+
+        print(f"  OK    {token!r:20s} id={tid}")
+
+    # Also validate the full COMMIT_SPECIAL_TOKENS set (warn only)
+    full_vocab = hf_tok.get_vocab()
+    missing_full = [t for t in COMMIT_SPECIAL_TOKENS if t not in full_vocab]
+    if missing_full:
+        print(f"[validate_commit_tokens] WARNING: {len(missing_full)} extended "
+              f"commit tokens not yet in vocab: {missing_full[:5]} ...")
+
+    status = "PASSED" if all_ok else "FAILED"
+    print(f"[validate_commit_tokens] {status} "
+          f"({len(CORE_COMMIT_TOKENS)} core tokens checked)")
+    return all_ok
 
 
 # ===========================================================================
