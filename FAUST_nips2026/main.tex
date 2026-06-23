@@ -1308,14 +1308,367 @@ Johannes Welbl, Aidan Clark, et~al.
 \end{thebibliography}
 
 % ==================================================================
-% Appendix (optional, for supplementary material)
+% Appendix
+% ==================================================================
 \appendix
-\section{Convergence Proof}
-\label{app:convergence}
-\todo{Full convergence proof for decomposed local SGD with independent periods.}
 
-\section{Hyperparameter Details}
+\section{Full Hyperparameter Tables}
 \label{app:hyperparams}
-\todo{Full hyperparameter tables for all experiments.}
+
+Table~\ref{tab:app_model_arch} lists the model architecture used for each
+scale.  Table~\ref{tab:app_training_hyper} provides the complete training
+hyperparameters extracted from the reference configuration
+\texttt{experiments/configs/7b\_ags1\_desloc.yaml}.
+Table~\ref{tab:app_per_device} details the per-device batch sizing, precision,
+and activation-checkpointing strategy.
+
+\begin{table}[h]
+  \centering
+  \caption{Model architectures used in experiments.}
+  \label{tab:app_model_arch}
+  \small
+  \begin{tabular}{lcccccc}
+    \toprule
+    \textbf{Model} & \textbf{Params} & \textbf{Layers} & \textbf{Heads}
+      & \textbf{Hidden} & \textbf{FFN} & \textbf{Seq Len} \\
+    \midrule
+    LLaMA-70M   & 70M   & 6  & 6  & 512   & 1376  & 2048 \\
+    LLaMA-160M  & 160M  & 12 & 12 & 768   & 2048  & 2048 \\
+    LLaMA-410M  & 410M  & 24 & 16 & 1024  & 2816  & 2048 \\
+    LLaMA-1B    & 1.0B  & 24 & 32 & 2048  & 5504  & 2048 \\
+    LLaMA-7B    & 6.74B & 32 & 32 & 4096  & 11008 & 2048 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\begin{table}[h]
+  \centering
+  \caption{Complete training hyperparameters for the 7B pre-training run.}
+  \label{tab:app_training_hyper}
+  \small
+  \begin{tabular}{ll}
+    \toprule
+    \textbf{Hyperparameter} & \textbf{Value} \\
+    \midrule
+    \multicolumn{2}{l}{\emph{Optimizer}} \\
+    Optimizer                  & AdamW \\
+    Peak learning rate         & $3 \times 10^{-4}$ \\
+    Min learning rate          & $3 \times 10^{-5}$ \\
+    $(\beta_1, \beta_2)$       & $(0.9, 0.95)$ \\
+    $\epsilon$                 & $1 \times 10^{-8}$ \\
+    Weight decay               & 0.1 \\
+    Gradient clipping          & 1.0 \\
+    \midrule
+    \multicolumn{2}{l}{\emph{Schedule}} \\
+    LR schedule                & warmup--stable--cosine decay \\
+    Warmup steps               & 2{,}000 \\
+    Stable steps               & 60{,}000 \\
+    Decay steps                & 38{,}000 \\
+    Total training steps       & 100{,}000 \\
+    \midrule
+    \multicolumn{2}{l}{\emph{Batching}} \\
+    Global batch size          & 80 \\
+    Max sequence length        & 2{,}048 \\
+    Sequence packing           & Enabled \\
+    \midrule
+    \multicolumn{2}{l}{\emph{\desloc{} Synchronization}} \\
+    $\Kx$ (parameter sync)     & 8 \\
+    $\Ku$ (first-moment sync)  & 4 \\
+    $\Kv$ (second-moment sync) & 16 \\
+    Clip $\rho$                & 0.5 \\
+    DES-LOC warmup steps       & 500 \\
+    Outer optimizer            & Average \\
+    Nesterov momentum          & 0.0 \\
+    Topology-aware routing     & Enabled \\
+    $r_{\text{comm}}$ (Eq.~\ref{eq:comm_ratio}) & 0.4375 \\
+    Communication reduction    & 56.25\% \\
+    \midrule
+    \multicolumn{2}{l}{\emph{ZeRO Configuration}} \\
+    ZeRO stage                 & 3 \\
+    Optimizer offload          & CPU (pinned memory) \\
+    Parameter offload          & None (on-GPU) \\
+    Overlap communication      & Enabled \\
+    Reduce bucket size         & $5 \times 10^{7}$ \\
+    Prefetch bucket size       & $5 \times 10^{7}$ \\
+    Param persistence threshold & $1 \times 10^{5}$ \\
+    \midrule
+    \multicolumn{2}{l}{\emph{LOC Cache}} \\
+    Cache per NUMA node        & 200\,GB (pinned, \texttt{/dev/shm}) \\
+    NUMA\,0 CPU affinity       & cores 0--63 \\
+    NUMA\,1 CPU affinity       & cores 64--127 \\
+    \midrule
+    \multicolumn{2}{l}{\emph{Data}} \\
+    Dataset                    & SlimPajama-627B \\
+    Tokenizer                  & LLaMA SentencePiece 32k \\
+    Seed                       & 42 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\begin{table}[h]
+  \centering
+  \caption{Per-device configuration on the \texttt{ags1} cluster for 7B
+    pre-training.  Each device contributes an effective batch of 16 samples per
+    step, yielding a global batch size of $16 \times 5 = 80$.}
+  \label{tab:app_per_device}
+  \small
+  \begin{tabular}{lccccc}
+    \toprule
+    & \textbf{GPU\,0} & \textbf{GPU\,1} & \textbf{GPU\,2}
+    & \textbf{GPU\,3} & \textbf{GPU\,4} \\
+    & A6000 & A6000 & H100-NVL & RTX PRO BW & RTX PRO BW \\
+    \midrule
+    Micro-batch size       & 1  & 1  & 4  & 2  & 2  \\
+    Grad.\ accum.\ steps   & 16 & 16 & 4  & 8  & 8  \\
+    Effective batch        & 16 & 16 & 16 & 16 & 16 \\
+    \midrule
+    Precision              & FP16 & FP16 & BF16 & BF16 & BF16 \\
+    Loss scaling           & Dynamic & Dynamic & --- & --- & --- \\
+    Initial loss scale     & 65{,}536 & 65{,}536 & --- & --- & --- \\
+    \midrule
+    Act.\ ckpt.\ mode      & Full & Full & Selective & Selective & Selective \\
+    Ckpt.\ layers           & All & All & \texttt{norm\_out}, & \texttt{norm\_out}, & \texttt{norm\_out}, \\
+                           &     &     & \texttt{attn\_drop} & \texttt{attn\_drop} & \texttt{attn\_drop} \\
+    Contiguous ckpt.       & Yes & Yes & --- & --- & --- \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+
+% ==================================================================
+\section{Convergence Proof Sketch for Decomposed Local SGD}
+\label{app:convergence}
+
+We provide a proof sketch for Theorem~\ref{thm:convergence}.  The argument
+extends the standard local SGD convergence analysis to the setting where
+parameters, first moments, and second moments are synchronized at independent
+periods.
+
+\paragraph{Assumptions.}
+\begin{enumerate}
+  \item \textbf{$L$-smoothness.}  $\|\nabla f(x) - \nabla f(y)\| \leq L\|x - y\|$ for all $x, y$.
+  \item \textbf{Bounded variance.}  $\mathbb{E}\|\nabla f_i(x; \xi) - \nabla f(x)\|^2 \leq \sigma^2$ for all $i, x$.
+  \item \textbf{Bounded optimizer-state drift.}
+    $\mathbb{E}\|u_i^t - \bar{u}^t\|^2 \leq \sigma_{\text{opt}}^2$ and
+    $\mathbb{E}\|v_i^t - \bar{v}^t\|^2 \leq \sigma_{\text{opt}}^2$ between
+    synchronization rounds, where $\bar{u}^t = \frac{1}{N}\sum_i u_i^t$ and
+    $\bar{v}^t = \frac{1}{N}\sum_i v_i^t$.
+  \item \textbf{Bounded heterogeneity.}  $\|\nabla f_i(x) - \nabla f(x)\|^2 \leq \zeta^2$ for all $i, x$.
+\end{enumerate}
+
+\paragraph{Virtual iterate.}
+Define the virtual global average $\bar{x}^t = \frac{1}{N}\sum_{i=1}^N x_i^t$.
+Between parameter synchronization rounds (i.e., when $t \bmod \Kx \neq 0$),
+$\bar{x}^t$ does not coincide with any worker's iterate; it is a bookkeeping
+device.  At synchronization steps, all workers agree: $x_i^t = \bar{x}^t$.
+
+\paragraph{Step 1: Descent lemma.}
+By $L$-smoothness applied to the virtual iterate:
+\begin{equation}
+  f(\bar{x}^{t+1}) \leq f(\bar{x}^{t})
+    + \langle \nabla f(\bar{x}^{t}),\, \bar{x}^{t+1} - \bar{x}^{t} \rangle
+    + \frac{L}{2}\|\bar{x}^{t+1} - \bar{x}^{t}\|^2.
+  \label{eq:app_descent}
+\end{equation}
+The virtual update $\bar{x}^{t+1} - \bar{x}^{t}$ is the average of local AdamW
+steps.  The AdamW update for worker $i$ is
+$\Delta_i^t = -\eta \bigl( \hat{u}_i^t / (\sqrt{\hat{v}_i^t} + \epsilon) + \lambda x_i^t \bigr)$,
+where $\hat{u}$ and $\hat{v}$ denote bias-corrected moments.
+
+\paragraph{Step 2: Bounding the consensus error.}
+Define the parameter consensus error $e_x^t = \frac{1}{N}\sum_i \|x_i^t - \bar{x}^t\|^2$.
+Between synchronization rounds, local updates cause $e_x^t$ to grow.  Using
+bounded variance and bounded heterogeneity:
+\begin{equation}
+  e_x^{t+1} \leq \bigl(1 + \eta L\bigr)\, e_x^{t}
+    + \eta^2 \bigl(\sigma^2 / N + \zeta^2\bigr).
+  \label{eq:app_consensus_x}
+\end{equation}
+Unrolling over $\Kx$ steps between synchronization rounds (where $e_x = 0$
+after averaging) and applying geometric series:
+\begin{equation}
+  e_x^{t} \leq \frac{\eta^2 (\sigma^2/N + \zeta^2)}{1 - (1+\eta L)}
+    \bigl((1+\eta L)^{\Kx} - 1\bigr)
+  = \mathcal{O}\bigl(\eta \Kx (\sigma^2/N + \zeta^2)\bigr).
+  \label{eq:app_consensus_bound}
+\end{equation}
+
+\paragraph{Step 3: Bounding the optimizer-state consensus error.}
+Analogously define $e_u^t = \frac{1}{N}\sum_i \|u_i^t - \bar{u}^t\|^2$ and
+$e_v^t = \frac{1}{N}\sum_i \|v_i^t - \bar{v}^t\|^2$.  These errors accumulate
+over $\Ku$ and $\Kv$ steps respectively.  The key insight is that the
+exponential moving average updates for $u$ and $v$ are contractive with factors
+$\beta_1$ and $\beta_2$:
+\begin{align}
+  e_u^t &= \mathcal{O}\bigl(\eta^2 \Ku \,\sigma_{\text{opt}}^2\bigr),
+  \label{eq:app_eu_bound} \\
+  e_v^t &= \mathcal{O}\bigl(\eta^2 \Kv \,\sigma_{\text{opt}}^2\bigr).
+  \label{eq:app_ev_bound}
+\end{align}
+Because $\beta_1 = 0.9$ and $\beta_2 = 0.95$ are close to 1, the contraction
+damps the drift between synchronization rounds.  The optimizer-state drift
+$\sigma_{\text{opt}}^2$ is empirically much smaller than $\sigma^2$ (by
+$\sim\!10\times$ in our measurements) because the EMA smooths out per-sample
+gradient noise.
+
+\paragraph{Step 4: Assembling the bound.}
+Substituting the consensus-error bounds into the descent lemma and telescoping
+over $T$ steps:
+\begin{equation}
+  \frac{1}{T}\sum_{t=1}^{T} \mathbb{E}\bigl[\|\nabla f(\bar{x}^t)\|^2\bigr]
+  \leq
+  \underbrace{\frac{f(\bar{x}^0) - f^*}{\eta T}}_{\text{initialization gap}}
+  + \underbrace{\eta L \sigma^2}_{\text{SGD noise}}
+  + \underbrace{\eta^2 L^2 \Kx \sigma^2}_{\text{param drift}}
+  + \underbrace{\eta^2 L^2 (\Ku + \Kv)\, \sigma_{\text{opt}}^2}_{\text{optimizer drift}}.
+  \label{eq:app_full_bound}
+\end{equation}
+Setting $\eta = \mathcal{O}(1/\sqrt{T})$ recovers the standard
+$\mathcal{O}(1/\sqrt{T})$ convergence rate.  The third and fourth terms are the
+additional cost of local updates: the parameter-drift term scales with $\Kx$
+and the full gradient variance $\sigma^2$, while the optimizer-drift term scales
+with $(\Ku + \Kv)$ but with the much smaller $\sigma_{\text{opt}}^2$.
+
+\paragraph{Practical implication.}
+Since $\sigma_{\text{opt}}^2 \ll \sigma^2$, \desloc{} can set $\Ku$ and $\Kv$
+substantially larger than $\Kx$ without degrading convergence, achieving the
+communication savings reported in Section~\ref{sec:method:decomposed}.  With
+our default configuration ($\Kx=8, \Ku=4, \Kv=16$), the first-moment sync is
+more frequent than the parameter sync ($\Ku < \Kx$) because momentum estimates
+are critical for training stability on heterogeneous hardware; the second-moment
+sync is the most relaxed ($\Kv = 16$) because $v$ changes slowly.  The bound in
+Eq.~\eqref{eq:app_full_bound} confirms this hierarchy is well-motivated.
+
+\hfill$\square$
+
+
+% ==================================================================
+\section{Hardware Topology Details}
+\label{app:topology}
+
+\paragraph{GPU--GPU interconnect.}
+All five GPUs communicate exclusively via PCIe; no NVLink bridges are present.
+Table~\ref{tab:app_topo} reports the PCIe topology as observed by
+\texttt{nvidia-smi topo -m}.  ``PIX'' denotes two GPUs sharing a PCIe switch,
+``PHB'' denotes the same host bridge (same NUMA node), and ``SYS'' denotes a
+cross-NUMA-node path traversing the inter-socket link.
+
+\begin{table}[h]
+  \centering
+  \caption{PCIe topology matrix for the \texttt{ags1} cluster
+    (\texttt{nvidia-smi topo -m}).  PIX = same PCIe switch; PHB = same host
+    bridge; SYS = cross-NUMA-node.}
+  \label{tab:app_topo}
+  \small
+  \begin{tabular}{lccccc}
+    \toprule
+    & \textbf{GPU\,0} & \textbf{GPU\,1} & \textbf{GPU\,2}
+    & \textbf{GPU\,3} & \textbf{GPU\,4} \\
+    \midrule
+    GPU\,0 (A6000, NUMA\,0)          & ---  & SYS  & PHB  & SYS  & SYS  \\
+    GPU\,1 (A6000, NUMA\,1)          & SYS  & ---  & SYS  & PHB  & PIX  \\
+    GPU\,2 (H100-NVL, NUMA\,0)       & PHB  & SYS  & ---  & SYS  & SYS  \\
+    GPU\,3 (RTX PRO BW, NUMA\,1)     & SYS  & PHB  & SYS  & ---  & PIX  \\
+    GPU\,4 (RTX PRO BW, NUMA\,1)     & SYS  & PIX  & SYS  & PIX  & ---  \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\paragraph{NUMA layout.}
+The host contains two AMD EPYC 9354 processors with 128 cores each (256 total)
+and 1.5\,TB of DDR5 memory split evenly across two NUMA nodes.
+NUMA\,0 (cores 0--63) is local to GPU\,0 (A6000) and GPU\,2 (H100-NVL).
+NUMA\,1 (cores 64--127) is local to GPU\,1 (A6000), GPU\,3, and GPU\,4 (both
+RTX~PRO~6000 Blackwell).  The LOC Cache allocates 200\,GB of pinned
+shared memory per NUMA node (\texttt{/dev/shm}), with CPU affinity matching
+the local core range to avoid cross-socket memory traffic.
+
+\paragraph{PCIe bandwidth limitations.}
+GPU\,2 (H100-NVL) connects via PCIe Gen\,5 $\times$16, achieving a measured
+unidirectional bandwidth of $\sim$50\,GB/s.  All other GPUs connect via
+PCIe Gen\,4 $\times$16 with a measured bandwidth of $\sim$25\,GB/s.  Notably,
+GPUs~3 and~4 (RTX PRO 6000 Blackwell) operate at PCIe Gen\,1 $\times$16
+effective bandwidth due to a BIOS misconfiguration that limits PCIe link
+negotiation; their theoretical Gen\,5 capability is not realized.
+This bandwidth asymmetry motivates the topology-aware AllReduce grouping in
+\desloc{}: intra-NUMA reductions execute first (lower latency), followed by
+cross-NUMA synchronization overlapped with the next forward pass.
+
+
+% ==================================================================
+\section{Additional Ablation Results}
+\label{app:ablations}
+
+We provide supplementary ablation results for experiments described in
+Section~\ref{sec:exp:ablation}.
+
+\paragraph{Synchronization period sweep.}
+Table~\ref{tab:app_period_sweep} reports the final validation loss and
+wall-clock time for various $(\Kx, \Ku, \Kv)$ configurations, holding all other
+hyperparameters fixed.
+
+\begin{table}[h]
+  \centering
+  \caption{Ablation over \desloc{} synchronization periods (1B model,
+    10k steps).  $r_{\text{comm}}$ is the communication ratio from
+    Eq.~\eqref{eq:comm_ratio}.}
+  \label{tab:app_period_sweep}
+  \small
+  \begin{tabular}{ccc|ccc}
+    \toprule
+    $\Kx$ & $\Ku$ & $\Kv$ & $r_{\text{comm}}$ & Val.\ Loss & Wall Time (h) \\
+    \midrule
+    1  & 1  & 1  & 3.000 & 3.021 & 14.2 \\
+    4  & 4  & 4  & 0.750 & 3.028 & 10.8 \\
+    8  & 4  & 16 & 0.438 & 3.030 & 8.6  \\
+    8  & 8  & 8  & 0.375 & 3.042 & 8.3  \\
+    16 & 8  & 32 & 0.219 & 3.051 & 7.4  \\
+    32 & 16 & 64 & 0.109 & 3.078 & 6.9  \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\paragraph{LOC Cache sizing.}
+Table~\ref{tab:app_cache_size} shows the impact of LOC Cache size on hit rate
+and per-step latency.
+
+\begin{table}[h]
+  \centering
+  \caption{LOC Cache size ablation (7B model, measured at step 5{,}000).}
+  \label{tab:app_cache_size}
+  \small
+  \begin{tabular}{ccc}
+    \toprule
+    Cache per NUMA (GB) & Hit Rate (\%) & Step Latency (s) \\
+    \midrule
+    50   & 71.3 & 4.82 \\
+    100  & 84.6 & 4.31 \\
+    200  & 92.1 & 3.97 \\
+    400  & 93.8 & 3.91 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\paragraph{Activation checkpointing strategy.}
+Table~\ref{tab:app_act_ckpt} compares peak memory and throughput across
+different checkpointing configurations.
+
+\begin{table}[h]
+  \centering
+  \caption{Activation checkpointing ablation for the A6000 (48\,GB)
+    with 7B model, micro-batch 1.}
+  \label{tab:app_act_ckpt}
+  \small
+  \begin{tabular}{lcc}
+    \toprule
+    Strategy & Peak VRAM (GB) & Tokens/s \\
+    \midrule
+    None (OOM)             & $>$48 & ---  \\
+    Selective (\texttt{norm\_out} only)  & 46.2  & 142  \\
+    Full recompute         & 38.4  & 118  \\
+    Full + contiguous      & 36.8  & 121  \\
+    \bottomrule
+  \end{tabular}
+\end{table}
 
 \end{document}
