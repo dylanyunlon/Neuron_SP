@@ -13,6 +13,7 @@ Supports:
   --batch-size  N                           (default: 2; override YAML)
   --seq-len     N                           (default: 2048; override YAML)
   --log-every   N                           (default: 10; override YAML)
+  --fsdp                                    (wrap model with FSDP instead of DDP)
 
 Config priority: explicit CLI flags > YAML file > built-in defaults.
 
@@ -46,6 +47,14 @@ import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
 from torch.nn.utils import clip_grad_norm_
+from torch.distributed.fsdp import (
+    FullyShardedDataParallel as FSDP,
+    ShardingStrategy,
+    CPUOffload,
+    MixedPrecision,
+)
+from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
+import functools
 
 # ---------------------------------------------------------------------------
 # Logging setup (before any import that might log)
@@ -444,7 +453,7 @@ def _cleanup_distributed() -> None:
 # ---------------------------------------------------------------------------
 
 def run_standalone(args: argparse.Namespace) -> None:
-    """Standalone PyTorch training loop — supports torchrun multi-GPU via DDP."""
+    """Standalone PyTorch training loop — supports torchrun multi-GPU via DDP or FSDP."""
     cfg = _MODEL_CONFIGS[args.model_size]
 
     # ------------------------------------------------------------------ setup
@@ -459,10 +468,10 @@ def run_standalone(args: argparse.Namespace) -> None:
     dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
 
     if is_main:
-        logger.info("=== Standalone training (DDP-aware, no DesLocEngine) ===")
+        logger.info("=== Standalone training (DDP/FSDP-aware, no DesLocEngine) ===")
         logger.info(
-            "model-size=%s  device=%s  dtype=%s  world_size=%d",
-            args.model_size, device, dtype, world_size,
+            "model-size=%s  device=%s  dtype=%s  world_size=%d  fsdp=%s",
+            args.model_size, device, dtype, world_size, getattr(args, "fsdp", False),
         )
 
     # ------------------------------------------------------------------ model
@@ -488,18 +497,58 @@ def run_standalone(args: argparse.Namespace) -> None:
     if is_main:
         logger.info("Model: %.2fM parameters", model.num_parameters / 1e6)
 
-    # Wrap with DDP when running in a distributed context
-    if is_dist:
+    # Wrap with FSDP or DDP when running in a distributed context.
+    # FSDP is required for heterogeneous GPU clusters (different VRAM per GPU)
+    # because DDP requires all ranks to hold a full model replica — impossible
+    # when VRAM differs. FSDP shards parameters, gradients, and (with
+    # cpu_offload) optimizer states across ranks, letting each GPU contribute
+    # its own capacity to the collective pool.
+    use_fsdp = is_dist and getattr(args, "fsdp", False)
+    if use_fsdp:
+        # auto_wrap_policy: shard at _TransformerBlock boundaries so each block
+        # is an independent FSDP unit.  This gives fine-grained overlap of
+        # all-gather / computation and limits peak memory per unit.
+        auto_wrap = functools.partial(
+            transformer_auto_wrap_policy,
+            transformer_layer_cls={_TransformerBlock},
+        )
+        # FULL_SHARD = ZeRO-3 equivalent: shards params + grads + optimizer states.
+        # cpu_offload=True moves optimizer states (and optionally grads) to host
+        # DRAM, which is critical when 5 heterogeneous GPUs have mismatched VRAM.
+        fsdp_cpu_offload = CPUOffload(offload_params=True)
+        # Mixed precision: bf16 for forward/backward, fp32 for reduction.
+        fsdp_mp = MixedPrecision(
+            param_dtype=dtype,
+            reduce_dtype=torch.float32,
+            buffer_dtype=dtype,
+        )
+        model = FSDP(
+            model,
+            sharding_strategy=ShardingStrategy.FULL_SHARD,
+            cpu_offload=fsdp_cpu_offload,
+            mixed_precision=fsdp_mp if device.type == "cuda" else None,
+            auto_wrap_policy=auto_wrap,
+            device_id=local_rank if device.type == "cuda" else None,
+        )
+        if is_main:
+            logger.info(
+                "Model wrapped with FSDP (FULL_SHARD / ZeRO-3, cpu_offload=True, "
+                "auto_wrap=_TransformerBlock).  Heterogeneous-GPU safe."
+            )
+    elif is_dist:
         from torch.nn.parallel import DistributedDataParallel as DDP  # noqa: PLC0415
         model = DDP(model, device_ids=[local_rank], output_device=local_rank)
         if is_main:
             logger.info("Model wrapped with DistributedDataParallel (DDP).")
 
     # ---------------------------------------------------------------- optim
-    # Access underlying module parameters when wrapped in DDP
-    raw_model = model.module if is_dist else model
+    # For FSDP: call model.parameters() directly — FSDP manages the sharded
+    # view of params for the optimizer on this rank.
+    # For DDP: use model.module to reach the underlying nn.Module.
+    # For single-GPU: model IS the raw module.
+    raw_model = model.module if (is_dist and not use_fsdp) else model
     optimizer = AdamW(
-        raw_model.parameters(),
+        model.parameters() if use_fsdp else raw_model.parameters(),
         lr           = 3e-4,
         betas        = (0.9, 0.95),
         eps          = 1e-8,
@@ -541,8 +590,12 @@ def run_standalone(args: argparse.Namespace) -> None:
             )
 
         loss.backward()
-        # DDP already all-reduces gradients during backward(); clip after reduce.
-        clip_grad_norm_(raw_model.parameters(), 1.0)
+        # For FSDP: use model.clip_grad_norm_ which handles the sharded reduce
+        # correctly across ranks.  For DDP/single-GPU: use the standard utility.
+        if use_fsdp:
+            model.clip_grad_norm_(1.0)
+        else:
+            clip_grad_norm_(raw_model.parameters(), 1.0)
         optimizer.step()
         scheduler.step()
 
@@ -708,6 +761,17 @@ def parse_args() -> argparse.Namespace:
         default=False,
         help="Enable gradient checkpointing (required for 7B on 48GB GPUs).",
     )
+    p.add_argument(
+        "--fsdp",
+        action="store_true",
+        default=False,
+        help=(
+            "Wrap model with FullyShardedDataParallel (FSDP) instead of DDP. "
+            "Use for heterogeneous-GPU clusters where GPUs have different VRAM. "
+            "Applies FULL_SHARD (ZeRO-3 equivalent) with CPU offload for "
+            "optimizer states (requires ample host DRAM, e.g. 1.5 TB)."
+        ),
+    )
     return p.parse_args()
 
 
@@ -740,6 +804,7 @@ def main() -> None:
         logger.info("  seq-len    : %d", args.seq_len)
         logger.info("  data-path  : %s", args.data_path or "(synthetic)")
         logger.info("  use-desloc : %s", args.use_desloc)
+        logger.info("  fsdp       : %s", getattr(args, "fsdp", False))
         logger.info("  world-size : %d", _world)
         logger.info("  torch      : %s", torch.__version__)
         if torch.cuda.is_available():
