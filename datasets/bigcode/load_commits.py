@@ -64,6 +64,65 @@ DATASETS_DIR = Path(__file__).parent
 
 
 # ---------------------------------------------------------------------------
+# Dataset registry
+# ---------------------------------------------------------------------------
+
+# Each entry maps a logical name → HuggingFace load kwargs + local directory.
+# The registry drives both pull_all_datasets.sh (for documentation) and the
+# streaming loaders below, keeping config in one authoritative place.
+#
+# Fields per entry:
+#   hf_repo      : HuggingFace dataset repo id
+#   hf_kwargs    : extra kwargs forwarded to load_dataset() (e.g. data_dir)
+#   local_dir    : subdirectory under DATASETS_DIR for cached JSONL files
+#   size_hint    : human-readable size for operator reference
+#   splits       : list of HF splits actually used (subset of the full dataset)
+#   description  : one-line purpose summary
+DATASET_REGISTRY: Dict[str, Dict] = {
+    # CommitPackFT — GPT-4-filtered high-quality instruction commits (~2 GB)
+    "commitpackft": {
+        "hf_repo": "bigcode/commitpackft",
+        "hf_kwargs": {},
+        "local_dir": "commitpackft",
+        "size_hint": "~2 GB",
+        "splits": ["train"],
+        "description": "GPT-4 curated instruction-style commits; primary SFT corpus",
+    },
+    # CommitPack — full unfiltered commit archive (~4 TB)
+    "commitpack": {
+        "hf_repo": "bigcode/commitpack",
+        "hf_kwargs": {},
+        "local_dir": "commitpack",
+        "size_hint": "~4 TB",
+        "splits": ["train"],
+        "description": "Full GHArchive-sourced commits; per-language streaming only",
+    },
+    # StarCoder commits — raw git-commits split (~32 GB)
+    # Single-file commits from Google BigQuery public GitHub data.
+    # 80 % of samples use a ±32-line context window; 20 % retain full file.
+    "starcoderdata": {
+        "hf_repo": "bigcode/starcoderdata",
+        "hf_kwargs": {"data_dir": "git-commits"},
+        "local_dir": "starcoderdata_commits",
+        "size_hint": "~32 GB",
+        "splits": ["train"],
+        "description": "StarCoder raw commit subset; baseline pretraining corpus",
+    },
+    # StarCoder commits — near-dedup filtered git-commits-cleaned split (~64 GB)
+    # Applies MinHash-LSH near-deduplication + exact-dedup on top of git-commits;
+    # higher token density and lower repetition → preferred for DES-LOC pretraining.
+    "starcoderdata_cleaned": {
+        "hf_repo": "bigcode/starcoderdata",
+        "hf_kwargs": {"data_dir": "git-commits-cleaned"},
+        "local_dir": "starcoderdata_commits",
+        "size_hint": "~64 GB",
+        "splits": ["train"],
+        "description": "StarCoder deduped commit subset (git-commits-cleaned); recommended for pretraining",
+    },
+}
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 

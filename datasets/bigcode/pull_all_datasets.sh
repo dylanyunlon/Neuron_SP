@@ -39,39 +39,66 @@ for lang in langs:
 print(f"  TOTAL: {total} samples across {len(langs)} languages")
 PY1
 
-# ── 2. StarCoder commits (32GB subset of starcoderdata) ──
+# ── 2. StarCoder commits (32-64GB subset of starcoderdata) ──
 echo ""
-echo "[2/4] bigcode/starcoderdata — git-commits subset (~32GB)"
-echo "  NOTE: This is a subset within starcoderdata, load with data_dir='git-commits'"
+echo "[2/4] bigcode/starcoderdata — git-commits + git-commits-cleaned splits (~32-64GB)"
+echo "  NOTE: Two splits available:"
+echo "    git-commits         (~32GB) raw single-file commits"
+echo "    git-commits-cleaned (~64GB) deduplicated + near-dedup filtered"
 python3 << 'PY2'
 from datasets import load_dataset
 import os
+import json
 
 out = "starcoderdata_commits"
 os.makedirs(out, exist_ok=True)
 
-# Streaming mode for large dataset
-ds = load_dataset("bigcode/starcoderdata", data_dir="git-commits", split="train", streaming=True)
+# ── 2a. git-commits (raw, ~32GB) ──
+print("  [2a] git-commits split (raw, ~32GB) — streaming sample")
+ds_raw = load_dataset("bigcode/starcoderdata", data_dir="git-commits", split="train", streaming=True)
 
-# Save first 10K samples as reference
 count = 0
-import json
 with open(f"{out}/sample_10k.jsonl", "w") as f:
-    for item in ds:
+    for item in ds_raw:
         f.write(json.dumps(item, ensure_ascii=False) + "\n")
         count += 1
         if count >= 10000:
             break
 
-print(f"  Saved {count} samples to {out}/sample_10k.jsonl")
-print(f"  Full dataset: ~32GB, use streaming=True for processing")
+print(f"    Saved {count} samples to {out}/sample_10k.jsonl")
+print(f"    Full dataset: ~32GB, use streaming=True for processing")
 
-# Save download script for full dataset
+# ── 2b. git-commits-cleaned (deduped, ~64GB) ──
+# This split applies StarCoder near-dedup + exact-dedup filtering on top of
+# git-commits; it is ~2x larger in token count due to retained full-file context
+# for 20% of samples, but higher quality for pretraining objectives.
+print("  [2b] git-commits-cleaned split (near-dedup filtered, ~64GB) — streaming sample")
+ds_cleaned = load_dataset("bigcode/starcoderdata", data_dir="git-commits-cleaned", split="train", streaming=True)
+
+count = 0
+with open(f"{out}/sample_cleaned_10k.jsonl", "w") as f:
+    for item in ds_cleaned:
+        f.write(json.dumps(item, ensure_ascii=False) + "\n")
+        count += 1
+        if count >= 10000:
+            break
+
+print(f"    Saved {count} samples to {out}/sample_cleaned_10k.jsonl")
+print(f"    Full dataset: ~64GB, use streaming=True for processing")
+
+# Save download script for full dataset (both splits)
 with open(f"{out}/download_full.py", "w") as f:
     f.write('''from datasets import load_dataset
-ds = load_dataset("bigcode/starcoderdata", data_dir="git-commits", split="train")
-ds.save_to_disk("starcoderdata_commits_full")
-print(f"Total: {len(ds)} samples")
+
+# git-commits: raw single-file commits (~32GB)
+ds_raw = load_dataset("bigcode/starcoderdata", data_dir="git-commits", split="train")
+ds_raw.save_to_disk("starcoderdata_commits_full")
+print(f"git-commits total: {len(ds_raw)} samples")
+
+# git-commits-cleaned: near-dedup + exact-dedup filtered (~64GB, preferred for pretraining)
+ds_cleaned = load_dataset("bigcode/starcoderdata", data_dir="git-commits-cleaned", split="train")
+ds_cleaned.save_to_disk("starcoderdata_commits_cleaned_full")
+print(f"git-commits-cleaned total: {len(ds_cleaned)} samples")
 ''')
 PY2
 
@@ -162,7 +189,7 @@ echo ""
 echo "=========================================="
 echo "Done. Summary:"
 echo "  commitpackft/     — ready to use (full download ~2GB)"
-echo "  starcoderdata_commits/ — 10K sample + full download script"
+echo "  starcoderdata_commits/ — 10K samples (raw + cleaned) + full download script"
 echo "  commitpack/       — 10K Python sample + per-language download script"
 echo "  the_stack_v2/     — metadata + access instructions"
 echo "=========================================="

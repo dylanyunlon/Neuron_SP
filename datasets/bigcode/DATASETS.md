@@ -16,12 +16,14 @@ bash pull_all_datasets.sh    # 在 ags1 上执行
 - **HF**: https://huggingface.co/datasets/bigcode/commitpackft
 - **论文**: OctoPack (arXiv:2308.07124)
 
-### 2. StarCoder Commits (`bigcode/starcoderdata`, data_dir="git-commits")
-- **规模**: ~32 GB (starcoderdata 总量 783 GB 的子集)
+### 2. StarCoder Commits (`bigcode/starcoderdata`, data_dir="git-commits" / "git-commits-cleaned")
+- **规模**: ~32 GB (git-commits, raw) / ~64 GB (git-commits-cleaned, HuggingFace 来源)
 - **来源**: Google BigQuery 公开 GitHub 数据，单文件 commit
 - **格式**: `{old_contents, new_contents, subject, message, repos, old_file, new_file, ...}`
 - **处理**: 80% 样本只取变更行 ±32 行窗口，20% 保留全文件
 - **过滤**: commit message 黑名单 + ≤2行变更 50% 丢弃 + 100K 字符上限
+- **git-commits-cleaned split**: 在 git-commits 基础上追加 near-dedup（MinHash LSH）+ exact-dedup 过滤；
+  保留更高质量样本，token 密度更高，推荐用于 DES-LOC 预训练主语料
 - **HF**: https://huggingface.co/datasets/bigcode/starcoderdata
 - **论文**: StarCoder (arXiv:2305.06161)
 
@@ -115,7 +117,8 @@ python datasets/bigcode/the_stack_v2/megatron_indexed.py --dummy --output /tmp/t
 
 | 数据集 | 规模 | 来源 | HuggingFace ID | 用途 |
 |--------|------|------|---------------|------|
-| StarCoder commits | 32 GB / 64 GB | BigQuery | `bigcode/starcoderdata` (data_dir="git-commits") | 预训练 code diff |
+| StarCoder commits (raw) | 32 GB | BigQuery | `bigcode/starcoderdata` (data_dir="git-commits") | 预训练 code diff |
+| StarCoder commits (cleaned) | 64 GB | BigQuery + near-dedup | `bigcode/starcoderdata` (data_dir="git-commits-cleaned") | 预训练主语料（推荐）|
 | CommitPack | 4 TB | GHArchive + GitHub API 爬取 | `bigcode/commitpack` | 大规模预训练 |
 | CommitPackFT | 2 GB (高质量子集) | GPT-4 筛选 | `bigcode/commitpackft` | 指令微调 |
 | The Stack v2 (PR/commit) | 未公开总量 | GHArchive + Software Heritage | `bigcode/the-stack-v2` | 全量预训练语料 (M761-M775 适配完成) |
