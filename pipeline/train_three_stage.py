@@ -47,7 +47,9 @@ from pipeline.engine_bridge import (
 from deepspeed.runtime.hetero_mimo_training_loop import (
     setup_hetero_mimo_training,
     HeteroMIMOTrainingLoop,
+    PCIeP2PCommunicator,
     PerModuleOptimizerConfig,
+    SharedLocalityCache,
 )
 from deepspeed.runtime.hetero_gdn_selective_recompute import build_neuron_sp_config
 
@@ -384,11 +386,30 @@ def _make_forward_backward_func(model: nn.Module):
         input_ids = batch["input_ids"]
         labels = batch["labels"]
 
-        # Move to model device if possible
+        # Route cross-GPU transfers through PCIeP2PCommunicator when
+        # available — large tensors are staged through CPU DRAM
+        # (SharedLocalityCache) instead of direct PCIe P2P copies.
         try:
             device = next(model.parameters()).device
-            input_ids = input_ids.to(device)
-            labels = labels.to(device)
+            src_dev = input_ids.device.index if input_ids.is_cuda else -1
+            dst_dev = device.index if device.type == "cuda" else -1
+            if (
+                p2p_communicator is not None
+                and src_dev >= 0
+                and dst_dev >= 0
+                and src_dev != dst_dev
+            ):
+                input_ids = p2p_communicator.send_activation(
+                    input_ids, src_dev, dst_dev,
+                    cache_key=f"fwd_input:iter={iteration}",
+                )
+                labels = p2p_communicator.send_activation(
+                    labels, src_dev, dst_dev,
+                    cache_key=f"fwd_labels:iter={iteration}",
+                )
+            else:
+                input_ids = input_ids.to(device)
+                labels = labels.to(device)
         except StopIteration:
             pass
 
@@ -443,6 +464,15 @@ def train_one_stage(
     print(f"\n{'='*60}")
     print(f"  {stage_name}: max_steps={max_steps}")
     print(f"{'='*60}\n")
+
+    # Log SharedLocalityCache and PCIeP2PCommunicator status from the MIMO
+    # loop so operators can verify the 1.5 TB DRAM staging path is active.
+    _cache = loop._cache
+    _p2p = loop._p2p
+    print(f"  [MIMO] SharedLocalityCache: max_entries={_cache._max_entries}, "
+          f"max_bytes={_cache._max_bytes / (1024**3):.1f} GB")
+    print(f"  [MIMO] PCIeP2PCommunicator: staging_threshold="
+          f"{_p2p._threshold_bytes / (1024**2):.1f} MB")
 
     os.makedirs(save_path, exist_ok=True)
 

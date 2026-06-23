@@ -90,6 +90,7 @@ from datasets.bigcode.commit_packing import (  # noqa: E402
 )
 
 from deepspeed.runtime.hetero_mimo_training_loop import (  # noqa: E402
+    DeviceCapabilityRegistry,
     HeteroMIMOTrainingLoop,
     PCIeP2PCommunicator,
     SharedLocalityCache,
@@ -1260,7 +1261,39 @@ class DesLocEngine:
 
         logger.info("Engine ready. Starting from step %d.", self.global_step)
 
-        # --- Phase 9: HeteroMIMOTrainingLoop ---
+        # --- Phase 9a: SharedLocalityCache (1.5 TB CPU DRAM staging) ---
+        # The training host has 2×EPYC 9354 with 1.5 TB DDR5.  We reserve
+        # ~192 GB (1/8 of total DRAM) for the inter-pool activation / gradient
+        # cache, leaving the rest for OS, data loaders, and checkpoint IO.
+        _cache_max_gb = 192.0
+        _cache_max_entries = 512   # ~128 micro-batches × 4 pipeline stages
+        self.locality_cache = SharedLocalityCache(
+            max_entries=_cache_max_entries,
+            max_bytes=int(_cache_max_gb * 1024 ** 3),
+        )
+        logger.info(
+            "SharedLocalityCache initialized: max_entries=%d, max_bytes=%.1f GB "
+            "(1.5 TB DRAM host, reserving 1/8 for cache).",
+            _cache_max_entries, _cache_max_gb,
+        )
+
+        # --- Phase 9b: PCIeP2PCommunicator (cross-pool activation transfer) ---
+        # Uses DeviceCapabilityRegistry to classify A6000 (SM86) vs H100 (SM90)
+        # pools, then routes large tensors (>= 64 MB) through CPU DRAM staging
+        # instead of direct PCIe P2P (which is bandwidth-limited at 16–32 GB/s).
+        self._device_registry = DeviceCapabilityRegistry()
+        self.p2p_communicator = PCIeP2PCommunicator(
+            registry=self._device_registry,
+            locality_cache=self.locality_cache,
+            staging_threshold_mb=64.0,
+        )
+        logger.info(
+            "PCIeP2PCommunicator initialized: staging_threshold=64.0 MB, "
+            "registry has %d device(s).",
+            len(self._device_registry.all_profiles),
+        )
+
+        # --- Phase 9c: HeteroMIMOTrainingLoop ---
         # Initialize PCIeP2PCommunicator and SharedLocalityCache via
         # setup_hetero_mimo_training(), then store the returned
         # HeteroMIMOTrainingLoop for use in the training loop.
@@ -1354,14 +1387,41 @@ class DesLocEngine:
 
             for micro in range(num_microbatches):
                 input_ids, labels = next(self.data_iter)
-                input_ids = input_ids.to(self.primary_device, non_blocking=True)
-                labels = labels.to(self.primary_device, non_blocking=True)
+                # Route cross-GPU activation transfers through
+                # PCIeP2PCommunicator: for tensors already on a different GPU,
+                # the communicator decides whether to use direct PCIe copy or
+                # stage through CPU DRAM (SharedLocalityCache) based on tensor
+                # size and pool topology.
+                src_dev = input_ids.device.index if input_ids.is_cuda else -1
+                dst_dev = (
+                    self.primary_device.index
+                    if self.primary_device.type == "cuda"
+                    else -1
+                )
+                if src_dev >= 0 and dst_dev >= 0 and src_dev != dst_dev:
+                    cache_key = f"input:step={step}:micro={micro}"
+                    input_ids = self.p2p_communicator.send_activation(
+                        input_ids, src_dev, dst_dev, cache_key=cache_key,
+                    )
+                    labels = self.p2p_communicator.send_activation(
+                        labels, src_dev, dst_dev,
+                        cache_key=f"labels:step={step}:micro={micro}",
+                    )
+                else:
+                    input_ids = input_ids.to(self.primary_device, non_blocking=True)
+                    labels = labels.to(self.primary_device, non_blocking=True)
 
                 if self.mimo_loop is not None:
                     # Use HeteroMIMOTrainingLoop.step(batch) — wires
                     # PCIeP2PCommunicator and SharedLocalityCache into the
                     # forward/backward pass.
                     batch = (input_ids, labels)
+
+                    # Capture engine-level cache and communicator so the
+                    # forward_backward_func can stage activations through CPU
+                    # DRAM when the scheduler assigns cross-pool micro-batches.
+                    _engine_cache = self.locality_cache
+                    _engine_p2p = self.p2p_communicator
 
                     def _forward_backward_func(
                         forward_only: bool = False,
@@ -1375,12 +1435,20 @@ class DesLocEngine:
                         _lbl=labels,
                         _num_mb=num_microbatches,
                     ):
+                        # Use the engine's P2P communicator when the MIMO loop
+                        # does not supply one (backward compatibility).
+                        _p2p = p2p_communicator if p2p_communicator is not None else _engine_p2p
                         with torch.autocast(
                             device_type=self.primary_device.type,
                             dtype=_DEFAULT_DTYPE,
                             enabled=(self.primary_device.type == "cuda"),
                         ):
                             logits: torch.Tensor = self.model(_ids)
+                            # Cache forward activations in the locality cache so
+                            # that cross-pool backward passes can retrieve them
+                            # without a redundant PCIe round-trip.
+                            _act_key = f"fwd_act:iter={iteration}"
+                            _engine_cache.put(_act_key, logits.detach())
                             B, T, V = logits.shape
                             shift_logits = logits[:, :-1, :].contiguous().reshape(-1, V)
                             shift_labels = _lbl[:, :T - 1].contiguous().reshape(-1)
