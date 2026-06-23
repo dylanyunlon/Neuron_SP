@@ -10,7 +10,9 @@ Supports GLM-130B-style mixed training:
 Usage:
     # On ags1, first run: bash pull_all_datasets.sh
     # Then in training:
-    from datasets.bigcode.load_commits import load_commit_dataset, MixedCommitDataset
+    from datasets.bigcode.load_commits import (
+        load_commit_dataset, MixedCommitDataset, build_streaming_dataloader
+    )
 
     # Plain iterator (original API, unchanged):
     ds = load_commit_dataset("commitpackft", lang="python")
@@ -24,6 +26,15 @@ Usage:
         print(sample["text"])          # tokenizer-ready string
         print(sample["loss_weight"])   # alpha (span) or 1-alpha (causal)
 
+    # Streaming DataLoader for bigcode/commitpack (4 TB):
+    loader = build_streaming_dataloader(
+        languages=["python", "javascript"],
+        seq_length=2048, micro_batch_size=4,
+        rank=rank, world_size=world_size,
+    )
+    for batch in loader:
+        tokens = batch["tokens"]       # (micro_batch_size, seq_length)
+
 Smoke-test (CommitPackFT Python subset):
     python load_commits.py commitpackft python --mixed --samples 500
 """
@@ -34,7 +45,7 @@ import glob
 import random
 import re
 from pathlib import Path
-from typing import Iterator, Dict, Optional, List
+from typing import Iterator, Dict, Optional, List, Union
 
 # ---------------------------------------------------------------------------
 # Formatting templates
@@ -440,6 +451,148 @@ def load_commit_dataset(
                 sample["_source"] = dataset_name
                 yield sample
                 count += 1
+
+
+def build_streaming_dataloader(
+    languages: Optional[List[str]] = None,
+    seq_length: int = 2048,
+    micro_batch_size: int = 4,
+    rank: int = 0,
+    world_size: int = 1,
+    tokenizer_name: str = "gpt2",
+    resume_path: Optional[str] = None,
+    prefetch_batches: int = 8,
+    tokenizer_workers: int = 8,
+    numa_aware: bool = True,
+    device: Optional["torch.device"] = None,
+    max_samples: Optional[int] = None,
+    seed: int = 42,
+) -> "torch.utils.data.DataLoader":
+    """
+    Build a streaming DataLoader over ``bigcode/commitpack`` (4 TB) using
+    :class:`CommitPackStreamingDataset` from Megatron-LM.
+
+    CommitPack is too large (~4 TB / 1.45 B commits) to materialise locally,
+    so this function enforces ``streaming=True`` via the Megatron-LM
+    ``CommitPackStreamingDataset`` which fetches HuggingFace Parquet shards
+    lazily — one Arrow record batch at a time — keeping resident memory
+    proportional to a single shard (~128 MB) rather than the full corpus.
+
+    Architecture features provided by ``CommitPackStreamingDataset``:
+      - Per-rank shard assignment  — each GPU pulls a disjoint subset of shards.
+      - Checkpoint / resume        — shard + sample offset persisted to JSON.
+      - Multi-threaded CPU tokenization (``tokenizer_workers`` threads).
+      - NUMA-aware prefetch thread pinning for ags1's 2-NUMA / 5-GPU topology.
+      - Async GPU prefetch via ``_PrefetchDataLoader`` wrapper.
+
+    Args:
+        languages:         CommitPack language subsets to stream.
+                           Defaults to the top-5 most common languages in the
+                           corpus: Python, JavaScript, TypeScript, Java, Go.
+        seq_length:        Training sequence length (tokens). Default 2048.
+        micro_batch_size:  Per-GPU micro batch size. Default 4.
+        rank:              Current process rank (used for shard assignment).
+        world_size:        Total number of processes.
+        tokenizer_name:    HuggingFace tokenizer name or local path.
+        resume_path:       Base path for checkpoint JSON files.  A per-rank
+                           suffix ``_rank{N}.json`` is appended automatically.
+        prefetch_batches:  Async prefetch queue depth (batches). Default 8.
+        tokenizer_workers: Number of CPU tokenization threads. Default 8.
+        numa_aware:        Enable NUMA-aware thread pinning (ags1 only).
+        device:            Target GPU device.  Defaults to ``cuda:{rank}``.
+        max_samples:       Debug cap — truncate iteration after N samples.
+        seed:              RNG seed for reproducible shard shuffling.
+
+    Returns:
+        A ``_PrefetchDataLoader`` wrapping a ``torch.utils.data.DataLoader``
+        backed by ``CommitPackStreamingDataset``.  Iterate directly in the
+        training loop::
+
+            loader = build_streaming_dataloader(
+                languages=["python", "javascript"],
+                rank=rank, world_size=world_size,
+            )
+            for batch in loader:
+                tokens      = batch["tokens"]       # (micro_batch_size, seq_length)
+                labels      = batch["labels"]
+                loss_mask   = batch["loss_mask"]
+                position_ids = batch["position_ids"]
+
+    Raises:
+        ImportError: if ``torch`` or the Megatron-LM package is not installed.
+
+    Dataset registry reference:
+        DATASET_REGISTRY["commitpack"] — ``bigcode/commitpack``, 4 TB,
+        streaming=True, no HF token required.
+    """
+    # Import lazily — avoids hard torch/megatron dependency when the caller
+    # only uses load_commit_dataset() / MixedCommitDataset.
+    try:
+        from Megatron_LM.megatron.core.datasets.commitpack_streaming_dataset import (  # noqa: E501
+            CommitPackStreamingDataset,
+            CommitPackStreamingConfig,
+            build_commitpack_dataloader,
+        )
+    except ImportError:
+        # Try alternate import path (editable install or sys.path variation)
+        try:
+            from megatron.core.datasets.commitpack_streaming_dataset import (  # noqa: E501
+                CommitPackStreamingDataset,
+                CommitPackStreamingConfig,
+                build_commitpack_dataloader,
+            )
+        except ImportError as exc:
+            raise ImportError(
+                "CommitPackStreamingDataset not found. "
+                "Ensure Megatron-LM/megatron/core/datasets/commitpack_streaming_dataset.py "
+                "is accessible on PYTHONPATH, or install Megatron-LM."
+            ) from exc
+
+    # Default language list: top-5 languages in bigcode/commitpack by sample count
+    if languages is None:
+        languages = ["python", "javascript", "typescript", "java", "go"]
+
+    # Resolve dataset entry from registry to confirm we use bigcode/commitpack
+    registry_entry = DATASET_REGISTRY["commitpack"]
+    hf_dataset_name: str = registry_entry["hf_id"]  # "bigcode/commitpack"
+
+    # Build CommitPackStreamingConfig explicitly so callers can inspect it
+    config = CommitPackStreamingConfig(
+        languages=languages,
+        split=registry_entry["split"],          # "train"
+        hf_dataset_name=hf_dataset_name,        # "bigcode/commitpack"
+        seq_length=seq_length,
+        micro_batch_size=micro_batch_size,
+        rank=rank,
+        world_size=world_size,
+        resume_path=resume_path,
+        prefetch_batches=prefetch_batches,
+        tokenizer_workers=tokenizer_workers,
+        tokenizer_name=tokenizer_name,
+        numa_aware=numa_aware,
+        max_samples=max_samples,
+        seed=seed,
+    )
+
+    # build_commitpack_dataloader creates the IterableDataset, wraps it in a
+    # DataLoader (pin_memory, drop_last), and adds async GPU prefetch.
+    loader = build_commitpack_dataloader(
+        languages=languages,
+        seq_length=seq_length,
+        micro_batch_size=micro_batch_size,
+        rank=rank,
+        world_size=world_size,
+        tokenizer_name=tokenizer_name,
+        resume_path=resume_path,
+        prefetch_batches=prefetch_batches,
+        tokenizer_workers=tokenizer_workers,
+        numa_aware=numa_aware,
+        device=device,
+        max_samples=max_samples,
+        seed=seed,
+    )
+
+    return loader
 
 
 class MixedCommitDataset:
