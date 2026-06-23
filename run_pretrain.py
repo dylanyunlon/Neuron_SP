@@ -301,19 +301,69 @@ def _gpu_mem_str(device: torch.device) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Distributed helpers
+# ---------------------------------------------------------------------------
+
+def _init_distributed() -> Tuple[int, int, bool]:
+    """
+    Initialise torch.distributed when launched via torchrun / torch.multiprocessing.
+
+    Returns (rank, world_size, is_distributed).
+    Works transparently for single-process runs as well.
+    """
+    # torchrun sets RANK / WORLD_SIZE / LOCAL_RANK / MASTER_ADDR / MASTER_PORT
+    rank       = int(os.environ.get("RANK",       "0"))
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+
+    is_dist = world_size > 1
+
+    if is_dist:
+        if not dist.is_initialized():
+            dist.init_process_group(backend="nccl", init_method="env://")
+        torch.cuda.set_device(local_rank)
+        logger.info(
+            "torch.distributed initialised: rank=%d / world_size=%d  local_rank=%d",
+            rank, world_size, local_rank,
+        )
+    else:
+        logger.info("Single-process run (no torch.distributed).")
+
+    return rank, world_size, is_dist
+
+
+def _cleanup_distributed() -> None:
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
+
+# ---------------------------------------------------------------------------
 # Standalone training loop (fallback when DesLocEngine unavailable)
 # ---------------------------------------------------------------------------
 
 def run_standalone(args: argparse.Namespace) -> None:
-    """Standalone PyTorch training loop — no DeepSpeed dependency."""
+    """Standalone PyTorch training loop — supports torchrun multi-GPU via DDP."""
     cfg = _MODEL_CONFIGS[args.model_size]
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    dtype  = torch.bfloat16 if device.type == "cuda" else torch.float32
+    # ------------------------------------------------------------------ setup
+    rank, world_size, is_dist = _init_distributed()
+    is_main = (rank == 0)
 
-    logger.info("=== Standalone training (no DesLocEngine) ===")
-    logger.info("model-size=%s  device=%s  dtype=%s", args.model_size, device, dtype)
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    if torch.cuda.is_available():
+        device = torch.device("cuda", local_rank)
+    else:
+        device = torch.device("cpu")
+    dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
 
+    if is_main:
+        logger.info("=== Standalone training (DDP-aware, no DesLocEngine) ===")
+        logger.info(
+            "model-size=%s  device=%s  dtype=%s  world_size=%d",
+            args.model_size, device, dtype, world_size,
+        )
+
+    # ------------------------------------------------------------------ model
     model = LlamaModel(
         vocab_size  = cfg["vocab_size"],
         hidden_size = cfg["hidden_size"],
@@ -322,11 +372,21 @@ def run_standalone(args: argparse.Namespace) -> None:
         seq_len     = args.seq_len,
     ).to(dtype=dtype, device=device)
 
-    n_params = model.num_parameters
-    logger.info("Model: %.2fM parameters", n_params / 1e6)
+    if is_main:
+        logger.info("Model: %.2fM parameters", model.num_parameters / 1e6)
 
+    # Wrap with DDP when running in a distributed context
+    if is_dist:
+        from torch.nn.parallel import DistributedDataParallel as DDP  # noqa: PLC0415
+        model = DDP(model, device_ids=[local_rank], output_device=local_rank)
+        if is_main:
+            logger.info("Model wrapped with DistributedDataParallel (DDP).")
+
+    # ---------------------------------------------------------------- optim
+    # Access underlying module parameters when wrapped in DDP
+    raw_model = model.module if is_dist else model
     optimizer = AdamW(
-        model.parameters(),
+        raw_model.parameters(),
         lr           = 3e-4,
         betas        = (0.9, 0.95),
         eps          = 1e-8,
@@ -334,19 +394,26 @@ def run_standalone(args: argparse.Namespace) -> None:
     )
     scheduler = build_cosine_schedule(optimizer, warmup_steps=10, total_steps=args.steps)
 
+    # ------------------------------------------------------------------ data
+    # Each rank uses a different random seed so data batches differ across GPUs,
+    # simulating independent data-parallel shards on synthetic data.
     if args.data_path:
         data = real_data_iter(args.data_path, args.batch_size, args.seq_len, device)
     else:
+        # Offset the RNG per rank so each worker draws different tokens
+        torch.manual_seed(42 + rank)
         data = synthetic_iter(cfg["vocab_size"], args.batch_size, args.seq_len, device)
 
+    # ----------------------------------------------------------------- train
     model.train()
-    t0    = time.time()
-    losses = []
+    t0     = time.time()
+    losses: list = []
 
-    print(
-        f"\n{'step':>6}  {'loss':>9}  {'lr':>10}  {'tok/s':>9}  {'GPU mem':>15}"
-    )
-    print("-" * 60)
+    if is_main:
+        print(
+            f"\n{'step':>6}  {'loss':>9}  {'lr':>10}  {'tok/s':>9}  {'GPU mem':>15}"
+        )
+        print("-" * 60)
 
     for step in range(1, args.steps + 1):
         input_ids, labels = next(data)
@@ -361,16 +428,21 @@ def run_standalone(args: argparse.Namespace) -> None:
             )
 
         loss.backward()
-        clip_grad_norm_(model.parameters(), 1.0)
+        # DDP already all-reduces gradients during backward(); clip after reduce.
+        clip_grad_norm_(raw_model.parameters(), 1.0)
         optimizer.step()
         scheduler.step()
 
-        losses.append(loss.item())
+        # Average loss across ranks so rank-0 logs the true global mean
+        loss_val = loss.detach()
+        if is_dist:
+            dist.all_reduce(loss_val, op=dist.ReduceOp.AVG)
+        losses.append(loss_val.item())
 
-        if step % args.log_every == 0:
+        if is_main and step % args.log_every == 0:
             elapsed   = time.time() - t0
             avg_loss  = sum(losses[-args.log_every:]) / args.log_every
-            toks_step = args.batch_size * args.seq_len
+            toks_step = args.batch_size * args.seq_len * world_size
             tok_s     = toks_step * args.log_every / max(elapsed, 1e-9)
             cur_lr    = scheduler.get_last_lr()[0]
             mem_str   = _gpu_mem_str(device)
@@ -380,19 +452,26 @@ def run_standalone(args: argparse.Namespace) -> None:
             )
             t0 = time.time()
 
-    final_loss = sum(losses[-min(10, len(losses)):]) / min(10, len(losses))
-    initial_10 = sum(losses[:min(10, len(losses))]) / min(10, len(losses))
-    loss_drop  = initial_10 - final_loss
-    logger.info(
-        "Training complete: initial_loss=%.4f  final_loss=%.4f  drop=%.4f (%.1f%%)",
-        initial_10, final_loss, loss_drop, 100.0 * loss_drop / max(initial_10, 1e-9),
-    )
+    # Barrier before final stats so all ranks finish together
+    if is_dist:
+        dist.barrier()
 
-    if args.steps >= 10:
-        assert final_loss < initial_10 + 0.5, (
-            f"Loss did not decrease: initial={initial_10:.4f}, final={final_loss:.4f}"
+    if is_main:
+        final_loss = sum(losses[-min(10, len(losses)):]) / min(10, len(losses))
+        initial_10 = sum(losses[:min(10, len(losses))]) / min(10, len(losses))
+        loss_drop  = initial_10 - final_loss
+        logger.info(
+            "Training complete: initial_loss=%.4f  final_loss=%.4f  drop=%.4f (%.1f%%)",
+            initial_10, final_loss, loss_drop, 100.0 * loss_drop / max(initial_10, 1e-9),
         )
-        logger.info("✅  Loss decreased — training loop verified.")
+
+        if args.steps >= 10:
+            assert final_loss < initial_10 + 0.5, (
+                f"Loss did not decrease: initial={initial_10:.4f}, final={final_loss:.4f}"
+            )
+            logger.info("✅  Loss decreased — training loop verified.")
+
+    _cleanup_distributed()
 
 
 # ---------------------------------------------------------------------------
@@ -510,26 +589,31 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
 
-    logger.info("=" * 60)
-    logger.info("Neuron_SP run_pretrain.py")
-    logger.info("  model-size : %s  (%s)", args.model_size, _MODEL_CONFIGS[args.model_size])
-    logger.info("  steps      : %d", args.steps)
-    logger.info("  batch-size : %d", args.batch_size)
-    logger.info("  seq-len    : %d", args.seq_len)
-    logger.info("  data-path  : %s", args.data_path or "(synthetic)")
-    logger.info("  use-desloc : %s", args.use_desloc)
-    logger.info("  torch      : %s", torch.__version__)
-    if torch.cuda.is_available():
-        for i in range(torch.cuda.device_count()):
-            props = torch.cuda.get_device_properties(i)
-            logger.info(
-                "  GPU %d: %s  %.0f GB  SM%d.%d",
-                i, props.name, props.total_memory / (1 << 30),
-                props.major, props.minor,
-            )
-    else:
-        logger.info("  No CUDA GPUs found — running on CPU")
-    logger.info("=" * 60)
+    # Only rank 0 prints the startup banner (avoids duplicate output under torchrun)
+    _rank  = int(os.environ.get("RANK",       "0"))
+    _world = int(os.environ.get("WORLD_SIZE", "1"))
+    if _rank == 0:
+        logger.info("=" * 60)
+        logger.info("Neuron_SP run_pretrain.py")
+        logger.info("  model-size : %s  (%s)", args.model_size, _MODEL_CONFIGS[args.model_size])
+        logger.info("  steps      : %d", args.steps)
+        logger.info("  batch-size : %d", args.batch_size)
+        logger.info("  seq-len    : %d", args.seq_len)
+        logger.info("  data-path  : %s", args.data_path or "(synthetic)")
+        logger.info("  use-desloc : %s", args.use_desloc)
+        logger.info("  world-size : %d", _world)
+        logger.info("  torch      : %s", torch.__version__)
+        if torch.cuda.is_available():
+            for i in range(torch.cuda.device_count()):
+                props = torch.cuda.get_device_properties(i)
+                logger.info(
+                    "  GPU %d: %s  %.0f GB  SM%d.%d",
+                    i, props.name, props.total_memory / (1 << 30),
+                    props.major, props.minor,
+                )
+        else:
+            logger.info("  No CUDA GPUs found — running on CPU")
+        logger.info("=" * 60)
 
     if args.use_desloc and _HAS_DESLOC:
         run_desloc(args)
