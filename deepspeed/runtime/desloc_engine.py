@@ -1312,7 +1312,7 @@ class DesLocEngine:
             )
             _dp_group = dist.group.WORLD
 
-        self.fp32_grad_accum_manager = HeteroFP32GradAccumManager(
+        self.fp32_grad_manager = HeteroFP32GradAccumManager(
             config=_fp32_config,
             model=self.model,
             data_parallel_group=_dp_group,
@@ -1335,7 +1335,7 @@ class DesLocEngine:
         # Failures here must not break legacy single-GPU training paths, so the
         # call is wrapped defensively and the loop falls back to None.
         try:
-            self.hetero_mimo_loop: Optional[HeteroMIMOTrainingLoop] = (
+            self.mimo_loop: Optional[HeteroMIMOTrainingLoop] = (
                 setup_hetero_mimo_training(self.model)
             )
             logger.info(
@@ -1347,12 +1347,9 @@ class DesLocEngine:
                 "MIMO loop. Heterogeneous dispatch will degrade to single-device.",
                 exc,
             )
-            self.hetero_mimo_loop = None
+            self.mimo_loop = None
 
-        # Wire the simplified engine-level grad manager (three-tier precision
-        # strategy + PCIe-aware copy).  self.fp32_grad_manager is the primary
-        # handle used inside train() for accumulate() / sync() calls.
-        self.fp32_grad_manager = HeteroFP32GradAccumManager(self)
+        # fp32_grad_manager already initialized in Phase 8 above.
 
         logger.info("Engine ready. Starting from step %d.", self.global_step)
 
@@ -1389,25 +1386,8 @@ class DesLocEngine:
         )
 
         # --- Phase 9c: HeteroMIMOTrainingLoop ---
-        # Initialize PCIeP2PCommunicator and SharedLocalityCache via
-        # setup_hetero_mimo_training(), then store the returned
-        # HeteroMIMOTrainingLoop for use in the training loop.
-        try:
-            self.mimo_loop: Optional[HeteroMIMOTrainingLoop] = setup_hetero_mimo_training(
-                model=self.model,
-                grad_clip=config.grad_clip,
-            )
-            logger.info(
-                "HeteroMIMOTrainingLoop initialized via setup_hetero_mimo_training(); "
-                "PCIeP2PCommunicator and SharedLocalityCache are live."
-            )
-        except Exception as _mimo_exc:  # noqa: BLE001
-            logger.warning(
-                "setup_hetero_mimo_training() failed (%s); "
-                "training loop will use standard forward/backward.",
-                _mimo_exc,
-            )
-            self.mimo_loop = None
+        # Already initialized in Phase 9 above (self.mimo_loop).
+        # Kept as a comment for clarity on the initialization order.
 
         # --- Phase 10: Final hetero hook activation ---
         # Re-run register_hooks() now that all phases have completed.  Some
@@ -1512,7 +1492,7 @@ class DesLocEngine:
         )
 
         # Drive any iteration-level hooks exposed by the MIMO loop (if available).
-        if getattr(self, "hetero_mimo_loop", None) is not None:
+        if getattr(self, "mimo_loop", None) is not None:
             logger.info(
                 "Training loop will coordinate with HeteroMIMOTrainingLoop "
                 "(P2P + LOC cache active)."
@@ -1619,28 +1599,24 @@ class DesLocEngine:
                     step_loss += mimo_result.loss
                 else:
                     # Standard forward/backward path
-                    # Prepare FP32 gradient accumulators for this micro-batch
-                    self.fp32_grad_accum_manager.before_backward()
-                    # Backward
-                    scaled_loss.backward()
-                    # Precision alignment: promote BF16 grads to FP32 accumulators
-                    # for parameters that require it (three-tier precision policy).
-                    self.fp32_grad_accum_manager.accumulate()
-                    step_loss += loss.item()
-
                     # Forward (routes through HeteroRecomputeConfig-aware path)
                     loss, scaled_loss = self.forward(
                         input_ids, labels, num_microbatches=num_microbatches,
                     )
 
+                    # Prepare FP32 gradient accumulators for this micro-batch
+                    self.fp32_grad_manager.before_backward()
                     # Backward
                     scaled_loss.backward()
+                    # Precision alignment: promote BF16 grads to FP32 accumulators
+                    # for parameters that require it (three-tier precision policy).
+                    self.fp32_grad_manager.accumulate()
                     step_loss += loss.item()
 
             if self.mimo_loop is None:
                 # Synchronize FP32 gradients (scale + all-reduce) across the DP group
                 # before gradient clipping and optimizer.step().
-                self.fp32_grad_accum_manager.after_backward(scale=1.0 / num_microbatches)
+                self.fp32_grad_manager.after_backward(scale=1.0 / num_microbatches)
 
             # Gradient clipping (only for standard path; mimo_loop handles it internally)
             if self.mimo_loop is None:
