@@ -262,9 +262,74 @@ class HeteroRegistry:
         """One-shot: discover all modules and register them with the engine.
 
         This is the intended entry point called during engine init.
+
+        Scans deepspeed/runtime/ and deepspeed/runtime/zero/ for all
+        hetero_*.py files.  For each discovered module, attempts
+        importlib.import_module and calls register(engine) if exposed.
+        Tracks per-module success / failure / skip counts.
         """
+        ds_root = os.path.join(self.project_root, "deepspeed")
+        scan_dirs = [
+            os.path.join(ds_root, "runtime"),
+            os.path.join(ds_root, "runtime", "zero"),
+        ]
+
+        succeeded = 0
+        failed = 0
+        skipped = 0
+
+        for scan_dir in scan_dirs:
+            if not os.path.isdir(scan_dir):
+                continue
+            for fname in sorted(os.listdir(scan_dir)):
+                if not fname.startswith("hetero_") or not fname.endswith(".py"):
+                    continue
+                # Skip self to avoid recursive import
+                if fname == "hetero_registry.py":
+                    skipped += 1
+                    continue
+
+                # Build dotted module path relative to project root
+                rel = os.path.relpath(
+                    os.path.join(scan_dir, fname), self.project_root
+                )
+                dotted = rel[:-3].replace(os.sep, ".")
+
+                try:
+                    mod = importlib.import_module(dotted)
+                except Exception as exc:
+                    logger.debug(
+                        "discover_and_register: import failed for %s: %s",
+                        dotted, exc,
+                    )
+                    failed += 1
+                    continue
+
+                register_fn = getattr(mod, "register", None)
+                if not callable(register_fn):
+                    skipped += 1
+                    continue
+
+                try:
+                    register_fn(engine)
+                    succeeded += 1
+                except Exception as exc:
+                    logger.debug(
+                        "discover_and_register: register() failed for %s: %s",
+                        dotted, exc,
+                    )
+                    failed += 1
+
+        total = succeeded + failed + skipped
+        logger.info(
+            "discover_and_register: %d modules total — "
+            "%d succeeded, %d failed, %d skipped",
+            total, succeeded, failed, skipped,
+        )
+
+        # Also populate the internal index for class lookups
         self.discover_modules()
-        return self.register_hooks(engine)
+        return succeeded
 
     def summary(self) -> str:
         """Human-readable summary."""
