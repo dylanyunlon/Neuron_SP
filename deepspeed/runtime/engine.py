@@ -69,6 +69,7 @@ from deepspeed.runtime.constants import \
     PLD_THETA, PLD_GAMMA, BFLOAT16, FP16, AMP, GRADIENT_ACCUMULATION_STEPS, \
     DATA_PARALLEL_GROUP, GLOBAL_RANK, DDP_BFLOAT16
 from deepspeed.runtime.zero.config import ZeroStageEnum
+from deepspeed.runtime.hetero_registry import HeteroRegistry
 from deepspeed.compression import compression_scheduler
 from deepspeed.compression.constants import \
     WEIGHT_QUANTIZE_IN_FORWARD_ENABLED, \
@@ -403,6 +404,11 @@ class DeepSpeedEngine(Module):
                 ))
         self.enable_backward_allreduce = True
         self.inside_no_sync_ctxt = False
+
+        # M1046-C41: Wire HeteroRegistry — discover all hetero_*.py modules
+        # and register them (or apply fallback) into the engine.
+        self._hetero_registry = HeteroRegistry()
+        self._hetero_registry.discover_and_register(self)
         self.progressive_layer_drop = None
         self.eigenvalue = None
         self.block_eigenvalue = None

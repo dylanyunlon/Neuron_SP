@@ -202,6 +202,70 @@ class HeteroRegistry:
                     result[info.primary_class] = cls
         return result
 
+    def discover_modules(self) -> int:
+        """Discover all hetero_*.py modules under deepspeed/.
+
+        Convenience wrapper around scan() that also indexes all classes
+        for later hook registration.  Returns number of modules found.
+        """
+        count = self.scan()
+        logger.info("HeteroRegistry: discovered %d modules", count)
+        return count
+
+    def register_hooks(self, engine: Any) -> int:
+        """Register every discovered module with the engine.
+
+        For each module that exposes a top-level ``register(engine)``
+        function, call it.  For modules without ``register()``, apply
+        the fallback: store a reference on the engine so the module's
+        primary class can be retrieved via the registry later.
+
+        Returns the number of modules that were successfully registered
+        (either via register() or via fallback).
+        """
+        registered = 0
+        for info in self.modules.values():
+            if not info.loaded:
+                self.load_module(info)
+            if info.module_obj is None:
+                continue
+
+            # Preferred path: module exposes register(engine)
+            register_fn = getattr(info.module_obj, "register", None)
+            if callable(register_fn):
+                try:
+                    register_fn(engine)
+                    registered += 1
+                    continue
+                except Exception as exc:
+                    logger.debug(
+                        "register() failed for %s: %s", info.module_name, exc
+                    )
+
+            # Fallback: no register() — store the primary class reference
+            # on the engine keyed by module name so it can be looked up.
+            if info.primary_class:
+                cls = getattr(info.module_obj, info.primary_class, None)
+                if cls is not None:
+                    attr_name = f"_hetero_mod_{info.module_name}"
+                    if not hasattr(engine, attr_name):
+                        setattr(engine, attr_name, cls)
+                    registered += 1
+
+        logger.info(
+            "HeteroRegistry: registered %d/%d modules with engine",
+            registered, len(self.modules),
+        )
+        return registered
+
+    def discover_and_register(self, engine: Any) -> int:
+        """One-shot: discover all modules and register them with the engine.
+
+        This is the intended entry point called during engine init.
+        """
+        self.discover_modules()
+        return self.register_hooks(engine)
+
     def summary(self) -> str:
         """Human-readable summary."""
         lines = ["DES-LOC Hetero Module Registry", "=" * 40]
