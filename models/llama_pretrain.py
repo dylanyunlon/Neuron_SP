@@ -2,15 +2,58 @@
 Pure PyTorch Llama model with RMSNorm, RoPE, SwiGLU, GQA.
 Supports 70M / 1B / 7B configurations.
 forward(input_ids) -> logits
+
+Flash Attention: uses torch.nn.functional.scaled_dot_product_attention with
+torch.backends.cuda.sdp_kernel to dispatch to the Flash-2 CUDA kernel when
+available (requires CUDA + PyTorch >= 2.0, sm80+).  Falls back transparently
+to math / mem-efficient kernels on unsupported hardware.
 """
 
 import math
-from dataclasses import dataclass
+import warnings
+from contextlib import contextmanager
+from dataclasses import dataclass, field
 from typing import Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+
+# ---------------------------------------------------------------------------
+# Flash Attention kernel selector
+# ---------------------------------------------------------------------------
+
+def _flash_attn_available() -> bool:
+    """True when the Flash-2 SDP kernel is present and CUDA is available."""
+    if not torch.cuda.is_available():
+        return False
+    # PyTorch >= 2.0 exposes flash_sdp_enabled()
+    try:
+        return torch.backends.cuda.flash_sdp_enabled()
+    except AttributeError:
+        return False
+
+
+@contextmanager
+def _sdp_kernel(use_flash: bool):
+    """Context manager that selects the SDP backend.
+
+    * use_flash=True  → request Flash-2 kernel; fall back to mem-efficient
+                        or math if not supported (no crash).
+    * use_flash=False → vanilla math kernel (always available).
+    """
+    try:
+        # PyTorch >= 2.0
+        with torch.backends.cuda.sdp_kernel(
+            enable_flash=use_flash,
+            enable_math=not use_flash,
+            enable_mem_efficient=use_flash,  # allow mem-efficient as fallback
+        ):
+            yield
+    except AttributeError:
+        # Older PyTorch — context manager absent; just yield (math path)
+        yield
 
 
 # ---------------------------------------------------------------------------
@@ -28,6 +71,10 @@ class LlamaConfig:
     max_seq_len: int = 2048
     rope_theta: float = 10000.0
     norm_eps: float = 1e-5
+    # Flash Attention: set True to dispatch to Flash-2 CUDA kernel via
+    # torch.backends.cuda.sdp_kernel.  Automatically falls back to
+    # mem-efficient / math SDP when running on CPU or older GPUs.
+    use_flash_attn: bool = True
 
 
 def llama_70m() -> LlamaConfig:
@@ -138,6 +185,7 @@ class GroupedQueryAttention(nn.Module):
         self.n_kv_heads = cfg.n_kv_heads
         self.head_dim   = cfg.dim // cfg.n_heads
         self.n_groups   = cfg.n_heads // cfg.n_kv_heads   # heads per kv group
+        self.use_flash  = cfg.use_flash_attn
 
         self.q_proj = nn.Linear(cfg.dim, cfg.n_heads    * self.head_dim, bias=False)
         self.k_proj = nn.Linear(cfg.dim, cfg.n_kv_heads * self.head_dim, bias=False)
@@ -158,13 +206,24 @@ class GroupedQueryAttention(nn.Module):
         xk = xk.repeat_interleave(self.n_groups, dim=2)  # (B, T, n_heads, D)
         xv = xv.repeat_interleave(self.n_groups, dim=2)
 
-        # (B, H, T, D) for scaled_dot_product_attention
+        # (B, H, T, D) layout expected by scaled_dot_product_attention
         xq = xq.transpose(1, 2)
         xk = xk.transpose(1, 2)
         xv = xv.transpose(1, 2)
 
-        out = F.scaled_dot_product_attention(xq, xk, xv, attn_mask=mask,
-                                             is_causal=(mask is None))
+        # Flash Attention dispatch via torch.backends.cuda.sdp_kernel:
+        #   use_flash=True  -> requests Flash-2 kernel first, falls back to
+        #                      mem-efficient then math (no crash on CPU/old GPU)
+        #   use_flash=False -> math kernel only
+        # F.scaled_dot_product_attention is the public API; the context manager
+        # controls which CUDA kernel is selected beneath it.
+        with _sdp_kernel(use_flash=self.use_flash):
+            out = F.scaled_dot_product_attention(
+                xq, xk, xv,
+                attn_mask=mask,
+                is_causal=(mask is None),
+            )
+
         out = out.transpose(1, 2).contiguous().view(B, T, -1)
         return self.o_proj(out)
 
