@@ -125,6 +125,17 @@ class MegatronTokenizerWrapper:
         self.old_id = hf_tokenizer.convert_tokens_to_ids("<|old|>")
         self.new_id = hf_tokenizer.convert_tokens_to_ids("<|new|>")
         self.msg_id = hf_tokenizer.convert_tokens_to_ids("<|commit_msg|>")
+        # Alias so eval code can use the explicit name
+        self.commit_msg_id = self.msg_id
+
+    def commit_token_ids(self):
+        """Return a dict of the three primary commit boundary token IDs
+        used by the eval pipeline to segment generated sequences."""
+        return {
+            "commit_msg": self.commit_msg_id,
+            "diff_start": self.diff_start_id,
+            "diff_end": self.diff_end_id,
+        }
 
     @property
     def tokenizer(self):

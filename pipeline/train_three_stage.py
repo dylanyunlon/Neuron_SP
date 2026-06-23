@@ -476,6 +476,194 @@ def train_one_stage(
     print(f"\n  [{stage_name}] done. {max_steps} steps, {time.time()-t0:.0f}s total\n")
 
 
+# ── Stage 3 评估: BLEU / ROUGE-L / Perplexity ──
+
+def _compute_bleu(references, hypotheses):
+    """Corpus-level BLEU-4 with +1 smoothing (no nltk dependency)."""
+    from collections import Counter
+
+    def _ngrams(tokens, n):
+        return [tuple(tokens[i:i + n]) for i in range(len(tokens) - n + 1)]
+
+    total_bp_r = 0
+    total_bp_c = 0
+    clipped_counts = [0] * 4
+    total_counts = [0] * 4
+
+    for ref, hyp in zip(references, hypotheses):
+        ref_tok = ref.split()
+        hyp_tok = hyp.split()
+        total_bp_r += len(ref_tok)
+        total_bp_c += len(hyp_tok)
+        for n in range(1, 5):
+            ref_ngrams = Counter(_ngrams(ref_tok, n))
+            hyp_ngrams = Counter(_ngrams(hyp_tok, n))
+            for ng, cnt in hyp_ngrams.items():
+                clipped_counts[n - 1] += min(cnt, ref_ngrams.get(ng, 0))
+            total_counts[n - 1] += max(len(hyp_tok) - n + 1, 0)
+
+    # +1 smoothing to avoid zero n-gram counts
+    log_bleu = 0.0
+    for n in range(4):
+        precision = (clipped_counts[n] + 1.0) / (total_counts[n] + 1.0)
+        log_bleu += math.log(precision) / 4.0
+
+    # Brevity penalty
+    if total_bp_c == 0:
+        return 0.0
+    bp = min(1.0, math.exp(1.0 - total_bp_r / total_bp_c))
+    return bp * math.exp(log_bleu)
+
+
+def _compute_rouge_l(references, hypotheses):
+    """Corpus-level ROUGE-L F1 via longest common subsequence."""
+
+    def _lcs_length(x, y):
+        m, n = len(x), len(y)
+        prev = [0] * (n + 1)
+        for i in range(1, m + 1):
+            curr = [0] * (n + 1)
+            for j in range(1, n + 1):
+                if x[i - 1] == y[j - 1]:
+                    curr[j] = prev[j - 1] + 1
+                else:
+                    curr[j] = max(curr[j - 1], prev[j])
+            prev = curr
+        return prev[n]
+
+    total_p = 0.0
+    total_r = 0.0
+    count = 0
+    for ref, hyp in zip(references, hypotheses):
+        ref_tok = ref.split()
+        hyp_tok = hyp.split()
+        if not ref_tok or not hyp_tok:
+            continue
+        lcs = _lcs_length(ref_tok, hyp_tok)
+        p = lcs / len(hyp_tok)
+        r = lcs / len(ref_tok)
+        total_p += p
+        total_r += r
+        count += 1
+
+    if count == 0:
+        return 0.0
+    avg_p = total_p / count
+    avg_r = total_r / count
+    if avg_p + avg_r == 0:
+        return 0.0
+    return 2.0 * avg_p * avg_r / (avg_p + avg_r)
+
+
+def run_stage3_eval(model, tokenizer, dataloader, seq_len, output_dir="experiments/eval_results"):
+    """Evaluate Stage 3 model: commit message → diff BLEU/ROUGE-L + perplexity.
+
+    Runs the model in eval mode over the Stage 3 dataloader, collecting:
+      1. Per-token cross-entropy → perplexity
+      2. Greedy-decoded commit messages compared to ground truth → BLEU-4 / ROUGE-L
+
+    Results are written as JSON to ``output_dir/stage3_eval.json``.
+    """
+    print("\n[eval] running Stage 3 evaluation (BLEU / ROUGE-L / perplexity) ...")
+    os.makedirs(output_dir, exist_ok=True)
+
+    device = next(model.parameters()).device
+    model.eval()
+
+    # Retrieve commit boundary token IDs for segmenting sequences
+    commit_ids = tokenizer.commit_token_ids()
+    msg_id = commit_ids["commit_msg"]
+    diff_start_id = commit_ids["diff_start"]
+    diff_end_id = commit_ids["diff_end"]
+
+    total_loss = 0.0
+    total_tokens = 0
+    references = []
+    hypotheses = []
+    max_eval_batches = 200
+
+    data_iter = iter(dataloader)
+    with torch.no_grad():
+        for batch_idx in range(max_eval_batches):
+            try:
+                batch = next(data_iter)
+            except StopIteration:
+                break
+
+            input_ids = batch["input_ids"].to(device)
+            labels = batch["labels"].to(device)
+
+            outputs = model(input_ids=input_ids, labels=labels)
+
+            # Accumulate cross-entropy loss for perplexity
+            if outputs.loss is not None:
+                n_tokens = (labels != -100).sum().item()
+                if n_tokens == 0:
+                    n_tokens = labels.numel()
+                total_loss += outputs.loss.item() * n_tokens
+                total_tokens += n_tokens
+
+            # Extract reference commit messages and greedy-decode predictions.
+            # Each sequence has the format:
+            #   ... <|commit_msg|> message_tokens <|diff_end|> ...
+            # We extract the ground-truth message tokens and compare against
+            # the model's argmax predictions at those positions.
+            logits = outputs.logits  # (B, T, V)
+            pred_ids = logits.argmax(dim=-1)  # (B, T)
+
+            for b in range(input_ids.size(0)):
+                seq = input_ids[b].tolist()
+                pred = pred_ids[b].tolist()
+
+                # Find <|commit_msg|> and <|diff_end|> boundaries
+                try:
+                    msg_pos = seq.index(msg_id)
+                except ValueError:
+                    continue
+                # Find the next diff_end after commit_msg
+                end_pos = None
+                for p in range(msg_pos + 1, len(seq)):
+                    if seq[p] == diff_end_id:
+                        end_pos = p
+                        break
+                if end_pos is None or end_pos <= msg_pos + 1:
+                    continue
+
+                ref_tokens = seq[msg_pos + 1:end_pos]
+                hyp_tokens = pred[msg_pos:end_pos - 1]
+
+                ref_text = tokenizer.detokenize(ref_tokens)
+                hyp_text = tokenizer.detokenize(hyp_tokens)
+                if ref_text.strip():
+                    references.append(ref_text.strip())
+                    hypotheses.append(hyp_text.strip())
+
+    # Compute metrics
+    perplexity = math.exp(total_loss / total_tokens) if total_tokens > 0 else float("inf")
+    bleu = _compute_bleu(references, hypotheses) if references else 0.0
+    rouge_l = _compute_rouge_l(references, hypotheses) if references else 0.0
+
+    results = {
+        "stage": "stage3_instruct",
+        "perplexity": round(perplexity, 4),
+        "bleu4": round(bleu, 6),
+        "rouge_l_f1": round(rouge_l, 6),
+        "eval_samples": len(references),
+        "eval_tokens": total_tokens,
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+    }
+
+    out_path = os.path.join(output_dir, "stage3_eval.json")
+    with open(out_path, "w") as f:
+        json.dump(results, f, indent=2)
+    print(f"[eval] perplexity={perplexity:.4f}  BLEU-4={bleu:.6f}  "
+          f"ROUGE-L={rouge_l:.6f}  samples={len(references)}")
+    print(f"[eval] results written to {out_path}")
+
+    model.train()
+    return results
+
+
 # ── 三阶段编排 ──
 
 def run_three_stage(args):
@@ -574,6 +762,11 @@ def run_three_stage(args):
             save_interval=args.save_interval,
             save_path=args.checkpoint_dir,
         )
+
+        # Run commit completion eval after Stage 3 (instruct tuning)
+        if stage_num == 3:
+            eval_dl = load_stage3_data(hf_tok, args.seq_len, args.batch_size, args.data_path)
+            run_stage3_eval(model, tok, eval_dl, args.seq_len)
 
         # Remember this stage's loop so the next iteration can tear it down.
         prev_loop = loop
