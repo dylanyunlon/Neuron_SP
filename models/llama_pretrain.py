@@ -196,6 +196,7 @@ class LlamaForCausalLM(nn.Module):
     def __init__(self, cfg: LlamaConfig):
         super().__init__()
         self.cfg = cfg
+        self.gradient_checkpointing = False
 
         self.embed_tokens = nn.Embedding(cfg.vocab_size, cfg.dim)
         self.layers       = nn.ModuleList([LlamaBlock(cfg) for _ in range(cfg.n_layers)])
@@ -211,6 +212,11 @@ class LlamaForCausalLM(nn.Module):
         self.register_buffer("freqs_cis", freqs, persistent=False)
 
         self._init_weights()
+
+    def enable_gradient_checkpointing(self):
+        """Enable gradient checkpointing for all transformer blocks.
+        Required for 7B on 48GB A6000 — reduces activation memory ~4x."""
+        self.gradient_checkpointing = True
 
     def _init_weights(self):
         for module in self.modules():
@@ -235,7 +241,12 @@ class LlamaForCausalLM(nn.Module):
         freqs = self.freqs_cis[:T]                        # (T, head_dim//2)
 
         for layer in self.layers:
-            x = layer(x, freqs)
+            if self.gradient_checkpointing and self.training:
+                x = torch.utils.checkpoint.checkpoint(
+                    layer, x, freqs, use_reentrant=False,
+                )
+            else:
+                x = layer(x, freqs)
 
         x = self.norm(x)
         return self.lm_head(x)                            # (B, T, vocab_size)

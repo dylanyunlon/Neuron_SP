@@ -474,6 +474,17 @@ def run_standalone(args: argparse.Namespace) -> None:
         seq_len     = args.seq_len,
     ).to(dtype=dtype, device=device)
 
+    if getattr(args, "gradient_checkpointing", False):
+        if hasattr(model, "enable_gradient_checkpointing"):
+            model.enable_gradient_checkpointing()
+            if is_main:
+                logger.info("Gradient checkpointing enabled")
+        else:
+            # Fallback: wrap each layer manually
+            model._gradient_checkpointing = True
+            if is_main:
+                logger.info("Gradient checkpointing flag set (manual)")
+
     if is_main:
         logger.info("Model: %.2fM parameters", model.num_parameters / 1e6)
 
@@ -612,6 +623,9 @@ def run_desloc(args: argparse.Namespace) -> None:
         seq_len     = args.seq_len,
     ).to(dtype=dtype, device=device)
 
+    if getattr(args, "gradient_checkpointing", False) and hasattr(model, "enable_gradient_checkpointing"):
+        model.enable_gradient_checkpointing()
+
     logger.info(
         "=== DesLocEngine path ===  model-size=%s  params=%.2fM  device=%s",
         args.model_size, model.num_parameters / 1e6, device,
@@ -687,6 +701,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         default=False,
         help="Use DesLocEngine instead of standalone loop (requires full cluster).",
+    )
+    p.add_argument(
+        "--gradient-checkpointing",
+        action="store_true",
+        default=False,
+        help="Enable gradient checkpointing (required for 7B on 48GB GPUs).",
     )
     return p.parse_args()
 

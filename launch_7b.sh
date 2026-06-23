@@ -63,6 +63,7 @@ torchrun \
     --micro-batch-size "$MICRO_BS" \
     --seq-len "$SEQ_LEN" \
     --lr "$LR" \
+    --gradient-checkpointing \
     --log-every 10 \
     --save-every 500 \
     --checkpoint-dir checkpoints/7b_${TIMESTAMP} \
