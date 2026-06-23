@@ -622,6 +622,32 @@ class DeepSpeedEngine(Module):
         if self.dist_backend is None:
             self.enable_backward_allreduce = False
 
+        # M1001-M1015: Wire HeteroGradNormSkipController into DeepSpeedEngine
+        # Integrates DES-LOC heterogeneous gradient norm skip logic so that
+        # optimizer steps with anomalously large gradient norms are skipped,
+        # preserving optimizer state integrity on mixed A6000/H100 hardware.
+        self._hetero_grad_controller = None
+        if self.desloc_enabled:
+            try:
+                from deepspeed.runtime.hetero_grad_norm_skip import (
+                    HeteroGradNormConfig,
+                    integrate_with_deepspeed_engine,
+                )
+                _hetero_grad_config = HeteroGradNormConfig(
+                    anchor_skip_threshold=50.0,
+                    compute_skip_threshold=80.0,
+                    consecutive_skip_warn_limit=3,
+                    use_adaptive_threshold=True,
+                    adaptive_ema_beta=0.98,
+                )
+                self._hetero_grad_controller = integrate_with_deepspeed_engine(
+                    self, _hetero_grad_config,
+                )
+            except Exception as e:
+                logger.warning(
+                    "DES-LOC: Failed to initialize HeteroGradNormSkipController: %s", e,
+                )
+
     def _optimized_linear_offload_setup(self):
         self.optimized_linear_base_weight_sharding = False
         self.optimized_linear_lora_enabled = False
@@ -3220,6 +3246,15 @@ class DeepSpeedEngine(Module):
 
         if hasattr(self.optimizer, '_global_grad_norm'):
             self._global_grad_norm = self.optimizer._global_grad_norm
+
+        # M1001-M1015: Record step in HeteroGradNormSkipController for
+        # consecutive-skip tracking and adaptive EMA threshold updates.
+        if self._hetero_grad_controller is not None:
+            _grad_norm = getattr(self, '_global_grad_norm', 0.0)
+            self._hetero_grad_controller.record_step(
+                skipped=not getattr(self, '_step_applied', True),
+                grad_norm=_grad_norm,
+            )
 
         # Quantize the updated parameter if there is no overflow
         if self.quantizer:
