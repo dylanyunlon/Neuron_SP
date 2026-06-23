@@ -56,6 +56,12 @@ from deepspeed.runtime.hetero_grad_norm_skip import (  # noqa: E402
     integrate_with_deepspeed_engine,
 )
 
+from datasets.bigcode.commit_packing import (  # noqa: E402
+    CommitSequencePacker,
+    HeteroBatchSampler,
+    PackedSequence,
+)
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -902,7 +908,79 @@ class DesLocEngine:
                 device=self.primary_device,
             )
         else:
-            self.data_iter = data_iter
+            # Wrap a dataset-like iterable with CommitSequencePacker so that
+            # commit boundaries are respected during sequence packing.  Then
+            # replace the default per-rank sampler with HeteroBatchSampler so
+            # that VRAM-proportional micro-batch sizes are enforced across
+            # heterogeneous GPUs (H100 96 GB / A6000 48 GB).
+            #
+            # data_iter may already be a plain (input_ids, labels) iterator
+            # (e.g. from a custom DataLoader).  We detect this by checking for
+            # a list/Sequence-like interface; plain generators are left as-is.
+            if hasattr(data_iter, "__len__") or hasattr(data_iter, "__getitem__"):
+                gpu_mem_map: Dict[int, int] = {
+                    spec.device_index: int(spec.total_mem_gb)
+                    for spec in self.tiers
+                } if self.tiers else {0: 96}
+
+                packer = CommitSequencePacker(
+                    tokenizer=None,
+                    seq_len=config.seq_len,
+                    pad_token_id=0,
+                )
+                packed_seqs: List[PackedSequence] = packer.pack_dataset(iter(data_iter))
+                logger.info(
+                    "CommitSequencePacker produced %d packed sequences "
+                    "(seq_len=%d, gpu_mem_map=%s).",
+                    len(packed_seqs), config.seq_len, gpu_mem_map,
+                )
+
+                hetero_sampler = HeteroBatchSampler(
+                    sequences=packed_seqs,
+                    gpu_mem_map=gpu_mem_map,
+                    base_batch=config.micro_batch_size,
+                    verbose=False,
+                )
+
+                # Expose sampler so callers can query it; wrap as an infinite
+                # token iterator compatible with the existing training loop.
+                self.hetero_sampler = hetero_sampler
+
+                def _packed_iter(
+                    sampler: HeteroBatchSampler,
+                    primary_idx: int,
+                    seq_len: int,
+                    device: torch.device,
+                ) -> Iterator[Tuple[torch.Tensor, torch.Tensor]]:
+                    # Cycle the sampler indefinitely so training never exhausts data.
+                    while True:
+                        for batch_per_rank in sampler:
+                            seqs = batch_per_rank.get(primary_idx, [])
+                            if not seqs:
+                                continue
+                            # Stack token lists into a single (B, T) tensor.
+                            ids = torch.tensor(
+                                [s.tokens for s in seqs], dtype=torch.long, device=device
+                            )
+                            # Causal LM shift: inputs = ids[:, :-1], labels = ids[:, 1:]
+                            yield ids[:, :-1], ids[:, 1:]
+
+                _primary_idx = (
+                    self.primary_device.index
+                    if self.primary_device.type == "cuda"
+                    else 0
+                )
+                self.data_iter = _packed_iter(
+                    hetero_sampler, _primary_idx, config.seq_len, self.primary_device
+                )
+                logger.info(
+                    "HeteroBatchSampler wired: %d steps/epoch, "
+                    "total_per_step=%d sequences.",
+                    len(hetero_sampler), hetero_sampler.total_per_step,
+                )
+            else:
+                # Plain iterator: pass through unchanged (caller handles batching).
+                self.data_iter = data_iter
 
         # Gradient accumulation from plan (use primary device's setting)
         primary_idx = self.primary_device.index if self.primary_device.type == "cuda" else -1
