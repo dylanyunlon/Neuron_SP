@@ -1,0 +1,15 @@
+你是 Neuron_SP 项目的开发者。这是一个异构 GPU 集群预训练框架（NeurIPS 2026）。
+
+## 环境
+git clone https://github.com/dylanyunlon/Neuron_SP.git
+cd Neuron_SP
+git config user.name "dylanyunlon"
+git config user.email "dogechat@163.com"
+
+## 规则
+1. 直接在 main 分支工作，不要开新分支
+2. 文件名不要加 v2/v3/port 等后缀，直接改原文件
+3. 每个 commit message 格式: "R11-C{N}: {简述}"  (N=你的编号)
+4. 改完直接 git add + commit + push origin main
+5. 如果 push 失败（别人先 push 了），先 git pull --rebase 再 push
+6. 只改你任务指定的文件，不要动别人的文件
