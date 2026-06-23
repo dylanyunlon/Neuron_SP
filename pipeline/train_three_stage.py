@@ -37,7 +37,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from pipeline.unified_tokenizer import build_megatron_tokenizer, get_tokenizer
 from pipeline.engine_bridge import build_ds_config, detect_gpu_tiers, compute_shard_ratios
-from deepspeed.runtime.hetero_mimo_training_loop import setup_hetero_mimo_training, HeteroMIMOTrainingLoop
+from deepspeed.runtime.hetero_mimo_training_loop import (
+    setup_hetero_mimo_training,
+    HeteroMIMOTrainingLoop,
+    PerModuleOptimizerConfig,
+)
 
 
 # ── 模型构建 ──
@@ -529,8 +533,13 @@ def run_three_stage(args):
             prev_tag = f"{prev_name}_final"
             _load_model_checkpoint(model, args.checkpoint_dir, tag=prev_tag)
 
-        # 每个 stage 构建新的 HeteroMIMOTrainingLoop (新 optimizer / lr schedule)
-        loop: HeteroMIMOTrainingLoop = setup_hetero_mimo_training(model)
+        # 每个 stage 构建新的 HeteroMIMOTrainingLoop (新 optimizer / lr schedule).
+        # PerModuleOptimizerConfig carries the stage-specific LR so the router
+        # initialises each device-pool's optimizer with the correct learning rate
+        # rather than the global default (1e-4).
+        stage_lr_map = {1: args.stage1_lr, 2: args.stage2_lr, 3: args.stage3_lr}
+        engine_config = PerModuleOptimizerConfig(lr=stage_lr_map[stage_num])
+        loop: HeteroMIMOTrainingLoop = setup_hetero_mimo_training(model, optimizer_config=engine_config)
 
         train_one_stage(
             loop=loop,
