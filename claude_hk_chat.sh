@@ -72,7 +72,7 @@ if [ -n "${CONV_ID:-}" ]; then
 else
     CREATE_RESP=$(curl -s -X POST "${ORIGIN}/api/organizations/${ORG_ID}/chat_conversations" \
         -H "Content-Type: application/json" -H "origin: ${ORIGIN}" "${COMMON_H[@]}" -b "$COOKIE" \
-        --data-raw '{"name":"","model":"claude-sonnet-4-6","is_temporary":false}' 2>/dev/null)
+        --data-raw '{"name":"","model":"claude-opus-4-6","is_temporary":false}' 2>/dev/null)
     CONV_ID=$(echo "$CREATE_RESP" | python3 -c "import sys,json; print(json.load(sys.stdin).get('uuid',''))" 2>/dev/null || echo "")
     if [ -z "$CONV_ID" ]; then
         echo "ERROR: Create conversation failed: ${CREATE_RESP:0:300}"; exit 1
@@ -87,7 +87,7 @@ curl -s -N "${ORIGIN}/api/organizations/${ORG_ID}/chat_conversations/${CONV_ID}/
     -H "accept: text/event-stream" -H "content-type: application/json" \
     -H "origin: ${ORIGIN}" "${COMMON_H[@]}" -b "$COOKIE" \
     --data-raw "{
-        \"prompt\":${ESCAPED_PROMPT},\"timezone\":\"Asia/Shanghai\",\"model\":\"claude-sonnet-4-6\",
+        \"prompt\":${ESCAPED_PROMPT},\"timezone\":\"Asia/Shanghai\",\"model\":\"claude-opus-4-6\",
         \"effort\":\"medium\",\"thinking_mode\":\"off\",
         \"tools\":[{\"type\":\"repl_v0\",\"name\":\"repl\"}],
         \"turn_message_uuids\":{\"human_message_uuid\":\"${HUMAN_UUID}\",\"assistant_message_uuid\":\"${ASST_UUID}\"},
