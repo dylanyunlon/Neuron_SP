@@ -1,0 +1,251 @@
+# SPDX-License-Identifier: Apache-2.0
+# DeepSpeed Team
+#
+# 7B Pre-training Experiment Configuration — DES-LOC on ags1 Cluster
+# Cluster: 2×A6000 (48GB) + 1×H100-NVL (96GB) + 2×RTX PRO 6000 Blackwell (96GB each)
+# Total GPUs: 5, Total VRAM: 384GB
+# CPU: 2×EPYC 9354 128-core, 1.5TB DDR5, 2 NUMA nodes
+#
+# DES-LOC decomposed local SGD with heterogeneous sync periods.
+# Kx=8 (param sync), Ku=4 (first moment), Kv=16 (second moment)
+# Rationale: 5 GPUs with large FLOPS disparity → frequent param sync (Kx=8)
+# but relaxed v sync (Kv=16) since second moment is low-variance.
+
+experiment:
+  name: 7b_ags1_desloc
+  description: "7B LLaMA DES-LOC pre-training on ags1 heterogeneous 5-GPU cluster"
+  target: NeurIPS-2026
+  seed: 42
+
+# ─── Model Architecture ──────────────────────────────────────────────────────
+model:
+  name: LLaMA-7B
+  vocab_size: 32000
+  hidden_size: 4096
+  num_layers: 32
+  num_heads: 32
+  intermediate_size: 11008
+  max_seq_len: 2048
+  params_approx: 6.74e9
+
+# ─── Cluster Topology ────────────────────────────────────────────────────────
+# NUMA0 (CPU 0-63):  GPU0 (A6000), GPU2 (H100-NVL)
+# NUMA1 (CPU 64-127): GPU1 (A6000), GPU3 (RTX PRO 6000 BW), GPU4 (RTX PRO 6000 BW)
+cluster:
+  name: ags1
+  interconnect: PCIe  # No NVLink
+  cpu: "2x EPYC 9354 128-core"
+  ram_gb: 1536
+  numa_nodes: 2
+  gpus:
+    - index: 0
+      name: A6000
+      mem_gb: 48
+      bf16_tflops: 38.7
+      pcie_gen: 4
+      pcie_bw_gbs: 25
+      sm_version: "8.6"
+      numa_node: 0
+    - index: 1
+      name: A6000
+      mem_gb: 48
+      bf16_tflops: 38.7
+      pcie_gen: 4
+      pcie_bw_gbs: 25
+      sm_version: "8.6"
+      numa_node: 1
+    - index: 2
+      name: H100-NVL
+      mem_gb: 96
+      bf16_tflops: 835
+      pcie_gen: 5
+      pcie_bw_gbs: 50
+      sm_version: "9.0"
+      numa_node: 0
+    - index: 3
+      name: RTX-PRO-6000-Blackwell
+      mem_gb: 96
+      bf16_tflops: 300
+      pcie_gen: 4
+      pcie_bw_gbs: 25   # PCIe Gen1×16 observed (BIOS misconfiguration)
+      sm_version: "12.0"
+      numa_node: 1
+    - index: 4
+      name: RTX-PRO-6000-Blackwell
+      mem_gb: 96
+      bf16_tflops: 300
+      pcie_gen: 4
+      pcie_bw_gbs: 25   # PCIe Gen1×16 observed (BIOS misconfiguration)
+      sm_version: "12.0"
+      numa_node: 1
+
+# ─── DES-LOC Configuration ───────────────────────────────────────────────────
+# Decomposed sync periods (Algorithm 1):
+#   Kx — parameter sync:     every 8 steps  (frequent, keeps model coherent)
+#   Ku — first moment sync:  every 4 steps  (momentum is fast-changing)
+#   Kv — second moment sync: every 16 steps (variance is slow-moving)
+# comm_reduction_ratio ≈ 1 - (1/Kx + 1/Ku + 1/Kv) = 1 - (0.125 + 0.25 + 0.0625) = 0.5625
+desloc:
+  enabled: true
+  Kx: 8
+  Ku: 4
+  Kv: 16
+  clip_rho: 0.5
+  warmup_steps: 500
+  outer_optimizer: "average"
+  nesterov_momentum: 0.0
+  topology_aware: true
+  auto_Kx: false
+
+# ─── Training Hyperparameters ────────────────────────────────────────────────
+training:
+  total_steps: 100000
+  global_batch_size: 80
+  max_lr: 3.0e-4
+  min_lr: 3.0e-5
+  warmup_steps: 2000
+  weight_decay: 0.1
+  grad_clip: 1.0
+  beta1: 0.9
+  beta2: 0.95
+  eps: 1.0e-8
+  lr_schedule: warmup_stable_decay
+  lr_decay_type: cosine
+  stable_steps: 60000
+  decay_steps: 38000
+
+# ─── Per-Device Batch Sizing ─────────────────────────────────────────────────
+# Micro-batch per device scaled by VRAM:
+#   A6000 (48GB):      micro_batch=1, grad_accum=16 → effective 16 samples/step
+#   H100-NVL (96GB):   micro_batch=4, grad_accum=4  → effective 16 samples/step
+#   Blackwell (96GB):  micro_batch=2, grad_accum=8   → effective 16 samples/step
+# Total per step: 16 × 5 = 80 = global_batch_size
+per_device:
+  gpu0_a6000:
+    micro_batch_size: 1
+    gradient_accumulation_steps: 16
+  gpu1_a6000:
+    micro_batch_size: 1
+    gradient_accumulation_steps: 16
+  gpu2_h100:
+    micro_batch_size: 4
+    gradient_accumulation_steps: 4
+  gpu3_blackwell:
+    micro_batch_size: 2
+    gradient_accumulation_steps: 8
+  gpu4_blackwell:
+    micro_batch_size: 2
+    gradient_accumulation_steps: 8
+
+# ─── Precision Configuration ─────────────────────────────────────────────────
+# A6000 (SM 8.6): no native BF16 tensor cores → use FP16 with loss scaling
+# H100 (SM 9.0) + Blackwell (SM 12.0): native BF16
+precision:
+  gpu0_a6000:
+    dtype: fp16
+    loss_scale: dynamic
+    initial_loss_scale: 65536
+  gpu1_a6000:
+    dtype: fp16
+    loss_scale: dynamic
+    initial_loss_scale: 65536
+  gpu2_h100:
+    dtype: bf16
+  gpu3_blackwell:
+    dtype: bf16
+  gpu4_blackwell:
+    dtype: bf16
+
+# ─── Activation Checkpointing ───────────────────────────────────────────────
+# Selective per tier: A6000 needs aggressive checkpointing (48GB VRAM),
+# H100/Blackwell have headroom (96GB) for selective-only.
+activation_checkpointing:
+  gpu0_a6000:
+    enabled: true
+    mode: full           # Recompute all activations to fit 7B in 48GB
+    contiguous_checkpointing: true
+    cpu_offload: false
+  gpu1_a6000:
+    enabled: true
+    mode: full
+    contiguous_checkpointing: true
+    cpu_offload: false
+  gpu2_h100:
+    enabled: true
+    mode: selective      # Only recompute norm_out (saves ~12GB, 96GB has margin)
+    layers_to_checkpoint: ["norm_out", "attention_dropout"]
+  gpu3_blackwell:
+    enabled: true
+    mode: selective
+    layers_to_checkpoint: ["norm_out", "attention_dropout"]
+  gpu4_blackwell:
+    enabled: true
+    mode: selective
+    layers_to_checkpoint: ["norm_out", "attention_dropout"]
+
+# ─── ZeRO Configuration ─────────────────────────────────────────────────────
+zero:
+  stage: 3
+  offload_optimizer:
+    device: cpu
+    pin_memory: true
+  offload_param:
+    device: none         # Keep params on GPU; only offload optimizer states
+  overlap_comm: true
+  contiguous_gradients: true
+  reduce_bucket_size: 50000000
+  stage3_prefetch_bucket_size: 50000000
+  stage3_param_persistence_threshold: 100000
+
+# ─── LOC Cache ───────────────────────────────────────────────────────────────
+# Host-memory cache for local SGD state (momentum shadows, param snapshots).
+# Split across NUMA nodes to avoid cross-socket memory access latency.
+loc_cache:
+  enabled: true
+  numa0:
+    size_gb: 200         # GPU0 (A6000) + GPU2 (H100) local state
+    path: /dev/shm/loc_cache_numa0
+    pin_memory: true
+    cpu_affinity: "0-63"
+  numa1:
+    size_gb: 200         # GPU1 (A6000) + GPU3,GPU4 (Blackwell) local state
+    path: /dev/shm/loc_cache_numa1
+    pin_memory: true
+    cpu_affinity: "64-127"
+
+# ─── Checkpointing ──────────────────────────────────────────────────────────
+checkpointing:
+  save_every: 1000
+  checkpoint_dir: ./checkpoints/7b_ags1_desloc
+  save_latest_only: false
+  resume_from: null
+
+# ─── Logging & Diagnostics ──────────────────────────────────────────────────
+logging:
+  log_every: 10
+  output_dir: ./desloc_results/7b_ags1_desloc
+  tensorboard: true
+  wandb: false
+
+diagnostics:
+  record_per_step_timing: true
+  record_memory_footprint: true
+  record_comm_overhead: true       # α+βN model
+  record_pipeline_bubble_ratio: false
+  record_cross_numa_latency_ms: true
+  record_mfu_per_gpu: true
+  record_desloc_sync_events: true  # Log every Kx/Ku/Kv sync
+
+# ─── Dataset ─────────────────────────────────────────────────────────────────
+dataset:
+  source: SlimPajama-627B
+  tokenizer: LLaMA-SentencePiece-32k
+  sequence_packing: true
+  data_mix:
+    commoncrawl: 0.52
+    c4: 0.27
+    github: 0.05
+    books: 0.05
+    arxiv: 0.05
+    wikipedia: 0.04
+    stackexchange: 0.02

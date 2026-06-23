@@ -1,0 +1,207 @@
+# SPDX-License-Identifier: Apache-2.0
+# DeepSpeed Team
+#
+# 7B Pre-training Baseline Configuration — Standard DDP on ags1 Cluster
+# Control experiment: identical model/cluster/hyperparameters, DES-LOC disabled.
+# All gradient syncs happen every step (Kx=Ku=Kv=1 equivalent).
+#
+# Cluster: 2×A6000 (48GB) + 1×H100-NVL (96GB) + 2×RTX PRO 6000 Blackwell (96GB each)
+
+experiment:
+  name: 7b_ags1_baseline
+  description: "7B LLaMA standard DDP baseline on ags1 (no DES-LOC, full sync every step)"
+  target: NeurIPS-2026
+  seed: 42
+
+# ─── Model Architecture ──────────────────────────────────────────────────────
+model:
+  name: LLaMA-7B
+  vocab_size: 32000
+  hidden_size: 4096
+  num_layers: 32
+  num_heads: 32
+  intermediate_size: 11008
+  max_seq_len: 2048
+  params_approx: 6.74e9
+
+# ─── Cluster Topology ────────────────────────────────────────────────────────
+cluster:
+  name: ags1
+  interconnect: PCIe
+  cpu: "2x EPYC 9354 128-core"
+  ram_gb: 1536
+  numa_nodes: 2
+  gpus:
+    - index: 0
+      name: A6000
+      mem_gb: 48
+      bf16_tflops: 38.7
+      pcie_gen: 4
+      pcie_bw_gbs: 25
+      sm_version: "8.6"
+      numa_node: 0
+    - index: 1
+      name: A6000
+      mem_gb: 48
+      bf16_tflops: 38.7
+      pcie_gen: 4
+      pcie_bw_gbs: 25
+      sm_version: "8.6"
+      numa_node: 1
+    - index: 2
+      name: H100-NVL
+      mem_gb: 96
+      bf16_tflops: 835
+      pcie_gen: 5
+      pcie_bw_gbs: 50
+      sm_version: "9.0"
+      numa_node: 0
+    - index: 3
+      name: RTX-PRO-6000-Blackwell
+      mem_gb: 96
+      bf16_tflops: 300
+      pcie_gen: 4
+      pcie_bw_gbs: 25
+      sm_version: "12.0"
+      numa_node: 1
+    - index: 4
+      name: RTX-PRO-6000-Blackwell
+      mem_gb: 96
+      bf16_tflops: 300
+      pcie_gen: 4
+      pcie_bw_gbs: 25
+      sm_version: "12.0"
+      numa_node: 1
+
+# ─── DES-LOC Disabled ────────────────────────────────────────────────────────
+desloc:
+  enabled: false
+
+# ─── Training Hyperparameters ────────────────────────────────────────────────
+# Identical to desloc config for fair comparison.
+training:
+  total_steps: 100000
+  global_batch_size: 80
+  max_lr: 3.0e-4
+  min_lr: 3.0e-5
+  warmup_steps: 2000
+  weight_decay: 0.1
+  grad_clip: 1.0
+  beta1: 0.9
+  beta2: 0.95
+  eps: 1.0e-8
+  lr_schedule: warmup_stable_decay
+  lr_decay_type: cosine
+  stable_steps: 60000
+  decay_steps: 38000
+
+# ─── Per-Device Batch Sizing ─────────────────────────────────────────────────
+# Same per-device allocation as DES-LOC experiment.
+per_device:
+  gpu0_a6000:
+    micro_batch_size: 1
+    gradient_accumulation_steps: 16
+  gpu1_a6000:
+    micro_batch_size: 1
+    gradient_accumulation_steps: 16
+  gpu2_h100:
+    micro_batch_size: 4
+    gradient_accumulation_steps: 4
+  gpu3_blackwell:
+    micro_batch_size: 2
+    gradient_accumulation_steps: 8
+  gpu4_blackwell:
+    micro_batch_size: 2
+    gradient_accumulation_steps: 8
+
+# ─── Precision Configuration ─────────────────────────────────────────────────
+precision:
+  gpu0_a6000:
+    dtype: fp16
+    loss_scale: dynamic
+    initial_loss_scale: 65536
+  gpu1_a6000:
+    dtype: fp16
+    loss_scale: dynamic
+    initial_loss_scale: 65536
+  gpu2_h100:
+    dtype: bf16
+  gpu3_blackwell:
+    dtype: bf16
+  gpu4_blackwell:
+    dtype: bf16
+
+# ─── Activation Checkpointing ───────────────────────────────────────────────
+activation_checkpointing:
+  gpu0_a6000:
+    enabled: true
+    mode: full
+    contiguous_checkpointing: true
+    cpu_offload: false
+  gpu1_a6000:
+    enabled: true
+    mode: full
+    contiguous_checkpointing: true
+    cpu_offload: false
+  gpu2_h100:
+    enabled: true
+    mode: selective
+    layers_to_checkpoint: ["norm_out", "attention_dropout"]
+  gpu3_blackwell:
+    enabled: true
+    mode: selective
+    layers_to_checkpoint: ["norm_out", "attention_dropout"]
+  gpu4_blackwell:
+    enabled: true
+    mode: selective
+    layers_to_checkpoint: ["norm_out", "attention_dropout"]
+
+# ─── ZeRO Configuration ─────────────────────────────────────────────────────
+zero:
+  stage: 3
+  offload_optimizer:
+    device: cpu
+    pin_memory: true
+  offload_param:
+    device: none
+  overlap_comm: true
+  contiguous_gradients: true
+  reduce_bucket_size: 50000000
+  stage3_prefetch_bucket_size: 50000000
+  stage3_param_persistence_threshold: 100000
+
+# ─── Checkpointing ──────────────────────────────────────────────────────────
+checkpointing:
+  save_every: 1000
+  checkpoint_dir: ./checkpoints/7b_ags1_baseline
+  save_latest_only: false
+  resume_from: null
+
+# ─── Logging & Diagnostics ──────────────────────────────────────────────────
+logging:
+  log_every: 10
+  output_dir: ./desloc_results/7b_ags1_baseline
+  tensorboard: true
+  wandb: false
+
+diagnostics:
+  record_per_step_timing: true
+  record_memory_footprint: true
+  record_comm_overhead: true
+  record_pipeline_bubble_ratio: false
+  record_cross_numa_latency_ms: true
+  record_mfu_per_gpu: true
+
+# ─── Dataset ─────────────────────────────────────────────────────────────────
+dataset:
+  source: SlimPajama-627B
+  tokenizer: LLaMA-SentencePiece-32k
+  sequence_packing: true
+  data_mix:
+    commoncrawl: 0.52
+    c4: 0.27
+    github: 0.05
+    books: 0.05
+    arxiv: 0.05
+    wikipedia: 0.04
+    stackexchange: 0.02
