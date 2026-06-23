@@ -596,6 +596,343 @@ class StackV2CommitAdapter:
 
 
 # ---------------------------------------------------------------------------
+# Megatron MMap Indexed Dataset conversion
+# ---------------------------------------------------------------------------
+
+# Binary format constants (mirrors MMapIndexedDataset in Megatron / DeepSpeed)
+_MMAP_HDR_MAGIC = b"MMIDIDX\x00\x00"  # 9 bytes
+_MMAP_VERSION   = 1                    # uint64 LE
+
+# dtype-code table used by MMapIndexedDataset (code → numpy dtype)
+_DTYPE_CODE: Dict[type, int] = {}
+try:
+    import numpy as _np
+    _DTYPE_CODE = {
+        _np.uint8:   1,
+        _np.int8:    2,
+        _np.int16:   3,
+        _np.int32:   4,
+        _np.int64:   5,
+        _np.float64: 6,
+        _np.float32: 7,
+        _np.uint16:  8,
+    }
+    del _np
+except ImportError:
+    pass
+
+
+def _write_mmap_idx(
+    idx_path: str,
+    sizes: List[int],
+    doc_idx: List[int],
+    dtype_code: int,
+    dtype_itemsize: int,
+) -> None:
+    """
+    Write a Megatron MMapIndexedDataset .idx file.
+
+    Binary layout
+    -------------
+    magic       : 9 bytes  b'MMIDIDX\\x00\\x00'
+    version     : uint64   (always 1)
+    dtype_code  : uint8    (dtype enum: 1=uint8 … 8=uint16)
+    n_seqs      : uint64   number of sequences
+    n_docs      : uint64   number of documents
+    sizes       : int32[n_seqs]   tokens-per-sequence
+    pointers    : int64[n_seqs]   byte offset of each sequence in .bin
+    doc_idx     : int64[n_docs]   sequence index of each document boundary
+    """
+    import numpy as np
+
+    n_seqs = len(sizes)
+    n_docs = len(doc_idx)
+
+    # Compute byte pointers (exclusive prefix-sum of sizes × itemsize)
+    sizes_arr = np.array(sizes, dtype=np.int32)
+    pointers  = np.zeros(n_seqs, dtype=np.int64)
+    if n_seqs:
+        byte_lengths = sizes_arr.astype(np.int64) * dtype_itemsize
+        pointers[1:] = np.cumsum(byte_lengths)[:-1]
+
+    with open(idx_path, "wb") as f:
+        f.write(_MMAP_HDR_MAGIC)
+        f.write(struct.pack("<Q", _MMAP_VERSION))
+        f.write(struct.pack("<B", dtype_code))
+        f.write(struct.pack("<Q", n_seqs))
+        f.write(struct.pack("<Q", n_docs))
+        f.write(sizes_arr.tobytes(order="C"))
+        f.write(pointers.tobytes(order="C"))
+        f.write(np.array(doc_idx, dtype=np.int64).tobytes(order="C"))
+
+
+def convert_to_megatron_indexed(
+    source,
+    output_prefix: str,
+    tokenizer=None,
+    dataset_id:  str           = "bigcode/the-stack-v2",
+    split:       str           = "train",
+    max_samples: Optional[int] = None,
+    hf_token:    Optional[str] = None,
+    dtype_str:   str           = "int32",
+    text_field:  str           = "text",
+    adapter_kwargs: Optional[Dict] = None,
+    log_interval: int          = 1000,
+) -> Tuple[str, str]:
+    """
+    Convert a HuggingFace streaming dataset (or any iterable of text dicts)
+    into Megatron MMap Indexed Dataset format (.bin + .idx).
+
+    This function is the bridge between the HuggingFace streaming pipeline and
+    Megatron-LM / Megatron-DeepSpeed pretraining data loaders.  It consumes
+    Stack v2 commit records through :class:`StackV2CommitAdapter`, tokenizes
+    each sample's ``text`` field, and writes a binary (.bin) / index (.idx)
+    pair that can be loaded directly by ``MMapIndexedDataset``.
+
+    Parameters
+    ----------
+    source : str | Iterable[dict]
+        Where to read samples from.  Three modes are supported:
+
+        * ``"hf"`` — stream from the HuggingFace Hub (requires *hf_token* if
+          the dataset is gated).  Uses ``dataset_id``, ``split``, and
+          ``max_samples``.
+        * A **glob pattern** (str containing ``*`` or ending in ``.parquet``)
+          — stream from local parquet files matched by the pattern.
+        * Any **iterable of dicts** with at least a ``"text"`` key (or the key
+          given by *text_field*) — consumed directly, one dict per sample.
+          If the dicts are raw Stack v2 records (not yet processed by the
+          adapter), pass them through ``adapter.stream_records()`` first, or
+          set ``adapter_kwargs`` to have the adapter created internally.
+
+    output_prefix : str
+        Path prefix for output files.  The function writes:
+
+        * ``{output_prefix}.bin`` — raw token IDs (dtype given by *dtype_str*)
+        * ``{output_prefix}.idx`` — Megatron MMapIndexedDataset index
+
+        Parent directories are created automatically.
+
+    tokenizer : optional
+        Any tokenizer with an ``encode(text) -> List[int]`` method (e.g.
+        ``tiktoken``, ``transformers.PreTrainedTokenizer``, ``sentencepiece``).
+        If ``None``, the text is encoded as UTF-8 bytes and each byte is stored
+        as one token (dtype ``uint8``).  This is useful for quick smoke tests
+        or byte-level models.
+
+    dataset_id : str
+        HuggingFace dataset identifier (used only when ``source="hf"``).
+        Defaults to ``"bigcode/the-stack-v2"``.
+
+    split : str
+        Dataset split (used only when ``source="hf"``).  Defaults to
+        ``"train"``.
+
+    max_samples : int | None
+        Stop after this many *kept* samples (post-filter).  ``None`` means
+        process all available data.
+
+    hf_token : str | None
+        HuggingFace API token for gated datasets.
+
+    dtype_str : str
+        NumPy dtype name for token IDs stored in the .bin file.  Must be one
+        of the eight types recognised by MMapIndexedDataset:
+        ``"uint8"``, ``"int8"``, ``"int16"``, ``"int32"`` *(default)*,
+        ``"int64"``, ``"float32"``, ``"float64"``, ``"uint16"``.
+
+    text_field : str
+        Key in the sample dict that holds the text to tokenize.  Defaults to
+        ``"text"``.  Useful when consuming pre-processed iterables that expose
+        the content under a different name.
+
+    adapter_kwargs : dict | None
+        Keyword arguments forwarded to :class:`StackV2CommitAdapter` when the
+        adapter is created internally (i.e. when *source* is ``"hf"`` or a
+        glob).  Ignored when *source* is an iterable of already-processed
+        sample dicts.  Example::
+
+            adapter_kwargs={"dedup": False, "min_changed_lines": 5}
+
+    log_interval : int
+        Print a progress line every *log_interval* documents written.
+
+    Returns
+    -------
+    tuple[str, str]
+        ``(bin_path, idx_path)`` — the absolute paths of the written files.
+
+    Raises
+    ------
+    ImportError
+        If ``numpy`` is not installed (always required).
+    ImportError
+        If ``source="hf"`` and the ``datasets`` library is not installed.
+    FileNotFoundError
+        If a glob pattern is given and no parquet files match.
+    ValueError
+        If *dtype_str* is not a recognised Megatron dtype.
+
+    Examples
+    --------
+    Stream from the HF Hub and write to ``/data/stackv2_commits``:
+
+    .. code-block:: python
+
+        bin_path, idx_path = convert_to_megatron_indexed(
+            source="hf",
+            output_prefix="/data/stackv2_commits",
+            tokenizer=my_tokenizer,
+            hf_token="hf_...",
+            max_samples=50_000,
+        )
+
+    Process local parquet shards:
+
+    .. code-block:: python
+
+        bin_path, idx_path = convert_to_megatron_indexed(
+            source="/mnt/data/stackv2/*.parquet",
+            output_prefix="/data/stackv2_commits",
+            tokenizer=my_tokenizer,
+        )
+
+    Dry-run with dummy data (no tokenizer, byte-level fallback):
+
+    .. code-block:: python
+
+        adapter = StackV2CommitAdapter()
+        records = StackV2CommitAdapter.dummy_records(20)
+        samples = list(adapter.stream_records(records))
+
+        bin_path, idx_path = convert_to_megatron_indexed(
+            source=samples,
+            output_prefix="/tmp/test_megatron",
+        )
+    """
+    try:
+        import numpy as np
+    except ImportError:
+        raise ImportError("numpy is required: pip install numpy")
+
+    # ------------------------------------------------------------------ #
+    # Validate / resolve dtype
+    # ------------------------------------------------------------------ #
+    _VALID_DTYPES: Dict[str, type] = {
+        "uint8":   np.uint8,
+        "int8":    np.int8,
+        "int16":   np.int16,
+        "int32":   np.int32,
+        "int64":   np.int64,
+        "float32": np.float32,
+        "float64": np.float64,
+        "uint16":  np.uint16,
+    }
+    if dtype_str not in _VALID_DTYPES:
+        raise ValueError(
+            f"dtype_str={dtype_str!r} is not recognised.  "
+            f"Choose from: {sorted(_VALID_DTYPES)}"
+        )
+    np_dtype      = _VALID_DTYPES[dtype_str]
+    dtype_code    = _DTYPE_CODE.get(np_dtype)
+    if dtype_code is None:
+        # Fallback: search by matching name
+        for dt, code in _DTYPE_CODE.items():
+            if dt().dtype == np_dtype().dtype:
+                dtype_code = code
+                break
+        if dtype_code is None:
+            raise ValueError(f"Could not map {dtype_str} to a Megatron dtype code")
+    dtype_itemsize = np_dtype().itemsize
+
+    # Byte-level fallback tokenizer
+    def _byte_tokenizer(text: str) -> List[int]:
+        return list(text.encode("utf-8", errors="replace"))
+
+    encode_fn = (lambda t: tokenizer.encode(t)) if tokenizer is not None else _byte_tokenizer
+
+    # ------------------------------------------------------------------ #
+    # Prepare output paths
+    # ------------------------------------------------------------------ #
+    output_prefix = str(output_prefix)
+    bin_path = output_prefix + ".bin"
+    idx_path = output_prefix + ".idx"
+    Path(bin_path).parent.mkdir(parents=True, exist_ok=True)
+
+    # ------------------------------------------------------------------ #
+    # Build the sample iterator
+    # ------------------------------------------------------------------ #
+    _akw: Dict = adapter_kwargs or {}
+
+    if source == "hf":
+        _adapter = StackV2CommitAdapter(**_akw)
+        sample_iter: Iterator[Dict] = _adapter.stream_hf(
+            dataset_id=dataset_id,
+            split=split,
+            max_samples=max_samples,
+            hf_token=hf_token,
+        )
+    elif isinstance(source, str) and ("*" in source or source.endswith(".parquet")):
+        # Glob of local parquet files
+        _adapter = StackV2CommitAdapter(**_akw)
+        sample_iter = _adapter.stream_parquet(source, max_samples=max_samples)
+    else:
+        # Assume source is already an iterable of processed sample dicts
+        # (each dict must have a key matching text_field)
+        sample_iter = iter(source)
+
+    # ------------------------------------------------------------------ #
+    # Stream → encode → write .bin; accumulate metadata for .idx
+    # ------------------------------------------------------------------ #
+    sizes:   List[int] = []          # token count per sequence
+    doc_idx: List[int] = [0]        # sequence index at start of each doc
+    n_written = 0
+
+    with open(bin_path, "wb") as bin_f:
+        for sample in sample_iter:
+            text = sample.get(text_field, "")
+            if not text:
+                continue
+
+            token_ids = encode_fn(text)
+            if not token_ids:
+                continue
+
+            arr = np.array(token_ids, dtype=np_dtype)
+            bin_f.write(arr.tobytes(order="C"))
+
+            sizes.append(arr.size)
+            # Each Stack v2 sample is one document
+            doc_idx.append(len(sizes))
+
+            n_written += 1
+            if log_interval > 0 and n_written % log_interval == 0:
+                print(
+                    f"[convert_to_megatron_indexed] written {n_written} docs "
+                    f"({sum(sizes):,} tokens)",
+                    flush=True,
+                )
+
+            if max_samples is not None and n_written >= max_samples:
+                break
+
+    # ------------------------------------------------------------------ #
+    # Write .idx
+    # ------------------------------------------------------------------ #
+    _write_mmap_idx(idx_path, sizes, doc_idx, dtype_code, dtype_itemsize)
+
+    total_tokens = sum(sizes)
+    print(
+        f"[convert_to_megatron_indexed] done. "
+        f"docs={n_written:,}  tokens={total_tokens:,}  "
+        f"dtype={dtype_str}\n"
+        f"  .bin → {bin_path}\n"
+        f"  .idx → {idx_path}"
+    )
+    return bin_path, idx_path
+
+
+# ---------------------------------------------------------------------------
 # Smoke-test CLI
 # ---------------------------------------------------------------------------
 
@@ -609,9 +946,37 @@ if __name__ == "__main__":
     parser.add_argument("--parquet",  type=str,  default=None,  help="Glob for parquet files")
     parser.add_argument("--hf-token", type=str,  default=None)
     parser.add_argument("--no-dedup", action="store_true")
+    # Megatron conversion options
+    parser.add_argument("--to-megatron", type=str, default=None,
+                        metavar="OUTPUT_PREFIX",
+                        help="Convert to Megatron MMap .bin/.idx at this prefix")
+    parser.add_argument("--dtype",       type=str, default="int32",
+                        help="Token dtype for Megatron output (default: int32)")
     args = parser.parse_args()
 
     adapter = StackV2CommitAdapter(dedup=not args.no_dedup)
+
+    if args.to_megatron:
+        # Megatron indexed dataset conversion mode
+        if args.source == "dummy":
+            records = StackV2CommitAdapter.dummy_records(args.samples)
+            src: object = list(adapter.stream_records(records))
+        elif args.source == "parquet":
+            if not args.parquet:
+                print("--parquet glob required for source=parquet", file=sys.stderr)
+                sys.exit(1)
+            src = args.parquet
+        else:
+            src = "hf"
+        convert_to_megatron_indexed(
+            source=src,
+            output_prefix=args.to_megatron,
+            tokenizer=None,           # byte-level fallback for smoke test
+            max_samples=args.samples,
+            hf_token=args.hf_token,
+            dtype_str=args.dtype,
+        )
+        sys.exit(0)
 
     if args.source == "dummy":
         print(f"=== Dummy smoke test ({args.samples} samples) ===\n")
