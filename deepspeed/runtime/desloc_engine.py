@@ -51,6 +51,25 @@ from deepspeed.runtime.hetero_step_batch_scheduler import (
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Eval hook import (eval/run_eval.py)
+# ---------------------------------------------------------------------------
+try:
+    import importlib.util as _importlib_util
+    _eval_spec = _importlib_util.spec_from_file_location(
+        "run_eval",
+        os.path.join(os.path.dirname(__file__), "..", "..", "eval", "run_eval.py"),
+    )
+    if _eval_spec is not None and _eval_spec.loader is not None:
+        _run_eval_mod = _importlib_util.module_from_spec(_eval_spec)
+        _eval_spec.loader.exec_module(_run_eval_mod)
+        _run_periodic_eval = _run_eval_mod.run_periodic_eval
+    else:
+        _run_periodic_eval = None
+except Exception as _eval_import_exc:
+    logger.debug("eval/run_eval.py not importable (%s); eval hook disabled.", _eval_import_exc)
+    _run_periodic_eval = None
+
 from deepspeed.runtime.hetero_grad_norm_skip import (  # noqa: E402
     HeteroGradNormConfig,
     integrate_with_deepspeed_engine,
@@ -224,6 +243,13 @@ class TrainingConfig:
 
     # Logging
     log_every: int = 10
+
+    # Eval hook: run eval/run_eval.py every this many steps (0 = disabled)
+    eval_every: int = 0
+    # Path to a saved model checkpoint dir for evaluation (None = skip model load)
+    eval_model_path: Optional[str] = None
+    # Output directory for eval result JSON files
+    eval_output_dir: str = "desloc_results/eval_runs"
 
     # Strategy override (None = auto-select)
     strategy_override: Optional[PartitionStrategy] = None
@@ -1687,7 +1713,38 @@ class DesLocEngine:
                 ckpt_path = cfg.checkpoint_dir / f"step_{self.global_step:07d}.pt"
                 self.save_checkpoint(ckpt_path)
 
-        total_time = time.time() - self._start_time
+            # --- Eval hook: every eval_every steps call eval/run_eval.py ---
+            if (
+                cfg.eval_every > 0
+                and self.global_step % cfg.eval_every == 0
+                and _run_periodic_eval is not None
+            ):
+                _eval_model_path = cfg.eval_model_path or ""
+                _eval_output_dir = cfg.eval_output_dir
+                logger.info(
+                    "[eval] step=%d — running periodic eval (model_path='%s', output='%s')",
+                    self.global_step, _eval_model_path, _eval_output_dir,
+                )
+                try:
+                    self.model.eval()
+                    eval_results = _run_periodic_eval(
+                        model_path=_eval_model_path,
+                        step=self.global_step,
+                        output_dir=_eval_output_dir,
+                    )
+                    # Log eval loss / key metrics
+                    _eval_summary = {
+                        k: v for k, v in eval_results.items()
+                        if k not in ("step", "model_path", "timestamp")
+                    }
+                    logger.info(
+                        "[eval] step=%d eval_results=%s",
+                        self.global_step, _eval_summary,
+                    )
+                except Exception as _eval_exc:  # noqa: BLE001
+                    logger.warning("[eval] step=%d eval hook failed: %s", self.global_step, _eval_exc)
+                finally:
+                    self.model.train()
         logger.info(
             "Training complete. %d steps in %.1fs. "
             "%.2fM tokens seen. Avg %.0f tok/s.",
