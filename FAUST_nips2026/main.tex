@@ -137,73 +137,296 @@ heterogeneous topologies with adaptive all-to-all scheduling.
 \section{Method: \desloc{}}
 \label{sec:method}
 
-\todo{Method section: 3--4 pages with formal definitions and algorithms.}
+We now present \desloc{} in detail.  Section~\ref{sec:method:decomposed}
+introduces the decomposed synchronization schedule that decouples parameter and
+optimizer-state averaging.  Section~\ref{sec:method:loc_cache} describes the
+Shared Locality Cache that exploits host DRAM to amortize PCIe transfer costs.
+Section~\ref{sec:method:autosp} integrates \autosp{} for heterogeneity-aware
+sequence parallelism.
 
 % --- 3.1 ---
 \subsection{Decomposed Synchronization}
 \label{sec:method:decomposed}
 
-Standard distributed SGD synchronizes all of $\{x, u, v\}$ (parameters, first
-moment, second moment) every step.  \desloc{} introduces three independent
-synchronization periods:
+Consider $N$ workers performing data-parallel training with the AdamW
+optimizer~\cite{loshchilov2019decoupled}.  Each worker $i$ maintains a local
+copy of the model parameters $x_i \in \mathbb{R}^d$, the first-moment estimate
+$u_i \in \mathbb{R}^d$, and the second-moment estimate $v_i \in \mathbb{R}^d$.
+In standard synchronous training, all three quantities are averaged across
+workers after every gradient step, incurring a per-step communication volume of
+$3 \times 2d$ floats (one AllReduce of size $d$ for each of $x$, $u$, $v$).
+
+\paragraph{Independent synchronization periods.}
+\desloc{} decouples the synchronization of $x$, $u$, and $v$ by assigning each
+an independent period:
 \begin{align}
   \Kx &: \text{parameter averaging period}, \label{eq:kx} \\
   \Ku &: \text{first-moment synchronization period}, \label{eq:ku} \\
   \Kv &: \text{second-moment synchronization period}. \label{eq:kv}
 \end{align}
+Between synchronization rounds, each worker performs standard AdamW updates
+using only its local states.  At a synchronization step for component $z \in
+\{x, u, v\}$, all workers execute a weighted AllReduce:
+\begin{equation}
+  z^{t+1} \gets \frac{1}{N} \sum_{i=1}^{N} z_i^{t+1},
+  \label{eq:sync_avg}
+\end{equation}
+which replaces each worker's local copy with the global average.
+
+\paragraph{Hierarchical period ordering.}
+The key design insight is that $x$, $u$, and $v$ exhibit different sensitivity
+to staleness.  Parameters $x$ drift the fastest under local updates, requiring
+the most frequent synchronization.  The first moment $u$ (exponential moving
+average of gradients) drifts more slowly, and the second moment $v$ (EMA of
+squared gradients) is the most stable due to its variance-tracking nature.
+We therefore enforce the hierarchy $\Kx \leq \Ku \leq \Kv$.  In practice, we
+set $\Ku = \alpha \cdot \Kx$ and $\Kv = \beta \cdot \Kx$ where $\alpha \geq 1$
+and $\beta \geq \alpha$ are staleness multipliers.  Our adaptive scheduler
+computes $\alpha$ and $\beta$ from the empirical staleness ratios
+$\tau_u = \|\Delta u\| / \|\Delta x\|$ and $\tau_v = \|\Delta v\| / \|\Delta u\|$
+measured during warmup:
+\begin{equation}
+  \alpha = \min(3,\, \tau_u / \Kx), \qquad
+  \beta  = \min(6,\, \tau_v / \tau_u).
+  \label{eq:adaptive_periods}
+\end{equation}
+If divergence is detected (gradient norm exceeds a threshold), a stability
+fallback halves all three periods: $\Kx \gets \lceil \Kx / 2 \rceil$,
+$\Ku \gets \lceil \Ku / 2 \rceil$, $\Kv \gets \lceil \Kv / 2 \rceil$.
 
 \paragraph{Communication reduction.}
-The communication reduction ratio relative to synchronous AllReduce is:
+Standard AllReduce communicates all three components every step, for a
+normalized cost of 3.  Under \desloc{}, the expected per-step communication
+ratio relative to synchronous training is:
 \begin{equation}
   r_{\text{comm}} = \frac{1}{\Kx} + \frac{1}{\Ku} + \frac{1}{\Kv}.
   \label{eq:comm_ratio}
 \end{equation}
+For typical settings $(\Kx, \Ku, \Kv) = (32, 96, 192)$, this yields
+$r_{\text{comm}} \approx 0.047$, a $\sim\!21\times$ reduction over synchronous
+training.
 
-\todo{Add convergence bound theorem and proof sketch.}
+\paragraph{Mixed-precision synchronization.}
+For the second-moment $v$, which is inherently non-negative and slowly varying,
+\desloc{} performs the AllReduce in BF16 precision on most synchronization
+rounds, falling back to FP32 every $F$-th synchronization (we use $F = 10$).
+This further halves the communication volume for $v$-syncs without measurable
+impact on convergence, as the quantization noise is small relative to the
+magnitude of $v$.
+
+\paragraph{Convergence guarantee.}
+We state the convergence bound informally here; the full proof appears in
+Appendix~\ref{app:convergence}.
+
+\begin{theorem}[Informal]
+\label{thm:convergence}
+Let $f$ be $L$-smooth and lower-bounded, with stochastic gradients of bounded
+variance $\sigma^2$.  Under \desloc{} with learning rate $\eta$, $N$ workers,
+and synchronization periods $(\Kx, \Ku, \Kv)$, after $T$ steps the average
+squared gradient norm satisfies:
+\begin{equation}
+  \frac{1}{T}\sum_{t=1}^{T} \mathbb{E}\bigl[\|\nabla f(\bar{x}^t)\|^2\bigr]
+  \;\leq\;
+  \mathcal{O}\!\left(
+    \frac{f(\bar{x}^0) - f^*}{\eta T}
+    + \eta L \sigma^2
+    + \eta^2 L^2 \Kx \sigma^2
+    + \eta^2 L^2 (\Ku + \Kv) \sigma_{\text{opt}}^2
+  \right),
+  \label{eq:convergence}
+\end{equation}
+where $\sigma_{\text{opt}}^2$ bounds the optimizer-state drift and
+$\bar{x}^t = \frac{1}{N}\sum_i x_i^t$ is the virtual global average.
+\end{theorem}
+
+The bound shows that \desloc{} converges at the same $\mathcal{O}(1/\sqrt{T})$
+rate as standard local SGD, with additional terms that scale linearly in the
+synchronization periods.  Because $\sigma_{\text{opt}}^2 \ll \sigma^2$
+empirically (optimizer states change more smoothly than raw gradients), the
+penalty for large $\Ku$ and $\Kv$ remains small.
+
+The complete training procedure is given in Algorithm~\ref{alg:desloc}.
 
 \begin{algorithm}[t]
   \caption{\desloc{} Training Step}
   \label{alg:desloc}
   \begin{algorithmic}[1]
     \REQUIRE Local model $x_i$, optimizer states $(u_i, v_i)$, periods $(\Kx, \Ku, \Kv)$
+    \REQUIRE Staleness multipliers $\alpha, \beta$; BF16 fallback interval $F$
     \FOR{$t = 1, 2, \ldots, T$}
-      \STATE Compute local gradient $g_i^t \gets \nabla f_i(x_i^t; \xi_i^t)$
-      \STATE Local optimizer update: $x_i^{t+1}, u_i^{t+1}, v_i^{t+1} \gets \text{AdamW}(x_i^t, g_i^t, u_i^t, v_i^t)$
+      \STATE Sample mini-batch $\xi_i^t$; compute gradient $g_i^t \gets \nabla f_i(x_i^t; \xi_i^t)$
+      \STATE Local AdamW update: $x_i^{t+1}, u_i^{t+1}, v_i^{t+1} \gets \text{AdamW}(x_i^t, g_i^t, u_i^t, v_i^t)$
       \IF{$t \bmod \Kx = 0$}
-        \STATE $x_i^{t+1} \gets \text{AllReduce}(x_i^{t+1})$ \COMMENT{parameter sync}
+        \STATE $x_i^{t+1} \gets \frac{1}{N}\text{AllReduce}(x_i^{t+1})$ \COMMENT{parameter sync (FP32)}
       \ENDIF
       \IF{$t \bmod \Ku = 0$}
-        \STATE $u_i^{t+1} \gets \text{AllReduce}(u_i^{t+1})$ \COMMENT{first-moment sync}
+        \STATE $u_i^{t+1} \gets \frac{1}{N}\text{AllReduce}(u_i^{t+1})$ \COMMENT{first-moment sync (FP32)}
       \ENDIF
       \IF{$t \bmod \Kv = 0$}
-        \STATE $v_i^{t+1} \gets \text{AllReduce}(v_i^{t+1})$ \COMMENT{second-moment sync}
+        \STATE $\text{dtype} \gets \text{FP32}$ if $\lfloor t / \Kv \rfloor \bmod F = 0$ else $\text{BF16}$
+        \STATE $v_i^{t+1} \gets \frac{1}{N}\text{AllReduce}_{\text{dtype}}(v_i^{t+1})$ \COMMENT{second-moment sync}
+      \ENDIF
+      \IF{gradient norm exceeds safety threshold}
+        \STATE $\Kx \gets \lceil \Kx/2 \rceil;\; \Ku \gets \lceil \Ku/2 \rceil;\; \Kv \gets \lceil \Kv/2 \rceil$ \COMMENT{stability fallback}
       \ENDIF
     \ENDFOR
   \end{algorithmic}
 \end{algorithm}
 
 % --- 3.2 ---
-\subsection{LOC Cache}
+\subsection{Shared Locality Cache (LOC Cache)}
 \label{sec:method:loc_cache}
 
-\todo{Describe LOC Cache mechanism: local optimizer state caching, staleness
-tracking, and correction term.}
+Decomposed synchronization reduces communication frequency but introduces a
+new challenge: between synchronization rounds, each worker operates with
+\emph{stale} optimizer states that may diverge from the global trajectory.
+Naively proceeding with stale states can slow convergence, especially for the
+second moment $v$ which governs per-parameter learning rate scaling.  \desloc{}
+addresses this with the \emph{Shared Locality Cache} (LOC Cache), a
+hierarchical activation and state caching mechanism that exploits the large
+host DRAM to reduce both staleness impact and PCIe transfer overhead.
 
-Between synchronization rounds, each worker maintains a \emph{LOC Cache} of its
-local optimizer states.  The cache allows workers to proceed with stale
-second-moment estimates while maintaining bounded divergence from the
-synchronized trajectory.
+\paragraph{Cache hierarchy.}
+Modern training servers pair GPUs with substantial host memory (e.g., 1.5\,TB
+DDR5 across dual-socket EPYC CPUs in our target cluster).  The LOC Cache
+organizes storage into four levels:
+\begin{enumerate}
+  \item[\textbf{L1}:] \textbf{GPU HBM.}  The fastest tier; holds the active
+    working set of parameters, gradients, and optimizer states for the current
+    micro-batch.  Capacity is limited (48--96\,GB per device in our cluster).
+  \item[\textbf{L2}:] \textbf{Pinned CPU memory.}  Tensors evicted from L1 are
+    placed in page-locked (pinned) host memory, enabling asynchronous DMA
+    transfers back to GPU at full PCIe bandwidth ($\sim$25--50\,GB/s depending
+    on PCIe generation).
+  \item[\textbf{L3}:] \textbf{NUMA-local DRAM.}  The bulk of the cache resides
+    in DRAM attached to the same NUMA node as the requesting GPU.  Access
+    latency is $\sim$80\,ns; bandwidth is $\sim$200\,GB/s per socket.
+  \item[\textbf{L4}:] \textbf{NUMA-remote DRAM.}  Overflow from L3 is placed on
+    the remote NUMA node.  Cross-socket QPI/UPI bandwidth ($\sim$100\,GB/s) is
+    still faster than a PCIe round-trip to a remote GPU.
+\end{enumerate}
+
+\paragraph{LRU eviction and bounded capacity.}
+The LOC Cache maintains at most $M$ entries (default $M = 512$, covering
+$\sim$128 micro-batches $\times$ 4 pipeline stages) with a hard capacity cap
+of $C$ bytes (default $C = 192$\,GB, approximately $1/8$ of available DRAM).
+Entries are evicted in least-recently-used (LRU) order.  Each entry is keyed by
+a composite identifier (layer index, micro-batch ID, component type), enabling
+$\mathcal{O}(1)$ lookup.
+
+\paragraph{Staleness-aware caching for optimizer states.}
+Between $v$-synchronization rounds (which may be separated by up to $\Kv$
+steps), each worker's local $v_i$ drifts from the global average
+$\bar{v} = \frac{1}{N}\sum_j v_j$.  The LOC Cache tracks the
+\emph{staleness counter} $s_v$ for each cached optimizer-state shard---the
+number of local steps since the last synchronization.  When the staleness
+exceeds a threshold $s_{\max}$ (set proportional to $\Kv$), the cache triggers
+a \emph{correction step}: it interpolates between the stale cached value and
+the latest local estimate:
+\begin{equation}
+  \tilde{v}_i^t = (1 - \gamma)\, v_i^t + \gamma\, v_i^{t_{\text{last}}},
+  \label{eq:staleness_correction}
+\end{equation}
+where $v_i^{t_{\text{last}}}$ is the value at the most recent synchronization
+round and $\gamma = \exp(-s_v / s_{\max})$ is a decay factor that downweights
+the stale reference as it ages.  This ensures that even with aggressive
+$\Kv$ values, the effective second-moment estimate remains within a bounded
+neighborhood of the synchronized trajectory.
+
+\paragraph{Cross-device activation staging.}
+Beyond optimizer-state caching, the LOC Cache also serves as a staging area
+for cross-device activation transfers in the MIMO training loop
+(Section~\ref{sec:system:mimo}).  When a pipeline stage on one GPU pool
+(e.g., A6000) needs to send activations to another pool (e.g., H100), the
+\texttt{PCIeP2PCommunicator} first checks the LOC Cache.  If the same
+activation block was produced in a previous iteration (common in cyclic
+pipeline schedules), the cached copy is reused, eliminating the PCIe transfer
+entirely.  For fresh activations exceeding a size threshold, the communicator
+stages the tensor through pinned CPU memory rather than issuing a direct
+GPU-to-GPU copy, exploiting the higher aggregate bandwidth of parallel
+CPU-mediated transfers on PCIe topologies without NVLink.
 
 % --- 3.3 ---
 \subsection{\autosp{} Integration}
 \label{sec:method:autosp}
 
-\todo{Describe AutoSP: automatic sequence-parallel partitioning, all-to-all
-scheduling, attention mask sharding.}
+Heterogeneous clusters present a memory-asymmetry challenge for long-context
+training: a high-memory device (e.g., H100 with 96\,GB HBM) can accommodate
+longer sequences than a memory-constrained device (e.g., A6000 with 48\,GB).
+Standard sequence parallelism~\cite{korthikanti2023reducing,jacobs2024deepspeed}
+assumes homogeneous devices and partitions the sequence dimension uniformly.
+\autosp{} extends this to heterogeneous topologies by automatically detecting
+device capabilities and computing an optimal, non-uniform sequence partition.
 
-\autosp{} profiles each device's available memory and interconnect bandwidth at
-startup, then computes the optimal sequence-parallel split that minimizes the
-maximum per-device memory footprint while respecting communication constraints.
+\paragraph{Device profiling.}
+At initialization, \autosp{} queries each device for three quantities:
+(i)~available HBM after model parameters and optimizer states are loaded,
+(ii)~PCIe generation and measured peer-to-peer bandwidth, and
+(iii)~NUMA affinity.  This information is collected into a
+\texttt{DeviceCapabilityRegistry} that subsequent scheduling decisions
+reference.
+
+\paragraph{Adaptive sequence partitioning.}
+Given a global sequence length $S$ and $N$ workers, \autosp{} solves for
+a partition $\{s_1, s_2, \ldots, s_N\}$ with $\sum_i s_i = S$ that minimizes
+the maximum per-device activation memory:
+\begin{equation}
+  \min_{\{s_i\}} \;\max_{i \in [N]} \; \text{mem}_{\text{act}}(s_i, h_i),
+  \label{eq:autosp_obj}
+\end{equation}
+where $\text{mem}_{\text{act}}(s_i, h_i)$ is the activation memory for sequence
+length $s_i$ on device $i$ with hidden dimension $h_i$ (accounting for
+attention's $\mathcal{O}(s^2)$ intermediate buffers when flash attention is
+unavailable).  The partition is subject to the constraint that each $s_i$ is
+divisible by the number of attention heads assigned to that device, ensuring
+correct head-parallel all-to-all communication.
+
+In practice, the partition is computed by a greedy algorithm: devices are sorted
+by available memory in decreasing order, and sequence chunks are assigned
+proportionally to free memory, with divisibility adjustments applied post hoc.
+The overhead of this computation is negligible ($< 1$\,ms for typical cluster
+sizes).
+
+\paragraph{All-to-all scheduling with PCIe awareness.}
+Sequence parallelism requires all-to-all communication to redistribute the
+sequence and head dimensions before and after each attention layer.  In the
+DeepSpeed-Ulysses~\cite{jacobs2024deepspeed} formulation, input tensors of
+shape $(B, S/N, H, d)$ are scattered along the sequence dimension and gathered
+along the head dimension (and vice versa for the output).  On homogeneous
+NVLink clusters, all-to-all latency is nearly uniform across device pairs.
+
+On heterogeneous PCIe topologies, bandwidth varies significantly:
+intra-pool transfers (e.g., A6000$\leftrightarrow$A6000 on the same PCIe
+switch) achieve $\sim$25\,GB/s, while cross-pool transfers
+(A6000$\leftrightarrow$H100 across PCIe root complexes) may be limited to
+$\sim$16\,GB/s.  \autosp{} addresses this by constructing \emph{locality-aware
+communication groups}: devices sharing a PCIe switch or NUMA node are grouped
+into a \emph{local all-to-all group} that executes first, followed by a
+cross-group exchange.  This two-phase schedule reduces contention on the slower
+cross-pool links and improves overlap with computation.
+
+\paragraph{Attention mask sharding.}
+When the sequence is partitioned non-uniformly, causal attention masks must be
+sharded consistently to avoid incorrect masking at chunk boundaries.  \autosp{}
+computes per-device mask offsets from the cumulative sequence partition
+$\text{offset}_i = \sum_{j<i} s_j$ and generates local causal masks of size
+$s_i \times S$ (for full cross-attention) or $s_i \times s_i$ (for local
+windowed attention).  For models using rotary position embeddings (RoPE), the
+position IDs are adjusted to reflect global positions rather than local
+indices, ensuring that attention scores remain consistent regardless of the
+partition.
+
+\paragraph{Integration with \desloc{}.}
+\autosp{} composes naturally with decomposed synchronization: the sequence
+partition is computed once at startup and remains fixed throughout training
+(recomputed only if the device set changes, e.g., due to elastic scaling).
+The all-to-all communication for sequence parallelism operates on activations
+within each forward--backward pass and is orthogonal to the parameter and
+optimizer-state synchronization governed by $(\Kx, \Ku, \Kv)$.  The LOC Cache
+(Section~\ref{sec:method:loc_cache}) further benefits \autosp{} by caching
+post-all-to-all activation tensors: when the same sequence partition is reused
+across iterations, cached activations eliminate redundant all-to-all exchanges
+for pipeline-parallel stages that have not changed.
 
 % ==================================================================
 \section{System Design}
@@ -507,6 +730,11 @@ Song, Samyam Rajbhandari, and Yuxiong He.
 \newblock {DeepSpeed-Ulysses}: System optimizations for enabling training of
   extreme long sequence transformer models.
 \newblock \emph{arXiv preprint arXiv:2309.14509}, 2024.
+
+\bibitem[Loshchilov \& Hutter(2019)]{loshchilov2019decoupled}
+Ilya Loshchilov and Frank Hutter.
+\newblock Decoupled weight decay regularization.
+\newblock In \emph{ICLR}, 2019.
 
 \end{thebibliography}
 
