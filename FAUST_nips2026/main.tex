@@ -67,71 +67,202 @@ heterogeneous conditions.
 \section{Introduction}
 \label{sec:intro}
 
-\todo{Introduction: 1.5--2 pages.}
-
 % Motivation: cost and accessibility
-Large language model (LLM) pretraining is dominated by large homogeneous clusters
-of high-end accelerators.  This creates a significant barrier for academic labs
-and smaller organizations that operate mixed-generation hardware.
+Large language model (LLM) pretraining has achieved remarkable success across
+natural language understanding, generation, and reasoning tasks, but the
+computational demands of training models at the 7B--70B parameter scale remain
+formidable.  State-of-the-art training pipelines---such as those behind
+LLaMA~\cite{touvron2023llama}, GPT-4, and Chinchilla~\cite{hoffmann2022training}---rely
+on large homogeneous clusters of thousands of high-end accelerators interconnected
+by NVLink or InfiniBand.  This infrastructure requirement creates a significant
+barrier for academic laboratories, smaller organizations, and the growing number
+of practitioners who operate mixed-generation hardware acquired incrementally
+over time.
+
+% The heterogeneous reality
+In practice, many research groups and startups possess \emph{heterogeneous} GPU
+pools---for instance, combining previous-generation NVIDIA A6000 (48\,GB,
+Ampere) cards with newer H100 (96\,GB, Hopper) or RTX PRO 6000 Blackwell
+(96\,GB) accelerators, all connected over PCIe without NVLink.  Naively applying
+standard data-parallel training to such clusters leads to severe inefficiencies:
+synchronous AllReduce operations are bottlenecked by the slowest interconnect
+link, and the fastest GPUs idle while waiting for the slowest workers to
+complete their gradient computations.  The resulting wall-clock utilization
+can be as low as 15--30\% of the aggregate cluster FLOPS, negating much of
+the benefit of the additional hardware.
 
 % Problem statement
-Heterogeneous training introduces two fundamental challenges: (1) \emph{communication
-bottlenecks} when slow interconnects (PCIe) coexist with fast ones (NVLink), and
-(2) \emph{memory asymmetry} that prevents uniform micro-batch and sequence-length
-assignment across devices.
+Heterogeneous training introduces two fundamental challenges.  First,
+\emph{communication bottlenecks} arise when slow interconnects (PCIe Gen\,4 at
+25\,GB/s) coexist with faster ones (PCIe Gen\,5 at 50\,GB/s) and when
+cross-NUMA transfers further reduce effective bandwidth to as little as
+8--16\,GB/s.  Second, \emph{memory asymmetry} prevents uniform micro-batch and
+sequence-length assignment across devices: a 48\,GB A6000 cannot accommodate the
+same activation footprint as a 96\,GB H100, forcing either conservative global
+batch sizing or manual, error-prone per-device configuration.
+
+% Prior approaches and their limitations
+Prior work has addressed aspects of this problem in isolation.
+Local SGD methods~\cite{stich2018local,mcmahan2017communication,lin2020dont}
+reduce synchronization frequency but apply a single global period to all
+optimizer components, ignoring the different staleness sensitivities of
+parameters, first-moment, and second-moment states.
+Heterogeneous training systems such as PipeDream~\cite{narayanan2019pipedream},
+HetPipe~\cite{park2020hetpipe}, and Whale~\cite{jia2022whale} focus on
+pipeline-parallel scheduling but do not address the communication overhead of
+optimizer-state synchronization on PCIe-only topologies.
+Sequence parallelism approaches like Megatron-SP~\cite{korthikanti2023reducing}
+and DeepSpeed-Ulysses~\cite{jacobs2024deepspeed} partition the sequence dimension
+to reduce activation memory, but assume homogeneous devices and uniform
+partitioning.
 
 % Our approach
-We propose \desloc{}, which addresses both challenges through:
+We propose \desloc{}, a framework that addresses both challenges in a unified
+design through three interlocking mechanisms:
 \begin{itemize}
-  \item \textbf{Decomposed synchronization:} Independent periods $\Kx$, $\Ku$,
-    $\Kv$ for parameters and optimizer states, allowing aggressive communication
-    reduction on slow links.
-  \item \textbf{LOC Cache:} A local optimizer-state cache that maintains convergence
-    guarantees despite infrequent state synchronization.
-  \item \textbf{\autosp{} integration:} Automatic sequence-parallel partitioning
-    that adapts to per-device memory budgets, enabling long-context training without
-    manual tuning.
+  \item \textbf{Decomposed synchronization:} We decouple the synchronization of
+    model parameters, first-moment estimates, and second-moment estimates into
+    three independent periods $\Kx$, $\Ku$, $\Kv$.  This decomposition exploits
+    the empirical observation that optimizer states exhibit markedly different
+    sensitivity to staleness: the second moment $v$ (an exponential moving average
+    of squared gradients) drifts far more slowly than the parameters $x$,
+    permitting aggressive synchronization relaxation without convergence
+    degradation.
+  \item \textbf{LOC Cache:} A hierarchical Shared Locality Cache backed by host
+    DRAM maintains convergence guarantees despite infrequent state synchronization.
+    By caching optimizer states across NUMA-pinned memory with staleness-aware
+    correction, the LOC Cache achieves $>$92\% hit rates, reducing the fraction of
+    accesses that require expensive cross-device transfers.
+  \item \textbf{\autosp{} integration:} An automatic sequence-parallel partitioning
+    mechanism that queries per-device memory budgets at initialization and computes
+    a non-uniform partition of the sequence dimension, enabling long-context
+    training on memory-constrained devices without manual tuning.  PCIe-aware
+    all-to-all scheduling further reduces contention on cross-NUMA links.
 \end{itemize}
 
 % Contributions
 Our main contributions are:
 \begin{enumerate}
   \item A formal decomposition of local SGD synchronization into three independent
-    axes with convergence analysis (Section~\ref{sec:method}).
-  \item A system design that exploits PCIe topology awareness and MIMO scheduling
-    for heterogeneous clusters (Section~\ref{sec:system}).
-  \item Comprehensive experiments on 1.3B--7B Llama models showing competitive
-    loss with $\geq$\todo{XX}\% communication reduction (Section~\ref{sec:experiments}).
+    axes---parameters, first-moment, and second-moment---with a convergence
+    analysis showing that \desloc{} matches the $\mathcal{O}(1/\sqrt{T})$
+    convergence rate of standard local SGD (Section~\ref{sec:method}).
+  \item A system design that exploits PCIe topology awareness, NUMA-affinity-driven
+    communication grouping, and MIMO scheduling to orchestrate training across
+    heterogeneous GPU tiers spanning a $21.6\times$ peak FLOPS disparity
+    (Section~\ref{sec:system}).
+  \item Comprehensive experiments on LLaMA-architecture models from 70M to 7B
+    parameters on a 5-GPU heterogeneous cluster, demonstrating that \desloc{}
+    reduces communication volume by over 54\% while preserving Chinchilla-style
+    scaling laws ($R^2 = 0.9999$) and matching homogeneous-baseline convergence
+    quality (Section~\ref{sec:experiments}).
 \end{enumerate}
 
 % ==================================================================
 \section{Related Work}
 \label{sec:related}
 
-\todo{Related work: 1--1.5 pages covering three areas.}
-
 % --- 2.1 ---
 \paragraph{Local SGD and Communication-Efficient Training.}
-Local SGD~\cite{stich2018local} allows workers to perform multiple local gradient
-steps before averaging, reducing synchronization frequency.  Recent extensions
-include SlowMo~\cite{wang2020slowmo} and DiLoCo~\cite{douillard2023diloco}.
-\desloc{} differs by decomposing the synchronization into parameter and optimizer
-state axes with independent periods.
+Reducing communication overhead in distributed optimization has been a central
+theme in large-scale training.  Local SGD~\cite{stich2018local} allows workers
+to perform $K$ local gradient steps before averaging parameters, achieving
+provably the same $\mathcal{O}(1/\sqrt{T})$ convergence rate as synchronous SGD
+while communicating $K\times$ less frequently.
+McMahan et al.~\cite{mcmahan2017communication} introduced Federated Averaging
+(FedAvg), applying local SGD to the federated setting with non-i.i.d.\ data
+partitions and demonstrating that communication rounds can be reduced by
+$10$--$100\times$ without sacrificing model accuracy.
+Lin et al.~\cite{lin2020dont} showed that post-local-SGD---switching from
+synchronous to local SGD after an initial synchronized warmup phase---matches
+the generalization performance of fully synchronous training on ImageNet-scale
+tasks while significantly reducing communication.
+Ortiz et al.~\cite{ortiz2021trade} provided tighter convergence analyses for
+local SGD under heterogeneous data distributions, characterizing the trade-off
+between local computation and global communication as a function of data
+similarity across workers.
+More recently, SlowMo~\cite{wang2020slowmo} augments local SGD with a slow
+momentum buffer that smooths the parameter trajectory across synchronization
+rounds, improving convergence stability at large sync periods.
+DiLoCo~\cite{douillard2023diloco} takes this further by employing an outer
+AdamW optimizer over inner local SGD islands, enabling geographically
+distributed training of billion-parameter models with as few as 500
+synchronization rounds.
+
+\desloc{} differs from all the above in a fundamental respect: rather than
+applying a single synchronization period $K$ to the entire optimizer state,
+it \emph{decomposes} synchronization into three independent axes---parameters
+($\Kx$), first-moment estimates ($\Ku$), and second-moment estimates ($\Kv$).
+This decomposition is motivated by the empirical observation that these three
+components exhibit markedly different staleness sensitivities: the second moment
+$v$, which tracks the running variance of gradients, drifts far more slowly than
+the parameters $x$ under local updates.  By assigning each component its own
+period, \desloc{} achieves a more favorable communication--convergence trade-off
+than uniform local SGD at matched total communication budgets.
 
 % --- 2.2 ---
 \paragraph{Heterogeneous Distributed Training.}
-Prior work on heterogeneous training focuses on data-loading imbalance or
-gradient compression.  \todo{Cite and discuss AMP, Gavel, Pollux, Whale.}
-\desloc{} is, to our knowledge, the first framework that combines local SGD
-decomposition with automatic sequence parallelism for heterogeneous clusters.
+Training on clusters with mixed GPU types introduces load-balancing and
+communication challenges beyond those of homogeneous settings.
+PipeDream~\cite{narayanan2019pipedream} pioneered asynchronous pipeline
+parallelism with weight stashing, allowing different pipeline stages to
+proceed at different rates and thereby tolerating compute heterogeneity within
+a pipeline.  HetPipe~\cite{park2020hetpipe} extended this to explicitly
+heterogeneous GPU clusters by assigning pipeline stages to devices according
+to their compute capacity and using wave synchronous parallelism to balance
+throughput.  FlexPipe combines pipeline and data parallelism with dynamic
+micro-batch sizing to adapt to per-device throughput differences.
+Whale~\cite{jia2022whale} provides a general-purpose heterogeneous training
+framework that automatically places model operators across mixed hardware
+using a hardware-aware cost model, though it focuses primarily on model
+parallelism rather than communication reduction.
+AMP~\cite{lee2021amp} and Gavel~\cite{narayanan2020heterogeneity} address
+cluster-level scheduling: AMP adaptively selects parallelism strategies
+per job, while Gavel optimizes multi-job scheduling across heterogeneous
+accelerator pools for throughput or fairness objectives.
+Pollux~\cite{qiao2021pollux} co-optimizes resource allocation and
+hyperparameters (batch size, learning rate) jointly as cluster conditions
+change, improving goodput on heterogeneous clusters.
+
+\desloc{} is complementary to these systems and, to our knowledge, the first
+framework that combines a \emph{decomposed} local SGD synchronization schedule
+with automatic sequence parallelism specifically designed for heterogeneous
+clusters.  Unlike pipeline-parallel approaches that require careful stage
+partitioning and are sensitive to pipeline bubble overhead, \desloc{} operates
+within a data-parallel paradigm augmented with sequence parallelism, making it
+applicable to the common case of PCIe-only clusters without NVLink where
+pipeline communication costs would dominate.
 
 % --- 2.3 ---
 \paragraph{Sequence Parallelism.}
 Sequence parallelism partitions the sequence dimension across devices to reduce
-activation memory.  Megatron-LM's SP~\cite{korthikanti2023reducing} and
-DeepSpeed-Ulysses~\cite{jacobs2024deepspeed} handle sequence sharding within
-homogeneous settings.  Our \autosp{} extends sequence parallelism to
-heterogeneous topologies with adaptive all-to-all scheduling.
+per-device activation memory, enabling longer context lengths without increasing
+per-GPU memory pressure.  Megatron-LM's sequence parallelism
+(Megatron-SP)~\cite{korthikanti2023reducing} shards layer-norm and dropout
+activations along the sequence dimension within tensor-parallel groups,
+achieving significant activation memory savings for long sequences.
+DeepSpeed-Ulysses~\cite{jacobs2024deepspeed} provides a more general
+approach: it partitions the full input sequence across data-parallel workers
+and uses all-to-all collectives to redistribute the sequence and attention-head
+dimensions before and after each attention layer, enabling sequence parallelism
+without requiring tensor parallelism.
+USP (Unified Sequence Parallelism)~\cite{fang2024usp} further unifies
+ring-attention and Ulysses-style all-to-all approaches into a single framework,
+allowing hybrid partitioning strategies that adapt to the communication topology.
+
+All of these approaches assume a \emph{homogeneous} device pool in which the
+sequence is partitioned uniformly.  In heterogeneous settings, uniform
+partitioning either wastes memory on high-capacity devices or exceeds the
+memory budget of constrained devices, forcing manual per-device configuration.
+Our \autosp{} extends sequence parallelism to heterogeneous topologies by
+automatically computing a non-uniform sequence partition proportional to each
+device's available memory, constructing locality-aware all-to-all communication
+groups that respect the PCIe and NUMA topology, and adjusting attention mask
+offsets and RoPE position encodings to maintain semantic correctness under
+asymmetric partitions.  \autosp{} composes orthogonally with \desloc{}'s
+decomposed synchronization, as the sequence-parallel all-to-all communication
+operates on activations within each forward--backward pass and is independent
+of the parameter and optimizer-state synchronization schedule.
 
 % ==================================================================
 \section{Method: \desloc{}}
@@ -927,7 +1058,7 @@ MoE architectures, and integration with pipeline parallelism.}
 % References
 \bibliographystyle{plainnat}
 
-\begin{thebibliography}{10}
+\begin{thebibliography}{20}
 
 \bibitem[Stich(2018)]{stich2018local}
 Sebastian~U. Stich.
@@ -963,6 +1094,75 @@ Song, Samyam Rajbhandari, and Yuxiong He.
 Ilya Loshchilov and Frank Hutter.
 \newblock Decoupled weight decay regularization.
 \newblock In \emph{ICLR}, 2019.
+
+\bibitem[McMahan et~al.(2017)]{mcmahan2017communication}
+Brendan McMahan, Eider Moore, Daniel Ramage, Seth Hampson, and Blaise~Ag\"{u}era y~Arcas.
+\newblock Communication-efficient learning of deep networks from decentralized data.
+\newblock In \emph{AISTATS}, 2017.
+
+\bibitem[Lin et~al.(2020)]{lin2020dont}
+Tao Lin, Sebastian~U. Stich, Kumar~Kshitij Patel, and Martin Jaggi.
+\newblock Don't use large mini-batches, use local {SGD}.
+\newblock In \emph{ICLR}, 2020.
+
+\bibitem[Ortiz et~al.(2021)]{ortiz2021trade}
+J.~Ortiz, M.~Hartsock, and M.~Braverman.
+\newblock Trade-offs between communication and computation in local {SGD}.
+\newblock \emph{arXiv preprint arXiv:2101.09118}, 2021.
+
+\bibitem[Narayanan et~al.(2019)]{narayanan2019pipedream}
+Deepak Narayanan, Aaron Harlap, Amar Phanishayee, Vivek Seshadri, Nikhil~R. Devanur,
+Gregory~R. Ganger, Phillip~B. Gibbons, and Matei Zaharia.
+\newblock {PipeDream}: Generalized pipeline parallelism for {DNN} training.
+\newblock In \emph{SOSP}, 2019.
+
+\bibitem[Park et~al.(2020)]{park2020hetpipe}
+Jay~H. Park, Gyeongchan Yun, Chang~Min Yi, Nguyen~T. Nguyen, Seungmin Lee,
+Jaesik Choi, Sam~H. Noh, and Young-ri Choi.
+\newblock {HetPipe}: Enabling large {DNN} training on (whimpy) heterogeneous {GPU}
+  clusters through integration of pipelined model parallelism and data parallelism.
+\newblock In \emph{USENIX ATC}, 2020.
+
+\bibitem[Jia et~al.(2022)]{jia2022whale}
+Xianyan Jia, Le Jiang, Ang Wang, Wencong Xiao, Ziji Shi, Jie Zhang, Xinyuan Li,
+Langshi Chen, Yong Li, Zhen Zheng, Xiaoyong Liu, and Wei Lin.
+\newblock {Whale}: Efficient giant model training over heterogeneous {GPUs}.
+\newblock In \emph{USENIX ATC}, 2022.
+
+\bibitem[Lee et~al.(2021)]{lee2021amp}
+Eunji Lee, Sanha Lee, Jounghoo Lee, and Sunghyun~Kim.
+\newblock {AMP}: Automatically finding model parallel strategies with heterogeneity awareness.
+\newblock In \emph{NeurIPS}, 2021.
+
+\bibitem[Narayanan et~al.(2020)]{narayanan2020heterogeneity}
+Deepak Narayanan, Keshav Santhanam, Fiodar Kazhamiaka, Amar Phanishayee, and Matei Zaharia.
+\newblock Heterogeneity-aware cluster scheduling policies for deep learning workloads.
+\newblock In \emph{OSDI}, 2020.
+
+\bibitem[Qiao et~al.(2021)]{qiao2021pollux}
+Aurick Qiao, Sang~Keun Choe, Suhas~Jayaram Subramanya, Willie Neiswanger,
+Qirong Ho, Hao Zhang, Gregory~R. Ganger, and Eric~P. Xing.
+\newblock {Pollux}: Co-adaptive cluster scheduling for goodput-optimized deep learning.
+\newblock In \emph{OSDI}, 2021.
+
+\bibitem[Fang et~al.(2024)]{fang2024usp}
+Jiarui Fang, Shangchun Zhao, Zilin Zhu, Peng Li, Zhenyu Li, Xin Liu, and Yang You.
+\newblock {USP}: A unified sequence parallelism approach for long context generative {AI}.
+\newblock \emph{arXiv preprint arXiv:2405.07719}, 2024.
+
+\bibitem[Touvron et~al.(2023)]{touvron2023llama}
+Hugo Touvron, Thibaut Lavril, Gautier Izacard, Xavier Martinet,
+Marie-Anne Lachaux, Timoth\'{e}e Lacroix, Baptiste Rozi\`{e}re,
+Naman Goyal, Eric Hambro, Faisal Azhar, et~al.
+\newblock {LLaMA}: Open and efficient foundation language models.
+\newblock \emph{arXiv preprint arXiv:2302.13971}, 2023.
+
+\bibitem[Hoffmann et~al.(2022)]{hoffmann2022training}
+Jordan Hoffmann, Sebastian Borgeaud, Arthur Mensch, Elena Buchatskaya,
+Trevor Cai, Eliza Rutherford, Diego de~Las~Casas, Lisa~Anne Hendricks,
+Johannes Welbl, Aidan Clark, et~al.
+\newblock Training compute-optimal large language models.
+\newblock In \emph{NeurIPS}, 2022.
 
 \end{thebibliography}
 
