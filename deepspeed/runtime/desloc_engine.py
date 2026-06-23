@@ -111,6 +111,7 @@ class TierClass(Enum):
     """GPU tier classification based on SM version and memory."""
     H100 = "H100"
     A6000 = "A6000"
+    RTX_PRO_6000_BW = "RTX_PRO_6000_BW"  # Blackwell SM12.0, 96GB
     UNKNOWN = "UNKNOWN"
 
 
@@ -400,6 +401,8 @@ class TierDiscovery:
     @staticmethod
     def _classify(sm_major: int, sm_minor: int, mem_gb: float) -> TierClass:
         """Classify a GPU into a TierClass based on SM version and memory."""
+        if sm_major >= 12 and mem_gb >= 90:
+            return TierClass.RTX_PRO_6000_BW
         if sm_major == 9 and mem_gb >= 80:
             return TierClass.H100
         if sm_major == 8 and sm_minor == 6 and mem_gb >= 40:

@@ -261,6 +261,7 @@ ACTIVATION_TENSORS_CKPT: int = 1         # with full recompute checkpointing
 class GPUType(Enum):
     A6000 = auto()
     H100  = auto()
+    RTX_PRO_6000_BW = auto()  # Blackwell SM12.0, 96GB
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -623,14 +624,18 @@ class HeteroPartitionSolver:
         micro_batch_size: int = 1,
         checkpointing: bool = True,
         verbose: bool = True,
+        blackwell: Optional[GPUSpec] = None,
     ):
         if a6000.gpu_type != GPUType.A6000:
             raise ValueError("First GPU spec must be A6000")
         if h100.gpu_type != GPUType.H100:
             raise ValueError("Second GPU spec must be H100")
+        if blackwell is not None and blackwell.gpu_type != GPUType.RTX_PRO_6000_BW:
+            raise ValueError("Third GPU spec must be RTX_PRO_6000_BW")
 
         self.a6000   = a6000
         self.h100    = h100
+        self.blackwell = blackwell
         self.model   = model
         self.B       = micro_batch_size
         self.ckpt    = checkpointing
@@ -639,13 +644,18 @@ class HeteroPartitionSolver:
         # Total GPU count
         self.n_a6000 = a6000.count
         self.n_h100  = h100.count
-        self.n_total = a6000.count + h100.count
+        self.n_blackwell = blackwell.count if blackwell else 0
+        self.n_total = a6000.count + h100.count + self.n_blackwell
 
-        # Compute ratio
+        # Compute ratio (H100 as reference)
         self.R = h100.flops / a6000.flops   # ≈ 21.57
+        self.R_bw = (blackwell.flops / a6000.flops) if blackwell else 0.0
 
-        # Sub-models
-        self.bw_model    = PCIeBandwidthModel([a6000] * a6000.count + [h100] * h100.count)
+        # Build GPU list for bandwidth model
+        gpu_list = [a6000] * a6000.count + [h100] * h100.count
+        if blackwell:
+            gpu_list += [blackwell] * blackwell.count
+        self.bw_model    = PCIeBandwidthModel(gpu_list)
         self.vram_est    = VRAMEstimator(model)
 
         # Convenience
@@ -656,7 +666,8 @@ class HeteroPartitionSolver:
         if verbose:
             print(f"HeteroPartitionSolver initialized:")
             print(f"  R = FLOPS_H / FLOPS_A = {self.R:.2f}")
-            print(f"  n_total = {self.n_total} ({self.n_a6000}×A6000 + {self.n_h100}×H100)")
+            bw_str = f" + {self.n_blackwell}×Blackwell" if self.n_blackwell else ""
+            print(f"  n_total = {self.n_total} ({self.n_a6000}×A6000 + {self.n_h100}×H100{bw_str})")
             print(f"  F_token = {self.F:.3e} FLOPs")
 
     # ─────────────────────────────────────────────────────────────
@@ -1231,6 +1242,15 @@ DEFAULT_H100 = GPUSpec(
     count             = 1,
 )
 
+DEFAULT_RTX_PRO_6000_BW = GPUSpec(
+    name              = "RTX_PRO_6000_BW",
+    gpu_type          = GPUType.RTX_PRO_6000_BW,
+    flops_bf16_tflops = 300.0,   # Conservative estimate for SM12.0 Blackwell workstation
+    vram_gb           = 96.0,
+    pcie_bw_gbps      = 25.0,    # PCIe Gen1×16 reported (likely BIOS misconfiguration)
+    count             = 2,
+)
+
 LLAMA_7B = ModelConfig(
     name       = "LLaMA-7B",
     num_params = 6.74e9,
@@ -1243,6 +1263,7 @@ LLAMA_7B = ModelConfig(
 # Quick sanity checks on constants
 assert abs(DEFAULT_H100.flops / DEFAULT_A6000.flops - 21.57) < 0.1, "R mismatch"
 assert abs(LLAMA_7B.flops_per_token - 4.044e10) < 1e9, "F_token mismatch"
+assert DEFAULT_RTX_PRO_6000_BW.gpu_type == GPUType.RTX_PRO_6000_BW, "BW type mismatch"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
