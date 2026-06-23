@@ -1,0 +1,341 @@
+% SPDX-License-Identifier: Apache-2.0
+% DeepSpeed Team
+%
+% DES-LOC: Decomposed Local SGD for Heterogeneous GPU Clusters
+% with Automatic Sequence Parallelism
+%
+% NeurIPS 2026 Submission
+
+\documentclass[11pt]{article}
+\usepackage[preprint]{neurips_2026}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+\usepackage{hyperref}
+\usepackage{url}
+\usepackage{xcolor}
+\usepackage{subcaption}
+\usepackage{multirow}
+
+% ---- convenience macros ----
+\newcommand{\desloc}{\textsc{DES-LOC}}
+\newcommand{\autosp}{\textsc{AutoSP}}
+\newcommand{\Kx}{K_x}
+\newcommand{\Ku}{K_u}
+\newcommand{\Kv}{K_v}
+\newcommand{\todo}[1]{{\color{red}\textbf{[TODO: #1]}}}
+
+\title{DES-LOC: Decomposed Local SGD for Heterogeneous GPU Clusters \\ with Automatic Sequence Parallelism}
+
+\author{
+  Jiacheng Yuan \\
+  \texttt{dogechat@163.com} \\
+}
+
+\begin{document}
+
+\maketitle
+
+% ==================================================================
+\begin{abstract}
+\todo{Write abstract: 200--250 words covering problem, method, key results.}
+
+Training large language models (LLMs) at scale requires expensive, homogeneous GPU
+clusters. We present \desloc{}, a decomposed local SGD framework that enables
+efficient pretraining across \emph{heterogeneous} GPU tiers (e.g., mixing A100 80 GB
+and consumer-grade GPUs) without sacrificing convergence quality. \desloc{} introduces
+three independent synchronization periods $\Kx$, $\Ku$, $\Kv$ for parameters,
+optimizer first-moment, and second-moment states respectively, reducing
+communication volume by up to $3\times$ compared to standard AllReduce.
+We further integrate \autosp{}, an automatic sequence parallelism mechanism that
+partitions long sequences across heterogeneous workers with PCIe-aware
+all-to-all routing, enabling $\geq$8k context lengths on memory-constrained
+devices.
+Experiments on Llama-architecture models from 1.3B to 7B parameters demonstrate
+that \desloc{} matches homogeneous baselines in loss-per-token while reducing
+wall-clock time by \todo{XX}\% on a 3-tier heterogeneous cluster.
+Scaling-law analysis confirms the predictability of \desloc{} training under
+heterogeneous conditions.
+\end{abstract}
+
+% ==================================================================
+\section{Introduction}
+\label{sec:intro}
+
+\todo{Introduction: 1.5--2 pages.}
+
+% Motivation: cost and accessibility
+Large language model (LLM) pretraining is dominated by large homogeneous clusters
+of high-end accelerators.  This creates a significant barrier for academic labs
+and smaller organizations that operate mixed-generation hardware.
+
+% Problem statement
+Heterogeneous training introduces two fundamental challenges: (1) \emph{communication
+bottlenecks} when slow interconnects (PCIe) coexist with fast ones (NVLink), and
+(2) \emph{memory asymmetry} that prevents uniform micro-batch and sequence-length
+assignment across devices.
+
+% Our approach
+We propose \desloc{}, which addresses both challenges through:
+\begin{itemize}
+  \item \textbf{Decomposed synchronization:} Independent periods $\Kx$, $\Ku$,
+    $\Kv$ for parameters and optimizer states, allowing aggressive communication
+    reduction on slow links.
+  \item \textbf{LOC Cache:} A local optimizer-state cache that maintains convergence
+    guarantees despite infrequent state synchronization.
+  \item \textbf{\autosp{} integration:} Automatic sequence-parallel partitioning
+    that adapts to per-device memory budgets, enabling long-context training without
+    manual tuning.
+\end{itemize}
+
+% Contributions
+Our main contributions are:
+\begin{enumerate}
+  \item A formal decomposition of local SGD synchronization into three independent
+    axes with convergence analysis (Section~\ref{sec:method}).
+  \item A system design that exploits PCIe topology awareness and MIMO scheduling
+    for heterogeneous clusters (Section~\ref{sec:system}).
+  \item Comprehensive experiments on 1.3B--7B Llama models showing competitive
+    loss with $\geq$\todo{XX}\% communication reduction (Section~\ref{sec:experiments}).
+\end{enumerate}
+
+% ==================================================================
+\section{Related Work}
+\label{sec:related}
+
+\todo{Related work: 1--1.5 pages covering three areas.}
+
+% --- 2.1 ---
+\paragraph{Local SGD and Communication-Efficient Training.}
+Local SGD~\cite{stich2018local} allows workers to perform multiple local gradient
+steps before averaging, reducing synchronization frequency.  Recent extensions
+include SlowMo~\cite{wang2020slowmo} and DiLoCo~\cite{douillard2023diloco}.
+\desloc{} differs by decomposing the synchronization into parameter and optimizer
+state axes with independent periods.
+
+% --- 2.2 ---
+\paragraph{Heterogeneous Distributed Training.}
+Prior work on heterogeneous training focuses on data-loading imbalance or
+gradient compression.  \todo{Cite and discuss AMP, Gavel, Pollux, Whale.}
+\desloc{} is, to our knowledge, the first framework that combines local SGD
+decomposition with automatic sequence parallelism for heterogeneous clusters.
+
+% --- 2.3 ---
+\paragraph{Sequence Parallelism.}
+Sequence parallelism partitions the sequence dimension across devices to reduce
+activation memory.  Megatron-LM's SP~\cite{korthikanti2023reducing} and
+DeepSpeed-Ulysses~\cite{jacobs2024deepspeed} handle sequence sharding within
+homogeneous settings.  Our \autosp{} extends sequence parallelism to
+heterogeneous topologies with adaptive all-to-all scheduling.
+
+% ==================================================================
+\section{Method: \desloc{}}
+\label{sec:method}
+
+\todo{Method section: 3--4 pages with formal definitions and algorithms.}
+
+% --- 3.1 ---
+\subsection{Decomposed Synchronization}
+\label{sec:method:decomposed}
+
+Standard distributed SGD synchronizes all of $\{x, u, v\}$ (parameters, first
+moment, second moment) every step.  \desloc{} introduces three independent
+synchronization periods:
+\begin{align}
+  \Kx &: \text{parameter averaging period}, \label{eq:kx} \\
+  \Ku &: \text{first-moment synchronization period}, \label{eq:ku} \\
+  \Kv &: \text{second-moment synchronization period}. \label{eq:kv}
+\end{align}
+
+\paragraph{Communication reduction.}
+The communication reduction ratio relative to synchronous AllReduce is:
+\begin{equation}
+  r_{\text{comm}} = \frac{1}{\Kx} + \frac{1}{\Ku} + \frac{1}{\Kv}.
+  \label{eq:comm_ratio}
+\end{equation}
+
+\todo{Add convergence bound theorem and proof sketch.}
+
+\begin{algorithm}[t]
+  \caption{\desloc{} Training Step}
+  \label{alg:desloc}
+  \begin{algorithmic}[1]
+    \REQUIRE Local model $x_i$, optimizer states $(u_i, v_i)$, periods $(\Kx, \Ku, \Kv)$
+    \FOR{$t = 1, 2, \ldots, T$}
+      \STATE Compute local gradient $g_i^t \gets \nabla f_i(x_i^t; \xi_i^t)$
+      \STATE Local optimizer update: $x_i^{t+1}, u_i^{t+1}, v_i^{t+1} \gets \text{AdamW}(x_i^t, g_i^t, u_i^t, v_i^t)$
+      \IF{$t \bmod \Kx = 0$}
+        \STATE $x_i^{t+1} \gets \text{AllReduce}(x_i^{t+1})$ \COMMENT{parameter sync}
+      \ENDIF
+      \IF{$t \bmod \Ku = 0$}
+        \STATE $u_i^{t+1} \gets \text{AllReduce}(u_i^{t+1})$ \COMMENT{first-moment sync}
+      \ENDIF
+      \IF{$t \bmod \Kv = 0$}
+        \STATE $v_i^{t+1} \gets \text{AllReduce}(v_i^{t+1})$ \COMMENT{second-moment sync}
+      \ENDIF
+    \ENDFOR
+  \end{algorithmic}
+\end{algorithm}
+
+% --- 3.2 ---
+\subsection{LOC Cache}
+\label{sec:method:loc_cache}
+
+\todo{Describe LOC Cache mechanism: local optimizer state caching, staleness
+tracking, and correction term.}
+
+Between synchronization rounds, each worker maintains a \emph{LOC Cache} of its
+local optimizer states.  The cache allows workers to proceed with stale
+second-moment estimates while maintaining bounded divergence from the
+synchronized trajectory.
+
+% --- 3.3 ---
+\subsection{\autosp{} Integration}
+\label{sec:method:autosp}
+
+\todo{Describe AutoSP: automatic sequence-parallel partitioning, all-to-all
+scheduling, attention mask sharding.}
+
+\autosp{} profiles each device's available memory and interconnect bandwidth at
+startup, then computes the optimal sequence-parallel split that minimizes the
+maximum per-device memory footprint while respecting communication constraints.
+
+% ==================================================================
+\section{System Design}
+\label{sec:system}
+
+\todo{System section: 2--3 pages with architecture diagrams.}
+
+% --- 4.1 ---
+\subsection{Heterogeneous GPU Tiers}
+\label{sec:system:tiers}
+
+\todo{Describe 3-tier GPU classification: Tier-0 (A100 80GB, NVLink),
+Tier-1 (A100 40GB or A6000, PCIe), Tier-2 (consumer GPUs, PCIe).}
+
+% --- 4.2 ---
+\subsection{PCIe-aware Communication}
+\label{sec:system:pcie}
+
+\todo{Describe topology detection, bandwidth profiling, and communication
+group formation.  How LOC routing adapts AllReduce to PCIe topology.}
+
+% --- 4.3 ---
+\subsection{MIMO Training Loop}
+\label{sec:system:mimo}
+
+\todo{Describe the Multiple-Input Multiple-Output training loop that handles
+asynchronous micro-batch completion across heterogeneous workers.}
+
+% ==================================================================
+\section{Experiments}
+\label{sec:experiments}
+
+\todo{Experiments section: 3--4 pages with tables and figures.}
+
+% --- 5.1 ---
+\subsection{Experimental Setup}
+\label{sec:exp:setup}
+
+\todo{Hardware: describe heterogeneous cluster configuration.
+Software: DeepSpeed fork with DES-LOC.
+Models: Llama 1.3B, 3B, 7B.
+Data: describe pretraining corpus.
+Baselines: standard AllReduce, DiLoCo, homogeneous Local SGD.}
+
+% --- 5.2 ---
+\subsection{Scaling Law Analysis}
+\label{sec:exp:scaling}
+
+\todo{Chinchilla-style scaling curves under heterogeneous DES-LOC.
+Show that loss prediction holds across cluster configurations.}
+
+% --- 5.3 ---
+\subsection{7B Pretraining}
+\label{sec:exp:7b}
+
+\todo{Full 7B pretraining results: loss curves, throughput, communication
+volume.  Comparison with homogeneous baselines on equivalent compute budget.}
+
+% --- 5.4 ---
+\subsection{Ablation Studies}
+\label{sec:exp:ablation}
+
+\todo{Ablation over $\Kx$, $\Ku$, $\Kv$ periods.
+AutoSP on/off comparison.
+LOC Cache contribution.
+PCIe-aware vs. naive communication.}
+
+% ==================================================================
+\section{Conclusion}
+\label{sec:conclusion}
+
+\todo{Conclusion: 0.5--1 page summarizing contributions, limitations,
+and future work.}
+
+We presented \desloc{}, a decomposed local SGD framework for pretraining large
+language models on heterogeneous GPU clusters.  By decoupling parameter and
+optimizer-state synchronization with independent periods $\Kx$, $\Ku$, $\Kv$,
+\desloc{} significantly reduces communication overhead while maintaining
+convergence quality.  Combined with \autosp{} for automatic sequence
+parallelism, our system enables efficient long-context pretraining on
+mixed-generation hardware.
+
+\todo{Discuss limitations: current scale ceiling, potential extensions to
+MoE architectures, and integration with pipeline parallelism.}
+
+% ==================================================================
+% References
+\bibliographystyle{plainnat}
+
+\begin{thebibliography}{10}
+
+\bibitem[Stich(2018)]{stich2018local}
+Sebastian~U. Stich.
+\newblock Local {SGD} converges fast and communicates little.
+\newblock In \emph{ICLR}, 2019.
+
+\bibitem[Wang et~al.(2020)]{wang2020slowmo}
+Jianyu Wang, Vinayak Tantia, Nicolas Ballas, and Michael Rabbat.
+\newblock {SlowMo}: Improving communication-efficient distributed {SGD} with slow momentum.
+\newblock In \emph{ICLR}, 2020.
+
+\bibitem[Douillard et~al.(2023)]{douillard2023diloco}
+Arthur Douillard, Qixuan Feng, Andrei~A. Rusu, Adhiguna Kuncoro, Yani Donchev,
+Rachita Chhaparia, Ionel Gog, Marc'Aurelio Ranzato, Jiajun Shen, and
+Arthur Szlam.
+\newblock {DiLoCo}: Distributed low-communication training of language models.
+\newblock \emph{arXiv preprint arXiv:2311.08105}, 2023.
+
+\bibitem[Korthikanti et~al.(2023)]{korthikanti2023reducing}
+Vijay~Anand Korthikanti, Jared Casper, Sangkug Lym, Lawrence McAfee,
+Michael Andersch, Mohammad Shoeybi, and Bryan Catanzaro.
+\newblock Reducing activation recomputation in large transformer models.
+\newblock In \emph{MLSys}, 2023.
+
+\bibitem[Jacobs et~al.(2024)]{jacobs2024deepspeed}
+Sam~Ade Jacobs, Masahiro Tanaka, Chengming Zhang, Minjia Zhang, Shuaiwen~Leon
+Song, Samyam Rajbhandari, and Yuxiong He.
+\newblock {DeepSpeed-Ulysses}: System optimizations for enabling training of
+  extreme long sequence transformer models.
+\newblock \emph{arXiv preprint arXiv:2309.14509}, 2024.
+
+\end{thebibliography}
+
+% ==================================================================
+% Appendix (optional, for supplementary material)
+\appendix
+\section{Convergence Proof}
+\label{app:convergence}
+\todo{Full convergence proof for decomposed local SGD with independent periods.}
+
+\section{Hyperparameter Details}
+\label{app:hyperparams}
+\todo{Full hyperparameter tables for all experiments.}
+
+\end{document}
