@@ -60,6 +60,7 @@ from deepspeed.runtime.hetero_fp32_grad_accum import (  # noqa: E402
     HeteroFP32GradAccumConfig,
     HeteroFP32GradAccumManager,
 )
+from deepspeed.runtime.hetero_fp32_grad_accum import HeteroFP32GradAccumManager  # noqa: E402,F811
 
 from deepspeed.runtime.hetero_mimo_training_loop import (  # noqa: E402
     HeteroMIMOTrainingLoop,
@@ -1242,6 +1243,11 @@ class DesLocEngine:
             )
             self.hetero_mimo_loop = None
 
+        # Wire the simplified engine-level grad manager (three-tier precision
+        # strategy + PCIe-aware copy).  self.fp32_grad_manager is the primary
+        # handle used inside train() for accumulate() / sync() calls.
+        self.fp32_grad_manager = HeteroFP32GradAccumManager(self)
+
         logger.info("Engine ready. Starting from step %d.", self.global_step)
 
     # ------------------------------------------------------------------
@@ -1339,6 +1345,9 @@ class DesLocEngine:
 
                 # Backward
                 scaled_loss.backward()
+                # Precision alignment: promote BF16 grads to FP32 accumulators
+                # for parameters that require it (three-tier precision policy).
+                self.fp32_grad_manager.accumulate()
                 step_loss += loss.item()
 
             # Synchronize FP32 gradients (scale + all-reduce) across the DP group
@@ -1358,6 +1367,9 @@ class DesLocEngine:
                 _skip_count += 1
                 print(f"[hetero_grad] SKIP step={step} (cumulative skips={_skip_count})")
             else:
+                # Cross-device gradient synchronisation (PCIe-aware all-reduce
+                # across heterogeneous tiers) before the optimizer consumes grads.
+                self.fp32_grad_manager.sync()
                 # Optimizer + scheduler step
                 self.optimizer.step()
                 self.scheduler.step()
