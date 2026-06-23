@@ -118,53 +118,108 @@ DATASET_REGISTRY: Dict[str, Dict] = {
 #   size_hint    : human-readable size for operator reference
 #   splits       : list of HF splits actually used (subset of the full dataset)
 #   description  : one-line purpose summary
+#
+# Optional fields (M1166-M1180):
+#   loader       : "jsonl" → load_commit_dataset()  (default)
+#                  "stackv2" → StackV2CommitAdapter (parquet / HF streaming)
+#   langs        : per-language download list; None = handled inside loader
+#   paper        : arXiv citation
+#   requires_agreement : bool — must accept HF dataset agreement before use
 DATASET_REGISTRY: Dict[str, Dict] = {
     # CommitPackFT — GPT-4-filtered high-quality instruction commits (~2 GB)
+    # (M1166-M1180: primary instruction-tuning source; langs list added)
     "commitpackft": {
-        "hf_repo": "bigcode/commitpackft",
+        "hf_repo":   "bigcode/commitpackft",
         "hf_kwargs": {},
         "local_dir": "commitpackft",
+        "loader":    "jsonl",
+        "langs": [
+            "python", "javascript", "typescript", "java", "go", "rust",
+            "c", "cpp", "ruby", "php", "swift", "kotlin", "scala", "r",
+            "julia", "lua", "haskell", "perl", "shell", "powershell",
+        ],
         "size_hint": "~2 GB",
-        "splits": ["train"],
+        "splits":    ["train"],
         "description": "GPT-4 curated instruction-style commits; primary SFT corpus",
+        "paper":     "OctoPack (arXiv:2308.07124)",
+        "requires_agreement": False,
     },
     # CommitPack — full unfiltered commit archive (~4 TB)
     "commitpack": {
-        "hf_repo": "bigcode/commitpack",
+        "hf_repo":   "bigcode/commitpack",
         "hf_kwargs": {},
         "local_dir": "commitpack",
+        "loader":    "jsonl",
+        "langs":     None,
         "size_hint": "~4 TB",
-        "splits": ["train"],
+        "splits":    ["train"],
         "description": "Full GHArchive-sourced commits; per-language streaming only",
     },
     # StarCoder commits — raw git-commits split (~32 GB)
     # Single-file commits from Google BigQuery public GitHub data.
     # 80 % of samples use a ±32-line context window; 20 % retain full file.
     "starcoderdata": {
-        "hf_repo": "bigcode/starcoderdata",
+        "hf_repo":   "bigcode/starcoderdata",
         "hf_kwargs": {"data_dir": "git-commits"},
         "local_dir": "starcoderdata_commits",
+        "loader":    "jsonl",
+        "langs":     None,
         "size_hint": "~32 GB",
-        "splits": ["train"],
+        "splits":    ["train"],
         "description": "StarCoder raw commit subset; baseline pretraining corpus",
     },
     # StarCoder commits — near-dedup filtered git-commits-cleaned split (~64 GB)
     # Applies MinHash-LSH near-deduplication + exact-dedup on top of git-commits;
     # higher token density and lower repetition → preferred for DES-LOC pretraining.
     "starcoderdata_cleaned": {
-        "hf_repo": "bigcode/starcoderdata",
+        "hf_repo":   "bigcode/starcoderdata",
         "hf_kwargs": {"data_dir": "git-commits-cleaned"},
         "local_dir": "starcoderdata_commits",
+        "loader":    "jsonl",
+        "langs":     None,
         "size_hint": "~64 GB",
-        "splits": ["train"],
+        "splits":    ["train"],
         "description": "StarCoder deduped commit subset (git-commits-cleaned); recommended for pretraining",
+    },
+    # The Stack v2 — PR/commit subset (gated, Software Heritage + GHArchive)
+    # (M1166-M1180: added for large-scale pretraining; uses StackV2CommitAdapter)
+    "the_stack_v2": {
+        "hf_repo":   "bigcode/the-stack-v2",
+        "hf_kwargs": {},
+        "local_dir": "the_stack_v2",
+        # stackv2 loader handles language normalisation internally; langs
+        # entry is informational only (filtering happens inside the adapter)
+        "loader":    "stackv2",
+        "langs":     None,
+        "size_hint": "~900 B tokens (gated)",
+        "splits":    ["train"],
+        "description": (
+            "Stack v2 PR/commit subset; ~900 B tokens; "
+            "dedup by directory_id, PII-scrubbed"
+        ),
+        "paper":     "StarCoder2 (arXiv:2402.19173)",
+        "requires_agreement": True,
     },
 }
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+def get_registry_entry(dataset_name: str) -> Dict:
+    """Return the registry entry for *dataset_name* (raises KeyError if absent).
+
+    Accepts both hyphenated HF-style names (e.g. "the-stack-v2") and the
+    canonical underscore keys stored in DATASET_REGISTRY.
+    """
+    key = dataset_name.replace("-", "_")
+    if key not in DATASET_REGISTRY:
+        available = ", ".join(DATASET_REGISTRY)
+        raise KeyError(
+            f"Unknown dataset '{dataset_name}'. "
+            f"Available: {available}"
+        )
+    return DATASET_REGISTRY[key]
+
+
+
 
 def _build_diff(old: str, new: str) -> str:
     """Minimal unified-diff-like representation from old/new contents."""
@@ -342,8 +397,13 @@ def load_commit_dataset(
     """
     Load commit samples from local JSONL files (original API, unchanged).
 
+    Raises KeyError via get_registry_entry() if *dataset_name* is not in
+    DATASET_REGISTRY, giving callers an early, explicit error rather than a
+    confusing FileNotFoundError deep inside the glob logic.
+
     Args:
-        dataset_name: one of "commitpackft", "starcoderdata_commits", "commitpack"
+        dataset_name: one of the keys in DATASET_REGISTRY (also accepts
+                      hyphenated aliases such as "the-stack-v2")
         lang: language filter (e.g. "python"), None for all
         max_samples: cap on number of samples returned
         data_dir: override base directory
@@ -351,7 +411,15 @@ def load_commit_dataset(
     Yields:
         dict with "text" (formatted for tokenizer) and original fields
     """
-    base = Path(data_dir) if data_dir else DATASETS_DIR / dataset_name
+    # Validate against registry early; KeyError propagates to caller.
+    entry = get_registry_entry(dataset_name)
+    if entry["loader"] != "jsonl":
+        raise ValueError(
+            f"Dataset '{dataset_name}' uses loader='{entry['loader']}', "
+            f"not 'jsonl'. Use StackV2CommitAdapter for the-stack-v2."
+        )
+
+    base = Path(data_dir) if data_dir else DATASETS_DIR / entry["local_dir"]
 
     if not base.exists():
         raise FileNotFoundError(

@@ -230,6 +230,74 @@ ds = load_dataset("bigcode/the-stack-v2", streaming=True, split="train")
 ```
 """)
 print(f"  README saved to {out}/README.md")
+
+# PR/commit streaming download script (requires accepted agreement + HF token)
+with open(f"{out}/stream_pr_commits.py", "w") as f:
+    f.write('''# SPDX-License-Identifier: Apache-2.0
+# DeepSpeed Team
+"""
+Stream The Stack v2 PR/commit subset into DES-LOC pretraining format.
+
+Requires:
+  - huggingface-cli login (accepted agreement on HF Hub)
+  - pip install datasets huggingface_hub pyarrow
+
+Usage:
+    python stream_pr_commits.py --max-samples 50000 --out-dir /data/stackv2_commits
+"""
+import argparse
+import os
+import json
+import sys
+
+# Adapter is in the sibling package
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+from datasets.bigcode.the_stack_v2.stackv2_commits import StackV2CommitAdapter
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Stream Stack v2 PR/commit subset")
+    parser.add_argument("--max-samples", type=int, default=None,
+                        help="Stop after N formatted samples (None = unlimited)")
+    parser.add_argument("--out-dir", type=str, default="stackv2_commits_jsonl",
+                        help="Output directory for per-language JSONL files")
+    parser.add_argument("--hf-token", type=str, default=None,
+                        help="HuggingFace token (defaults to cached login)")
+    parser.add_argument("--no-dedup", action="store_true",
+                        help="Disable directory_id deduplication")
+    parser.add_argument("--split", type=str, default="train")
+    args = parser.parse_args()
+
+    os.makedirs(args.out_dir, exist_ok=True)
+    adapter = StackV2CommitAdapter(dedup=not args.no_dedup)
+    handles = {}
+    count = 0
+
+    print(f"Streaming bigcode/the-stack-v2 ({args.split}) → {args.out_dir}/")
+    for sample in adapter.stream_hf(
+        split=args.split,
+        max_samples=args.max_samples,
+        hf_token=args.hf_token,
+    ):
+        lang = sample.get("lang", "unknown")
+        if lang not in handles:
+            handles[lang] = open(os.path.join(args.out_dir, f"{lang}.jsonl"), "w")
+        handles[lang].write(json.dumps(sample, ensure_ascii=False) + "\\n")
+        count += 1
+        if count % 5000 == 0:
+            print(f"  {count} samples written …")
+
+    for fh in handles.values():
+        fh.close()
+
+    adapter.print_stats()
+    print(f"Done. {count} samples saved to {args.out_dir}/")
+
+
+if __name__ == "__main__":
+    main()
+''')
+print(f"  stream_pr_commits.py saved to {out}/stream_pr_commits.py")
 PY4
 
 echo ""
