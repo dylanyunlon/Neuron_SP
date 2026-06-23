@@ -40,6 +40,18 @@ try:
 except ImportError:
     _HAS_YAML = False
 
+try:
+    import wandb as _wandb
+    _HAS_WANDB = True
+except ImportError:
+    _HAS_WANDB = False
+
+try:
+    from torch.utils.tensorboard import SummaryWriter as _SummaryWriter
+    _HAS_TENSORBOARD = True
+except ImportError:
+    _HAS_TENSORBOARD = False
+
 import torch
 import torch.distributed as dist
 import torch.nn as nn
@@ -571,6 +583,29 @@ def run_standalone(args: argparse.Namespace) -> None:
     t0     = time.time()
     losses: list = []
 
+    # ------------------------------------------------- wandb / tensorboard init
+    _wb_run = None
+    _tb_writer = None
+    if is_main:
+        if getattr(args, "wandb_project", None) and _HAS_WANDB:
+            _wb_run = _wandb.init(
+                project=args.wandb_project,
+                config=vars(args),
+                resume="allow",
+            )
+            logger.info("W&B run initialised: project=%s  run=%s", args.wandb_project, _wb_run.name)
+        elif getattr(args, "wandb_project", None) and not _HAS_WANDB:
+            logger.warning("--wandb-project set but wandb is not installed; skipping W&B logging.")
+
+        if getattr(args, "tensorboard_dir", None) and _HAS_TENSORBOARD:
+            _tb_writer = _SummaryWriter(log_dir=args.tensorboard_dir)
+            logger.info("TensorBoard SummaryWriter initialised: dir=%s", args.tensorboard_dir)
+        elif getattr(args, "tensorboard_dir", None) and not _HAS_TENSORBOARD:
+            logger.warning(
+                "--tensorboard-dir set but torch.utils.tensorboard is not available; "
+                "skipping TensorBoard logging."
+            )
+
     if is_main:
         print(
             f"\n{'step':>6}  {'loss':>9}  {'lr':>10}  {'tok/s':>9}  {'GPU mem':>15}"
@@ -612,10 +647,48 @@ def run_standalone(args: argparse.Namespace) -> None:
             tok_s     = toks_step * args.log_every / max(elapsed, 1e-9)
             cur_lr    = scheduler.get_last_lr()[0]
             mem_str   = _gpu_mem_str(device)
+            step_time = elapsed / args.log_every
+
+            # Compute grad norm (after clip_grad_norm_ has already clipped; re-use last value)
+            grad_norm = sum(
+                p.grad.detach().float().norm() ** 2
+                for p in raw_model.parameters()
+                if p.grad is not None
+            ) ** 0.5
+
+            # GPU memory in GB (allocated)
+            gpu_mem_gb = (
+                torch.cuda.memory_allocated(device) / (1 << 30)
+                if device.type == "cuda" else 0.0
+            )
 
             print(
                 f"{step:>6}  {avg_loss:>9.4f}  {cur_lr:>10.2e}  {tok_s:>9.0f}  {mem_str:>15}"
             )
+
+            # ---- W&B logging ----
+            if _wb_run is not None:
+                _wb_run.log(
+                    {
+                        "train/loss":      avg_loss,
+                        "train/lr":        cur_lr,
+                        "train/grad_norm": grad_norm,
+                        "train/tok_per_s": tok_s,
+                        "train/gpu_mem_gb": gpu_mem_gb,
+                        "train/step_time_s": step_time,
+                    },
+                    step=step,
+                )
+
+            # ---- TensorBoard logging ----
+            if _tb_writer is not None:
+                _tb_writer.add_scalar("train/loss",        avg_loss,    step)
+                _tb_writer.add_scalar("train/lr",          cur_lr,      step)
+                _tb_writer.add_scalar("train/grad_norm",   grad_norm,   step)
+                _tb_writer.add_scalar("train/tok_per_s",   tok_s,       step)
+                _tb_writer.add_scalar("train/gpu_mem_gb",  gpu_mem_gb,  step)
+                _tb_writer.add_scalar("train/step_time_s", step_time,   step)
+
             t0 = time.time()
 
     # Barrier before final stats so all ranks finish together
@@ -636,6 +709,15 @@ def run_standalone(args: argparse.Namespace) -> None:
                 f"Loss did not decrease: initial={initial_10:.4f}, final={final_loss:.4f}"
             )
             logger.info("✅  Loss decreased — training loop verified.")
+
+    # ------------------------------------------- cleanup loggers (rank 0 only)
+    if is_main:
+        if _wb_run is not None:
+            _wb_run.finish()
+            logger.info("W&B run finished.")
+        if _tb_writer is not None:
+            _tb_writer.close()
+            logger.info("TensorBoard writer closed.")
 
     _cleanup_distributed()
 
@@ -772,6 +854,21 @@ def parse_args() -> argparse.Namespace:
             "optimizer states (requires ample host DRAM, e.g. 1.5 TB)."
         ),
     )
+    p.add_argument(
+        "--wandb-project",
+        default=None,
+        metavar="PROJECT",
+        help="Weights & Biases project name. If set, metrics are logged to W&B "
+             "(requires `pip install wandb`). Disabled when omitted.",
+    )
+    p.add_argument(
+        "--tensorboard-dir",
+        default=None,
+        metavar="DIR",
+        help="Directory for TensorBoard SummaryWriter logs. If set, metrics are "
+             "written to this directory (requires `pip install tensorboard`). "
+             "Disabled when omitted.",
+    )
     return p.parse_args()
 
 
@@ -806,6 +903,8 @@ def main() -> None:
         logger.info("  use-desloc : %s", args.use_desloc)
         logger.info("  fsdp       : %s", getattr(args, "fsdp", False))
         logger.info("  world-size : %d", _world)
+        logger.info("  wandb      : %s", args.wandb_project or "(disabled)")
+        logger.info("  tensorboard: %s", args.tensorboard_dir or "(disabled)")
         logger.info("  torch      : %s", torch.__version__)
         if torch.cuda.is_available():
             for i in range(torch.cuda.device_count()):
