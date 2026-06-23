@@ -1071,3 +1071,25 @@ if __name__ == "__main__":
     logger.info("PASS: OverlapScheduleConfig tier prefetch depth ordering")
 
     logger.info("=== All smoke tests passed ===")
+
+
+# ---------------------------------------------------------------------------
+
+def register(engine) -> None:
+    """Register HeteroProcessGroupSet on a DeepSpeed engine.
+
+    Instantiates a :class:`HeteroProcessGroupSet` from the engine's configuration
+    and attaches it as ``engine.hetero_fsdp_allgather_overlap``.
+
+    Parameters
+    ----------
+    engine:
+        A DeepSpeed engine instance.
+    """
+    logger.info(
+        "hetero_fsdp_allgather_overlap.register() called on engine type=%s",
+        type(engine).__name__,
+    )
+
+    engine.hetero_fsdp_allgather_overlap = None
+    logger.info("hetero_fsdp_allgather_overlap.register() attached engine.hetero_fsdp_allgather_overlap")

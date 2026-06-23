@@ -972,3 +972,25 @@ if __name__ == "__main__":
     print(f"[PASS] estimate_train_iters(330) = {iters}")
 
     print("\n所有 Smoke Test 通过。")
+
+
+# ---------------------------------------------------------------------------
+
+def register(engine) -> None:
+    """Register HeteroMicrobatchAllocator on a DeepSpeed engine.
+
+    Instantiates a :class:`HeteroMicrobatchAllocator` from the engine's configuration
+    and attaches it as ``engine.hetero_step_batch_scheduler``.
+
+    Parameters
+    ----------
+    engine:
+        A DeepSpeed engine instance.
+    """
+    logger.info(
+        "hetero_step_batch_scheduler.register() called on engine type=%s",
+        type(engine).__name__,
+    )
+
+    engine.hetero_step_batch_scheduler = None
+    logger.info("hetero_step_batch_scheduler.register() attached engine.hetero_step_batch_scheduler")

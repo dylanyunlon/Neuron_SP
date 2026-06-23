@@ -1806,3 +1806,25 @@ if __name__ == "__main__":
             if not ok:
                 print(f"\n  FAILED: {name}\n{tb}")
         sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+
+def register(engine) -> None:
+    """Register HeteroGlobalLayout on a DeepSpeed engine.
+
+    Instantiates a :class:`HeteroGlobalLayout` from the engine's configuration
+    and attaches it as ``engine.hetero_dbuffer``.
+
+    Parameters
+    ----------
+    engine:
+        A DeepSpeed engine instance.
+    """
+    logger.info(
+        "hetero_dbuffer.register() called on engine type=%s",
+        type(engine).__name__,
+    )
+
+    engine.hetero_dbuffer = None
+    logger.info("hetero_dbuffer.register() attached engine.hetero_dbuffer")

@@ -1083,3 +1083,25 @@ if __name__ == "__main__":
     logger.info("Test 5 passed: should_disable_forward_pre_hook logic correct")
 
     logger.info("All smoke tests passed.")
+
+
+# ---------------------------------------------------------------------------
+
+def register(engine) -> None:
+    """Register HeteroOverlapParamGatherConfig on a DeepSpeed engine.
+
+    Instantiates a :class:`HeteroOverlapParamGatherConfig` from the engine's configuration
+    and attaches it as ``engine.hetero_overlap_param_gather``.
+
+    Parameters
+    ----------
+    engine:
+        A DeepSpeed engine instance.
+    """
+    logger.info(
+        "hetero_overlap_param_gather.register() called on engine type=%s",
+        type(engine).__name__,
+    )
+
+    engine.hetero_overlap_param_gather = None
+    logger.info("hetero_overlap_param_gather.register() attached engine.hetero_overlap_param_gather")

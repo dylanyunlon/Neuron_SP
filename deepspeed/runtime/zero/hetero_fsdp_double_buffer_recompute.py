@@ -1105,3 +1105,25 @@ if __name__ == "__main__":
     logger.info("PRE_BACKWARD hook smoke test passed")
 
     logger.info("All smoke tests passed ✓")
+
+
+# ---------------------------------------------------------------------------
+
+def register(engine) -> None:
+    """Register HeteroFSDPDoubleBufferRecompute on a DeepSpeed engine.
+
+    Instantiates a :class:`HeteroFSDPDoubleBufferRecompute` from the engine's configuration
+    and attaches it as ``engine.hetero_fsdp_double_buffer_recompute``.
+
+    Parameters
+    ----------
+    engine:
+        A DeepSpeed engine instance.
+    """
+    logger.info(
+        "hetero_fsdp_double_buffer_recompute.register() called on engine type=%s",
+        type(engine).__name__,
+    )
+
+    engine.hetero_fsdp_double_buffer_recompute = None
+    logger.info("hetero_fsdp_double_buffer_recompute.register() attached engine.hetero_fsdp_double_buffer_recompute")

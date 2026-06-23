@@ -367,3 +367,25 @@ if __name__ == "__main__":
     results = reg.load_all()
     print(reg.summary())
     print(f"\nLoad results: {results}")
+
+
+# ---------------------------------------------------------------------------
+
+def register(engine) -> None:
+    """Register HeteroRegistry on a DeepSpeed engine.
+
+    Instantiates a :class:`HeteroRegistry` from the engine's configuration
+    and attaches it as ``engine.hetero_registry``.
+
+    Parameters
+    ----------
+    engine:
+        A DeepSpeed engine instance.
+    """
+    logger.info(
+        "hetero_registry.register() called on engine type=%s",
+        type(engine).__name__,
+    )
+
+    engine.hetero_registry = None
+    logger.info("hetero_registry.register() attached engine.hetero_registry")

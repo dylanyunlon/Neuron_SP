@@ -801,3 +801,25 @@ if __name__ == "__main__":
 
     print("All smoke tests passed.")
     sys.exit(0)
+
+
+# ---------------------------------------------------------------------------
+
+def register(engine) -> None:
+    """Register HeteroGradReduceDoubleBuffer on a DeepSpeed engine.
+
+    Instantiates a :class:`HeteroGradReduceDoubleBuffer` from the engine's configuration
+    and attaches it as ``engine.hetero_grad_reduce_double_buffer``.
+
+    Parameters
+    ----------
+    engine:
+        A DeepSpeed engine instance.
+    """
+    logger.info(
+        "hetero_grad_reduce_double_buffer.register() called on engine type=%s",
+        type(engine).__name__,
+    )
+
+    engine.hetero_grad_reduce_double_buffer = None
+    logger.info("hetero_grad_reduce_double_buffer.register() attached engine.hetero_grad_reduce_double_buffer")

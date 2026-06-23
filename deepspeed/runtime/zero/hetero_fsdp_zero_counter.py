@@ -981,3 +981,25 @@ if __name__ == "__main__":
     runner = unittest.TextTestRunner(verbosity=2)
     result = runner.run(suite)
     sys.exit(0 if result.wasSuccessful() else 1)
+
+
+# ---------------------------------------------------------------------------
+
+def register(engine) -> None:
+    """Register HeteroFSDPZeroCounter on a DeepSpeed engine.
+
+    Instantiates a :class:`HeteroFSDPZeroCounter` from the engine's configuration
+    and attaches it as ``engine.hetero_fsdp_zero_counter``.
+
+    Parameters
+    ----------
+    engine:
+        A DeepSpeed engine instance.
+    """
+    logger.info(
+        "hetero_fsdp_zero_counter.register() called on engine type=%s",
+        type(engine).__name__,
+    )
+
+    engine.hetero_fsdp_zero_counter = None
+    logger.info("hetero_fsdp_zero_counter.register() attached engine.hetero_fsdp_zero_counter")

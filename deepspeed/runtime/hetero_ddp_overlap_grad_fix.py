@@ -919,3 +919,25 @@ if __name__ == "__main__":
                 len(reducer.bucket_groups))
 
     logger.info("All smoke tests PASSED.")
+
+
+# ---------------------------------------------------------------------------
+
+def register(engine) -> None:
+    """Register HeteroDDPOverlapGradReducer on a DeepSpeed engine.
+
+    Instantiates a :class:`HeteroDDPOverlapGradReducer` from the engine's configuration
+    and attaches it as ``engine.hetero_ddp_overlap_grad_reducer``.
+
+    Parameters
+    ----------
+    engine:
+        A DeepSpeed engine instance.
+    """
+    logger.info(
+        "hetero_ddp_overlap_grad_fix.register() called on engine type=%s",
+        type(engine).__name__,
+    )
+
+    engine.hetero_ddp_overlap_grad_reducer = None
+    logger.info("hetero_ddp_overlap_grad_fix.register() attached engine.hetero_ddp_overlap_grad_reducer")

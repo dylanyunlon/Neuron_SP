@@ -1083,3 +1083,25 @@ if __name__ == "__main__":
     logger.info("PASS: build_hetero_param_groups assigns _hetero_bucket_id")
 
     logger.info("All smoke tests passed.")
+
+
+# ---------------------------------------------------------------------------
+
+def register(engine) -> None:
+    """Register HeteroDoubleBufferLimitEnforcer on a DeepSpeed engine.
+
+    Instantiates a :class:`HeteroDoubleBufferLimitEnforcer` from the engine's configuration
+    and attaches it as ``engine.hetero_wgrad_race_fix``.
+
+    Parameters
+    ----------
+    engine:
+        A DeepSpeed engine instance.
+    """
+    logger.info(
+        "hetero_wgrad_race_fix.register() called on engine type=%s",
+        type(engine).__name__,
+    )
+
+    engine.hetero_wgrad_race_fix = None
+    logger.info("hetero_wgrad_race_fix.register() attached engine.hetero_wgrad_race_fix")

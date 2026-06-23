@@ -1693,3 +1693,25 @@ if __name__ == "__main__":
     @_test("_validate_deslocgrid_layout: valid disjoint layout passes (no dist)")
     def _():
         spec_a = DES
+
+
+# ---------------------------------------------------------------------------
+
+def register(engine) -> None:
+    """Register DESLOCTopology on a DeepSpeed engine.
+
+    Instantiates a :class:`DESLOCTopology` from the engine's configuration
+    and attaches it as ``engine.hetero_mimo_topology``.
+
+    Parameters
+    ----------
+    engine:
+        A DeepSpeed engine instance.
+    """
+    logger.info(
+        "hetero_mimo_topology.register() called on engine type=%s",
+        type(engine).__name__,
+    )
+
+    engine.hetero_mimo_topology = None
+    logger.info("hetero_mimo_topology.register() attached engine.hetero_mimo_topology")

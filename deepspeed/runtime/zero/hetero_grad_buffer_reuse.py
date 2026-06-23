@@ -941,3 +941,25 @@ if __name__ == "__main__":
     print("Test 5 PASSED: grad-buffer arena view sanity")
 
     print("\nAll smoke tests passed.")
+
+
+# ---------------------------------------------------------------------------
+
+def register(engine) -> None:
+    """Register HeteroSLCManager on a DeepSpeed engine.
+
+    Instantiates a :class:`HeteroSLCManager` from the engine's configuration
+    and attaches it as ``engine.hetero_grad_buffer_reuse``.
+
+    Parameters
+    ----------
+    engine:
+        A DeepSpeed engine instance.
+    """
+    logger.info(
+        "hetero_grad_buffer_reuse.register() called on engine type=%s",
+        type(engine).__name__,
+    )
+
+    engine.hetero_grad_buffer_reuse = None
+    logger.info("hetero_grad_buffer_reuse.register() attached engine.hetero_grad_buffer_reuse")

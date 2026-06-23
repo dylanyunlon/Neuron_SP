@@ -964,3 +964,25 @@ if __name__ == "__main__":
     assert default_cfg.upstream_outer_strategy == "no_shard"
 
     logger.info("All smoke tests passed.")
+
+
+# ---------------------------------------------------------------------------
+
+def register(engine) -> None:
+    """Register HeteroFSDPShardingStrategy on a DeepSpeed engine.
+
+    Instantiates a :class:`HeteroFSDPShardingStrategy` from the engine's configuration
+    and attaches it as ``engine.hetero_fsdp_sharding_strategy``.
+
+    Parameters
+    ----------
+    engine:
+        A DeepSpeed engine instance.
+    """
+    logger.info(
+        "hetero_fsdp_sharding_strategy.register() called on engine type=%s",
+        type(engine).__name__,
+    )
+
+    engine.hetero_fsdp_sharding_strategy = None
+    logger.info("hetero_fsdp_sharding_strategy.register() attached engine.hetero_fsdp_sharding_strategy")

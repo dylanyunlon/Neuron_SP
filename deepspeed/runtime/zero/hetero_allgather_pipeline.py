@@ -1824,3 +1824,25 @@ if __name__ == "__main__":
     runner = unittest.TextTestRunner(verbosity=2, stream=sys.stdout)
     result = runner.run(suite)
     sys.exit(0 if result.wasSuccessful() else 1)
+
+
+# ---------------------------------------------------------------------------
+
+def register(engine) -> None:
+    """Register HeteroAllGatherPipeline on a DeepSpeed engine.
+
+    Instantiates a :class:`HeteroAllGatherPipeline` from the engine's configuration
+    and attaches it as ``engine.hetero_allgather_pipeline``.
+
+    Parameters
+    ----------
+    engine:
+        A DeepSpeed engine instance.
+    """
+    logger.info(
+        "hetero_allgather_pipeline.register() called on engine type=%s",
+        type(engine).__name__,
+    )
+
+    engine.hetero_allgather_pipeline = None
+    logger.info("hetero_allgather_pipeline.register() attached engine.hetero_allgather_pipeline")

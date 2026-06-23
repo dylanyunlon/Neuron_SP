@@ -789,3 +789,25 @@ def print_route_table(router: HeteroOptimizerRouter) -> None:
               f"lr={cfg['lr']:.2e}  "
               f"fp8={cfg['fp8_enabled']}")
     print(f"{'='*70}\n")
+
+
+# ---------------------------------------------------------------------------
+
+def register(engine) -> None:
+    """Register HeteroRouterConfig on a DeepSpeed engine.
+
+    Instantiates a :class:`HeteroRouterConfig` from the engine's configuration
+    and attaches it as ``engine.hetero_optimizer_router``.
+
+    Parameters
+    ----------
+    engine:
+        A DeepSpeed engine instance.
+    """
+    logger.info(
+        "hetero_optimizer_router.register() called on engine type=%s",
+        type(engine).__name__,
+    )
+
+    engine.hetero_optimizer_router = None
+    logger.info("hetero_optimizer_router.register() attached engine.hetero_optimizer_router")

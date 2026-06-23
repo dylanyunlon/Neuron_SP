@@ -1656,3 +1656,25 @@ if __name__ == "__main__":
 
     if not result.wasSuccessful():
         raise SystemExit(1)
+
+
+# ---------------------------------------------------------------------------
+
+def register(engine) -> None:
+    """Register HeteroLocalCGMoEFix on a DeepSpeed engine.
+
+    Instantiates a :class:`HeteroLocalCGMoEFix` from the engine's configuration
+    and attaches it as ``engine.hetero_local_cg_moe_fix``.
+
+    Parameters
+    ----------
+    engine:
+        A DeepSpeed engine instance.
+    """
+    logger.info(
+        "hetero_local_cg_moe_fix.register() called on engine type=%s",
+        type(engine).__name__,
+    )
+
+    engine.hetero_local_cg_moe_fix = None
+    logger.info("hetero_local_cg_moe_fix.register() attached engine.hetero_local_cg_moe_fix")

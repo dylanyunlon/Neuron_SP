@@ -1478,3 +1478,25 @@ if __name__ == "__main__":
     runner = unittest.TextTestRunner(verbosity=2)
     result = runner.run(suite)
     raise SystemExit(0 if result.wasSuccessful() else 1)
+
+
+# ---------------------------------------------------------------------------
+
+def register(engine) -> None:
+    """Register HeteroPostParamSyncManager on a DeepSpeed engine.
+
+    Instantiates a :class:`HeteroPostParamSyncManager` from the engine's configuration
+    and attaches it as ``engine.hetero_fp8_param_gather_eval``.
+
+    Parameters
+    ----------
+    engine:
+        A DeepSpeed engine instance.
+    """
+    logger.info(
+        "hetero_fp8_param_gather_eval.register() called on engine type=%s",
+        type(engine).__name__,
+    )
+
+    engine.hetero_fp8_param_gather_eval = None
+    logger.info("hetero_fp8_param_gather_eval.register() attached engine.hetero_fp8_param_gather_eval")

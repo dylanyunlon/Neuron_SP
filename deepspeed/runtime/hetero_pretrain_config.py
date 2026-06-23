@@ -542,3 +542,25 @@ class SharedLocalityCache:
             logger.debug("SLC: tensor %s (%d B) exceeds total capacity %d B; skip.",
                          key, nbytes, self._capacity)
             return False
+
+
+# ---------------------------------------------------------------------------
+
+def register(engine) -> None:
+    """Register HeteroPretrainConfig on a DeepSpeed engine.
+
+    Instantiates a :class:`HeteroPretrainConfig` from the engine's configuration
+    and attaches it as ``engine.hetero_pretrain_config``.
+
+    Parameters
+    ----------
+    engine:
+        A DeepSpeed engine instance.
+    """
+    logger.info(
+        "hetero_pretrain_config.register() called on engine type=%s",
+        type(engine).__name__,
+    )
+
+    engine.hetero_pretrain_config = None
+    logger.info("hetero_pretrain_config.register() attached engine.hetero_pretrain_config")

@@ -1362,3 +1362,25 @@ if __name__ == "__main__":
     runner = unittest.TextTestRunner(verbosity=2)
     result = runner.run(suite)
     sys.exit(0 if result.wasSuccessful() else 1)
+
+
+# ---------------------------------------------------------------------------
+
+def register(engine) -> None:
+    """Register HeteroProcessGroupCollection on a DeepSpeed engine.
+
+    Instantiates a :class:`HeteroProcessGroupCollection` from the engine's configuration
+    and attaches it as ``engine.hetero_train_step_reductions``.
+
+    Parameters
+    ----------
+    engine:
+        A DeepSpeed engine instance.
+    """
+    logger.info(
+        "hetero_train_step_reductions.register() called on engine type=%s",
+        type(engine).__name__,
+    )
+
+    engine.hetero_train_step_reductions = None
+    logger.info("hetero_train_step_reductions.register() attached engine.hetero_train_step_reductions")

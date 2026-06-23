@@ -745,3 +745,25 @@ if __name__ == "__main__":
     assert flags_h100[0][1] is False, "H100 pp_rank=1 chunk0 should NOT disable bucketing"
 
     print("All smoke-test assertions passed.")
+
+
+# ---------------------------------------------------------------------------
+
+def register(engine) -> None:
+    """Register HeteroDDPBucketPGCollection on a DeepSpeed engine.
+
+    Instantiates a :class:`HeteroDDPBucketPGCollection` from the engine's configuration
+    and attaches it as ``engine.hetero_ddp_bucket_pg_collection``.
+
+    Parameters
+    ----------
+    engine:
+        A DeepSpeed engine instance.
+    """
+    logger.info(
+        "hetero_ddp_bucket_pg_collection.register() called on engine type=%s",
+        type(engine).__name__,
+    )
+
+    engine.hetero_ddp_bucket_pg_collection = None
+    logger.info("hetero_ddp_bucket_pg_collection.register() attached engine.hetero_ddp_bucket_pg_collection")

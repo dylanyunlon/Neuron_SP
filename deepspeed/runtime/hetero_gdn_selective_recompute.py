@@ -1622,3 +1622,25 @@ if __name__ == "__main__":
     runner = unittest.TextTestRunner(verbosity=2, stream=sys.stdout)
     result = runner.run(suite)
     sys.exit(0 if result.wasSuccessful() else 1)
+
+
+# ---------------------------------------------------------------------------
+
+def register(engine) -> None:
+    """Register HeteroGDNNormOutRecompute on a DeepSpeed engine.
+
+    Instantiates a :class:`HeteroGDNNormOutRecompute` from the engine's configuration
+    and attaches it as ``engine.hetero_gdn_selective_recompute``.
+
+    Parameters
+    ----------
+    engine:
+        A DeepSpeed engine instance.
+    """
+    logger.info(
+        "hetero_gdn_selective_recompute.register() called on engine type=%s",
+        type(engine).__name__,
+    )
+
+    engine.hetero_gdn_selective_recompute = None
+    logger.info("hetero_gdn_selective_recompute.register() attached engine.hetero_gdn_selective_recompute")

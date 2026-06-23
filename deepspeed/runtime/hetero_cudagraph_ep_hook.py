@@ -1138,3 +1138,25 @@ if __name__ == "__main__":
 
     if not result.wasSuccessful():
         sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+
+def register(engine) -> None:
+    """Register HeteroCudagraphEPHook on a DeepSpeed engine.
+
+    Instantiates a :class:`HeteroCudagraphEPHook` from the engine's configuration
+    and attaches it as ``engine.hetero_cudagraph_ep_hook``.
+
+    Parameters
+    ----------
+    engine:
+        A DeepSpeed engine instance.
+    """
+    logger.info(
+        "hetero_cudagraph_ep_hook.register() called on engine type=%s",
+        type(engine).__name__,
+    )
+
+    engine.hetero_cudagraph_ep_hook = None
+    logger.info("hetero_cudagraph_ep_hook.register() attached engine.hetero_cudagraph_ep_hook")

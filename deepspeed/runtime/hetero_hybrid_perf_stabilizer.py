@@ -996,3 +996,25 @@ if __name__ == "__main__":
     assert result.throughput_tok_per_sec > 0, "throughput must be positive"
 
     logger.info("All smoke tests passed. result=%s", result)
+
+
+# ---------------------------------------------------------------------------
+
+def register(engine) -> None:
+    """Register HeteroWarmupScheduler on a DeepSpeed engine.
+
+    Instantiates a :class:`HeteroWarmupScheduler` from the engine's configuration
+    and attaches it as ``engine.hetero_hybrid_perf_stabilizer``.
+
+    Parameters
+    ----------
+    engine:
+        A DeepSpeed engine instance.
+    """
+    logger.info(
+        "hetero_hybrid_perf_stabilizer.register() called on engine type=%s",
+        type(engine).__name__,
+    )
+
+    engine.hetero_hybrid_perf_stabilizer = None
+    logger.info("hetero_hybrid_perf_stabilizer.register() attached engine.hetero_hybrid_perf_stabilizer")

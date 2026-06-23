@@ -985,3 +985,25 @@ if __name__ == "__main__":
     assert r2 is False, "Bug-3: duplicate registration should be skipped"
 
     print("All smoke tests passed. DES-LOC MXFP8 fix OK.")
+
+
+# ---------------------------------------------------------------------------
+
+def register(engine) -> None:
+    """Register HeteroPreBackwardCoordinator on a DeepSpeed engine.
+
+    Instantiates a :class:`HeteroPreBackwardCoordinator` from the engine's configuration
+    and attaches it as ``engine.hetero_fsdp_mxfp8_fix``.
+
+    Parameters
+    ----------
+    engine:
+        A DeepSpeed engine instance.
+    """
+    logger.info(
+        "hetero_fsdp_mxfp8_fix.register() called on engine type=%s",
+        type(engine).__name__,
+    )
+
+    engine.hetero_fsdp_mxfp8_fix = None
+    logger.info("hetero_fsdp_mxfp8_fix.register() attached engine.hetero_fsdp_mxfp8_fix")

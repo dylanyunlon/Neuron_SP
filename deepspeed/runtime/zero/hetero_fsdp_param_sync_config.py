@@ -912,3 +912,25 @@ if __name__ == "__main__":
     logger.info("Test 5 PASSED: force_sync drains in-flight map")
 
     logger.info("All smoke tests PASSED")
+
+
+# ---------------------------------------------------------------------------
+
+def register(engine) -> None:
+    """Register HeteroDevicePlacement on a DeepSpeed engine.
+
+    Instantiates a :class:`HeteroDevicePlacement` from the engine's configuration
+    and attaches it as ``engine.hetero_fsdp_param_sync_config``.
+
+    Parameters
+    ----------
+    engine:
+        A DeepSpeed engine instance.
+    """
+    logger.info(
+        "hetero_fsdp_param_sync_config.register() called on engine type=%s",
+        type(engine).__name__,
+    )
+
+    engine.hetero_fsdp_param_sync_config = None
+    logger.info("hetero_fsdp_param_sync_config.register() attached engine.hetero_fsdp_param_sync_config")

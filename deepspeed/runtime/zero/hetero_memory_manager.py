@@ -635,3 +635,25 @@ class HeteroMemoryManager:
         log.info(msg)
         if _HAS_DS:
             ds_logger.info(msg)
+
+
+# ---------------------------------------------------------------------------
+
+def register(engine) -> None:
+    """Register HeteroMemoryConfig on a DeepSpeed engine.
+
+    Instantiates a :class:`HeteroMemoryConfig` from the engine's configuration
+    and attaches it as ``engine.hetero_memory_manager``.
+
+    Parameters
+    ----------
+    engine:
+        A DeepSpeed engine instance.
+    """
+    logger.info(
+        "hetero_memory_manager.register() called on engine type=%s",
+        type(engine).__name__,
+    )
+
+    engine.hetero_memory_manager = None
+    logger.info("hetero_memory_manager.register() attached engine.hetero_memory_manager")

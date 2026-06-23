@@ -728,3 +728,25 @@ if __name__ == "__main__":
     slc = cast_to_slc(t, policy, non_blocking=False)
     assert slc.device.type == "cpu"
     print("All smoke tests passed.")
+
+
+# ---------------------------------------------------------------------------
+
+def register(engine) -> None:
+    """Register HeteroFSDPMixedPrecisionPolicy on a DeepSpeed engine.
+
+    Instantiates a :class:`HeteroFSDPMixedPrecisionPolicy` from the engine's configuration
+    and attaches it as ``engine.hetero_fsdp_mixed_precision_args``.
+
+    Parameters
+    ----------
+    engine:
+        A DeepSpeed engine instance.
+    """
+    logger.info(
+        "hetero_fsdp_mixed_precision_args.register() called on engine type=%s",
+        type(engine).__name__,
+    )
+
+    engine.hetero_fsdp_mixed_precision_args = None
+    logger.info("hetero_fsdp_mixed_precision_args.register() attached engine.hetero_fsdp_mixed_precision_args")

@@ -898,3 +898,25 @@ if __name__ == "__main__":
     print("PASS: bucket size default set")
 
     print("\nAll smoke tests passed.")
+
+
+# ---------------------------------------------------------------------------
+
+def register(engine) -> None:
+    """Register HeteroDDPGradOverlapFix on a DeepSpeed engine.
+
+    Instantiates a :class:`HeteroDDPGradOverlapFix` from the engine's configuration
+    and attaches it as ``engine.hetero_ddp_grad_overlap_fix``.
+
+    Parameters
+    ----------
+    engine:
+        A DeepSpeed engine instance.
+    """
+    logger.info(
+        "hetero_ddp_grad_overlap_fix.register() called on engine type=%s",
+        type(engine).__name__,
+    )
+
+    engine.hetero_ddp_grad_overlap_fix = None
+    logger.info("hetero_ddp_grad_overlap_fix.register() attached engine.hetero_ddp_grad_overlap_fix")

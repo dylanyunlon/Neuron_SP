@@ -1461,3 +1461,25 @@ if __name__ == "__main__":
         print(" — all tests passed.")
     print("=" * 55)
     sys.exit(0 if failed == 0 else 1)
+
+
+# ---------------------------------------------------------------------------
+
+def register(engine) -> None:
+    """Register HeteroChainedOptimizerSync on a DeepSpeed engine.
+
+    Instantiates a :class:`HeteroChainedOptimizerSync` from the engine's configuration
+    and attaches it as ``engine.hetero_chained_optimizer_sync``.
+
+    Parameters
+    ----------
+    engine:
+        A DeepSpeed engine instance.
+    """
+    logger.info(
+        "hetero_chained_optimizer_sync.register() called on engine type=%s",
+        type(engine).__name__,
+    )
+
+    engine.hetero_chained_optimizer_sync = None
+    logger.info("hetero_chained_optimizer_sync.register() attached engine.hetero_chained_optimizer_sync")

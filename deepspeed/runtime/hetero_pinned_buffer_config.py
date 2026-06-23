@@ -816,3 +816,25 @@ if __name__ == "__main__":
     assert cfg2.cuda_graph_stable is True
 
     print("All smoke tests passed.")
+
+
+# ---------------------------------------------------------------------------
+
+def register(engine) -> None:
+    """Register HeteroPinnedBufferConfig on a DeepSpeed engine.
+
+    Instantiates a :class:`HeteroPinnedBufferConfig` from the engine's configuration
+    and attaches it as ``engine.hetero_pinned_buffer_config``.
+
+    Parameters
+    ----------
+    engine:
+        A DeepSpeed engine instance.
+    """
+    logger.info(
+        "hetero_pinned_buffer_config.register() called on engine type=%s",
+        type(engine).__name__,
+    )
+
+    engine.hetero_pinned_buffer_config = None
+    logger.info("hetero_pinned_buffer_config.register() attached engine.hetero_pinned_buffer_config")

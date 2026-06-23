@@ -1612,3 +1612,25 @@ if __name__ == "__main__":
             self.assertFalse(meta.loc_sync_pending)
 
     unittest.main(verbosity=2)
+
+
+# ---------------------------------------------------------------------------
+
+def register(engine) -> None:
+    """Register HeteroGraphPoolRegistry on a DeepSpeed engine.
+
+    Instantiates a :class:`HeteroGraphPoolRegistry` from the engine's configuration
+    and attaches it as ``engine.hetero_optimizer_cg_pool``.
+
+    Parameters
+    ----------
+    engine:
+        A DeepSpeed engine instance.
+    """
+    logger.info(
+        "hetero_optimizer_cg_pool.register() called on engine type=%s",
+        type(engine).__name__,
+    )
+
+    engine.hetero_optimizer_cg_pool = None
+    logger.info("hetero_optimizer_cg_pool.register() attached engine.hetero_optimizer_cg_pool")

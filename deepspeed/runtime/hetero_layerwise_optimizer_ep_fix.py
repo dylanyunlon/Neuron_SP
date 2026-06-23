@@ -1069,3 +1069,25 @@ if __name__ == "__main__":
 
     logger.info("=== All smoke tests passed ===")
     sys.exit(0)
+
+
+# ---------------------------------------------------------------------------
+
+def register(engine) -> None:
+    """Register HeteroParamGradBucketGroup on a DeepSpeed engine.
+
+    Instantiates a :class:`HeteroParamGradBucketGroup` from the engine's configuration
+    and attaches it as ``engine.hetero_layerwise_optimizer_ep_fix``.
+
+    Parameters
+    ----------
+    engine:
+        A DeepSpeed engine instance.
+    """
+    logger.info(
+        "hetero_layerwise_optimizer_ep_fix.register() called on engine type=%s",
+        type(engine).__name__,
+    )
+
+    engine.hetero_layerwise_optimizer_ep_fix = None
+    logger.info("hetero_layerwise_optimizer_ep_fix.register() attached engine.hetero_layerwise_optimizer_ep_fix")

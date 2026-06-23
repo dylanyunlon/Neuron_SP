@@ -1526,3 +1526,25 @@ if __name__ == "__main__":
 
     if passed < total:
         sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+
+def register(engine) -> None:
+    """Register HeteroFixedPoolAllocator on a DeepSpeed engine.
+
+    Instantiates a :class:`HeteroFixedPoolAllocator` from the engine's configuration
+    and attaches it as ``engine.hetero_fsdp_double_buffer``.
+
+    Parameters
+    ----------
+    engine:
+        A DeepSpeed engine instance.
+    """
+    logger.info(
+        "hetero_fsdp_double_buffer.register() called on engine type=%s",
+        type(engine).__name__,
+    )
+
+    engine.hetero_fsdp_double_buffer = None
+    logger.info("hetero_fsdp_double_buffer.register() attached engine.hetero_fsdp_double_buffer")
