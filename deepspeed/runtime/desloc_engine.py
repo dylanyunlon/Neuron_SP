@@ -1333,6 +1333,50 @@ class DesLocEngine:
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        labels: torch.Tensor,
+        num_microbatches: int = 1,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Engine-level forward pass with HeteroRecomputeConfig-aware autocast.
+
+        Wraps ``self.model(input_ids)`` inside device-appropriate autocast and
+        computes the causal-LM cross-entropy loss.  The per-layer selective
+        recompute (applied via ``torch.utils.checkpoint`` in ``__init__``) is
+        transparently active for every block whose device class requires it
+        (A6000 → recompute norm_out; H100/Blackwell → no recompute).
+
+        Parameters
+        ----------
+        input_ids : torch.Tensor
+            Token ids of shape ``(B, T)``.
+        labels : torch.Tensor
+            Target ids of shape ``(B, T)`` (shifted internally).
+        num_microbatches : int
+            Divisor for loss scaling (gradient accumulation).
+
+        Returns
+        -------
+        loss : torch.Tensor
+            Unscaled per-sample cross-entropy loss (for logging).
+        scaled_loss : torch.Tensor
+            ``loss / num_microbatches`` (for ``.backward()``).
+        """
+        with torch.autocast(
+            device_type=self.primary_device.type,
+            dtype=_DEFAULT_DTYPE,
+            enabled=(self.primary_device.type == "cuda"),
+        ):
+            logits: torch.Tensor = self.model(input_ids)
+            B, T, V = logits.shape
+            shift_logits = logits[:, :-1, :].contiguous().reshape(-1, V)
+            shift_labels = labels[:, :T - 1].contiguous().reshape(-1)
+            loss = F.cross_entropy(shift_logits, shift_labels)
+            scaled_loss = loss / num_microbatches
+        return loss, scaled_loss
+
     def train(self) -> None:
         """
         Run the full training loop.
@@ -1454,22 +1498,14 @@ class DesLocEngine:
                         # Use the engine's P2P communicator when the MIMO loop
                         # does not supply one (backward compatibility).
                         _p2p = p2p_communicator if p2p_communicator is not None else _engine_p2p
-                        with torch.autocast(
-                            device_type=self.primary_device.type,
-                            dtype=_DEFAULT_DTYPE,
-                            enabled=(self.primary_device.type == "cuda"),
-                        ):
-                            logits: torch.Tensor = self.model(_ids)
-                            # Cache forward activations in the locality cache so
-                            # that cross-pool backward passes can retrieve them
-                            # without a redundant PCIe round-trip.
-                            _act_key = f"fwd_act:iter={iteration}"
-                            _engine_cache.put(_act_key, logits.detach())
-                            B, T, V = logits.shape
-                            shift_logits = logits[:, :-1, :].contiguous().reshape(-1, V)
-                            shift_labels = _lbl[:, :T - 1].contiguous().reshape(-1)
-                            loss = F.cross_entropy(shift_logits, shift_labels)
-                            scaled_loss = loss / _num_mb
+                        loss, scaled_loss = self.forward(
+                            _ids, _lbl, num_microbatches=_num_mb,
+                        )
+                        # Cache forward activations in the locality cache so
+                        # that cross-pool backward passes can retrieve them
+                        # without a redundant PCIe round-trip.
+                        _act_key = f"fwd_act:iter={iteration}"
+                        _engine_cache.put(_act_key, loss.detach())
                         if not forward_only:
                             scaled_loss.backward()
                         return [loss]
@@ -1492,19 +1528,10 @@ class DesLocEngine:
                     self.fp32_grad_accum_manager.accumulate()
                     step_loss += loss.item()
 
-                    # Forward
-                    with torch.autocast(
-                        device_type=self.primary_device.type,
-                        dtype=_DEFAULT_DTYPE,
-                        enabled=(self.primary_device.type == "cuda"),
-                    ):
-                        logits: torch.Tensor = self.model(input_ids)
-                        # Shift: predict token t+1 from token t
-                        B, T, V = logits.shape
-                        shift_logits = logits[:, :-1, :].contiguous().reshape(-1, V)
-                        shift_labels = labels[:, :T - 1].contiguous().reshape(-1)
-                        loss = F.cross_entropy(shift_logits, shift_labels)
-                        scaled_loss = loss / num_microbatches
+                    # Forward (routes through HeteroRecomputeConfig-aware path)
+                    loss, scaled_loss = self.forward(
+                        input_ids, labels, num_microbatches=num_microbatches,
+                    )
 
                     # Backward
                     scaled_loss.backward()
