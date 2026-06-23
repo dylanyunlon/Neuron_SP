@@ -56,6 +56,11 @@ from deepspeed.runtime.hetero_grad_norm_skip import (  # noqa: E402
     integrate_with_deepspeed_engine,
 )
 
+from deepspeed.runtime.hetero_fp32_grad_accum import (  # noqa: E402
+    HeteroFP32GradAccumConfig,
+    HeteroFP32GradAccumManager,
+)
+
 from datasets.bigcode.commit_packing import (  # noqa: E402
     CommitSequencePacker,
     HeteroBatchSampler,
@@ -1107,6 +1112,50 @@ class DesLocEngine:
                 "per-layer recompute wrapping skipped."
             )
 
+        # --- Phase 8: HeteroFP32GradAccumManager ---
+        # Build a default config: H100 (Tier-0) always accumulates in FP32;
+        # A6000s (Tier-1) follow the LayerNorm/embedding patterns; CPU is FP32.
+        _fp32_config = HeteroFP32GradAccumConfig(
+            param_name_patterns_for_fp32_local_accumulation=(
+                "*.norm*",
+                "*.ln_*",
+                "*.layer_norm*",
+                "embedding*",
+            ),
+            tier0_always_fp32=True,
+            tier1_follow_patterns=True,
+            offload_fp32_grads_to_cpu=False,
+        )
+        # data_parallel_group: use the default process group if distributed is
+        # initialised, otherwise fall back to a single-rank gloo group so the
+        # manager can still be constructed without a real multi-GPU setup.
+        if dist.is_initialized():
+            _dp_group = dist.group.WORLD
+        else:
+            dist.init_process_group(
+                backend="gloo",
+                init_method="env://",
+                world_size=int(os.environ.get("WORLD_SIZE", 1)),
+                rank=int(os.environ.get("RANK", 0)),
+            )
+            _dp_group = dist.group.WORLD
+
+        self.fp32_grad_accum_manager = HeteroFP32GradAccumManager(
+            config=_fp32_config,
+            model=self.model,
+            data_parallel_group=_dp_group,
+            device=self.primary_device,
+            param_dtype=_DEFAULT_DTYPE,
+            grad_dtype=_DEFAULT_DTYPE,
+        )
+        logger.info(
+            "HeteroFP32GradAccumManager wired: selective_fp32=%s, "
+            "offload_to_cpu=%s, device=%s",
+            _fp32_config.has_selective_fp32,
+            _fp32_config.offload_fp32_grads_to_cpu,
+            self.primary_device,
+        )
+
         logger.info("Engine ready. Starting from step %d.", self.global_step)
 
     # ------------------------------------------------------------------
@@ -1159,6 +1208,9 @@ class DesLocEngine:
                 input_ids = input_ids.to(self.primary_device, non_blocking=True)
                 labels = labels.to(self.primary_device, non_blocking=True)
 
+                # Prepare FP32 gradient accumulators for this micro-batch
+                self.fp32_grad_accum_manager.before_backward()
+
                 # Forward
                 with torch.autocast(
                     device_type=self.primary_device.type,
@@ -1176,6 +1228,10 @@ class DesLocEngine:
                 # Backward
                 scaled_loss.backward()
                 step_loss += loss.item()
+
+            # Synchronize FP32 gradients (scale + all-reduce) across the DP group
+            # before gradient clipping and optimizer.step().
+            self.fp32_grad_accum_manager.after_backward(scale=1.0 / num_microbatches)
 
             # Gradient clipping
             gnorm = clip_grad_norm_(self.model.parameters(), cfg.grad_clip)
