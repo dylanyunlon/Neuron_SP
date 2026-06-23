@@ -324,6 +324,10 @@ class LlamaForCausalLM(nn.Module):
         return params
 
 
+# Public alias so callers can use the shorter name
+Llama = LlamaForCausalLM
+
+
 # ---------------------------------------------------------------------------
 # Quick sanity check
 # ---------------------------------------------------------------------------
