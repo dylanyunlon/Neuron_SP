@@ -571,7 +571,43 @@ def run_standalone(args: argparse.Namespace) -> None:
     # ------------------------------------------------------------------ data
     # Each rank uses a different random seed so data batches differ across GPUs,
     # simulating independent data-parallel shards on synthetic data.
-    if args.data_path:
+    if getattr(args, "data_mode", "single") == "blend":
+        # ---- blend mode: read data.sources from YAML and build blended loader ----
+        yaml_cfg = getattr(args, "yaml_cfg", {})
+        sources = yaml_cfg.get("data", {}).get("sources", [])
+        if not sources:
+            raise ValueError(
+                "--data-mode blend requires 'data.sources' list in the YAML config, "
+                "but none was found. Example:\n"
+                "  data:\n"
+                "    sources:\n"
+                "      - {path: data/stack_v2.bin, weight: 0.5}\n"
+                "      - {path: data/commitpack.bin, weight: 0.5}\n"
+            )
+        if is_main:
+            logger.info(
+                "blend mode: loading %d source(s) from data.sources", len(sources)
+            )
+        from data.blend_datasets import build_blended_dataloader  # noqa: PLC0415
+        _blend_loader = build_blended_dataloader(
+            sources=sources,
+            batch_size=args.batch_size,
+            seq_len=args.seq_len,
+        )
+        _blend_iter = iter(_blend_loader)
+
+        def _blend_data_iter():
+            nonlocal _blend_iter
+            while True:
+                try:
+                    x, y = next(_blend_iter)
+                except StopIteration:
+                    _blend_iter = iter(_blend_loader)
+                    x, y = next(_blend_iter)
+                yield x.to(device), y.to(device)
+
+        data = _blend_data_iter()
+    elif args.data_path:
         data = real_data_iter(args.data_path, args.batch_size, args.seq_len, device)
     else:
         # Offset the RNG per rank so each worker draws different tokens
@@ -803,7 +839,36 @@ def run_desloc(args: argparse.Namespace) -> None:
     )
 
     data_iter = None
-    if args.data_path:
+    if getattr(args, "data_mode", "single") == "blend":
+        yaml_cfg = getattr(args, "yaml_cfg", {})
+        sources = yaml_cfg.get("data", {}).get("sources", [])
+        if not sources:
+            raise ValueError(
+                "--data-mode blend requires 'data.sources' list in the YAML config."
+            )
+        logger.info(
+            "blend mode (desloc): loading %d source(s) from data.sources", len(sources)
+        )
+        from data.blend_datasets import build_blended_dataloader  # noqa: PLC0415
+        device_tmp = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        _blend_loader = build_blended_dataloader(
+            sources=sources,
+            batch_size=args.batch_size,
+            seq_len=args.seq_len,
+        )
+        _blend_iter_ref = [iter(_blend_loader)]
+
+        def _blend_desloc_iter():
+            while True:
+                try:
+                    x, y = next(_blend_iter_ref[0])
+                except StopIteration:
+                    _blend_iter_ref[0] = iter(_blend_loader)
+                    x, y = next(_blend_iter_ref[0])
+                yield x.to(device_tmp), y.to(device_tmp)
+
+        data_iter = _blend_desloc_iter()
+    elif args.data_path:
         data_iter = real_data_iter(args.data_path, args.batch_size, args.seq_len, device)
 
     engine = DesLocEngine(config=tc, model=model, data_iter=data_iter)
@@ -923,6 +988,17 @@ def parse_args() -> argparse.Namespace:
         default="checkpoints",
         help="Directory to save checkpoints.",
     )
+    p.add_argument(
+        "--data-mode",
+        choices=["single", "blend"],
+        default="single",
+        help=(
+            "Data loading mode. 'single' (default) reads a flat binary token file "
+            "via --data-path. 'blend' reads a list of weighted sources from the "
+            "YAML config's data.sources field and calls "
+            "data.blend_datasets.build_blended_dataloader()."
+        ),
+    )
     return p.parse_args()
 
 
@@ -954,6 +1030,7 @@ def main() -> None:
         logger.info("  batch-size : %d", args.batch_size)
         logger.info("  seq-len    : %d", args.seq_len)
         logger.info("  data-path  : %s", args.data_path or "(synthetic)")
+        logger.info("  data-mode  : %s", getattr(args, "data_mode", "single"))
         logger.info("  use-desloc : %s", args.use_desloc)
         logger.info("  fsdp       : %s", getattr(args, "fsdp", False))
         logger.info("  world-size : %d", _world)
