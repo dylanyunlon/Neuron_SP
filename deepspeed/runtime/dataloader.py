@@ -121,6 +121,18 @@ class DeepSpeedDataLoader(object):
         # M134: DES-LOC tracked.
         self.post_process_func = None
 
+        # DES-LOC Phase 8 (M1091): HeteroStepBatchScheduler for heterogeneous batch sizing
+        self._hetero_batch_scheduler = None
+        if self.desloc_enabled:
+            try:
+                from deepspeed.runtime.hetero_step_batch_scheduler import HeteroStepBatchScheduler
+                self._hetero_batch_scheduler = HeteroStepBatchScheduler(
+                    base_batch_size=self.batch_size,
+                )
+                logger.info("DES-LOC: HeteroStepBatchScheduler wired into DataLoader")
+            except Exception:
+                pass
+
         if self.dataloader_drop_last:
         # M134: DES-LOC tracked.
             self.len = len(self.data_sampler) // self.batch_size

@@ -4665,6 +4665,21 @@ class DeepSpeedEngine(Module):
             else:
                 print("[M452] no desloc_state in checkpoint — desloc_step stays at 0")
 
+        # DES-LOC Phase 8 (M1106): restore SharedLocalityCache stats for warm restart
+        if self._hetero_mimo_loop is not None and load_path:
+            try:
+                import pickle
+                loc_path = os.path.join(load_path, 'loc_cache_stats.pkl')
+                if os.path.exists(loc_path):
+                    loc_cache = getattr(self._hetero_mimo_loop, 'locality_cache', None)
+                    if loc_cache is not None:
+                        with open(loc_path, 'rb') as f:
+                            stats = pickle.load(f)
+                        loc_cache.restore_stats(stats)
+                        logger.info(f"DES-LOC: LOC cache stats restored from {loc_path}")
+            except Exception as e:
+                logger.warning(f"DES-LOC: LOC cache restore skipped: {e}")
+
         return load_path, client_states
 
     def _load_checkpoint(self,
@@ -5014,6 +5029,20 @@ class DeepSpeedEngine(Module):
             if save_latest and self.global_rank == 0:
                 with open(os.path.join(save_dir, 'latest'), 'w') as fd:
                     fd.write(tag)
+
+        # DES-LOC Phase 8 (M1106): persist SharedLocalityCache stats for warm restart
+        if self._hetero_mimo_loop is not None and rank == 0:
+            try:
+                loc_cache = getattr(self._hetero_mimo_loop, 'locality_cache', None)
+                if loc_cache is not None:
+                    import pickle
+                    loc_path = os.path.join(save_dir, tag, 'loc_cache_stats.pkl')
+                    os.makedirs(os.path.dirname(loc_path), exist_ok=True)
+                    with open(loc_path, 'wb') as f:
+                        pickle.dump(loc_cache.get_stats(), f)
+                    logger.info(f"DES-LOC: LOC cache stats saved to {loc_path}")
+            except Exception as e:
+                logger.warning(f"DES-LOC: LOC cache save skipped: {e}")
 
         dist.barrier()
 
