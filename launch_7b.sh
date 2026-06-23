@@ -1,84 +1,32 @@
 #!/usr/bin/env bash
-# launch_7b.sh — 在 ags1 的 5 张 GPU 上用 DES-LOC 异构引擎启动 7B 预训练
-# 用法: bash launch_7b.sh [--dry-run]
+# launch_7b.sh — ags1 5-GPU DES-LOC 7B pretrain
 set -euo pipefail
+cd "$(cd "$(dirname "$0")" && pwd)"
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-cd "$SCRIPT_DIR"
-
-LOG_DIR="logs"
-mkdir -p "$LOG_DIR"
+mkdir -p logs
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-LOG_FILE="${LOG_DIR}/7b_pretrain_${TIMESTAMP}.log"
+LOG="logs/7b_pretrain_${TIMESTAMP}.log"
 
-# GPU config: all 5 GPUs on ags1
 export CUDA_VISIBLE_DEVICES=0,1,2,3,4
-
-# NUMA binding: GPU0-2 → NUMA0 (cpus 0-63), GPU3-4 → NUMA1 (cpus 64-127)
-# ags1 topology: 2×EPYC 9354 128-core, 2 NUMA nodes
-NUMA0_CPUS="0-63"
-NUMA1_CPUS="64-127"
-
-# NCCL: disable P2P (no NVLink between GPUs), use SHM for intra-node
 export NCCL_P2P_DISABLE=1
-export NCCL_SHM_DISABLE=0
 export NCCL_IB_DISABLE=1
 export NCCL_SOCKET_IFNAME=lo
 export NCCL_DEBUG=WARN
-
-# Torch config
 export OMP_NUM_THREADS=8
 export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
 
-NGPUS=5
-MODEL_SIZE="7b"
-TOTAL_STEPS=100000
-MICRO_BS=1
-SEQ_LEN=2048
-DS_CONFIG="experiments/configs/7b_ags1_desloc.yaml"
+echo "=== Neuron_SP 7B DES-LOC ==="
+echo "Log: $LOG"
 
-echo "=== Neuron_SP 7B Pretrain (DES-LOC) ==="
-echo "GPUs: $CUDA_VISIBLE_DEVICES ($NGPUS)"
-echo "Model: $MODEL_SIZE"
-echo "Config: $DS_CONFIG"
-echo "NUMA: GPU0-2 → node0 ($NUMA0_CPUS), GPU3-4 → node1 ($NUMA1_CPUS)"
-echo "Log: $LOG_FILE"
-echo ""
-
-if [[ "${1:-}" == "--dry-run" ]]; then
-    echo "[DRY RUN] Would execute:"
-    echo "  numactl --cpunodebind=0,1 --membind=0,1 \\"
-    echo "  deepspeed --num_gpus=$NGPUS --master_port=29500 \\"
-    echo "    run_pretrain.py \\"
-    echo "    --deepspeed_config $DS_CONFIG \\"
-    echo "    --model-size $MODEL_SIZE --steps $TOTAL_STEPS \\"
-    echo "    --batch-size $MICRO_BS --seq-len $SEQ_LEN \\"
-    echo "    --use-desloc --gradient-checkpointing"
-    echo ""
-    nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader 2>/dev/null || echo "  (nvidia-smi not available)"
-    exit 0
-fi
-
-echo "Starting DES-LOC training..." | tee "$LOG_FILE"
-
-# DES-LOC: DeepSpeed launcher with NUMA-aware binding
-# GPU0-2 workers bind NUMA0, GPU3-4 workers bind NUMA1
-numactl --cpunodebind=0,1 --membind=0,1 \
-deepspeed \
-    --num_gpus=$NGPUS \
-    --master_port=29500 \
+torchrun --nproc_per_node=5 --master_port=29500 \
     run_pretrain.py \
-    --deepspeed_config "$DS_CONFIG" \
-    --model-size "$MODEL_SIZE" \
-    --steps "$TOTAL_STEPS" \
-    --batch-size "$MICRO_BS" \
-    --seq-len "$SEQ_LEN" \
+    --model-size 7b \
+    --steps 100000 \
+    --batch-size 1 \
+    --seq-len 2048 \
     --use-desloc \
     --gradient-checkpointing \
     --log-every 10 \
     --save-every 500 \
     --checkpoint-dir checkpoints/7b_${TIMESTAMP} \
-    2>&1 | tee -a "$LOG_FILE"
-
-echo "" | tee -a "$LOG_FILE"
-echo "=== Training complete. Log: $LOG_FILE ===" | tee -a "$LOG_FILE"
+    2>&1 | tee "$LOG"
