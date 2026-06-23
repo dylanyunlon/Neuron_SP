@@ -458,7 +458,7 @@ def _compute_grad_norm_fp32(
     total_sq = sum(sq.cpu() for sq in device_sums.values())
 
     if dist.is_available() and dist.is_initialized():
-        total_sq_tensor = total_sq.cuda()
+        total_sq_tensor = total_sq.to(f"cuda:{torch.cuda.current_device()}")
         dist.all_reduce(total_sq_tensor, op=dist.ReduceOp.SUM, group=process_group)
         total_sq = total_sq_tensor.cpu()
 

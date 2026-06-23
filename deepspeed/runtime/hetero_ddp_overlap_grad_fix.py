@@ -906,7 +906,7 @@ if __name__ == "__main__":
     # ── Test 5: build_hetero_ddp_reducer 工厂 ───────────────────────────────
     model = torch.nn.Linear(128, 64)
     if torch.cuda.is_available():
-        model = model.cuda()
+        model = model.to(torch.device(f"cuda:{torch.cuda.current_device()}"))
     reducer = build_hetero_ddp_reducer(
         model=model,
         deepspeed_config={"hetero_ddp": {"num_dist_optimizer_instances": 2,

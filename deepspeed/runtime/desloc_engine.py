@@ -1516,6 +1516,9 @@ class DesLocEngine:
           - Optimizer + scheduler step
           - Periodic logging and checkpointing
         """
+        # Rank guard: only rank 0 prints/logs to avoid 5x log spam
+        _is_main = (not dist.is_initialized()) or (dist.get_rank() == 0)
+
         # Lazy imports (hetero_* not imported at module level to avoid apex dep)
         from deepspeed.runtime.hetero_gdn_selective_recompute import build_neuron_sp_config  # noqa: PLC0415
         from deepspeed.runtime.hetero_grad_norm_skip import (  # noqa: PLC0415
@@ -1698,15 +1701,17 @@ class DesLocEngine:
 
             # HeteroGradNorm skip decision
             _should_skip = _skip_controller.should_skip()
-            print(
-                f"[hetero_grad] step={step} grad_norm={gnorm:.6f} "
-                f"skip={_should_skip} total_skips={_skip_count}"
-            )
+            if _is_main:
+                print(
+                    f"[hetero_grad] step={step} grad_norm={gnorm:.6f} "
+                    f"skip={_should_skip} total_skips={_skip_count}"
+                )
             if self.mimo_loop is None:
                 # Standard path: apply skip logic and step the engine's optimizer
                 if _should_skip:
                     _skip_count += 1
-                    print(f"[hetero_grad] SKIP step={step} (cumulative skips={_skip_count})")
+                    if _is_main:
+                        print(f"[hetero_grad] SKIP step={step} (cumulative skips={_skip_count})")
                 else:
                     # Optimizer + scheduler step
                     self.optimizer.step()
@@ -1720,7 +1725,8 @@ class DesLocEngine:
                     self.fp32_grad_manager.sync()
                 if _should_skip:
                     _skip_count += 1
-                    print(f"[hetero_grad] SKIP step={step} (cumulative skips={_skip_count})")
+                    if _is_main:
+                        print(f"[hetero_grad] SKIP step={step} (cumulative skips={_skip_count})")
                 else:
                     self.scheduler.step()
 
@@ -1910,9 +1916,14 @@ class DesLocEngine:
 
         # ------------------------------------------------------------------
         # Synchronous fallback (also used when hetero config is absent).
+        # Only rank 0 saves to avoid file corruption from concurrent writes.
         # ------------------------------------------------------------------
-        torch.save(payload, path)
-        logger.info("Checkpoint saved: %s (step %d)", path, self.global_step)
+        _is_main_rank = (not dist.is_initialized()) or (dist.get_rank() == 0)
+        if _is_main_rank:
+            torch.save(payload, path)
+            logger.info("Checkpoint saved: %s (step %d)", path, self.global_step)
+        if dist.is_initialized():
+            dist.barrier()  # all ranks wait for rank 0 to finish writing
 
     def load_checkpoint(self, path: Path) -> None:
         """
@@ -2047,7 +2058,11 @@ class DesLocEngine:
         # ------------------------------------------------------------------
         # Accept both a bare .pt file and a directory that contains one.
         pt_file = path if path.suffix == ".pt" else path
-        payload = torch.load(pt_file, map_location=self.primary_device)
+        payload = torch.load(
+            pt_file,
+            map_location=f"cuda:{torch.cuda.current_device()}"
+            if torch.cuda.is_available() else "cpu",
+        )
         self.model.load_state_dict(payload["model_state"])
         self.optimizer.load_state_dict(payload["optimizer_state"])
         self.scheduler.load_state_dict(payload["scheduler_state"])
