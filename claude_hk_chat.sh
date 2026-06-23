@@ -23,7 +23,7 @@ if [ ! -f "$RAW_CURL" ]; then
     exit 1
 fi
 
-COOKIE=$(grep -oP "(?<=-b 'share-session=1hflpc6f3gsw90djg8exc61e9g5jr95q; ajs_anonymous_id=claudeai.v1.fd38ff3a-6fa9-4bb4-8b45-3d502873bd1f; user-sidebar-visible-on-load=true; CH-prefers-color-scheme=light; user-sidebar-pinned=false; lastActiveOrg=2ec8e60d-f0c6-456e-971d-735ec9e61e70; _dd_s=aid=1f0fa0af-44f1-4b2f-8054-15dc64a41176&rum=2&id=152ec09d-ba3a-437f-920f-cbbeaff40d6e&created=1782197873615&expire=1782199218823']*" "$RAW_CURL" || echo "")
+COOKIE=$(grep -oP "(?<=-b ')[^']*" "$RAW_CURL" | head -1 || echo "")
 ORG_ID=$(grep -oP 'organizations/\K[^/]+' "$RAW_CURL" | head -1)
 ORIGIN=$(grep -oP "(?<=-H 'origin: )[^']+" "$RAW_CURL" | head -1 || echo "https://claude.hk.cn")
 UA=$(grep -oP "(?<=-H 'user-agent: )[^']+" "$RAW_CURL" | head -1 || echo "Mozilla/5.0")
@@ -72,7 +72,7 @@ if [ -n "${CONV_ID:-}" ]; then
 else
     CREATE_RESP=$(curl -s -X POST "${ORIGIN}/api/organizations/${ORG_ID}/chat_conversations" \
         -H "Content-Type: application/json" -H "origin: ${ORIGIN}" "${COMMON_H[@]}" -b "$COOKIE" \
-        --data-raw '{"name":"","model":"claude-opus-4-6","is_temporary":false}' 2>/dev/null)
+        --data-raw '{"name":"","model":"claude-sonnet-4-6","is_temporary":false}' 2>/dev/null)
     CONV_ID=$(echo "$CREATE_RESP" | python3 -c "import sys,json; print(json.load(sys.stdin).get('uuid',''))" 2>/dev/null || echo "")
     if [ -z "$CONV_ID" ]; then
         echo "ERROR: Create conversation failed: ${CREATE_RESP:0:300}"; exit 1
@@ -87,7 +87,7 @@ curl -s -N "${ORIGIN}/api/organizations/${ORG_ID}/chat_conversations/${CONV_ID}/
     -H "accept: text/event-stream" -H "content-type: application/json" \
     -H "origin: ${ORIGIN}" "${COMMON_H[@]}" -b "$COOKIE" \
     --data-raw "{
-        \"prompt\":${ESCAPED_PROMPT},\"timezone\":\"Asia/Shanghai\",\"model\":\"claude-opus-4-6\",
+        \"prompt\":${ESCAPED_PROMPT},\"timezone\":\"Asia/Shanghai\",\"model\":\"claude-sonnet-4-6\",
         \"effort\":\"medium\",\"thinking_mode\":\"off\",
         \"tools\":[{\"type\":\"repl_v0\",\"name\":\"repl\"}],
         \"turn_message_uuids\":{\"human_message_uuid\":\"${HUMAN_UUID}\",\"assistant_message_uuid\":\"${ASST_UUID}\"},
