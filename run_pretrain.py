@@ -443,7 +443,11 @@ def _init_distributed() -> Tuple[int, int, bool]:
 
     if is_dist:
         if not dist.is_initialized():
-            dist.init_process_group(backend="nccl", init_method="env://")
+            import datetime as _dt
+            dist.init_process_group(
+                backend="nccl", init_method="env://",
+                timeout=_dt.timedelta(minutes=30),
+            )
         torch.cuda.set_device(local_rank)
         logger.info(
             "torch.distributed initialised: rank=%d / world_size=%d  local_rank=%d",
@@ -803,7 +807,11 @@ def run_desloc(args: argparse.Namespace) -> None:
     # Distributed init (torchrun sets env vars but we must call init ourselves)
     import torch.distributed as _dist
     if not _dist.is_initialized() and "RANK" in os.environ:
-        _dist.init_process_group(backend="nccl", init_method="env://")
+        import datetime as _dt
+        _dist.init_process_group(
+            backend="nccl", init_method="env://",
+            timeout=_dt.timedelta(minutes=30),  # PCIe heterogeneous: slow ranks need time
+        )
 
     cfg = _MODEL_CONFIGS[args.model_size]
 

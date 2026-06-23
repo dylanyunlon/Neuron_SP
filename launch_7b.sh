@@ -15,8 +15,12 @@ export NCCL_P2P_DISABLE=1
 export NCCL_IB_DISABLE=1
 export NCCL_SOCKET_IFNAME=lo
 export NCCL_DEBUG=WARN
+# 30min timeout: H100 finishes 20x faster than A6000, slow rank needs time
+export NCCL_TIMEOUT=1800000
 export OMP_NUM_THREADS=8
 export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
+# A6000 48GB is tight — reduce fragmentation
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,max_split_size_mb:256
 
 EXTRA_ARGS=("$@")
 

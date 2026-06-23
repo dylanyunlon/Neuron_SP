@@ -31,7 +31,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.cuda.amp import GradScaler
+# GradScaler removed — BF16 does not need loss scaling
 from torch.nn.utils import clip_grad_norm_
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
@@ -1604,8 +1604,9 @@ class DesLocEngine:
                         cache_key=f"labels:step={step}:micro={micro}",
                     )
                 else:
-                    input_ids = input_ids.to(self.primary_device, non_blocking=True)
-                    labels = labels.to(self.primary_device, non_blocking=True)
+                    _local_dev = torch.device(f"cuda:{torch.cuda.current_device()}")
+                    input_ids = input_ids.to(_local_dev, non_blocking=True)
+                    labels = labels.to(_local_dev, non_blocking=True)
 
                 if self.mimo_loop is not None:
                     # Use HeteroMIMOTrainingLoop.step(batch) — wires
@@ -1672,6 +1673,17 @@ class DesLocEngine:
                     step_loss += loss.item()
 
             if self.mimo_loop is None:
+                # NaN/Inf guard — heterogeneous precision can produce NaN
+                if not math.isfinite(step_loss):
+                    _nan_count = getattr(self, '_nan_count', 0) + 1
+                    self._nan_count = _nan_count
+                    logger.warning(
+                        "NaN/Inf loss at step %d (count=%d), skipping optimizer update",
+                        step, _nan_count,
+                    )
+                    self.optimizer.zero_grad(set_to_none=True)
+                    continue  # skip to next step
+
                 # Synchronize FP32 gradients (scale + all-reduce) across the DP group
                 # before gradient clipping and optimizer.step().
                 if self.fp32_grad_manager is not None:
@@ -1995,8 +2007,9 @@ class DesLocEngine:
                     # loader may have placed them on H100 or A6000 depending
                     # on SM routing.  load_state_dict expects them on the same
                     # device as the model.
+                    _ckpt_dev = torch.device(f"cuda:{torch.cuda.current_device()}")
                     model_state_cpu = {
-                        k: (v.to(self.primary_device) if isinstance(v, torch.Tensor) else v)
+                        k: (v.to(_ckpt_dev) if isinstance(v, torch.Tensor) else v)
                         for k, v in model_state.items()
                     }
                     self.model.load_state_dict(model_state_cpu, strict=cfg.dist_ckpt_strictness.value != "raise_all")
