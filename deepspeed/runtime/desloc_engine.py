@@ -87,6 +87,7 @@ from datasets.bigcode.commit_packing import (  # noqa: E402
     CommitSequencePacker,
     HeteroBatchSampler,
     PackedSequence,
+    compute_packing_stats,
 )
 
 from deepspeed.runtime.hetero_mimo_training_loop import (  # noqa: E402
@@ -865,6 +866,8 @@ class DesLocEngine:
         config: TrainingConfig with all hyperparameters.
         model: Optional pre-built nn.Module. If None, MiniTransformer is used.
         data_iter: Optional data iterator. If None, synthetic data is used.
+        tokenizer: Optional HF tokenizer for CommitSequencePacker. When None
+            the packer falls back to a word-split approximation.
     """
 
     def __init__(
@@ -872,8 +875,10 @@ class DesLocEngine:
         config: TrainingConfig,
         model: Optional[nn.Module] = None,
         data_iter: Optional[Iterator] = None,
+        tokenizer: Optional[Any] = None,
     ) -> None:
         self.config = config
+        self.tokenizer = tokenizer
         self._setup_logging()
 
         logger.info("=" * 70)
@@ -966,7 +971,7 @@ class DesLocEngine:
                 } if self.tiers else {0: 96}
 
                 packer = CommitSequencePacker(
-                    tokenizer=None,
+                    tokenizer=self.tokenizer,
                     seq_len=config.seq_len,
                     pad_token_id=0,
                 )
@@ -976,6 +981,18 @@ class DesLocEngine:
                     "(seq_len=%d, gpu_mem_map=%s).",
                     len(packed_seqs), config.seq_len, gpu_mem_map,
                 )
+
+                # Log packing efficiency so regressions are caught early.
+                pack_stats = compute_packing_stats(packed_seqs)
+                if pack_stats:
+                    logger.info(
+                        "Packing stats: padding_ratio=%.4f, meets_5pct=%s, "
+                        "commits_packed=%d, avg_commits/seq=%.1f",
+                        pack_stats["padding_ratio"],
+                        pack_stats["meets_5pct_target"],
+                        pack_stats["commits_packed"],
+                        pack_stats["avg_commits_per_seq"],
+                    )
 
                 hetero_sampler = HeteroBatchSampler(
                     sequences=packed_seqs,
@@ -991,7 +1008,6 @@ class DesLocEngine:
                 def _packed_iter(
                     sampler: HeteroBatchSampler,
                     primary_idx: int,
-                    seq_len: int,
                     device: torch.device,
                 ) -> Iterator[Tuple[torch.Tensor, torch.Tensor]]:
                     # Cycle the sampler indefinitely so training never exhausts data.
@@ -1013,7 +1029,7 @@ class DesLocEngine:
                     else 0
                 )
                 self.data_iter = _packed_iter(
-                    hetero_sampler, _primary_idx, config.seq_len, self.primary_device
+                    hetero_sampler, _primary_idx, self.primary_device
                 )
                 logger.info(
                     "HeteroBatchSampler wired: %d steps/epoch, "
