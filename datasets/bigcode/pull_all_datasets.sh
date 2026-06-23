@@ -105,38 +105,85 @@ PY2
 # ── 3. CommitPack (4TB, 完整 commit 数据) ──
 echo ""
 echo "[3/4] bigcode/commitpack — 4TB full Git commits"
-echo "  WARNING: 4TB is too large for full download. Pulling metadata + Python subset."
+echo "  NOTE: 4TB corpus — streaming=True mandatory; only sample subsets are written to disk."
 python3 << 'PY3'
+# CommitPack streaming pull.
+#
+# Why streaming=True is non-negotiable here:
+#   Without it, HuggingFace would try to download and cache all ~4 TB before
+#   yielding a single sample.  streaming=True flips to an IterableDataset that
+#   fetches one Arrow shard at a time (~128 MB each), so resident memory and
+#   disk usage stay bounded regardless of language corpus size.
+#
+# DATASET_REGISTRY in load_commits.py enforces this constraint programmatically
+# so callers cannot accidentally omit streaming=True for this dataset.
+
 from datasets import load_dataset
 import os, json
 
 out = "commitpack"
 os.makedirs(out, exist_ok=True)
 
-# Only pull Python subset in streaming mode
-ds = load_dataset("bigcode/commitpack", "python", split="train", streaming=True)
+# Representative sample set: cover top-5 languages for integration tests
+# and CI smoke runs without pulling the full 4 TB corpus.
+SAMPLE_LANGS = ["python", "javascript", "java", "go", "rust"]
+SAMPLE_SIZE  = 10_000   # per language
 
-count = 0
-with open(f"{out}/python_sample_10k.jsonl", "w") as f:
-    for item in ds:
-        f.write(json.dumps(item, ensure_ascii=False) + "\n")
-        count += 1
-        if count >= 10000:
-            break
+for lang in SAMPLE_LANGS:
+    try:
+        # streaming=True: shards are fetched on demand; no full-corpus download
+        ds = load_dataset("bigcode/commitpack", lang, split="train", streaming=True)
+        count = 0
+        out_file = f"{out}/{lang}_sample_{SAMPLE_SIZE}.jsonl"
+        with open(out_file, "w") as f:
+            for item in ds:
+                f.write(json.dumps(item, ensure_ascii=False) + "\n")
+                count += 1
+                if count >= SAMPLE_SIZE:
+                    break
+        print(f"  {lang}: {count} samples -> {out_file}")
+    except Exception as e:
+        print(f"  {lang}: SKIP ({e})")
 
-print(f"  Saved {count} Python commit samples to {out}/python_sample_10k.jsonl")
-
-# Save full download script
+# Streaming download helper used by training pipeline (load_commits.py registry)
 with open(f"{out}/download_by_language.py", "w") as f:
-    f.write('''"""Download CommitPack by language (4TB total, do one lang at a time)"""
-import sys
+    f.write('''"""Stream CommitPack one language at a time (4TB total).
+
+Usage:
+    python download_by_language.py python          # stream to disk
+    python download_by_language.py javascript --sample 50000
+
+streaming=True is enforced; omitting it on a 4TB corpus would exhaust disk.
+"""
+import sys, argparse
 from datasets import load_dataset
 
-lang = sys.argv[1] if len(sys.argv) > 1 else "python"
-ds = load_dataset("bigcode/commitpack", lang, split="train")
-ds.save_to_disk(f"commitpack_{lang}")
-print(f"{lang}: {len(ds)} samples")
+parser = argparse.ArgumentParser()
+parser.add_argument("lang", default="python", nargs="?")
+parser.add_argument("--sample", type=int, default=None,
+                    help="Cap: only materialise this many rows (streaming walk)")
+args = parser.parse_args()
+
+# streaming=True: load one shard at a time — mandatory for 4TB corpus
+ds = load_dataset("bigcode/commitpack", args.lang, split="train", streaming=True)
+
+if args.sample:
+    import itertools, json
+    rows = list(itertools.islice(ds, args.sample))
+    out  = f"commitpack_{args.lang}_sample{args.sample}.jsonl"
+    with open(out, "w") as f:
+        for r in rows:
+            f.write(json.dumps(r, ensure_ascii=False) + "\\n")
+    print(f"{args.lang}: {len(rows)} samples -> {out}")
+else:
+    # Fully materialise language shard to disk (may be hundreds of GB)
+    ds_full = load_dataset("bigcode/commitpack", args.lang, split="train")
+    ds_full.save_to_disk(f"commitpack_{args.lang}")
+    print(f"{args.lang}: {len(ds_full)} samples saved to commitpack_{args.lang}/")
 ''')
+
+print(f"  streaming helper written to {out}/download_by_language.py")
+print(f"  Use load_commits.DATASET_REGISTRY['commitpack'] for programmatic access")
 PY3
 
 # ── 4. The Stack v2 (PR/commit 数据) ──

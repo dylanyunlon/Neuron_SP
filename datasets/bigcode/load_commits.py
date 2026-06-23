@@ -62,6 +62,46 @@ SPAN_CORRUPT_FORMAT = (
 
 DATASETS_DIR = Path(__file__).parent
 
+# ---------------------------------------------------------------------------
+# Dataset registry
+# ---------------------------------------------------------------------------
+
+# Each entry declares how a dataset should be loaded from HuggingFace Hub.
+# ``streaming=True`` is mandatory for multi-TB datasets (commitpack) to avoid
+# downloading the full corpus before iteration begins — the iterator fetches
+# shards on demand, keeping memory footprint bounded to a single shard at a
+# time instead of the entire 4 TB.
+DATASET_REGISTRY: Dict[str, Dict] = {
+    "commitpackft": {
+        "hf_id": "bigcode/commitpackft",
+        "streaming": False,    # 2 GB — full download is practical
+        "split": "train",
+        "config_field": "lang",  # load_dataset 2nd positional arg
+        "local_subdir": "commitpackft",
+        "description": "CommitPackFT: 2 GB GPT-4-filtered high-quality commits",
+    },
+    "starcoderdata_commits": {
+        "hf_id": "bigcode/starcoderdata",
+        "streaming": True,     # 32 GB subset — stream to avoid OOM
+        "split": "train",
+        "hf_kwargs": {"data_dir": "git-commits"},
+        "local_subdir": "starcoderdata_commits",
+        "description": "StarCoder git-commits: ~32 GB subset of starcoderdata",
+    },
+    "commitpack": {
+        "hf_id": "bigcode/commitpack",
+        # 4 TB corpus: streaming is the only viable access pattern.
+        # Loading without streaming=True would attempt to materialise all
+        # ~1.45 billion commits (≈4 TB) before yielding any sample, which
+        # exhausts disk on any practical machine.
+        "streaming": True,
+        "split": "train",
+        "config_field": "lang",  # one language config per load_dataset call
+        "local_subdir": "commitpack",
+        "description": "CommitPack: 4 TB full GHArchive Git commits (streaming only)",
+    },
+}
+
 
 # ---------------------------------------------------------------------------
 # Dataset registry
@@ -224,6 +264,69 @@ def _format_span_corrupt(sample: Dict,
         message=msg,
         targets=result["targets"],
     )
+
+
+def load_from_hub(
+    dataset_name: str = "commitpack",
+    lang: Optional[str] = "python",
+    max_samples: Optional[int] = None,
+) -> Iterator[Dict[str, str]]:
+    """
+    Stream commit samples directly from HuggingFace Hub using DATASET_REGISTRY.
+
+    For ``commitpack`` (4 TB) the registry enforces ``streaming=True`` so that
+    shards are fetched lazily — one Arrow record batch at a time — rather than
+    materialising the entire corpus on disk first.  This keeps resident memory
+    proportional to a single shard (typically ~128 MB) regardless of the
+    total dataset size.
+
+    Args:
+        dataset_name: registry key, e.g. ``"commitpack"``, ``"commitpackft"``.
+        lang: language config passed as the second positional argument to
+              ``load_dataset`` when the registry entry has ``config_field``.
+        max_samples: optional hard cap on yielded samples.
+
+    Yields:
+        dict with ``"text"`` (tokenizer-ready), ``"_source"``, and all
+        original HuggingFace dataset fields.
+
+    Raises:
+        KeyError:  ``dataset_name`` not in ``DATASET_REGISTRY``.
+        ImportError: ``datasets`` package not installed.
+    """
+    try:
+        from datasets import load_dataset as hf_load  # type: ignore
+    except ImportError as exc:
+        raise ImportError("pip install datasets  # required for load_from_hub") from exc
+
+    if dataset_name not in DATASET_REGISTRY:
+        raise KeyError(
+            f"Unknown dataset '{dataset_name}'. "
+            f"Available: {list(DATASET_REGISTRY.keys())}"
+        )
+
+    entry = DATASET_REGISTRY[dataset_name]
+    hf_id = entry["hf_id"]
+    streaming = entry.get("streaming", False)
+    split = entry.get("split", "train")
+    extra_kwargs = dict(entry.get("hf_kwargs", {}))
+
+    # Language-scoped config (commitpack / commitpackft pass lang as config)
+    positional_config = lang if (lang and entry.get("config_field")) else None
+
+    if positional_config:
+        ds = hf_load(hf_id, positional_config, split=split, streaming=streaming, **extra_kwargs)
+    else:
+        ds = hf_load(hf_id, split=split, streaming=streaming, **extra_kwargs)
+
+    count = 0
+    for sample in ds:
+        if max_samples and count >= max_samples:
+            return
+        sample["text"] = _format_commit(sample)
+        sample["_source"] = dataset_name
+        yield sample
+        count += 1
 
 
 # ---------------------------------------------------------------------------

@@ -32,6 +32,8 @@ bash pull_all_datasets.sh    # 在 ags1 上执行
 - **来源**: GHArchive 元数据 + GitHub API 逐个爬取代码变更
 - **格式**: 同 CommitPackFT，但未经质量筛选
 - **覆盖**: 截至 2016 年的 1.45 亿个唯一 commit
+- **加载模式**: `streaming=True` 强制 — 4TB 语料不可全量落盘，每次拉取一个 Arrow shard (~128 MB)
+- **DATASET_REGISTRY 条目**: `load_commits.DATASET_REGISTRY["commitpack"]`，`config_field="lang"` 按语言分片
 - **HF**: https://huggingface.co/datasets/bigcode/commitpack
 - **论文**: OctoPack (arXiv:2308.07124)
 
@@ -49,7 +51,8 @@ bash pull_all_datasets.sh    # 在 ags1 上执行
 |------|-----------|------|
 | 预训练 (code) | StarCoder commits (32GB) | 规模适中，已过滤，直接可用 |
 | 指令微调 | CommitPackFT (2GB) | 高质量，GPT-4 筛选，格式规整 |
-| 大规模预训练 | The Stack v2 | 需要 HF 协议，但覆盖最全 |
+| 大规模预训练 | CommitPack (4TB, streaming) | `DATASET_REGISTRY["commitpack"]` 强制 streaming=True，按语言分片迭代 |
+| 全量预训练语料 | The Stack v2 | 需要 HF 协议，但覆盖最全 |
 | 消融实验 | CommitPackFT Python subset | 小而精，快速迭代 |
 
 ---
@@ -119,6 +122,6 @@ python datasets/bigcode/the_stack_v2/megatron_indexed.py --dummy --output /tmp/t
 |--------|------|------|---------------|------|
 | StarCoder commits (raw) | 32 GB | BigQuery | `bigcode/starcoderdata` (data_dir="git-commits") | 预训练 code diff |
 | StarCoder commits (cleaned) | 64 GB | BigQuery + near-dedup | `bigcode/starcoderdata` (data_dir="git-commits-cleaned") | 预训练主语料（推荐）|
-| CommitPack | 4 TB | GHArchive + GitHub API 爬取 | `bigcode/commitpack` | 大规模预训练 |
+| CommitPack | 4 TB | GHArchive + GitHub API 爬取 | `bigcode/commitpack` | 大规模预训练 (streaming=True, DATASET_REGISTRY 注册) |
 | CommitPackFT | 2 GB (高质量子集) | GPT-4 筛选 | `bigcode/commitpackft` | 指令微调 |
 | The Stack v2 (PR/commit) | 未公开总量 | GHArchive + Software Heritage | `bigcode/the-stack-v2` | 全量预训练语料 (M761-M775 适配完成) |
