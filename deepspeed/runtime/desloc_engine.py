@@ -292,20 +292,70 @@ class HeteroRegistry:
 
         logger.info("HeteroRegistry: discovered %d hetero_* modules.", found)
 
-    def register_hooks(self, engine: "DesLocEngine") -> None:
+    def register_hooks(self, engine: "DesLocEngine") -> int:
         """
-        Call each discovered module's register(engine) hook if present.
+        Activate every discovered hetero_* module against the engine.
 
-        Args:
-            engine: The DesLocEngine instance to pass to each hook.
+        Two activation paths are supported:
+          1. Preferred — the module exposes a top-level ``register(engine)``
+             function which is invoked directly.
+          2. Fallback  — the module has no ``register()`` hook, in which case
+             its primary ``Hetero*`` class is attached to the engine under
+             ``_hetero_mod_<module_name>`` so it can be retrieved later via
+             the registry.  This ensures even passive extension modules are
+             discoverable from the engine instance.
+
+        Returns:
+            The number of modules that were successfully activated
+            (either via register() or via the fallback path).
         """
+        activated = 0
         for key, mod in self._modules.items():
-            if callable(getattr(mod, "register", None)):
+            if key in self._hooks:
+                # Already registered in a previous pass — skip to make this
+                # method idempotent when called multiple times during init.
+                continue
+
+            register_fn = getattr(mod, "register", None)
+            if callable(register_fn):
                 try:
-                    mod.register(engine)
+                    register_fn(engine)
+                    self._hooks[key] = mod
+                    activated += 1
                     logger.debug("Hook registered from module: %s", key)
+                    continue
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("Hook registration failed for %s: %s", key, exc)
+
+            # Fallback: no register() — discover the primary Hetero* class
+            # via the module's public names and attach it to the engine.
+            primary_cls = None
+            for attr_name in getattr(mod, "__all__", None) or dir(mod):
+                if not attr_name.startswith("Hetero") or "Config" in attr_name:
+                    continue
+                candidate = getattr(mod, attr_name, None)
+                if isinstance(candidate, type) and candidate.__module__ == mod.__name__:
+                    primary_cls = (attr_name, candidate)
+                    break
+
+            if primary_cls is not None:
+                attr_name, cls = primary_cls
+                short = mod.__name__.rsplit(".", 1)[-1]
+                engine_attr = f"_hetero_mod_{short}"
+                if not hasattr(engine, engine_attr):
+                    setattr(engine, engine_attr, cls)
+                self._hooks[key] = mod
+                activated += 1
+                logger.debug(
+                    "Hook fallback for %s: attached %s as engine.%s",
+                    key, attr_name, engine_attr,
+                )
+
+        logger.info(
+            "HeteroRegistry: activated %d/%d hetero_* modules on engine.",
+            activated, len(self._modules),
+        )
+        return activated
 
     def get(self, name: str) -> Optional[Any]:
         """Retrieve a registered module by its registry name."""
@@ -903,8 +953,11 @@ class DesLocEngine:
         # --- Phase 2: Registry ---
         self.registry = HeteroRegistry()
         self.registry.discover()
-        self.registry.register_hooks(self)
-        logger.info("HeteroRegistry loaded %d modules.", len(self.registry))
+        _initial_hooks = self.registry.register_hooks(self)
+        logger.info(
+            "HeteroRegistry loaded %d modules; %d hooks activated.",
+            len(self.registry), _initial_hooks,
+        )
 
         # --- Phase 3: Partition plan ---
         solver = PartitionSolver(self.tiers, config)
@@ -1329,6 +1382,27 @@ class DesLocEngine:
                 _mimo_exc,
             )
             self.mimo_loop = None
+
+        # --- Phase 10: Final hetero hook activation ---
+        # Re-run register_hooks() now that all phases have completed.  Some
+        # hetero_*.py modules are imported lazily by later phases (e.g. the
+        # MIMO training loop in Phase 9c) and therefore only become available
+        # to the registry after Phase 2.  This second pass picks up any
+        # modules that were missed and attaches their hooks/primary classes
+        # to the engine instance.  ``register_hooks`` is idempotent, so
+        # already-registered modules are skipped.
+        try:
+            self.registry.discover()
+            activated = self.registry.register_hooks(self)
+            logger.info(
+                "HeteroRegistry: final pass activated %d hooks on engine.",
+                activated,
+            )
+        except Exception as _reg_exc:  # noqa: BLE001
+            logger.warning(
+                "HeteroRegistry final register_hooks() pass failed: %s",
+                _reg_exc,
+            )
 
     # ------------------------------------------------------------------
     # Public API
