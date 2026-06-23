@@ -23,7 +23,7 @@ if [ ! -f "$RAW_CURL" ]; then
     exit 1
 fi
 
-COOKIE=$(grep -oP "(?<=-b ')[^']*" "$RAW_CURL" || echo "")
+COOKIE=$(grep -oP "(?<=-b 'share-session=1hflpc6f3gsw90djg8exc61e9g5jr95q; ajs_anonymous_id=claudeai.v1.fd38ff3a-6fa9-4bb4-8b45-3d502873bd1f; user-sidebar-visible-on-load=true; CH-prefers-color-scheme=light; user-sidebar-pinned=false; lastActiveOrg=2ec8e60d-f0c6-456e-971d-735ec9e61e70; _dd_s=aid=1f0fa0af-44f1-4b2f-8054-15dc64a41176&rum=2&id=152ec09d-ba3a-437f-920f-cbbeaff40d6e&created=1782197873615&expire=1782199218823']*" "$RAW_CURL" || echo "")
 ORG_ID=$(grep -oP 'organizations/\K[^/]+' "$RAW_CURL" | head -1)
 ORIGIN=$(grep -oP "(?<=-H 'origin: )[^']+" "$RAW_CURL" | head -1 || echo "https://claude.hk.cn")
 UA=$(grep -oP "(?<=-H 'user-agent: )[^']+" "$RAW_CURL" | head -1 || echo "Mozilla/5.0")
