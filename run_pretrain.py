@@ -818,7 +818,9 @@ def run_desloc(args: argparse.Namespace) -> None:
         eval_every      = 0,
     )
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    torch.cuda.set_device(local_rank)
+    device = torch.device(f"cuda:{local_rank}")
 
     # Build the LlamaModel and pass it in (DesLocEngine wraps it)
     dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
