@@ -61,6 +61,11 @@ from deepspeed.runtime.hetero_fp32_grad_accum import (  # noqa: E402
     HeteroFP32GradAccumManager,
 )
 
+from deepspeed.runtime.hetero_mimo_training_loop import (  # noqa: E402
+    HeteroMIMOTrainingLoop,
+    setup_hetero_mimo_training,
+)
+
 from deepspeed.checkpoint.hetero_checkpoint_config import (  # noqa: E402
     HeteroCheckpointConfig,
     TierRole,
@@ -1216,6 +1221,27 @@ class DesLocEngine:
             self.primary_device,
         )
 
+        # --- Phase 9: Hetero MIMO training loop bootstrap ---
+        # Build the DES-LOC heterogeneous MIMO training loop (device registry,
+        # locality cache, P2P communicator, optimizer router, schedule groups)
+        # so that DesLocEngine.train() can dispatch micro-batches through it.
+        # Failures here must not break legacy single-GPU training paths, so the
+        # call is wrapped defensively and the loop falls back to None.
+        try:
+            self.hetero_mimo_loop: Optional[HeteroMIMOTrainingLoop] = (
+                setup_hetero_mimo_training(self.model)
+            )
+            logger.info(
+                "HeteroMIMOTrainingLoop initialized via setup_hetero_mimo_training()."
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning(
+                "setup_hetero_mimo_training() failed (%s); continuing without "
+                "MIMO loop. Heterogeneous dispatch will degrade to single-device.",
+                exc,
+            )
+            self.hetero_mimo_loop = None
+
         logger.info("Engine ready. Starting from step %d.", self.global_step)
 
     # ------------------------------------------------------------------
@@ -1235,6 +1261,32 @@ class DesLocEngine:
         self.model.train()
         logger.info("Training start: %d steps, grad_accum=%d",
                     cfg.total_steps, self.grad_accum)
+
+        # --- Neuron_SP: build / refresh heterogeneous recompute config ---
+        # Recompute policy may depend on the current device topology; rebuild
+        # the config here so that train() always picks up the latest mapping.
+        # The per-layer torch.utils.checkpoint wrapping is applied in __init__,
+        # but we keep the live config attached to the model for downstream
+        # modules (e.g. HeteroGDNNormOutRecompute) that query it at runtime.
+        recompute_config = build_neuron_sp_config()
+        self.neuron_sp_config = recompute_config
+        try:
+            self.model.neuron_sp_recompute_config = recompute_config  # type: ignore[attr-defined]
+        except Exception:  # pragma: no cover - some models forbid attr assignment
+            pass
+        logger.info(
+            "Neuron_SP recompute config applied to model "
+            "(granularity=%s, attention=%s).",
+            recompute_config.granularity,
+            recompute_config.attention_variant,
+        )
+
+        # Drive any iteration-level hooks exposed by the MIMO loop (if available).
+        if getattr(self, "hetero_mimo_loop", None) is not None:
+            logger.info(
+                "Training loop will coordinate with HeteroMIMOTrainingLoop "
+                "(P2P + LOC cache active)."
+            )
 
         # Wire HeteroGradNormSkipController into this engine.
         _hetero_config = HeteroGradNormConfig()
