@@ -209,28 +209,211 @@ maximum per-device memory footprint while respecting communication constraints.
 \section{System Design}
 \label{sec:system}
 
-\todo{System section: 2--3 pages with architecture diagrams.}
+We now describe the system architecture that realizes \desloc{} on commodity
+heterogeneous hardware.  The design targets a cluster composed of mixed-generation
+GPUs interconnected exclusively over PCIe (no NVLink), with a large CPU DRAM pool
+serving as a shared locality cache.  Three subsystems cooperate: (i) a runtime
+device classifier that assigns each GPU to a functional \emph{tier}, (ii) a
+topology-aware communication layer that adapts collective strategies to the PCIe
+fabric, and (iii) a Multiple-Input Multiple-Output (MIMO) training loop that
+orchestrates asynchronous micro-batch processing across heterogeneous workers.
 
 % --- 4.1 ---
 \subsection{Heterogeneous GPU Tiers}
 \label{sec:system:tiers}
 
-\todo{Describe 3-tier GPU classification: Tier-0 (A100 80GB, NVLink),
-Tier-1 (A100 40GB or A6000, PCIe), Tier-2 (consumer GPUs, PCIe).}
+At initialization, \desloc{} probes each visible CUDA device and classifies it
+into one of three \texttt{TierClass} categories based on SM architecture version
+and physical memory capacity:
+
+\begin{table}[h]
+\centering
+\small
+\caption{GPU tier classification in \desloc{}.  All devices connect via PCIe;
+no NVLink is assumed.}
+\label{tab:tiers}
+\begin{tabular}{lccccc}
+\toprule
+\textbf{Tier} & \textbf{GPU} & \textbf{VRAM} & \textbf{SM Arch} & \textbf{PCIe Gen} & \textbf{BF16 TFLOPS} \\
+\midrule
+A6000         & RTX A6000              & 48\,GB  & SM86 (Ampere)    & Gen4 $\times$16 & 38.7 \\
+H100          & H100 NVL               & 94\,GB  & SM90 (Hopper)    & Gen5 $\times$16 & 835  \\
+RTX PRO 6000 BW & RTX PRO 6000 Blackwell & 96\,GB  & SM120 (Blackwell) & Gen5 $\times$16 & $\sim$300 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The classification rule is intentionally coarse-grained: SM major version
+$\geq12$ with $\geq90$\,GB memory maps to the Blackwell tier, SM9 with
+$\geq80$\,GB maps to H100, and SM8.6 with $\geq40$\,GB maps to A6000.  Unknown
+devices fall back to a conservative default.  Each \texttt{TierSpec} record
+additionally stores the NUMA node affinity, estimated PCIe bandwidth (queried
+via \texttt{nvidia-smi}), and a BF16 peak throughput estimate.
+
+\paragraph{Functional role assignment.}
+Tiers are mapped to three functional roles that govern how the \desloc{} engine
+places model layers, sizes micro-batches, and schedules communication:
+
+\begin{itemize}
+  \item \textbf{Compute tier} (H100, RTX PRO 6000 BW): Devices with the highest
+    BF16 throughput host the bulk of transformer attention layers, which benefit
+    from FP8 tensor cores and large HBM capacity.  The compute tier receives
+    $2\times$ the gradient accumulation steps relative to the memory tier,
+    absorbing proportionally more training work per synchronization round.
+  \item \textbf{Memory tier} (A6000): Devices with moderate compute but
+    sufficient VRAM host feed-forward projections, layer normalization, and
+    output head layers whose memory footprint fits within 48\,GB.  Two A6000
+    devices operate as a data-parallel pair for these layers.
+  \item \textbf{Bandwidth tier} (host CPU DRAM, 1.5\,TB): A shared locality
+    cache backed by CPU memory serves as a staging area for cross-tier activation
+    transfers and as overflow storage for optimizer states when GPU memory is
+    exhausted.  The bandwidth tier is not a GPU tier per se, but participates in
+    the communication topology as a relay for large tensors crossing NUMA
+    boundaries.
+\end{itemize}
+
+This tier-to-role mapping is encoded in the \texttt{PartitionPlan} dataclass,
+which the engine's partition solver computes at startup by jointly optimizing
+estimated throughput and memory balance across tiers.
 
 % --- 4.2 ---
 \subsection{PCIe-aware Communication}
 \label{sec:system:pcie}
 
-\todo{Describe topology detection, bandwidth profiling, and communication
-group formation.  How LOC routing adapts AllReduce to PCIe topology.}
+A defining characteristic of our target hardware is the absence of NVLink:
+all inter-GPU communication traverses the PCIe fabric.  This introduces
+bandwidth asymmetries that conventional AllReduce implementations do not
+account for.
+
+\paragraph{Topology discovery.}
+At process group creation time, \desloc{} queries the PCI bus topology through
+\texttt{/sys/bus/pci/devices/.../numa\_node} for each CUDA device to determine
+NUMA affinity.  Devices sharing a NUMA node communicate through a PCIe switch
+with near-peak bandwidth; devices on different NUMA nodes traverse the inter-socket
+link (typically QPI/UPI) with substantially reduced throughput.  Concretely, our
+measurements show the following effective bidirectional bandwidths:
+
+\begin{table}[h]
+\centering
+\small
+\caption{Measured PCIe bidirectional bandwidth between GPU pairs in the
+\desloc{} cluster.  NODE = same NUMA node; SYS = cross-NUMA.}
+\label{tab:pcie_bw}
+\begin{tabular}{lcc}
+\toprule
+\textbf{Link} & \textbf{Affinity} & \textbf{Bandwidth} \\
+\midrule
+A6000 $\leftrightarrow$ A6000 & NODE & $\sim$60\,GB/s \\
+H100 $\leftrightarrow$ H100   & NODE & $\sim$128\,GB/s \\
+A6000 $\leftrightarrow$ H100  & SYS  & $\sim$8--16\,GB/s \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The $8\times$ bandwidth gap between intra-NUMA and cross-NUMA paths is the
+central constraint that shapes \desloc{}'s communication strategy.
+
+\paragraph{\texttt{PCIeP2PCommunicator} and strategy selection.}
+For point-to-point activation transfers between tiers, \desloc{} employs a
+\texttt{PCIeP2PCommunicator} that selects among three transfer strategies based
+on tensor size and device locality:
+
+\begin{enumerate}
+  \item \textbf{Direct copy} (intra-NUMA, any tensor size): When source and
+    destination GPUs share a NUMA node, the transfer proceeds as a standard
+    \texttt{cudaMemcpyDeviceToDevice} through the PCIe switch.  This matches the
+    fast path of conventional P2P communication.
+  \item \textbf{CPU-staged transfer} (cross-NUMA, tensor $\geq$ 64\,MB): For
+    large activations crossing NUMA boundaries, direct GPU-to-GPU copy would
+    stall at the 8\,GB/s bottleneck.  Instead, the communicator stages through
+    CPU DRAM: the source GPU writes to a pinned host buffer at its local PCIe
+    bandwidth, and the destination GPU reads from the same buffer at its own
+    local PCIe bandwidth.  Because the two PCIe links operate in parallel, this
+    achieves up to $2\times$ the throughput of a serial cross-NUMA copy.
+  \item \textbf{Direct copy} (cross-NUMA, tensor $<$ 64\,MB): Small tensors
+    incur negligible absolute transfer time; the staging overhead would dominate.
+    These proceed as direct device-to-device copies.
+\end{enumerate}
+
+\paragraph{Collective communication.}
+For gradient AllReduce, NCCL automatically selects between ring and tree
+algorithms based on the detected PCIe topology.  \desloc{} augments this by
+constructing NUMA-aware process subgroups: intra-NUMA AllReduce runs first
+within each NUMA node's device subgroup (at full PCIe bandwidth), followed by
+a single cross-NUMA reduction of the partial results.  This \emph{segmented
+overlap} strategy---implemented in the \texttt{TopoAwareBridge}---reduces the
+volume traversing the slow inter-NUMA link from $O(n)$ individual transfers to
+a single aggregated exchange, halving cross-NUMA traffic relative to a naive
+flat AllReduce.
+
+The topology-aware bridge integrates with \desloc{}'s decomposed
+synchronization: parameter averaging (period $\Kx$) uses the segmented strategy
+for cross-tier groups, while optimizer state synchronization (periods $\Ku$,
+$\Kv$) can be deferred entirely until local steps accumulate, further amortizing
+the cross-NUMA cost.
 
 % --- 4.3 ---
 \subsection{MIMO Training Loop}
 \label{sec:system:mimo}
 
-\todo{Describe the Multiple-Input Multiple-Output training loop that handles
-asynchronous micro-batch completion across heterogeneous workers.}
+The Multiple-Input Multiple-Output (MIMO) training loop coordinates the
+forward-backward-optimizer cycle across heterogeneous devices that may complete
+micro-batches at different rates due to compute asymmetry.
+
+\paragraph{Per-module optimizer dispatch.}
+Because different model layers reside on different GPU tiers with distinct
+compute and memory profiles, \desloc{} assigns per-module optimizers through a
+\texttt{HeteroOptimizerRouter}.  Transformer attention layers on the compute
+tier (H100/Blackwell) receive one optimizer configuration (e.g., higher learning
+rate scaling, FP8-aware weight updates), while feed-forward and normalization
+layers on the memory tier (A6000) receive another.  This per-module dispatch
+mirrors the MIMO optimizer pattern but adapts it to device-class-aware
+hyperparameter routing rather than model-architecture-aware routing.
+
+\paragraph{Cross-tier activation handoff.}
+When a forward pass produces an activation on one tier that is consumed by a
+layer on a different tier, the \texttt{PCIeP2PCommunicator} handles the
+transfer.  A \texttt{SharedLocalityCache} backed by CPU DRAM persists
+activations across iterations: if the activation for a given (stage,
+micro-batch) key is already resident in the cache from a prior iteration, the
+transfer is elided entirely.  This caching mechanism converts the otherwise
+expensive cross-NUMA activation relay into a cache lookup on subsequent
+iterations, amortizing the PCIe cost.
+
+\paragraph{Training step structure.}
+Each MIMO training step proceeds as follows:
+\begin{enumerate}
+  \item \textbf{Zero gradients} across all per-module optimizers.
+  \item \textbf{Forward + backward} via a pluggable
+    \texttt{forward\_backward\_func} callable that receives the
+    \texttt{PCIeP2PCommunicator} and \texttt{HeteroScheduleGroups} as arguments,
+    enabling the forward-backward schedule to issue topology-aware transfers at
+    stage boundaries.
+  \item \textbf{Gradient clipping + optimizer step}: Gradient norms are computed
+    per module and clipped independently before each per-module optimizer steps.
+    The compute tier processes $2\times$ the gradient accumulation steps of the
+    memory tier, absorbing the compute imbalance.
+  \item \textbf{Cache write-back}: Updated parameter signatures are written to
+    the \texttt{SharedLocalityCache} so the next iteration can warm-start
+    cross-tier transfers.
+  \item \textbf{Decomposed synchronization}: At intervals determined by $\Kx$,
+    $\Ku$, $\Kv$, the relevant tensors are synchronized across tiers using the
+    topology-aware collective described in Section~\ref{sec:system:pcie}.
+\end{enumerate}
+
+\paragraph{Straggler mitigation.}
+Because the A6000 ($\sim$38.7 BF16 TFLOPS) is roughly $22\times$ slower in raw
+throughput than the H100 ($\sim$835 TFLOPS), naive synchronous execution would
+idle the faster device.  \desloc{} addresses this through two mechanisms:
+(i) the memory tier processes smaller micro-batches with fewer gradient
+accumulation steps, so its wall-clock time per synchronization round
+approximates that of the compute tier; and (ii) the MIMO scheduler pipelines
+the compute tier's next micro-batch forward pass concurrently with the memory
+tier's backward pass, overlapping compute across tiers on independent CUDA
+streams.  The \texttt{HeteroScheduleGroups} data structure records which
+execution phase (forward, backward, offload) each device participates in at
+each time step, enabling the engine to issue non-blocking cross-phase
+communication.
 
 % ==================================================================
 \section{Experiments}
