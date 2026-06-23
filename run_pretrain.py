@@ -6,12 +6,15 @@ run_pretrain.py — Neuron_SP pretraining entry point
 Direct entry point for ags1: python run_pretrain.py
 
 Supports:
-  --model-size  7b / 1b / 70m   (default: 7b)
-  --data-path   /path/to/data   (default: synthetic)
-  --steps       N               (default: 100)
-  --batch-size  N               (default: 2)
-  --seq-len     N               (default: 2048)
-  --log-every   N               (default: 10)
+  --config      configs/7b_commitpack.yaml   (YAML config file, optional)
+  --model-size  7b / 1b / 70m               (default: 7b; override YAML)
+  --data-path   /path/to/data               (default: synthetic; override YAML)
+  --steps       N                           (default: 100; override YAML)
+  --batch-size  N                           (default: 2; override YAML)
+  --seq-len     N                           (default: 2048; override YAML)
+  --log-every   N                           (default: 10; override YAML)
+
+Config priority: explicit CLI flags > YAML file > built-in defaults.
 
 Import discipline:
   - NO `import deepspeed` (avoids apex/op_builder init chain)
@@ -28,7 +31,13 @@ import os
 import sys
 import time
 from pathlib import Path
-from typing import Dict, Iterator, Optional, Tuple
+from typing import Any, Dict, Iterator, Optional, Tuple
+
+try:
+    import yaml as _yaml  # PyYAML
+    _HAS_YAML = True
+except ImportError:
+    _HAS_YAML = False
 
 import torch
 import torch.distributed as dist
@@ -47,6 +56,99 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 logger = logging.getLogger("run_pretrain")
+
+# ---------------------------------------------------------------------------
+# YAML config loader
+# ---------------------------------------------------------------------------
+
+def _load_yaml_config(path: str) -> Dict[str, Any]:
+    """
+    Load a YAML config file and return it as a nested dict.
+
+    Requires PyYAML (``pip install pyyaml``).  Raises RuntimeError when the
+    file exists but PyYAML is unavailable so the user gets a clear error
+    instead of a silent no-op.
+    """
+    config_path = Path(path)
+    if not config_path.exists():
+        raise FileNotFoundError(f"Config file not found: {config_path}")
+    if not _HAS_YAML:
+        raise RuntimeError(
+            f"PyYAML is required to read '{config_path}'.  "
+            "Install it with:  pip install pyyaml"
+        )
+    with config_path.open("r") as fh:
+        cfg = _yaml.safe_load(fh)
+    if cfg is None:
+        cfg = {}
+    logger.info("Loaded config from %s", config_path)
+    return cfg
+
+
+def _apply_yaml_config(args: argparse.Namespace, cfg: Dict[str, Any]) -> argparse.Namespace:
+    """
+    Merge YAML config values into *args*, giving CLI flags priority.
+
+    Only the keys that map to existing argparse attributes are applied; unknown
+    YAML sections (e.g. ``parallelism``, ``nccl``) are silently ignored here
+    but remain accessible via the returned ``args.yaml_cfg`` attribute for
+    downstream consumers such as DesLocEngine.
+
+    Mapping (YAML path → argparse attribute):
+        model.size           → model_size
+        model.vocab_size     → (stored in yaml_cfg only; overrides _MODEL_CONFIGS at runtime)
+        training.steps       → steps
+        training.micro_batch_size → batch_size
+        training.seq_len     / model.seq_len → seq_len
+        logging.log_every    → log_every
+        data.path            → data_path   (CLI --data-path takes priority)
+        desloc.enabled       → use_desloc
+    """
+    # Attach the raw cfg for optional downstream inspection
+    args.yaml_cfg = cfg
+
+    # Helper: read a dotted path from nested dict, return default if missing
+    def _get(section: str, key: str, default: Any = None) -> Any:
+        return cfg.get(section, {}).get(key, default)
+
+    # model.size / --model-size
+    if _get("model", "size") is not None:
+        if "--model-size" not in sys.argv and "-model-size" not in sys.argv:
+            args.model_size = _get("model", "size")
+
+    # training.steps / --steps
+    if _get("training", "steps") is not None:
+        if "--steps" not in sys.argv:
+            args.steps = int(_get("training", "steps"))
+
+    # training.micro_batch_size / --batch-size
+    if _get("training", "micro_batch_size") is not None:
+        if "--batch-size" not in sys.argv:
+            args.batch_size = int(_get("training", "micro_batch_size"))
+
+    # model.seq_len or training.seq_len / --seq-len
+    seq_len_val = _get("model", "seq_len") or _get("training", "seq_len")
+    if seq_len_val is not None:
+        if "--seq-len" not in sys.argv:
+            args.seq_len = int(seq_len_val)
+
+    # logging.log_every / --log-every
+    if _get("logging", "log_every") is not None:
+        if "--log-every" not in sys.argv:
+            args.log_every = int(_get("logging", "log_every"))
+
+    # data.path / --data-path
+    if _get("data", "path") is not None:
+        if "--data-path" not in sys.argv:
+            args.data_path = _get("data", "path")
+
+    # desloc.enabled / --use-desloc
+    if _get("desloc", "enabled") is not None:
+        if "--use-desloc" not in sys.argv:
+            args.use_desloc = bool(_get("desloc", "enabled"))
+
+    return args
+
 
 # ---------------------------------------------------------------------------
 # Targeted import — bypass deepspeed.__init__ entirely
@@ -535,6 +637,13 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument(
+        "--config",
+        default=None,
+        metavar="YAML",
+        help="Path to a YAML config file (e.g. configs/7b_commitpack.yaml). "
+             "Values in the file act as defaults; explicit CLI flags override them.",
+    )
+    p.add_argument(
         "--model-size",
         choices=list(_MODEL_CONFIGS.keys()),
         default="7b",
@@ -589,12 +698,22 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
 
+    # ------------------------------------------------------------------
+    # YAML config: load file first, then let explicit CLI flags override
+    # ------------------------------------------------------------------
+    if args.config is not None:
+        yaml_cfg = _load_yaml_config(args.config)
+        args = _apply_yaml_config(args, yaml_cfg)
+    else:
+        args.yaml_cfg = {}
+
     # Only rank 0 prints the startup banner (avoids duplicate output under torchrun)
     _rank  = int(os.environ.get("RANK",       "0"))
     _world = int(os.environ.get("WORLD_SIZE", "1"))
     if _rank == 0:
         logger.info("=" * 60)
         logger.info("Neuron_SP run_pretrain.py")
+        logger.info("  config     : %s", args.config or "(none — CLI only)")
         logger.info("  model-size : %s  (%s)", args.model_size, _MODEL_CONFIGS[args.model_size])
         logger.info("  steps      : %d", args.steps)
         logger.info("  batch-size : %d", args.batch_size)

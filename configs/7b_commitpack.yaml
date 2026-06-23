@@ -1,0 +1,139 @@
+# =============================================================================
+# configs/7b_commitpack.yaml
+# 7B CommitPack pretraining — full configuration for ags1 cluster
+#
+# Hardware target:
+#   GPU0: RTX A6000  48 GB  SM8.6  PCIe4  38.7 TFLOPS(BF16)  NUMA0
+#   GPU1: RTX A6000  48 GB  SM8.6  PCIe4  38.7 TFLOPS(BF16)  NUMA0
+#   GPU2: H100 NVL   96 GB  SM9.0  PCIe5  835  TFLOPS(BF16)  NUMA1
+#
+# Invoke:
+#   python run_pretrain.py --config configs/7b_commitpack.yaml
+#   python run_pretrain.py --config configs/7b_commitpack.yaml --data-path /data/commits
+# CLI flags override any value set here.
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Model architecture
+# ---------------------------------------------------------------------------
+model:
+  size: "7b"                   # preset key in _MODEL_CONFIGS; sets the defaults below
+  vocab_size: 32064             # 32000 base + 64 special tokens (CommitPack tokenizer)
+  hidden_size: 4096
+  num_layers: 32
+  num_heads: 32
+  seq_len: 2048
+  # Intermediate size for SwiGLU: int(4096 * 8/3) rounded up to multiple of 64
+  ffn_hidden_size: 11008
+
+# ---------------------------------------------------------------------------
+# Training hyperparameters
+# ---------------------------------------------------------------------------
+training:
+  steps: 100000                 # ~14 B tokens at global_batch=64, seq=2048
+  warmup_steps: 2000
+  max_lr: 3.0e-4
+  min_lr: 3.0e-5
+  lr_schedule: "cosine"        # "cosine" | "linear"
+  min_lr_ratio: 0.1             # min_lr = max_lr * min_lr_ratio
+
+  # Batch sizes
+  micro_batch_size: 2           # per-GPU micro-batch
+  global_batch_size: 64         # effective batch = micro_batch * grad_accum * world_size
+  grad_accum_steps: 8           # gradient accumulation steps
+
+  # Regularisation
+  weight_decay: 0.1
+  grad_clip: 1.0
+  beta1: 0.9
+  beta2: 0.95
+  eps: 1.0e-8
+
+  # Precision per tier
+  # A6000 uses BF16 (SM8.6 supports BF16 natively); H100 uses BF16
+  dtype: "bfloat16"             # "bfloat16" | "float16" | "float32"
+
+  # Activation checkpointing (saves ~30% memory, ~10% slower)
+  activation_checkpointing: true
+  checkpoint_activations_granularity: "selective"   # "full" | "selective"
+
+# ---------------------------------------------------------------------------
+# Data
+# ---------------------------------------------------------------------------
+data:
+  path: null                    # override via --data-path CLI flag
+  # CommitPack-specific
+  fim_rate: 0.15                # Fill-in-the-Middle augmentation rate
+  ctx_loss_weight: 0.5          # loss weight for context (non-diff) lines
+  tokenizer_model: null         # path to sentencepiece model (null = default)
+
+# ---------------------------------------------------------------------------
+# Parallelism
+# ---------------------------------------------------------------------------
+parallelism:
+  tensor_parallel: 1            # TP=1 (no NVLink — cross-GPU TP too slow on PCIe)
+  pipeline_parallel: 3          # PP across 3 GPUs
+  data_parallel: 1              # DP = world_size / (TP * PP)
+
+  # Layer split across PP stages (layers per stage, must sum to num_layers=32)
+  # A6000×2 each carry 6 layers (12 total), H100 carries 20 layers
+  pp_layer_split: [6, 6, 20]
+
+  sequence_parallel: false      # Requires NVLink for efficient all-gather
+
+# ---------------------------------------------------------------------------
+# DES-LOC engine (DesLocEngine)
+# ---------------------------------------------------------------------------
+desloc:
+  enabled: true                 # set false to fall back to standalone DDP loop
+  # LOC (Layer-Offload Cache) sizes per NUMA node — uses CPU DRAM
+  loc_cache_numa0_gb: 200
+  loc_cache_numa1_gb: 200
+  # Sequence partition coefficients
+  Kx: 8                         # token split factor for A6000 tier
+  Ku: 4                         # token split factor for H100 tier (upload)
+  Kv: 16                        # token split factor for H100 tier (value cache)
+  # ZeRO stage for parameters not pinned to a tier
+  zero_stage: 3
+
+# ---------------------------------------------------------------------------
+# NCCL / communication tuning (PCIe, no NVLink)
+# ---------------------------------------------------------------------------
+nccl:
+  p2p_disable: true             # PCIe P2P is unreliable on this cluster
+  shm_disable: false
+  net_gdr_level: 0
+  ib_disable: true
+  socket_ifname: "lo"
+  debug: "WARN"                 # "WARN" | "INFO" | "TRACE"
+
+# ---------------------------------------------------------------------------
+# Checkpointing
+# ---------------------------------------------------------------------------
+checkpoint:
+  save_every: 5000              # steps between saves
+  dir: "checkpoints/7b_commitpack"
+  resume_from: null             # path to resume checkpoint (null = train from scratch)
+  keep_last_n: 3                # delete older checkpoints, keep N most recent
+
+# ---------------------------------------------------------------------------
+# Evaluation
+# ---------------------------------------------------------------------------
+eval:
+  eval_every: 1000              # 0 = disabled
+  eval_iters: 50
+  model_path: null
+  output_dir: "desloc_results/eval_runs/7b_commitpack"
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+logging:
+  log_every: 10
+  level: "INFO"
+  log_dir: "logs/7b_commitpack"
+  wandb:
+    enabled: false
+    project: "neuron_sp"
+    run_name: "7b_commitpack"
+    tags: ["7b", "commitpack", "desloc"]
