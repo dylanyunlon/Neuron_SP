@@ -118,82 +118,31 @@ python datasets/bigcode/the_stack_v2/megatron_indexed.py --dummy --output /tmp/t
 
 ## 完整数据集矩阵 (更新: Phase 8 / M1166-M1180)
 
-| 数据集 | 规模 | 来源 | HuggingFace ID | 用途 |
-|--------|------|------|---------------|------|
-| StarCoder commits (raw) | 32 GB | BigQuery | `bigcode/starcoderdata` (data_dir="git-commits") | 预训练 code diff |
-| StarCoder commits (cleaned) | 64 GB | BigQuery + near-dedup | `bigcode/starcoderdata` (data_dir="git-commits-cleaned") | 预训练主语料（推荐）|
-| CommitPack | 4 TB | GHArchive + GitHub API 爬取 | `bigcode/commitpack` | 大规模预训练 (streaming=True, DATASET_REGISTRY 注册) |
-| CommitPackFT | 2 GB (高质量子集) | GPT-4 筛选 | `bigcode/commitpackft` | 指令微调 |
-| The Stack v2 (PR/commit) | 未公开总量 | GHArchive + Software Heritage | `bigcode/the-stack-v2` | 全量预训练语料 (M761-M775 适配完成) |
+新增: `DATASET_REGISTRY` 统一注册表 (`datasets/bigcode/load_commits.py`)，
+`load_stackv2_dataset()` 接口，以及 `pull_all_datasets.sh` 中各数据集的
+`_manifest.json` 清单文件 (供 `load_commits.py` 验证本地下载状态)。
 
----
+| 数据集 | 规模 | 来源 | HuggingFace ID | 用途 | streaming | requires_token |
+|--------|------|------|---------------|------|-----------|----------------|
+| StarCoder commits (raw) | 32 GB | BigQuery | `bigcode/starcoderdata` (data_dir="git-commits") | 预训练 code diff | True | False |
+| StarCoder commits (cleaned) | 64 GB | BigQuery + near-dedup | `bigcode/starcoderdata` (data_dir="git-commits-cleaned") | 预训练主语料（推荐） | True | False |
+| CommitPack | 4 TB | GHArchive + GitHub API 爬取 | `bigcode/commitpack` | 大规模预训练 | True | False |
+| CommitPackFT | 2 GB (高质量子集) | GPT-4 筛选 | `bigcode/commitpackft` | 指令微调 | False | False |
+| The Stack v2 (PR/commit) | ~900B tokens | GHArchive + Software Heritage | `bigcode/the-stack-v2` | 全量预训练语料 | True | True |
 
-## DATASET_REGISTRY (M1166-M1180 新增)
-
-`load_commits.py` 中新增 `DATASET_REGISTRY` 字典，统一管理所有数据集的加载配置，消除散落在各处的硬编码路径和 loader 逻辑。
-
-### 注册条目
-
-#### `commitpackft`
+### DATASET_REGISTRY 使用示例 (M1166-M1180 新增)
 ```python
-DATASET_REGISTRY["commitpackft"] = {
-    "hf_id":        "bigcode/commitpackft",
-    "local_subdir": "commitpackft",
-    "loader":       "jsonl",          # → load_commit_dataset()
-    "langs": ["python", "javascript", "typescript", "java", "go", "rust",
-              "c", "cpp", "ruby", "php", "swift", "kotlin", "scala", "r",
-              "julia", "lua", "haskell", "perl", "shell", "powershell"],
-    "description": "GPT-4-filtered high-quality commit instructions (~2 GB)",
-    "paper":       "OctoPack (arXiv:2308.07124)",
-    "size_hint":   "~2 GB",
-    "requires_agreement": False,
-}
-```
+from datasets.bigcode.load_commits import DATASET_REGISTRY, load_commit_dataset, load_stackv2_dataset
 
-#### `the_stack_v2`
-```python
-DATASET_REGISTRY["the_stack_v2"] = {
-    "hf_id":        "bigcode/the-stack-v2",
-    "local_subdir": "the_stack_v2",
-    "loader":       "stackv2",        # → StackV2CommitAdapter
-    "langs":        None,             # adapter handles lang normalisation
-    "description":  "Stack v2 PR/commit subset; ~900 B tokens; dedup + PII",
-    "paper":        "StarCoder2 (arXiv:2402.19173)",
-    "size_hint":    "~900 B tokens (gated)",
-    "requires_agreement": True,
-}
-```
+# 查看所有注册条目
+for name, meta in DATASET_REGISTRY.items():
+    print(f"{name}: {meta['hf_id']} ({meta['size_hint']})")
 
-### 使用方式
-```python
-from datasets.bigcode.load_commits import (
-    DATASET_REGISTRY, get_registry_entry, load_commit_dataset, MixedCommitDataset
-)
-
-# 列出所有已注册数据集
-for name, cfg in DATASET_REGISTRY.items():
-    print(name, "→", cfg["description"])
-
-# CommitPackFT (JSONL loader)
-ds = load_commit_dataset("commitpackft", lang="python")
-
-# The Stack v2 (registry 校验后交给 StackV2CommitAdapter)
-# load_commit_dataset 会检测 loader="stackv2" 并抛出说明性 ValueError
-from datasets.bigcode.the_stack_v2.stackv2_commits import StackV2CommitAdapter
-entry = get_registry_entry("the-stack-v2")   # 接受连字符别名
-adapter = StackV2CommitAdapter()
-for sample in adapter.stream_hf(max_samples=1000):
+# CommitPackFT — 直接用 load_commit_dataset (本地 JSONL)
+for sample in load_commit_dataset("commitpackft", lang="python", max_samples=100):
     print(sample["text"][:200])
-```
 
-### The Stack v2 PR/commit 流式下载 (M1166-M1180 新增)
-
-`pull_all_datasets.sh` 的第 4 节现在额外生成 `the_stack_v2/stream_pr_commits.py`，
-支持将 PR/commit 子集按语言分片写出为 JSONL，与 `StackV2CommitAdapter` 直接集成：
-
-```bash
-# 需先 huggingface-cli login 并接受 bigcode/the-stack-v2 协议
-python datasets/bigcode/the_stack_v2/stream_pr_commits.py \
-    --max-samples 50000 \
-    --out-dir /data/stackv2_commits
+# The Stack v2 — 专用 load_stackv2_dataset (内部用 StackV2CommitAdapter)
+for sample in load_stackv2_dataset(max_samples=1000, hf_token="hf_..."):
+    print(sample["text"][:200])
 ```

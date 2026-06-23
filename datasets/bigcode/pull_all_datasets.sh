@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 # pull_all_datasets.sh — 在 ags1 服务器上执行，拉取 BigCode 四大 commit 数据集
 # 前置: pip install datasets huggingface_hub
+# 数据集注册表: datasets/bigcode/load_commits.py::DATASET_REGISTRY
+#   commitpackft      (bigcode/commitpackft,    ~2 GB,   streaming=False)
+#   the-stack-v2      (bigcode/the-stack-v2,    ~900B t, streaming=True, requires_token=True)
+#   starcoderdata_commits (bigcode/starcoderdata, ~32 GB, streaming=True)
+#   commitpack        (bigcode/commitpack,       ~4 TB,  streaming=True)
 set -euo pipefail
 
 BASE_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -11,6 +16,7 @@ echo "BigCode Commit Datasets Downloader"
 echo "=========================================="
 
 # ── 1. CommitPackFT (2GB, 高质量子集, GPT-4 筛选) ──
+# DATASET_REGISTRY entry: "commitpackft" — schema_layout=flat, streaming=False
 echo ""
 echo "[1/4] bigcode/commitpackft — 2GB high-quality instruction commits"
 python3 << 'PY1'
@@ -37,6 +43,18 @@ for lang in langs:
         print(f"  {lang}: SKIP ({e})")
 
 print(f"  TOTAL: {total} samples across {len(langs)} languages")
+
+# Write registry-compatible manifest so load_commits.py can verify the download
+manifest = {
+    "dataset_name": "commitpackft",
+    "hf_id": "bigcode/commitpackft",
+    "schema_layout": "flat",
+    "total_samples": total,
+    "languages": langs,
+}
+with open(f"{out}/_manifest.json", "w") as mf:
+    json.dump(manifest, mf, indent=2)
+print(f"  Manifest written to {out}/_manifest.json")
 PY1
 
 # ── 2. StarCoder commits (32-64GB subset of starcoderdata) ──
@@ -187,6 +205,9 @@ print(f"  Use load_commits.DATASET_REGISTRY['commitpack'] for programmatic acces
 PY3
 
 # ── 4. The Stack v2 (PR/commit 数据) ──
+# DATASET_REGISTRY entry: "the-stack-v2" — schema_layout=head_base_files,
+#   streaming=True, requires_token=True
+# Adapter: datasets/bigcode/the_stack_v2/stackv2_commits.py::StackV2CommitAdapter
 echo ""
 echo "[4/4] bigcode/the-stack-v2 — PR + commit data"
 echo "  NOTE: Requires agreement to dataset terms on HuggingFace first"
@@ -213,6 +234,25 @@ try:
 except Exception as e:
     print(f"  Could not fetch metadata: {e}")
 
+# Write registry-compatible manifest so load_commits.py::load_stackv2_dataset
+# can locate the adapter and verify the local directory.
+manifest = {
+    "dataset_name": "the-stack-v2",
+    "hf_id": "bigcode/the-stack-v2",
+    "schema_layout": "head_base_files",
+    "streaming": True,
+    "adapter_class": "StackV2CommitAdapter",
+    "adapter_module": "datasets.bigcode.the_stack_v2.stackv2_commits",
+    "requires_token": True,
+    "note": (
+        "Full download requires HF agreement. "
+        "Use load_stackv2_dataset() or StackV2CommitAdapter.stream_hf() directly."
+    ),
+}
+with open(f"{out}/_manifest.json", "w") as f:
+    json.dump(manifest, f, indent=2)
+print(f"  Registry manifest written to {out}/_manifest.json")
+
 # Save access instructions
 with open(f"{out}/README.md", "w") as f:
     f.write("""# The Stack v2
@@ -227,6 +267,19 @@ with open(f"{out}/README.md", "w") as f:
 from datasets import load_dataset
 # Full dataset is too large, use streaming
 ds = load_dataset("bigcode/the-stack-v2", streaming=True, split="train")
+```
+
+## DES-LOC integration (via DATASET_REGISTRY)
+```python
+from datasets.bigcode.load_commits import load_stackv2_dataset
+
+# Stream from HF Hub (requires token + accepted agreement):
+for sample in load_stackv2_dataset(max_samples=1000, hf_token="hf_..."):
+    print(sample["text"][:200])
+
+# Stream from local parquet files:
+for sample in load_stackv2_dataset(parquet_glob="/data/stackv2/*.parquet"):
+    print(sample["text"][:200])
 ```
 """)
 print(f"  README saved to {out}/README.md")
