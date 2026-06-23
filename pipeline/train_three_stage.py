@@ -52,6 +52,7 @@ from deepspeed.runtime.hetero_mimo_training_loop import (
     SharedLocalityCache,
 )
 from deepspeed.runtime.hetero_gdn_selective_recompute import build_neuron_sp_config
+from megatron.core.datasets.commit_dataset import build_commit_datasets
 
 
 # ── 模型构建 ──
@@ -185,77 +186,34 @@ def load_stage1_data(tokenizer, seq_len, batch_size, data_path=None):
 
 
 def load_stage2_data(tokenizer, seq_len, batch_size, data_path=None):
-    """Stage 2: CommitPack diff 序列 — uses CommitSequencePacker + HeteroBatchSampler."""
-    import json as _json
-    from torch.utils.data import DataLoader, Dataset
-    from datasets.bigcode.commit_packing import (
-        CommitSequencePacker, HeteroBatchSampler, compute_packing_stats,
+    """Stage 2: CommitPack diff 序列 — uses build_commit_datasets() from
+    megatron.core.datasets.commit_dataset to replace the dummy dataloader."""
+    from torch.utils.data import DataLoader
+
+    # Resolve data path: use provided path or fall back to default corpus location
+    resolved_path = data_path or "datasets/bigcode/commitpack"
+
+    # -- Build train/valid/test CommitDatasets via Megatron commit_dataset --
+    print(f"[stage2] building CommitDatasets from {resolved_path} "
+          f"(seq_length={seq_len}) ...")
+    train_ds, valid_ds, test_ds = build_commit_datasets(
+        data_path=resolved_path,
+        seq_length=seq_len,
+        tokenizer=tokenizer,
     )
+    print(f"[stage2] CommitDataset sizes -- "
+          f"train={len(train_ds)}, valid={len(valid_ds)}, test={len(test_ds)}")
 
-    # ── 1. 收集原始 commit 样本 ──────────────────────────────────────────
-    sample_file = "datasets/bigcode/commitpack/python_sample_10k.jsonl"
-    if not os.path.exists(sample_file):
-        sample_file = "datasets/bigcode/commitpackft/python.jsonl"
-
-    raw_samples = []
-    with open(sample_file) as fh:
-        for line in fh:
-            d = _json.loads(line)
-            old = d.get("old_contents", "")
-            new = d.get("new_contents", "")
-            msg = d.get("subject", d.get("message", ""))
-            text = (
-                f"<commit_before>\n{old}\n"
-                f"<commit_msg>\n{msg}\n"
-                f"<commit_after>\n{new}"
-            )
-            raw_samples.append({"text": text})
-
-    # ── 2. CommitSequencePacker: 替代手动 tokenize+pad ──────────────────
-    pad_id = getattr(tokenizer, "eos_token_id", 0) or 0
-    packer = CommitSequencePacker(tokenizer=tokenizer, seq_len=seq_len, pad_token_id=pad_id)
-    packed = packer.pack_dataset(iter(raw_samples))
-
-    # ── 3. 验证 padding ratio < 5% ──────────────────────────────────────
-    stats = compute_packing_stats(packed)
-    print(f"[stage2] packing stats: {stats}")
-    if not stats.get("meets_5pct_target", True):
-        print(
-            f"[stage2] WARNING: padding_ratio={stats['padding_ratio']:.3%} "
-            f"exceeds 5% target. Check commit length distribution."
-        )
-
-    # ── 4. 封装成 Dataset ────────────────────────────────────────────────
-    class PackedDataset(Dataset):
-        def __init__(self, sequences):
-            self.sequences = sequences
-
-        def __len__(self):
-            return len(self.sequences)
-
-        def __getitem__(self, idx):
-            tokens = torch.tensor(self.sequences[idx].tokens, dtype=torch.long)
-            return {"input_ids": tokens, "labels": tokens}
-
-    ds = PackedDataset(packed)
-
-    # ── 5. HeteroBatchSampler: 按 GPU 显存比例分配 batch ─────────────────
-    gpu_tiers = detect_gpu_tiers()  # {rank: vram_gb}
-    hetero_sampler = HeteroBatchSampler(
-        sequences=packed,
-        gpu_mem_map=gpu_tiers if gpu_tiers else {0: 96, 1: 49},
-        base_batch=batch_size,
-        verbose=True,
-    )
-
-    # DataLoader wraps the hetero sampler; collation handled per-batch
+    # -- Collate: CommitDataset returns 'tokens'/'labels'/'loss_mask'/
+    #    'position_ids'; remap to the 'input_ids'/'labels' convention used
+    #    by _make_forward_backward_func. --
     def _collate(items):
-        input_ids = torch.stack([i["input_ids"] for i in items])
-        return {"input_ids": input_ids, "labels": input_ids}
+        input_ids = torch.stack([item["tokens"] for item in items])
+        labels    = torch.stack([item["labels"]  for item in items])
+        return {"input_ids": input_ids, "labels": labels}
 
-    return DataLoader(ds, batch_size=batch_size, sampler=None,
-                      collate_fn=_collate,
-                      batch_sampler=_HeteroBatchSamplerAdapter(hetero_sampler, ds))
+    return DataLoader(train_ds, batch_size=batch_size,
+                      shuffle=True, collate_fn=_collate, drop_last=True)
 
 
 class _HeteroBatchSamplerAdapter:
