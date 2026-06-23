@@ -42,12 +42,12 @@ echo ""
 if [[ "${1:-}" == "--dry-run" ]]; then
     echo "[DRY RUN] Would execute:"
     echo "  torchrun --nproc_per_node=$NGPUS run_pretrain.py \\"
-    echo "    --model-size $MODEL_SIZE --data-mode $DATA_MODE \\"
-    echo "    --total-steps $TOTAL_STEPS --micro-batch-size $MICRO_BS \\"
-    echo "    --seq-len $SEQ_LEN --lr $LR"
+    echo "    --model-size $MODEL_SIZE --steps $TOTAL_STEPS \\"
+    echo "    --batch-size $MICRO_BS --seq-len $SEQ_LEN \\"
+    echo "    --fsdp --gradient-checkpointing"
     echo ""
     # Print GPU info
-    nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader
+    nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader 2>/dev/null || echo "  (nvidia-smi not available)"
     exit 0
 fi
 
@@ -58,11 +58,10 @@ torchrun \
     --master_port=29500 \
     run_pretrain.py \
     --model-size "$MODEL_SIZE" \
-    --data-mode "$DATA_MODE" \
-    --total-steps "$TOTAL_STEPS" \
-    --micro-batch-size "$MICRO_BS" \
+    --steps "$TOTAL_STEPS" \
+    --batch-size "$MICRO_BS" \
     --seq-len "$SEQ_LEN" \
-    --lr "$LR" \
+    --fsdp \
     --gradient-checkpointing \
     --log-every 10 \
     --save-every 500 \
