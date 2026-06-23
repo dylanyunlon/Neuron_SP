@@ -1053,6 +1053,24 @@ class HeteroFP32GradAccumManager:
         """Zero gradient buffers at the start of each backward pass."""
         self.buffer.reset()
 
+    def accumulate(self) -> None:
+        """Promote current BF16 gradients into FP32 main_grad accumulators.
+
+        Called once per micro-batch immediately after ``backward()``.  For
+        parameters that carry a separate FP32 ``main_grad`` (selected by the
+        tier-aware precision policy), the BF16 ``param.grad`` produced by
+        autograd is *added* into ``main_grad`` so that numerical precision is
+        preserved across multiple micro-batch accumulations.
+
+        This is the DES-LOC equivalent of the inner accumulation loop in
+        Megatron's ``_ParamAndGradBucketGroup``: BF16 comms buffer stays
+        compact while the local FP32 accumulator absorbs rounding drift.
+        """
+        for bucket in self.buffer.buckets:
+            for param in bucket.params_with_extra_main_grads:
+                if param.grad is not None and hasattr(param, "main_grad"):
+                    param.main_grad.add_(param.grad.float())
+
     def after_backward(self, scale: float = 1.0) -> None:
         """
         Apply gradient scaling and run synchronous all-reduce across all buckets.

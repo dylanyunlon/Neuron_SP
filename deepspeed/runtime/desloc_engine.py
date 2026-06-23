@@ -1405,7 +1405,7 @@ class DesLocEngine:
                     scaled_loss.backward()
                     # Precision alignment: promote BF16 grads to FP32 accumulators
                     # for parameters that require it (three-tier precision policy).
-                    self.fp32_grad_manager.accumulate()
+                    self.fp32_grad_accum_manager.accumulate()
                     step_loss += loss.item()
 
                     # Forward
