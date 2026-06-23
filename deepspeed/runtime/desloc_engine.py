@@ -61,6 +61,22 @@ from deepspeed.runtime.hetero_fp32_grad_accum import (  # noqa: E402
     HeteroFP32GradAccumManager,
 )
 
+from deepspeed.checkpoint.hetero_checkpoint_config import (  # noqa: E402
+    HeteroCheckpointConfig,
+    TierRole,
+    build_config_for_cluster,
+)
+from deepspeed.checkpoint.hetero_async_checkpoint_save import (  # noqa: E402
+    HeteroAsyncCheckpointScheduler,
+    build_hetero_async_save_pipeline,
+    validate_async_checkpoint_config,
+)
+from deepspeed.checkpoint.hetero_async_checkpoint_load import (  # noqa: E402
+    HeteroAsyncCheckpointLoad,
+    detect_device_arch,
+    DeviceArch,
+)
+
 from datasets.bigcode.commit_packing import (  # noqa: E402
     CommitSequencePacker,
     HeteroBatchSampler,
@@ -195,6 +211,10 @@ class TrainingConfig:
 
     # Strategy override (None = auto-select)
     strategy_override: Optional[PartitionStrategy] = None
+
+    # Heterogeneous checkpoint config.  When None the engine will auto-build
+    # one via build_config_for_cluster() at init time.
+    hetero_checkpoint_config: Optional[Any] = None
 
     # HeteroStepBatchScheduler config
     # Format: "0:32 90B:64 180B:128" (THRESHOLD:BATCH_SIZE, token or sample units)
@@ -1044,6 +1064,46 @@ class DesLocEngine:
         if config.resume_from is not None:
             self.load_checkpoint(config.resume_from)
 
+        # --- Phase 7: Hetero Checkpoint System ---
+        # Build or adopt a HeteroCheckpointConfig, then create the per-tier
+        # async scheduler so that save_checkpoint() can hand off IO immediately.
+        if config.hetero_checkpoint_config is not None:
+            self._hetero_ckpt_cfg: HeteroCheckpointConfig = config.hetero_checkpoint_config
+        else:
+            # Auto-build from cluster topology when CUDA is available;
+            # fall back to a minimal config for CPU-only environments.
+            try:
+                self._hetero_ckpt_cfg = build_config_for_cluster(
+                    save_dir=str(config.checkpoint_dir),
+                    load_dir=(
+                        str(config.resume_from)
+                        if config.resume_from is not None
+                        else None
+                    ),
+                    locality_cache_dir="/dev/shm/neuron_sp_ckpt",
+                    save_interval=config.save_every,
+                )
+                logger.info(
+                    "HeteroCheckpointConfig built: cache_device=%d, "
+                    "workers=%s, async=%s",
+                    self._hetero_ckpt_cfg.cache_tier_device_id,
+                    self._hetero_ckpt_cfg.worker_device_ids,
+                    self._hetero_ckpt_cfg.hetero_async_save,
+                )
+            except Exception as _hcc_exc:  # noqa: BLE001
+                logger.warning(
+                    "Could not auto-build HeteroCheckpointConfig (%s); "
+                    "hetero async save will be disabled.",
+                    _hcc_exc,
+                )
+                self._hetero_ckpt_cfg = None  # type: ignore[assignment]
+
+        # Per-rank async scheduler (one instance, reused across save calls).
+        self._hetero_ckpt_scheduler: Optional[HeteroAsyncCheckpointScheduler] = None
+        if self._hetero_ckpt_cfg is not None and self._hetero_ckpt_cfg.hetero_async_save:
+            self._hetero_ckpt_scheduler = HeteroAsyncCheckpointScheduler()
+            logger.info("HeteroAsyncCheckpointScheduler created for async per-tier saves.")
+
         # --- Phase 7: Neuron_SP heterogeneous recompute config ---
         self.neuron_sp_config: HeteroRecomputeConfig = build_neuron_sp_config()
         logger.info(
@@ -1301,22 +1361,100 @@ class DesLocEngine:
         """
         Save a full training checkpoint to disk.
 
-        Checkpoint includes: model weights, optimizer state, scheduler state,
-        global step, and tokens seen.
+        When a :class:`HeteroCheckpointConfig` is active the save is routed
+        through the per-tier async pipeline
+        (:func:`build_hetero_async_save_pipeline`):
+
+        * CACHE tier (H100): optimizer state staged to host-DRAM LocalityCache,
+          then written asynchronously in a background IO thread.
+        * WORKER tiers (A6000): parameter shards written synchronously (or
+          offloaded to CACHE tier when ``worker_offload_optim=True``).
+
+        When no hetero config is available (CPU-only fallback) the method
+        reverts to a plain :func:`torch.save`.
 
         Args:
-            path: Destination file path (will create parent dirs).
+            path: Destination file path (parent dirs are created as needed).
         """
+        path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
+
         payload = {
-            "global_step": self.global_step,
-            "tokens_seen": self.tokens_seen,
-            "model_state": self.model.state_dict(),
-            "optimizer_state": self.optimizer.state_dict(),
-            "scheduler_state": self.scheduler.state_dict(),
-            "plan": self.plan,
-            "config": self.config,
+            "global_step":       self.global_step,
+            "tokens_seen":       self.tokens_seen,
+            "model_state":       self.model.state_dict(),
+            "optimizer_state":   self.optimizer.state_dict(),
+            "scheduler_state":   self.scheduler.state_dict(),
+            "plan":              self.plan,
+            "config":            self.config,
         }
+
+        cfg = self._hetero_ckpt_cfg  # may be None in CPU-only mode
+
+        if cfg is not None and cfg.hetero_async_save:
+            # ------------------------------------------------------------------
+            # Hetero async path: determine current tier role, apply per-tier
+            # policy, then hand off to the async save pipeline.
+            # ------------------------------------------------------------------
+            current_device = self.primary_device
+            if current_device.type == "cuda":
+                arch = detect_device_arch(current_device)
+                if arch == DeviceArch.SM90_H100:
+                    tier_role = TierRole.CACHE
+                else:
+                    tier_role = TierRole.WORKER
+            else:
+                tier_role = TierRole.WORKER   # CPU fallback
+
+            tier_policy = cfg.get_policy(tier_role)
+
+            # Optionally strip optimizer state on WORKER tiers when offload
+            # is enabled (optimizer state is owned by the CACHE tier).
+            if not tier_policy.save_optim and "optimizer_state" in payload:
+                logger.info(
+                    "[hetero_ckpt] WORKER tier: omitting optimizer_state "
+                    "(offloaded to CACHE tier)."
+                )
+                payload.pop("optimizer_state")
+
+            ckpt_format = cfg.hetero_ckpt_format.value  # e.g. "torch_dist"
+
+            try:
+                validate_async_checkpoint_config(
+                    ckpt_format,
+                    async_save=True,
+                    require_nvrx_for_dcp=False,  # graceful fallback if no NVRx
+                )
+                logger.info(
+                    "[hetero_ckpt] Launching async save to %s "
+                    "(tier=%s, format=%s, scheduler=%s).",
+                    path, tier_role.value, ckpt_format,
+                    "reused" if self._hetero_ckpt_scheduler is not None else "new",
+                )
+                self._hetero_ckpt_scheduler = build_hetero_async_save_pipeline(
+                    state_dict=payload,
+                    checkpoint_path=str(path),
+                    ckpt_format=ckpt_format,
+                    iteration=self.global_step,
+                    scheduler=self._hetero_ckpt_scheduler,
+                )
+                logger.info(
+                    "[hetero_ckpt] Async save scheduled: %s (step %d).",
+                    path, self.global_step,
+                )
+                return
+            except (NotImplementedError, RuntimeError) as _async_err:
+                # Format not async-eligible or NVRx missing: fall through to
+                # synchronous save so training is never blocked.
+                logger.warning(
+                    "[hetero_ckpt] Async save unavailable (%s); "
+                    "falling back to torch.save.",
+                    _async_err,
+                )
+
+        # ------------------------------------------------------------------
+        # Synchronous fallback (also used when hetero config is absent).
+        # ------------------------------------------------------------------
         torch.save(payload, path)
         logger.info("Checkpoint saved: %s (step %d)", path, self.global_step)
 
@@ -1324,15 +1462,128 @@ class DesLocEngine:
         """
         Resume training from a saved checkpoint.
 
+        When a :class:`HeteroCheckpointConfig` with
+        ``shard_rebalance_on_load=True`` is active, the method uses
+        :class:`~deepspeed.checkpoint.hetero_async_checkpoint_load.HeteroAsyncCheckpointLoad`
+        to restore tensors via the three-stage CPU-DRAM staging pipeline
+        (async IO → SM-arch routing → PCIe DMA to GPU), enabling heterogeneous
+        resume even when the saved tier layout differs from the current one.
+
+        When the hetero path is unavailable (no CUDA, no config, or the
+        checkpoint is a plain ``torch.save`` dict), falls back to
+        :func:`torch.load`.
+
         Args:
-            path: Path to the .pt checkpoint file.
+            path: Path to the checkpoint directory (hetero format) or ``.pt``
+                  file (legacy format).
 
         Raises:
-            FileNotFoundError: If the checkpoint file does not exist.
+            FileNotFoundError: If *path* does not exist.
         """
+        path = Path(path)
         if not path.exists():
             raise FileNotFoundError(f"Checkpoint not found: {path}")
-        payload = torch.load(path, map_location=self.primary_device)
+
+        cfg = self._hetero_ckpt_cfg  # may be None before __init__ completes
+
+        # ------------------------------------------------------------------
+        # Hetero async-load path
+        # ------------------------------------------------------------------
+        if (
+            cfg is not None
+            and cfg.shard_rebalance_on_load
+            and path.is_dir()   # hetero checkpoints are directories
+        ):
+            logger.info(
+                "[hetero_ckpt] Attempting HeteroAsyncCheckpointLoad from %s.", path
+            )
+
+            # Discover device topology from tiers (populated by TierDiscovery).
+            h100_device: Optional[torch.device] = None
+            a6000_devices: List[torch.device] = []
+            for spec in getattr(self, "tiers", []):
+                dev = spec.device
+                arch = detect_device_arch(dev)
+                if arch == DeviceArch.SM90_H100 and h100_device is None:
+                    h100_device = dev
+                elif arch == DeviceArch.SM86_A6000:
+                    a6000_devices.append(dev)
+
+            if h100_device is None:
+                h100_device = self.primary_device
+
+            try:
+                loader = HeteroAsyncCheckpointLoad(
+                    checkpoint_dir=str(path),
+                    h100_device=h100_device,
+                    a6000_devices=a6000_devices or [self.primary_device],
+                    slc_capacity_gb=min(cfg.locality_cache_max_gb, 64.0),
+                    io_workers=8,
+                    h100_budget_gb=80.0,
+                    a6000_budget_gb=40.0,
+                )
+
+                # Build shard metadata from a hetero checkpoint metadata file
+                # (written by save_checkpoint on the CACHE tier).  Fall back
+                # gracefully to torch.load if the metadata file is absent.
+                meta_file = path / "hetero_metadata.pt"
+                if meta_file.exists():
+                    state_dict_meta: Dict[str, Any] = torch.load(
+                        meta_file, map_location="cpu"
+                    )
+                    loaded_state = loader.load(state_dict_meta)
+                    loader.shutdown()
+
+                    model_state     = loaded_state.get("model_state", {})
+                    optimizer_state = loaded_state.get("optimizer_state")
+                    scheduler_state = loaded_state.get("scheduler_state")
+                    global_step     = int(loaded_state.get("global_step", 0))
+                    tokens_seen     = int(loaded_state.get("tokens_seen", 0))
+
+                    # Move model state tensors to the primary device; the
+                    # loader may have placed them on H100 or A6000 depending
+                    # on SM routing.  load_state_dict expects them on the same
+                    # device as the model.
+                    model_state_cpu = {
+                        k: (v.to(self.primary_device) if isinstance(v, torch.Tensor) else v)
+                        for k, v in model_state.items()
+                    }
+                    self.model.load_state_dict(model_state_cpu, strict=cfg.dist_ckpt_strictness.value != "raise_all")
+
+                    if optimizer_state is not None and cfg.load_optim:
+                        self.optimizer.load_state_dict(optimizer_state)
+
+                    if scheduler_state is not None and cfg.load_rng:
+                        self.scheduler.load_state_dict(scheduler_state)
+
+                    self.global_step = global_step
+                    self.tokens_seen = tokens_seen
+                    logger.info(
+                        "[hetero_ckpt] Hetero load complete: %s "
+                        "(step %d, %.2fM tokens seen)",
+                        path, self.global_step, self.tokens_seen / 1e6,
+                    )
+                    return
+                else:
+                    loader.shutdown()
+                    logger.info(
+                        "[hetero_ckpt] No hetero_metadata.pt in %s; "
+                        "falling back to torch.load.",
+                        path,
+                    )
+            except Exception as _load_exc:  # noqa: BLE001
+                logger.warning(
+                    "[hetero_ckpt] HeteroAsyncCheckpointLoad failed (%s); "
+                    "falling back to torch.load.",
+                    _load_exc,
+                )
+
+        # ------------------------------------------------------------------
+        # Legacy / synchronous fallback: torch.load of a .pt file.
+        # ------------------------------------------------------------------
+        # Accept both a bare .pt file and a directory that contains one.
+        pt_file = path if path.suffix == ".pt" else path
+        payload = torch.load(pt_file, map_location=self.primary_device)
         self.model.load_state_dict(payload["model_state"])
         self.optimizer.load_state_dict(payload["optimizer_state"])
         self.scheduler.load_state_dict(payload["scheduler_state"])
@@ -1345,9 +1596,24 @@ class DesLocEngine:
             self.tokens_seen / 1e6,
         )
 
-    # ------------------------------------------------------------------
-    # Utility helpers
-    # ------------------------------------------------------------------
+    def drain_checkpoint(self, timeout: float = 600.0) -> None:
+        """
+        Block until all pending async checkpoint IO is complete.
+
+        Should be called before program exit or before scheduling the next
+        checkpoint when the async queue could overflow.  No-op when the
+        hetero async path is inactive.
+
+        Args:
+            timeout: Maximum seconds to wait.  Raises ``TimeoutError`` if
+                     the scheduler exceeds this limit.
+        """
+        if self._hetero_ckpt_scheduler is not None:
+            logger.info("[hetero_ckpt] Draining async checkpoint queue …")
+            self._hetero_ckpt_scheduler.drain(timeout=timeout)
+            logger.info("[hetero_ckpt] Checkpoint queue drained.")
+        else:
+            logger.debug("[hetero_ckpt] drain_checkpoint: no async scheduler active.")
     @staticmethod
     def _setup_logging() -> None:
         """Configure root logger with timestamp format if not already configured."""
