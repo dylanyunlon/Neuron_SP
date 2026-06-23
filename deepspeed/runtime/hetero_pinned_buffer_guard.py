@@ -885,3 +885,67 @@ if __name__ == "__main__":
     assert registry.total_live() == 0
 
     logger.info("All smoke tests passed.")
+
+
+# ---------------------------------------------------------------------------
+# Engine registration hook
+# ---------------------------------------------------------------------------
+
+def register(engine) -> None:
+    """Register HeteroPinnedBufferVersionGuard hooks on a DeepSpeed engine.
+
+    Constructs a :class:`HeteroPinnedBufferVersionGuard` via
+    :func:`build_guard_for_neuron_sp` and attaches it as
+    ``engine.hetero_pinned_buffer_guard``.
+
+    A step-end hook is registered (when the engine provides a suitable callback
+    point) to call :meth:`HeteroPinnedBufferVersionGuard.step` at the end of
+    every optimiser step, advancing epoch counters and triggering eviction of
+    stale pinned buffers that exceed the configured budget.
+
+    Parameters
+    ----------
+    engine:
+        A DeepSpeed engine instance.  The pinned-memory budget in GiB is read
+        from ``engine.config.get("hetero_pinned_buffer", {}).get("budget_gb", 64.0)``
+        when available, defaulting to 64 GiB.
+    """
+    import logging as _logging
+    _log = _logging.getLogger(__name__)
+
+    _log.info(
+        "hetero_pinned_buffer_guard.register() called on engine type=%s",
+        type(engine).__name__,
+    )
+
+    # Resolve budget from engine config
+    budget_gb = 64.0
+    if hasattr(engine, "config") and isinstance(engine.config, dict):
+        pb_cfg = engine.config.get("hetero_pinned_buffer", {})
+        budget_gb = float(pb_cfg.get("budget_gb", 64.0))
+
+    guard = build_guard_for_neuron_sp(budget_gb=budget_gb)
+
+    # Attach to engine
+    engine.hetero_pinned_buffer_guard = guard
+
+    # Wire step hook so epoch counters advance automatically
+    if hasattr(engine, "register_hook_on_step_end"):
+        engine.register_hook_on_step_end(lambda: guard.step())
+        _log.info(
+            "HeteroPinnedBufferVersionGuard.step registered via "
+            "engine.register_hook_on_step_end."
+        )
+    elif hasattr(engine, "optimizer") and hasattr(engine.optimizer, "register_step_post_hook"):
+        engine.optimizer.register_step_post_hook(
+            lambda opt, args: guard.step()
+        )
+        _log.info(
+            "HeteroPinnedBufferVersionGuard.step registered via "
+            "optimizer.register_step_post_hook."
+        )
+    else:
+        _log.info(
+            "No step-end hook point found; call "
+            "engine.hetero_pinned_buffer_guard.step() manually after each optimiser step."
+        )

@@ -1349,3 +1349,80 @@ if __name__ == "__main__":
     runner = unittest.TextTestRunner(verbosity=2, stream=sys.stdout)
     result = runner.run(suite)
     sys.exit(0 if result.wasSuccessful() else 1)
+
+
+# ---------------------------------------------------------------------------
+# Engine registration hook
+# ---------------------------------------------------------------------------
+
+def register(engine) -> None:
+    """Register HeteroElasticBatch hooks on a DeepSpeed engine.
+
+    Attaches a :class:`HeteroElasticBatchPipeHook` to ``engine`` so that every
+    micro-batch fetch goes through the DES-LOC capacity-weighted CP partition
+    and locality-aware broadcast path.
+
+    The hook is stored on ``engine.hetero_elastic_batch_hook`` for inspection
+    and is also set as the engine's dataloader when the engine exposes a
+    ``set_dataloader`` method (DeepSpeed ``PipelineEngine`` pattern).
+
+    Parameters
+    ----------
+    engine:
+        A DeepSpeed engine instance (e.g. ``PipelineEngine`` or
+        ``DeepSpeedEngine``).  Must have ``mpu`` attributes for TP/CP groups,
+        or fall back to the default process group.
+    """
+    logger.info(
+        "hetero_elastic_batch.register() called on engine type=%s",
+        type(engine).__name__,
+    )
+
+    # Resolve TP and CP process groups from the engine's model-parallel unit
+    tp_group: dist.ProcessGroup
+    cp_group: dist.ProcessGroup
+
+    if hasattr(engine, "mpu") and engine.mpu is not None:
+        mpu = engine.mpu
+        tp_group = (
+            mpu.get_tensor_model_parallel_group()
+            if hasattr(mpu, "get_tensor_model_parallel_group")
+            else dist.GroupMember.WORLD
+        )
+        cp_group = (
+            mpu.get_context_parallel_group()
+            if hasattr(mpu, "get_context_parallel_group")
+            else dist.GroupMember.WORLD
+        )
+    else:
+        # Fallback: single-device or no model parallelism
+        tp_group = dist.GroupMember.WORLD
+        cp_group = dist.GroupMember.WORLD
+
+    device: Optional[torch.device] = None
+    if hasattr(engine, "device"):
+        device = engine.device
+    elif torch.cuda.is_available():
+        device = torch.device(f"cuda:{torch.cuda.current_device()}")
+
+    hook = HeteroElasticBatchPipeHook(
+        tp_group=tp_group,
+        cp_group=cp_group,
+        device=device,
+        enable_hetero_cp=True,
+    )
+
+    # Store hook on engine for external access / debugging
+    engine.hetero_elastic_batch_hook = hook
+
+    # Wire into DeepSpeed PipelineEngine dataloader slot if available
+    if hasattr(engine, "set_dataloader"):
+        engine.set_dataloader(hook)
+        logger.info(
+            "HeteroElasticBatchPipeHook registered as pipeline dataloader on engine."
+        )
+    else:
+        logger.info(
+            "Engine does not expose set_dataloader; hook stored at "
+            "engine.hetero_elastic_batch_hook only."
+        )

@@ -899,3 +899,67 @@ if __name__ == "__main__":
     print("  HeteroSyncBarrier device-local wait ✓")
 
     print("\nAll smoke tests passed.")
+
+
+# ---------------------------------------------------------------------------
+# Engine registration hook
+# ---------------------------------------------------------------------------
+
+def register(engine) -> None:
+    """Register HeteroH2DStreamSync hooks on a DeepSpeed engine.
+
+    Builds a :class:`HeteroH2DStreamSync` stack from the engine's device
+    configuration and attaches it as ``engine.hetero_h2d_sync``.  A
+    ``step_begin`` hook is also registered (when the engine supports
+    ``register_forward_pre_hook`` or exposes an ``optimizer``) so that
+    :meth:`HeteroH2DStreamSync.begin_step` is called automatically at the
+    start of every training step to reset per-step version counters and
+    locality-cache state.
+
+    Parameters
+    ----------
+    engine:
+        A DeepSpeed engine instance.  The device list is inferred from
+        ``engine.device_ids`` when present, otherwise falls back to all
+        visible CUDA devices.
+    """
+    import logging as _logging
+    _log = _logging.getLogger(__name__)
+
+    _log.info(
+        "hetero_h2d_stream_sync.register() called on engine type=%s",
+        type(engine).__name__,
+    )
+
+    # Resolve device IDs from engine or environment
+    if hasattr(engine, "device_ids") and engine.device_ids:
+        device_ids = list(engine.device_ids)
+    elif torch.cuda.is_available():
+        device_ids = list(range(torch.cuda.device_count()))
+    else:
+        device_ids = [0]
+
+    h2d_sync = build_des_loc_h2d_sync(device_ids)
+
+    # Attach to engine for external access
+    engine.hetero_h2d_sync = h2d_sync
+
+    # Register begin_step hook via DeepSpeed optimizer step callback if available
+    if hasattr(engine, "register_hook_on_step_begin"):
+        engine.register_hook_on_step_begin(lambda: h2d_sync.begin_step())
+        _log.info(
+            "HeteroH2DStreamSync.begin_step registered via register_hook_on_step_begin."
+        )
+    elif hasattr(engine, "optimizer") and hasattr(engine.optimizer, "register_step_pre_hook"):
+        # PyTorch >= 2.1 optimizer pre-hook
+        engine.optimizer.register_step_pre_hook(
+            lambda opt, args: h2d_sync.begin_step()
+        )
+        _log.info(
+            "HeteroH2DStreamSync.begin_step registered via optimizer.register_step_pre_hook."
+        )
+    else:
+        _log.info(
+            "No step-begin hook point found on engine; call "
+            "engine.hetero_h2d_sync.begin_step() manually before each step."
+        )

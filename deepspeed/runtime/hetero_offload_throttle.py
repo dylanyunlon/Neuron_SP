@@ -1099,3 +1099,71 @@ if __name__ == "__main__":
     runner = unittest.TextTestRunner(verbosity=2, stream=sys.stdout)
     result = runner.run(suite)
     sys.exit(0 if result.wasSuccessful() else 1)
+
+
+# ---------------------------------------------------------------------------
+# Engine registration hook
+# ---------------------------------------------------------------------------
+
+def register(engine) -> None:
+    """Register HeteroOffloadThrottle / DESLOCPipelineOffloadCoordinator hooks on a DeepSpeed engine.
+
+    Builds a :class:`DESLOCPipelineOffloadCoordinator` from the engine's
+    configuration and attaches it as ``engine.hetero_offload_coordinator``.
+
+    Micro-batch lifecycle hooks (``on_microbatch_start``,
+    ``on_microbatch_forward_end``, ``on_microbatch_backward_start``,
+    ``on_microbatch_complete``) are wired to the engine's pipeline schedule
+    callbacks when the engine supports them, ensuring that offload throttling
+    and locality-cache bookkeeping are driven automatically without changes to
+    the training loop.
+
+    Parameters
+    ----------
+    engine:
+        A DeepSpeed engine instance (typically ``PipelineEngine``).  The
+        offload configuration is derived from
+        ``engine.config.get("hetero_offload", {})`` when available.
+    """
+    import logging as _logging
+    _log = _logging.getLogger(__name__)
+
+    _log.info(
+        "hetero_offload_throttle.register() called on engine type=%s",
+        type(engine).__name__,
+    )
+
+    # Build offload configuration from engine config or defaults
+    cfg_dict = {}
+    if hasattr(engine, "config") and isinstance(engine.config, dict):
+        cfg_dict = engine.config.get("hetero_offload", {})
+
+    config = DESLOCOffloadConfig(
+        base_cap_per_group=cfg_dict.get("base_cap_per_group", 4),
+        h100_cap_multiplier=cfg_dict.get("h100_cap_multiplier", 2.0),
+        enable_locality_cache=cfg_dict.get("enable_locality_cache", True),
+        max_outstanding_bytes=cfg_dict.get("max_outstanding_bytes", 4 * 1024 ** 3),
+    )
+
+    coordinator = DESLOCPipelineOffloadCoordinator(config=config)
+
+    # Attach to engine
+    engine.hetero_offload_coordinator = coordinator
+
+    # Wire pipeline micro-batch lifecycle hooks if the engine supports them
+    if hasattr(engine, "register_pipeline_microbatch_hook"):
+        engine.register_pipeline_microbatch_hook(
+            on_start=coordinator.on_microbatch_start,
+            on_forward_end=coordinator.on_microbatch_forward_end,
+            on_backward_start=coordinator.on_microbatch_backward_start,
+            on_complete=coordinator.on_microbatch_complete,
+        )
+        _log.info(
+            "DESLOCPipelineOffloadCoordinator registered via "
+            "engine.register_pipeline_microbatch_hook."
+        )
+    else:
+        _log.info(
+            "Engine does not expose register_pipeline_microbatch_hook; "
+            "call engine.hetero_offload_coordinator lifecycle methods manually."
+        )

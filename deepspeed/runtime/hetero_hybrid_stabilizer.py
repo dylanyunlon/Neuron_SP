@@ -1458,3 +1458,86 @@ if __name__ == "__main__":
 
     if not result.wasSuccessful():
         raise SystemExit(1)
+
+
+# ---------------------------------------------------------------------------
+# Engine registration hook
+# ---------------------------------------------------------------------------
+
+def register(engine) -> None:
+    """Register HeteroHybridStabilizer hooks on a DeepSpeed engine.
+
+    Constructs a :class:`HeteroHybridStabilizer` (or
+    :class:`DistributedHeteroHybridStabilizer` when ``torch.distributed`` is
+    available and initialised) from ``engine``'s device configuration, runs
+    the calibration pass, and attaches it as ``engine.hetero_hybrid_stabilizer``.
+
+    A ``step_end`` hook is wired in so that
+    :meth:`HeteroHybridStabilizer.record_step_latency` is called
+    automatically at the end of every training step when the engine exposes
+    a suitable callback registration point.
+
+    Parameters
+    ----------
+    engine:
+        A DeepSpeed engine instance.  Device indices are resolved from
+        ``engine.device_ids`` when present, otherwise all visible CUDA
+        devices are used.
+    """
+    import logging as _logging
+    import time as _time
+    _log = _logging.getLogger(__name__)
+
+    _log.info(
+        "hetero_hybrid_stabilizer.register() called on engine type=%s",
+        type(engine).__name__,
+    )
+
+    # Resolve device indices
+    if hasattr(engine, "device_ids") and engine.device_ids:
+        device_indices = list(engine.device_ids)
+    elif torch.cuda.is_available():
+        device_indices = list(range(torch.cuda.device_count()))
+    else:
+        device_indices = [0]
+
+    # Build stabilizer
+    if dist.is_available() and dist.is_initialized():
+        stab: HeteroHybridStabilizer = DistributedHeteroHybridStabilizer(
+            config=HybridStabilizerConfig(device_indices=device_indices)
+        )
+    else:
+        stab = make_stabilizer_for_cluster(device_indices=device_indices)
+
+    stab.calibrate()
+
+    # Attach to engine
+    engine.hetero_hybrid_stabilizer = stab
+
+    # Wire step-end hook for automatic latency recording
+    _step_start: list = [_time.monotonic()]  # mutable cell
+
+    def _on_step_begin() -> None:
+        _step_start[0] = _time.monotonic()
+
+    def _on_step_end() -> None:
+        elapsed_ms = (_time.monotonic() - _step_start[0]) * 1000.0
+        stab.record_step_latency(elapsed_ms)
+
+    if hasattr(engine, "register_hook_on_step_begin") and hasattr(engine, "register_hook_on_step_end"):
+        engine.register_hook_on_step_begin(_on_step_begin)
+        engine.register_hook_on_step_end(_on_step_end)
+        _log.info(
+            "HeteroHybridStabilizer step hooks registered via engine step callbacks."
+        )
+    elif hasattr(engine, "optimizer") and hasattr(engine.optimizer, "register_step_pre_hook"):
+        engine.optimizer.register_step_pre_hook(lambda opt, args: _on_step_begin())
+        engine.optimizer.register_step_post_hook(lambda opt, args: _on_step_end())
+        _log.info(
+            "HeteroHybridStabilizer step hooks registered via optimizer hooks."
+        )
+    else:
+        _log.info(
+            "No step hook point found; call "
+            "engine.hetero_hybrid_stabilizer.record_step_latency() manually."
+        )
