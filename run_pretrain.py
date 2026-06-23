@@ -800,7 +800,16 @@ def run_standalone(args: argparse.Namespace) -> None:
 
 def run_desloc(args: argparse.Namespace) -> None:
     """Run training via the DES-LOC heterogeneous engine."""
+    # Distributed init (torchrun sets env vars but we must call init ourselves)
+    import torch.distributed as _dist
+    if not _dist.is_initialized() and "RANK" in os.environ:
+        _dist.init_process_group(backend="nccl", init_method="env://")
+
     cfg = _MODEL_CONFIGS[args.model_size]
+
+    # Compute world size from torchrun env; fallback to 1 for single-GPU
+    _world = int(os.environ.get("WORLD_SIZE", 1))
+    _grad_accum = getattr(args, "grad_accum_steps", 8)
 
     tc = TrainingConfig(
         vocab_size      = cfg["vocab_size"],
@@ -810,11 +819,11 @@ def run_desloc(args: argparse.Namespace) -> None:
         seq_len         = args.seq_len,
         total_steps     = args.steps,
         micro_batch_size= args.batch_size,
-        global_batch_size= args.batch_size * 8,
-        grad_accum_steps= 8,
-        warmup_steps    = min(10, args.steps // 10),
+        global_batch_size= args.batch_size * _world * _grad_accum,
+        grad_accum_steps= _grad_accum,
+        warmup_steps    = min(2000, args.steps // 10),
         log_every       = args.log_every,
-        save_every      = max(args.steps + 1, 10000),  # no saves during smoke test
+        save_every      = getattr(args, "save_every", 500),
         eval_every      = 0,
     )
 
@@ -852,7 +861,6 @@ def run_desloc(args: argparse.Namespace) -> None:
             "blend mode (desloc): loading %d source(s) from data.sources", len(sources)
         )
         from data.blend_datasets import build_blended_dataloader  # noqa: PLC0415
-        device_tmp = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         _blend_loader = build_blended_dataloader(
             sources=sources,
             batch_size=args.batch_size,
@@ -867,7 +875,7 @@ def run_desloc(args: argparse.Namespace) -> None:
                 except StopIteration:
                     _blend_iter_ref[0] = iter(_blend_loader)
                     x, y = next(_blend_iter_ref[0])
-                yield x.to(device_tmp), y.to(device_tmp)
+                yield x.to(device), y.to(device)
 
         data_iter = _blend_desloc_iter()
     elif args.data_path:

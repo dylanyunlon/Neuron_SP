@@ -1661,18 +1661,21 @@ class DesLocEngine:
                     )
 
                     # Prepare FP32 gradient accumulators for this micro-batch
-                    self.fp32_grad_manager.before_backward()
+                    if self.fp32_grad_manager is not None:
+                        self.fp32_grad_manager.before_backward()
                     # Backward
                     scaled_loss.backward()
                     # Precision alignment: promote BF16 grads to FP32 accumulators
                     # for parameters that require it (three-tier precision policy).
-                    self.fp32_grad_manager.accumulate()
+                    if self.fp32_grad_manager is not None:
+                        self.fp32_grad_manager.accumulate()
                     step_loss += loss.item()
 
             if self.mimo_loop is None:
                 # Synchronize FP32 gradients (scale + all-reduce) across the DP group
                 # before gradient clipping and optimizer.step().
-                self.fp32_grad_manager.after_backward(scale=1.0 / num_microbatches)
+                if self.fp32_grad_manager is not None:
+                    self.fp32_grad_manager.after_backward(scale=1.0 / num_microbatches)
 
             # Gradient clipping (only for standard path; mimo_loop handles it internally)
             if self.mimo_loop is None:
@@ -1701,7 +1704,8 @@ class DesLocEngine:
                 # train_step(); still honour the skip controller for the scheduler.
                 # Cross-device gradient synchronisation (PCIe-aware all-reduce
                 # across heterogeneous tiers) before the scheduler step.
-                self.fp32_grad_manager.sync()
+                if self.fp32_grad_manager is not None:
+                    self.fp32_grad_manager.sync()
                 if _should_skip:
                     _skip_count += 1
                     print(f"[hetero_grad] SKIP step={step} (cumulative skips={_skip_count})")
