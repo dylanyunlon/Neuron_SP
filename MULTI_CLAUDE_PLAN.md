@@ -276,3 +276,102 @@ CONV_ID=<uuid> bash claude_hk_chat.sh "Continue"
 - 37, 38, 39, 40, 41, 42, 43, 44, 45 可并行（改不同方法/文件）
 - 46 必须在所有前面完成后执行
 - 所有 Claude push 前必须 `git pull --rebase origin main`
+
+---
+
+## Phase 9: Dataset Pull + Wiring (M1136-M1285) — ✅ 完成
+
+> 10 tasks (Claude-47 to Claude-56), dataset 拉取 + 模块接线
+
+- Claude-51: wire `setup_hetero_mimo_training` to DesLocEngine in `train_three_stage.py`
+- Claude-52: wire `HeteroFP32GradAccumManager.accumulate()` into backward pass
+- Claude-53: wire `HeteroRecomputeConfig` into `DesLocEngine.forward()`
+- Claude-55: wire `CommitSequencePacker` + `HeteroBatchSampler` into data loading
+- Claude-56: wire `SharedLocalityCache` + `PCIeP2PCommunicator` into MIMO loop
+- 其余 Claude 完成 dataset pipeline 和配置任务
+
+---
+
+## Phase 10-12: Wiring Layer, Bug Fixes, register() (M1286-M1585) — ✅ 完成
+
+> Phase 10 (Claude-57~66): dataset pull + wiring + Blackwell tier
+> Phase 11 (Claude-67~76): wiring + dataset tasks
+> Phase 12 (R12-C1~C10): register() 初始批次 + scaling law + smoke test
+
+- R11-C1: wire `HeteroMIMOTrainingLoop` into `DesLocEngine.train()`
+- R11-C2: wire `HeteroFP32GradAccumManager` into backward pass
+- R11-C9: wire commit tokenizer special tokens to Megatron tokenizer
+- R12-C2: Stage 2 数据加载替换为 `build_commit_datasets()`
+- R12-C3: 为 5 个 hetero 模块添加 `register(engine)` 函数
+- R12-C9/C10: scaling law 7B prediction + DesLocEngine smoke test
+
+---
+
+## Phase 13: register() Bulk + Paper + Experiments + Eval (M1586-M1735) — ✅ 完成
+
+> 10 tasks (Claude-77 to Claude-86)
+
+- Claude-78: add `register()` to 6 hetero modules (batch 2)
+- Claude-82: NeurIPS 2026 paper skeleton — `main.tex`, `neurips_2026.sty`, Makefile
+- Claude-83: paper figure generation script + 5 figures
+- Claude-84: 7B pre-training experiment configs for ags1 5-GPU cluster
+- Claude-85: eval pipeline — BLEU/ROUGE-L/perplexity for Stage 3 commit completion
+- Claude-86: end-to-end integration tests for hetero module wiring
+
+---
+
+## Phase 14-15: Paper Content, Tests, Tools (M1736-M2035) — ✅ 完成
+
+> Phase 14 (Claude-87~96): register bulk + paper content + config + verify
+> Phase 15 (R15-C1~C10): FSDP, logging, checkpoint, Flash Attention, tools
+
+- Claude-89: add `register(engine)` to all 44 remaining hetero modules
+- Claude-90: fill Method section (3.1 Decomposed Sync, 3.2 LOC Cache, 3.3 AutoSP)
+- Claude-91: fill Section 4 (System Design) — tiers, PCIe comm, MIMO loop
+- Claude-92: fill Experiments section (Section 5) framework in `main.tex`
+- Claude-93: add Llama alias for standalone training pipeline import
+- Claude-94: `discover_and_register()` auto-scans `runtime/` and `runtime/zero/` for `hetero_*.py`
+- Claude-96: fill Introduction and Related Work sections in `main.tex`
+- R15-C1: FSDP 支持 — 5 张异构 GPU 替代 DDP
+- R15-C2: wandb and tensorboard logging to `run_pretrain.py`
+- R15-C3: checkpoint save/resume
+- R15-C5: `tools/count_tokens.py` 统计 token 总量
+- R15-C8: Flash Attention 支持 for GroupedQueryAttention
+- R14-C1: `benchmark_mfu.py` — 纯 torch MFU benchmark
+- R14-C2: `data/prepare_commits.py` streaming 加载 + tokenize
+- R14-C3: `tools/convert_to_hf.py` 转 HF safetensors
+- R14-C6: `configs/7b_commitpack.yaml` + `--config` flag
+
+---
+
+## Phase 16: 收尾 (当前轮, Claude-97~106) — 🔄 进行中
+
+> 10 finishing tasks — paper polish, tools, tests, README
+
+- Claude-98: full Appendix A-D (hyperparams, convergence proof, topology, ablations) ✅
+- Claude-99: DES-LOC convergence analysis module ✅
+- Claude-100: MFU calculator for heterogeneous GPU clusters ✅
+- Claude-101: HeteroRegistry auto-discovery test ✅
+- Claude-102~106: 剩余收尾任务进行中
+
+---
+
+## 项目统计 (Phase 16 时点)
+
+| 指标 | 数值 |
+|------|------|
+| 总 commits | 8283 |
+| hetero_*.py 模块数 | 138 (167,044 行) |
+| register() 覆盖率 | 77/138 (55.8%) |
+| 论文行数 (FAUST_nips2026/*.tex) | 1,674 行 |
+| 当前 HEAD | e1f8302d |
+
+---
+
+## Next Steps
+
+1. **真机测试 on ags1**: 在 5-GPU 异构集群 (2×A6000 + 1×H100 NVL) 上运行 7B 完整训练
+2. **收集实验数据**: DES-LOC vs DDP vs LocalAdam 基线对比, Kx sweep, SP scalability
+3. **填充论文 TBD**: 用真实实验数据替换 `main.tex` 中所有 TBD 占位符 (表格数值, 图表数据点)
+4. **register() 覆盖提升**: 剩余 61 个 hetero 模块尚未添加 `register(engine)` 接口
+5. **NeurIPS 2026 投稿准备**: 完成 camera-ready 格式, 补充 appendix 实验细节
