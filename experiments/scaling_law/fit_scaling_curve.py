@@ -613,5 +613,59 @@ def main() -> None:
     _try_plot(points, fit, os.path.join(out_dir, "scaling_fit_plot.png"))
 
 
+def predict_7b_training(results_json: str = None) -> dict:
+    """Predict loss for a 7B model at various token budgets.
+
+    Uses the Chinchilla-style scaling law: L(N, D) = E + A/N^alpha + B/D^beta
+    with parameters fitted from prior experiments on the heterogeneous cluster.
+
+    Returns a dict with predictions and writes to scaling_7b_predictions.json.
+    """
+    if results_json is None:
+        results_json = os.path.join(
+            os.path.dirname(__file__), "scaling_fit_results.json"
+        )
+    with open(results_json) as f:
+        params = json.load(f)
+
+    E = params["E"]
+    A = params["A"]
+    alpha = params["alpha"]
+    B = params["B"]
+    beta = params["beta"]
+
+    N = 7e9  # 7B parameters
+    token_budgets = [20e9, 50e9, 100e9, 140e9, 300e9]
+
+    predictions = []
+    for D in token_budgets:
+        L = E + A / (N ** alpha) + B / (D ** beta)
+        total_flops = 6 * N * D
+        predictions.append({
+            "tokens_B": D / 1e9,
+            "predicted_loss": round(L, 4),
+            "total_pflops": round(total_flops / 1e15, 1),
+            "chinchilla_ratio": round(D / N, 1),
+        })
+
+    result = {
+        "model_params": "7B",
+        "scaling_law": f"L = {E:.4f} + {A:.2f}/N^{alpha:.4f} + {B:.2f}/D^{beta:.4f}",
+        "predictions": predictions,
+    }
+
+    out_path = os.path.join(os.path.dirname(__file__), "scaling_7b_predictions.json")
+    with open(out_path, "w") as f:
+        json.dump(result, f, indent=2)
+    print(f"[predict_7b] Saved to {out_path}")
+    for p in predictions:
+        print(f"  {p['tokens_B']:.0f}B tokens -> loss={p['predicted_loss']:.4f}")
+    return result
+
+
 if __name__ == "__main__":
-    main()
+    import sys
+    if len(sys.argv) > 1 and sys.argv[1] == "--predict-7b":
+        predict_7b_training()
+    else:
+        main()

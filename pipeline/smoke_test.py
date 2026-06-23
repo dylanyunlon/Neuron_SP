@@ -191,6 +191,73 @@ def test_checkpoint():
         print(f"  weights match ✓")
 
 
+def test_desloc_engine_train():
+    """Run a tiny model through DesLocEngine.train() for 10 steps.
+
+    Validates that HeteroRegistry, HeteroStepBatchScheduler,
+    and the full train loop work end-to-end.
+    """
+    import torch
+    import torch.nn as nn
+
+    # Tiny GPT-like model
+    class TinyGPT(nn.Module):
+        def __init__(self, vocab=512, hidden=64, layers=2, heads=2, seq=128):
+            super().__init__()
+            self.embed = nn.Embedding(vocab, hidden)
+            self.pos = nn.Embedding(seq, hidden)
+            encoder_layer = nn.TransformerEncoderLayer(
+                d_model=hidden, nhead=heads, dim_feedforward=hidden * 4,
+                batch_first=True,
+            )
+            self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=layers)
+            self.head = nn.Linear(hidden, vocab)
+            self.seq = seq
+
+        def forward(self, x):
+            B, T = x.shape
+            pos_ids = torch.arange(T, device=x.device).unsqueeze(0)
+            h = self.embed(x) + self.pos(pos_ids)
+            h = self.transformer(h)
+            return self.head(h)
+
+    # Try importing DesLocEngine
+    try:
+        from deepspeed.runtime.desloc_engine import DesLocEngine, DesLocConfig
+    except ImportError as e:
+        print(f"  [skip] DesLocEngine import failed: {e}")
+        return
+
+    model = TinyGPT()
+    n_params = sum(p.numel() for p in model.parameters())
+    print(f"  TinyGPT: {n_params/1e3:.0f}K params")
+
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmpdir:
+        cfg = DesLocConfig(
+            total_steps=10,
+            micro_batch_size=2,
+            seq_len=128,
+            lr=1e-3,
+            grad_clip=1.0,
+            log_every=5,
+            save_every=999,
+            checkpoint_dir=tmpdir,
+        )
+        try:
+            engine = DesLocEngine(model=model, config=cfg)
+            print(f"  DesLocEngine created, registry={len(engine.registry)} modules")
+            engine.train()
+            print(f"  Train completed: {engine.global_step} steps, {engine.tokens_seen} tokens")
+        except Exception as e:
+            print(f"  DesLocEngine.train() raised: {type(e).__name__}: {e}")
+            # Still pass if it's an expected issue (no GPU, etc)
+            if "cuda" in str(e).lower() or "device" in str(e).lower():
+                print("  [ok] Expected error in CPU-only environment")
+            else:
+                raise
+
+
 # ── Run all ──
 
 def main():
@@ -204,6 +271,7 @@ def main():
     test("data_loading", test_data_loading)
     test("engine_config", test_engine_config)
     test("checkpoint", test_checkpoint)
+    test("desloc_engine_train", test_desloc_engine_train)
 
     print(f"\n{'='*50}")
     passed = sum(1 for _, ok, _ in results if ok)

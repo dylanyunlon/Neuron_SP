@@ -1,0 +1,36 @@
+{
+  "model_params": "7B",
+  "scaling_law": "L = 1.7180 + 447.61/N^0.3433 + 483.89/D^0.2902",
+  "predictions": [
+    {
+      "tokens_B": 20.0,
+      "predicted_loss": 2.4013,
+      "total_pflops": 840000.0,
+      "chinchilla_ratio": 2.9
+    },
+    {
+      "tokens_B": 50.0,
+      "predicted_loss": 2.2854,
+      "total_pflops": 2100000.0,
+      "chinchilla_ratio": 7.1
+    },
+    {
+      "tokens_B": 100.0,
+      "predicted_loss": 2.216,
+      "total_pflops": 4200000.0,
+      "chinchilla_ratio": 14.3
+    },
+    {
+      "tokens_B": 140.0,
+      "predicted_loss": 2.1871,
+      "total_pflops": 5880000.0,
+      "chinchilla_ratio": 20.0
+    },
+    {
+      "tokens_B": 300.0,
+      "predicted_loss": 2.1311,
+      "total_pflops": 12600000.0,
+      "chinchilla_ratio": 42.9
+    }
+  ]
+}
