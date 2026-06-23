@@ -89,6 +89,13 @@ from datasets.bigcode.commit_packing import (  # noqa: E402
     PackedSequence,
 )
 
+from deepspeed.runtime.hetero_mimo_training_loop import (  # noqa: E402
+    HeteroMIMOTrainingLoop,
+    PCIeP2PCommunicator,
+    SharedLocalityCache,
+    setup_hetero_mimo_training,
+)
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -1253,6 +1260,27 @@ class DesLocEngine:
 
         logger.info("Engine ready. Starting from step %d.", self.global_step)
 
+        # --- Phase 9: HeteroMIMOTrainingLoop ---
+        # Initialize PCIeP2PCommunicator and SharedLocalityCache via
+        # setup_hetero_mimo_training(), then store the returned
+        # HeteroMIMOTrainingLoop for use in the training loop.
+        try:
+            self.mimo_loop: Optional[HeteroMIMOTrainingLoop] = setup_hetero_mimo_training(
+                model=self.model,
+                grad_clip=config.grad_clip,
+            )
+            logger.info(
+                "HeteroMIMOTrainingLoop initialized via setup_hetero_mimo_training(); "
+                "PCIeP2PCommunicator and SharedLocalityCache are live."
+            )
+        except Exception as _mimo_exc:  # noqa: BLE001
+            logger.warning(
+                "setup_hetero_mimo_training() failed (%s); "
+                "training loop will use standard forward/backward.",
+                _mimo_exc,
+            )
+            self.mimo_loop = None
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -1329,36 +1357,86 @@ class DesLocEngine:
                 input_ids = input_ids.to(self.primary_device, non_blocking=True)
                 labels = labels.to(self.primary_device, non_blocking=True)
 
-                # Prepare FP32 gradient accumulators for this micro-batch
-                self.fp32_grad_accum_manager.before_backward()
+                if self.mimo_loop is not None:
+                    # Use HeteroMIMOTrainingLoop.step(batch) — wires
+                    # PCIeP2PCommunicator and SharedLocalityCache into the
+                    # forward/backward pass.
+                    batch = (input_ids, labels)
 
-                # Forward
-                with torch.autocast(
-                    device_type=self.primary_device.type,
-                    dtype=_DEFAULT_DTYPE,
-                    enabled=(self.primary_device.type == "cuda"),
-                ):
-                    logits: torch.Tensor = self.model(input_ids)
-                    # Shift: predict token t+1 from token t
-                    B, T, V = logits.shape
-                    shift_logits = logits[:, :-1, :].contiguous().reshape(-1, V)
-                    shift_labels = labels[:, :T - 1].contiguous().reshape(-1)
-                    loss = F.cross_entropy(shift_logits, shift_labels)
-                    scaled_loss = loss / num_microbatches
+                    def _forward_backward_func(
+                        forward_only: bool = False,
+                        p2p_communicator=None,
+                        pg_collection=None,
+                        data_iterator=None,
+                        model=None,
+                        config=None,
+                        iteration: int = 0,
+                        _ids=input_ids,
+                        _lbl=labels,
+                        _num_mb=num_microbatches,
+                    ):
+                        with torch.autocast(
+                            device_type=self.primary_device.type,
+                            dtype=_DEFAULT_DTYPE,
+                            enabled=(self.primary_device.type == "cuda"),
+                        ):
+                            logits: torch.Tensor = self.model(_ids)
+                            B, T, V = logits.shape
+                            shift_logits = logits[:, :-1, :].contiguous().reshape(-1, V)
+                            shift_labels = _lbl[:, :T - 1].contiguous().reshape(-1)
+                            loss = F.cross_entropy(shift_logits, shift_labels)
+                            scaled_loss = loss / _num_mb
+                        if not forward_only:
+                            scaled_loss.backward()
+                        return [loss]
 
-                # Backward
-                scaled_loss.backward()
-                # Precision alignment: promote BF16 grads to FP32 accumulators
-                # for parameters that require it (three-tier precision policy).
-                self.fp32_grad_manager.accumulate()
-                step_loss += loss.item()
+                    mimo_result = self.mimo_loop.train_step(
+                        forward_backward_func=_forward_backward_func,
+                        data_iterator=iter([batch]),
+                        config=cfg,
+                        iteration=step * num_microbatches + micro,
+                    )
+                    step_loss += mimo_result.loss
+                else:
+                    # Standard forward/backward path
+                    # Prepare FP32 gradient accumulators for this micro-batch
+                    self.fp32_grad_accum_manager.before_backward()
+                    # Backward
+                    scaled_loss.backward()
+                    # Precision alignment: promote BF16 grads to FP32 accumulators
+                    # for parameters that require it (three-tier precision policy).
+                    self.fp32_grad_manager.accumulate()
+                    step_loss += loss.item()
 
-            # Synchronize FP32 gradients (scale + all-reduce) across the DP group
-            # before gradient clipping and optimizer.step().
-            self.fp32_grad_accum_manager.after_backward(scale=1.0 / num_microbatches)
+                    # Forward
+                    with torch.autocast(
+                        device_type=self.primary_device.type,
+                        dtype=_DEFAULT_DTYPE,
+                        enabled=(self.primary_device.type == "cuda"),
+                    ):
+                        logits: torch.Tensor = self.model(input_ids)
+                        # Shift: predict token t+1 from token t
+                        B, T, V = logits.shape
+                        shift_logits = logits[:, :-1, :].contiguous().reshape(-1, V)
+                        shift_labels = labels[:, :T - 1].contiguous().reshape(-1)
+                        loss = F.cross_entropy(shift_logits, shift_labels)
+                        scaled_loss = loss / num_microbatches
 
-            # Gradient clipping
-            gnorm = clip_grad_norm_(self.model.parameters(), cfg.grad_clip)
+                    # Backward
+                    scaled_loss.backward()
+                    step_loss += loss.item()
+
+            if self.mimo_loop is None:
+                # Synchronize FP32 gradients (scale + all-reduce) across the DP group
+                # before gradient clipping and optimizer.step().
+                self.fp32_grad_accum_manager.after_backward(scale=1.0 / num_microbatches)
+
+            # Gradient clipping (only for standard path; mimo_loop handles it internally)
+            if self.mimo_loop is None:
+                gnorm = clip_grad_norm_(self.model.parameters(), cfg.grad_clip)
+            else:
+                # mimo_loop.train_step() already clipped; retrieve norm from last result
+                gnorm = mimo_result.grad_norm  # type: ignore[possibly-undefined]
 
             # HeteroGradNorm skip decision
             _should_skip = _skip_controller.should_skip()
@@ -1366,16 +1444,26 @@ class DesLocEngine:
                 f"[hetero_grad] step={step} grad_norm={gnorm:.6f} "
                 f"skip={_should_skip} total_skips={_skip_count}"
             )
-            if _should_skip:
-                _skip_count += 1
-                print(f"[hetero_grad] SKIP step={step} (cumulative skips={_skip_count})")
+            if self.mimo_loop is None:
+                # Standard path: apply skip logic and step the engine's optimizer
+                if _should_skip:
+                    _skip_count += 1
+                    print(f"[hetero_grad] SKIP step={step} (cumulative skips={_skip_count})")
+                else:
+                    # Optimizer + scheduler step
+                    self.optimizer.step()
+                    self.scheduler.step()
             else:
+                # HeteroMIMOTrainingLoop path: optimizer/clip already done inside
+                # train_step(); still honour the skip controller for the scheduler.
                 # Cross-device gradient synchronisation (PCIe-aware all-reduce
-                # across heterogeneous tiers) before the optimizer consumes grads.
+                # across heterogeneous tiers) before the scheduler step.
                 self.fp32_grad_manager.sync()
-                # Optimizer + scheduler step
-                self.optimizer.step()
-                self.scheduler.step()
+                if _should_skip:
+                    _skip_count += 1
+                    print(f"[hetero_grad] SKIP step={step} (cumulative skips={_skip_count})")
+                else:
+                    self.scheduler.step()
 
             # Accounting
             self.global_step = step + 1
