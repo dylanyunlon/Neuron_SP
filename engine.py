@@ -783,6 +783,27 @@ class DeepSpeedEngine(Module):
         except Exception as e:
             logger.warning(f"DES-LOC: HeteroRegistry skipped: {e}")
 
+        # 5. HeteroFP32GradAccumManager — three-tier precision for ZeRO backward
+        self._hetero_fp32_grad_accum = None
+        try:
+            from deepspeed.runtime.hetero_fp32_grad_accum import (
+                HeteroFP32GradAccumManager,
+                HeteroFP32GradAccumConfig,
+            )
+            fp32_config = HeteroFP32GradAccumConfig()
+            dp_group = self.data_parallel_group if hasattr(self, 'data_parallel_group') and self.data_parallel_group else None
+            if dp_group is not None:
+                device = next(self.module.parameters()).device
+                self._hetero_fp32_grad_accum = HeteroFP32GradAccumManager(
+                    config=fp32_config,
+                    model=self.module,
+                    data_parallel_group=dp_group,
+                    device=device,
+                )
+                logger.info("DES-LOC: HeteroFP32GradAccumManager wired")
+        except Exception as e:
+            logger.warning(f"DES-LOC: HeteroFP32GradAccumManager skipped: {e}")
+
     def _optimized_linear_offload_setup(self):
         self.optimized_linear_base_weight_sharding = False
         self.optimized_linear_lora_enabled = False
@@ -3331,6 +3352,13 @@ class DeepSpeedEngine(Module):
 
         see_memory_usage("Engine before backward", force=self.memory_breakdown())
 
+        # DES-LOC Phase 8 (M1016): zero FP32 grad buffers before backward
+        if self._hetero_fp32_grad_accum is not None:
+            try:
+                self._hetero_fp32_grad_accum.before_backward()
+            except Exception:
+                pass
+
         assert not self.eigenvalue_enabled(), "Eigenvalue is not supported with non-scalar backward"
         assert not self.amp_enabled(), "Apex AMP is not supported with non-scalar backward"
 
@@ -3360,6 +3388,13 @@ class DeepSpeedEngine(Module):
         if isinstance(self.optimizer, ZeROOptimizer):
             self.optimizer.backward_epilogue()
             self.optimizer.exit_backward()
+
+        # DES-LOC Phase 8 (M1016): sync FP32 grad accum after reduce
+        if self._hetero_fp32_grad_accum is not None:
+            try:
+                self._hetero_fp32_grad_accum.after_backward()
+            except Exception:
+                pass
 
         see_memory_usage("Engine after backward", force=self.memory_breakdown())
         self._stop_timers(self.engine_timers.backward_reduce_timers)
