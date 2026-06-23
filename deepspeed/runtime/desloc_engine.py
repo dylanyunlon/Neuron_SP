@@ -36,19 +36,6 @@ from torch.nn.utils import clip_grad_norm_
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
 
-from deepspeed.runtime.hetero_gdn_selective_recompute import (
-    build_neuron_sp_config,
-    DeviceClass,
-    HeteroRecomputeConfig,
-)
-
-from deepspeed.runtime.hetero_step_batch_scheduler import (
-    HeteroStepBatchScheduler,
-    DeviceProfile,
-    MicrobatchAllocation,
-    DEFAULT_DES_LOC_DEVICE_PROFILES,
-)
-
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -70,52 +57,11 @@ except Exception as _eval_import_exc:
     logger.debug("eval/run_eval.py not importable (%s); eval hook disabled.", _eval_import_exc)
     _run_periodic_eval = None
 
-from deepspeed.runtime.hetero_grad_norm_skip import (  # noqa: E402
-    HeteroGradNormConfig,
-    integrate_with_deepspeed_engine,
-)
-
-from deepspeed.runtime.hetero_fp32_grad_accum import (  # noqa: E402
-    HeteroFP32GradAccumConfig,
-    HeteroFP32GradAccumManager,
-)
-from deepspeed.runtime.hetero_fp32_grad_accum import HeteroFP32GradAccumManager  # noqa: E402,F811
-
-from deepspeed.runtime.hetero_mimo_training_loop import (  # noqa: E402
-    HeteroMIMOTrainingLoop,
-    setup_hetero_mimo_training,
-)
-
-from deepspeed.checkpoint.hetero_checkpoint_config import (  # noqa: E402
-    HeteroCheckpointConfig,
-    TierRole,
-    build_config_for_cluster,
-)
-from deepspeed.checkpoint.hetero_async_checkpoint_save import (  # noqa: E402
-    HeteroAsyncCheckpointScheduler,
-    build_hetero_async_save_pipeline,
-    validate_async_checkpoint_config,
-)
-from deepspeed.checkpoint.hetero_async_checkpoint_load import (  # noqa: E402
-    HeteroAsyncCheckpointLoad,
-    detect_device_arch,
-    DeviceArch,
-)
-
-from datasets.bigcode.commit_packing import (  # noqa: E402
-    CommitSequencePacker,
-    HeteroBatchSampler,
-    PackedSequence,
-    compute_packing_stats,
-)
-
-from deepspeed.runtime.hetero_mimo_training_loop import (  # noqa: E402
-    DeviceCapabilityRegistry,
-    HeteroMIMOTrainingLoop,
-    PCIeP2PCommunicator,
-    SharedLocalityCache,
-    setup_hetero_mimo_training,
-)
+# ---------------------------------------------------------------------------
+# NOTE: All deepspeed.runtime.hetero_* and deepspeed.checkpoint.hetero_*
+# imports have been made lazy (imported inside __init__ / methods) to avoid
+# triggering deepspeed/__init__.py → apex dependency at module import time.
+# ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -957,6 +903,93 @@ class DesLocEngine:
         self.tokenizer = tokenizer
         self._setup_logging()
 
+        # ------------------------------------------------------------------
+        # Lazy imports: hetero_* modules are imported here (inside __init__)
+        # so that merely importing desloc_engine does NOT trigger the
+        # deepspeed/__init__.py → apex dependency chain.
+        # ------------------------------------------------------------------
+        from deepspeed.runtime.hetero_gdn_selective_recompute import (  # noqa: PLC0415
+            build_neuron_sp_config,
+            DeviceClass,
+            HeteroRecomputeConfig,
+        )
+        from deepspeed.runtime.hetero_step_batch_scheduler import (  # noqa: PLC0415
+            HeteroStepBatchScheduler,
+            DeviceProfile,
+            MicrobatchAllocation,
+            DEFAULT_DES_LOC_DEVICE_PROFILES,
+        )
+        from deepspeed.runtime.hetero_grad_norm_skip import (  # noqa: PLC0415
+            HeteroGradNormConfig,
+            integrate_with_deepspeed_engine,
+        )
+        from deepspeed.runtime.hetero_fp32_grad_accum import (  # noqa: PLC0415
+            HeteroFP32GradAccumConfig,
+            HeteroFP32GradAccumManager,
+        )
+        from deepspeed.runtime.hetero_mimo_training_loop import (  # noqa: PLC0415
+            DeviceCapabilityRegistry,
+            HeteroMIMOTrainingLoop,
+            PCIeP2PCommunicator,
+            SharedLocalityCache,
+            setup_hetero_mimo_training,
+        )
+        from deepspeed.checkpoint.hetero_checkpoint_config import (  # noqa: PLC0415
+            HeteroCheckpointConfig,
+            TierRole,
+            build_config_for_cluster,
+        )
+        from deepspeed.checkpoint.hetero_async_checkpoint_save import (  # noqa: PLC0415
+            HeteroAsyncCheckpointScheduler,
+            build_hetero_async_save_pipeline,
+            validate_async_checkpoint_config,
+        )
+        from deepspeed.checkpoint.hetero_async_checkpoint_load import (  # noqa: PLC0415
+            HeteroAsyncCheckpointLoad,
+            detect_device_arch,
+            DeviceArch,
+        )
+        from datasets.bigcode.commit_packing import (  # noqa: PLC0415
+            CommitSequencePacker,
+            HeteroBatchSampler,
+            PackedSequence,
+            compute_packing_stats,
+        )
+        # Store frequently-used lazy symbols on the instance so sub-methods
+        # (save_checkpoint, load_checkpoint, train) can reference them without
+        # re-importing each time.
+        self._lazy = {
+            "build_neuron_sp_config": build_neuron_sp_config,
+            "DeviceClass": DeviceClass,
+            "HeteroRecomputeConfig": HeteroRecomputeConfig,
+            "HeteroStepBatchScheduler": HeteroStepBatchScheduler,
+            "DeviceProfile": DeviceProfile,
+            "MicrobatchAllocation": MicrobatchAllocation,
+            "DEFAULT_DES_LOC_DEVICE_PROFILES": DEFAULT_DES_LOC_DEVICE_PROFILES,
+            "HeteroGradNormConfig": HeteroGradNormConfig,
+            "integrate_with_deepspeed_engine": integrate_with_deepspeed_engine,
+            "HeteroFP32GradAccumConfig": HeteroFP32GradAccumConfig,
+            "HeteroFP32GradAccumManager": HeteroFP32GradAccumManager,
+            "DeviceCapabilityRegistry": DeviceCapabilityRegistry,
+            "HeteroMIMOTrainingLoop": HeteroMIMOTrainingLoop,
+            "PCIeP2PCommunicator": PCIeP2PCommunicator,
+            "SharedLocalityCache": SharedLocalityCache,
+            "setup_hetero_mimo_training": setup_hetero_mimo_training,
+            "HeteroCheckpointConfig": HeteroCheckpointConfig,
+            "TierRole": TierRole,
+            "build_config_for_cluster": build_config_for_cluster,
+            "HeteroAsyncCheckpointScheduler": HeteroAsyncCheckpointScheduler,
+            "build_hetero_async_save_pipeline": build_hetero_async_save_pipeline,
+            "validate_async_checkpoint_config": validate_async_checkpoint_config,
+            "HeteroAsyncCheckpointLoad": HeteroAsyncCheckpointLoad,
+            "detect_device_arch": detect_device_arch,
+            "DeviceArch": DeviceArch,
+            "CommitSequencePacker": CommitSequencePacker,
+            "HeteroBatchSampler": HeteroBatchSampler,
+            "PackedSequence": PackedSequence,
+            "compute_packing_stats": compute_packing_stats,
+        }
+
         logger.info("=" * 70)
         logger.info("DES-LOC Engine initializing — Neuron_SP / production build")
         logger.info("=" * 70)
@@ -1467,6 +1500,13 @@ class DesLocEngine:
           - Optimizer + scheduler step
           - Periodic logging and checkpointing
         """
+        # Lazy imports (hetero_* not imported at module level to avoid apex dep)
+        from deepspeed.runtime.hetero_gdn_selective_recompute import build_neuron_sp_config  # noqa: PLC0415
+        from deepspeed.runtime.hetero_grad_norm_skip import (  # noqa: PLC0415
+            HeteroGradNormConfig,
+            integrate_with_deepspeed_engine,
+        )
+
         cfg = self.config
         self.model.train()
         logger.info("Training start: %d steps, grad_accum=%d",
@@ -1749,6 +1789,17 @@ class DesLocEngine:
         Args:
             path: Destination file path (parent dirs are created as needed).
         """
+        # Lazy imports (hetero_* not imported at module level to avoid apex dep)
+        from deepspeed.checkpoint.hetero_async_checkpoint_save import (  # noqa: PLC0415
+            build_hetero_async_save_pipeline,
+            validate_async_checkpoint_config,
+        )
+        from deepspeed.checkpoint.hetero_async_checkpoint_load import (  # noqa: PLC0415
+            detect_device_arch,
+            DeviceArch,
+        )
+        from deepspeed.checkpoint.hetero_checkpoint_config import TierRole  # noqa: PLC0415
+
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -1853,6 +1904,13 @@ class DesLocEngine:
         Raises:
             FileNotFoundError: If *path* does not exist.
         """
+        # Lazy imports (hetero_* not imported at module level to avoid apex dep)
+        from deepspeed.checkpoint.hetero_async_checkpoint_load import (  # noqa: PLC0415
+            HeteroAsyncCheckpointLoad,
+            detect_device_arch,
+            DeviceArch,
+        )
+
         path = Path(path)
         if not path.exists():
             raise FileNotFoundError(f"Checkpoint not found: {path}")
