@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 DES-LOC CodeGen Evaluation Harness (M821-M835)
-Supports: HumanEval (pass@k), MBPP, commit message prediction
+Supports: HumanEval (pass@k), MBPP, commit prediction (message+context → diff)
 """
 
 import argparse
@@ -27,6 +27,46 @@ try:
     HAS_TRANSFORMERS = True
 except ImportError:
     HAS_TRANSFORMERS = False
+
+try:
+    import yaml
+    HAS_YAML = True
+except ImportError:
+    HAS_YAML = False
+
+
+# ---------------------------------------------------------------------------
+# Config loading
+# ---------------------------------------------------------------------------
+
+_DEFAULT_EVAL_CONFIG = {
+    "eval": {
+        "benchmarks": ["humaneval", "mbpp", "commit"],
+        "humaneval": {"samples_per_task": 10, "k_values": [1, 5, 10],
+                      "max_new_tokens": 512, "temperature": 0.8},
+        "mbpp": {"max_new_tokens": 256, "temperature": 0.2},
+        "commit_prediction": {
+            "n_samples": 1000, "max_new_tokens": 64, "temperature": 0.1,
+            "metrics": ["bleu", "rouge_l", "exact_match"],
+        },
+        "output_dir": "desloc_results/eval_runs",
+    },
+    "data": {"commitpack_split": "test", "commitpack_n": 1000},
+}
+
+
+def load_eval_config(config_path: Optional[str] = None) -> dict:
+    """Load eval_config.yaml; return defaults if unavailable."""
+    if config_path is None:
+        config_path = os.path.join(os.path.dirname(__file__), "eval_config.yaml")
+    if HAS_YAML and os.path.exists(config_path):
+        try:
+            with open(config_path) as f:
+                cfg = yaml.safe_load(f)
+            return cfg if cfg else _DEFAULT_EVAL_CONFIG
+        except Exception as e:
+            print(f"  [WARN] Could not parse {config_path}: {e}; using defaults")
+    return _DEFAULT_EVAL_CONFIG
 
 # ---------------------------------------------------------------------------
 # Metric helpers
@@ -294,83 +334,250 @@ def run_mbpp(model: Optional["ModelWrapper"], use_stubs: bool = False) -> dict:
 
 COMMITPACK_STUB = [
     {
-        "diff": "diff --git a/src/utils.py b/src/utils.py\n--- a/src/utils.py\n+++ b/src/utils.py\n@@ -10,6 +10,10 @@ def parse_args():\n+    parser.add_argument('--lr', type=float, default=1e-4)\n+    parser.add_argument('--epochs', type=int, default=10)\n",
+        "old_file": "src/utils.py",
+        "new_file": "src/utils.py",
+        "old_contents": "import argparse\n\ndef parse_args():\n    parser = argparse.ArgumentParser()\n    parser.add_argument('--batch-size', type=int, default=32)\n    return parser.parse_args()\n",
+        "new_contents": "import argparse\n\ndef parse_args():\n    parser = argparse.ArgumentParser()\n    parser.add_argument('--batch-size', type=int, default=32)\n    parser.add_argument('--lr', type=float, default=1e-4)\n    parser.add_argument('--epochs', type=int, default=10)\n    return parser.parse_args()\n",
+        "subject": "add lr and epochs arguments to arg parser",
         "message": "add lr and epochs arguments to arg parser",
+        "diff": "diff --git a/src/utils.py b/src/utils.py\n--- a/src/utils.py\n+++ b/src/utils.py\n@@ -4,4 +4,6 @@ def parse_args():\n     parser.add_argument('--batch-size', type=int, default=32)\n+    parser.add_argument('--lr', type=float, default=1e-4)\n+    parser.add_argument('--epochs', type=int, default=10)\n     return parser.parse_args()\n",
     },
     {
-        "diff": "diff --git a/README.md b/README.md\n--- a/README.md\n+++ b/README.md\n@@ -1,3 +1,5 @@\n+# DES-LOC\n+Distributed Efficient Supervised Learning with Optimization Clusters\n",
+        "old_file": "README.md",
+        "new_file": "README.md",
+        "old_contents": "A machine learning project.\n",
+        "new_contents": "# DES-LOC\nDistributed Efficient Supervised Learning with Optimization Clusters\n\nA machine learning project.\n",
+        "subject": "add project title and description to README",
         "message": "add project title and description to README",
+        "diff": "diff --git a/README.md b/README.md\n--- a/README.md\n+++ b/README.md\n@@ -1,1 +1,3 @@\n+# DES-LOC\n+Distributed Efficient Supervised Learning with Optimization Clusters\n+\n A machine learning project.\n",
     },
     {
-        "diff": "diff --git a/train.py b/train.py\n--- a/train.py\n+++ b/train.py\n@@ -45,3 +45,7 @@\n+    if step % eval_interval == 0:\n+        loss = evaluate(model, val_loader)\n+        logger.info(f'step {step} val_loss={loss:.4f}')\n",
+        "old_file": "train.py",
+        "new_file": "train.py",
+        "old_contents": "for step in range(max_steps):\n    loss = train_step(model, batch)\n    optimizer.step()\n",
+        "new_contents": "for step in range(max_steps):\n    loss = train_step(model, batch)\n    optimizer.step()\n    if step % eval_interval == 0:\n        loss = evaluate(model, val_loader)\n        logger.info(f'step {step} val_loss={loss:.4f}')\n",
+        "subject": "add periodic validation loss logging during training",
         "message": "add periodic validation loss logging during training",
+        "diff": "diff --git a/train.py b/train.py\n--- a/train.py\n+++ b/train.py\n@@ -3,2 +3,5 @@\n     optimizer.step()\n+    if step % eval_interval == 0:\n+        loss = evaluate(model, val_loader)\n+        logger.info(f'step {step} val_loss={loss:.4f}')\n",
     },
 ]
 
 
-def load_commitpack_sample(n: int = 1000) -> list:
-    """Attempt to load CommitPackFT; fall back to stub on failure."""
+def _compute_unified_diff(old_contents: str, new_contents: str,
+                          old_file: str = "a", new_file: str = "b") -> str:
+    """Compute a unified diff string from old/new file contents."""
+    import difflib
+    old_lines = old_contents.splitlines(keepends=True)
+    new_lines = new_contents.splitlines(keepends=True)
+    diff_lines = list(difflib.unified_diff(
+        old_lines, new_lines,
+        fromfile=f"a/{old_file}", tofile=f"b/{new_file}",
+    ))
+    return "".join(diff_lines)
+
+
+def _build_commit_prediction_prompt(message: str, old_contents: str,
+                                    filename: str) -> str:
+    """
+    Build a prompt for commit prediction evaluation.
+
+    Given:
+      - commit message (what the developer intended to change)
+      - file context before the change (old_contents)
+      - filename
+
+    The model should predict the unified diff (the actual change).
+    """
+    prompt = (
+        f"File: {filename}\n"
+        f"Commit message: {message}\n\n"
+        f"File contents before the commit:\n"
+        f"```\n{old_contents}\n```\n\n"
+        f"Generate the unified diff for this commit:\n"
+    )
+    return prompt
+
+
+def load_commitpack_sample(n: int = 1000, split: str = "test") -> list:
+    """
+    Load CommitPackFT samples.  Each returned item includes the fields
+    needed for commit prediction evaluation:
+      - old_file, new_file
+      - old_contents, new_contents
+      - subject / message  (commit description)
+      - diff               (ground-truth unified diff; computed if absent)
+
+    Falls back to COMMITPACK_STUB on any failure.
+    """
+    # 1) Try a local JSONL cache first (written by extract_commitpack_test.py)
+    local_path = os.path.join(
+        os.path.dirname(__file__), "data", "commitpack_test_1000.jsonl"
+    )
+    if os.path.exists(local_path):
+        try:
+            samples = []
+            with open(local_path) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    item = json.loads(line)
+                    samples.append(item)
+                    if len(samples) >= n:
+                        break
+            if samples:
+                print(f"  [INFO] Loaded {len(samples)} samples from {local_path}")
+                return samples
+        except Exception as e:
+            print(f"  [WARN] Local cache read failed ({e}), trying HF datasets")
+
+    # 2) Try HuggingFace datasets (bigcode/commitpackft)
     try:
         import datasets as hf_datasets
         ds = hf_datasets.load_dataset(
-            "bigcode/commitpackft", split="test", streaming=True
+            "bigcode/commitpackft", split=split, streaming=True
         )
         samples = []
         for item in ds:
-            samples.append({"diff": item.get("diff", ""), "message": item.get("message", "")})
+            samples.append({
+                "old_file":      item.get("old_file", "file"),
+                "new_file":      item.get("new_file", "file"),
+                "old_contents":  item.get("old_contents", ""),
+                "new_contents":  item.get("new_contents", ""),
+                "subject":       item.get("subject", item.get("message", "")),
+                "message":       item.get("message", ""),
+                "diff":          item.get("diff", ""),
+            })
             if len(samples) >= n:
                 break
         if samples:
             return samples
     except Exception as e:
-        print(f"  [WARN] CommitPackFT load failed ({e}), using stubs")
+        print(f"  [WARN] CommitPackFT HF load failed ({e}), using stubs")
+
     return COMMITPACK_STUB
 
 
 def run_commit_prediction(model: Optional["ModelWrapper"], n_samples: int = 1000,
-                          use_stubs: bool = False) -> dict:
-    print(f"\n=== Commit Message Prediction (n={n_samples}) ===")
+                          max_new_tokens: int = 64, temperature: float = 0.1,
+                          metrics: Optional[list] = None,
+                          use_stubs: bool = False,
+                          config: Optional[dict] = None) -> dict:
+    """
+    Commit prediction evaluation.
+
+    Given a commit message and the file context (old_contents), the model
+    predicts the diff.  The predicted diff is compared against the ground-truth
+    diff using BLEU, ROUGE-L, and exact-match.
+
+    Parameters are read from eval_config.yaml (commit_prediction section) when
+    *config* is supplied; explicit keyword arguments take precedence.
+    """
+    # Read config overrides
+    if config is not None:
+        cp_cfg = config.get("eval", {}).get("commit_prediction", {})
+        n_samples     = cp_cfg.get("n_samples",      n_samples)
+        max_new_tokens = cp_cfg.get("max_new_tokens", max_new_tokens)
+        temperature    = cp_cfg.get("temperature",    temperature)
+        if metrics is None:
+            metrics = cp_cfg.get("metrics", ["bleu", "rouge_l", "exact_match"])
+        split = config.get("data", {}).get("commitpack_split", "test")
+    else:
+        split = "test"
+
+    if metrics is None:
+        metrics = ["bleu", "rouge_l", "exact_match"]
+
+    print(f"\n=== Commit Prediction Evaluation (n={n_samples}) ===")
+    print(f"  metrics={metrics}  max_new_tokens={max_new_tokens}  temperature={temperature}")
 
     if use_stubs or model is None:
         dataset = COMMITPACK_STUB
     else:
-        dataset = load_commitpack_sample(n_samples)
+        dataset = load_commitpack_sample(n_samples, split=split)
 
-    bleu_scores = []
-    rouge_scores = []
-    exact_matches = 0
+    bleu_scores: list = []
+    rouge_scores: list = []
+    exact_matches: int = 0
+    per_sample: list = []
 
-    for item in dataset:
-        diff = item["diff"]
-        reference = item["message"]
+    for idx, item in enumerate(dataset):
+        message      = item.get("subject") or item.get("message", "")
+        old_contents = item.get("old_contents", "")
+        new_contents = item.get("new_contents", "")
+        old_file     = item.get("old_file", "file")
+        new_file     = item.get("new_file", "file")
+
+        # Ground-truth diff: prefer pre-computed field; otherwise derive it
+        reference_diff = item.get("diff", "")
+        if not reference_diff and old_contents and new_contents:
+            reference_diff = _compute_unified_diff(
+                old_contents, new_contents, old_file, new_file
+            )
+
+        if not reference_diff:
+            # Nothing to evaluate against; skip
+            continue
+
+        # Build prompt and generate predicted diff
+        prompt = _build_commit_prediction_prompt(message, old_contents, old_file)
 
         if model is not None:
-            prompt = f"<diff>\n{diff}\n</diff>\nCommit message:"
-            completions = model.generate(prompt, max_new_tokens=64, temperature=0.1)
-            hypothesis = completions[0].strip().split("\n")[0]
+            completions = model.generate(
+                prompt, max_new_tokens=max_new_tokens, temperature=temperature
+            )
+            predicted_diff = completions[0].strip()
         else:
-            # Oracle: return reference directly (upper bound simulation)
-            hypothesis = reference
+            # Dry-run / oracle: compute the real diff from old→new contents
+            # (upper-bound simulation — use it to validate metric plumbing)
+            if old_contents and new_contents:
+                predicted_diff = _compute_unified_diff(
+                    old_contents, new_contents, old_file, new_file
+                )
+            else:
+                predicted_diff = reference_diff
 
-        bleu_scores.append(bleu_score(reference, hypothesis))
-        rouge_scores.append(rouge_l(reference, hypothesis))
-        if exact_match(reference, hypothesis):
+        b = bleu_score(reference_diff, predicted_diff)
+        r = rouge_l(reference_diff, predicted_diff)
+        em = exact_match(reference_diff, predicted_diff)
+
+        bleu_scores.append(b)
+        rouge_scores.append(r)
+        if em:
             exact_matches += 1
 
-    avg_bleu = sum(bleu_scores) / len(bleu_scores) if bleu_scores else 0.0
-    avg_rouge = sum(rouge_scores) / len(rouge_scores) if rouge_scores else 0.0
-    em_rate = exact_matches / len(dataset) if dataset else 0.0
+        per_sample.append({
+            "idx":            idx,
+            "message":        message,
+            "bleu":           b,
+            "rouge_l":        r,
+            "exact_match":    em,
+        })
 
-    print(f"  BLEU:        {avg_bleu:.4f}")
-    print(f"  ROUGE-L:     {avg_rouge:.4f}")
-    print(f"  Exact match: {em_rate:.4f}  ({exact_matches}/{len(dataset)})")
+    n_evaluated = len(bleu_scores)
+    avg_bleu  = sum(bleu_scores)  / n_evaluated if n_evaluated else 0.0
+    avg_rouge = sum(rouge_scores) / n_evaluated if n_evaluated else 0.0
+    em_rate   = exact_matches     / n_evaluated if n_evaluated else 0.0
 
-    return {
-        "bleu": avg_bleu,
-        "rouge_l": avg_rouge,
-        "exact_match_rate": em_rate,
-        "n_samples": len(dataset),
+    print(f"  Evaluated:   {n_evaluated} samples")
+    if "bleu" in metrics:
+        print(f"  BLEU:        {avg_bleu:.4f}")
+    if "rouge_l" in metrics:
+        print(f"  ROUGE-L:     {avg_rouge:.4f}")
+    if "exact_match" in metrics:
+        print(f"  Exact match: {em_rate:.4f}  ({exact_matches}/{n_evaluated})")
+
+    result: dict = {
+        "n_samples":         n_evaluated,
+        "exact_match_rate":  em_rate,
+        "exact_matches":     exact_matches,
     }
+    if "bleu" in metrics:
+        result["bleu"] = avg_bleu
+    if "rouge_l" in metrics:
+        result["rouge_l"] = avg_rouge
+
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -378,7 +585,8 @@ def run_commit_prediction(model: Optional["ModelWrapper"], n_samples: int = 1000
 # ---------------------------------------------------------------------------
 
 def run_periodic_eval(model_path: str, step: int, output_dir: str,
-                      benchmarks: list = None, device: str = "auto") -> dict:
+                      benchmarks: list = None, device: str = "auto",
+                      config_path: str = None) -> dict:
     """
     Called every N training steps from the DES-LOC training loop.
     Only runs on the H100 (highest-capability) node; other GPUs continue
@@ -388,8 +596,11 @@ def run_periodic_eval(model_path: str, step: int, output_dir: str,
         if step % EVAL_INTERVAL == 0 and is_h100():
             results = run_periodic_eval(model_path, step, output_dir)
     """
+    cfg = load_eval_config(config_path)
+    eval_cfg = cfg.get("eval", {})
+
     if benchmarks is None:
-        benchmarks = ["humaneval", "mbpp", "commit"]
+        benchmarks = eval_cfg.get("benchmarks", ["humaneval", "mbpp", "commit"])
 
     print(f"\n[PeriodicEval] step={step}  model={model_path}")
     os.makedirs(output_dir, exist_ok=True)
@@ -404,13 +615,26 @@ def run_periodic_eval(model_path: str, step: int, output_dir: str,
     all_results: dict = {"step": step, "model_path": model_path, "timestamp": time.time()}
 
     if "humaneval" in benchmarks:
-        all_results["humaneval"] = run_humaneval(model, samples_per_task=10,
-                                                  use_stubs=(model is None))
+        he_cfg = eval_cfg.get("humaneval", {})
+        all_results["humaneval"] = run_humaneval(
+            model,
+            samples_per_task=he_cfg.get("samples_per_task", 10),
+            k_values=he_cfg.get("k_values", [1, 5, 10]),
+            use_stubs=(model is None),
+        )
     if "mbpp" in benchmarks:
         all_results["mbpp"] = run_mbpp(model, use_stubs=(model is None))
     if "commit" in benchmarks:
-        all_results["commit"] = run_commit_prediction(model, n_samples=1000,
-                                                       use_stubs=(model is None))
+        cp_cfg = eval_cfg.get("commit_prediction", {})
+        all_results["commit"] = run_commit_prediction(
+            model,
+            n_samples=cp_cfg.get("n_samples", 1000),
+            max_new_tokens=cp_cfg.get("max_new_tokens", 64),
+            temperature=cp_cfg.get("temperature", 0.1),
+            metrics=cp_cfg.get("metrics", ["bleu", "rouge_l", "exact_match"]),
+            use_stubs=(model is None),
+            config=cfg,
+        )
 
     out_file = os.path.join(output_dir, f"eval_step_{step:07d}.json")
     with open(out_file, "w") as f:
@@ -430,16 +654,25 @@ def main():
     parser.add_argument("--benchmarks", nargs="+",
                         default=["humaneval", "mbpp", "commit"],
                         choices=["humaneval", "mbpp", "commit"])
-    parser.add_argument("--output-dir", default="desloc_results/eval_runs")
+    parser.add_argument("--output-dir", default=None,
+                        help="Override output dir from eval_config.yaml")
     parser.add_argument("--step", type=int, default=0, help="Training step (for logging)")
-    parser.add_argument("--samples-per-task", type=int, default=10,
+    parser.add_argument("--samples-per-task", type=int, default=None,
                         help="Number of samples per HumanEval task (for pass@k)")
-    parser.add_argument("--commit-samples", type=int, default=1000)
+    parser.add_argument("--commit-samples", type=int, default=None,
+                        help="Override commit_prediction.n_samples from config")
+    parser.add_argument("--config", default=None,
+                        help="Path to eval_config.yaml (default: eval/eval_config.yaml)")
     parser.add_argument("--dry-run", action="store_true",
                         help="Run with stub data only (no model needed)")
     args = parser.parse_args()
 
-    os.makedirs(args.output_dir, exist_ok=True)
+    # Load configuration
+    cfg = load_eval_config(args.config)
+    eval_cfg = cfg.get("eval", {})
+
+    output_dir = args.output_dir or eval_cfg.get("output_dir", "desloc_results/eval_runs")
+    os.makedirs(output_dir, exist_ok=True)
 
     model = None
     if args.model and not args.dry_run:
@@ -453,21 +686,34 @@ def main():
     }
 
     if "humaneval" in args.benchmarks:
+        he_cfg = eval_cfg.get("humaneval", {})
+        spt = args.samples_per_task or he_cfg.get("samples_per_task", 10)
         all_results["humaneval"] = run_humaneval(
-            model, samples_per_task=args.samples_per_task,
-            use_stubs=(model is None)
+            model, samples_per_task=spt,
+            k_values=he_cfg.get("k_values", [1, 5, 10]),
+            use_stubs=(model is None),
         )
 
     if "mbpp" in args.benchmarks:
         all_results["mbpp"] = run_mbpp(model, use_stubs=(model is None))
 
     if "commit" in args.benchmarks:
+        cp_cfg = eval_cfg.get("commit_prediction", {})
+        n_samples     = args.commit_samples or cp_cfg.get("n_samples", 1000)
+        max_new_tokens = cp_cfg.get("max_new_tokens", 64)
+        temperature    = cp_cfg.get("temperature", 0.1)
+        metrics        = cp_cfg.get("metrics", ["bleu", "rouge_l", "exact_match"])
         all_results["commit"] = run_commit_prediction(
-            model, n_samples=args.commit_samples,
-            use_stubs=(model is None)
+            model,
+            n_samples=n_samples,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            metrics=metrics,
+            use_stubs=(model is None),
+            config=cfg,
         )
 
-    out_file = os.path.join(args.output_dir, f"eval_step_{args.step:07d}.json")
+    out_file = os.path.join(output_dir, f"eval_step_{args.step:07d}.json")
     with open(out_file, "w") as f:
         json.dump(all_results, f, indent=2)
 
