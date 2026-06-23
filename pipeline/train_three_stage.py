@@ -36,7 +36,7 @@ import torch.nn as nn
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from pipeline.unified_tokenizer import build_megatron_tokenizer, get_tokenizer
-from pipeline.engine_bridge import build_ds_config, detect_gpu_tiers, compute_shard_ratios
+from pipeline.engine_bridge import build_ds_config, detect_gpu_tiers, compute_shard_ratios, DESLOCEngine
 from deepspeed.runtime.hetero_mimo_training_loop import (
     setup_hetero_mimo_training,
     HeteroMIMOTrainingLoop,
@@ -503,6 +503,15 @@ def run_three_stage(args):
         position_encoding=args.position_encoding,
     )
 
+    # DeepSpeed engine — wraps model for heterogeneous ZeRO sharding
+    ds_config = build_ds_config(
+        hetero_shard_ratio=compute_shard_ratios(detect_gpu_tiers()) if torch.cuda.is_available() else None,
+        train_batch_size=args.batch_size * args.gradient_accumulation,
+        gradient_accumulation_steps=args.gradient_accumulation,
+    )
+    engine = DESLOCEngine(model, ds_config=ds_config)
+    engine.init()
+
     stages_to_run = [int(s) for s in args.stages.split(",")]
 
     for stage_num in stages_to_run:
@@ -539,7 +548,9 @@ def run_three_stage(args):
         # rather than the global default (1e-4).
         stage_lr_map = {1: args.stage1_lr, 2: args.stage2_lr, 3: args.stage3_lr}
         engine_config = PerModuleOptimizerConfig(lr=stage_lr_map[stage_num])
-        loop: HeteroMIMOTrainingLoop = setup_hetero_mimo_training(model, optimizer_config=engine_config)
+        loop: HeteroMIMOTrainingLoop = setup_hetero_mimo_training(
+            engine.engine, optimizer_config=engine_config,
+        )
 
         train_one_stage(
             loop=loop,
