@@ -849,6 +849,77 @@ def build_hetero_reset_manager(
 
 
 # ---------------------------------------------------------------------------
+# DeepSpeed engine registration
+# ---------------------------------------------------------------------------
+
+def register(engine) -> None:
+    """Register HeteroActivationOffloadReset on a DeepSpeed engine.
+
+    Builds a :class:`HeteroActivationOffloadReset` from the engine's
+    configuration and attaches it as ``engine.hetero_activation_offload_reset``.
+    A schedule-exit hook is registered so that :func:`schedule_reset_hook` is
+    called automatically after every pipeline schedule completes.
+
+    The ``getattr`` defensive access pattern mirrors the Megatron b8e23d5874
+    fix: if ``fine_grained_activation_offloading`` is absent from the config
+    object, the manager is still built but logs a warning.
+
+    Parameters
+    ----------
+    engine:
+        A DeepSpeed engine instance (e.g. ``DeepSpeedEngine`` or
+        ``PipelineEngine``).  The engine's ``config`` (or ``ds_config``)
+        attribute is used to read DES-LOC heterogeneous device settings.
+    """
+    logger.info(
+        "hetero_activation_offload_reset.register() called on engine type=%s",
+        type(engine).__name__,
+    )
+
+    # Resolve config object from engine
+    config = getattr(engine, "config", None) or getattr(engine, "ds_config", None)
+    if config is None:
+        logger.warning(
+            "[register] engine has no config/ds_config attribute; "
+            "using default HeteroActivationOffloadReset configuration"
+        )
+
+        class _DefaultCfg:
+            fine_grained_activation_offloading = True
+        config = _DefaultCfg()
+
+    # Build the manager via the factory (returns None if offloading is disabled)
+    mgr = build_hetero_reset_manager(config)
+
+    if mgr is None:
+        # Offloading disabled — attach a sentinel so callers can check
+        engine.hetero_activation_offload_reset = None
+        logger.info(
+            "[register] fine_grained_activation_offloading=False; "
+            "no HeteroActivationOffloadReset attached to engine."
+        )
+        return
+
+    engine.hetero_activation_offload_reset = mgr
+
+    # Register a post-schedule hook if the engine supports it
+    if hasattr(engine, "register_hook_on_step_end"):
+        def _post_schedule_hook():
+            forward_only = getattr(engine, "forward_only", False)
+            schedule_reset_hook(mgr, config, forward_only=forward_only)
+        engine.register_hook_on_step_end(_post_schedule_hook)
+        logger.info(
+            "HeteroActivationOffloadReset registered via register_hook_on_step_end."
+        )
+    else:
+        logger.info(
+            "Engine does not expose register_hook_on_step_end; "
+            "manager stored at engine.hetero_activation_offload_reset only. "
+            "Call schedule_reset_hook() manually after each schedule."
+        )
+
+
+# ---------------------------------------------------------------------------
 # Smoke test
 # ---------------------------------------------------------------------------
 

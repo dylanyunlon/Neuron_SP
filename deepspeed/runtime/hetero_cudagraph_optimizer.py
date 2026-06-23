@@ -1229,6 +1229,84 @@ class HeteroCudaGraphOptimizer:
 
 
 # ---------------------------------------------------------------------------
+# DeepSpeed engine registration
+# ---------------------------------------------------------------------------
+
+def register(engine) -> None:
+    """Register HeteroCudaGraphOptimizer on a DeepSpeed engine.
+
+    Profiles the available CUDA devices, assigns model layers to devices via
+    the greedy VRAM-fit strategy, and attaches a
+    :class:`HeteroCudaGraphOptimizer` as ``engine.hetero_cudagraph_optimizer``.
+
+    Graph capture is **not** performed here — call
+    ``engine.hetero_cudagraph_optimizer.record_graphs(sample_input)`` after
+    the first forward pass to trigger capture.
+
+    Parameters
+    ----------
+    engine:
+        A DeepSpeed engine instance whose ``module`` attribute is the
+        user model.  The engine's ``config`` (or ``ds_config``) is used
+        to read DES-LOC heterogeneous settings.
+    """
+    logger.info(
+        "hetero_cudagraph_optimizer.register() called on engine type=%s",
+        type(engine).__name__,
+    )
+
+    if not torch.cuda.is_available():
+        engine.hetero_cudagraph_optimizer = None
+        logger.warning(
+            "[register] No CUDA devices available; "
+            "HeteroCudaGraphOptimizer not attached."
+        )
+        return
+
+    # Resolve model layers
+    model = getattr(engine, "module", None)
+    if model is None:
+        engine.hetero_cudagraph_optimizer = None
+        logger.warning(
+            "[register] engine.module is None; "
+            "cannot build HeteroCudaGraphOptimizer."
+        )
+        return
+
+    # Collect leaf nn.Module layers from the model
+    modules: List[nn.Module] = []
+    for child in model.children():
+        modules.append(child)
+    if not modules:
+        modules = [model]
+
+    # Read config for warmup steps and MoE partial graph preference
+    config = getattr(engine, "config", None) or getattr(engine, "ds_config", None)
+    num_warmup = 2
+    moe_partial = True
+    loc_capacity = 4
+    if config is not None:
+        num_warmup = getattr(config, "des_loc_cudagraph_warmup_steps", 2)
+        moe_partial = getattr(config, "des_loc_moe_partial_graph", True)
+        loc_capacity = getattr(config, "des_loc_loc_buffer_capacity", 4)
+
+    opt = HeteroCudaGraphOptimizer(
+        modules=modules,
+        num_warmup_steps=num_warmup,
+        moe_partial_graph=moe_partial,
+        loc_buffer_capacity=loc_capacity,
+    )
+
+    engine.hetero_cudagraph_optimizer = opt
+    logger.info(
+        "HeteroCudaGraphOptimizer registered on engine with %d layers "
+        "across %d devices (graphs not yet captured).",
+        len(modules),
+        len(opt.profiles),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Smoke test
 # ---------------------------------------------------------------------------
 

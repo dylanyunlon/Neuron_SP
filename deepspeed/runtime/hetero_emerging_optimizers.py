@@ -1002,6 +1002,92 @@ def get_hetero_optimizer(
 
 
 # ===========================================================================
+# DeepSpeed engine registration
+# ===========================================================================
+
+
+def register(engine) -> None:
+    """Register DES-LOC heterogeneous emerging optimizer support on a DeepSpeed engine.
+
+    Detects the device placement policy from the available CUDA devices,
+    builds the :class:`DevicePlacementPolicy` and
+    :class:`GradientStagingBuffer`, and attaches them as
+    ``engine.hetero_emerging_optimizer_ctx``.  The actual optimizer
+    instantiation is deferred to the engine's optimizer-build phase;
+    this hook prepares the infrastructure that
+    :func:`get_hetero_optimizer` needs.
+
+    Parameters
+    ----------
+    engine:
+        A DeepSpeed engine instance.  The engine's ``config`` (or
+        ``ds_config``) is inspected for optimizer type and DES-LOC
+        settings.
+    """
+    logger.info(
+        "hetero_emerging_optimizers.register() called on engine type=%s",
+        type(engine).__name__,
+    )
+
+    # Auto-detect device placement policy
+    policy = DevicePlacementPolicy.auto_detect()
+
+    # Read optimizer name from engine config
+    config = getattr(engine, "config", None) or getattr(engine, "ds_config", None)
+    optimizer_name = None
+    if config is not None:
+        optimizer_name = getattr(config, "des_loc_emerging_optimizer", None)
+
+    # Build locality caches for all devices
+    locality_caches: Dict[str, DeslocLocalityCache] = {}
+    all_devices = [policy.fast_device] + policy.slow_devices
+    for dev in all_devices:
+        key = str(dev)
+        if key not in locality_caches and dev.type == "cuda":
+            try:
+                _, total = torch.cuda.mem_get_info(dev.index)
+                budget = int(total * 0.25)
+            except RuntimeError:
+                budget = 4 * 1024 ** 3
+            locality_caches[key] = DeslocLocalityCache(dev, vram_budget_bytes=budget)
+
+    # Build gradient staging buffer
+    grad_staging = GradientStagingBuffer(policy)
+
+    # Attach context to engine
+    engine.hetero_emerging_optimizer_ctx = {
+        "placement_policy": policy,
+        "locality_caches": locality_caches,
+        "grad_staging": grad_staging,
+        "optimizer_name": optimizer_name,
+        "registry": _HETERO_OPTIMIZER_REGISTRY,
+    }
+
+    # If optimizer name is specified, validate it exists in registry
+    if optimizer_name is not None:
+        if optimizer_name in _HETERO_OPTIMIZER_REGISTRY:
+            logger.info(
+                "DES-LOC emerging optimizer '%s' will be used. "
+                "fast=%s slow=%s.",
+                optimizer_name,
+                policy.fast_device,
+                [str(d) for d in policy.slow_devices],
+            )
+        else:
+            logger.warning(
+                "DES-LOC emerging optimizer '%s' not found in registry. "
+                "Available: %s",
+                optimizer_name,
+                list(_HETERO_OPTIMIZER_REGISTRY.keys()),
+            )
+    else:
+        logger.info(
+            "No emerging optimizer specified; context stored at "
+            "engine.hetero_emerging_optimizer_ctx for manual use."
+        )
+
+
+# ===========================================================================
 # Smoke test
 # ===========================================================================
 

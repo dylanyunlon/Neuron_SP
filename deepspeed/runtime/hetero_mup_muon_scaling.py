@@ -1052,6 +1052,108 @@ def get_hetero_mup_muon_overrides(
 
 
 # ---------------------------------------------------------------------------
+# DeepSpeed engine registration
+# ---------------------------------------------------------------------------
+
+def register(engine) -> None:
+    """Register HeteroMuPMuonScaler on a DeepSpeed engine.
+
+    Reads MuP and Muon configuration from the engine's config, builds a
+    :class:`HeteroMuPMuonScaler`, and attaches it as
+    ``engine.hetero_mup_muon_scaler``.  If the engine exposes named
+    parameters, the scaler computes and caches the MuP-override parameter
+    groups for later use by the optimizer builder.
+
+    Parameters
+    ----------
+    engine:
+        A DeepSpeed engine instance.  The engine's ``config`` (or
+        ``ds_config``) is inspected for MuP width multiplier, Muon
+        scale mode, optimizer type, and learning-rate settings.
+    """
+    logger.info(
+        "hetero_mup_muon_scaling.register() called on engine type=%s",
+        type(engine).__name__,
+    )
+
+    # Resolve config
+    config = getattr(engine, "config", None) or getattr(engine, "ds_config", None)
+
+    # Read MuP and Muon settings from config
+    mup_width_mult = 1.0
+    muon_scale_mode = "hetero_auto"
+    optimizer_type = "adamw"
+    base_lr = 1e-3
+    base_min_lr = 1e-5
+    base_eps = 1e-8
+    decoupled_lr = None
+
+    if config is not None:
+        mup_width_mult = getattr(config, "mup_width_mult", 1.0)
+        muon_scale_mode = getattr(config, "muon_scale_mode", "hetero_auto")
+        optimizer_type = getattr(config, "optimizer_type", "adamw")
+        base_lr = getattr(config, "lr", 1e-3)
+        base_min_lr = getattr(config, "min_lr", 1e-5)
+        base_eps = getattr(config, "adam_eps", 1e-8)
+        decoupled_lr = getattr(config, "decoupled_lr", None)
+
+    # Parse scale mode enum
+    try:
+        mode = MuonMuPScaleMode(muon_scale_mode)
+    except ValueError:
+        logger.warning(
+            "[register] Invalid muon_scale_mode='%s', falling back to hetero_auto.",
+            muon_scale_mode,
+        )
+        mode = MuonMuPScaleMode.HETERO_AUTO
+
+    scaler = HeteroMuPMuonScaler(
+        mup_width_mult=mup_width_mult,
+        muon_scale_mode=mode,
+        optimizer_type=optimizer_type,
+        base_lr=base_lr,
+        base_min_lr=base_min_lr,
+        base_eps=base_eps,
+        decoupled_lr=decoupled_lr,
+    )
+
+    engine.hetero_mup_muon_scaler = scaler
+
+    # Pre-compute param groups if model is available
+    model = getattr(engine, "module", None)
+    if model is not None:
+        named_params = list(model.named_parameters())
+        if named_params:
+            device_id = None
+            if hasattr(engine, "device") and engine.device is not None:
+                if engine.device.type == "cuda":
+                    device_id = engine.device.index
+
+            param_groups = scaler.get_param_groups_with_mup_overrides(
+                named_params, device_id
+            )
+            engine.hetero_mup_muon_param_groups = param_groups
+            logger.info(
+                "HeteroMuPMuonScaler registered with %d param groups "
+                "(width_mult=%.2f, mode=%s).",
+                len(param_groups),
+                mup_width_mult,
+                mode.value,
+            )
+        else:
+            engine.hetero_mup_muon_param_groups = []
+            logger.info(
+                "HeteroMuPMuonScaler registered (no parameters found in model)."
+            )
+    else:
+        engine.hetero_mup_muon_param_groups = None
+        logger.info(
+            "HeteroMuPMuonScaler stored at engine.hetero_mup_muon_scaler; "
+            "param groups not computed (engine.module not available)."
+        )
+
+
+# ---------------------------------------------------------------------------
 # Smoke test
 # ---------------------------------------------------------------------------
 

@@ -747,6 +747,94 @@ def build_hetero_lion_optimizer(
 
 
 # ---------------------------------------------------------------------------
+# DeepSpeed engine registration
+# ---------------------------------------------------------------------------
+
+def register(engine) -> None:
+    """Register HeteroLionOptimizer support on a DeepSpeed engine.
+
+    Reads DES-LOC Lion optimizer configuration from the engine's config,
+    builds a :class:`HeteroLionConfig` and :class:`SLCPlacementPolicy`,
+    and attaches them as ``engine.hetero_lion_optimizer_ctx``.
+
+    If the engine's optimizer has not yet been created and the config
+    requests Lion, the optimizer is built via
+    :func:`build_hetero_lion_optimizer` and stored on the engine.
+
+    Parameters
+    ----------
+    engine:
+        A DeepSpeed engine instance.  The engine's ``config`` (or
+        ``ds_config``) is inspected for Lion-specific settings and
+        DES-LOC SLC placement parameters.
+    """
+    logger.info(
+        "hetero_lion_optimizer.register() called on engine type=%s",
+        type(engine).__name__,
+    )
+
+    # Resolve config
+    config = getattr(engine, "config", None) or getattr(engine, "ds_config", None)
+
+    # Build HeteroLionConfig from engine config
+    lr = 1e-4
+    beta1 = 0.95
+    beta2 = 0.98
+    weight_decay = 0.0
+    compute_device = "cuda:2"
+    enable_async = True
+
+    if config is not None:
+        lr = getattr(config, "lion_lr", getattr(config, "lr", 1e-4))
+        beta1 = getattr(config, "lion_beta1", 0.95)
+        beta2 = getattr(config, "lion_beta2", 0.98)
+        weight_decay = getattr(config, "weight_decay", 0.0)
+        compute_device = getattr(config, "des_loc_compute_device", "cuda:2")
+        enable_async = getattr(config, "des_loc_enable_async_h100", True)
+
+    slc_policy = SLCPlacementPolicy(
+        compute_device=compute_device,
+    )
+    lion_config = HeteroLionConfig(
+        lr=lr,
+        beta1=beta1,
+        beta2=beta2,
+        weight_decay=weight_decay,
+        slc_policy=slc_policy,
+        compute_device=compute_device,
+        enable_async_h100=enable_async,
+    )
+
+    # Attach config context to engine
+    engine.hetero_lion_optimizer_ctx = {
+        "config": lion_config,
+        "slc_policy": slc_policy,
+    }
+
+    # If the engine has a model and the optimizer type is Lion, build it
+    model = getattr(engine, "module", None)
+    optimizer_type = None
+    if config is not None:
+        optimizer_type = getattr(config, "optimizer_type", None)
+
+    if model is not None and optimizer_type is not None and "lion" in str(optimizer_type).lower():
+        opt = build_hetero_lion_optimizer(model, config=lion_config)
+        engine.hetero_lion_optimizer = opt
+        logger.info(
+            "HeteroLionOptimizer built and attached to engine: "
+            "lr=%.2e, beta1=%.3f, beta2=%.3f, compute=%s.",
+            lr, beta1, beta2, compute_device,
+        )
+    else:
+        engine.hetero_lion_optimizer = None
+        logger.info(
+            "HeteroLionOptimizer config stored at engine.hetero_lion_optimizer_ctx; "
+            "optimizer not built (optimizer_type=%s).",
+            optimizer_type,
+        )
+
+
+# ---------------------------------------------------------------------------
 # Smoke test
 # ---------------------------------------------------------------------------
 

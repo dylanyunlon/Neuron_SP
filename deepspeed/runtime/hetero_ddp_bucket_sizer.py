@@ -1022,6 +1022,98 @@ def configure_ddp_bucket_sizes(
 
 
 # ---------------------------------------------------------------------------
+# DeepSpeed engine registration
+# ---------------------------------------------------------------------------
+
+def register(engine) -> None:
+    """Register HeteroDDPBucketSizer on a DeepSpeed engine.
+
+    Builds a :class:`HeteroProcessGroupCollection` from the engine's
+    distributed configuration, computes per-device-class DDP bucket sizes,
+    and stores the results as ``engine.hetero_ddp_bucket_sizer``.
+
+    The bucket sizes are written back into the engine's DDP config when
+    the engine exposes a ``ddp_config`` attribute with a mutable
+    ``bucket_size`` field.
+
+    Parameters
+    ----------
+    engine:
+        A DeepSpeed engine instance.  Process group information is read
+        from ``engine.mpu`` (model-parallel unit) when available, falling
+        back to ``torch.distributed`` globals otherwise.
+    """
+    logger.info(
+        "hetero_ddp_bucket_sizer.register() called on engine type=%s",
+        type(engine).__name__,
+    )
+
+    # Build HeteroProcessGroupCollection from engine's mpu
+    pg_collection: Optional[HeteroProcessGroupCollection] = None
+
+    if hasattr(engine, "mpu") and engine.mpu is not None:
+        mpu = engine.mpu
+        dp_cp_group = (
+            mpu.get_data_parallel_group()
+            if hasattr(mpu, "get_data_parallel_group")
+            else None
+        )
+        pp_group = (
+            mpu.get_pipe_parallel_group()
+            if hasattr(mpu, "get_pipe_parallel_group")
+            else None
+        )
+        pg_collection = HeteroProcessGroupCollection(
+            dp_cp=dp_cp_group,
+            pp=pp_group,
+            local_device_class=detect_device_class(),
+            loc_enabled=True,
+        )
+    else:
+        logger.info(
+            "[register] engine.mpu not available; "
+            "using legacy fallback (pg_collection=None)."
+        )
+
+    # Determine number of model chunks
+    model = getattr(engine, "module", None)
+    if model is not None and hasattr(model, "model_chunks"):
+        num_chunks = len(model.model_chunks)
+    else:
+        num_chunks = 1
+
+    # Read overlap flags from engine config
+    config = getattr(engine, "config", None) or getattr(engine, "ds_config", None)
+    overlap_grad_reduce = True
+    overlap_param_gather = False
+    if config is not None:
+        overlap_grad_reduce = getattr(config, "overlap_grad_reduce", True)
+        overlap_param_gather = getattr(
+            config, "overlap_param_gather_with_optimizer_step", False
+        )
+
+    sizer = HeteroDDPBucketSizer(
+        pg_collection=pg_collection,
+        overlap_grad_reduce=overlap_grad_reduce,
+        overlap_param_gather_with_optimizer_step=overlap_param_gather,
+    ).compute(num_chunks)
+
+    engine.hetero_ddp_bucket_sizer = sizer
+
+    # Write bucket_size back into engine's DDP config if possible
+    ddp_config = getattr(engine, "ddp_config", None)
+    if ddp_config is not None and hasattr(ddp_config, "bucket_size"):
+        if getattr(ddp_config, "bucket_size", None) is None:
+            ddp_config.bucket_size = sizer.bucket_size
+            logger.info(
+                "Wrote bucket_size=%s to engine.ddp_config.",
+                sizer.bucket_size,
+            )
+
+    logger.info("HeteroDDPBucketSizer registered:\n%s", sizer.summary())
+
+
+# ---------------------------------------------------------------------------
 # Unit tests
 # ---------------------------------------------------------------------------
 
