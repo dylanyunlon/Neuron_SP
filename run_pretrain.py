@@ -51,11 +51,33 @@ logger = logging.getLogger("run_pretrain")
 # ---------------------------------------------------------------------------
 # Targeted import — bypass deepspeed.__init__ entirely
 # ---------------------------------------------------------------------------
-# We import only the runtime submodule so Python never executes
+# We stub the deepspeed package so Python never executes
 # deepspeed/__init__.py (which pulls in apex, op_builder, triton, etc.).
+import importlib.util
+import types as _types
+
+def _stub_deepspeed():
+    """Create minimal package stubs so submodule import works."""
+    for name in ("deepspeed", "deepspeed.runtime"):
+        if name not in sys.modules:
+            stub = _types.ModuleType(name)
+            stub.__path__ = [name.replace(".", "/")]
+            stub.__package__ = name
+            sys.modules[name] = stub
+
+_stub_deepspeed()
+
 try:
-    from deepspeed.runtime.desloc_engine import DesLocEngine, TrainingConfig
-    logger.info("DesLocEngine / TrainingConfig imported from deepspeed.runtime.desloc_engine")
+    _spec = importlib.util.spec_from_file_location(
+        "deepspeed.runtime.desloc_engine",
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "deepspeed", "runtime", "desloc_engine.py"),
+    )
+    _mod = importlib.util.module_from_spec(_spec)
+    sys.modules["deepspeed.runtime.desloc_engine"] = _mod
+    _spec.loader.exec_module(_mod)
+    DesLocEngine = _mod.DesLocEngine
+    TrainingConfig = _mod.TrainingConfig
+    logger.info("DesLocEngine / TrainingConfig imported (apex-free path)")
     _HAS_DESLOC = True
 except Exception as _desloc_import_err:
     logger.warning(
