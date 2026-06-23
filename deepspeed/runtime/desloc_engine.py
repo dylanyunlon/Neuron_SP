@@ -949,12 +949,16 @@ class DesLocEngine:
             detect_device_arch,
             DeviceArch,
         )
-        from datasets.bigcode.commit_packing import (  # noqa: PLC0415
-            CommitSequencePacker,
-            HeteroBatchSampler,
-            PackedSequence,
-            compute_packing_stats,
-        )
+        import importlib.util as _ilu  # noqa: PLC0415
+        _cp_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "datasets", "bigcode", "commit_packing.py")
+        _cp_spec = _ilu.spec_from_file_location("commit_packing", _cp_path)
+        _cp_mod = _ilu.module_from_spec(_cp_spec)
+        import sys as _sys; _sys.modules["commit_packing"] = _cp_mod  # noqa: E702
+        _cp_spec.loader.exec_module(_cp_mod)
+        CommitSequencePacker = _cp_mod.CommitSequencePacker
+        HeteroBatchSampler = _cp_mod.HeteroBatchSampler
+        PackedSequence = _cp_mod.PackedSequence
+        compute_packing_stats = _cp_mod.compute_packing_stats
         # Store frequently-used lazy symbols on the instance so sub-methods
         # (save_checkpoint, load_checkpoint, train) can reference them without
         # re-importing each time.
