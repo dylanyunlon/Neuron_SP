@@ -27,31 +27,47 @@ export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
 
 NGPUS=5
 MODEL_SIZE="7b"
-DATA_MODE="synthetic"  # change to "real" + --data-path when data is ready
 TOTAL_STEPS=1000
 MICRO_BS=1
 SEQ_LEN=2048
-LR="3e-4"
+
+# Training mode: "fsdp" (PyTorch FSDP, safe default) or "desloc" (DES-LOC heterogeneous engine)
+MODE="${NEURON_SP_MODE:-fsdp}"
 
 echo "=== Neuron_SP 7B Pretrain Launch ==="
 echo "GPUs: $CUDA_VISIBLE_DEVICES ($NGPUS)"
 echo "Model: $MODEL_SIZE"
+echo "Mode: $MODE"
 echo "Log: $LOG_FILE"
 echo ""
 
 if [[ "${1:-}" == "--dry-run" ]]; then
     echo "[DRY RUN] Would execute:"
-    echo "  torchrun --nproc_per_node=$NGPUS run_pretrain.py \\"
-    echo "    --model-size $MODEL_SIZE --steps $TOTAL_STEPS \\"
-    echo "    --batch-size $MICRO_BS --seq-len $SEQ_LEN \\"
-    echo "    --fsdp --gradient-checkpointing"
+    if [[ "$MODE" == "desloc" ]]; then
+        echo "  torchrun --nproc_per_node=$NGPUS run_pretrain.py \\"
+        echo "    --model-size $MODEL_SIZE --steps $TOTAL_STEPS \\"
+        echo "    --batch-size $MICRO_BS --seq-len $SEQ_LEN \\"
+        echo "    --use-desloc --gradient-checkpointing"
+    else
+        echo "  torchrun --nproc_per_node=$NGPUS run_pretrain.py \\"
+        echo "    --model-size $MODEL_SIZE --steps $TOTAL_STEPS \\"
+        echo "    --batch-size $MICRO_BS --seq-len $SEQ_LEN \\"
+        echo "    --fsdp --gradient-checkpointing"
+    fi
     echo ""
-    # Print GPU info
     nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader 2>/dev/null || echo "  (nvidia-smi not available)"
     exit 0
 fi
 
-echo "Starting training..." | tee "$LOG_FILE"
+echo "Starting training ($MODE mode)..." | tee "$LOG_FILE"
+
+# Build mode-specific flags
+MODE_FLAGS=""
+if [[ "$MODE" == "desloc" ]]; then
+    MODE_FLAGS="--use-desloc"
+else
+    MODE_FLAGS="--fsdp"
+fi
 
 torchrun \
     --nproc_per_node=$NGPUS \
@@ -61,7 +77,7 @@ torchrun \
     --steps "$TOTAL_STEPS" \
     --batch-size "$MICRO_BS" \
     --seq-len "$SEQ_LEN" \
-    --fsdp \
+    $MODE_FLAGS \
     --gradient-checkpointing \
     --log-every 10 \
     --save-every 500 \
