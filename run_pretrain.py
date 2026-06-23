@@ -578,6 +578,23 @@ def run_standalone(args: argparse.Namespace) -> None:
         torch.manual_seed(42 + rank)
         data = synthetic_iter(cfg["vocab_size"], args.batch_size, args.seq_len, device)
 
+    # ----------------------------------------------------------------- resume
+    start_step = 1
+    if getattr(args, "resume_from", None) and os.path.isfile(args.resume_from):
+        if is_main:
+            logger.info("Resuming from checkpoint: %s", args.resume_from)
+        ckpt = torch.load(args.resume_from, map_location=device, weights_only=False)
+        if not use_fsdp:
+            raw_model.load_state_dict(ckpt["model_state_dict"])
+        else:
+            model.load_state_dict(ckpt["model_state_dict"])
+        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+        start_step = ckpt.get("step", 0) + 1
+        if is_main:
+            logger.info("Resumed at step %d (loss=%.4f, tokens_seen=%s)",
+                        start_step, ckpt.get("loss", 0), ckpt.get("tokens_seen", "?"))
+
     # ----------------------------------------------------------------- train
     model.train()
     t0     = time.time()
@@ -612,7 +629,7 @@ def run_standalone(args: argparse.Namespace) -> None:
         )
         print("-" * 60)
 
-    for step in range(1, args.steps + 1):
+    for step in range(start_step, args.steps + 1):
         input_ids, labels = next(data)
 
         optimizer.zero_grad(set_to_none=True)
@@ -639,6 +656,25 @@ def run_standalone(args: argparse.Namespace) -> None:
         if is_dist:
             dist.all_reduce(loss_val, op=dist.ReduceOp.AVG)
         losses.append(loss_val.item())
+
+        # --- Checkpoint save ---
+        save_every = getattr(args, "save_every", 500)
+        ckpt_dir = getattr(args, "checkpoint_dir", "checkpoints")
+        if is_main and save_every > 0 and step % save_every == 0:
+            os.makedirs(ckpt_dir, exist_ok=True)
+            ckpt_path = os.path.join(ckpt_dir, f"step_{step:07d}.pt")
+            ckpt = {
+                "step": step,
+                "model_state_dict": (raw_model.state_dict() if not use_fsdp
+                                     else model.state_dict()),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "scheduler_state_dict": scheduler.state_dict(),
+                "tokens_seen": step * args.batch_size * args.seq_len * world_size,
+                "loss": loss_val.item(),
+                "args": vars(args),
+            }
+            torch.save(ckpt, ckpt_path)
+            logger.info("Checkpoint saved: %s", ckpt_path)
 
         if is_main and step % args.log_every == 0:
             elapsed   = time.time() - t0
@@ -868,6 +904,24 @@ def parse_args() -> argparse.Namespace:
         help="Directory for TensorBoard SummaryWriter logs. If set, metrics are "
              "written to this directory (requires `pip install tensorboard`). "
              "Disabled when omitted.",
+    )
+    p.add_argument(
+        "--resume-from",
+        type=str,
+        default=None,
+        help="Path to checkpoint .pt file to resume training from.",
+    )
+    p.add_argument(
+        "--save-every",
+        type=int,
+        default=500,
+        help="Save checkpoint every N steps (0 to disable).",
+    )
+    p.add_argument(
+        "--checkpoint-dir",
+        type=str,
+        default="checkpoints",
+        help="Directory to save checkpoints.",
     )
     return p.parse_args()
 
