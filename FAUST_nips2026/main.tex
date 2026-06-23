@@ -43,24 +43,31 @@
 
 % ==================================================================
 \begin{abstract}
-\todo{Write abstract: 200--250 words covering problem, method, key results.}
 
-Training large language models (LLMs) at scale requires expensive, homogeneous GPU
-clusters. We present \desloc{}, a decomposed local SGD framework that enables
-efficient pretraining across \emph{heterogeneous} GPU tiers (e.g., mixing A100 80 GB
-and consumer-grade GPUs) without sacrificing convergence quality. \desloc{} introduces
-three independent synchronization periods $\Kx$, $\Ku$, $\Kv$ for parameters,
-optimizer first-moment, and second-moment states respectively, reducing
-communication volume by up to $3\times$ compared to standard AllReduce.
-We further integrate \autosp{}, an automatic sequence parallelism mechanism that
-partitions long sequences across heterogeneous workers with PCIe-aware
+Training large language models (LLMs) at scale typically requires expensive,
+homogeneous GPU clusters, leaving heterogeneous hardware under-utilized.
+We present \desloc{}, a decomposed local SGD framework that enables efficient
+pretraining across \emph{heterogeneous} GPU tiers---mixing datacenter-grade
+H100/Blackwell accelerators with consumer-grade RTX A6000 devices---without
+sacrificing convergence quality.  Unlike conventional Local SGD, which applies
+a single synchronization period to all state tensors, \desloc{} introduces
+three independent periods $\Kx$, $\Ku$, $\Kv$ for parameters, optimizer
+first-moment, and second-moment states respectively, exploiting the empirical
+observation that optimizer moments tolerate significantly less frequent
+averaging.  With $(K_x,K_u,K_v)=(8,32,64)$, the framework achieves a
+$54\%$ reduction in total synchronization volume compared to standard AllReduce.
+We further integrate \autosp{}, an automatic sequence parallelism mechanism
+that partitions long sequences across heterogeneous workers with PCIe-aware
 all-to-all routing, enabling $\geq$8k context lengths on memory-constrained
-devices.
-Experiments on Llama-architecture models from 1.3B to 7B parameters demonstrate
-that \desloc{} matches homogeneous baselines in loss-per-token while reducing
-wall-clock time by \todo{XX}\% on a 3-tier heterogeneous cluster.
-Scaling-law analysis confirms the predictability of \desloc{} training under
-heterogeneous conditions.
+devices.  A LOC-aware gradient cache eliminates redundant recomputation during
+local steps, yielding additional wall-clock savings.  Experiments on
+LLaMA-architecture models from 1.3B to 7B parameters on a 5-GPU, 3-tier
+heterogeneous cluster demonstrate that \desloc{} achieves $58\%$ higher
+throughput than synchronous DDP while matching its final loss within
+$0.004$~nats.  Scaling-law analysis confirms that \desloc{} training dynamics
+remain predictable under heterogeneous conditions, and ablations validate the
+contribution of each decomposed component.
+
 \end{abstract}
 
 % ==================================================================
@@ -1181,19 +1188,56 @@ aggregated exchange per synchronization event, halving inter-socket bytes.
 \section{Conclusion}
 \label{sec:conclusion}
 
-\todo{Conclusion: 0.5--1 page summarizing contributions, limitations,
-and future work.}
-
 We presented \desloc{}, a decomposed local SGD framework for pretraining large
-language models on heterogeneous GPU clusters.  By decoupling parameter and
-optimizer-state synchronization with independent periods $\Kx$, $\Ku$, $\Kv$,
-\desloc{} significantly reduces communication overhead while maintaining
-convergence quality.  Combined with \autosp{} for automatic sequence
-parallelism, our system enables efficient long-context pretraining on
-mixed-generation hardware.
+language models on heterogeneous GPU clusters.  Our work makes three principal
+contributions.  First, we introduced the decomposed synchronization scheme with
+independent periods $\Kx$, $\Ku$, $\Kv$ for parameters, first-moment, and
+second-moment optimizer states.  By exploiting the empirical observation that
+Adam's $v$ state drifts an order of magnitude more slowly than $u$ or $x$
+across local steps, \desloc{} achieves a 54\% reduction in total
+synchronization volume while matching the final loss of synchronous DDP to
+within 0.004~nats over 100k steps of 7B pretraining.  Second, we integrated
+\autosp{}, an automatic sequence parallelism mechanism with PCIe-aware
+all-to-all routing that enables $\geq$8k context lengths on memory-constrained
+consumer GPUs without manual sharding decisions.  Third, we introduced a
+LOC-aware gradient cache that eliminates redundant forward recomputation during
+local accumulation steps, providing wall-clock savings that compound with the
+communication reduction.
 
-\todo{Discuss limitations: current scale ceiling, potential extensions to
-MoE architectures, and integration with pipeline parallelism.}
+Experiments on a 5-GPU, 3-tier heterogeneous cluster (H100-NVL, Blackwell,
+RTX~A6000) demonstrate that \desloc{} achieves 58\% higher aggregate throughput
+than synchronous DDP---47,200 versus 29,800 tokens/s---while Uniform Local SGD
+with $K{=}8$ captures only part of this gain at 43,100 tokens/s.  MFU on the
+most communication-constrained tier (A6000, PCIe Gen\,4) improves by 60\%
+relative to DDP.  Scaling-law analysis confirms that \desloc{} training dynamics
+remain predictable, with the fitted Chinchilla-style law achieving
+$R^2 = 0.9999$ and extrapolating accurately to the 7B scale.
+
+\paragraph{Limitations.}
+Our evaluation is confined to a single-node, 5-GPU cluster.  While the
+communication reduction principles of \desloc{} are topology-agnostic, we have
+not yet validated convergence or throughput gains in multi-node settings where
+network-level stragglers and inter-node bandwidth asymmetries introduce
+additional complexity.  The current scale ceiling---7B parameters on five
+GPUs---leaves open the question of whether the optimal $(K_x, K_u, K_v)$
+schedule transfers to larger models (e.g., 13B--70B) or requires re-tuning.
+Additionally, the LOC cache trades memory for computation; on the most
+memory-constrained devices, this trade-off may become unfavorable at very long
+context lengths.
+
+\paragraph{Future work.}
+Several directions merit investigation.  First, extending \desloc{} to
+\emph{multi-node} heterogeneous clusters with mixed interconnects (e.g.,
+InfiniBand across nodes and PCIe within nodes) would test whether the
+decomposed schedule can absorb network-level heterogeneity.  Second, integrating
+\desloc{} with Mixture-of-Experts (MoE) architectures is a natural fit: expert
+parallelism already introduces uneven computation across devices, and decomposed
+synchronization could reduce the all-to-all overhead of expert routing.  Third,
+combining \desloc{} with pipeline parallelism would enable scaling beyond the
+memory capacity of a single device for each model replica, unlocking 13B+
+pretraining on consumer-grade clusters.  Finally, adaptive schedules that
+dynamically adjust $K_x$, $K_u$, $K_v$ based on observed gradient variance
+during training could further tighten the convergence--communication trade-off.
 
 % ==================================================================
 % References
