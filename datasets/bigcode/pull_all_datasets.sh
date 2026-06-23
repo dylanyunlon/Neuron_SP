@@ -353,6 +353,86 @@ if __name__ == "__main__":
 print(f"  stream_pr_commits.py saved to {out}/stream_pr_commits.py")
 PY4
 
+
+# ── 5. huggingface-cli download (元数据 + 配置文件缓存，四大数据集) ──
+# 作用: 将每个数据集的 README / dataset_infos.json / config 等元数据文件拉到本地
+# HF 缓存目录，让 load_dataset() 离线初始化更快；同时验证网络连通性和权限。
+# 注意: 对于 TB 级数据集 (commitpack / the-stack-v2) 此处仅拉元数据，
+#       不加 --local-dir 以避免触发完整数据下载。
+echo ""
+echo "=========================================="
+echo "[5/5] huggingface-cli download — 元数据 & 配置缓存 (四大数据集)"
+echo "=========================================="
+
+# 检查 huggingface-cli 是否可用
+if ! command -v huggingface-cli &>/dev/null; then
+    echo "  [WARN] huggingface-cli 未找到，尝试通过 pip 安装 huggingface_hub ..."
+    pip install --quiet huggingface_hub || {
+        echo "  [ERROR] 安装 huggingface_hub 失败，跳过 Section 5"
+    }
+fi
+
+# ── 辅助函数: 带重试和进度显示的 huggingface-cli download ──
+hf_download() {
+    local dataset_id="$1"
+    local label="$2"
+    local extra_args="${3:-}"        # 可选额外参数，如 --repo-type dataset
+    local max_retries=3
+    local attempt=1
+
+    echo ""
+    echo "  ┌─ $label ($dataset_id)"
+
+    while [ $attempt -le $max_retries ]; do
+        echo "  │  尝试 $attempt/$max_retries ..."
+        # shellcheck disable=SC2086
+        if huggingface-cli download \
+                --repo-type dataset \
+                --include "*.json" "*.md" "*.yaml" "*.txt" \
+                $extra_args \
+                "$dataset_id" 2>&1 | \
+            while IFS= read -r line; do
+                echo "  │  $line"
+            done; then
+            echo "  └─ ✓ $label — 元数据缓存成功"
+            return 0
+        else
+            echo "  │  [WARN] 下载失败 (attempt $attempt)"
+            attempt=$(( attempt + 1 ))
+            [ $attempt -le $max_retries ] && sleep 5
+        fi
+    done
+
+    echo "  └─ [ERROR] $label — $max_retries 次均失败，跳过 (不影响其他数据集)"
+    return 1   # 非 fatal: set -e 不会因此中止脚本 (通过 || true 调用)
+}
+
+# ── 5a. bigcode/commitpack (~4TB, streaming) ──
+echo ""
+echo "  [5a] bigcode/commitpack — 仅拉元数据 (完整数据 4TB, streaming=True 使用)"
+hf_download "bigcode/commitpack" "CommitPack" || true
+
+# ── 5b. bigcode/commitpackft (~2GB, 可全量下载) ──
+echo ""
+echo "  [5b] bigcode/commitpackft — 仅拉元数据 (完整数据见 commitpackft/ 目录)"
+hf_download "bigcode/commitpackft" "CommitPackFT" || true
+
+# ── 5c. bigcode/starcoderdata (~32-64GB git-commits splits) ──
+echo ""
+echo "  [5c] bigcode/starcoderdata — 仅拉元数据 (git-commits / git-commits-cleaned)"
+hf_download "bigcode/starcoderdata" "StarCoderData" || true
+
+# ── 5d. bigcode/the-stack-v2 (requires HF token + accepted agreement) ──
+echo ""
+echo "  [5d] bigcode/the-stack-v2 — 仅拉元数据 (需 huggingface-cli login + 接受协议)"
+if huggingface-cli whoami &>/dev/null 2>&1; then
+    hf_download "bigcode/the-stack-v2" "The Stack v2" || true
+else
+    echo "  │  [SKIP] 未登录 HuggingFace，跳过 the-stack-v2"
+    echo "  │  运行 'huggingface-cli login' 并在 HF Hub 接受协议后重新执行"
+    echo "  └─ 已跳过"
+fi
+
 echo ""
 echo "=========================================="
 echo "Done. Summary:"
@@ -360,4 +440,10 @@ echo "  commitpackft/     — ready to use (full download ~2GB)"
 echo "  starcoderdata_commits/ — 10K samples (raw + cleaned) + full download script"
 echo "  commitpack/       — 10K Python sample + per-language download script"
 echo "  the_stack_v2/     — metadata + access instructions"
+echo ""
+echo "  [Section 5] huggingface-cli 元数据缓存:"
+echo "    bigcode/commitpack      — 元数据 (完整数据 streaming=True 拉取)"
+echo "    bigcode/commitpackft    — 元数据 (完整数据见 commitpackft/)"
+echo "    bigcode/starcoderdata   — 元数据 (完整数据见 starcoderdata_commits/)"
+echo "    bigcode/the-stack-v2   — 需登录 + 协议，见 the_stack_v2/README.md"
 echo "=========================================="
