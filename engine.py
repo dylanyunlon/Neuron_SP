@@ -778,12 +778,24 @@ class DeepSpeedEngine(Module):
         try:
             from deepspeed.runtime.hetero_registry import HeteroRegistry
             self._hetero_registry = HeteroRegistry()
-            n_discovered = self._hetero_registry.discover_modules()
+            n_discovered = self._hetero_registry.scan()
             logger.info(f"DES-LOC: HeteroRegistry discovered {n_discovered} modules")
         except Exception as e:
             logger.warning(f"DES-LOC: HeteroRegistry skipped: {e}")
 
-        # 5. HeteroFP32GradAccumManager — three-tier precision for ZeRO backward
+        # 5. HeteroMIMOTrainingLoop — complete heterogeneous training orchestrator
+        # This creates PCIeP2PCommunicator, HeteroOptimizerRouter, SharedLocalityCache
+        try:
+            from deepspeed.runtime.hetero_mimo_training_loop import setup_hetero_mimo_training
+            self._hetero_mimo_loop = setup_hetero_mimo_training(self.module)
+            # Extract sub-components for direct use in engine methods
+            self._hetero_p2p = getattr(self._hetero_mimo_loop, 'p2p_communicator', None)
+            self._hetero_optimizer_router = getattr(self._hetero_mimo_loop, 'optimizer_router', None)
+            logger.info("DES-LOC: HeteroMIMOTrainingLoop wired (PCIeP2P + OptimizerRouter + LOC)")
+        except Exception as e:
+            logger.warning(f"DES-LOC: HeteroMIMOTrainingLoop skipped: {e}")
+
+        # 6. HeteroFP32GradAccumManager — three-tier precision for ZeRO backward
         self._hetero_fp32_grad_accum = None
         try:
             from deepspeed.runtime.hetero_fp32_grad_accum import (
