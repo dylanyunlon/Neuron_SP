@@ -841,6 +841,8 @@ def run_desloc(args: argparse.Namespace) -> None:
         log_every       = args.log_every,
         save_every      = getattr(args, "save_every", 1000),
         eval_every      = 0,
+        wandb_project   = getattr(args, "wandb_desloc_project", None),
+        tensorboard_dir = getattr(args, "tensorboard_desloc_dir", None),
     )
 
     # Build the LlamaModel and pass it in (DesLocEngine wraps it)
@@ -1011,6 +1013,27 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="checkpoints",
         help="Directory to save checkpoints.",
+    )
+    p.add_argument(
+        "--wandb",
+        default=None,
+        metavar="PROJECT",
+        dest="wandb_desloc_project",
+        help=(
+            "W&B project name for DesLocEngine training metrics. "
+            "If set, logs train/loss, lr, grad_norm, throughput, MFU, GPU mem to W&B. "
+            "Distinct from --wandb-project which controls the standalone loop."
+        ),
+    )
+    p.add_argument(
+        "--tensorboard",
+        default=None,
+        metavar="DIR",
+        dest="tensorboard_desloc_dir",
+        help=(
+            "Directory for DesLocEngine TensorBoard logs. "
+            "If set, writes train/* scalars every log_every steps (rank 0 only)."
+        ),
     )
     p.add_argument(
         "--data-mode",

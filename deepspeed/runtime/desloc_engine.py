@@ -60,6 +60,23 @@ except Exception as _eval_import_exc:
     _run_periodic_eval = None
 
 # ---------------------------------------------------------------------------
+# Optional logging backends: wandb and TensorBoard
+# ---------------------------------------------------------------------------
+try:
+    import wandb as _wandb
+    _HAS_WANDB = True
+except ImportError:
+    _wandb = None  # type: ignore[assignment]
+    _HAS_WANDB = False
+
+try:
+    from torch.utils.tensorboard import SummaryWriter as _SummaryWriter
+    _HAS_TENSORBOARD = True
+except ImportError:
+    _SummaryWriter = None  # type: ignore[assignment]
+    _HAS_TENSORBOARD = False
+
+# ---------------------------------------------------------------------------
 # NOTE: All deepspeed.runtime.hetero_* and deepspeed.checkpoint.hetero_*
 # imports have been made lazy (imported inside __init__ / methods) to avoid
 # triggering deepspeed/__init__.py → apex dependency at module import time.
@@ -221,6 +238,12 @@ class TrainingConfig:
     #   H100  (96 GB) → "selective"  (checkpoint every other TransformerBlock)
     activation_checkpointing: bool = False
     checkpoint_activations_granularity: str = "full"  # "full" | "selective"
+
+    # Logging backends (rank 0 only)
+    # wandb_project: W&B project name; None = disabled.  Requires wandb installed.
+    # tensorboard_dir: directory for SummaryWriter; None = disabled.  Requires tensorboard.
+    wandb_project: Optional[str] = None
+    tensorboard_dir: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -1816,6 +1839,36 @@ class DesLocEngine:
         # Rank guard: only rank 0 prints/logs to avoid 5x log spam
         _is_main = (not dist.is_initialized()) or (dist.get_rank() == 0)
 
+        # --- Optional logging backends (rank 0 only) ---
+        import datetime as _dt  # noqa: PLC0415
+        _ts = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+        _wb_run = None
+        _tb_writer = None
+        if _is_main:
+            if cfg.wandb_project and _HAS_WANDB:
+                _wb_run = _wandb.init(
+                    project=cfg.wandb_project,
+                    name=f"desloc_{_ts}",
+                    config={
+                        "model_size": f"{cfg.hidden_size}h_{cfg.num_layers}L",
+                        "total_steps": cfg.total_steps,
+                        "micro_batch_size": cfg.micro_batch_size,
+                        "global_batch_size": cfg.global_batch_size,
+                        "seq_len": cfg.seq_len,
+                        "max_lr": cfg.max_lr,
+                    },
+                    resume="allow",
+                )
+                logger.info("W&B run initialised: project=%s  run=%s", cfg.wandb_project, _wb_run.name)
+            elif cfg.wandb_project and not _HAS_WANDB:
+                logger.warning("wandb_project set but wandb is not installed; W&B logging disabled.")
+            tb_dir = cfg.tensorboard_dir or f"logs/tb_{_ts}"
+            if cfg.tensorboard_dir and _HAS_TENSORBOARD:
+                _tb_writer = _SummaryWriter(log_dir=tb_dir)
+                logger.info("TensorBoard SummaryWriter: dir=%s", tb_dir)
+            elif cfg.tensorboard_dir and not _HAS_TENSORBOARD:
+                logger.warning("tensorboard_dir set but torch.utils.tensorboard unavailable.")
+
         # Lazy imports (hetero_* not imported at module level to avoid apex dep)
         from deepspeed.runtime.hetero_gdn_selective_recompute import build_neuron_sp_config  # noqa: PLC0415
         from deepspeed.runtime.hetero_grad_norm_skip import (  # noqa: PLC0415
@@ -2095,6 +2148,36 @@ class DesLocEngine:
                     elapsed / cfg.log_every * 1000,
                     self.tokens_seen / 1e6,
                 )
+                # --- W&B / TensorBoard metrics (rank 0 only) ---
+                if _is_main and (_wb_run is not None or _tb_writer is not None):
+                    # GPU allocated memory per visible device (up to 5 GPUs)
+                    _gpu_mems = {}
+                    if torch.cuda.is_available():
+                        for _gi in range(min(torch.cuda.device_count(), 5)):
+                            _gpu_mems[f"train/gpu{_gi}_mem_gb"] = (
+                                torch.cuda.memory_allocated(_gi) / (1 << 30)
+                            )
+                    # MFU estimate: 6 * N_params * T_tokens / (elapsed * peak_flops)
+                    # Peak BF16 FLOPS for the primary device tier
+                    _peak_flops = 835e12  # H100 NVL BF16; conservative estimate
+                    _n_params = sum(p.numel() for p in self.model.parameters())
+                    _t_tokens = tokens_this_step * cfg.log_every
+                    _mfu = (6 * _n_params * _t_tokens) / max(elapsed * _peak_flops, 1.0)
+                    _log_dict = {
+                        "train/loss":                 smooth_loss,
+                        "train/lr":                   current_lr,
+                        "train/grad_norm":            gnorm,
+                        "train/throughput_tokens_per_sec": toks_per_sec,
+                        "train/mfu":                  _mfu,
+                        "train/tokens_seen_M":        self.tokens_seen / 1e6,
+                        **_gpu_mems,
+                    }
+                    if _wb_run is not None:
+                        _wb_run.log(_log_dict, step=self.global_step)
+                    if _tb_writer is not None:
+                        for _k, _v in _log_dict.items():
+                            _tb_writer.add_scalar(_k, _v, self.global_step)
+
                 loss_accum = 0.0
                 t0 = time.time()
 
@@ -2144,6 +2227,14 @@ class DesLocEngine:
             self.tokens_seen / 1e6,
             self.tokens_seen / max(total_time, 1.0),
         )
+        # Flush and close logging backends (rank 0 only)
+        if _is_main:
+            if _wb_run is not None:
+                _wb_run.finish()
+                logger.info("W&B run finished.")
+            if _tb_writer is not None:
+                _tb_writer.close()
+                logger.info("TensorBoard writer closed.")
 
     def save_checkpoint(self, path: Path) -> None:
         """
