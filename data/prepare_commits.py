@@ -446,7 +446,7 @@ def prepare_commitpackft(
     # Dataset
     # ------------------------------------------------------------------
     print(f"[prepare_commitpackft] Loading bigcode/commitpackft ('python', split='{split}') ...")
-    dataset = load_dataset("bigcode/commitpackft", "python", split=split)
+    dataset = load_dataset("bigcode/commitpackft", "python", split=split, trust_remote_code=True)
     total_samples = len(dataset)
     print(f"[prepare_commitpackft] Dataset has {_format_num(total_samples)} samples.")
 

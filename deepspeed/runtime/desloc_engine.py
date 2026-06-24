@@ -1854,9 +1854,9 @@ class DesLocEngine:
         _wb_run = None
         _tb_writer = None
         if _is_main:
-            if cfg.wandb_project and _HAS_WANDB:
+            if getattr(self.config, "wandb_project", None) and _HAS_WANDB:
                 _wb_run = _wandb.init(
-                    project=cfg.wandb_project,
+                    project=getattr(self.config, "wandb_project", None),
                     name=f"desloc_{_ts}",
                     config={
                         "model_size": f"{cfg.hidden_size}h_{cfg.num_layers}L",
@@ -1868,14 +1868,14 @@ class DesLocEngine:
                     },
                     resume="allow",
                 )
-                logger.info("W&B run initialised: project=%s  run=%s", cfg.wandb_project, _wb_run.name)
-            elif cfg.wandb_project and not _HAS_WANDB:
+                logger.info("W&B run initialised: project=%s  run=%s", getattr(self.config, "wandb_project", None), _wb_run.name)
+            elif getattr(self.config, "wandb_project", None) and not _HAS_WANDB:
                 logger.warning("wandb_project set but wandb is not installed; W&B logging disabled.")
-            tb_dir = cfg.tensorboard_dir or f"logs/tb_{_ts}"
-            if cfg.tensorboard_dir and _HAS_TENSORBOARD:
+            tb_dir = getattr(self.config, "tensorboard_dir", None) or f"logs/tb_{_ts}"
+            if getattr(self.config, "tensorboard_dir", None) and _HAS_TENSORBOARD:
                 _tb_writer = _SummaryWriter(log_dir=tb_dir)
                 logger.info("TensorBoard SummaryWriter: dir=%s", tb_dir)
-            elif cfg.tensorboard_dir and not _HAS_TENSORBOARD:
+            elif getattr(self.config, "tensorboard_dir", None) and not _HAS_TENSORBOARD:
                 logger.warning("tensorboard_dir set but torch.utils.tensorboard unavailable.")
 
         # Lazy imports (hetero_* not imported at module level to avoid apex dep)
