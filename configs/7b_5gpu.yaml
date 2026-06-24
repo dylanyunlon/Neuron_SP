@@ -1,0 +1,190 @@
+# =============================================================================
+# configs/7b_5gpu.yaml
+# 7B CommitPack pretraining — 5-GPU heterogeneous configuration
+#
+# Hardware target (ags1 cluster, full 5-GPU setup):
+#   GPU0: RTX A6000          49 GB  SM8.6   PCIe4  ~38.7 TFLOPS(BF16)   NUMA0
+#   GPU1: RTX PRO 6000 Blackwell  98 GB  SM12.0  PCIe5  ~??  TFLOPS(BF16)   NUMA0
+#   GPU2: H100 NVL           96 GB  SM9.0   PCIe5  835   TFLOPS(BF16)   NUMA0
+#   GPU3: RTX A6000          49 GB  SM8.6   PCIe4  ~38.7 TFLOPS(BF16)   NUMA1
+#   GPU4: RTX PRO 6000 Blackwell  98 GB  SM12.0  PCIe5  ~??  TFLOPS(BF16)   NUMA1
+#
+# NOTE: RTX PRO 6000 Blackwell (SM12.0) requires PyTorch with CUDA 12.6+
+#   (cu126 or later). Older PyTorch builds lack SM12.0 kernels and will either
+#   fall back to slower PTX JIT compilation or fail at runtime.
+#   Recommended: torch>=2.7.0+cu126  (or nightly with CUDA 12.8 for full
+#   Blackwell kernel support including FP8 tensor ops).
+#
+# Invoke:
+#   python run_pretrain.py --config configs/7b_5gpu.yaml
+#   python run_pretrain.py --config configs/7b_5gpu.yaml --data-path /data/commits
+# CLI flags override any value set here.
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Model architecture  (identical to 7b_commitpack baseline)
+# ---------------------------------------------------------------------------
+model:
+  size: "7b"                   # preset key in _MODEL_CONFIGS
+  vocab_size: 32064             # 32000 base + 64 special tokens (CommitPack tokenizer)
+  hidden_size: 4096
+  num_layers: 32
+  num_heads: 32
+  seq_len: 2048
+  # Intermediate size for SwiGLU: int(4096 * 8/3) rounded up to multiple of 64
+  ffn_hidden_size: 11008
+
+# ---------------------------------------------------------------------------
+# Training hyperparameters
+# ---------------------------------------------------------------------------
+training:
+  steps: 100000                 # ~14 B tokens at global_batch=64, seq=2048
+  warmup_steps: 2000
+  max_lr: 3.0e-4
+  min_lr: 3.0e-5
+  lr_schedule: "cosine"
+  min_lr_ratio: 0.1
+
+  # --- Batch sizes ---
+  # global_batch_size = sum(micro_batch_size_per_gpu) * grad_accum_steps
+  # Here: (2+4+4+2+4) * 4 = 16 * 4 = 64  → matches the 3-GPU baseline
+  global_batch_size: 64
+  grad_accum_steps: 4           # reduced from 8; more GPUs offset accumulation
+
+  # Per-GPU micro-batch sizes, scaled by available VRAM:
+  #   GPU0 A6000        49 GB → 2  (same as baseline; 49 GB is the tightest stage)
+  #   GPU1 Blackwell    98 GB → 4  (2× VRAM vs A6000)
+  #   GPU2 H100 NVL     96 GB → 4  (large VRAM, high BW — take bigger slice)
+  #   GPU3 A6000        49 GB → 2  (mirror of GPU0)
+  #   GPU4 Blackwell    98 GB → 4  (mirror of GPU1)
+  # NOTE: these values are used by the DesLocEngine per-stage micro-batch
+  #   scheduler; the key name must match what run_pretrain.py expects.
+  micro_batch_size_per_gpu: [2, 4, 4, 2, 4]
+
+  # Kept for backwards-compat with single-value consumers; set to the minimum
+  # stage value so nothing OOMs on the A6000 stages.
+  micro_batch_size: 2
+
+  # Regularisation
+  weight_decay: 0.1
+  grad_clip: 1.0
+  beta1: 0.9
+  beta2: 0.95
+  eps: 1.0e-8
+
+  # Precision
+  # All GPUs support BF16 natively (SM8.6/SM9.0/SM12.0).
+  # SM12.0 also exposes FP8, but leave that for a dedicated FP8 config.
+  dtype: "bfloat16"
+
+  # Activation checkpointing — essential on the 49 GB A6000 stages
+  activation_checkpointing: true
+  checkpoint_activations_granularity: "selective"   # "full" | "selective"
+
+# ---------------------------------------------------------------------------
+# Data
+# ---------------------------------------------------------------------------
+data:
+  path: null                    # override via --data-path CLI flag
+  fim_rate: 0.15
+  ctx_loss_weight: 0.5
+  tokenizer_model: null
+
+# ---------------------------------------------------------------------------
+# Parallelism
+# ---------------------------------------------------------------------------
+parallelism:
+  tensor_parallel: 1            # TP=1: no NVLink across all 5 GPUs (PCIe topology)
+  pipeline_parallel: 5          # PP across all 5 GPUs
+  data_parallel: 1              # DP = world_size / (TP * PP)
+
+  # Layer split across PP stages (must sum to num_layers = 32).
+  # Allocation rationale (VRAM proportional, rounded to even layer counts):
+  #   Total VRAM:  49 + 98 + 96 + 49 + 98 = 390 GB
+  #   32 layers / 390 GB ≈ 0.082 layers/GB
+  #   GPU0  49 GB → 49×0.082 ≈ 4.0  → 4  layers
+  #   GPU1  98 GB → 98×0.082 ≈ 8.0  → 8  layers
+  #   GPU2  96 GB → 96×0.082 ≈ 7.9  → 8  layers
+  #   GPU3  49 GB → 49×0.082 ≈ 4.0  → 4  layers
+  #   GPU4  98 GB → 98×0.082 ≈ 8.0  → 8  layers
+  #   Total: 4+8+8+4+8 = 32 ✓
+  pp_layer_split: [4, 8, 8, 4, 8]
+
+  sequence_parallel: false      # requires NVLink for efficient all-gather
+
+# ---------------------------------------------------------------------------
+# DES-LOC engine (DesLocEngine)
+# ---------------------------------------------------------------------------
+desloc:
+  enabled: true
+  # LOC sizes per NUMA node — NUMA0 holds GPU0+GPU1+GPU2, NUMA1 holds GPU3+GPU4
+  # NUMA0 total VRAM: 49+98+96 = 243 GB → generous LOC budget
+  # NUMA1 total VRAM: 49+98    = 147 GB
+  loc_cache_numa0_gb: 300
+  loc_cache_numa1_gb: 200
+  # Sequence partition coefficients
+  # A6000 stages (GPU0, GPU3): lower BW → larger split factor
+  # Blackwell/H100 stages: higher BW → smaller split factor
+  Kx: 8                         # token split factor for A6000 tier (SM8.6)
+  Ku: 4                         # token split factor for H100/Blackwell upload
+  Kv: 16                        # token split factor for H100/Blackwell value cache
+  zero_stage: 3
+
+  # Per-stage overrides for Blackwell GPUs (SM12.0).
+  # Blackwell has a different async-copy engine; tune independently.
+  # Requires PyTorch cu126+ to avoid PTX fallback on SM12.0.
+  stage_overrides:
+    - stage: 1       # GPU1  RTX PRO 6000 Blackwell  SM12.0
+      Kx: 4
+      Ku: 2
+      Kv: 8
+    - stage: 4       # GPU4  RTX PRO 6000 Blackwell  SM12.0
+      Kx: 4
+      Ku: 2
+      Kv: 8
+
+# ---------------------------------------------------------------------------
+# NCCL / communication tuning
+# PCIe-only mesh: P2P disabled, no IB, lo loopback for single-node comms.
+# Cross-NUMA traffic (GPU0-2 ↔ GPU3-4) goes through the CPU NUMA interconnect;
+# set NCCL_CROSS_NIC=0 to prevent unnecessary NIC round-trips.
+# ---------------------------------------------------------------------------
+nccl:
+  p2p_disable: true
+  shm_disable: false
+  net_gdr_level: 0
+  ib_disable: true
+  socket_ifname: "lo"
+  cross_nic: 0                  # avoid NUMA-cross NIC hops on the 5-GPU mesh
+  debug: "WARN"
+
+# ---------------------------------------------------------------------------
+# Checkpointing
+# ---------------------------------------------------------------------------
+checkpoint:
+  save_every: 5000
+  dir: "checkpoints/7b_5gpu"
+  resume_from: null
+  keep_last_n: 3
+
+# ---------------------------------------------------------------------------
+# Evaluation
+# ---------------------------------------------------------------------------
+eval:
+  eval_every: 1000
+  eval_iters: 50
+  model_path: null
+  output_dir: "desloc_results/eval_runs/7b_5gpu"
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+logging:
+  log_every: 10
+  level: "INFO"
+  log_dir: "logs/7b_5gpu"
+  wandb:
+    enabled: false
+    project: "neuron_sp"
+    run_name: "7b_5gpu"
+    tags: ["7b", "commitpack", "desloc", "5gpu", "blackwell", "sm120"]
