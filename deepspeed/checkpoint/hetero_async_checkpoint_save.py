@@ -932,7 +932,8 @@ def build_hetero_async_save_pipeline(
             thread_count=thread_count,
             use_msc=use_msc,
         )
-        planner = torch.distributed.checkpoint.DefaultSavePlanner()
+        import torch.distributed.checkpoint as dcp
+        planner = dcp.DefaultSavePlanner()
         save_state_dict_ret = save_state_dict_async_plan(
             staged_state_dict,
             writer,
@@ -956,11 +957,17 @@ def build_hetero_async_save_pipeline(
         )
 
         def _sync_save() -> None:
-            fs_writer = torch.distributed.checkpoint.FileSystemWriter(checkpoint_path)
-            torch.distributed.checkpoint.save(
-                state_dict=staged_state_dict,
-                storage_writer=fs_writer,
-            )
+            try:
+                import torch.distributed.checkpoint as dcp
+                fs_writer = dcp.FileSystemWriter(checkpoint_path)
+                dcp.save(
+                    state_dict=staged_state_dict,
+                    storage_writer=fs_writer,
+                )
+            except (ImportError, AttributeError):
+                os.makedirs(checkpoint_path, exist_ok=True)
+                save_path = os.path.join(checkpoint_path, f"rank{dist.get_rank()}.pt")
+                torch.save(staged_state_dict, save_path)
 
         def _flush_cache() -> None:
             locality_cache.flush()
