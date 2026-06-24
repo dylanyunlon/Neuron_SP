@@ -1045,6 +1045,39 @@ class DesLocEngine:
         _local_device = torch.device(f"cuda:{torch.cuda.current_device()}")
         self.model = self.model.to(dtype=_DEFAULT_DTYPE, device=_local_device)
         self.model_device = _local_device  # cached for forward()
+
+        # --- Phase 4b: FSDP wrapping for ZeRO-3 heterogeneous sharding ---
+        # Neuron_SP core design: partition model params + optimizer states
+        # across heterogeneous GPUs so that models exceeding single-GPU VRAM
+        # (e.g. 7B on A6000 48GB) can train via sharding.
+        if dist.is_initialized() and dist.get_world_size() > 1:
+            from torch.distributed.fsdp import (
+                FullyShardedDataParallel as FSDP,
+                MixedPrecision,
+                ShardingStrategy,
+                CPUOffload,
+            )
+            _local_mem_gb = torch.cuda.get_device_properties(_local_device).total_memory / (1 << 30)
+            # Use CPU offload on small-VRAM GPUs (A6000 48GB)
+            _cpu_offload = CPUOffload(offload_params=(_local_mem_gb < 60))
+            _mp = MixedPrecision(
+                param_dtype=_DEFAULT_DTYPE,
+                reduce_dtype=_DEFAULT_DTYPE,
+                buffer_dtype=_DEFAULT_DTYPE,
+            )
+            self.model = FSDP(
+                self.model,
+                sharding_strategy=ShardingStrategy.FULL_SHARD,
+                mixed_precision=_mp,
+                cpu_offload=_cpu_offload,
+                device_id=_local_device,
+                use_orig_params=True,
+            )
+            logger.info(
+                "FSDP wrapped: strategy=FULL_SHARD, cpu_offload=%s, device=%s",
+                _local_mem_gb < 60, _local_device,
+            )
+
         n_params = sum(p.numel() for p in self.model.parameters())
         logger.info("Model: %.2fM parameters on %s", n_params / 1e6, _local_device)
 
