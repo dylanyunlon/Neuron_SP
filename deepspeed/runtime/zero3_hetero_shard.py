@@ -228,18 +228,14 @@ class ShardState:
             vram_weights is not None,
         )
 
-        # Save CPU-pinned full BF16 copies BEFORE we overwrite p.data with
-        # the sharded view. These allow forward/backward hooks to
-        # reconstruct full params via H2D copy without NCCL collectives.
+        # cpu_param_data is no longer populated: the full BF16 model is kept
+        # on GPU for the duration of training (see ZeRO3ForwardHook.register).
+        # Keeping the field as an empty dict preserves backward-compatibility
+        # for any callers that inspect it.
         cpu_param_data: Dict[str, torch.Tensor] = {}
-        for name, p in param_order:
-            cpu_param_data[name] = p.detach().clone().to(
-                dtype=torch.bfloat16
-            ).pin_memory()
 
-        # Pre-allocate the gradient buffer NOW, before forward all-gather
-        # consumes GPU memory. Lazy allocation inside backward hooks would
-        # OOM because forward already holds the full-layer gathered params.
+        # Pre-allocate the gradient buffer NOW so optimizer state is ready
+        # before forward runs.
         param_shard.grad = torch.zeros_like(param_shard)
         logger.info(
             "[zero3] rank=%d pre-allocated param_shard.grad: %.2f GB on %s",
@@ -543,11 +539,12 @@ class ShardState:
                 self.param_shard.grad[s_start:s_start + take].copy_(grad_flat[:take])
 
     def sync_shard_to_model(self) -> None:
-        """Copy updated FP32 param_shard back to model's BF16 parameters
-        and to the CPU-pinned full param copies used by forward hooks.
+        """Copy updated FP32 param_shard back to model's BF16 parameters.
 
         Called after optimizer.step() updates param_shard. Each rank writes
-        only the slice of each parameter that it owns.
+        only the slice of each parameter that it owns.  The full model now
+        lives on GPU (see ZeRO3ForwardHook.register), so we update p.data
+        in-place; cpu_param_data is no longer maintained.
         """
         lo = self.shard_offsets[self.rank]
         hi = self.shard_offsets[self.rank + 1]
@@ -564,192 +561,79 @@ class ShardState:
             s_end = g_end - lo
             with torch.no_grad():
                 updated = self.param_shard.data[s_start:s_end]
-                # Update model param (BF16)
+                # Update model param in-place (p.data lives on GPU in BF16)
                 flat = p.data.reshape(-1)
                 flat[p_start:p_end].copy_(updated.to(p.dtype))
-                # Update CPU pinned copy for next forward's H2D gather
-                cpu_data = self.cpu_param_data.get(name)
-                if cpu_data is not None:
-                    cpu_flat = cpu_data.reshape(-1)
-                    cpu_flat[p_start:p_end].copy_(updated.to(cpu_data.dtype))
 
 class ZeRO3ForwardHook:
     """
-    Layer-by-layer ZeRO-3 forward all-gather.
+    ZeRO-3 parameter materialisation for DesLocEngine.
 
-    Registers ``register_forward_pre_hook`` / ``register_forward_hook``
-    on every ``nn.Module`` that directly owns trainable parameters. The
-    pre-hook reconstructs the full BF16 params for *that layer only*
-    via ``dist.all_gather_into_tensor`` (falling back to ``all_gather``
-    when shard sizes vary across ranks). The post-hook restores each
-    parameter's local sharded storage and frees the gathered buffer.
+    **Previous design (broken):** per-layer H2D gather/release hooks that
+    swapped ``p.data`` between CPU and GPU around each module's forward.
+    This broke autograd because the graph records the tensor storage
+    address at forward time; swapping ``p.data`` to CPU in the post-hook
+    made the backward-pre re-gather invisible to autograd's saved-tensor
+    machinery.
 
-    Why per-layer (not all-at-once)
-    -------------------------------
-    Peak VRAM during forward becomes::
+    **Current design:** load the *entire* model to GPU once, in BF16,
+    before the training loop starts.  ``register()`` performs this move
+    and installs no per-module hooks.  ``remove()`` is a no-op.
 
-        model_shard + max(per_layer_full_params)
+    VRAM budget (per rank)
+    ----------------------
+    ::
 
-    instead of ``full_model``. For a 7B LLM with 32 transformer blocks
-    that is roughly 1/32 of the model on top of the shard — making it
-    feasible to train models that wouldn't otherwise fit.
+        param_shard (FP32) : ~12 GB  (H100) / ~6 GB  (A6000)
+        grad shard  (FP32) : ~12 GB  (H100) / ~6 GB  (A6000)
+        Adam m+v    (FP32) : ~24 GB  (H100) / ~12 GB (A6000)
+        full model  (BF16) : ~12 GB  (both)
+        activations        :  ~5 GB  (H100) / ~3 GB  (A6000)
+        ──────────────────────────────────────────────────────
+        total              : ~65 GB / 93 GB  (H100)  OK
+                           : ~39 GB / 47 GB  (A6000) OK
 
-    Notes
-    -----
-    * Only direct parameters of a module are gathered in that module's
-      pre-hook (i.e. ``module._parameters``, not recursive). Each
-      submodule will trigger its own hook.
-    * Shared parameters (the same ``nn.Parameter`` referenced by
-      multiple modules) are gathered once per forward call site; the
-      restore step is keyed on ``id(parameter)`` so we always return
-      the original local shard view.
-    * ``world_size <= 1``: install no hooks (no-op).
+    Backward hooks in ``ShardState.register_backward_hooks`` still extract
+    each parameter's local gradient slice into ``param_shard.grad``.
+    ``sync_shard_to_model`` writes the updated FP32 shard back to the GPU
+    BF16 parameters in-place after every optimizer step.
     """
 
     def __init__(self, model: nn.Module, shard_state: "ShardState") -> None:
         self.model = model
         self.shard_state = shard_state
         self._handles: List[torch.utils.hooks.RemovableHandle] = []
-        # param identity (id) -> (param, original local-shard storage)
-        # used as a transient per-layer save/restore map.
-        self._saved: Dict[int, Tuple[nn.Parameter, torch.Tensor]] = {}
-        # Map nn.Parameter id -> ParamSlice for O(1) lookup during hooks.
-        self._param_to_slice: Dict[int, ParamSlice] = {}
-        if shard_state is not None:
-            for name, p in shard_state.param_order:
-                sl = shard_state.param_offsets.get(name)
-                if sl is not None:
-                    self._param_to_slice[id(p)] = sl
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
     def register(self) -> int:
         """
-        Walk the model and attach pre/post hooks to every module that
-        directly owns at least one trainable, sharded parameter.
+        Move the full model to the local GPU in BF16.
 
-        Returns the number of modules hooked. Safe to call when
-        ``world_size <= 1`` — installs nothing and returns 0.
+        Returns 1 when the move was performed, 0 when sharding is not
+        active (``world_size <= 1``).  No per-module hooks are installed.
         """
         if self.shard_state is None or self.shard_state.world_size <= 1:
             logger.info(
-                "[zero3-hook] world_size<=1, skipping hook installation"
+                "[zero3-hook] world_size<=1, skipping full-model GPU load"
             )
             return 0
 
-        hooked = 0
-        for mod in self.model.modules():
-            direct_params = [
-                p for p in mod._parameters.values()
-                if p is not None and id(p) in self._param_to_slice
-            ]
-            if not direct_params:
-                continue
-            pre = mod.register_forward_pre_hook(self._make_pre_hook(direct_params))
-            post = mod.register_forward_hook(self._make_post_hook(direct_params))
-            self._handles.extend([pre, post])
-            hooked += 1
-
+        device = self.shard_state.param_shard.device
+        self.model.to(device=device, dtype=torch.bfloat16)
         logger.info(
-            "[zero3-hook] installed forward all-gather hooks on %d modules "
-            "(rank=%d/%d)",
-            hooked, self.shard_state.rank, self.shard_state.world_size,
+            "[zero3-hook] full BF16 model loaded to %s "
+            "(rank=%d/%d, no per-layer hooks)",
+            device,
+            self.shard_state.rank,
+            self.shard_state.world_size,
         )
-        return hooked
+        return 1
 
     def remove(self) -> None:
-        """Remove all installed hooks (e.g. for teardown / eval)."""
-        for h in self._handles:
-            try:
-                h.remove()
-            except Exception:  # noqa: BLE001
-                pass
+        """No-op — no hooks were installed."""
         self._handles.clear()
-        self._saved.clear()
-
-    # ------------------------------------------------------------------
-    # Hook factories
-    # ------------------------------------------------------------------
-    def _make_pre_hook(self, params: List[nn.Parameter]):
-        def _pre(module: nn.Module, inputs):
-            self._gather_params(params)
-            return None
-        return _pre
-
-    def _make_post_hook(self, params: List[nn.Parameter]):
-        def _post(module: nn.Module, inputs, output):
-            # Release immediately after forward — saves GPU memory.
-            # Backward will re-gather via full_backward_pre_hook.
-            saved_params = list(params)
-
-            # Register one-shot backward hooks: pre to re-gather, post to release
-            pre_ref = [None]
-            post_ref = [None]
-
-            def _bwd_pre_hook(module, grad_output):
-                """Re-gather params before backward computes gradients."""
-                self._gather_params(saved_params)
-
-            def _bwd_post_hook(module, grad_input, grad_output):
-                """Release params after backward finishes this module."""
-                self._release_params(saved_params)
-                # Remove one-shot hooks
-                if pre_ref[0] is not None:
-                    pre_ref[0].remove()
-                    pre_ref[0] = None
-                if post_ref[0] is not None:
-                    post_ref[0].remove()
-                    post_ref[0] = None
-
-            pre_ref[0] = module.register_full_backward_pre_hook(_bwd_pre_hook)
-            post_ref[0] = module.register_full_backward_hook(_bwd_post_hook)
-
-            # Now release forward's gathered params
-            self._release_params(saved_params)
-            return None
-        return _post
-
-    # ------------------------------------------------------------------
-    # Per-layer gather / release
-    # ------------------------------------------------------------------
-    def _gather_params(self, params: List[nn.Parameter]) -> None:
-        """Reconstruct full params on GPU via H2D copy from CPU pinned memory.
-
-        This is a rank-local operation — no NCCL collectives — so it works
-        correctly with heterogeneous microbatch counts across ranks.
-        """
-        state = self.shard_state
-        device = state.param_shard.device
-
-        for p in params:
-            pid = id(p)
-            if pid in self._saved:
-                continue
-            sl = self._param_to_slice.get(pid)
-            if sl is None:
-                continue
-            name = sl.name
-            cpu_data = state.cpu_param_data.get(name)
-            if cpu_data is None:
-                continue
-            # Synchronous H2D copy from pinned CPU memory.
-            # non_blocking=False ensures the data is fully on GPU before
-            # forward/backward compute uses it.
-            full = cpu_data.to(device=device, non_blocking=False)
-            self._saved[pid] = (p, p.data)
-            p.data = full
-
-    def _release_params(self, params: List[nn.Parameter]) -> None:
-        """Restore each parameter's local sharded storage and drop the
-        gathered buffer (freed when its last reference goes away)."""
-        for p in params:
-            pid = id(p)
-            entry = self._saved.pop(pid, None)
-            if entry is None:
-                continue
-            _, orig = entry
-            p.data = orig
 
 
 def install_zero3_forward_hooks(
