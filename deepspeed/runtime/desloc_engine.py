@@ -1742,16 +1742,10 @@ class DesLocEngine:
             print("[DBG] Entering training loop", flush=True)
 
         for step in range(self.global_step, cfg.total_steps):
-            self.optimizer.zero_grad(set_to_none=True)
+            self.optimizer.zero_grad(set_to_none=False)
             # Zero param_shard.grad — backward hooks accumulate into it
             if self.param_shard_state is not None:
-                if self.param_shard_state.param_shard.grad is not None:
-                    self.param_shard_state.param_shard.grad.zero_()
-                else:
-                    # Re-allocate if optimizer.zero_grad(set_to_none=True) cleared it
-                    self.param_shard_state.param_shard.grad = torch.zeros_like(
-                        self.param_shard_state.param_shard
-                    )
+                self.param_shard_state.param_shard.grad.zero_()
             step_loss = 0.0
 
             # Heterogeneous scheduling: each rank gets its own micro-batch count
@@ -1826,7 +1820,7 @@ class DesLocEngine:
                     "NaN/Inf loss at step %d (count=%d), skipping optimizer update",
                     step, _nan_count,
                 )
-                self.optimizer.zero_grad(set_to_none=True)
+                self.optimizer.zero_grad(set_to_none=False)
                 continue
 
             # FP32 grad sync (if active and no ZeRO-3 — ZeRO-3 hooks handle grad reduction)
