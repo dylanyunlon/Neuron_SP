@@ -345,13 +345,10 @@ class ShardState:
         shard_sizes = self.shard_sizes
         shard_offsets = self.shard_offsets
         even = all(s == shard_sizes[0] for s in shard_sizes)
+        _param_shard = self.param_shard  # captured for closure
 
         def _make_hook(name: str, p: nn.Parameter):
             sl = self.param_offsets[name]
-            # Pre-compute per-rank slice indices for this parameter's
-            # flat layout. shard_slices[r] = (p_lo, p_hi) where
-            # p.flatten()[p_lo:p_hi] is the slab destined for rank r;
-            # an empty slice means rank r owns none of this param.
             shard_slices: List[Tuple[int, int]] = []
             for r in range(world_size):
                 r_lo = shard_offsets[r]
@@ -364,6 +361,12 @@ class ShardState:
                     shard_slices.append(
                         (g_lo - sl.global_start, g_hi - sl.global_start)
                     )
+
+            # Pre-compute where this param's local grad lands in param_shard
+            _g_start = max(sl.global_start, lo_rank)
+            _g_end = min(sl.global_end, hi_rank)
+            _shard_start = _g_start - lo_rank if _g_end > _g_start else 0
+            _shard_end = _g_end - lo_rank if _g_end > _g_start else 0
 
             def _hook(param: nn.Parameter) -> None:
                 grad = param.grad
@@ -412,18 +415,19 @@ class ShardState:
                     local_grad = full[p_lo:p_hi].clone() if p_hi > p_lo else \
                         torch.empty(0, dtype=flat.dtype, device=device)
 
-                # Replace the full grad with our rank-local shard. After
-                # this the per-parameter ``.grad`` no longer matches the
-                # parameter's shape, which is intentional: optimizer math
-                # runs on ``param_shard`` and the FP32 main_grad, not on
-                # ``param.grad`` directly.
-                # Move to param device (param may be on CPU after forward
-                # post-hook restores sharded storage).
-                if local_grad.numel() > 0:
-                    param.grad = local_grad.to(param.device)
-                else:
-                    # This rank owns no slice of this param — clear grad
-                    param.grad = None
+                # Write reduced gradient directly into param_shard.grad at
+                # the correct offset. Do NOT write param.grad — the param
+                # shape doesn't match the 1-D reduced shard.
+                if local_grad.numel() > 0 and _shard_end > _shard_start:
+                    if _param_shard.grad is None:
+                        _param_shard.grad = torch.zeros_like(_param_shard)
+                    _param_shard.grad[_shard_start:_shard_end].add_(
+                        local_grad[:_shard_end - _shard_start].to(
+                            dtype=_param_shard.dtype, device=_param_shard.device
+                        )
+                    )
+                # Clear param.grad to free memory (it's been consumed)
+                param.grad = None
 
                 # Optional FP32 accumulator integration. We only touch
                 # ``main_grad`` if the manager actually allocated one for

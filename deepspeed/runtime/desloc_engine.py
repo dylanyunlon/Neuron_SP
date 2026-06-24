@@ -1733,6 +1733,10 @@ class DesLocEngine:
 
         for step in range(self.global_step, cfg.total_steps):
             self.optimizer.zero_grad(set_to_none=True)
+            # Zero param_shard.grad — backward hooks accumulate into it
+            if self.param_shard_state is not None:
+                if self.param_shard_state.param_shard.grad is not None:
+                    self.param_shard_state.param_shard.grad.zero_()
             step_loss = 0.0
 
             # Heterogeneous scheduling: each rank gets its own micro-batch count
@@ -1819,9 +1823,7 @@ class DesLocEngine:
             if self.fp32_grad_manager is not None and self.param_shard_state is None:
                 self.fp32_grad_manager.after_backward(scale=1.0 / num_microbatches)
 
-            # ZeRO-3: collect reduce-scattered per-param grads into param_shard.grad
-            if self.param_shard_state is not None:
-                self.param_shard_state.collect_grads_into_shard()
+            # Backward hooks have already written reduced grads into param_shard.grad
 
             # Gradient clipping — clip on param_shard when ZeRO-3 active
             if self.param_shard_state is not None:
