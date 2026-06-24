@@ -229,12 +229,161 @@ def prepare(
 
 
 # ---------------------------------------------------------------------------
+# CommitPackFT
+# ---------------------------------------------------------------------------
+
+def prepare_commitpackft(
+    output_dir: str = "data/processed",
+    tokenizer_name: str = "bigcode/starcoderbase",
+    split: str = "train",
+) -> None:
+    """Tokenize bigcode/commitpackft (Python subset) into a numpy mmap .bin file.
+
+    Each sample is formatted as:
+        <commit_before> {old_contents} <commit_after> {new_contents} <commit_msg> {message}
+
+    Tokens are written as uint16 to ``<output_dir>/commitpackft_python.bin``.
+
+    Args:
+        output_dir:      Directory to write the output .bin file.
+        tokenizer_name:  HuggingFace tokenizer to use (default: bigcode/starcoderbase).
+        split:           Dataset split (default: train).
+    """
+    load_dataset, AutoTokenizer = _import_deps()
+
+    os.makedirs(output_dir, exist_ok=True)
+    bin_path = os.path.join(output_dir, "commitpackft_python.bin")
+    idx_path = os.path.join(output_dir, "commitpackft_python.idx")
+
+    # ------------------------------------------------------------------
+    # Tokenizer
+    # ------------------------------------------------------------------
+    print(f"[prepare_commitpackft] Loading tokenizer: {tokenizer_name}")
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, trust_remote_code=True)
+    if tokenizer.eos_token_id is None:
+        tokenizer.add_special_tokens({"eos_token": "<|endoftext|>"})
+    eos_id = tokenizer.eos_token_id
+    vocab_size = tokenizer.vocab_size
+    print(f"[prepare_commitpackft] vocab_size={_format_num(vocab_size)}, eos_id={eos_id}")
+
+    if vocab_size > 65535:
+        print(
+            f"[prepare_commitpackft] WARNING: vocab_size={vocab_size} > 65535. "
+            "Tokens will be truncated to uint16.",
+            file=sys.stderr,
+        )
+
+    # ------------------------------------------------------------------
+    # Dataset
+    # ------------------------------------------------------------------
+    print(f"[prepare_commitpackft] Loading bigcode/commitpackft ('python', split='{split}') ...")
+    dataset = load_dataset("bigcode/commitpackft", "python", split=split)
+    total_samples = len(dataset)
+    print(f"[prepare_commitpackft] Dataset has {_format_num(total_samples)} samples.")
+
+    # ------------------------------------------------------------------
+    # Pre-allocate mmap (avg ~512 tokens/sample is a safe upper bound)
+    # ------------------------------------------------------------------
+    initial_capacity = total_samples * 512
+    print(f"[prepare_commitpackft] Pre-allocating mmap: {_format_num(initial_capacity)} tokens -> {bin_path}")
+    mmap_arr = np.memmap(bin_path, dtype=np.uint16, mode="w+", shape=(initial_capacity,))
+
+    # ------------------------------------------------------------------
+    # Tokenize and write
+    # ------------------------------------------------------------------
+    start_time = time.time()
+    total_tokens = 0
+    log_every = max(1, total_samples // 100)
+
+    for i, sample in enumerate(dataset):
+        old_contents = sample.get("old_contents") or ""
+        new_contents = sample.get("new_contents") or ""
+        message      = sample.get("message") or ""
+
+        text = (
+            f"<commit_before>{old_contents}"
+            f"<commit_after>{new_contents}"
+            f"<commit_msg>{message}"
+        )
+
+        ids = tokenizer.encode(text, add_special_tokens=False)
+        ids.append(eos_id)
+        token_count = len(ids)
+
+        # Grow mmap if needed
+        if total_tokens + token_count > len(mmap_arr):
+            new_size = max(len(mmap_arr) * 2, total_tokens + token_count)
+            print(
+                f"[prepare_commitpackft] Expanding mmap: "
+                f"{_format_num(len(mmap_arr))} -> {_format_num(new_size)} tokens ..."
+            )
+            mmap_arr.flush()
+            del mmap_arr
+            mmap_arr = np.memmap(bin_path, dtype=np.uint16, mode="r+", shape=(new_size,))
+
+        ids_np = np.array(ids, dtype=np.uint16)
+        mmap_arr[total_tokens : total_tokens + token_count] = ids_np
+        total_tokens += token_count
+
+        samples_done = i + 1
+        if samples_done % log_every == 0 or samples_done == total_samples:
+            pct = 100.0 * samples_done / total_samples
+            tps = total_tokens / max(1e-6, time.time() - start_time)
+            print(
+                f"[prepare_commitpackft] {pct:5.1f}% | "
+                f"samples={_format_num(samples_done)}/{_format_num(total_samples)} | "
+                f"tokens={_format_num(total_tokens)} | "
+                f"elapsed={_elapsed(start_time)} | "
+                f"tok/s={_format_num(int(tps))}"
+            )
+            sys.stdout.flush()
+
+    # ------------------------------------------------------------------
+    # Flush, truncate, write index
+    # ------------------------------------------------------------------
+    mmap_arr.flush()
+    del mmap_arr
+
+    actual_bytes = total_tokens * np.dtype(np.uint16).itemsize
+    with open(bin_path, "r+b") as f:
+        f.truncate(actual_bytes)
+
+    with open(idx_path, "w") as f:
+        f.write(f"total_tokens={total_tokens}\n")
+        f.write(f"num_samples={total_samples}\n")
+        f.write(f"tokenizer={tokenizer_name}\n")
+        f.write(f"dtype=uint16\n")
+        f.write(f"eos_id={eos_id}\n")
+        f.write(f"format=<commit_before>old_contents<commit_after>new_contents<commit_msg>message\n")
+
+    print()
+    print("[prepare_commitpackft] Done!")
+    print(f"  samples : {_format_num(total_samples)}")
+    print(f"  tokens  : {_format_num(total_tokens)}")
+    print(f"  bin     : {bin_path}  ({actual_bytes / 1e9:.3f} GB)")
+    print(f"  idx     : {idx_path}")
+    print(f"  elapsed : {_elapsed(start_time)}")
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Tokenize bigcode/commitpack into numpy mmap .bin files (uint16)."
+        description="Tokenize bigcode/commitpack or bigcode/commitpackft into numpy mmap .bin files (uint16)."
+    )
+    parser.add_argument(
+        "--task",
+        type=str,
+        default="commitpack",
+        choices=["commitpack", "commitpackft"],
+        help=(
+            "Which preparation task to run. "
+            "'commitpack' runs prepare() (original CommitPack). "
+            "'commitpackft' runs prepare_commitpackft() (CommitPackFT, Python subset). "
+            "Default: commitpack."
+        ),
     )
     parser.add_argument(
         "--output-dir",
@@ -293,16 +442,23 @@ def parse_args():
 if __name__ == "__main__":
     args = parse_args()
 
-    languages = args.languages
-    if languages == ["all"]:
-        languages = []  # signals 'load all config'
+    if args.task == "commitpackft":
+        prepare_commitpackft(
+            output_dir=args.output_dir,
+            tokenizer_name=args.tokenizer_name,
+            split=args.split,
+        )
+    else:
+        languages = args.languages
+        if languages == ["all"]:
+            languages = []  # signals 'load all config'
 
-    prepare(
-        output_dir=args.output_dir,
-        num_samples=args.num_samples,
-        tokenizer_name=args.tokenizer_name,
-        split=args.split,
-        languages=languages,
-        shard_size=args.shard_size,
-        text_field=args.text_field,
-    )
+        prepare(
+            output_dir=args.output_dir,
+            num_samples=args.num_samples,
+            tokenizer_name=args.tokenizer_name,
+            split=args.split,
+            languages=languages,
+            shard_size=args.shard_size,
+            text_field=args.text_field,
+        )
