@@ -1744,7 +1744,13 @@ class DesLocEngine:
             self.optimizer.zero_grad(set_to_none=True)
             # Zero param_shard.grad — backward hooks accumulate into it
             if self.param_shard_state is not None:
-                self.param_shard_state.param_shard.grad.zero_()
+                if self.param_shard_state.param_shard.grad is not None:
+                    self.param_shard_state.param_shard.grad.zero_()
+                else:
+                    # Re-allocate if optimizer.zero_grad(set_to_none=True) cleared it
+                    self.param_shard_state.param_shard.grad = torch.zeros_like(
+                        self.param_shard_state.param_shard
+                    )
             step_loss = 0.0
 
             # Heterogeneous scheduling: each rank gets its own micro-batch count
