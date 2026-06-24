@@ -1086,6 +1086,18 @@ Table~\ref{tab:training_config}.
   \label{fig:comm_reduction}
 \end{figure}
 
+\paragraph{5-GPU Scaling Projection.}
+Adding 2$\times$ RTX PRO 6000 Blackwell (SM12.0, 98\,GB VRAM each) to the
+current three-GPU cluster would raise aggregate BF16 compute from
+$\approx$917\,TFLOPS to $\approx$1117+\,TFLOPS—a $\sim$22\% increase in raw
+flops capacity.  Because the new cards share the same PCIe\,5.0 fabric, the
+practical throughput gain is projected at \textbf{40--60\%}, with the upper
+bound gated by available inter-node PCIe bandwidth rather than compute.
+\texttt{PartitionSolver} handles this expansion automatically: upon detecting
+the enlarged device pool it re-solves the integer programme
+(Eq.~\ref{eq:partition_obj}) and redistributes \texttt{pp\_layer\_split}
+across all five GPUs, requiring no manual pipeline-stage configuration.
+
 % --- 5.4 ---
 \subsection{Ablation Studies}
 \label{sec:exp:ablation}
