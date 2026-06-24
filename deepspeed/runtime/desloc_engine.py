@@ -1807,52 +1807,17 @@ class DesLocEngine:
                     labels = labels.to(_local_dev, non_blocking=True)
 
                 if self.mimo_loop is not None:
-                    if _real_micro:
-                        # Use HeteroMIMOTrainingLoop.step(batch)
-                        batch = (input_ids, labels)
-                        _engine_cache = self.locality_cache
-                        _engine_p2p = self.p2p_communicator
-
-                        def _forward_backward_func(
-                            forward_only: bool = False,
-                            p2p_communicator=None,
-                            pg_collection=None,
-                            data_iterator=None,
-                            model=None,
-                            config=None,
-                            iteration: int = 0,
-                            _ids=input_ids,
-                            _lbl=labels,
-                            _num_mb=num_microbatches,
-                        ):
-                            _p2p = p2p_communicator if p2p_communicator is not None else _engine_p2p
-                            loss, scaled_loss = self.forward(
-                                _ids, _lbl, num_microbatches=_num_mb,
-                            )
-                            _act_key = f"fwd_act:iter={iteration}"
-                            _engine_cache.put(_act_key, loss.detach())
-                            if not forward_only:
-                                scaled_loss.backward()
-                            return [loss]
-
-                        mimo_result = self.mimo_loop.train_step(
-                            forward_backward_func=_forward_backward_func,
-                            data_iterator=iter([(input_ids, labels)]),
-                            config=cfg,
-                            iteration=step * num_microbatches + micro,
-                        )
-                        step_loss += mimo_result.loss
-                    else:
-                        # Dummy forward for FSDP sync (MIMO path)
-                        with torch.no_grad():
-                            self.forward(input_ids, labels, num_microbatches=num_microbatches)
+                    raise RuntimeError("MIMO loop should be disabled — code path error")
                 else:
                     # Standard forward/backward path
                     if _real_micro:
-                        # Real micro-batch: forward + backward + accumulate
+                        if _is_main:
+                            print(f"[DBG] step={step} micro={micro} BEFORE forward", flush=True)
                         loss, scaled_loss = self.forward(
                             input_ids, labels, num_microbatches=num_microbatches,
                         )
+                        if _is_main:
+                            print(f"[DBG] step={step} micro={micro} AFTER forward loss={loss.item():.4f}", flush=True)
                         if self.fp32_grad_manager is not None:
                             self.fp32_grad_manager.before_backward()
                         scaled_loss.backward()
