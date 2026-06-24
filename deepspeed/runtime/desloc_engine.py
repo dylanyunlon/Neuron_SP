@@ -1528,8 +1528,9 @@ class DesLocEngine:
         from deepspeed.runtime.hetero_gdn_selective_recompute import build_neuron_sp_config  # noqa: PLC0415
         from deepspeed.runtime.hetero_grad_norm_skip import (  # noqa: PLC0415
             HeteroGradNormConfig,
-            integrate_with_deepspeed_engine,
+            HeteroGradNormSkipController,
         )
+
 
         cfg = self.config
         self.model.train()
@@ -1563,8 +1564,12 @@ class DesLocEngine:
             )
 
         # Wire HeteroGradNormSkipController into this engine.
+        # Note: integrate_with_deepspeed_engine() monkey-patches engine.step(),
+        # but DesLocEngine doesn't have a .step() method (step logic is inline
+        # in train()). Create the controller directly and call should_skip()
+        # manually in the loop below.
         _hetero_config = HeteroGradNormConfig()
-        _skip_controller = integrate_with_deepspeed_engine(self, _hetero_config)
+        _skip_controller = HeteroGradNormSkipController(config=_hetero_config)
         _skip_count = 0
 
         loss_accum = 0.0
@@ -1704,8 +1709,12 @@ class DesLocEngine:
                 # mimo_loop.train_step() already clipped; retrieve norm from last result
                 gnorm = mimo_result.grad_norm  # type: ignore[possibly-undefined]
 
-            # HeteroGradNorm skip decision
-            _should_skip = _skip_controller.should_skip()
+            # HeteroGradNorm skip decision — use gnorm threshold directly
+            # (full anchor/compute split requires per-device grad classification
+            # which is handled by MIMO loop when active; for standalone path
+            # we use the combined threshold on the already-computed gnorm)
+            _grad_skip_thr = _hetero_config.combined_skip_threshold
+            _should_skip = (gnorm > _grad_skip_thr) if torch.is_tensor(gnorm) else (gnorm > _grad_skip_thr)
             if _is_main:
                 print(
                     f"[hetero_grad] step={step} grad_norm={gnorm:.6f} "

@@ -220,7 +220,7 @@ def probe_local_vram(rank: Optional[int] = None) -> GPUVRAMInfo:
 
     dev = torch.cuda.current_device()
     props = torch.cuda.get_device_properties(dev)
-    vram_gb = props.total_mem / (1024 ** 3)
+    vram_gb = props.total_memory / (1024 ** 3)
     info = GPUVRAMInfo(rank=rank, vram_gb=vram_gb, device_name=props.name)
     log.info(
         "%s PROBE rank=%d device=%s vram_gb=%.1f",
