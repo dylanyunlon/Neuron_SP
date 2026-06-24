@@ -2103,18 +2103,30 @@ class DesLocEngine:
 
                 # -----------------------------------------------------------------
                 # Async grad-norm-sq all_reduce (comm/compute overlap).
-                # After backward completes, compute the local partial norm-sq for
-                # this microbatch's param_shard.grad and fire an async all_reduce.
-                # The handle is waited on at the top of the *next* microbatch so
-                # the allreduce communication overlaps with the next forward pass.
+                # After backward completes on the *last* microbatch of the
+                # accumulation window, compute the local full norm-sq on
+                # param_shard.grad (which now holds the fully-accumulated
+                # gradient) and fire an async all_reduce.
+                #
+                # Previously this fired after every microbatch, costing
+                # num_microbatches NCCL round-trips per optimizer step.  By
+                # deferring to the final microbatch we emit exactly one
+                # all_reduce per step — reducing NCCL synchronisation overhead
+                # on H100 by up to (grad_accum_steps - 1) round-trips.
+                #
+                # The handle is waited on immediately below (post-loop drain),
+                # so the allreduce communication from the final backward
+                # overlaps with any CPU bookkeeping between the loop exit and
+                # the wait() call.
                 # Only active when dist is initialized and ZeRO-3 sharding is on.
                 # -----------------------------------------------------------------
-                if dist.is_initialized() and self.param_shard_state is not None:
+                _is_last_micro = (micro == num_microbatches - 1)
+                if _is_last_micro and dist.is_initialized() and self.param_shard_state is not None:
                     _g_mb = self.param_shard_state.param_shard.grad
                     if _g_mb is not None:
+                        # Compute norm-sq on the fully-accumulated gradient shard.
                         # Clone to a standalone scalar so the reduction buffer is
-                        # independent of param_shard.grad (which continues to
-                        # accumulate across microbatches).
+                        # independent of param_shard.grad.
                         _micro_norm_sq = _g_mb.float().norm(2).to(torch.float64).pow(2).clone()
                         _async_norm_tensor = _micro_norm_sq
                         _async_norm_handle = dist.all_reduce(
@@ -2135,8 +2147,7 @@ class DesLocEngine:
             # Problem: in heterogeneous ZeRO-3 training each rank runs a
             # different number of micro-batches (e.g. H100 runs 22, A6000
             # runs 1).  Every model forward triggers one collective call per
-            # layer (all_gather inside gather_full_params) plus one async
-            # all_reduce on the per-microbatch grad-norm-sq scalar.  NCCL
+            # layer (all_gather inside gather_full_params).  NCCL
             # requires *every* rank to call each collective the same number of
             # times; a mismatch causes NCCL to hang indefinitely.
             #
@@ -2150,10 +2161,10 @@ class DesLocEngine:
             #      as a real forward (triggered by ZeRO3ForwardHook /
             #      gather_full_params hooks that are layer-level pre_forward
             #      hooks; no_grad does not suppress them).
-            #   2. Fires one async all_reduce on a zero scalar to match the
-            #      per-microbatch grad-norm-sq all_reduce that runs after every
-            #      real backward.  We immediately wait() on it so the scalar
-            #      buffer does not alias across iterations.
+            #   2. Does NOT fire a dummy grad-norm-sq all_reduce.  The
+            #      grad-norm-sq all_reduce was moved to the last microbatch
+            #      only (one per optimizer step), so all ranks emit exactly
+            #      one such collective per step and no padding is required.
             #   3. Does NOT call backward, so gradients and param_shard.grad
             #      are unaffected.
             #
@@ -2198,20 +2209,9 @@ class DesLocEngine:
                                     self.model_device, non_blocking=True,
                                 )
                                 _ = self.model(_dummy_ids_dev)
-
-                        # Match the async all_reduce on the per-microbatch
-                        # grad-norm-sq scalar that fires after each real backward.
-                        # Use a zero tensor so it contributes nothing to the norm.
-                        if self.param_shard_state is not None:
-                            _dummy_norm_sq = torch.zeros(
-                                1, dtype=torch.float64, device=_dummy_dev,
-                            )
-                            _dummy_handle = dist.all_reduce(
-                                _dummy_norm_sq,
-                                op=dist.ReduceOp.SUM,
-                                async_op=True,
-                            )
-                            _dummy_handle.wait()
+                        # No dummy grad-norm-sq all_reduce needed: the norm-sq
+                        # all_reduce now fires exactly once per step (on the last
+                        # real microbatch), so all ranks are already symmetric.
 
             # Post-microbatch: NaN guard
             if not math.isfinite(step_loss):
