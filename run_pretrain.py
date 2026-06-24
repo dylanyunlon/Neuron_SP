@@ -215,6 +215,7 @@ except Exception as _desloc_import_err:
 _MODEL_CONFIGS: Dict[str, Dict] = {
     "70m": dict(hidden_size=512,  num_layers=8,  num_heads=8,  vocab_size=32000),
     "1b":  dict(hidden_size=2048, num_layers=16, num_heads=16, vocab_size=32000),
+    "3b":  dict(hidden_size=3200, num_layers=26, num_heads=32, vocab_size=32000),
     "7b":  dict(hidden_size=4096, num_layers=32, num_heads=32, vocab_size=32000),
 }
 
