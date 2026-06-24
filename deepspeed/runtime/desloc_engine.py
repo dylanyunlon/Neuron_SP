@@ -1766,17 +1766,31 @@ class DesLocEngine:
                 consumed_samples=self.consumed_samples,
                 consistency_check=False,
             )
-            num_microbatches = allocation.num_microbatches
-            # Log scheduler step events (batch size change or LOC cache hint)
-            if allocation.loc_cache_hint:
-                logger.info(
-                    "step=%d | scheduler step: gbs=%d, num_microbatches=%d, "
-                    "per_device=%s",
-                    step, allocation.global_batch_size,
-                    num_microbatches, allocation.per_device_assignment,
-                )
+            # CRITICAL: With FSDP, all ranks MUST call forward the same number
+            # of times because each forward triggers a collective all-gather.
+            # If H100 does 22 micro-batches but A6000 does 1, the A6000 ranks
+            # won't participate in all-gather #2 → NCCL deadlock.
+            #
+            # Solution: all ranks use the SAME num_microbatches (the max across
+            # the partition plan). A6000 ranks still only accumulate gradients
+            # from their assigned micro-batches; for the "extra" ones they run
+            # forward (maintaining FSDP sync) but skip backward to avoid
+            # polluting gradients.
+            _my_assigned = allocation.num_microbatches
+            num_microbatches = max(self.partition_plan.grad_accum_steps.values())
+            if allocation.loc_cache_hint or _my_assigned != num_microbatches:
+                if _is_main:
+                    logger.info(
+                        "step=%d | scheduler: gbs=%d, local_micro=%d, global_micro=%d, "
+                        "per_device=%s",
+                        step, allocation.global_batch_size,
+                        _my_assigned, num_microbatches,
+                        allocation.per_device_assignment,
+                    )
 
             for micro in range(num_microbatches):
+                # Whether this rank should accumulate gradients for this micro-batch
+                _real_micro = micro < _my_assigned
                 input_ids, labels = next(self.data_iter)
                 # Route cross-GPU activation transfers through
                 # PCIeP2PCommunicator: for tensors already on a different GPU,
@@ -1804,68 +1818,65 @@ class DesLocEngine:
                     labels = labels.to(_local_dev, non_blocking=True)
 
                 if self.mimo_loop is not None:
-                    # Use HeteroMIMOTrainingLoop.step(batch) — wires
-                    # PCIeP2PCommunicator and SharedLocalityCache into the
-                    # forward/backward pass.
-                    batch = (input_ids, labels)
+                    if _real_micro:
+                        # Use HeteroMIMOTrainingLoop.step(batch)
+                        batch = (input_ids, labels)
+                        _engine_cache = self.locality_cache
+                        _engine_p2p = self.p2p_communicator
 
-                    # Capture engine-level cache and communicator so the
-                    # forward_backward_func can stage activations through CPU
-                    # DRAM when the scheduler assigns cross-pool micro-batches.
-                    _engine_cache = self.locality_cache
-                    _engine_p2p = self.p2p_communicator
+                        def _forward_backward_func(
+                            forward_only: bool = False,
+                            p2p_communicator=None,
+                            pg_collection=None,
+                            data_iterator=None,
+                            model=None,
+                            config=None,
+                            iteration: int = 0,
+                            _ids=input_ids,
+                            _lbl=labels,
+                            _num_mb=_my_assigned,
+                        ):
+                            _p2p = p2p_communicator if p2p_communicator is not None else _engine_p2p
+                            loss, scaled_loss = self.forward(
+                                _ids, _lbl, num_microbatches=_num_mb,
+                            )
+                            _act_key = f"fwd_act:iter={iteration}"
+                            _engine_cache.put(_act_key, loss.detach())
+                            if not forward_only:
+                                scaled_loss.backward()
+                            return [loss]
 
-                    def _forward_backward_func(
-                        forward_only: bool = False,
-                        p2p_communicator=None,
-                        pg_collection=None,
-                        data_iterator=None,
-                        model=None,
-                        config=None,
-                        iteration: int = 0,
-                        _ids=input_ids,
-                        _lbl=labels,
-                        _num_mb=num_microbatches,
-                    ):
-                        # Use the engine's P2P communicator when the MIMO loop
-                        # does not supply one (backward compatibility).
-                        _p2p = p2p_communicator if p2p_communicator is not None else _engine_p2p
-                        loss, scaled_loss = self.forward(
-                            _ids, _lbl, num_microbatches=_num_mb,
+                        mimo_result = self.mimo_loop.train_step(
+                            forward_backward_func=_forward_backward_func,
+                            data_iterator=iter([(input_ids, labels)]),
+                            config=cfg,
+                            iteration=step * num_microbatches + micro,
                         )
-                        # Cache forward activations in the locality cache so
-                        # that cross-pool backward passes can retrieve them
-                        # without a redundant PCIe round-trip.
-                        _act_key = f"fwd_act:iter={iteration}"
-                        _engine_cache.put(_act_key, loss.detach())
-                        if not forward_only:
-                            scaled_loss.backward()
-                        return [loss]
-
-                    mimo_result = self.mimo_loop.train_step(
-                        forward_backward_func=_forward_backward_func,
-                        data_iterator=iter([batch]),
-                        config=cfg,
-                        iteration=step * num_microbatches + micro,
-                    )
-                    step_loss += mimo_result.loss
+                        step_loss += mimo_result.loss
+                    else:
+                        # Dummy forward for FSDP sync (MIMO path)
+                        with torch.no_grad():
+                            self.forward(input_ids, labels, num_microbatches=_my_assigned)
                 else:
                     # Standard forward/backward path
-                    # Forward (routes through HeteroRecomputeConfig-aware path)
-                    loss, scaled_loss = self.forward(
-                        input_ids, labels, num_microbatches=num_microbatches,
-                    )
-
-                    # Prepare FP32 gradient accumulators for this micro-batch
-                    if self.fp32_grad_manager is not None:
-                        self.fp32_grad_manager.before_backward()
-                    # Backward
-                    scaled_loss.backward()
-                    # Precision alignment: promote BF16 grads to FP32 accumulators
-                    # for parameters that require it (three-tier precision policy).
-                    if self.fp32_grad_manager is not None:
-                        self.fp32_grad_manager.accumulate()
-                    step_loss += loss.item()
+                    if _real_micro:
+                        # Real micro-batch: forward + backward + accumulate
+                        loss, scaled_loss = self.forward(
+                            input_ids, labels, num_microbatches=_my_assigned,
+                        )
+                        if self.fp32_grad_manager is not None:
+                            self.fp32_grad_manager.before_backward()
+                        scaled_loss.backward()
+                        if self.fp32_grad_manager is not None:
+                            self.fp32_grad_manager.accumulate()
+                        step_loss += loss.item()
+                    else:
+                        # Dummy micro-batch: forward only (keeps FSDP all-gather in sync)
+                        # No backward → no gradient pollution from non-assigned micro-batches
+                        with torch.no_grad():
+                            _dummy_loss, _ = self.forward(
+                                input_ids, labels, num_microbatches=_my_assigned,
+                            )
 
             if self.mimo_loop is None:
                 # NaN/Inf guard — heterogeneous precision can produce NaN
