@@ -1043,7 +1043,15 @@ class DesLocEngine:
 
         # Each rank keeps model on its own local device (not all on primary_device)
         _local_device = torch.device(f"cuda:{torch.cuda.current_device()}")
-        self.model = self.model.to(dtype=_DEFAULT_DTYPE, device=_local_device)
+        _local_mem_gb = torch.cuda.get_device_properties(_local_device).total_memory / (1 << 30)
+
+        # If FSDP will be used (world_size > 1), do NOT move model to GPU here —
+        # FSDP's device_id handles placement after sharding. Moving first causes OOM.
+        _use_fsdp = int(os.environ.get("WORLD_SIZE", 1)) > 1
+        if not _use_fsdp:
+            self.model = self.model.to(dtype=_DEFAULT_DTYPE, device=_local_device)
+        else:
+            self.model = self.model.to(dtype=_DEFAULT_DTYPE)  # keep on CPU for FSDP
         self.model_device = _local_device  # cached for forward()
 
         # --- Phase 4b: FSDP wrapping for ZeRO-3 heterogeneous sharding ---

@@ -841,14 +841,16 @@ def run_desloc(args: argparse.Namespace) -> None:
     device = torch.device(f"cuda:{local_rank}")
 
     # Build the LlamaModel and pass it in (DesLocEngine wraps it)
-    dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
+    # Model stays on CPU here — DesLocEngine/FSDP handles device placement.
+    # Moving to GPU first then FSDP flatten causes OOM on A6000 (47GB).
+    dtype = torch.bfloat16
     model = LlamaModel(
         vocab_size  = cfg["vocab_size"],
         hidden_size = cfg["hidden_size"],
         num_layers  = cfg["num_layers"],
         num_heads   = cfg["num_heads"],
         seq_len     = args.seq_len,
-    ).to(dtype=dtype, device=device)
+    ).to(dtype=dtype)
 
     if getattr(args, "gradient_checkpointing", False) and hasattr(model, "enable_gradient_checkpointing"):
         model.enable_gradient_checkpointing()
