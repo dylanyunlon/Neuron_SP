@@ -46,7 +46,7 @@ torchrun --nproc_per_node="$NUM_GPUS" --master_port=29500 \
     --seq-len 2048 \
     --use-desloc \
     --gradient-checkpointing \
-    --log-every 10 \
+    --log-every 1 \
     --save-every 500 \
     --checkpoint-dir checkpoints/7b_${TIMESTAMP} \
     2>&1 | tee "$LOG"

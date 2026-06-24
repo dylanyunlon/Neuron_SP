@@ -1766,31 +1766,21 @@ class DesLocEngine:
                 consumed_samples=self.consumed_samples,
                 consistency_check=False,
             )
-            # CRITICAL: With FSDP, all ranks MUST call forward the same number
-            # of times because each forward triggers a collective all-gather.
-            # If H100 does 22 micro-batches but A6000 does 1, the A6000 ranks
-            # won't participate in all-gather #2 → NCCL deadlock.
+            # TEMPORARY: Force all ranks to 1 micro-batch to verify the
+            # forward→backward→optimizer pipeline works end-to-end.
+            # FSDP collectives require all ranks to call forward/backward
+            # the same number of times. Heterogeneous grad_accum (H100=22,
+            # A6000=1) causes deadlocks because dummy forwards under
+            # torch.no_grad() don't trigger the matching backward hooks
+            # that FSDP expects.
             #
-            # Solution: all ranks use the SAME num_microbatches (the max across
-            # the partition plan). A6000 ranks still only accumulate gradients
-            # from their assigned micro-batches; for the "extra" ones they run
-            # forward (maintaining FSDP sync) but skip backward to avoid
-            # polluting gradients.
-            _my_assigned = allocation.num_microbatches
-            num_microbatches = max(self.plan.grad_accum_steps.values())
-            if allocation.loc_cache_hint or _my_assigned != num_microbatches:
-                if _is_main:
-                    logger.info(
-                        "step=%d | scheduler: gbs=%d, local_micro=%d, global_micro=%d, "
-                        "per_device=%s",
-                        step, allocation.global_batch_size,
-                        _my_assigned, num_microbatches,
-                        allocation.per_device_assignment,
-                    )
+            # TODO: Once loss output is confirmed, restore heterogeneous
+            # scheduling by replacing FSDP all-gather with LOC Cache
+            # (Neuron_SP's native communication layer).
+            num_microbatches = 1
 
             for micro in range(num_microbatches):
-                # Whether this rank should accumulate gradients for this micro-batch
-                _real_micro = micro < _my_assigned
+                _real_micro = True  # all microbatches are real when num_microbatches=1
                 input_ids, labels = next(self.data_iter)
                 # Route cross-GPU activation transfers through
                 # PCIeP2PCommunicator: for tensors already on a different GPU,
