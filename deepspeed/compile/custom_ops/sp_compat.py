@@ -50,7 +50,7 @@ def preflight_memory_check(n_params_billions, sp_size, world_size, cpu_offload=F
     if not torch.cuda.is_available():
         return
     dev = torch.cuda.current_device()
-    mem_gb = torch.cuda.get_device_properties(dev).total_mem / (1024 ** 3)
+    mem_gb = torch.cuda.get_device_properties(dev).total_memory / (1024 ** 3)
     param_bytes_bf16 = n_params_billions * 1e9 * 2
     grad_bytes_bf16 = param_bytes_bf16
     model_per_gpu_gb = (param_bytes_bf16 + grad_bytes_bf16) / (1024 ** 3)

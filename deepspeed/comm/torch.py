@@ -1536,7 +1536,7 @@ class DeslocHeteroBalancer:
         for i in range(torch.cuda.device_count()):
             props = torch.cuda.get_device_properties(i)
             name = props.name
-            mem_gb = props.total_mem / (1024 ** 3)
+            mem_gb = props.total_memory / (1024 ** 3)
             # Estimate BF16 TFLOPS from SMs and clock
             sm_count = props.multi_processor_count
             clock_ghz = props.clock_rate / 1e6

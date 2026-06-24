@@ -42,7 +42,7 @@ def _probe_local_gpu() -> GPUTierInfo:
     props = torch.cuda.get_device_properties(dev)
     info.device_name = props.name
     info.compute_capability = (props.major, props.minor)
-    info.memory_total_gb = props.total_mem / (1024 ** 3)
+    info.memory_total_gb = props.total_memory / (1024 ** 3)
 
     _BW_TABLE = {
         "H100": 3350, "H200": 4800, "B100": 8000, "B200": 8000,
