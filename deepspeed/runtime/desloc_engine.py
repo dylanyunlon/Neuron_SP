@@ -1498,6 +1498,10 @@ class DesLocEngine:
             dtype=_DEFAULT_DTYPE,
             enabled=(self.primary_device.type == "cuda"),
         ):
+            # Ensure inputs are on the same device as the model
+            _model_dev = next(self.model.parameters()).device
+            input_ids = input_ids.to(_model_dev, non_blocking=True)
+            labels = labels.to(_model_dev, non_blocking=True)
             logits: torch.Tensor = self.model(input_ids)
             B, T, V = logits.shape
             shift_logits = logits[:, :-1, :].contiguous().reshape(-1, V)
