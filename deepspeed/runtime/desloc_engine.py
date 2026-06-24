@@ -1475,6 +1475,35 @@ class DesLocEngine:
             self.primary_device,
         )
 
+        # --- Phase 8b: ZeRO-3 backward reduce-scatter hooks ---
+        # Register a post-accumulate-grad hook on every sharded parameter
+        # so that each rank's ``.grad`` is reduced and scattered the
+        # moment autograd produces it. After the hook each rank only
+        # retains the gradient slice corresponding to its own
+        # ``param_shard``, and (when applicable) those slices are
+        # accumulated into the FP32 ``main_grad`` of
+        # ``fp32_grad_manager`` for selective-FP32 parameters.
+        self._zero3_grad_hook_handles: List = []
+        if self.param_shard_state is not None:
+            try:
+                self._zero3_grad_hook_handles = (
+                    self.param_shard_state.register_backward_hooks(
+                        fp32_grad_manager=self.fp32_grad_manager,
+                    )
+                )
+                logger.info(
+                    "[zero3] backward reduce-scatter hooks registered: %d "
+                    "(fp32_grad_manager=%s)",
+                    len(self._zero3_grad_hook_handles),
+                    self.fp32_grad_manager is not None,
+                )
+            except Exception as _hook_exc:  # noqa: BLE001
+                logger.warning(
+                    "[zero3] backward hook registration failed (%s); "
+                    "post-backward scatter_grads() will still run.",
+                    _hook_exc,
+                )
+
         # --- Phase 9: Hetero MIMO training loop bootstrap ---
         # Build the DES-LOC heterogeneous MIMO training loop (device registry,
         # locality cache, P2P communicator, optimizer router, schedule groups)

@@ -301,6 +301,160 @@ class ShardState:
                 p.data = orig
             del full
 
+    # ------------------------------------------------------------------
+    # Per-parameter backward hooks (reduce-scatter on the fly)
+    # ------------------------------------------------------------------
+    def register_backward_hooks(
+        self,
+        fp32_grad_manager: Optional[object] = None,
+    ) -> List[torch.utils.hooks.RemovableHandle]:
+        """
+        Register a post-accumulate-grad hook on every sharded parameter so
+        that, the moment autograd finishes producing a parameter's
+        ``.grad`` during the backward pass, that grad is reduce-scattered
+        across ranks and only this rank's slice is retained.
+
+        After the hook fires for parameter ``p``:
+          * ``p.grad`` is overwritten by a per-rank grad shard tensor of
+            shape ``(local_numel,)`` (i.e. the intersection of
+            ``[lo, hi) = [shard_offsets[rank], shard_offsets[rank+1])``
+            with this parameter's flat layout, possibly zero-length when
+            the parameter lives entirely on other ranks).
+          * The shard has already been ``SUM``-reduced across the world
+            and divided by ``world_size`` (mean), matching standard DDP
+            semantics.
+          * When ``fp32_grad_manager`` is supplied, the shard is also
+            accumulated into the corresponding FP32 ``main_grad`` slice
+            (if one exists for this parameter) so the existing
+            three-tier precision policy still applies — the only
+            difference from the unsharded path is that ``main_grad`` now
+            only ever sees its rank-local slice of the gradient.
+
+        ``world_size <= 1`` is a no-op and returns an empty list.
+
+        Returns the handles for later ``handle.remove()``.
+        """
+        handles: List[torch.utils.hooks.RemovableHandle] = []
+        if self.world_size <= 1:
+            return handles
+
+        lo_rank = self.shard_offsets[self.rank]
+        hi_rank = self.shard_offsets[self.rank + 1]
+        world_size = self.world_size
+        rank = self.rank
+        shard_sizes = self.shard_sizes
+        shard_offsets = self.shard_offsets
+        even = all(s == shard_sizes[0] for s in shard_sizes)
+
+        def _make_hook(name: str, p: nn.Parameter):
+            sl = self.param_offsets[name]
+            # Pre-compute per-rank slice indices for this parameter's
+            # flat layout. shard_slices[r] = (p_lo, p_hi) where
+            # p.flatten()[p_lo:p_hi] is the slab destined for rank r;
+            # an empty slice means rank r owns none of this param.
+            shard_slices: List[Tuple[int, int]] = []
+            for r in range(world_size):
+                r_lo = shard_offsets[r]
+                r_hi = shard_offsets[r + 1]
+                g_lo = max(sl.global_start, r_lo)
+                g_hi = min(sl.global_end,   r_hi)
+                if g_hi <= g_lo:
+                    shard_slices.append((0, 0))
+                else:
+                    shard_slices.append(
+                        (g_lo - sl.global_start, g_hi - sl.global_start)
+                    )
+
+            def _hook(param: nn.Parameter) -> None:
+                grad = param.grad
+                if grad is None:
+                    return
+                device = grad.device
+                flat = grad.detach().reshape(-1)
+
+                if even:
+                    # Build a contiguous send buffer laid out as
+                    # [rank0_slab | rank1_slab | ... | rankN-1_slab] so a
+                    # single reduce_scatter_tensor produces our local slab.
+                    shard = shard_sizes[0]
+                    send = torch.zeros(
+                        shard * world_size, dtype=flat.dtype, device=device,
+                    )
+                    for r in range(world_size):
+                        p_lo, p_hi = shard_slices[r]
+                        if p_hi > p_lo:
+                            s_off = r * shard
+                            send[s_off:s_off + (p_hi - p_lo)].copy_(
+                                flat[p_lo:p_hi]
+                            )
+                    local_shard = torch.empty(
+                        shard, dtype=flat.dtype, device=device,
+                    )
+                    dist.reduce_scatter_tensor(
+                        local_shard, send, op=dist.ReduceOp.SUM,
+                    )
+                    local_shard.div_(world_size)
+                    # Trim to the (possibly shorter) slice this param
+                    # actually contributes on our rank — the rest is
+                    # zero-padding belonging to other params.
+                    p_lo, p_hi = shard_slices[rank]
+                    take = p_hi - p_lo
+                    local_grad = local_shard[:take].clone() if take > 0 else \
+                        torch.empty(0, dtype=flat.dtype, device=device)
+                else:
+                    # Heterogeneous shard sizes — reduce_scatter_tensor
+                    # requires equal-sized chunks, so fall back to an
+                    # all-reduce + local slice.
+                    full = flat.clone()
+                    dist.all_reduce(full, op=dist.ReduceOp.SUM)
+                    full.div_(world_size)
+                    p_lo, p_hi = shard_slices[rank]
+                    local_grad = full[p_lo:p_hi].clone() if p_hi > p_lo else \
+                        torch.empty(0, dtype=flat.dtype, device=device)
+
+                # Replace the full grad with our rank-local shard. After
+                # this the per-parameter ``.grad`` no longer matches the
+                # parameter's shape, which is intentional: optimizer math
+                # runs on ``param_shard`` and the FP32 main_grad, not on
+                # ``param.grad`` directly.
+                param.grad = local_grad
+
+                # Optional FP32 accumulator integration. We only touch
+                # ``main_grad`` if the manager actually allocated one for
+                # this parameter (selective FP32 policy).
+                if fp32_grad_manager is not None and hasattr(param, "main_grad"):
+                    mg = param.main_grad
+                    if mg is not None and local_grad.numel() > 0:
+                        # ``main_grad`` may be full-shape FP32; flatten
+                        # and add into the matching slice. If the
+                        # manager pre-sharded it to local size, accept
+                        # that too.
+                        mg_flat = mg.reshape(-1)
+                        if mg_flat.numel() == local_grad.numel():
+                            mg_flat.add_(local_grad.float())
+                        elif mg_flat.numel() == flat.numel():
+                            # Full-shape main_grad: write only the local
+                            # slice; the remaining entries are owned by
+                            # other ranks and stay zero on this rank.
+                            mg_flat[p_lo:p_hi].add_(local_grad.float())
+                        # Any other shape mismatch is ignored — the
+                        # manager's own accumulate()/after_backward()
+                        # path will still run on whatever it owns.
+
+            return p.register_post_accumulate_grad_hook(_hook)
+
+        for name, p in self.param_order:
+            if not p.requires_grad:
+                continue
+            handles.append(_make_hook(name, p))
+
+        logger.info(
+            "[zero3] rank=%d registered %d backward reduce-scatter hooks "
+            "(fp32_grad_manager=%s)",
+            self.rank, len(handles), fp32_grad_manager is not None,
+        )
+        return handles
+
     def scatter_grads(self, model: nn.Module) -> torch.Tensor:
         """
         Reduce-scatter gradients across all ranks.
