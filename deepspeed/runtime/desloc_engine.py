@@ -1660,6 +1660,7 @@ class DesLocEngine:
         from deepspeed.runtime.hetero_grad_norm_skip import (  # noqa: PLC0415
             HeteroGradNormConfig,
             HeteroGradNormSkipController,
+            integrate_with_deepspeed_engine,
         )
 
 
@@ -1725,13 +1726,15 @@ class DesLocEngine:
                 "(P2P + LOC cache active)."
             )
 
-        # Wire HeteroGradNormSkipController into this engine.
-        # Note: integrate_with_deepspeed_engine() monkey-patches engine.step(),
-        # but DesLocEngine doesn't have a .step() method (step logic is inline
-        # in train()). Create the controller directly and call should_skip()
-        # manually in the loop below.
+        # Wire HeteroGradNormSkipController into this engine via
+        # integrate_with_deepspeed_engine(). That function monkey-patches
+        # engine.step(), but DesLocEngine has no .step() method — step logic
+        # is inline in train(). We therefore call it for the standard
+        # initialisation path (config wiring, logging, controller creation)
+        # and retain the returned controller to drive should_skip() /
+        # record_step() manually inside the loop below.
         _hetero_config = HeteroGradNormConfig()
-        _skip_controller = HeteroGradNormSkipController(config=_hetero_config)
+        _skip_controller = integrate_with_deepspeed_engine(self, _hetero_config)
         _skip_count = 0
 
         loss_accum = 0.0
@@ -1863,17 +1866,23 @@ class DesLocEngine:
                 if torch.is_tensor(gnorm):
                     gnorm = gnorm.item()
 
-            # HeteroGradNorm skip decision
-            _grad_skip_thr = _hetero_config.combined_skip_threshold
-            _should_skip = gnorm > _grad_skip_thr
+            # HeteroGradNorm skip decision via HeteroGradNormSkipController
+            # (wired through integrate_with_deepspeed_engine at train() setup).
+            # Collect parameter gradients for the skip evaluation; classify all
+            # params as compute-side since DesLocEngine runs on a single device
+            # class per rank (anchor/compute split is resolved at init time).
+            _all_grads = [p.grad for p in self.model.parameters()]
+            _should_skip, _skip_info = _skip_controller.should_skip([], _all_grads)
+            _skip_controller.record_step(skipped=_should_skip, grad_norm=_skip_info.combined_norm)
+            if _should_skip:
+                _skip_count += 1
             if _is_main:
                 print(
                     f"[hetero_grad] step={step} loss={step_loss:.4f} grad_norm={gnorm:.6f} "
-                    f"skip={_should_skip} total_skips={_skip_count}"
+                    f"skip={_should_skip} total_skips={_skip_count} "
+                    f"ctrl_norm={_skip_info.combined_norm:.6f}"
                 )
-            if _should_skip:
-                _skip_count += 1
-            else:
+            if not _should_skip:
                 self.optimizer.step()
                 self.scheduler.step()
                 # ZeRO-3: sync updated FP32 shard back to model BF16 params
