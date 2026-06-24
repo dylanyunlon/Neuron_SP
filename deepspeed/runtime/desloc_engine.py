@@ -1351,7 +1351,7 @@ class DesLocEngine:
 
         # Each rank allocates FP32 grad buffer on its own device, not on primary_device
         _local_device = torch.device(f"cuda:{torch.cuda.current_device()}")
-        _local_mem_gb = torch.cuda.get_device_properties(_local_device).total_mem / (1 << 30)
+        _local_mem_gb = torch.cuda.get_device_properties(_local_device).total_memory / (1 << 30)
         # 7B model needs ~12GB bf16 + 2×12GB FP32 buffers = ~36GB minimum
         # A6000 (47GB) can't fit all three; skip FP32 grad accum on small devices
         if _local_mem_gb < 60:
