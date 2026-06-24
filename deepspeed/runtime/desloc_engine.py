@@ -1040,69 +1040,18 @@ class DesLocEngine:
         else:
             self.model = model
 
-        # Each rank keeps model on its own local device (not all on primary_device)
         _local_device = torch.device(f"cuda:{torch.cuda.current_device()}")
         _local_mem_gb = torch.cuda.get_device_properties(_local_device).total_memory / (1 << 30)
+        self._use_fsdp = False  # Neuron_SP native ZeRO-3, no FSDP
 
-        # If FSDP will be used (world_size > 1), do NOT move model to GPU here —
-        # FSDP's device_id handles placement after sharding. Moving first causes OOM.
-        _use_fsdp = int(os.environ.get("WORLD_SIZE", 1)) > 1
-        self._use_fsdp = _use_fsdp
-        if not _use_fsdp:
-            self.model = self.model.to(dtype=_DEFAULT_DTYPE, device=_local_device)
-        else:
-            self.model = self.model.to(dtype=_DEFAULT_DTYPE)  # keep on CPU for FSDP
-        self.model_device = _local_device  # cached for forward()
-
-        # --- Phase 4b: FSDP wrapping for ZeRO-3 heterogeneous sharding ---
-        # Neuron_SP core design: partition model params + optimizer states
-        # across heterogeneous GPUs so that models exceeding single-GPU VRAM
-        # (e.g. 7B on A6000 48GB) can train via sharding.
-        #
-        # CRITICAL: FSDP1 needs the full model materialized on at least one rank
-        # during init. With sync_module_states=True, only rank 0 needs the model
-        # on GPU; other ranks get synced params after sharding. This avoids the
-        # OOM where all ranks try to load the full 7B model simultaneously.
-        if dist.is_initialized() and dist.get_world_size() > 1:
-            from torch.distributed.fsdp import (
-                FullyShardedDataParallel as FSDP,
-                MixedPrecision,
-                ShardingStrategy,
-                CPUOffload,
-            )
-            _mp = MixedPrecision(
-                param_dtype=_DEFAULT_DTYPE,
-                reduce_dtype=_DEFAULT_DTYPE,
-                buffer_dtype=_DEFAULT_DTYPE,
-            )
-            # For 7B+ models, always use CPU offload — even H100 93GB benefits
-            # from offloading optimizer states to 1.5TB DRAM.
-            # This is the Neuron_SP heterogeneous design: use all available DRAM.
-            _cpu_offload = CPUOffload(offload_params=True)
-
-            # Only rank 0 moves model to GPU for init; others stay on CPU.
-            # sync_module_states broadcasts params from rank 0 after flatten.
-            _rank = dist.get_rank()
-            if _rank == 0:
-                self.model = self.model.to(device=_local_device)
-
-            self.model = FSDP(
-                self.model,
-                sharding_strategy=ShardingStrategy.FULL_SHARD,
-                mixed_precision=_mp,
-                cpu_offload=_cpu_offload,
-                device_id=_local_device,
-                use_orig_params=True,
-                sync_module_states=True,
-            )
-            logger.info(
-                "FSDP wrapped: strategy=FULL_SHARD, cpu_offload=True, "
-                "sync_module_states=True, device=%s, rank=%d",
-                _local_device, _rank,
-            )
+        # Model stays in BF16 on CPU — ZeRO-3 ShardState holds FP32 master
+        # copy per-rank on GPU; forward uses gather_full_params() to
+        # materialize full BF16 params layer-by-layer on demand.
+        self.model = self.model.to(dtype=_DEFAULT_DTYPE)
+        self.model_device = _local_device  # forward() moves inputs here
 
         n_params = sum(p.numel() for p in self.model.parameters())
-        logger.info("Model: %.2fM parameters on %s", n_params / 1e6, _local_device)
+        logger.info("Model: %.2fM parameters (BF16 on CPU, ZeRO-3 sharded)", n_params / 1e6)
 
         # --- Phase 4b: ZeRO-3 heterogeneous parameter sharding ---
         # Each rank keeps only a 1/N (or VRAM-proportional) slice of the
@@ -1506,11 +1455,8 @@ class DesLocEngine:
         # ``param_shard``, and (when applicable) those slices are
         # accumulated into the FP32 ``main_grad`` of
         # ``fp32_grad_manager`` for selective-FP32 parameters.
-        # zero3_hetero_shard backward hooks DISABLED when FSDP is active.
-        # FSDP already manages reduce-scatter in backward; installing a second
-        # set of reduce-scatter hooks causes NCCL collective conflicts → hang.
         self._zero3_grad_hook_handles: List = []
-        if self.param_shard_state is not None and not self._use_fsdp:
+        if self.param_shard_state is not None:
             try:
                 self._zero3_grad_hook_handles = (
                     self.param_shard_state.register_backward_hooks(
@@ -1537,11 +1483,12 @@ class DesLocEngine:
         # Failures here must not break legacy single-GPU training paths, so the
         # call is wrapped defensively and the loop falls back to None.
         try:
-            # TEMPORARY: Disable MIMO loop to isolate the training pipeline.
-            # MIMO loop has its own collective ops and optimizer management
-            # that may conflict with FSDP. Use standard forward/backward path.
-            self.mimo_loop = None
-            logger.info("MIMO loop DISABLED — using standard forward/backward path for pipeline verification.")
+            self.mimo_loop: Optional[HeteroMIMOTrainingLoop] = (
+                setup_hetero_mimo_training(self.model)
+            )
+            logger.info(
+                "HeteroMIMOTrainingLoop initialized via setup_hetero_mimo_training()."
+            )
         except Exception as exc:  # pragma: no cover - defensive
             logger.warning(
                 "setup_hetero_mimo_training() failed (%s); continuing without "
@@ -1699,11 +1646,10 @@ class DesLocEngine:
         # hooks so that the full BF16 params for the *currently
         # executing* nn.Module are materialized on entry and freed on
         # exit. Peak memory: model_shard + max(per_layer_full_params).
-        # zero3_hetero_shard forward hooks DISABLED when FSDP is active.
-        # FSDP already does per-layer all-gather in forward; a second set of
-        # all-gather hooks causes NCCL collective interleaving → deadlock.
+        # zero3_hetero_shard forward hooks: per-layer all-gather on entry,
+        # release on exit. This is Neuron_SP's native parameter gathering.
         self._zero3_forward_hook = None
-        if getattr(self, "param_shard_state", None) is not None and not self._use_fsdp:
+        if getattr(self, "param_shard_state", None) is not None:
             try:
                 from deepspeed.runtime.zero3_hetero_shard import (  # noqa: PLC0415
                     install_zero3_forward_hooks as _install_z3_hooks,
@@ -1767,87 +1713,87 @@ class DesLocEngine:
             print("[DBG] Entering training loop", flush=True)
 
         for step in range(self.global_step, cfg.total_steps):
-            if _is_main:
-                print(f"[DBG] step={step} START", flush=True)
             self.optimizer.zero_grad(set_to_none=True)
             step_loss = 0.0
 
-            if _is_main:
-                print(f"[DBG] step={step} after zero_grad", flush=True)
-
-            num_microbatches = 1
+            # Heterogeneous scheduling: each rank gets its own micro-batch count
+            # based on VRAM/compute tier. No FSDP collective constraints —
+            # Neuron_SP ZeRO-3 uses per-layer gather_full_params which only
+            # requires collectives at the granularity the hooks fire.
+            allocation: MicrobatchAllocation = self.hetero_scheduler.update(
+                consumed_samples=self.consumed_samples,
+                consistency_check=False,
+            )
+            num_microbatches = allocation.num_microbatches
 
             for micro in range(num_microbatches):
-                _real_micro = True
-                if _is_main:
-                    print(f"[DBG] step={step} micro={micro} fetching data", flush=True)
                 input_ids, labels = next(self.data_iter)
-                if _is_main:
-                    print(f"[DBG] step={step} micro={micro} data fetched, shape={input_ids.shape}", flush=True)
-                # Route cross-GPU activation transfers through
-                # PCIeP2PCommunicator: for tensors already on a different GPU,
-                # the communicator decides whether to use direct PCIe copy or
-                # stage through CPU DRAM (SharedLocalityCache) based on tensor
-                # size and pool topology.
-                src_dev = input_ids.device.index if input_ids.is_cuda else -1
-                dst_dev = (
-                    self.primary_device.index
-                    if self.primary_device.type == "cuda"
-                    else -1
-                )
-                if src_dev >= 0 and dst_dev >= 0 and src_dev != dst_dev:
-                    cache_key = f"input:step={step}:micro={micro}"
-                    input_ids = self.p2p_communicator.send_activation(
-                        input_ids, src_dev, dst_dev, cache_key=cache_key,
-                    )
-                    labels = self.p2p_communicator.send_activation(
-                        labels, src_dev, dst_dev,
-                        cache_key=f"labels:step={step}:micro={micro}",
-                    )
-                else:
-                    _local_dev = torch.device(f"cuda:{torch.cuda.current_device()}")
-                    input_ids = input_ids.to(_local_dev, non_blocking=True)
-                    labels = labels.to(_local_dev, non_blocking=True)
+                _local_dev = torch.device(f"cuda:{torch.cuda.current_device()}")
+                input_ids = input_ids.to(_local_dev, non_blocking=True)
+                labels = labels.to(_local_dev, non_blocking=True)
 
                 if self.mimo_loop is not None:
-                    raise RuntimeError("MIMO loop should be disabled — code path error")
+                    # MIMO path: forward/backward dispatched through
+                    # HeteroMIMOTrainingLoop with P2P + LOC cache
+                    batch = (input_ids, labels)
+                    _engine_cache = self.locality_cache
+                    _engine_p2p = self.p2p_communicator
+
+                    def _forward_backward_func(
+                        forward_only: bool = False,
+                        p2p_communicator=None,
+                        pg_collection=None,
+                        data_iterator=None,
+                        model=None,
+                        config=None,
+                        iteration: int = 0,
+                        _ids=input_ids,
+                        _lbl=labels,
+                        _num_mb=num_microbatches,
+                    ):
+                        _p2p = p2p_communicator if p2p_communicator is not None else _engine_p2p
+                        loss, scaled_loss = self.forward(
+                            _ids, _lbl, num_microbatches=_num_mb,
+                        )
+                        _act_key = f"fwd_act:iter={iteration}"
+                        _engine_cache.put(_act_key, loss.detach())
+                        if not forward_only:
+                            scaled_loss.backward()
+                        return [loss]
+
+                    mimo_result = self.mimo_loop.train_step(
+                        forward_backward_func=_forward_backward_func,
+                        data_iterator=iter([(input_ids, labels)]),
+                        config=cfg,
+                        iteration=step * num_microbatches + micro,
+                    )
+                    step_loss += mimo_result.loss
                 else:
                     # Standard forward/backward path
-                    if _real_micro:
-                        if _is_main:
-                            print(f"[DBG] step={step} micro={micro} BEFORE forward", flush=True)
-                        loss, scaled_loss = self.forward(
-                            input_ids, labels, num_microbatches=num_microbatches,
-                        )
-                        if _is_main:
-                            print(f"[DBG] step={step} micro={micro} AFTER forward loss={loss.item():.4f}", flush=True)
-                        # fp32_grad_manager disabled with FSDP — FSDP handles
-                        # gradient dtype/device management internally.
-                        if _is_main:
-                            print(f"[DBG] step={step} micro={micro} BEFORE backward", flush=True)
-                        scaled_loss.backward()
-                        if _is_main:
-                            print(f"[DBG] step={step} micro={micro} AFTER backward", flush=True)
-                        step_loss += loss.item()
-                    else:
-                        # Dummy micro-batch: forward only (keeps FSDP all-gather in sync)
-                        # No backward → no gradient pollution from non-assigned micro-batches
-                        with torch.no_grad():
-                            _dummy_loss, _ = self.forward(
-                                input_ids, labels, num_microbatches=num_microbatches,
-                            )
-
-            if self.mimo_loop is None:
-                # NaN/Inf guard — heterogeneous precision can produce NaN
-                if not math.isfinite(step_loss):
-                    _nan_count = getattr(self, '_nan_count', 0) + 1
-                    self._nan_count = _nan_count
-                    logger.warning(
-                        "NaN/Inf loss at step %d (count=%d), skipping optimizer update",
-                        step, _nan_count,
+                    loss, scaled_loss = self.forward(
+                        input_ids, labels, num_microbatches=num_microbatches,
                     )
-                    self.optimizer.zero_grad(set_to_none=True)
-                    continue  # skip to next step
+                    if self.fp32_grad_manager is not None:
+                        self.fp32_grad_manager.before_backward()
+                    scaled_loss.backward()
+                    if self.fp32_grad_manager is not None:
+                        self.fp32_grad_manager.accumulate()
+                    step_loss += loss.item()
+
+            # Post-microbatch: NaN guard
+            if not math.isfinite(step_loss):
+                _nan_count = getattr(self, '_nan_count', 0) + 1
+                self._nan_count = _nan_count
+                logger.warning(
+                    "NaN/Inf loss at step %d (count=%d), skipping optimizer update",
+                    step, _nan_count,
+                )
+                self.optimizer.zero_grad(set_to_none=True)
+                continue
+
+            # FP32 grad sync (if active)
+            if self.fp32_grad_manager is not None:
+                self.fp32_grad_manager.after_backward(scale=1.0 / num_microbatches)
 
             # Gradient clipping
             gnorm = clip_grad_norm_(self.model.parameters(), cfg.grad_clip)
