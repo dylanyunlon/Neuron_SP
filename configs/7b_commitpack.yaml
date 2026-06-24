@@ -95,6 +95,10 @@ desloc:
   Kv: 16                        # token split factor for H100 tier (value cache)
   # ZeRO stage for parameters not pinned to a tier
   zero_stage: 3
+  # Per-tier micro-batch sizing (H100 processes more per step)
+  micro_batch_per_tier:
+    h100: 4
+    a6000: 1
 
 # ---------------------------------------------------------------------------
 # NCCL / communication tuning (PCIe, no NVLink)
