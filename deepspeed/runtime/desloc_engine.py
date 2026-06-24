@@ -1964,6 +1964,19 @@ class DesLocEngine:
         t0 = time.time()
         train_start = t0  # used to compute total_time after the loop
 
+        # --- Async ZeRO-3 shard-sync state ---
+        # After optimizer.step() we launch sync_shard_to_model_async() on a
+        # dedicated CUDA stream so the FP32→BF16 PCIe copies overlap with the
+        # next step's data preprocessing on the CPU / default stream.
+        # _shard_sync_stream  : persistent stream reused every step
+        # _shard_sync_pending : True iff a sync was launched but not yet waited
+        _shard_sync_stream: Optional[torch.cuda.Stream] = (
+            torch.cuda.Stream()
+            if torch.cuda.is_available() and getattr(self, "param_shard_state", None) is not None
+            else None
+        )
+        _shard_sync_pending: bool = False
+
         if _is_main:
             print("[DBG] Entering training loop", flush=True)
 
@@ -2046,6 +2059,21 @@ class DesLocEngine:
                 _local_dev = torch.device(f"cuda:{torch.cuda.current_device()}")
                 input_ids = input_ids.to(_local_dev, non_blocking=True)
                 labels = labels.to(_local_dev, non_blocking=True)
+
+                # -----------------------------------------------------------------
+                # Wait for async ZeRO-3 shard sync (launched after optimizer.step
+                # of the *previous* step).  Data loading above runs on the default
+                # stream / CPU, so it overlaps with the sync stream doing the
+                # FP32→BF16 param copies.  We wait here — before the first forward
+                # kernel — to guarantee model BF16 params are fully up-to-date.
+                # On the very first step _shard_sync_pending is False, so this is
+                # a no-op.
+                # -----------------------------------------------------------------
+                if _shard_sync_pending and micro == 0:
+                    if _shard_sync_stream is not None:
+                        torch.cuda.current_stream().wait_stream(_shard_sync_stream)
+                    _shard_sync_pending = False
+
 
                 if self.mimo_loop is not None:
                     # MIMO path: forward/backward dispatched through
@@ -2305,9 +2333,20 @@ class DesLocEngine:
             if not _should_skip:
                 self.optimizer.step()
                 self.scheduler.step()
-                # ZeRO-3: sync updated FP32 shard back to model BF16 params
+                # ZeRO-3: async sync updated FP32 shard back to model BF16 params.
+                # Copies are issued on _shard_sync_stream so they overlap with the
+                # next step's data preprocessing on the default stream.  The
+                # default stream will wait_stream() at the start of the next
+                # forward pass (top of the micro-batch loop above).
                 if self.param_shard_state is not None:
-                    self.param_shard_state.sync_shard_to_model()
+                    if _shard_sync_stream is not None:
+                        self.param_shard_state.sync_shard_to_model_async(
+                            stream=_shard_sync_stream
+                        )
+                        _shard_sync_pending = True
+                    else:
+                        # CPU-only fallback: synchronous path
+                        self.param_shard_state.sync_shard_to_model()
 
             # Accounting
             self.global_step = step + 1
@@ -2434,6 +2473,11 @@ class DesLocEngine:
                 finally:
                     self.model.train()
         total_time = time.time() - train_start
+        # Drain any outstanding async shard sync from the final step so that
+        # checkpointing / evaluation that follows reads consistent BF16 params.
+        if _shard_sync_pending and _shard_sync_stream is not None:
+            torch.cuda.current_stream().wait_stream(_shard_sync_stream)
+            _shard_sync_pending = False
         logger.info(
             "Training complete. %d steps in %.1fs. "
             "%.2fM tokens seen. Avg %.0f tok/s.",

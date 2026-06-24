@@ -583,6 +583,54 @@ class ShardState:
                 flat = p.data.reshape(-1)
                 flat[p_start:p_end].copy_(updated.to(p.dtype))
 
+    def sync_shard_to_model_async(
+        self, stream: Optional["torch.cuda.Stream"] = None
+    ) -> "torch.cuda.Stream":
+        """Launch async copy of updated FP32 param_shard → model BF16 params.
+
+        All ``p.data`` copies are issued on *stream* (or a freshly-created
+        stream when none is supplied) without waiting for them to complete.
+        The caller is responsible for synchronising before the next forward
+        pass, e.g.::
+
+            stream = shard_state.sync_shard_to_model_async()
+            # ... data preprocessing happens on the default stream ...
+            torch.cuda.current_stream().wait_stream(stream)  # before forward
+
+        Returns the CUDA stream on which the copies were issued so the caller
+        can wait on it at the appropriate point.
+        """
+        if not torch.cuda.is_available():
+            # Fallback: CPU path — just do the synchronous version and return
+            # a sentinel (None handled by caller).
+            self.sync_shard_to_model()
+            return None  # type: ignore[return-value]
+
+        if stream is None:
+            stream = torch.cuda.Stream()
+
+        lo = self.shard_offsets[self.rank]
+        hi = self.shard_offsets[self.rank + 1]
+
+        with torch.cuda.stream(stream):
+            with torch.no_grad():
+                for name, p in self.param_order:
+                    sl = self.param_offsets[name]
+                    if sl.global_end <= lo or sl.global_start >= hi:
+                        continue
+                    g_start = max(sl.global_start, lo)
+                    g_end = min(sl.global_end, hi)
+                    p_start = g_start - sl.global_start
+                    p_end = g_end - sl.global_start
+                    s_start = g_start - lo
+                    s_end = g_end - lo
+                    updated = self.param_shard.data[s_start:s_end]
+                    flat = p.data.reshape(-1)
+                    # non_blocking=True: copy proceeds asynchronously on *stream*
+                    flat[p_start:p_end].copy_(updated.to(p.dtype), non_blocking=True)
+
+        return stream
+
 class ZeRO3ForwardHook:
     """
     ZeRO-3 parameter materialisation for DesLocEngine.
