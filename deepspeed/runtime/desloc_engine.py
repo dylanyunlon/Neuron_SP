@@ -1849,7 +1849,8 @@ class DesLocEngine:
             if self.param_shard_state is not None:
                 _g = self.param_shard_state.param_shard.grad
                 if _g is not None:
-                    local_norm_sq = _g.to(torch.float64).norm(2).pow(2)
+                    # FP32 norm — no extra allocation (grad is already FP32)
+                    local_norm_sq = _g.float().norm(2).to(torch.float64).pow(2)
                 else:
                     local_norm_sq = torch.tensor(0.0, dtype=torch.float64,
                                                   device=self.param_shard_state.param_shard.device)
