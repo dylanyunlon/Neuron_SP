@@ -347,6 +347,241 @@ class ShardState:
 
 
 # ---------------------------------------------------------------------------
+# Per-layer forward all-gather hooks (Claude-128)
+# ---------------------------------------------------------------------------
+class ZeRO3ForwardHook:
+    """
+    Layer-by-layer ZeRO-3 forward all-gather.
+
+    Registers ``register_forward_pre_hook`` / ``register_forward_hook``
+    on every ``nn.Module`` that directly owns trainable parameters. The
+    pre-hook reconstructs the full BF16 params for *that layer only*
+    via ``dist.all_gather_into_tensor`` (falling back to ``all_gather``
+    when shard sizes vary across ranks). The post-hook restores each
+    parameter's local sharded storage and frees the gathered buffer.
+
+    Why per-layer (not all-at-once)
+    -------------------------------
+    Peak VRAM during forward becomes::
+
+        model_shard + max(per_layer_full_params)
+
+    instead of ``full_model``. For a 7B LLM with 32 transformer blocks
+    that is roughly 1/32 of the model on top of the shard — making it
+    feasible to train models that wouldn't otherwise fit.
+
+    Notes
+    -----
+    * Only direct parameters of a module are gathered in that module's
+      pre-hook (i.e. ``module._parameters``, not recursive). Each
+      submodule will trigger its own hook.
+    * Shared parameters (the same ``nn.Parameter`` referenced by
+      multiple modules) are gathered once per forward call site; the
+      restore step is keyed on ``id(parameter)`` so we always return
+      the original local shard view.
+    * ``world_size <= 1``: install no hooks (no-op).
+    """
+
+    def __init__(self, model: nn.Module, shard_state: "ShardState") -> None:
+        self.model = model
+        self.shard_state = shard_state
+        self._handles: List[torch.utils.hooks.RemovableHandle] = []
+        # param identity (id) -> (param, original local-shard storage)
+        # used as a transient per-layer save/restore map.
+        self._saved: Dict[int, Tuple[nn.Parameter, torch.Tensor]] = {}
+        # Map nn.Parameter id -> ParamSlice for O(1) lookup during hooks.
+        self._param_to_slice: Dict[int, ParamSlice] = {}
+        if shard_state is not None:
+            for name, p in shard_state.param_order:
+                sl = shard_state.param_offsets.get(name)
+                if sl is not None:
+                    self._param_to_slice[id(p)] = sl
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+    def register(self) -> int:
+        """
+        Walk the model and attach pre/post hooks to every module that
+        directly owns at least one trainable, sharded parameter.
+
+        Returns the number of modules hooked. Safe to call when
+        ``world_size <= 1`` — installs nothing and returns 0.
+        """
+        if self.shard_state is None or self.shard_state.world_size <= 1:
+            logger.info(
+                "[zero3-hook] world_size<=1, skipping hook installation"
+            )
+            return 0
+
+        hooked = 0
+        for mod in self.model.modules():
+            direct_params = [
+                p for p in mod._parameters.values()
+                if p is not None and id(p) in self._param_to_slice
+            ]
+            if not direct_params:
+                continue
+            pre = mod.register_forward_pre_hook(self._make_pre_hook(direct_params))
+            post = mod.register_forward_hook(self._make_post_hook(direct_params))
+            self._handles.extend([pre, post])
+            hooked += 1
+
+        logger.info(
+            "[zero3-hook] installed forward all-gather hooks on %d modules "
+            "(rank=%d/%d)",
+            hooked, self.shard_state.rank, self.shard_state.world_size,
+        )
+        return hooked
+
+    def remove(self) -> None:
+        """Remove all installed hooks (e.g. for teardown / eval)."""
+        for h in self._handles:
+            try:
+                h.remove()
+            except Exception:  # noqa: BLE001
+                pass
+        self._handles.clear()
+        self._saved.clear()
+
+    # ------------------------------------------------------------------
+    # Hook factories
+    # ------------------------------------------------------------------
+    def _make_pre_hook(self, params: List[nn.Parameter]):
+        def _pre(module: nn.Module, inputs):
+            self._gather_params(params)
+            return None
+        return _pre
+
+    def _make_post_hook(self, params: List[nn.Parameter]):
+        def _post(module: nn.Module, inputs, output):
+            self._release_params(params)
+            return None
+        return _post
+
+    # ------------------------------------------------------------------
+    # Per-layer gather / release
+    # ------------------------------------------------------------------
+    def _gather_params(self, params: List[nn.Parameter]) -> None:
+        """All-gather each parameter in ``params`` and rewrite ``p.data``
+        to view into the gathered buffer."""
+        state = self.shard_state
+        ws = state.world_size
+        rank = state.rank
+        device = state.param_shard.device
+
+        for p in params:
+            pid = id(p)
+            if pid in self._saved:
+                # Already gathered (re-entrant / shared param): skip.
+                continue
+            sl = self._param_to_slice.get(pid)
+            if sl is None:
+                continue
+
+            gather_dtype = p.dtype  # typically BF16 during training
+            numel = sl.global_end - sl.global_start
+
+            # Determine each rank's contribution to this layer: the
+            # intersection of [sl.global_start, sl.global_end) with that
+            # rank's shard window [shard_offsets[r], shard_offsets[r+1]).
+            per_rank_sizes: List[int] = []
+            per_rank_local_offsets: List[Tuple[int, int]] = []  # (s_start, s_end) in our local shard
+            for r in range(ws):
+                lo = state.shard_offsets[r]
+                hi = state.shard_offsets[r + 1]
+                g0 = max(sl.global_start, lo)
+                g1 = min(sl.global_end, hi)
+                contrib = max(0, g1 - g0)
+                per_rank_sizes.append(contrib)
+                if r == rank and contrib > 0:
+                    per_rank_local_offsets.append((g0 - lo, g1 - lo))
+                else:
+                    per_rank_local_offsets.append((0, 0))
+
+            # This rank's slice of *this layer*, taken from param_shard.
+            s_start, s_end = per_rank_local_offsets[rank]
+            if s_end > s_start:
+                local_piece = state.param_shard[s_start:s_end].to(gather_dtype)
+            else:
+                local_piece = torch.empty(0, dtype=gather_dtype, device=device)
+
+            # Allocate the full per-layer buffer and run the collective.
+            full = torch.empty(numel, dtype=gather_dtype, device=device)
+
+            even = all(s == per_rank_sizes[0] for s in per_rank_sizes)
+            if even and per_rank_sizes[0] > 0:
+                # Fast path: equal contributions → all_gather_into_tensor.
+                dist.all_gather_into_tensor(full, local_piece)
+            else:
+                # Variable-size fallback: per-rank tensors + concat.
+                chunks = [
+                    torch.empty(s, dtype=gather_dtype, device=device)
+                    for s in per_rank_sizes
+                ]
+                # all_gather requires all chunks > 0 on every rank? In
+                # practice torch tolerates zero-sized tensors here; if
+                # not, fall back to padded all_gather_into_tensor.
+                try:
+                    dist.all_gather(chunks, local_piece)
+                except Exception:  # noqa: BLE001
+                    # Pad to max size and use the equal-size collective.
+                    max_sz = max(per_rank_sizes) if per_rank_sizes else 0
+                    padded_local = torch.zeros(
+                        max_sz, dtype=gather_dtype, device=device
+                    )
+                    if local_piece.numel() > 0:
+                        padded_local[:local_piece.numel()].copy_(local_piece)
+                    padded_full = torch.empty(
+                        max_sz * ws, dtype=gather_dtype, device=device
+                    )
+                    dist.all_gather_into_tensor(padded_full, padded_local)
+                    for r in range(ws):
+                        sz = per_rank_sizes[r]
+                        if sz > 0:
+                            chunks[r] = padded_full[r * max_sz : r * max_sz + sz]
+
+                # Stitch chunks into ``full`` in rank order.
+                cursor = 0
+                for r in range(ws):
+                    sz = per_rank_sizes[r]
+                    if sz > 0:
+                        full[cursor:cursor + sz].copy_(chunks[r])
+                    cursor += sz
+
+            # Save original storage and rewrite param to view into full.
+            self._saved[pid] = (p, p.data)
+            p.data = full.view(sl.shape)
+
+    def _release_params(self, params: List[nn.Parameter]) -> None:
+        """Restore each parameter's local sharded storage and drop the
+        gathered buffer (freed when its last reference goes away)."""
+        for p in params:
+            pid = id(p)
+            entry = self._saved.pop(pid, None)
+            if entry is None:
+                continue
+            _, orig = entry
+            p.data = orig
+
+
+def install_zero3_forward_hooks(
+    model: nn.Module, shard_state: Optional["ShardState"]
+) -> Optional[ZeRO3ForwardHook]:
+    """
+    Convenience entry point used by ``DesLocEngine.train()`` to wire
+    layer-by-layer all-gather hooks onto the model. Returns the hook
+    manager (so callers can later ``.remove()`` it), or ``None`` when
+    sharding is not active.
+    """
+    if shard_state is None or shard_state.world_size <= 1:
+        return None
+    hook = ZeRO3ForwardHook(model, shard_state)
+    hook.register()
+    return hook
+
+
+# ---------------------------------------------------------------------------
 # Heterogeneous helpers
 # ---------------------------------------------------------------------------
 def vram_weights_from_tiers(tiers: Sequence[object]) -> List[float]:

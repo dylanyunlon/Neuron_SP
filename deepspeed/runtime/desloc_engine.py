@@ -1639,6 +1639,35 @@ class DesLocEngine:
         logger.info("Training start: %d steps, grad_accum=%d",
                     cfg.total_steps, self.grad_accum)
 
+        # --- Claude-128: ZeRO-3 per-layer forward all-gather hooks ---
+        # When ZeRO-3 sharding is active each rank only holds 1/N of the
+        # flat parameter buffer. We install layer-by-layer all-gather
+        # hooks so that the full BF16 params for the *currently
+        # executing* nn.Module are materialized on entry and freed on
+        # exit. Peak memory: model_shard + max(per_layer_full_params).
+        self._zero3_forward_hook = None
+        if getattr(self, "param_shard_state", None) is not None:
+            try:
+                from deepspeed.runtime.zero3_hetero_shard import (  # noqa: PLC0415
+                    install_zero3_forward_hooks as _install_z3_hooks,
+                )
+                self._zero3_forward_hook = _install_z3_hooks(
+                    self.model, self.param_shard_state,
+                )
+                if self._zero3_forward_hook is not None and _is_main:
+                    logger.info(
+                        "[zero3-hook] per-layer forward all-gather active "
+                        "(rank=%d/%d)",
+                        self.param_shard_state.rank,
+                        self.param_shard_state.world_size,
+                    )
+            except Exception as _hook_exc:  # noqa: BLE001
+                logger.warning(
+                    "[zero3-hook] failed to install forward hooks (%s); "
+                    "continuing without per-layer gather.", _hook_exc,
+                )
+                self._zero3_forward_hook = None
+
         # --- Neuron_SP: build / refresh heterogeneous recompute config ---
         # Recompute policy may depend on the current device topology; rebuild
         # the config here so that train() always picks up the latest mapping.
