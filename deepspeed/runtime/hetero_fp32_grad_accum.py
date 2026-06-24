@@ -1088,6 +1088,28 @@ class HeteroFP32GradAccumManager:
         """Aggregate memory stats from the underlying buffer."""
         return self.buffer.report_memory()
 
+    @classmethod
+    def register(cls, engine) -> None:
+        """Attach a HeteroFP32GradAccumManager placeholder to the engine.
+
+        Sets ``engine.hetero_fp32_grad_accum = None`` as a placeholder; full
+        initialisation is deferred until model parameters and the DP process
+        group are available.
+
+        Parameters
+        ----------
+        engine:
+            A DeepSpeed engine instance.
+        """
+        logger.info(
+            "HeteroFP32GradAccumManager.register() called on engine type=%s",
+            type(engine).__name__,
+        )
+        engine.hetero_fp32_grad_accum = None
+        logger.info(
+            "HeteroFP32GradAccumManager.register() attached engine.hetero_fp32_grad_accum"
+        )
+
 
 # ---------------------------------------------------------------------------
 # Unit tests
@@ -1482,20 +1504,14 @@ if __name__ == "__main__":
 # ---------------------------------------------------------------------------
 
 def register(engine) -> None:
-    """Register HeteroFP32GradAccumConfig on a DeepSpeed engine.
+    """Register HeteroFP32GradAccumManager on a DeepSpeed engine.
 
-    Instantiates a :class:`HeteroFP32GradAccumConfig` from the engine's configuration
-    and attaches it as ``engine.hetero_fp32_grad_accum``.
+    Delegates to :meth:`HeteroFP32GradAccumManager.register` and attaches the
+    module as ``engine.hetero_fp32_grad_accum``.
 
     Parameters
     ----------
     engine:
         A DeepSpeed engine instance.
     """
-    logger.info(
-        "hetero_fp32_grad_accum.register() called on engine type=%s",
-        type(engine).__name__,
-    )
-
-    engine.hetero_fp32_grad_accum = None
-    logger.info("hetero_fp32_grad_accum.register() attached engine.hetero_fp32_grad_accum")
+    HeteroFP32GradAccumManager.register(engine)

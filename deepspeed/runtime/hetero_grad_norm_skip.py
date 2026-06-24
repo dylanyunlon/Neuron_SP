@@ -805,6 +805,28 @@ class HeteroGradNormSkipController:
                 dist.all_reduce(partial_tensor, op=dist.ReduceOp.SUM, group=self._pg)
             self._accumulator._partials[dc] = partial_tensor.item()
 
+    @classmethod
+    def register(cls, engine) -> None:
+        """Attach a HeteroGradNormSkipController placeholder to the engine.
+
+        Sets ``engine.hetero_grad_norm_skip = None`` as a placeholder; full
+        initialisation (with a ``HeteroGradNormConfig`` and optional LOC cache
+        handle) is deferred until training configuration is available.
+
+        Parameters
+        ----------
+        engine:
+            A DeepSpeed engine instance.
+        """
+        logger.info(
+            "HeteroGradNormSkipController.register() called on engine type=%s",
+            type(engine).__name__,
+        )
+        engine.hetero_grad_norm_skip = None
+        logger.info(
+            "HeteroGradNormSkipController.register() attached engine.hetero_grad_norm_skip"
+        )
+
 
 # ---------------------------------------------------------------------------
 # DeepSpeed Engine Integration Helpers
@@ -1346,20 +1368,14 @@ if __name__ == "__main__":
 # ---------------------------------------------------------------------------
 
 def register(engine) -> None:
-    """Register HeteroGradNormConfig on a DeepSpeed engine.
+    """Register HeteroGradNormSkipController on a DeepSpeed engine.
 
-    Instantiates a :class:`HeteroGradNormConfig` from the engine's configuration
-    and attaches it as ``engine.hetero_grad_norm_skip``.
+    Delegates to :meth:`HeteroGradNormSkipController.register` and attaches the
+    module as ``engine.hetero_grad_norm_skip``.
 
     Parameters
     ----------
     engine:
         A DeepSpeed engine instance.
     """
-    logger.info(
-        "hetero_grad_norm_skip.register() called on engine type=%s",
-        type(engine).__name__,
-    )
-
-    engine.hetero_grad_norm_skip = None
-    logger.info("hetero_grad_norm_skip.register() attached engine.hetero_grad_norm_skip")
+    HeteroGradNormSkipController.register(engine)

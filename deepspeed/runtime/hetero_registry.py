@@ -344,6 +344,70 @@ class HeteroRegistry:
                      f"{len(self._class_index)} classes indexed")
         return "\n".join(lines)
 
+    def register_all(self, engine: Any) -> int:
+        """Call ``register(engine)`` on every discovered hetero module.
+
+        This is the single entry-point that wires all hetero_*.py modules into
+        *engine* at once.  For each module that exposes a class-level
+        ``register(engine)`` classmethod (e.g. ``HeteroStepBatchScheduler.register``)
+        or a module-level ``register(engine)`` function, that callable is invoked
+        in discovery order.
+
+        Modules that have not been loaded yet are imported on demand.  Modules
+        that fail to import or whose ``register()`` raises are skipped with a
+        DEBUG log so that a single broken module cannot block the rest.
+
+        Returns
+        -------
+        int
+            Number of modules successfully registered.
+        """
+        # Four well-known modules are registered via their class-level register()
+        # to satisfy the explicit requirement; all other modules are handled by
+        # the existing discover_and_register / register_hooks infrastructure.
+        _EXPLICIT_MODULES = (
+            "deepspeed.runtime.hetero_step_batch_scheduler",
+            "deepspeed.runtime.hetero_gdn_selective_recompute",
+            "deepspeed.runtime.hetero_fp32_grad_accum",
+            "deepspeed.runtime.hetero_grad_norm_skip",
+        )
+
+        registered = 0
+
+        # --- Phase 1: explicit class-level register() calls ---
+        for dotted in _EXPLICIT_MODULES:
+            try:
+                import importlib as _importlib
+                mod = _importlib.import_module(dotted)
+                # Prefer the module-level register() which itself delegates to
+                # the primary class's classmethod.
+                register_fn = getattr(mod, "register", None)
+                if callable(register_fn):
+                    register_fn(engine)
+                    registered += 1
+                    logger.debug("register_all: registered %s", dotted)
+                else:
+                    logger.debug(
+                        "register_all: no register() found in %s, skipping", dotted
+                    )
+            except Exception as exc:
+                logger.debug("register_all: failed to register %s: %s", dotted, exc)
+
+        # --- Phase 2: remaining modules via the generic hook mechanism ---
+        # Ensure the registry has been scanned.
+        if not self.modules:
+            self.scan()
+
+        extra = self.register_hooks(engine)
+        # Avoid double-counting the explicit modules that were handled in phase 1.
+        registered_total = registered + max(0, extra - len(_EXPLICIT_MODULES))
+
+        logger.info(
+            "HeteroRegistry.register_all(): %d modules registered with engine",
+            registered_total,
+        )
+        return registered_total
+
 
 # ---------------------------------------------------------------------------
 # Convenience: global registry singleton

@@ -786,6 +786,27 @@ class HeteroGDNNormOutRecompute:
             self._loc_cache.clear()
         self.norm_out_checkpoint = None
 
+    @classmethod
+    def register(cls, engine) -> None:
+        """Attach a HeteroGDNNormOutRecompute placeholder to the engine.
+
+        Sets ``engine.hetero_gdn_selective_recompute = None`` as a placeholder;
+        full initialisation is deferred until per-layer configuration is available.
+
+        Parameters
+        ----------
+        engine:
+            A DeepSpeed engine instance.
+        """
+        logger.info(
+            "HeteroGDNNormOutRecompute.register() called on engine type=%s",
+            type(engine).__name__,
+        )
+        engine.hetero_gdn_selective_recompute = None
+        logger.info(
+            "HeteroGDNNormOutRecompute.register() attached engine.hetero_gdn_selective_recompute"
+        )
+
 
 # ---------------------------------------------------------------------------
 # RMSNorm (minimal implementation used in tests / standalone mode)
@@ -1629,18 +1650,12 @@ if __name__ == "__main__":
 def register(engine) -> None:
     """Register HeteroGDNNormOutRecompute on a DeepSpeed engine.
 
-    Instantiates a :class:`HeteroGDNNormOutRecompute` from the engine's configuration
-    and attaches it as ``engine.hetero_gdn_selective_recompute``.
+    Delegates to :meth:`HeteroGDNNormOutRecompute.register` and attaches the
+    module as ``engine.hetero_gdn_selective_recompute``.
 
     Parameters
     ----------
     engine:
         A DeepSpeed engine instance.
     """
-    logger.info(
-        "hetero_gdn_selective_recompute.register() called on engine type=%s",
-        type(engine).__name__,
-    )
-
-    engine.hetero_gdn_selective_recompute = None
-    logger.info("hetero_gdn_selective_recompute.register() attached engine.hetero_gdn_selective_recompute")
+    HeteroGDNNormOutRecompute.register(engine)

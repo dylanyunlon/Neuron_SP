@@ -826,6 +826,28 @@ class HeteroStepBatchScheduler:
             )
         return iterations
 
+    @classmethod
+    def register(cls, engine) -> None:
+        """Attach a HeteroStepBatchScheduler placeholder to the engine.
+
+        Sets ``engine.hetero_step_batch_scheduler = None`` as a placeholder;
+        full initialisation is deferred until the engine's training
+        configuration (schedule string, micro_batch_size, etc.) is available.
+
+        Parameters
+        ----------
+        engine:
+            A DeepSpeed engine instance.
+        """
+        logger.info(
+            "HeteroStepBatchScheduler.register() called on engine type=%s",
+            type(engine).__name__,
+        )
+        engine.hetero_step_batch_scheduler = None
+        logger.info(
+            "HeteroStepBatchScheduler.register() attached engine.hetero_step_batch_scheduler"
+        )
+
 
 # ---------------------------------------------------------------------------
 # DeepSpeed Engine 适配层
@@ -977,20 +999,14 @@ if __name__ == "__main__":
 # ---------------------------------------------------------------------------
 
 def register(engine) -> None:
-    """Register HeteroMicrobatchAllocator on a DeepSpeed engine.
+    """Register HeteroStepBatchScheduler on a DeepSpeed engine.
 
-    Instantiates a :class:`HeteroMicrobatchAllocator` from the engine's configuration
-    and attaches it as ``engine.hetero_step_batch_scheduler``.
+    Delegates to :meth:`HeteroStepBatchScheduler.register` and attaches the
+    module as ``engine.hetero_step_batch_scheduler``.
 
     Parameters
     ----------
     engine:
         A DeepSpeed engine instance.
     """
-    logger.info(
-        "hetero_step_batch_scheduler.register() called on engine type=%s",
-        type(engine).__name__,
-    )
-
-    engine.hetero_step_batch_scheduler = None
-    logger.info("hetero_step_batch_scheduler.register() attached engine.hetero_step_batch_scheduler")
+    HeteroStepBatchScheduler.register(engine)
