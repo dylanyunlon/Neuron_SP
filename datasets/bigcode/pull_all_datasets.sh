@@ -15,6 +15,64 @@ echo "=========================================="
 echo "BigCode Commit Datasets Downloader"
 echo "=========================================="
 
+# ══════════════════════════════════════════════════════════════════════════════
+# 0. huggingface-cli download — 四大数据集直接下载命令（快速参考）
+# ══════════════════════════════════════════════════════════════════════════════
+# 以下四条命令可独立运行，无需执行后续 Python 脚本。
+# 对于 TB 级数据集，加 --include "*.json" "*.md" 仅拉元数据；
+# 如需完整数据，去掉 --include 过滤（commitpack 除外，4TB 请用 streaming=True）。
+
+echo "=========================================="
+echo "四大数据集 huggingface-cli download 命令参考"
+echo "=========================================="
+echo ""
+echo "  # [A] bigcode/starcoderdata — ~32-64GB git-commits splits（仅元数据）"
+echo "  huggingface-cli download --repo-type dataset bigcode/starcoderdata \\"
+echo "      --include '*.json' '*.md' '*.yaml'"
+echo ""
+echo "  # [B] bigcode/commitpack — ~4TB（仅元数据；完整数据请用 streaming=True）"
+echo "  huggingface-cli download --repo-type dataset bigcode/commitpack \\"
+echo "      --include '*.json' '*.md' '*.yaml'"
+echo ""
+echo "  # [C] bigcode/commitpackft — ~2GB 高质量子集（可完整下载）"
+echo "  huggingface-cli download --repo-type dataset bigcode/commitpackft \\"
+echo "      --local-dir commitpackft/"
+echo ""
+echo "  # [D] bigcode/the-stack-v2 — ~900B tokens（需 login + 接受协议）"
+echo "  huggingface-cli login   # 先登录"
+echo "  huggingface-cli download --repo-type dataset bigcode/the-stack-v2 \\"
+echo "      --include '*.json' '*.md' '*.yaml'"
+echo ""
+
+# 实际执行：下载四大数据集的元数据/配置文件到本地 HF 缓存
+if command -v huggingface-cli &>/dev/null; then
+    echo "  [0a] 下载 bigcode/starcoderdata 元数据 ..."
+    huggingface-cli download --repo-type dataset bigcode/starcoderdata \
+        --include "*.json" "*.md" "*.yaml" 2>&1 | sed 's/^/    /' || true
+
+    echo "  [0b] 下载 bigcode/commitpack 元数据 ..."
+    huggingface-cli download --repo-type dataset bigcode/commitpack \
+        --include "*.json" "*.md" "*.yaml" 2>&1 | sed 's/^/    /' || true
+
+    echo "  [0c] 下载 bigcode/commitpackft 元数据 ..."
+    huggingface-cli download --repo-type dataset bigcode/commitpackft \
+        --include "*.json" "*.md" "*.yaml" 2>&1 | sed 's/^/    /' || true
+
+    echo "  [0d] bigcode/the-stack-v2 — 检查登录状态 ..."
+    if huggingface-cli whoami &>/dev/null 2>&1; then
+        huggingface-cli download --repo-type dataset bigcode/the-stack-v2 \
+            --include "*.json" "*.md" "*.yaml" 2>&1 | sed 's/^/    /' || true
+    else
+        echo "    [SKIP] 未登录 HuggingFace，跳过 the-stack-v2"
+        echo "    运行 'huggingface-cli login' 并接受协议后重新执行"
+    fi
+else
+    echo "  [WARN] huggingface-cli 未安装，跳过 Section 0 (pip install huggingface_hub)"
+fi
+
+echo ""
+echo "=========================================="
+
 # ── 1. CommitPackFT (2GB, 高质量子集, GPT-4 筛选) ──
 # DATASET_REGISTRY entry: "commitpackft" — schema_layout=flat, streaming=False
 echo ""

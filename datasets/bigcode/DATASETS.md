@@ -6,6 +6,34 @@ cd datasets/bigcode
 bash pull_all_datasets.sh    # 在 ags1 上执行
 ```
 
+## 四大数据集快速参考表
+
+| 数据集 | HuggingFace ID | 规模 | streaming | 需要 Token | 主要用途 |
+|--------|---------------|------|-----------|-----------|---------|
+| StarCoder commits (raw) | `bigcode/starcoderdata` (git-commits) | ~32 GB | ✅ | ❌ | 预训练 code diff |
+| StarCoder commits (cleaned) | `bigcode/starcoderdata` (git-commits-cleaned) | ~64 GB | ✅ | ❌ | 预训练主语料（推荐） |
+| CommitPack | `bigcode/commitpack` | ~4 TB | ✅ 强制 | ❌ | 大规模预训练 |
+| CommitPackFT | `bigcode/commitpackft` | ~2 GB | ❌ | ❌ | 指令微调 |
+| The Stack v2 | `bigcode/the-stack-v2` | ~900B tokens | ✅ | ✅ | 全量预训练语料 |
+
+> **下载命令速查** — 详见 `pull_all_datasets.sh` 或下方各节。
+>
+> ```bash
+> # StarCoder commits（仅元数据/配置）
+> huggingface-cli download --repo-type dataset bigcode/starcoderdata --include "*.json" "*.md"
+>
+> # CommitPack（仅元数据，完整 4TB 用 streaming=True）
+> huggingface-cli download --repo-type dataset bigcode/commitpack --include "*.json" "*.md"
+>
+> # CommitPackFT（完整下载 ~2GB）
+> huggingface-cli download --repo-type dataset bigcode/commitpackft --local-dir commitpackft/
+>
+> # The Stack v2（需先 huggingface-cli login 并接受协议）
+> huggingface-cli download --repo-type dataset bigcode/the-stack-v2 --include "*.json" "*.md"
+> ```
+
+---
+
 ## 四大数据集
 
 ### 1. CommitPackFT (`bigcode/commitpackft`)
