@@ -228,6 +228,175 @@ def prepare(
     print(f"  elapsed   : {elapsed}")
 
 
+
+# ---------------------------------------------------------------------------
+# .npy output with 99:1 train/valid split and CodeLlama tokenizer support
+# ---------------------------------------------------------------------------
+
+def prepare_npy(
+    output_dir: str = "data",
+    num_samples: int = 500_000,
+    tokenizer_name: str = "codellama/CodeLlama-7b-hf",
+    seq_len: int = 2048,
+    languages: list = None,
+    text_field: str = "message",
+    train_ratio: float = 0.99,
+) -> None:
+    """Tokenize CommitPack and write memory-mapped .npy arrays for run_pretrain.py.
+
+    Outputs:
+        <output_dir>/commitpack_train.npy  -- int32 token ids, shape (N_train,)
+        <output_dir>/commitpack_valid.npy  -- int32 token ids, shape (N_valid,)
+        <output_dir>/commitpack_meta.json  -- total_tokens, split, tokenizer info
+
+    The files can be loaded in run_pretrain.py via:
+        tokens = np.load(path, mmap_mode='r')
+
+    Args:
+        output_dir:     Where to write the .npy files.
+        num_samples:    Target number of commit samples to process.
+        tokenizer_name: HuggingFace tokenizer; defaults to CodeLlama-7b-hf.
+                        Falls back to 'gpt2' if the model is not accessible.
+        seq_len:        Sequence length for packing; not used during tokenization
+                        (run_pretrain.py handles packing at load time).
+        languages:      CommitPack language sub-configs (default: python, javascript).
+        text_field:     Dataset field to tokenize (default: message).
+        train_ratio:    Fraction of tokens for train split (default: 0.99).
+    """
+    import json  # noqa: PLC0415
+    load_dataset, AutoTokenizer = _import_deps()
+
+    if languages is None:
+        languages = ["python", "javascript"]
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    # ------------------------------------------------------------------
+    # Tokenizer — CodeLlama preferred; fall back to gpt2
+    # ------------------------------------------------------------------
+    print(f"[prepare_npy] Loading tokenizer: {tokenizer_name}")
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, trust_remote_code=True)
+    except Exception as tok_exc:
+        fallback = "gpt2"
+        print(
+            f"[prepare_npy] WARNING: could not load '{tokenizer_name}' ({tok_exc}). "
+            f"Falling back to '{fallback}'.",
+            file=sys.stderr,
+        )
+        tokenizer = AutoTokenizer.from_pretrained(fallback)
+    if tokenizer.eos_token_id is None:
+        tokenizer.add_special_tokens({"eos_token": "<|endoftext|>"})
+    eos_id = tokenizer.eos_token_id
+    vocab_size = tokenizer.vocab_size
+    print(f"[prepare_npy] vocab_size={_format_num(vocab_size)}, eos_id={eos_id}")
+
+    # ------------------------------------------------------------------
+    # Stream dataset
+    # ------------------------------------------------------------------
+    datasets_iter = []
+    for lang in languages:
+        try:
+            ds = load_dataset(
+                "bigcode/commitpack",
+                lang,
+                split="train",
+                streaming=True,
+                trust_remote_code=True,
+            )
+            datasets_iter.append(ds)
+            print(f"[prepare_npy] Streaming commitpack/{lang}")
+        except Exception as e:
+            print(f"[prepare_npy] WARNING: could not load '{lang}': {e}", file=sys.stderr)
+
+    if not datasets_iter:
+        print("ERROR: No valid language datasets loaded.", file=sys.stderr)
+        sys.exit(1)
+
+    from itertools import chain  # noqa: PLC0415
+    dataset_stream = chain.from_iterable(datasets_iter)
+
+    # ------------------------------------------------------------------
+    # Collect all tokens into a list, then split and save as .npy
+    # ------------------------------------------------------------------
+    all_tokens: list = []
+    start_time = time.time()
+    samples_done = 0
+    log_every = max(1, num_samples // 100)
+
+    for sample in dataset_stream:
+        if samples_done >= num_samples:
+            break
+        text = sample.get(text_field, "")
+        if not text:
+            continue
+        ids = tokenizer.encode(text, add_special_tokens=False)
+        ids.append(eos_id)
+        all_tokens.extend(ids)
+        samples_done += 1
+        if samples_done % log_every == 0 or samples_done == num_samples:
+            pct = 100.0 * samples_done / num_samples
+            tps = len(all_tokens) / max(1e-6, time.time() - start_time)
+            print(
+                f"[prepare_npy] {pct:5.1f}% | samples={_format_num(samples_done)} | "
+                f"tokens={_format_num(len(all_tokens))} | "
+                f"elapsed={_elapsed(start_time)} | tok/s={_format_num(int(tps))}"
+            )
+            sys.stdout.flush()
+
+    total_tokens = len(all_tokens)
+    print(f"[prepare_npy] Total tokens collected: {_format_num(total_tokens)}")
+
+    if total_tokens < 1_000_000:
+        print(
+            f"[prepare_npy] WARNING: only {_format_num(total_tokens)} tokens; "
+            "target is ≥1B tokens for meaningful pretraining.",
+            file=sys.stderr,
+        )
+
+    # ------------------------------------------------------------------
+    # 99:1 train/valid split
+    # ------------------------------------------------------------------
+    split_idx = int(total_tokens * train_ratio)
+    train_tokens = np.array(all_tokens[:split_idx], dtype=np.int32)
+    valid_tokens = np.array(all_tokens[split_idx:], dtype=np.int32)
+
+    train_path = os.path.join(output_dir, "commitpack_train.npy")
+    valid_path = os.path.join(output_dir, "commitpack_valid.npy")
+
+    print(f"[prepare_npy] Saving train: {_format_num(len(train_tokens))} tokens → {train_path}")
+    np.save(train_path, train_tokens)
+
+    print(f"[prepare_npy] Saving valid: {_format_num(len(valid_tokens))} tokens → {valid_path}")
+    np.save(valid_path, valid_tokens)
+
+    # Metadata
+    meta = {
+        "total_tokens":  total_tokens,
+        "train_tokens":  int(len(train_tokens)),
+        "valid_tokens":  int(len(valid_tokens)),
+        "train_ratio":   train_ratio,
+        "num_samples":   samples_done,
+        "tokenizer":     tokenizer_name,
+        "eos_id":        int(eos_id),
+        "vocab_size":    int(vocab_size),
+        "seq_len":       seq_len,
+        "dtype":         "int32",
+        "format":        "npy",
+    }
+    meta_path = os.path.join(output_dir, "commitpack_meta.json")
+    with open(meta_path, "w") as fh:
+        json.dump(meta, fh, indent=2)
+
+    print(f"[prepare_npy] Done!")
+    print(f"  train  : {train_path}  ({os.path.getsize(train_path) / 1e9:.3f} GB)")
+    print(f"  valid  : {valid_path}  ({os.path.getsize(valid_path) / 1e9:.3f} GB)")
+    print(f"  meta   : {meta_path}")
+    print(f"  elapsed: {_elapsed(start_time)}")
+    print()
+    print("Load in run_pretrain.py with:")
+    print(f"  python run_pretrain.py --data-path {train_path}")
+
 # ---------------------------------------------------------------------------
 # CommitPackFT
 # ---------------------------------------------------------------------------
@@ -377,13 +546,21 @@ def parse_args():
         "--task",
         type=str,
         default="commitpack",
-        choices=["commitpack", "commitpackft"],
+        choices=["commitpack", "commitpackft", "npy"],
         help=(
             "Which preparation task to run. "
-            "'commitpack' runs prepare() (original CommitPack). "
+            "'commitpack' runs prepare() (uint16 .bin output). "
             "'commitpackft' runs prepare_commitpackft() (CommitPackFT, Python subset). "
+            "'npy' runs prepare_npy() — CodeLlama tokenizer, int32, "
+            "99:1 train/valid split, outputs commitpack_train.npy / commitpack_valid.npy. "
             "Default: commitpack."
         ),
+    )
+    parser.add_argument(
+        "--train-ratio",
+        type=float,
+        default=0.99,
+        help="Fraction of tokens for train split in 'npy' task (default: 0.99 = 99%%).",
     )
     parser.add_argument(
         "--output-dir",
@@ -442,7 +619,20 @@ def parse_args():
 if __name__ == "__main__":
     args = parse_args()
 
-    if args.task == "commitpackft":
+    if args.task == "npy":
+        languages = args.languages
+        if languages == ["all"]:
+            languages = []
+        prepare_npy(
+            output_dir=args.output_dir,
+            num_samples=args.num_samples,
+            tokenizer_name=args.tokenizer_name or "codellama/CodeLlama-7b-hf",
+            seq_len=2048,
+            languages=languages if languages else ["python", "javascript"],
+            text_field=args.text_field,
+            train_ratio=getattr(args, "train_ratio", 0.99),
+        )
+    elif args.task == "commitpackft":
         prepare_commitpackft(
             output_dir=args.output_dir,
             tokenizer_name=args.tokenizer_name,

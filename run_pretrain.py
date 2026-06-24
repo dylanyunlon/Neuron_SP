@@ -362,21 +362,34 @@ def real_data_iter(
         yield from synthetic_iter(32000, batch_size, seq_len, device)
         return
 
-    # Try common binary formats
-    for dtype in (np.uint16, np.int32):
+    # .npy files: memory-mapped int32 arrays (output of data/prepare_commits.py --task npy)
+    if path.suffix == ".npy":
         try:
-            tokens = np.fromfile(str(path), dtype=dtype)
+            tokens = np.load(str(path), mmap_mode="r").astype(np.int64)
             logger.info(
-                "Loaded %s: %d tokens (dtype=%s)", path.name, len(tokens), dtype.__name__
+                "Loaded %s as memory-mapped .npy: %d tokens (int32→int64)", path.name, len(tokens)
             )
-            break
-        except Exception:
-            tokens = None
+        except Exception as _npy_exc:
+            logger.warning("Failed to mmap '%s' (%s); using synthetic data.", data_path, _npy_exc)
+            yield from synthetic_iter(32000, batch_size, seq_len, device)
+            return
+    else:
+        # Try common binary formats
+        tokens = None
+        for dtype in (np.uint16, np.int32):
+            try:
+                tokens = np.fromfile(str(path), dtype=dtype)
+                logger.info(
+                    "Loaded %s: %d tokens (dtype=%s)", path.name, len(tokens), dtype.__name__
+                )
+                break
+            except Exception:
+                tokens = None
 
-    if tokens is None or len(tokens) < seq_len + 1:
-        logger.warning("Could not read '%s'; using synthetic data.", data_path)
-        yield from synthetic_iter(32000, batch_size, seq_len, device)
-        return
+        if tokens is None or len(tokens) < seq_len + 1:
+            logger.warning("Could not read '%s'; using synthetic data.", data_path)
+            yield from synthetic_iter(32000, batch_size, seq_len, device)
+            return
 
     chunk = seq_len + 1
     n_chunks = len(tokens) // chunk
