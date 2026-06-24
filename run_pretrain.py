@@ -839,7 +839,7 @@ def run_desloc(args: argparse.Namespace) -> None:
         grad_accum_steps= _grad_accum,
         warmup_steps    = min(2000, args.steps // 10),
         log_every       = args.log_every,
-        save_every      = getattr(args, "save_every", 500),
+        save_every      = getattr(args, "save_every", 1000),
         eval_every      = 0,
     )
 

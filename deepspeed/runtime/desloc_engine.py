@@ -2193,7 +2193,7 @@ class DesLocEngine:
 
         cfg = self._hetero_ckpt_cfg  # may be None in CPU-only mode
 
-        if cfg is not None and cfg.hetero_async_save:
+        if cfg is not None and False:  # DISABLED: DCP async save deadlocks with training all_reduce (dcp.save calls gather_object→allgather in background thread while main thread does grad all_reduce)
             # ------------------------------------------------------------------
             # Hetero async path
             # Step 1: classify the current device into a TierRole using the
@@ -2372,15 +2372,30 @@ class DesLocEngine:
                 )
 
         # ------------------------------------------------------------------
-        # Synchronous fallback (also used when hetero config is absent).
-        # Only rank 0 saves to avoid file corruption from concurrent writes.
+        # Synchronous per-rank save.  Each rank saves its own shard to a
+        # rank-suffixed file.  No collective communication needed.
         # ------------------------------------------------------------------
-        _is_main_rank = (not dist.is_initialized()) or (dist.get_rank() == 0)
-        if _is_main_rank:
+        _rank = dist.get_rank() if dist.is_initialized() else 0
+        _world = dist.get_world_size() if dist.is_initialized() else 1
+        # For rank 0 (or single-GPU), save full payload.
+        # For other ranks, save only param_shard + step (optimizer is redundant
+        # since each rank has its own shard's Adam states).
+        if _world == 1:
             torch.save(payload, path)
             logger.info("Checkpoint saved: %s (step %d)", path, self.global_step)
+        else:
+            path = Path(path)
+            ckpt_dir = path.parent / path.stem
+            ckpt_dir.mkdir(parents=True, exist_ok=True)
+            rank_path = ckpt_dir / f"rank_{_rank}.pt"
+            torch.save(payload, rank_path)
+            logger.info(
+                "Checkpoint saved: %s (rank %d/%d, step %d, %.1f MB)",
+                rank_path, _rank, _world, self.global_step,
+                rank_path.stat().st_size / (1 << 20),
+            )
         if dist.is_initialized():
-            dist.barrier()  # all ranks wait for rank 0 to finish writing
+            dist.barrier()  # all ranks wait for IO to finish
 
     def load_checkpoint(self, path: Path) -> None:
         """
