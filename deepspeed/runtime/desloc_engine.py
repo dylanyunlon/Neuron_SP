@@ -1058,6 +1058,11 @@ class DesLocEngine:
         # Neuron_SP core design: partition model params + optimizer states
         # across heterogeneous GPUs so that models exceeding single-GPU VRAM
         # (e.g. 7B on A6000 48GB) can train via sharding.
+        #
+        # CRITICAL: FSDP1 needs the full model materialized on at least one rank
+        # during init. With sync_module_states=True, only rank 0 needs the model
+        # on GPU; other ranks get synced params after sharding. This avoids the
+        # OOM where all ranks try to load the full 7B model simultaneously.
         if dist.is_initialized() and dist.get_world_size() > 1:
             from torch.distributed.fsdp import (
                 FullyShardedDataParallel as FSDP,
@@ -1065,14 +1070,22 @@ class DesLocEngine:
                 ShardingStrategy,
                 CPUOffload,
             )
-            _local_mem_gb = torch.cuda.get_device_properties(_local_device).total_memory / (1 << 30)
-            # Use CPU offload on small-VRAM GPUs (A6000 48GB)
-            _cpu_offload = CPUOffload(offload_params=(_local_mem_gb < 60))
             _mp = MixedPrecision(
                 param_dtype=_DEFAULT_DTYPE,
                 reduce_dtype=_DEFAULT_DTYPE,
                 buffer_dtype=_DEFAULT_DTYPE,
             )
+            # For 7B+ models, always use CPU offload — even H100 93GB benefits
+            # from offloading optimizer states to 1.5TB DRAM.
+            # This is the Neuron_SP heterogeneous design: use all available DRAM.
+            _cpu_offload = CPUOffload(offload_params=True)
+
+            # Only rank 0 moves model to GPU for init; others stay on CPU.
+            # sync_module_states broadcasts params from rank 0 after flatten.
+            _rank = dist.get_rank()
+            if _rank == 0:
+                self.model = self.model.to(device=_local_device)
+
             self.model = FSDP(
                 self.model,
                 sharding_strategy=ShardingStrategy.FULL_SHARD,
@@ -1080,10 +1093,12 @@ class DesLocEngine:
                 cpu_offload=_cpu_offload,
                 device_id=_local_device,
                 use_orig_params=True,
+                sync_module_states=True,
             )
             logger.info(
-                "FSDP wrapped: strategy=FULL_SHARD, cpu_offload=%s, device=%s",
-                _local_mem_gb < 60, _local_device,
+                "FSDP wrapped: strategy=FULL_SHARD, cpu_offload=True, "
+                "sync_module_states=True, device=%s, rank=%d",
+                _local_device, _rank,
             )
 
         n_params = sum(p.numel() for p in self.model.parameters())
