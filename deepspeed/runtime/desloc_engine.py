@@ -1506,6 +1506,11 @@ class DesLocEngine:
             scaled_loss = loss / num_microbatches
         return loss, scaled_loss
 
+    def step(self) -> None:
+        """Optimizer step — used by hetero_grad_norm_skip monkey-patch."""
+        if self.optimizer is not None:
+            self.optimizer.step()
+
     def train(self) -> None:
         """
         Run the full training loop.
