@@ -1533,12 +1533,11 @@ class DesLocEngine:
         # Failures here must not break legacy single-GPU training paths, so the
         # call is wrapped defensively and the loop falls back to None.
         try:
-            self.mimo_loop: Optional[HeteroMIMOTrainingLoop] = (
-                setup_hetero_mimo_training(self.model)
-            )
-            logger.info(
-                "HeteroMIMOTrainingLoop initialized via setup_hetero_mimo_training()."
-            )
+            # TEMPORARY: Disable MIMO loop to isolate the training pipeline.
+            # MIMO loop has its own collective ops and optimizer management
+            # that may conflict with FSDP. Use standard forward/backward path.
+            self.mimo_loop = None
+            logger.info("MIMO loop DISABLED — using standard forward/backward path for pipeline verification.")
         except Exception as exc:  # pragma: no cover - defensive
             logger.warning(
                 "setup_hetero_mimo_training() failed (%s); continuing without "
