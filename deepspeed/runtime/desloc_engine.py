@@ -1736,6 +1736,7 @@ class DesLocEngine:
 
         loss_accum = 0.0
         t0 = time.time()
+        train_start = t0  # used to compute total_time after the loop
 
         if _is_main:
             print("[DBG] Entering training loop", flush=True)
@@ -1934,6 +1935,7 @@ class DesLocEngine:
                     logger.warning("[eval] step=%d eval hook failed: %s", self.global_step, _eval_exc)
                 finally:
                     self.model.train()
+        total_time = time.time() - train_start
         logger.info(
             "Training complete. %d steps in %.1fs. "
             "%.2fM tokens seen. Avg %.0f tok/s.",
