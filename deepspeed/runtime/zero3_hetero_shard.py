@@ -222,6 +222,15 @@ class ShardState:
             vram_weights is not None,
         )
 
+        # Pre-allocate the gradient buffer NOW, before forward all-gather
+        # consumes GPU memory. Lazy allocation inside backward hooks would
+        # OOM because forward already holds the full-layer gathered params.
+        param_shard.grad = torch.zeros_like(param_shard)
+        logger.info(
+            "[zero3] rank=%d pre-allocated param_shard.grad: %.2f GB on %s",
+            rank, param_shard.grad.nbytes / (1 << 30), device,
+        )
+
         return cls(
             rank=rank,
             world_size=world_size,
@@ -419,8 +428,6 @@ class ShardState:
                 # the correct offset. Do NOT write param.grad — the param
                 # shape doesn't match the 1-D reduced shard.
                 if local_grad.numel() > 0 and _shard_end > _shard_start:
-                    if _param_shard.grad is None:
-                        _param_shard.grad = torch.zeros_like(_param_shard)
                     _param_shard.grad[_shard_start:_shard_end].add_(
                         local_grad[:_shard_end - _shard_start].to(
                             dtype=_param_shard.dtype, device=_param_shard.device

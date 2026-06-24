@@ -1441,9 +1441,18 @@ class DesLocEngine:
         # Each rank allocates FP32 grad buffer on its own device, not on primary_device
         _local_device = torch.device(f"cuda:{torch.cuda.current_device()}")
         _local_mem_gb = torch.cuda.get_device_properties(_local_device).total_memory / (1 << 30)
-        # 7B model needs ~12GB bf16 + 2×12GB FP32 buffers = ~36GB minimum
-        # A6000 (47GB) can't fit all three; skip FP32 grad accum on small devices
-        if _local_mem_gb < 60:
+        # When ZeRO-3 param sharding is active, param_shard IS the FP32
+        # master copy and backward hooks handle reduce-scatter. The
+        # fp32_grad_manager would duplicate FP32 grad buffers (~24GB on
+        # H100) and conflict with the ZeRO-3 gradient flow.
+        if self.param_shard_state is not None:
+            self.fp32_grad_manager = None
+            logger.info(
+                "HeteroFP32GradAccumManager SKIPPED — ZeRO-3 param_shard "
+                "is the FP32 master copy (device=%s)",
+                _local_device,
+            )
+        elif _local_mem_gb < 60:
             self.fp32_grad_manager = None
             logger.info(
                 "HeteroFP32GradAccumManager SKIPPED on %s (%.0f GB < 60 GB threshold)",
@@ -1735,8 +1744,7 @@ class DesLocEngine:
             self.optimizer.zero_grad(set_to_none=True)
             # Zero param_shard.grad — backward hooks accumulate into it
             if self.param_shard_state is not None:
-                if self.param_shard_state.param_shard.grad is not None:
-                    self.param_shard_state.param_shard.grad.zero_()
+                self.param_shard_state.param_shard.grad.zero_()
             step_loss = 0.0
 
             # Heterogeneous scheduling: each rank gets its own micro-batch count
