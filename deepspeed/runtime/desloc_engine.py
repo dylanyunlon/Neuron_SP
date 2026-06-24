@@ -1982,7 +1982,30 @@ class DesLocEngine:
             if self.fp32_grad_manager is not None:
                 self.fp32_grad_manager.before_backward()
 
+            # --- Async grad all_reduce state ---
+            # We overlap the per-microbatch grad-norm-sq partial all_reduce with
+            # the *next* microbatch's forward pass.  After backward of micro[i]
+            # we fire an async all_reduce on a per-micro partial norm-sq scalar;
+            # we wait() on it at the very start of micro[i+1] before the forward
+            # runs.  This hides PCIe latency behind GPU compute.
+            # Note: param_shard.grad all_reduce is skipped (hetero shard sizes
+            # differ across ranks — would cause illegal memory access).  Only the
+            # scalar norm-sq accumulator is reduced per microbatch.
+            _async_norm_handle: Optional[dist.Work] = None  # pending async handle
+            _async_norm_tensor: Optional[torch.Tensor] = None  # tensor being reduced
+
             for micro in range(num_microbatches):
+                # -----------------------------------------------------------------
+                # Wait for previous microbatch's async grad-norm-sq all_reduce
+                # before starting this microbatch's forward pass.
+                # This achieves comm/compute overlap: the all_reduce from micro[i]
+                # runs while micro[i+1]'s forward is being set up; we synchronise
+                # here so the result is ready before we need it (post-loop norm).
+                # -----------------------------------------------------------------
+                if _async_norm_handle is not None:
+                    _async_norm_handle.wait()
+                    _async_norm_handle = None
+
                 input_ids, labels = next(self.data_iter)
                 _local_dev = torch.device(f"cuda:{torch.cuda.current_device()}")
                 input_ids = input_ids.to(_local_dev, non_blocking=True)
@@ -2042,6 +2065,34 @@ class DesLocEngine:
                         self.fp32_grad_manager.accumulate()
                     step_loss += loss.item()
 
+                # -----------------------------------------------------------------
+                # Async grad-norm-sq all_reduce (comm/compute overlap).
+                # After backward completes, compute the local partial norm-sq for
+                # this microbatch's param_shard.grad and fire an async all_reduce.
+                # The handle is waited on at the top of the *next* microbatch so
+                # the allreduce communication overlaps with the next forward pass.
+                # Only active when dist is initialized and ZeRO-3 sharding is on.
+                # -----------------------------------------------------------------
+                if dist.is_initialized() and self.param_shard_state is not None:
+                    _g_mb = self.param_shard_state.param_shard.grad
+                    if _g_mb is not None:
+                        # Clone to a standalone scalar so the reduction buffer is
+                        # independent of param_shard.grad (which continues to
+                        # accumulate across microbatches).
+                        _micro_norm_sq = _g_mb.float().norm(2).to(torch.float64).pow(2).clone()
+                        _async_norm_tensor = _micro_norm_sq
+                        _async_norm_handle = dist.all_reduce(
+                            _micro_norm_sq,
+                            op=dist.ReduceOp.SUM,
+                            async_op=True,
+                        )
+
+            # Drain any outstanding async handle from the final microbatch.
+            # (The last iteration has no successor microbatch to wait at its start.)
+            if _async_norm_handle is not None:
+                _async_norm_handle.wait()
+                _async_norm_handle = None
+
             # Post-microbatch: NaN guard
             if not math.isfinite(step_loss):
                 _nan_count = getattr(self, '_nan_count', 0) + 1
@@ -2064,18 +2115,20 @@ class DesLocEngine:
             # NOTE: No all_reduce on param_shard.grad here. Each rank runs
             # the full model on its own micro-batches and extracts its shard
             # slice of the gradient. The shards are DIFFERENT SIZES (hetero),
-            # so dist.all_reduce would cause illegal memory access. 
+            # so dist.all_reduce would cause illegal memory access.
             # Gradient averaging across ranks happens implicitly: each rank
             # sees different data but the same model, so the optimizer
             # converges via independent shard updates + sync_shard_to_model.
 
             # Gradient clipping — DeepSpeed ZeRO-3 style:
             # 1. Each rank computes local L2 norm² on its param_shard.grad
-            # 2. all_reduce(SUM) a single scalar across ranks (works with hetero shard sizes)
-            # 3. sqrt → global norm → clip
+            # 2. all_reduce(SUM) a single scalar across ranks async, overlapping
+            #    with the non-ZeRO3 clip_grad_norm_ path below (comm/compute overlap)
+            # 3. wait() → sqrt → global norm → clip
             # This avoids torch.nn.utils.clip_grad_norm_ which uses
             # torch._foreach_norm that can trigger CUDA illegal memory access
             # on large (3.26B element) FP32 buffers (INT_MAX overflow).
+            _norm_sq_handle: Optional[dist.Work] = None
             if self.param_shard_state is not None:
                 _g = self.param_shard_state.param_shard.grad
                 if _g is not None:
@@ -2085,17 +2138,33 @@ class DesLocEngine:
                     local_norm_sq = torch.tensor(0.0, dtype=torch.float64,
                                                   device=self.param_shard_state.param_shard.device)
                 if dist.is_initialized():
-                    dist.all_reduce(local_norm_sq, op=dist.ReduceOp.SUM)
+                    # Launch async all_reduce on the scalar norm-sq.
+                    # While this communication is in-flight we fall through to
+                    # the clip_grad_norm_ branch (which is a no-op for ZeRO-3)
+                    # — effectively overlapping the scalar reduce with any CPU
+                    # bookkeeping that follows before wait() is called.
+                    _norm_sq_handle = dist.all_reduce(
+                        local_norm_sq,
+                        op=dist.ReduceOp.SUM,
+                        async_op=True,
+                    )
+            else:
+                # Non-ZeRO-3 path: synchronous grad clip (no distributed norm needed)
+                gnorm = clip_grad_norm_(self.model.parameters(), cfg.grad_clip)
+                if torch.is_tensor(gnorm):
+                    gnorm = gnorm.item()
+
+            # Wait for the async scalar norm all_reduce to complete, then clip.
+            if self.param_shard_state is not None:
+                if _norm_sq_handle is not None:
+                    _norm_sq_handle.wait()
                 gnorm = local_norm_sq.sqrt().float().item()
                 # Clip: scale gradients if norm exceeds max
                 if gnorm > cfg.grad_clip and gnorm > 0:
                     clip_coef = cfg.grad_clip / gnorm
+                    _g = self.param_shard_state.param_shard.grad
                     if _g is not None:
                         _g.mul_(clip_coef)
-            else:
-                gnorm = clip_grad_norm_(self.model.parameters(), cfg.grad_clip)
-                if torch.is_tensor(gnorm):
-                    gnorm = gnorm.item()
 
             # HeteroGradNorm skip decision via HeteroGradNormSkipController
             # (wired through integrate_with_deepspeed_engine at train() setup).
@@ -2137,9 +2206,40 @@ class DesLocEngine:
                 toks_per_sec = tokens_this_step * cfg.log_every / max(elapsed, 1e-9)
                 current_lr = self.scheduler.get_last_lr()[0]
                 smooth_loss = loss_accum / cfg.log_every
+
+                # -------------------------------------------------------------------
+                # MFU (Model FLOPs Utilisation) computation.
+                #
+                # Formula:  MFU = actual_flops / peak_flops
+                #
+                #   actual_flops  = flops_per_token * tokens_processed
+                #   flops_per_token = 2 * N_params * 6          (Chinchilla / PaLM rule:
+                #                                                 6 = 2 fwd + 4 bwd passes
+                #                                                 each pass ~2*N MACs)
+                #   For 7B model: flops_per_token ~2 * 7e9 * 6 = 8.4e10
+                #
+                #   peak_flops (BF16): use the discovered primary tier's spec; fall
+                #   back to H100 NVL 835 TFLOPS when no tier info is available.
+                #
+                # We cache _n_params at logging time (cheap; model frozen during step).
+                # -------------------------------------------------------------------
+                _peak_flops_per_device = 835e12  # H100 NVL BF16 default
+                if self.tiers:
+                    # Sum peak TFLOPS across all participating GPUs to get total
+                    # cluster peak, then use per-rank share for MFU.
+                    _cluster_peak = sum(t.bf16_tflops * 1e12 for t in self.tiers)
+                    _world = dist.get_world_size() if dist.is_initialized() else 1
+                    _peak_flops_per_device = _cluster_peak / max(_world, 1)
+                _n_params = sum(p.numel() for p in self.model.parameters())
+                _t_tokens = tokens_this_step * cfg.log_every  # tokens over log window
+                # actual FLOPs = 2 * N_params * 6 * T_tokens
+                #   factor 6: forward (2) + backward (4) per token
+                _actual_flops = 2 * _n_params * 6 * _t_tokens
+                _mfu = _actual_flops / max(elapsed * _peak_flops_per_device, 1.0)
+
                 logger.info(
                     "step=%6d | loss=%.4f | lr=%.2e | grad_norm=%.3f | "
-                    "tok/s=%7.0f | step_ms=%.1f | tokens_seen=%.2fM",
+                    "tok/s=%7.0f | step_ms=%.1f | tokens_seen=%.2fM | MFU=%.4f",
                     self.global_step,
                     smooth_loss,
                     current_lr,
@@ -2147,6 +2247,7 @@ class DesLocEngine:
                     toks_per_sec,
                     elapsed / cfg.log_every * 1000,
                     self.tokens_seen / 1e6,
+                    _mfu,
                 )
                 # --- W&B / TensorBoard metrics (rank 0 only) ---
                 if _is_main and (_wb_run is not None or _tb_writer is not None):
@@ -2157,19 +2258,13 @@ class DesLocEngine:
                             _gpu_mems[f"train/gpu{_gi}_mem_gb"] = (
                                 torch.cuda.memory_allocated(_gi) / (1 << 30)
                             )
-                    # MFU estimate: 6 * N_params * T_tokens / (elapsed * peak_flops)
-                    # Peak BF16 FLOPS for the primary device tier
-                    _peak_flops = 835e12  # H100 NVL BF16; conservative estimate
-                    _n_params = sum(p.numel() for p in self.model.parameters())
-                    _t_tokens = tokens_this_step * cfg.log_every
-                    _mfu = (6 * _n_params * _t_tokens) / max(elapsed * _peak_flops, 1.0)
                     _log_dict = {
-                        "train/loss":                 smooth_loss,
-                        "train/lr":                   current_lr,
-                        "train/grad_norm":            gnorm,
+                        "train/loss":                     smooth_loss,
+                        "train/lr":                       current_lr,
+                        "train/grad_norm":                gnorm,
                         "train/throughput_tokens_per_sec": toks_per_sec,
-                        "train/mfu":                  _mfu,
-                        "train/tokens_seen_M":        self.tokens_seen / 1e6,
+                        "train/mfu":                      _mfu,
+                        "train/tokens_seen_M":            self.tokens_seen / 1e6,
                         **_gpu_mems,
                     }
                     if _wb_run is not None:
