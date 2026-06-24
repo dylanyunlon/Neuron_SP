@@ -1821,15 +1821,13 @@ class DesLocEngine:
                         )
                         if _is_main:
                             print(f"[DBG] step={step} micro={micro} AFTER forward loss={loss.item():.4f}", flush=True)
-                        if self.fp32_grad_manager is not None:
-                            self.fp32_grad_manager.before_backward()
+                        # fp32_grad_manager disabled with FSDP — FSDP handles
+                        # gradient dtype/device management internally.
                         if _is_main:
                             print(f"[DBG] step={step} micro={micro} BEFORE backward", flush=True)
                         scaled_loss.backward()
                         if _is_main:
                             print(f"[DBG] step={step} micro={micro} AFTER backward", flush=True)
-                        if self.fp32_grad_manager is not None:
-                            self.fp32_grad_manager.accumulate()
                         step_loss += loss.item()
                     else:
                         # Dummy micro-batch: forward only (keeps FSDP all-gather in sync)
@@ -1851,52 +1849,22 @@ class DesLocEngine:
                     self.optimizer.zero_grad(set_to_none=True)
                     continue  # skip to next step
 
-                # Synchronize FP32 gradients (scale + all-reduce) across the DP group
-                # before gradient clipping and optimizer.step().
-                if self.fp32_grad_manager is not None:
-                    self.fp32_grad_manager.after_backward(scale=1.0 / num_microbatches)
+            # Gradient clipping
+            gnorm = clip_grad_norm_(self.model.parameters(), cfg.grad_clip)
 
-            # Gradient clipping (only for standard path; mimo_loop handles it internally)
-            if self.mimo_loop is None:
-                gnorm = clip_grad_norm_(self.model.parameters(), cfg.grad_clip)
-            else:
-                # mimo_loop.train_step() already clipped; retrieve norm from last result
-                gnorm = mimo_result.grad_norm  # type: ignore[possibly-undefined]
-
-            # HeteroGradNorm skip decision — use gnorm threshold directly
-            # (full anchor/compute split requires per-device grad classification
-            # which is handled by MIMO loop when active; for standalone path
-            # we use the combined threshold on the already-computed gnorm)
+            # HeteroGradNorm skip decision
             _grad_skip_thr = _hetero_config.combined_skip_threshold
             _should_skip = (gnorm > _grad_skip_thr) if torch.is_tensor(gnorm) else (gnorm > _grad_skip_thr)
             if _is_main:
                 print(
-                    f"[hetero_grad] step={step} grad_norm={gnorm:.6f} "
+                    f"[hetero_grad] step={step} loss={step_loss:.4f} grad_norm={gnorm:.6f} "
                     f"skip={_should_skip} total_skips={_skip_count}"
                 )
-            if self.mimo_loop is None:
-                # Standard path: apply skip logic and step the engine's optimizer
-                if _should_skip:
-                    _skip_count += 1
-                    if _is_main:
-                        print(f"[hetero_grad] SKIP step={step} (cumulative skips={_skip_count})")
-                else:
-                    # Optimizer + scheduler step
-                    self.optimizer.step()
-                    self.scheduler.step()
+            if _should_skip:
+                _skip_count += 1
             else:
-                # HeteroMIMOTrainingLoop path: optimizer/clip already done inside
-                # train_step(); still honour the skip controller for the scheduler.
-                # Cross-device gradient synchronisation (PCIe-aware all-reduce
-                # across heterogeneous tiers) before the scheduler step.
-                if self.fp32_grad_manager is not None:
-                    self.fp32_grad_manager.sync()
-                if _should_skip:
-                    _skip_count += 1
-                    if _is_main:
-                        print(f"[hetero_grad] SKIP step={step} (cumulative skips={_skip_count})")
-                else:
-                    self.scheduler.step()
+                self.optimizer.step()
+                self.scheduler.step()
 
             # Accounting
             self.global_step = step + 1
@@ -1904,8 +1872,7 @@ class DesLocEngine:
                 num_microbatches * cfg.micro_batch_size * cfg.seq_len
             )
             self.tokens_seen += tokens_this_step
-            # Update consumed_samples for next scheduler query
-            self.consumed_samples += allocation.global_batch_size
+            self.consumed_samples += num_microbatches * cfg.micro_batch_size
 
             avg_loss = step_loss / num_microbatches
             loss_accum += avg_loss
