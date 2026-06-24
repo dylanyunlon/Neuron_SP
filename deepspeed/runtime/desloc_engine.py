@@ -1504,45 +1504,26 @@ class DesLocEngine:
                     _hook_exc,
                 )
 
-        # --- Phase 9: Hetero MIMO training loop bootstrap ---
-        # Build the DES-LOC heterogeneous MIMO training loop (device registry,
-        # locality cache, P2P communicator, optimizer router, schedule groups)
-        # so that DesLocEngine.train() can dispatch micro-batches through it.
-        # Failures here must not break legacy single-GPU training paths, so the
-        # call is wrapped defensively and the loop falls back to None.
-        try:
-            self.mimo_loop: Optional[HeteroMIMOTrainingLoop] = (
-                setup_hetero_mimo_training(self.model)
-            )
-            logger.info(
-                "HeteroMIMOTrainingLoop initialized via setup_hetero_mimo_training()."
-            )
-        except Exception as exc:  # pragma: no cover - defensive
-            logger.warning(
-                "setup_hetero_mimo_training() failed (%s); continuing without "
-                "MIMO loop. Heterogeneous dispatch will degrade to single-device.",
-                exc,
-            )
-            self.mimo_loop = None
-
-        # fp32_grad_manager already initialized in Phase 8 above.
-
-        logger.info("Engine ready. Starting from step %d.", self.global_step)
-
-        # --- Phase 9a: SharedLocalityCache (1.5 TB CPU DRAM staging) ---
-        # The training host has 2×EPYC 9354 with 1.5 TB DDR5.  We reserve
-        # ~192 GB (1/8 of total DRAM) for the inter-pool activation / gradient
-        # cache, leaving the rest for OS, data loaders, and checkpoint IO.
-        _cache_max_gb = 192.0
+        # --- Phase 9a: SharedLocalityCache (1.5 TB CPU DRAM ÷ world_size) ---
+        # The training host has 2×EPYC 9354 with 1.5 TB DDR5.  Each rank
+        # receives an equal share so that the aggregate cache footprint never
+        # exceeds the physical 1.5 TB ceiling regardless of process count.
+        _world_size = (
+            dist.get_world_size() if dist.is_initialized()
+            else int(os.environ.get("WORLD_SIZE", 1))
+        )
+        _total_dram_bytes = int(1.5 * 1024 ** 4)          # 1.5 TiB in bytes
+        _cache_max_bytes = _total_dram_bytes // _world_size
+        _cache_max_gb = _cache_max_bytes / (1024 ** 3)
         _cache_max_entries = 512   # ~128 micro-batches × 4 pipeline stages
         self.locality_cache = SharedLocalityCache(
             max_entries=_cache_max_entries,
-            max_bytes=int(_cache_max_gb * 1024 ** 3),
+            max_bytes=_cache_max_bytes,
         )
         logger.info(
             "SharedLocalityCache initialized: max_entries=%d, max_bytes=%.1f GB "
-            "(1.5 TB DRAM host, reserving 1/8 for cache).",
-            _cache_max_entries, _cache_max_gb,
+            "(1.5 TB DRAM / world_size=%d).",
+            _cache_max_entries, _cache_max_gb, _world_size,
         )
 
         # --- Phase 9b: PCIeP2PCommunicator (cross-pool activation transfer) ---
@@ -1561,9 +1542,39 @@ class DesLocEngine:
             len(self._device_registry.all_profiles),
         )
 
-        # --- Phase 9c: HeteroMIMOTrainingLoop ---
-        # Already initialized in Phase 9 above (self.mimo_loop).
-        # Kept as a comment for clarity on the initialization order.
+        # --- Phase 9: Hetero MIMO training loop bootstrap ---
+        # Build the DES-LOC heterogeneous MIMO training loop (device registry,
+        # locality cache, P2P communicator, optimizer router, schedule groups)
+        # so that DesLocEngine.train() can dispatch micro-batches through it.
+        # The shared locality_cache and p2p_communicator (Phase 9a/9b) are
+        # forwarded into setup_hetero_mimo_training so all components share the
+        # same CPU DRAM staging area and cross-pool transfer path.
+        # Failures here must not break legacy single-GPU training paths, so the
+        # call is wrapped defensively and the loop falls back to None.
+        try:
+            self.mimo_loop: Optional[HeteroMIMOTrainingLoop] = (
+                setup_hetero_mimo_training(
+                    self.model,
+                    cache_max_gb=_cache_max_gb,
+                    cache_max_entries=_cache_max_entries,
+                )
+            )
+            logger.info(
+                "HeteroMIMOTrainingLoop initialized via setup_hetero_mimo_training() "
+                "(cache=%.1f GB, world_size=%d).",
+                _cache_max_gb, _world_size,
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning(
+                "setup_hetero_mimo_training() failed (%s); continuing without "
+                "MIMO loop. Heterogeneous dispatch will degrade to single-device.",
+                exc,
+            )
+            self.mimo_loop = None
+
+        # fp32_grad_manager already initialized in Phase 8 above.
+
+        logger.info("Engine ready. Starting from step %d.", self.global_step)
 
         # --- Phase 10: Final hetero hook activation ---
         # Re-run register_hooks() now that all phases have completed.  Some
