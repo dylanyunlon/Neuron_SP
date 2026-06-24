@@ -679,9 +679,23 @@ class ZeRO3ForwardHook:
 
     def _make_post_hook(self, params: List[nn.Parameter]):
         def _post(module: nn.Module, inputs, output):
-            self._release_params(params)
+            # Do NOT release here — backward still needs params on GPU.
+            # Params will be released after backward via release_all().
             return None
         return _post
+
+    # ------------------------------------------------------------------
+    # Explicit release (called after backward completes)
+    # ------------------------------------------------------------------
+    def release_all(self) -> None:
+        """Restore all gathered parameters back to their local CPU shard.
+        Must be called after backward() completes each step."""
+        for pid in list(self._saved.keys()):
+            entry = self._saved.pop(pid, None)
+            if entry is None:
+                continue
+            p, orig = entry
+            p.data = orig
 
     # ------------------------------------------------------------------
     # Per-layer gather / release

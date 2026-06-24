@@ -1799,6 +1799,11 @@ class DesLocEngine:
                         self.fp32_grad_manager.accumulate()
                     step_loss += loss.item()
 
+            # Release gathered ZeRO-3 params back to CPU shards now that
+            # backward is complete for all microbatches this step.
+            if self._zero3_forward_hook is not None:
+                self._zero3_forward_hook.release_all()
+
             # Post-microbatch: NaN guard
             if not math.isfinite(step_loss):
                 _nan_count = getattr(self, '_nan_count', 0) + 1
