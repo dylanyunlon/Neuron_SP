@@ -2093,6 +2093,90 @@ class DesLocEngine:
                 _async_norm_handle.wait()
                 _async_norm_handle = None
 
+            # ------------------------------------------------------------------
+            # Dummy forward padding for asymmetric micro-batch counts.
+            #
+            # Problem: in heterogeneous ZeRO-3 training each rank runs a
+            # different number of micro-batches (e.g. H100 runs 22, A6000
+            # runs 1).  Every model forward triggers one collective call per
+            # layer (all_gather inside gather_full_params) plus one async
+            # all_reduce on the per-microbatch grad-norm-sq scalar.  NCCL
+            # requires *every* rank to call each collective the same number of
+            # times; a mismatch causes NCCL to hang indefinitely.
+            #
+            # Fix: after the real microbatch loop we determine the global
+            # maximum micro-batch count via a single all_reduce(MAX), then
+            # ranks that ran fewer micro-batches execute (max - local) dummy
+            # forward passes.  Each dummy pass:
+            #   1. Runs model(dummy_input) under torch.no_grad() so no
+            #      autograd graph is built and no parameters are modified.
+            #      This fires exactly the same per-layer all_gather collectives
+            #      as a real forward (triggered by ZeRO3ForwardHook /
+            #      gather_full_params hooks that are layer-level pre_forward
+            #      hooks; no_grad does not suppress them).
+            #   2. Fires one async all_reduce on a zero scalar to match the
+            #      per-microbatch grad-norm-sq all_reduce that runs after every
+            #      real backward.  We immediately wait() on it so the scalar
+            #      buffer does not alias across iterations.
+            #   3. Does NOT call backward, so gradients and param_shard.grad
+            #      are unaffected.
+            #
+            # The dummy_input uses the minimum sequence length of 1 to minimise
+            # memory and compute overhead on the fast rank while still driving
+            # the exact same collective call graph as a full-length forward.
+            # ------------------------------------------------------------------
+            if dist.is_initialized():
+                _local_mb_tensor = torch.tensor(
+                    [num_microbatches],
+                    dtype=torch.int64,
+                    device=self.primary_device,
+                )
+                dist.all_reduce(_local_mb_tensor, op=dist.ReduceOp.MAX)
+                _max_microbatches: int = int(_local_mb_tensor.item())
+                _padding_steps = _max_microbatches - num_microbatches
+
+                if _padding_steps > 0:
+                    logger.debug(
+                        "[dummy-fwd] rank needs %d dummy forward(s) to match "
+                        "max_microbatches=%d (local=%d)",
+                        _padding_steps, _max_microbatches, num_microbatches,
+                    )
+                    # Build a minimal (batch=1, seq=1) dummy input on the local device.
+                    _dummy_dev = torch.device(
+                        f"cuda:{torch.cuda.current_device()}"
+                    ) if torch.cuda.is_available() else self.primary_device
+                    _dummy_ids = torch.zeros(
+                        (1, 1), dtype=torch.long, device=_dummy_dev,
+                    )
+
+                    for _pad_i in range(_padding_steps):
+                        # Forward-only: fires all per-layer all_gather collectives
+                        # without constructing an autograd graph.
+                        with torch.no_grad():
+                            with torch.autocast(
+                                device_type=_dummy_dev.type,
+                                dtype=_DEFAULT_DTYPE,
+                                enabled=(_dummy_dev.type == "cuda"),
+                            ):
+                                _dummy_ids_dev = _dummy_ids.to(
+                                    self.model_device, non_blocking=True,
+                                )
+                                _ = self.model(_dummy_ids_dev)
+
+                        # Match the async all_reduce on the per-microbatch
+                        # grad-norm-sq scalar that fires after each real backward.
+                        # Use a zero tensor so it contributes nothing to the norm.
+                        if self.param_shard_state is not None:
+                            _dummy_norm_sq = torch.zeros(
+                                1, dtype=torch.float64, device=_dummy_dev,
+                            )
+                            _dummy_handle = dist.all_reduce(
+                                _dummy_norm_sq,
+                                op=dist.ReduceOp.SUM,
+                                async_op=True,
+                            )
+                            _dummy_handle.wait()
+
             # Post-microbatch: NaN guard
             if not math.isfinite(step_loss):
                 _nan_count = getattr(self, '_nan_count', 0) + 1
