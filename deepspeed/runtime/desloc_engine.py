@@ -1824,7 +1824,7 @@ class DesLocEngine:
                             iteration: int = 0,
                             _ids=input_ids,
                             _lbl=labels,
-                            _num_mb=_my_assigned,
+                            _num_mb=num_microbatches,
                         ):
                             _p2p = p2p_communicator if p2p_communicator is not None else _engine_p2p
                             loss, scaled_loss = self.forward(
@@ -1846,13 +1846,13 @@ class DesLocEngine:
                     else:
                         # Dummy forward for FSDP sync (MIMO path)
                         with torch.no_grad():
-                            self.forward(input_ids, labels, num_microbatches=_my_assigned)
+                            self.forward(input_ids, labels, num_microbatches=num_microbatches)
                 else:
                     # Standard forward/backward path
                     if _real_micro:
                         # Real micro-batch: forward + backward + accumulate
                         loss, scaled_loss = self.forward(
-                            input_ids, labels, num_microbatches=_my_assigned,
+                            input_ids, labels, num_microbatches=num_microbatches,
                         )
                         if self.fp32_grad_manager is not None:
                             self.fp32_grad_manager.before_backward()
@@ -1865,7 +1865,7 @@ class DesLocEngine:
                         # No backward → no gradient pollution from non-assigned micro-batches
                         with torch.no_grad():
                             _dummy_loss, _ = self.forward(
-                                input_ids, labels, num_microbatches=_my_assigned,
+                                input_ids, labels, num_microbatches=num_microbatches,
                             )
 
             if self.mimo_loop is None:
