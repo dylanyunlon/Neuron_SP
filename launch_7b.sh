@@ -26,6 +26,10 @@ export OMP_NUM_THREADS=8
 export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
 export TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=1800
 export TORCH_NCCL_ENABLE_MONITORING=0
+# Disable torch.compile / inductor — JIT compilation of 7B FSDP model
+# spawns 32 compile workers and takes 10-20 min on first forward.
+# Run eager mode first to verify correctness, enable compile later.
+export TORCHDYNAMO_DISABLE=1
 
 mkdir -p logs
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
