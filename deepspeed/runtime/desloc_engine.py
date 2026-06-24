@@ -213,6 +213,15 @@ class TrainingConfig:
     # If provided, schedule thresholds are interpreted as token counts (÷ seq_len → samples)
     batch_schedule_seq_length: Optional[int] = None
 
+    # Activation checkpointing config.
+    # activation_checkpointing: master on/off switch (default OFF for backward compat).
+    # checkpoint_activations_granularity: "full" (every layer) or "selective" (every other layer).
+    # Per-tier defaults applied in DesLocEngine.__init__:
+    #   A6000 (48 GB) → "full"       (checkpoint every TransformerBlock)
+    #   H100  (96 GB) → "selective"  (checkpoint every other TransformerBlock)
+    activation_checkpointing: bool = False
+    checkpoint_activations_granularity: str = "full"  # "full" | "selective"
+
 
 # ---------------------------------------------------------------------------
 # HeteroRegistry: discovers and loads hetero_*.py modules
@@ -1420,13 +1429,29 @@ class DesLocEngine:
             self.neuron_sp_config.attention_variant,
         )
 
-        # Apply torch.utils.checkpoint selectively based on device class.
-        # A6000 layers (48 GB HBM) → recompute norm_out to save memory.
-        # H100/Blackwell layers (96 GB HBM) → no recompute needed.
+        # ------------------------------------------------------------------
+        # Per-tier activation checkpointing via torch.utils.checkpoint.
         #
-        # Strategy: inspect the partition plan's tier_layer_map to assign each
-        # layer its device index, then classify via HeteroDeviceMap.
+        # Reads two fields from TrainingConfig:
+        #   config.activation_checkpointing          – master on/off switch
+        #   config.checkpoint_activations_granularity – "full" | "selective"
+        #
+        # Per-tier policy (overrides granularity config for each GPU class):
+        #   A6000 (48 GB VRAM, SM 8.6) → FULL checkpoint (every layer)
+        #       Memory budget is tighter; recompute all activations on backward.
+        #   H100  (96 GB VRAM, SM 9.x) → SELECTIVE checkpoint (every other layer)
+        #       Abundant VRAM; only half the layers are wrapped to reduce recompute
+        #       overhead while still capping peak activation memory.
+        #
+        # The master switch (activation_checkpointing) defaults to False so
+        # existing callers are unaffected until they explicitly opt in.
+        # ------------------------------------------------------------------
         import torch.utils.checkpoint as _torch_ckpt  # noqa: PLC0415
+
+        # Build a tier-class lookup for each device index discovered.
+        _dev_tier: Dict[int, TierClass] = {
+            spec.device_index: spec.tier for spec in self.tiers
+        }
 
         # Build layer → device_index mapping from the partition plan.
         layer_device_map: Dict[int, int] = {}
@@ -1434,26 +1459,74 @@ class DesLocEngine:
             for li in layer_indices:
                 layer_device_map[li] = dev_idx
 
-        # Support both MiniTransformer (.blocks) and standard models (.layers).
+        # Support both MiniTransformer (.blocks) and standard Transformer (.layers).
         block_list = getattr(self.model, "blocks", None) or getattr(
             self.model, "layers", None
         )
 
+        _ckpt_master_on = bool(config.activation_checkpointing)
+        _ckpt_granularity = str(config.checkpoint_activations_granularity).lower()
+
+        _local_rank = (
+            dist.get_rank() if dist.is_initialized()
+            else int(os.environ.get("RANK", 0))
+        )
+
         if block_list is not None:
-            print("[Neuron_SP] Per-layer recompute strategy:")
+            logger.info(
+                "[ActCkpt] GPU%d — master=%s  config_granularity=%s",
+                _local_rank, _ckpt_master_on, _ckpt_granularity,
+            )
+            print(
+                f"[Neuron_SP] Activation-checkpoint strategy "
+                f"(master={'ON' if _ckpt_master_on else 'OFF'}, "
+                f"config_granularity={_ckpt_granularity}):"
+            )
+
             for layer_idx, block in enumerate(block_list):
                 dev_idx = layer_device_map.get(layer_idx, primary_idx)
-                if dev_idx < 0:
-                    dev_class = DeviceClass.UNKNOWN
+                tier = _dev_tier.get(dev_idx, TierClass.UNKNOWN)
+
+                # ---- Per-tier policy decision --------------------------------
+                if not _ckpt_master_on:
+                    # Master switch OFF → no wrapping regardless of tier.
+                    apply_ckpt = False
+                    policy_label = "OFF (master disabled)"
+                elif tier == TierClass.A6000:
+                    # A6000: full checkpoint — wrap every layer.
+                    apply_ckpt = True
+                    policy_label = "FULL (A6000 — every layer)"
+                elif tier == TierClass.H100:
+                    # H100: selective checkpoint — wrap every other layer.
+                    apply_ckpt = (layer_idx % 2 == 0)
+                    policy_label = (
+                        "SELECTIVE (H100 — even layer)"
+                        if apply_ckpt
+                        else "SELECTIVE (H100 — odd layer, skip)"
+                    )
+                elif tier == TierClass.RTX_PRO_6000_BW:
+                    # Blackwell 96 GB — treat same as H100 (selective).
+                    apply_ckpt = (layer_idx % 2 == 0)
+                    policy_label = (
+                        "SELECTIVE (RTX_PRO_6000_BW — even layer)"
+                        if apply_ckpt
+                        else "SELECTIVE (RTX_PRO_6000_BW — odd layer, skip)"
+                    )
                 else:
-                    dev_class = self.neuron_sp_config.device_map.get(dev_idx)
+                    # UNKNOWN tier: fall back to config granularity.
+                    if _ckpt_granularity == "selective":
+                        apply_ckpt = (layer_idx % 2 == 0)
+                        policy_label = (
+                            "SELECTIVE (UNKNOWN — even layer)"
+                            if apply_ckpt
+                            else "SELECTIVE (UNKNOWN — odd layer, skip)"
+                        )
+                    else:
+                        apply_ckpt = True
+                        policy_label = "FULL (UNKNOWN — fallback to full)"
+                # ---- End policy decision -------------------------------------
 
-                recompute_modules = self.neuron_sp_config.modules_per_device.get(
-                    dev_class, set()
-                )
-                should_recompute = bool(recompute_modules)
-
-                if should_recompute:
+                if apply_ckpt:
                     original_fwd = block.forward
 
                     def _make_ckpt_fwd(fwd):
@@ -1464,20 +1537,27 @@ class DesLocEngine:
                         return _ckpt_fwd
 
                     block.forward = _make_ckpt_fwd(original_fwd)
-                    print(
-                        f"  Layer {layer_idx:3d} -> GPU{dev_idx} "
-                        f"({dev_class.name}): recompute=ON  "
-                        f"modules={recompute_modules}"
-                    )
-                else:
-                    print(
-                        f"  Layer {layer_idx:3d} -> GPU{dev_idx} "
-                        f"({dev_class.name}): recompute=OFF"
-                    )
+
+                logger.info(
+                    "[ActCkpt] GPU%d  layer=%3d  dev=GPU%d  tier=%-18s  ckpt=%s  [%s]",
+                    _local_rank, layer_idx, dev_idx, tier.value,
+                    "ON " if apply_ckpt else "OFF",
+                    policy_label,
+                )
+                print(
+                    f"  GPU{_local_rank}  layer {layer_idx:3d} -> GPU{dev_idx} "
+                    f"({tier.value:18s})  ckpt={'ON ' if apply_ckpt else 'OFF'}  "
+                    f"[{policy_label}]"
+                )
         else:
+            logger.warning(
+                "[ActCkpt] GPU%d: model exposes no .blocks/.layers; "
+                "per-layer activation-checkpoint wrapping skipped.",
+                _local_rank,
+            )
             print(
-                "[Neuron_SP] WARNING: model exposes no .blocks/.layers; "
-                "per-layer recompute wrapping skipped."
+                f"[Neuron_SP] WARNING GPU{_local_rank}: model exposes no .blocks/.layers; "
+                "activation-checkpoint wrapping skipped."
             )
 
         # --- Phase 8: HeteroFP32GradAccumManager ---
