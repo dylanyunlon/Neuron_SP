@@ -690,22 +690,34 @@ class ZeRO3ForwardHook:
 
     def _make_post_hook(self, params: List[nn.Parameter]):
         def _post(module: nn.Module, inputs, output):
-            # Register a one-shot full backward hook on the MODULE itself.
-            # This fires AFTER all weight gradients for this module are
-            # computed, so it's safe to release gathered params.
-            # (register_hook on output tensor fires too early — before
-            # weight grads are computed, causing device mismatch.)
+            # Release immediately after forward — saves GPU memory.
+            # Backward will re-gather via full_backward_pre_hook.
             saved_params = list(params)
-            hook_ref = [None]  # wrap in list for closure mutation
 
-            def _module_backward_hook(module, grad_input, grad_output):
+            # Register one-shot backward hooks: pre to re-gather, post to release
+            pre_ref = [None]
+            post_ref = [None]
+
+            def _bwd_pre_hook(module, grad_output):
+                """Re-gather params before backward computes gradients."""
+                self._gather_params(saved_params)
+
+            def _bwd_post_hook(module, grad_input, grad_output):
+                """Release params after backward finishes this module."""
                 self._release_params(saved_params)
-                # Remove hook so it doesn't fire on next forward/backward
-                if hook_ref[0] is not None:
-                    hook_ref[0].remove()
-                    hook_ref[0] = None
+                # Remove one-shot hooks
+                if pre_ref[0] is not None:
+                    pre_ref[0].remove()
+                    pre_ref[0] = None
+                if post_ref[0] is not None:
+                    post_ref[0].remove()
+                    post_ref[0] = None
 
-            hook_ref[0] = module.register_full_backward_hook(_module_backward_hook)
+            pre_ref[0] = module.register_full_backward_pre_hook(_bwd_pre_hook)
+            post_ref[0] = module.register_full_backward_hook(_bwd_post_hook)
+
+            # Now release forward's gathered params
+            self._release_params(saved_params)
             return None
         return _post
 
