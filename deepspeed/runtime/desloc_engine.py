@@ -1772,6 +1772,13 @@ class DesLocEngine:
             )
             num_microbatches = allocation.num_microbatches
 
+            # --- HeteroFP32GradAccumManager: before_backward ---
+            # Zero FP32 gradient accumulators (main_grad tensors) once per step,
+            # before any micro-batch backward.  Called unconditionally here so
+            # both the MIMO and standard paths share the same zero-grad semantics.
+            if self.fp32_grad_manager is not None:
+                self.fp32_grad_manager.before_backward()
+
             for micro in range(num_microbatches):
                 input_ids, labels = next(self.data_iter)
                 _local_dev = torch.device(f"cuda:{torch.cuda.current_device()}")
@@ -1813,15 +1820,21 @@ class DesLocEngine:
                         config=cfg,
                         iteration=step * num_microbatches + micro,
                     )
+                    # --- HeteroFP32GradAccumManager: accumulate (MIMO path) ---
+                    # Promote BF16 param.grad into FP32 main_grad accumulators
+                    # after each micro-batch backward in the MIMO path.
+                    if self.fp32_grad_manager is not None:
+                        self.fp32_grad_manager.accumulate()
                     step_loss += mimo_result.loss
                 else:
                     # Standard forward/backward path
                     loss, scaled_loss = self.forward(
                         input_ids, labels, num_microbatches=num_microbatches,
                     )
-                    if self.fp32_grad_manager is not None:
-                        self.fp32_grad_manager.before_backward()
                     scaled_loss.backward()
+                    # --- HeteroFP32GradAccumManager: accumulate (standard path) ---
+                    # Promote BF16 param.grad into FP32 main_grad accumulators
+                    # after each micro-batch backward.
                     if self.fp32_grad_manager is not None:
                         self.fp32_grad_manager.accumulate()
                     step_loss += loss.item()
@@ -1837,7 +1850,10 @@ class DesLocEngine:
                 self.optimizer.zero_grad(set_to_none=False)
                 continue
 
-            # FP32 grad sync (if active and no ZeRO-3 — ZeRO-3 hooks handle grad reduction)
+            # --- HeteroFP32GradAccumManager: after_backward ---
+            # Scale gradients and run synchronous all-reduce across all buckets.
+            # Runs for both MIMO and standard paths; skipped when ZeRO-3 is
+            # active (ZeRO-3 backward hooks handle gradient reduction directly).
             if self.fp32_grad_manager is not None and self.param_shard_state is None:
                 self.fp32_grad_manager.after_backward(scale=1.0 / num_microbatches)
 
