@@ -626,7 +626,33 @@ def run_standalone(args: argparse.Namespace) -> None:
 
         data = _blend_data_iter()
     elif args.data_path:
-        data = real_data_iter(args.data_path, args.batch_size, args.seq_len, device)
+        # Use MmapTokenDataset via build_dataloader for memory-mapped int32 token loading
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from data.commit_loader import build_dataloader as _build_dataloader  # noqa: PLC0415
+        _mmap_loader = _build_dataloader(
+            mode="mmap",
+            data_path=args.data_path,
+            batch_size=args.batch_size,
+            seq_len=args.seq_len,
+            num_workers=2,
+        )
+        if is_main:
+            logger.info(
+                "mmap data: %s  |  %d samples  |  batch=%d  seq_len=%d",
+                args.data_path, len(_mmap_loader.dataset), args.batch_size, args.seq_len,
+            )
+        _mmap_iter_ref = [iter(_mmap_loader)]
+
+        def _mmap_data_iter():
+            while True:
+                try:
+                    x, y = next(_mmap_iter_ref[0])
+                except StopIteration:
+                    _mmap_iter_ref[0] = iter(_mmap_loader)
+                    x, y = next(_mmap_iter_ref[0])
+                yield x.to(device), y.to(device)
+
+        data = _mmap_data_iter()
     else:
         # Offset the RNG per rank so each worker draws different tokens
         torch.manual_seed(42 + rank)
@@ -944,8 +970,11 @@ def parse_args() -> argparse.Namespace:
         "--data-path",
         default=None,
         metavar="PATH",
-        help="Path to a flat binary token file (uint16 or int32). "
-             "If omitted, synthetic random tokens are used.",
+        help="Path to a flat binary token file of int32 token ids (e.g. produced "
+             "by Megatron-style preprocess_data.py).  When specified, uses "
+             "numpy.memmap (MmapTokenDataset) for zero-copy memory-mapped loading "
+             "instead of synthetic torch.randint data.  If omitted, synthetic "
+             "random tokens are used.",
     )
     p.add_argument(
         "--steps",

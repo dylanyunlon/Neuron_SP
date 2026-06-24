@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Commit data loader — synthetic, real, and commit-boundary-packed modes.
+"""Commit data loader — synthetic, real, mmap, and commit-boundary-packed modes.
 
 Usage:
     # Synthetic (for testing):
@@ -7,6 +7,14 @@ Usage:
 
     # Real from .jsonl (naive token-stream packing, may cross commit boundaries):
     loader = build_dataloader(mode="real", data_path="data/commits.jsonl",
+                               batch_size=4, seq_len=2048)
+
+    # Mmap — load real int32 token ids from a flat binary mmap file:
+    #   Expects a flat binary file of int32 token ids (e.g. produced by
+    #   Megatron-style preprocess_data.py).  Uses numpy.memmap for zero-copy
+    #   memory-mapped access — the OS pages in only the data actually read,
+    #   making this suitable for files larger than available RAM.
+    loader = build_dataloader(mode="mmap", data_path="data/tokens.bin",
                                batch_size=4, seq_len=2048)
 
     # Packed — commit-boundary-aware packing via CommitSequencePacker:
@@ -20,6 +28,7 @@ import json
 import os
 from typing import Iterator, List, Optional, Tuple
 
+import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader, IterableDataset
 
@@ -100,6 +109,60 @@ class JsonlCommitDataset(IterableDataset):
                         buffer = buffer[self.seq_len:]
                         t = torch.tensor(chunk, dtype=torch.long)
                         yield t[:-1], t[1:]
+
+
+
+# ---------------------------------------------------------------------------
+# Mmap-backed dataset: reads int32 token ids from a flat binary file
+# ---------------------------------------------------------------------------
+
+class MmapTokenDataset(Dataset):
+    """Map-style dataset backed by a memory-mapped flat binary token file.
+
+    The file is expected to contain a flat array of ``int32`` token ids, e.g.
+    as produced by Megatron-style ``preprocess_data.py``.  Uses
+    ``numpy.memmap`` so the OS pages in only the data actually read — suitable
+    for files larger than available RAM.
+
+    Each sample returns (input_ids, labels) of length ``seq_len``, where
+    ``labels = input_ids`` shifted by one (standard causal LM convention).
+    Samples are taken from non-overlapping windows of size ``seq_len + 1``
+    starting at offset 0.
+
+    Args:
+        data_path : path to the flat binary ``.bin`` / ``.npy`` file of int32
+                    token ids.
+        seq_len   : sequence length in tokens (default 2048).
+    """
+
+    def __init__(self, data_path: str, seq_len: int = 2048) -> None:
+        self.data_path = data_path
+        self.seq_len = seq_len
+
+        # Memory-map the file as read-only int32.  numpy.memmap does not load
+        # the entire file into RAM; the OS maps virtual pages on demand.
+        self._tokens: np.memmap = np.memmap(data_path, dtype=np.int32, mode="r")
+
+        self._chunk = seq_len + 1  # tokens needed per sample (shifted by 1)
+        n_total = len(self._tokens)
+        self._n_samples = n_total // self._chunk
+        if self._n_samples == 0:
+            raise ValueError(
+                f"MmapTokenDataset: file '{data_path}' contains {n_total} "
+                f"int32 tokens but at least {self._chunk} are needed for a "
+                f"single sample (seq_len={seq_len})."
+            )
+
+    def __len__(self) -> int:
+        return self._n_samples
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        start = idx * self._chunk
+        # Slice the memmap — copies only this window into host memory
+        chunk = torch.from_numpy(
+            self._tokens[start : start + self._chunk].astype(np.int64)
+        )
+        return chunk[:-1], chunk[1:]
 
 
 # ---------------------------------------------------------------------------
@@ -236,17 +299,24 @@ def build_dataloader(
     """Build a DataLoader for commit data.
 
     Args:
-        mode        : one of ``"synthetic"``, ``"real"``, or ``"packed"``.
+        mode        : one of ``"synthetic"``, ``"real"``, ``"mmap"``, or
+                      ``"packed"``.
 
                       * ``"synthetic"`` — random token data, no tokenizer needed.
                       * ``"real"``      — naïve token-stream concatenation from
                         .jsonl; sequences **may cross commit boundaries**.
+                      * ``"mmap"``      — memory-mapped flat binary file of
+                        ``int32`` token ids (e.g. Megatron-style .bin files).
+                        Uses :class:`MmapTokenDataset` / ``numpy.memmap`` for
+                        zero-copy, RAM-efficient access.  Requires
+                        ``data_path``.
                       * ``"packed"``    — commit-boundary-aware packing via
                         :class:`CommitPackerDataset` /
                         ``CommitSequencePacker``.  Requires ``data_path`` and
                         (optionally) a ``tokenizer``.
 
-        data_path   : required for ``"real"`` and ``"packed"`` modes.
+        data_path   : required for ``"real"``, ``"mmap"``, and ``"packed"``
+                      modes.
         batch_size  : number of packed sequences per batch.
         seq_len     : target sequence length in tokens.
         vocab_size  : vocabulary size (used only in ``"synthetic"`` mode).
@@ -268,6 +338,12 @@ def build_dataloader(
                                 seq_len=seq_len, vocab_size=vocab_size)
         return DataLoader(ds, batch_size=batch_size,
                           num_workers=num_workers, pin_memory=True)
+
+    elif mode == "mmap":
+        assert data_path, "data_path required for mmap mode"
+        ds = MmapTokenDataset(data_path=data_path, seq_len=seq_len)
+        return DataLoader(ds, batch_size=batch_size, shuffle=True,
+                          num_workers=num_workers, pin_memory=True, drop_last=True)
 
     elif mode == "packed":
         assert data_path, "data_path required for packed mode"
@@ -296,4 +372,4 @@ def build_dataloader(
         )
 
     else:
-        raise ValueError(f"Unknown mode: {mode!r}. Choose 'synthetic', 'real', or 'packed'.")
+        raise ValueError(f"Unknown mode: {mode!r}. Choose 'synthetic', 'real', 'mmap', or 'packed'.")
