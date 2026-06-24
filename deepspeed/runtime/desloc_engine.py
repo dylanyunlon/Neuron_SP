@@ -1836,15 +1836,36 @@ class DesLocEngine:
             # sees different data but the same model, so the optimizer
             # converges via independent shard updates + sync_shard_to_model.
 
-            # Gradient clipping — clip on param_shard when ZeRO-3 active
+            # Gradient clipping — DeepSpeed ZeRO-3 style:
+            # 1. Each rank computes local L2 norm² on its param_shard.grad
+            # 2. all_reduce(SUM) a single scalar across ranks (works with hetero shard sizes)
+            # 3. sqrt → global norm → clip
+            # This avoids torch.nn.utils.clip_grad_norm_ which uses
+            # torch._foreach_norm that can trigger CUDA illegal memory access
+            # on large (3.26B element) FP32 buffers (INT_MAX overflow).
             if self.param_shard_state is not None:
-                gnorm = clip_grad_norm_([self.param_shard_state.param_shard], cfg.grad_clip)
+                _g = self.param_shard_state.param_shard.grad
+                if _g is not None:
+                    local_norm_sq = _g.to(torch.float64).norm(2).pow(2)
+                else:
+                    local_norm_sq = torch.tensor(0.0, dtype=torch.float64,
+                                                  device=self.param_shard_state.param_shard.device)
+                if dist.is_initialized():
+                    dist.all_reduce(local_norm_sq, op=dist.ReduceOp.SUM)
+                gnorm = local_norm_sq.sqrt().float().item()
+                # Clip: scale gradients if norm exceeds max
+                if gnorm > cfg.grad_clip and gnorm > 0:
+                    clip_coef = cfg.grad_clip / gnorm
+                    if _g is not None:
+                        _g.mul_(clip_coef)
             else:
                 gnorm = clip_grad_norm_(self.model.parameters(), cfg.grad_clip)
+                if torch.is_tensor(gnorm):
+                    gnorm = gnorm.item()
 
             # HeteroGradNorm skip decision
             _grad_skip_thr = _hetero_config.combined_skip_threshold
-            _should_skip = (gnorm > _grad_skip_thr) if torch.is_tensor(gnorm) else (gnorm > _grad_skip_thr)
+            _should_skip = gnorm > _grad_skip_thr
             if _is_main:
                 print(
                     f"[hetero_grad] step={step} loss={step_loss:.4f} grad_norm={gnorm:.6f} "
