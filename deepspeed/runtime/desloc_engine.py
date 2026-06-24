@@ -1041,9 +1041,12 @@ class DesLocEngine:
         else:
             self.model = model
 
-        self.model = self.model.to(dtype=_DEFAULT_DTYPE, device=self.primary_device)
+        # Each rank keeps model on its own local device (not all on primary_device)
+        _local_device = torch.device(f"cuda:{torch.cuda.current_device()}")
+        self.model = self.model.to(dtype=_DEFAULT_DTYPE, device=_local_device)
+        self.model_device = _local_device  # cached for forward()
         n_params = sum(p.numel() for p in self.model.parameters())
-        logger.info("Model: %.2fM parameters on %s", n_params / 1e6, self.primary_device)
+        logger.info("Model: %.2fM parameters on %s", n_params / 1e6, _local_device)
 
         # --- Phase 5: Optimizer & Scheduler ---
         self.optimizer = AdamW(
@@ -1499,7 +1502,7 @@ class DesLocEngine:
             enabled=(self.primary_device.type == "cuda"),
         ):
             # Ensure inputs are on the same device as the model
-            _model_dev = next(self.model.parameters()).device
+            _model_dev = self.model_device
             input_ids = input_ids.to(_model_dev, non_blocking=True)
             labels = labels.to(_model_dev, non_blocking=True)
             logits: torch.Tensor = self.model(input_ids)
