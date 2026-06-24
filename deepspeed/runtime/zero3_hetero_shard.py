@@ -733,8 +733,10 @@ class ZeRO3ForwardHook:
             cpu_data = state.cpu_param_data.get(name)
             if cpu_data is None:
                 continue
-            # Non-blocking H2D copy from pinned CPU memory
-            full = cpu_data.to(device=device, non_blocking=True)
+            # Synchronous H2D copy from pinned CPU memory.
+            # non_blocking=False ensures the data is fully on GPU before
+            # forward/backward compute uses it.
+            full = cpu_data.to(device=device, non_blocking=False)
             self._saved[pid] = (p, p.data)
             p.data = full
 

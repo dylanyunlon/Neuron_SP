@@ -1840,7 +1840,7 @@ class DesLocEngine:
             # with heterogeneous microbatch counts.
             if self.param_shard_state is not None:
                 _ps = self.param_shard_state.param_shard
-                if _ps.grad is not None:
+                if _ps.grad is not None and dist.is_initialized():
                     dist.all_reduce(_ps.grad, op=dist.ReduceOp.SUM)
                     _ps.grad.div_(dist.get_world_size())
 
