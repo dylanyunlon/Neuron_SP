@@ -690,23 +690,32 @@ class ZeRO3ForwardHook:
 
     def _make_post_hook(self, params: List[nn.Parameter]):
         def _post(module: nn.Module, inputs, output):
-            # Do NOT release here — backward still needs params on GPU.
-            # Params will be released after backward via release_all().
+            # Find a grad-requiring output tensor to hook backward onto
+            if torch.is_tensor(output) and output.requires_grad:
+                hook_target = output
+            elif isinstance(output, (tuple, list)):
+                hook_target = None
+                for t in output:
+                    if torch.is_tensor(t) and t.requires_grad:
+                        hook_target = t
+                        break
+            else:
+                hook_target = None
+
+            if hook_target is not None:
+                # When backward flows through this output, release this
+                # layer's gathered params — per-layer granularity keeps
+                # only ~1 layer's full params on GPU at a time.
+                saved_params = list(params)
+                def _backward_release_hook(grad):
+                    self._release_params(saved_params)
+                    return grad
+                hook_target.register_hook(_backward_release_hook)
+            else:
+                # No grad output (eval mode?) → release immediately
+                self._release_params(params)
             return None
         return _post
-
-    # ------------------------------------------------------------------
-    # Explicit release (called after backward completes)
-    # ------------------------------------------------------------------
-    def release_all(self) -> None:
-        """Restore all gathered parameters back to their local CPU shard.
-        Must be called after backward() completes each step."""
-        for pid in list(self._saved.keys()):
-            entry = self._saved.pop(pid, None)
-            if entry is None:
-                continue
-            p, orig = entry
-            p.data = orig
 
     # ------------------------------------------------------------------
     # Per-layer gather / release
