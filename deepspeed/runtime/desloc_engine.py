@@ -403,7 +403,6 @@ class TierDiscovery:
         sm_minor = props.minor
         name = props.name
 
-        torch.cuda.set_device(idx)
         torch.cuda.synchronize(idx)
         free_bytes, _ = torch.cuda.mem_get_info(idx)
         free_mem_gb = free_bytes / (1 << 30)
