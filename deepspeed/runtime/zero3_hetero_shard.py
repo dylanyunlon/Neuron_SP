@@ -503,6 +503,70 @@ class ShardState:
 # ---------------------------------------------------------------------------
 # Per-layer forward all-gather hooks (Claude-128)
 # ---------------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # Gradient collection & param sync for optimizer operating on param_shard
+    # ------------------------------------------------------------------
+    def collect_grads_into_shard(self) -> None:
+        """Collect reduce-scattered per-param grads into param_shard.grad.
+
+        After backward hooks fire, each param.grad contains only this rank's
+        local slice of the reduced gradient. This method stitches them into
+        a single 1-D FP32 gradient buffer aligned with param_shard.
+        """
+        device = self.param_shard.device
+        if self.param_shard.grad is None:
+            self.param_shard.grad = torch.zeros_like(self.param_shard)
+        else:
+            self.param_shard.grad.zero_()
+
+        lo = self.shard_offsets[self.rank]
+        hi = self.shard_offsets[self.rank + 1]
+
+        for name, p in self.param_order:
+            if p.grad is None:
+                continue
+            sl = self.param_offsets[name]
+            # Intersection of this param's flat range with our shard window
+            g_start = max(sl.global_start, lo)
+            g_end = min(sl.global_end, hi)
+            if g_end <= g_start:
+                continue
+            # Index into param_shard
+            s_start = g_start - lo
+            s_end = g_end - lo
+            # The backward hook already reduce-scattered and stored the
+            # local slice in param.grad. Its length should match (g_end - g_start).
+            grad_flat = p.grad.detach().reshape(-1).to(torch.float32)
+            take = min(grad_flat.numel(), s_end - s_start)
+            if take > 0:
+                self.param_shard.grad[s_start:s_start + take].copy_(grad_flat[:take])
+
+    def sync_shard_to_model(self) -> None:
+        """Copy updated FP32 param_shard back to model's BF16 parameters.
+
+        Called after optimizer.step() updates param_shard. Each rank writes
+        only the slice of each parameter that it owns.
+        """
+        lo = self.shard_offsets[self.rank]
+        hi = self.shard_offsets[self.rank + 1]
+
+        for name, p in self.param_order:
+            sl = self.param_offsets[name]
+            if sl.global_end <= lo or sl.global_start >= hi:
+                continue
+            g_start = max(sl.global_start, lo)
+            g_end = min(sl.global_end, hi)
+            p_start = g_start - sl.global_start
+            p_end = g_end - sl.global_start
+            s_start = g_start - lo
+            s_end = g_end - lo
+            with torch.no_grad():
+                flat = p.data.reshape(-1)
+                flat[p_start:p_end].copy_(
+                    self.param_shard.data[s_start:s_end].to(p.dtype)
+                )
+
 class ZeRO3ForwardHook:
     """
     Layer-by-layer ZeRO-3 forward all-gather.
@@ -757,3 +821,4 @@ def vram_weights_from_tiers(tiers: Sequence[object]) -> List[float]:
     # Order by device index so that rank r maps to the rth lowest GPU.
     ordered = [by_idx[k] for k in sorted(by_idx)]
     return ordered
+

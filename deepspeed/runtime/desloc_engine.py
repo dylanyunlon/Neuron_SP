@@ -1116,14 +1116,33 @@ class DesLocEngine:
             self.param_shard_state = None
 
         # --- Phase 5: Optimizer & Scheduler ---
-        self.optimizer = AdamW(
-            self.model.parameters(),
-            lr=config.max_lr,
-            betas=(config.beta1, config.beta2),
-            eps=config.eps,
-            weight_decay=config.weight_decay,
-            fused=self._fused_adam_available(),
-        )
+        # When ZeRO-3 is active, optimizer operates on param_shard (FP32
+        # master copy on GPU), not model.parameters() (BF16 on CPU).
+        if self.param_shard_state is not None:
+            # param_shard is a 1-D FP32 tensor holding this rank's slice.
+            # We need it to be a leaf tensor with requires_grad for AdamW.
+            _shard = self.param_shard_state.param_shard
+            _shard.requires_grad_(True)
+            self.optimizer = AdamW(
+                [_shard],
+                lr=config.max_lr,
+                betas=(config.beta1, config.beta2),
+                eps=config.eps,
+                weight_decay=config.weight_decay,
+            )
+            logger.info(
+                "[zero3] Optimizer on param_shard: %d FP32 elements on %s",
+                _shard.numel(), _shard.device,
+            )
+        else:
+            self.optimizer = AdamW(
+                self.model.parameters(),
+                lr=config.max_lr,
+                betas=(config.beta1, config.beta2),
+                eps=config.eps,
+                weight_decay=config.weight_decay,
+                fused=self._fused_adam_available(),
+            )
         self.scheduler = build_warmup_cosine_scheduler(
             self.optimizer,
             warmup_steps=config.warmup_steps,
@@ -1791,12 +1810,19 @@ class DesLocEngine:
                 self.optimizer.zero_grad(set_to_none=True)
                 continue
 
-            # FP32 grad sync (if active)
-            if self.fp32_grad_manager is not None:
+            # FP32 grad sync (if active and no ZeRO-3 — ZeRO-3 hooks handle grad reduction)
+            if self.fp32_grad_manager is not None and self.param_shard_state is None:
                 self.fp32_grad_manager.after_backward(scale=1.0 / num_microbatches)
 
-            # Gradient clipping
-            gnorm = clip_grad_norm_(self.model.parameters(), cfg.grad_clip)
+            # ZeRO-3: collect reduce-scattered per-param grads into param_shard.grad
+            if self.param_shard_state is not None:
+                self.param_shard_state.collect_grads_into_shard()
+
+            # Gradient clipping — clip on param_shard when ZeRO-3 active
+            if self.param_shard_state is not None:
+                gnorm = clip_grad_norm_([self.param_shard_state.param_shard], cfg.grad_clip)
+            else:
+                gnorm = clip_grad_norm_(self.model.parameters(), cfg.grad_clip)
 
             # HeteroGradNorm skip decision
             _grad_skip_thr = _hetero_config.combined_skip_threshold
@@ -1811,6 +1837,9 @@ class DesLocEngine:
             else:
                 self.optimizer.step()
                 self.scheduler.step()
+                # ZeRO-3: sync updated FP32 shard back to model BF16 params
+                if self.param_shard_state is not None:
+                    self.param_shard_state.sync_shard_to_model()
 
             # Accounting
             self.global_step = step + 1
