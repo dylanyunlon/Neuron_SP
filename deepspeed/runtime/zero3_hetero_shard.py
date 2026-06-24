@@ -393,6 +393,9 @@ class ShardState:
                 grad = param.grad
                 if grad is None:
                     return
+                if _param_shard.grad is None:
+                    # Should never happen — pre-allocated in build()
+                    return
                 flat = grad.detach().reshape(-1)
 
                 # No NCCL here — just extract this rank's shard slice of
@@ -405,14 +408,29 @@ class ShardState:
                     # Map from param-local flat indices to our shard window
                     p_lo = _g_start - sl.global_start
                     p_hi = _g_end - sl.global_start
+                    # Bounds safety check
+                    if p_hi > flat.numel():
+                        logger.warning(
+                            "[zero3-hook] BOUNDS: %s p_hi=%d > flat=%d, clamping",
+                            name, p_hi, flat.numel(),
+                        )
+                        p_hi = flat.numel()
+                    if p_lo >= p_hi:
+                        param.grad = None
+                        return
                     local_grad = flat[p_lo:p_hi]
                     take = min(local_grad.numel(), _shard_end - _shard_start)
-                    if take > 0:
+                    if take > 0 and _shard_start + take <= _param_shard.grad.numel():
                         _param_shard.grad[_shard_start:_shard_start + take].add_(
                             local_grad[:take].to(
                                 dtype=_param_shard.dtype,
                                 device=_param_shard.device,
                             )
+                        )
+                    elif take > 0:
+                        logger.warning(
+                            "[zero3-hook] SHARD OVERFLOW: %s shard_start=%d take=%d grad_numel=%d",
+                            name, _shard_start, take, _param_shard.grad.numel(),
                         )
                 else:
                     local_grad = None
