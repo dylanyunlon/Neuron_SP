@@ -1081,6 +1081,68 @@ class DesLocEngine:
         n_params = sum(p.numel() for p in self.model.parameters())
         logger.info("Model: %.2fM parameters on %s", n_params / 1e6, _local_device)
 
+        # --- Phase 4b: ZeRO-3 heterogeneous parameter sharding ---
+        # Each rank keeps only a 1/N (or VRAM-proportional) slice of the
+        # flattened FP32 master parameter buffer. The full BF16 params
+        # are gathered on-demand via param_shard_state.gather_full_params
+        # during forward / backward.
+        #
+        # Skipped entirely when world_size <= 1 (backward compatible).
+        self.param_shard_state = None
+        self.param_shard = None
+        self.param_offsets = None
+        try:
+            from deepspeed.runtime.zero3_hetero_shard import (
+                ShardState as _ShardState,
+                vram_weights_from_tiers as _vram_weights_from_tiers,
+            )
+            _ws = dist.get_world_size() if dist.is_initialized() else int(
+                os.environ.get("WORLD_SIZE", 1)
+            )
+            _rk = dist.get_rank() if dist.is_initialized() else int(
+                os.environ.get("RANK", 0)
+            )
+            if _ws > 1:
+                # Heterogeneous: weight shards by VRAM (H100 > A6000).
+                _weights = _vram_weights_from_tiers(self.tiers) if getattr(
+                    self, "tiers", None
+                ) else None
+                if _weights and len(_weights) != _ws:
+                    # World size doesn't match discovered tier count —
+                    # fall back to an even split to stay safe.
+                    _weights = None
+                self.param_shard_state = _ShardState.build(
+                    model=self.model,
+                    rank=_rk,
+                    world_size=_ws,
+                    device=_local_device,
+                    vram_weights=_weights,
+                )
+                if self.param_shard_state is not None:
+                    self.param_shard = self.param_shard_state.param_shard
+                    self.param_offsets = self.param_shard_state.param_offsets
+                    # Sanity check (T127 acceptance criterion): the sum
+                    # of per-rank shard sizes must equal the original
+                    # total parameter count (up to alignment padding).
+                    _orig_total = sum(p.numel() for p in self.model.parameters())
+                    _shard_total = sum(self.param_shard_state.shard_sizes)
+                    assert _shard_total >= _orig_total, (
+                        f"shard total {_shard_total} < orig {_orig_total}"
+                    )
+                    logger.info(
+                        "[zero3] Sharding active: %d ranks, local=%d, "
+                        "total=%d (orig=%d, pad=%d)",
+                        _ws, self.param_shard.numel(),
+                        _shard_total, _orig_total,
+                        self.param_shard_state.pad,
+                    )
+        except Exception as _shard_exc:  # noqa: BLE001
+            logger.warning(
+                "[zero3] Sharding init failed (%s); continuing with "
+                "full-replica parameters.", _shard_exc,
+            )
+            self.param_shard_state = None
+
         # --- Phase 5: Optimizer & Scheduler ---
         self.optimizer = AdamW(
             self.model.parameters(),
