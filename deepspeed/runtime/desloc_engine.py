@@ -1276,14 +1276,28 @@ class DesLocEngine:
         schedule_str = config.batch_schedule or f"0:{config.global_batch_size}"
         seq_len_for_schedule = config.batch_schedule_seq_length
 
-        self.hetero_scheduler = HeteroStepBatchScheduler(
-            rank=0,
+        _rank = dist.get_rank() if dist.is_initialized() else int(
+            os.environ.get("RANK", 0)
+        )
+        self.hetero_scheduler: HeteroStepBatchScheduler = HeteroStepBatchScheduler(
+            rank=_rank,
             micro_batch_size=config.micro_batch_size,
             data_parallel_size=dp_size,
             schedule=schedule_str,
             device_profiles=device_profiles,
             seq_length=seq_len_for_schedule,
+            loc_cache_invalidation_hook=lambda old_bs, new_bs: logger.info(
+                "LOC Cache invalidated: global_batch_size %d -> %d", old_bs, new_bs
+            ),
+            dp_reconfigure_hook=lambda new_gbs: logger.info(
+                "DP reconfigure hint: new global_batch_size=%d", new_gbs
+            ),
         )
+        # Also expose under the registry-standard name so that code that
+        # references engine.hetero_step_batch_scheduler (set as a placeholder
+        # by HeteroStepBatchScheduler.register() during Phase 2) finds the
+        # fully-initialized scheduler rather than None.
+        self.hetero_step_batch_scheduler: HeteroStepBatchScheduler = self.hetero_scheduler
         logger.info(
             "HeteroStepBatchScheduler initialized: schedule='%s', dp_size=%d, "
             "device_profiles=%d devices",
@@ -1776,7 +1790,7 @@ class DesLocEngine:
             # based on VRAM/compute tier. No FSDP collective constraints —
             # Neuron_SP ZeRO-3 uses per-layer gather_full_params which only
             # requires collectives at the granularity the hooks fire.
-            allocation: MicrobatchAllocation = self.hetero_scheduler.update(
+            allocation: MicrobatchAllocation = self.hetero_scheduler.schedule(
                 consumed_samples=self.consumed_samples,
                 consistency_check=False,
             )

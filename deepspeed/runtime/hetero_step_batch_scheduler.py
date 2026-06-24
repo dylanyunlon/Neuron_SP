@@ -737,6 +737,45 @@ class HeteroStepBatchScheduler:
     # DeepSpeed 兼容接口（对应 Megatron NumMicroBatchesCalculator 的公共方法）
     # ------------------------------------------------------------------
 
+    def schedule(
+        self,
+        consumed_samples: int,
+        consistency_check: bool = False,
+        verbose: bool = False,
+    ) -> "MicrobatchAllocation":
+        """Advance the batch-size schedule and return the current microbatch allocation.
+
+        Public entry-point for DeepSpeed engine training loops.  Delegates to
+        :meth:`update` so that all stepping logic (LOC Cache invalidation hook,
+        DP reconfigure hook, per-device microbatch reallocation) is executed
+        exactly once per call.
+
+        This method exists as a named contract between
+        :class:`HeteroStepBatchScheduler` and
+        :class:`~deepspeed.runtime.desloc_engine.DesLocEngine`.  Engine code
+        should call ``hetero_scheduler.schedule(consumed_samples)`` at the top
+        of every training step; lower-level code may call ``update()`` directly.
+
+        Args:
+            consumed_samples: Total number of samples consumed so far.  Used to
+                determine which schedule entry (batch-size breakpoint) is active.
+            consistency_check: When ``True``, assert that the current global
+                batch size is divisible by ``micro_batch_size * data_parallel_size``.
+                Set to ``True`` when resuming from a checkpoint.
+            verbose: Forward to :meth:`update`; enables extra logging on the
+                first call (consumed_samples == 0).
+
+        Returns:
+            :class:`MicrobatchAllocation` describing the global batch size,
+            total microbatch count, and per-device microbatch assignment for
+            this training step.
+        """
+        return self.update(
+            consumed_samples=consumed_samples,
+            consistency_check=consistency_check,
+            verbose=verbose,
+        )
+
     def get_num_microbatches(self) -> int:
         """获取当前总微批数。
 
