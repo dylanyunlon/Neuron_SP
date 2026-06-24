@@ -53,6 +53,11 @@ from deepspeed.runtime.hetero_mimo_training_loop import (
 )
 from deepspeed.runtime.hetero_gdn_selective_recompute import build_neuron_sp_config
 from megatron.core.datasets.commit_dataset import build_commit_datasets
+from datasets.bigcode.commit_packing import (
+    CommitSequencePacker,
+    HeteroBatchSampler,
+    compute_packing_stats,
+)
 
 
 # ── 模型构建 ──
@@ -186,16 +191,100 @@ def load_stage1_data(tokenizer, seq_len, batch_size, data_path=None):
 
 
 def load_stage2_data(tokenizer, seq_len, batch_size, data_path=None):
-    """Stage 2: CommitPack diff 序列 — uses build_commit_datasets() from
-    megatron.core.datasets.commit_dataset to replace the dummy dataloader."""
-    from torch.utils.data import DataLoader
+    """Stage 2: CommitPack diff sequences — commit-boundary-aware packing.
 
-    # Resolve data path: use provided path or fall back to default corpus location
+    Loading strategy (in order):
+    1. If ``data_path`` (or the default location) contains .jsonl files,
+       stream the raw commit samples through :class:`CommitSequencePacker`
+       so no training sequence ever crosses a commit boundary.
+    2. Otherwise fall back to ``build_commit_datasets()`` from
+       ``megatron.core.datasets.commit_dataset`` (Megatron indexed format).
+
+    In both cases, short commits (≤ 256 tokens) are merged into the same
+    packed sequence; commits longer than ``seq_len`` are split with a
+    sliding window.  The resulting :class:`PackedDataset` is wrapped with
+    :class:`HeteroBatchSampler` so sequences are distributed to GPUs
+    proportionally to their available VRAM.
+    """
+    import glob as _glob
+    from torch.utils.data import DataLoader, Dataset
+
     resolved_path = data_path or "datasets/bigcode/commitpack"
 
-    # -- Build train/valid/test CommitDatasets via Megatron commit_dataset --
-    print(f"[stage2] building CommitDatasets from {resolved_path} "
-          f"(seq_length={seq_len}) ...")
+    # ── 1. Check for .jsonl files — prefer CommitSequencePacker path ───────
+    jsonl_files = sorted(_glob.glob(os.path.join(resolved_path, "*.jsonl")))
+
+    if jsonl_files:
+        print(f"[stage2] found {len(jsonl_files)} .jsonl file(s) in {resolved_path}; "
+              f"packing with CommitSequencePacker (seq_len={seq_len}) ...")
+
+        # Stream all commit samples from the .jsonl files.
+        def _iter_samples():
+            for filepath in jsonl_files:
+                with open(filepath) as fh:
+                    for line in fh:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            yield json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+
+        pad_id = getattr(tokenizer, "eos_token_id", None) or 0
+        packer = CommitSequencePacker(
+            tokenizer=tokenizer,
+            seq_len=seq_len,
+            pad_token_id=pad_id,
+        )
+        packed = packer.pack_dataset(_iter_samples())
+
+        stats = compute_packing_stats(packed)
+        print(f"[stage2] packing stats: {stats}")
+        if not stats.get("meets_5pct_target", True):
+            print(
+                f"[stage2] WARNING: padding_ratio={stats['padding_ratio']:.3%} "
+                f"exceeds 5% target. Check commit length distribution."
+            )
+
+        # ── Map-style dataset over PackedSequence objects ─────────────────
+        class PackedDataset(Dataset):
+            def __init__(self, sequences):
+                self.sequences = sequences
+
+            def __len__(self):
+                return len(self.sequences)
+
+            def __getitem__(self, idx):
+                tokens = torch.tensor(self.sequences[idx].tokens, dtype=torch.long)
+                return {"input_ids": tokens, "labels": tokens}
+
+        ds = PackedDataset(packed)
+
+        # ── HeteroBatchSampler: distribute by GPU VRAM ratio ──────────────
+        gpu_tiers = detect_gpu_tiers()  # {rank: vram_gb}
+        hetero_sampler = HeteroBatchSampler(
+            sequences=packed,
+            gpu_mem_map=gpu_tiers if gpu_tiers else {0: 96, 1: 49},
+            base_batch=batch_size,
+            verbose=True,
+        )
+
+        def _collate(items):
+            input_ids = torch.stack([i["input_ids"] for i in items])
+            return {"input_ids": input_ids, "labels": input_ids}
+
+        return DataLoader(
+            ds,
+            batch_size=batch_size,
+            sampler=None,
+            collate_fn=_collate,
+            batch_sampler=_HeteroBatchSamplerAdapter(hetero_sampler, ds),
+        )
+
+    # ── 2. Fallback: Megatron indexed CommitDataset ────────────────────────
+    print(f"[stage2] no .jsonl files found; building CommitDatasets from "
+          f"{resolved_path} (seq_length={seq_len}) ...")
     train_ds, valid_ds, test_ds = build_commit_datasets(
         data_path=resolved_path,
         seq_length=seq_len,
@@ -245,9 +334,8 @@ def load_stage3_data(tokenizer, seq_len, batch_size, data_path=None):
     """Stage 3: CommitPackFT instruction tuning — uses CommitSequencePacker + HeteroBatchSampler."""
     import json as _json, glob
     from torch.utils.data import DataLoader, Dataset
-    from datasets.bigcode.commit_packing import (
-        CommitSequencePacker, HeteroBatchSampler, compute_packing_stats,
-    )
+    # CommitSequencePacker, HeteroBatchSampler, compute_packing_stats are
+    # imported at module level from datasets.bigcode.commit_packing.
 
     # ── 1. 收集指令格式 commit 样本 ─────────────────────────────────────
     files = sorted(glob.glob("datasets/bigcode/commitpackft/*.jsonl"))
