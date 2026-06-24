@@ -805,13 +805,20 @@ def run_standalone(args: argparse.Namespace) -> None:
 
 def run_desloc(args: argparse.Namespace) -> None:
     """Run training via the DES-LOC heterogeneous engine."""
+    # CRITICAL: set_device MUST come before init_process_group(backend="nccl").
+    # NCCL binds to the current CUDA device at init time. If all ranks default
+    # to cuda:0, NCCL sees "Duplicate GPU" and crashes.
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    torch.cuda.set_device(local_rank)
+    device = torch.device(f"cuda:{local_rank}")
+
     # Distributed init (torchrun sets env vars but we must call init ourselves)
     import torch.distributed as _dist
     if not _dist.is_initialized() and "RANK" in os.environ:
         import datetime as _dt
         _dist.init_process_group(
             backend="nccl", init_method="env://",
-            timeout=_dt.timedelta(minutes=30),  # PCIe heterogeneous: slow ranks need time
+            timeout=_dt.timedelta(minutes=30),
         )
 
     cfg = _MODEL_CONFIGS[args.model_size]
@@ -835,10 +842,6 @@ def run_desloc(args: argparse.Namespace) -> None:
         save_every      = getattr(args, "save_every", 500),
         eval_every      = 0,
     )
-
-    local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    torch.cuda.set_device(local_rank)
-    device = torch.device(f"cuda:{local_rank}")
 
     # Build the LlamaModel and pass it in (DesLocEngine wraps it)
     # Model stays on CPU here — DesLocEngine/FSDP handles device placement.
