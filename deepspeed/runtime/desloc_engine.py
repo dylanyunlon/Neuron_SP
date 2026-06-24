@@ -1832,7 +1832,16 @@ class DesLocEngine:
             if self.fp32_grad_manager is not None and self.param_shard_state is None:
                 self.fp32_grad_manager.after_backward(scale=1.0 / num_microbatches)
 
-            # Backward hooks have already written reduced grads into param_shard.grad
+            # Backward hooks have already written local grads into param_shard.grad.
+            # Synchronise gradients across ranks (data-parallel all-reduce).
+            # This is the ONLY NCCL collective per step — called once after
+            # all microbatches complete, so rank sync is guaranteed even
+            # with heterogeneous microbatch counts.
+            if self.param_shard_state is not None:
+                _ps = self.param_shard_state.param_shard
+                if _ps.grad is not None:
+                    dist.all_reduce(_ps.grad, op=dist.ReduceOp.SUM)
+                    _ps.grad.div_(dist.get_world_size())
 
             # Gradient clipping — clip on param_shard when ZeRO-3 active
             if self.param_shard_state is not None:

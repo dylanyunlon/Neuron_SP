@@ -95,6 +95,12 @@ class ShardState:
     param_offsets: Dict[str, ParamSlice]
     param_order: List[Tuple[str, nn.Parameter]] = field(default_factory=list)
     pad: int = 0
+    # CPU-pinned full BF16 copy of each param, keyed by param name.
+    # Used by forward/backward hooks to reconstruct full params on GPU
+    # via H2D copy instead of NCCL all-gather — avoids cross-rank
+    # synchronisation which is incompatible with heterogeneous
+    # microbatch counts.
+    cpu_param_data: Dict[str, torch.Tensor] = field(default_factory=dict)
 
     # ------------------------------------------------------------------
     # Constructors
@@ -222,6 +228,15 @@ class ShardState:
             vram_weights is not None,
         )
 
+        # Save CPU-pinned full BF16 copies BEFORE we overwrite p.data with
+        # the sharded view. These allow forward/backward hooks to
+        # reconstruct full params via H2D copy without NCCL collectives.
+        cpu_param_data: Dict[str, torch.Tensor] = {}
+        for name, p in param_order:
+            cpu_param_data[name] = p.detach().clone().to(
+                dtype=torch.bfloat16
+            ).pin_memory()
+
         # Pre-allocate the gradient buffer NOW, before forward all-gather
         # consumes GPU memory. Lazy allocation inside backward hooks would
         # OOM because forward already holds the full-layer gathered params.
@@ -241,6 +256,7 @@ class ShardState:
             param_offsets=param_offsets,
             param_order=param_order,
             pad=pad,
+            cpu_param_data=cpu_param_data,
         )
 
     # ------------------------------------------------------------------
@@ -381,65 +397,37 @@ class ShardState:
                 grad = param.grad
                 if grad is None:
                     return
-                device = grad.device
                 flat = grad.detach().reshape(-1)
 
-                if even:
-                    # Build a contiguous send buffer laid out as
-                    # [rank0_slab | rank1_slab | ... | rankN-1_slab] so a
-                    # single reduce_scatter_tensor produces our local slab.
-                    shard = shard_sizes[0]
-                    send = torch.zeros(
-                        shard * world_size, dtype=flat.dtype, device=device,
-                    )
-                    for r in range(world_size):
-                        p_lo, p_hi = shard_slices[r]
-                        if p_hi > p_lo:
-                            s_off = r * shard
-                            send[s_off:s_off + (p_hi - p_lo)].copy_(
-                                flat[p_lo:p_hi]
+                # No NCCL here — just extract this rank's shard slice of
+                # the full gradient and accumulate into param_shard.grad.
+                # Gradient synchronisation across ranks happens once per
+                # step via all_reduce on param_shard.grad before the
+                # optimizer step (compatible with heterogeneous microbatch
+                # counts).
+                if _shard_end > _shard_start:
+                    # Map from param-local flat indices to our shard window
+                    p_lo = _g_start - sl.global_start
+                    p_hi = _g_end - sl.global_start
+                    local_grad = flat[p_lo:p_hi]
+                    take = min(local_grad.numel(), _shard_end - _shard_start)
+                    if take > 0:
+                        _param_shard.grad[_shard_start:_shard_start + take].add_(
+                            local_grad[:take].to(
+                                dtype=_param_shard.dtype,
+                                device=_param_shard.device,
                             )
-                    local_shard = torch.empty(
-                        shard, dtype=flat.dtype, device=device,
-                    )
-                    dist.reduce_scatter_tensor(
-                        local_shard, send, op=dist.ReduceOp.SUM,
-                    )
-                    local_shard.div_(world_size)
-                    # Trim to the (possibly shorter) slice this param
-                    # actually contributes on our rank — the rest is
-                    # zero-padding belonging to other params.
-                    p_lo, p_hi = shard_slices[rank]
-                    take = p_hi - p_lo
-                    local_grad = local_shard[:take].clone() if take > 0 else \
-                        torch.empty(0, dtype=flat.dtype, device=device)
-                else:
-                    # Heterogeneous shard sizes — reduce_scatter_tensor
-                    # requires equal-sized chunks, so fall back to an
-                    # all-reduce + local slice.
-                    full = flat.clone()
-                    dist.all_reduce(full, op=dist.ReduceOp.SUM)
-                    full.div_(world_size)
-                    p_lo, p_hi = shard_slices[rank]
-                    local_grad = full[p_lo:p_hi].clone() if p_hi > p_lo else \
-                        torch.empty(0, dtype=flat.dtype, device=device)
-
-                # Write reduced gradient directly into param_shard.grad at
-                # the correct offset. Do NOT write param.grad — the param
-                # shape doesn't match the 1-D reduced shard.
-                if local_grad.numel() > 0 and _shard_end > _shard_start:
-                    _param_shard.grad[_shard_start:_shard_end].add_(
-                        local_grad[:_shard_end - _shard_start].to(
-                            dtype=_param_shard.dtype, device=_param_shard.device
                         )
-                    )
+                else:
+                    local_grad = None
+
                 # Clear param.grad to free memory (it's been consumed)
                 param.grad = None
 
                 # Optional FP32 accumulator integration. We only touch
                 # ``main_grad`` if the manager actually allocated one for
                 # this parameter (selective FP32 policy).
-                if fp32_grad_manager is not None and hasattr(param, "main_grad"):
+                if fp32_grad_manager is not None and hasattr(param, "main_grad") and local_grad is not None:
                     mg = param.main_grad
                     if mg is not None and local_grad.numel() > 0:
                         # ``main_grad`` may be full-shape FP32; flatten
@@ -560,7 +548,8 @@ class ShardState:
                 self.param_shard.grad[s_start:s_start + take].copy_(grad_flat[:take])
 
     def sync_shard_to_model(self) -> None:
-        """Copy updated FP32 param_shard back to model's BF16 parameters.
+        """Copy updated FP32 param_shard back to model's BF16 parameters
+        and to the CPU-pinned full param copies used by forward hooks.
 
         Called after optimizer.step() updates param_shard. Each rank writes
         only the slice of each parameter that it owns.
@@ -579,10 +568,15 @@ class ShardState:
             s_start = g_start - lo
             s_end = g_end - lo
             with torch.no_grad():
+                updated = self.param_shard.data[s_start:s_end]
+                # Update model param (BF16)
                 flat = p.data.reshape(-1)
-                flat[p_start:p_end].copy_(
-                    self.param_shard.data[s_start:s_end].to(p.dtype)
-                )
+                flat[p_start:p_end].copy_(updated.to(p.dtype))
+                # Update CPU pinned copy for next forward's H2D gather
+                cpu_data = self.cpu_param_data.get(name)
+                if cpu_data is not None:
+                    cpu_flat = cpu_data.reshape(-1)
+                    cpu_flat[p_start:p_end].copy_(updated.to(cpu_data.dtype))
 
 class ZeRO3ForwardHook:
     """
@@ -725,95 +719,29 @@ class ZeRO3ForwardHook:
     # Per-layer gather / release
     # ------------------------------------------------------------------
     def _gather_params(self, params: List[nn.Parameter]) -> None:
-        """All-gather each parameter in ``params`` and rewrite ``p.data``
-        to view into the gathered buffer."""
+        """Reconstruct full params on GPU via H2D copy from CPU pinned memory.
+
+        This is a rank-local operation — no NCCL collectives — so it works
+        correctly with heterogeneous microbatch counts across ranks.
+        """
         state = self.shard_state
-        ws = state.world_size
-        rank = state.rank
         device = state.param_shard.device
 
         for p in params:
             pid = id(p)
             if pid in self._saved:
-                # Already gathered (re-entrant / shared param): skip.
                 continue
             sl = self._param_to_slice.get(pid)
             if sl is None:
                 continue
-
-            gather_dtype = p.dtype  # typically BF16 during training
-            numel = sl.global_end - sl.global_start
-
-            # Determine each rank's contribution to this layer: the
-            # intersection of [sl.global_start, sl.global_end) with that
-            # rank's shard window [shard_offsets[r], shard_offsets[r+1]).
-            per_rank_sizes: List[int] = []
-            per_rank_local_offsets: List[Tuple[int, int]] = []  # (s_start, s_end) in our local shard
-            for r in range(ws):
-                lo = state.shard_offsets[r]
-                hi = state.shard_offsets[r + 1]
-                g0 = max(sl.global_start, lo)
-                g1 = min(sl.global_end, hi)
-                contrib = max(0, g1 - g0)
-                per_rank_sizes.append(contrib)
-                if r == rank and contrib > 0:
-                    per_rank_local_offsets.append((g0 - lo, g1 - lo))
-                else:
-                    per_rank_local_offsets.append((0, 0))
-
-            # This rank's slice of *this layer*, taken from param_shard.
-            s_start, s_end = per_rank_local_offsets[rank]
-            if s_end > s_start:
-                local_piece = state.param_shard[s_start:s_end].to(gather_dtype)
-            else:
-                local_piece = torch.empty(0, dtype=gather_dtype, device=device)
-
-            # Allocate the full per-layer buffer and run the collective.
-            full = torch.empty(numel, dtype=gather_dtype, device=device)
-
-            even = all(s == per_rank_sizes[0] for s in per_rank_sizes)
-            if even and per_rank_sizes[0] > 0:
-                # Fast path: equal contributions → all_gather_into_tensor.
-                dist.all_gather_into_tensor(full, local_piece)
-            else:
-                # Variable-size fallback: per-rank tensors + concat.
-                chunks = [
-                    torch.empty(s, dtype=gather_dtype, device=device)
-                    for s in per_rank_sizes
-                ]
-                # all_gather requires all chunks > 0 on every rank? In
-                # practice torch tolerates zero-sized tensors here; if
-                # not, fall back to padded all_gather_into_tensor.
-                try:
-                    dist.all_gather(chunks, local_piece)
-                except Exception:  # noqa: BLE001
-                    # Pad to max size and use the equal-size collective.
-                    max_sz = max(per_rank_sizes) if per_rank_sizes else 0
-                    padded_local = torch.zeros(
-                        max_sz, dtype=gather_dtype, device=device
-                    )
-                    if local_piece.numel() > 0:
-                        padded_local[:local_piece.numel()].copy_(local_piece)
-                    padded_full = torch.empty(
-                        max_sz * ws, dtype=gather_dtype, device=device
-                    )
-                    dist.all_gather_into_tensor(padded_full, padded_local)
-                    for r in range(ws):
-                        sz = per_rank_sizes[r]
-                        if sz > 0:
-                            chunks[r] = padded_full[r * max_sz : r * max_sz + sz]
-
-                # Stitch chunks into ``full`` in rank order.
-                cursor = 0
-                for r in range(ws):
-                    sz = per_rank_sizes[r]
-                    if sz > 0:
-                        full[cursor:cursor + sz].copy_(chunks[r])
-                    cursor += sz
-
-            # Save original storage and rewrite param to view into full.
+            name = sl.name
+            cpu_data = state.cpu_param_data.get(name)
+            if cpu_data is None:
+                continue
+            # Non-blocking H2D copy from pinned CPU memory
+            full = cpu_data.to(device=device, non_blocking=True)
             self._saved[pid] = (p, p.data)
-            p.data = full.view(sl.shape)
+            p.data = full
 
     def _release_params(self, params: List[nn.Parameter]) -> None:
         """Restore each parameter's local sharded storage and drop the
