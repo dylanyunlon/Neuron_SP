@@ -1047,6 +1047,7 @@ class DesLocEngine:
         # If FSDP will be used (world_size > 1), do NOT move model to GPU here —
         # FSDP's device_id handles placement after sharding. Moving first causes OOM.
         _use_fsdp = int(os.environ.get("WORLD_SIZE", 1)) > 1
+        self._use_fsdp = _use_fsdp
         if not _use_fsdp:
             self.model = self.model.to(dtype=_DEFAULT_DTYPE, device=_local_device)
         else:
@@ -1505,8 +1506,11 @@ class DesLocEngine:
         # ``param_shard``, and (when applicable) those slices are
         # accumulated into the FP32 ``main_grad`` of
         # ``fp32_grad_manager`` for selective-FP32 parameters.
+        # zero3_hetero_shard backward hooks DISABLED when FSDP is active.
+        # FSDP already manages reduce-scatter in backward; installing a second
+        # set of reduce-scatter hooks causes NCCL collective conflicts → hang.
         self._zero3_grad_hook_handles: List = []
-        if self.param_shard_state is not None:
+        if self.param_shard_state is not None and not self._use_fsdp:
             try:
                 self._zero3_grad_hook_handles = (
                     self.param_shard_state.register_backward_hooks(
@@ -1695,8 +1699,11 @@ class DesLocEngine:
         # hooks so that the full BF16 params for the *currently
         # executing* nn.Module are materialized on entry and freed on
         # exit. Peak memory: model_shard + max(per_layer_full_params).
+        # zero3_hetero_shard forward hooks DISABLED when FSDP is active.
+        # FSDP already does per-layer all-gather in forward; a second set of
+        # all-gather hooks causes NCCL collective interleaving → deadlock.
         self._zero3_forward_hook = None
-        if getattr(self, "param_shard_state", None) is not None:
+        if getattr(self, "param_shard_state", None) is not None and not self._use_fsdp:
             try:
                 from deepspeed.runtime.zero3_hetero_shard import (  # noqa: PLC0415
                     install_zero3_forward_hooks as _install_z3_hooks,
