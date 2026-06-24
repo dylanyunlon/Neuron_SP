@@ -30,7 +30,6 @@ export TORCH_NCCL_ENABLE_MONITORING=0
 # spawns 32 compile workers and takes 10-20 min on first forward.
 # Run eager mode first to verify correctness, enable compile later.
 export TORCHDYNAMO_DISABLE=1
-export CUDA_LAUNCH_BLOCKING=1  # debug: synchronous CUDA errors
 
 mkdir -p logs
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
