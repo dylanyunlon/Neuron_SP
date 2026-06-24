@@ -14,6 +14,7 @@ Hardware spec:
 
 from __future__ import annotations
 
+import concurrent.futures
 import importlib
 import inspect
 import logging
@@ -21,6 +22,7 @@ import math
 import os
 import pkgutil
 import subprocess
+import threading
 import time
 from dataclasses import dataclass, field
 from enum import Enum, auto
@@ -1360,6 +1362,50 @@ class DesLocEngine:
                 self._hetero_ckpt_cfg.pcie_bw_throttle_gbps,
             )
 
+        # CPU-staging thread pool: used by save_checkpoint to push payload to
+        # the locality-cache ramdisk (/dev/shm) without blocking the training
+        # loop.  One worker is sufficient — saves are sequential per rank and
+        # we want to avoid saturating the PCIe bus with concurrent H2H copies.
+        self._cpu_stage_executor: concurrent.futures.ThreadPoolExecutor = (
+            concurrent.futures.ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="desloc_cpu_stage"
+            )
+        )
+        self._cpu_stage_futures: List[concurrent.futures.Future] = []
+        # Lock guards _cpu_stage_futures list (drain_checkpoint may be called
+        # from a different thread than save_checkpoint).
+        self._cpu_stage_lock = threading.Lock()
+
+        # Emit a structured config summary so checkpoint policy is visible in
+        # training logs without having to inspect the config object manually.
+        if self._hetero_ckpt_cfg is not None:
+            _cfg_s = self._hetero_ckpt_cfg
+            _cache_pol  = _cfg_s.get_policy(TierRole.CACHE)
+            _worker_pol = _cfg_s.get_policy(TierRole.WORKER)
+            logger.info(
+                "HeteroCheckpointConfig summary:\n"
+                "  save_dir            : %s\n"
+                "  load_dir            : %s\n"
+                "  locality_cache_dir  : %s  (max %.0f GB)\n"
+                "  cache_device        : %d   CACHE policy → async=%s  save_optim=%s\n"
+                "  worker_devices      : %s   WORKER policy → async=%s  save_optim=%s\n"
+                "  worker_offload_optim: %s   hetero_async_save: %s\n"
+                "  shard_rebalance     : %s   ckpt_format: %s\n"
+                "  save_interval       : %s   non_persistent_interval: %s\n"
+                "  pcie_bw_throttle    : %.0f GB/s",
+                _cfg_s.save,
+                _cfg_s.load,
+                _cfg_s.locality_cache_dir,       _cfg_s.locality_cache_max_gb,
+                _cfg_s.cache_tier_device_id,
+                _cache_pol.async_save,           _cache_pol.save_optim,
+                _cfg_s.worker_device_ids,
+                _worker_pol.async_save,          _worker_pol.save_optim,
+                _cfg_s.worker_offload_optim,     _cfg_s.hetero_async_save,
+                _cfg_s.shard_rebalance_on_load,  _cfg_s.hetero_ckpt_format.value,
+                _cfg_s.save_interval,            _cfg_s.non_persistent_save_interval,
+                _cfg_s.pcie_bw_throttle_gbps,
+            )
+
         # Optionally resume from checkpoint.  The HeteroCheckpointConfig is
         # now fully initialised so load_checkpoint() will use the tier-aware
         # async load path when available.
@@ -2101,24 +2147,113 @@ class DesLocEngine:
             # Step 3 (CACHE tier only): stage the full payload to the
             # host-DRAM locality cache before handing off to async IO.
             # This gives sub-second fast-resume capability from /dev/shm.
+            # The staging itself runs in a background thread so the training
+            # loop returns immediately after submitting the IO work.
             if tier_role == _TierRole.CACHE and cfg.locality_cache_dir is not None:
                 lc_path = cfg.locality_cache_path(self.global_step)
                 if lc_path is not None:
-                    try:
-                        lc_path.mkdir(parents=True, exist_ok=True)
-                        meta_file = lc_path / "hetero_metadata.pt"
-                        torch.save(payload, meta_file)
-                        logger.info(
-                            "[hetero_ckpt] CACHE tier: staged payload to "
-                            "locality cache %s (%.0f MB).",
-                            meta_file,
-                            meta_file.stat().st_size / (1 << 20),
+                    # Detach all tensors to CPU before the thread takes them —
+                    # GPU tensors cannot be safely serialised from a background
+                    # thread while the main thread uses the same CUDA context.
+                    _stage_payload = {
+                        k: (v.cpu().detach().clone() if isinstance(v, torch.Tensor) else v)
+                        for k, v in payload.items()
+                    }
+                    # Recursively CPU-detach nested optimizer state tensors so
+                    # that CUDA context access from the worker thread is safe.
+                    if "optimizer_state" in _stage_payload:
+                        def _cpu_detach_state(obj):
+                            if isinstance(obj, torch.Tensor):
+                                return obj.cpu().detach().clone()
+                            if isinstance(obj, dict):
+                                return {k: _cpu_detach_state(v) for k, v in obj.items()}
+                            if isinstance(obj, (list, tuple)):
+                                return type(obj)(_cpu_detach_state(v) for v in obj)
+                            return obj
+                        _stage_payload["optimizer_state"] = _cpu_detach_state(
+                            _stage_payload["optimizer_state"]
                         )
-                    except Exception as _lc_exc:  # noqa: BLE001
-                        logger.warning(
-                            "[hetero_ckpt] locality_cache staging failed (%s); "
-                            "continuing with direct async save.",
-                            _lc_exc,
+
+                    def _do_stage(lc_path_=lc_path, payload_=_stage_payload):
+                        try:
+                            lc_path_.mkdir(parents=True, exist_ok=True)
+                            meta_file = lc_path_ / "hetero_metadata.pt"
+                            torch.save(payload_, meta_file)
+                            logger.info(
+                                "[hetero_ckpt] CACHE tier: staged payload to "
+                                "locality cache %s (%.0f MB).",
+                                meta_file,
+                                meta_file.stat().st_size / (1 << 20),
+                            )
+                        except Exception as _lc_exc:  # noqa: BLE001
+                            logger.warning(
+                                "[hetero_ckpt] locality_cache staging failed (%s); "
+                                "async stage thread exiting.",
+                                _lc_exc,
+                            )
+
+                    _fut = self._cpu_stage_executor.submit(_do_stage)
+                    with self._cpu_stage_lock:
+                        # Prune already-done futures to avoid unbounded growth.
+                        self._cpu_stage_futures = [
+                            f for f in self._cpu_stage_futures if not f.done()
+                        ]
+                        self._cpu_stage_futures.append(_fut)
+                    logger.info(
+                        "[hetero_ckpt] CACHE tier: locality-cache stage submitted "
+                        "asynchronously → %s (step %d).",
+                        lc_path, self.global_step,
+                    )
+
+            # Step 3b (WORKER tier): CPU-stage param shard to locality cache so
+            # that the persistent async write can proceed from CPU memory and the
+            # GPU's PCIe bandwidth is freed for gradient all-reduce traffic.
+            # Optimizer state is omitted here when worker_offload_optim=True.
+            if (
+                tier_role == _TierRole.WORKER
+                and cfg.locality_cache_dir is not None
+                and self.param_shard_state is not None
+            ):
+                lc_path_w = cfg.locality_cache_path(self.global_step)
+                if lc_path_w is not None:
+                    _shard_cpu = (
+                        self.param_shard_state.param_shard.cpu().detach().clone()
+                        if self.param_shard_state.param_shard is not None
+                        else None
+                    )
+                    if _shard_cpu is not None:
+                        def _do_worker_stage(
+                            lc_path_=lc_path_w,
+                            shard_=_shard_cpu,
+                            step_=self.global_step,
+                        ):
+                            try:
+                                lc_path_.mkdir(parents=True, exist_ok=True)
+                                shard_file = lc_path_ / "param_shard.pt"
+                                torch.save({"param_shard": shard_, "global_step": step_},
+                                           shard_file)
+                                logger.info(
+                                    "[hetero_ckpt] WORKER tier: param shard staged to "
+                                    "locality cache %s (%.1f MB).",
+                                    shard_file,
+                                    shard_file.stat().st_size / (1 << 20),
+                                )
+                            except Exception as _ws_exc:  # noqa: BLE001
+                                logger.warning(
+                                    "[hetero_ckpt] WORKER param-shard stage failed (%s).",
+                                    _ws_exc,
+                                )
+
+                        _fut_w = self._cpu_stage_executor.submit(_do_worker_stage)
+                        with self._cpu_stage_lock:
+                            self._cpu_stage_futures = [
+                                f for f in self._cpu_stage_futures if not f.done()
+                            ]
+                            self._cpu_stage_futures.append(_fut_w)
+                        logger.info(
+                            "[hetero_ckpt] WORKER tier: param-shard stage submitted "
+                            "asynchronously → %s (step %d).",
+                            lc_path_w, self.global_step,
                         )
 
             # Step 4: launch the async save pipeline (CACHE and WORKER tiers).
@@ -2346,12 +2481,28 @@ class DesLocEngine:
     ) -> None:
         """
         Apply a loaded state dict to the engine, honouring
-        :class:`HeteroCheckpointConfig` flags for optim / rng / strictness.
+        :class:`HeteroCheckpointConfig` flags for optim / rng / strictness /
+        shard rebalancing.
 
         This helper is called by all three load paths in
         :meth:`load_checkpoint` so that ``cfg.load_optim``,
-        ``cfg.load_rng``, and ``cfg.dist_ckpt_strictness`` are enforced
-        consistently regardless of which path succeeded.
+        ``cfg.load_rng``, ``cfg.dist_ckpt_strictness``, and
+        ``cfg.shard_rebalance_on_load`` are enforced consistently regardless
+        of which path succeeded.
+
+        When ``cfg.shard_rebalance_on_load`` is ``True`` and the saved
+        checkpoint was produced by a different tier layout (e.g. the
+        checkpoint contains CACHE-tier tensors that need to be redistributed
+        to WORKER devices), this method remaps every model tensor to the
+        *current* tier device before calling ``load_state_dict``.  The remap
+        policy is:
+
+        * Parameters whose saved shard metadata indicates they belong to the
+          CACHE device are loaded to the current CACHE-tier device.
+        * All other parameters are loaded to the current primary device.
+
+        When no shard metadata is present (legacy checkpoint), tensors are
+        loaded to whichever device is cheapest (CPU then moved to GPU).
 
         Args:
             payload: Dictionary with keys ``model_state``, optionally
@@ -2366,20 +2517,88 @@ class DesLocEngine:
             (cfg.dist_ckpt_strictness.value != "raise_all")
             if cfg is not None else True
         )
+        _rebalance  = (cfg.shard_rebalance_on_load if cfg is not None else False)
 
         model_state     = payload.get("model_state", {})
         optimizer_state = payload.get("optimizer_state")
         scheduler_state = payload.get("scheduler_state")
 
-        # Move model state tensors to the target device before load_state_dict.
-        _tgt_dev = (
+        # ------------------------------------------------------------------
+        # Tier-aware tensor remapping (shard_rebalance_on_load)
+        # ------------------------------------------------------------------
+        # Determine the *current* target device for each state tensor.
+        # Strategy:
+        #   1.  When rebalancing is active, tensors that were saved on the
+        #       CACHE device (device_id == cfg.cache_tier_device_id) are
+        #       placed on the current CACHE device; everything else goes to
+        #       the primary device.
+        #   2.  When rebalancing is off, tensors simply go to the primary
+        #       device (backward-compatible behaviour).
+        #
+        # The "saved device" is inferred from the tensor's .device attribute
+        # if the payload was loaded map_location="cpu" (in which case all
+        # tensors are on CPU and we fall back to primary device placement).
+        _primary_dev = (
             torch.device(f"cuda:{torch.cuda.current_device()}")
             if torch.cuda.is_available() else torch.device("cpu")
         )
-        model_state_on_dev = {
-            k: (v.to(_tgt_dev) if isinstance(v, torch.Tensor) else v)
-            for k, v in model_state.items()
-        }
+        # CACHE device: use the config's cache_tier_device_id when CUDA is
+        # available, else fall back to primary.
+        _cache_dev_id = (
+            cfg.cache_tier_device_id
+            if cfg is not None and torch.cuda.is_available()
+            else None
+        )
+        _cache_dev = (
+            torch.device(f"cuda:{_cache_dev_id}")
+            if _cache_dev_id is not None
+            else _primary_dev
+        )
+        # WORKER devices come from cfg; first worker (if any) is the default
+        # target for non-CACHE parameters when rebalancing.
+        _worker_dev_ids: List[int] = (
+            cfg.worker_device_ids if cfg is not None else []
+        )
+        _default_worker_dev = (
+            torch.device(f"cuda:{_worker_dev_ids[0]}")
+            if _worker_dev_ids and torch.cuda.is_available()
+            else _primary_dev
+        )
+
+        def _target_device_for(key: str, tensor: torch.Tensor) -> torch.device:
+            """Pick the destination device for a model-state tensor."""
+            if not _rebalance:
+                return _primary_dev
+            # If the saved tensor carries a real CUDA device index, use it as
+            # a hint: if it matches the saved cache_tier_device_id we place it
+            # on the *current* cache device; otherwise on the worker device.
+            if tensor.device.type == "cuda" and _cache_dev_id is not None:
+                if tensor.device.index == _cache_dev_id:
+                    return _cache_dev
+                return _default_worker_dev
+            # Tensor is on CPU (map_location="cpu" path): heuristic — use the
+            # current primary device (training loop will re-shard as needed).
+            return _primary_dev
+
+        # Move model state tensors to the target device before load_state_dict.
+        model_state_on_dev: Dict[str, Any] = {}
+        for k, v in model_state.items():
+            if isinstance(v, torch.Tensor):
+                tgt = _target_device_for(k, v)
+                model_state_on_dev[k] = v.to(tgt)
+            else:
+                model_state_on_dev[k] = v
+
+        if _rebalance:
+            logger.info(
+                "[hetero_ckpt] shard_rebalance_on_load=True: "
+                "remapped %d model tensors "
+                "(cache_dev=%s, default_worker_dev=%s).",
+                len(model_state_on_dev),
+                _cache_dev,
+                _default_worker_dev,
+            )
+
         self.model.load_state_dict(model_state_on_dev, strict=_strict)
 
         if optimizer_state is not None and _load_optim:
@@ -2403,14 +2622,57 @@ class DesLocEngine:
         """
         Block until all pending async checkpoint IO is complete.
 
+        Waits for two async subsystems:
+
+        1. **CPU-staging futures** — background threads copying GPU tensors to
+           the locality-cache ramdisk (``/dev/shm``).  These are submitted
+           by :meth:`save_checkpoint` when the CACHE or WORKER tier staging
+           path is active.
+
+        2. **HeteroAsyncCheckpointScheduler** — the async disk-IO pipeline
+           that persists staged tensors from CPU DRAM to the checkpoint
+           directory.
+
         Should be called before program exit or before scheduling the next
-        checkpoint when the async queue could overflow.  No-op when the
-        hetero async path is inactive.
+        checkpoint when the async queue could overflow.  No-op when both
+        subsystems are inactive.
 
         Args:
             timeout: Maximum seconds to wait.  Raises ``TimeoutError`` if
-                     the scheduler exceeds this limit.
+                     either subsystem exceeds this limit.
         """
+        # --- 1: drain CPU-staging futures ---
+        with self._cpu_stage_lock:
+            pending = list(self._cpu_stage_futures)
+
+        if pending:
+            logger.info(
+                "[hetero_ckpt] Draining %d CPU-staging future(s) …", len(pending)
+            )
+            done, not_done = concurrent.futures.wait(
+                pending, timeout=timeout,
+                return_when=concurrent.futures.ALL_COMPLETED,
+            )
+            if not_done:
+                raise TimeoutError(
+                    f"drain_checkpoint: {len(not_done)} CPU-staging future(s) "
+                    f"did not complete within {timeout:.0f}s."
+                )
+            # Re-raise any exceptions from completed futures so they surface
+            # rather than being silently swallowed.
+            for _f in done:
+                exc = _f.exception()
+                if exc is not None:
+                    logger.warning(
+                        "[hetero_ckpt] CPU-staging future raised: %s", exc
+                    )
+            with self._cpu_stage_lock:
+                self._cpu_stage_futures = [
+                    f for f in self._cpu_stage_futures if not f.done()
+                ]
+            logger.info("[hetero_ckpt] CPU-staging futures drained.")
+
+        # --- 2: drain async disk-IO scheduler ---
         if self._hetero_ckpt_scheduler is not None:
             logger.info("[hetero_ckpt] Draining async checkpoint queue …")
             self._hetero_ckpt_scheduler.drain(timeout=timeout)
