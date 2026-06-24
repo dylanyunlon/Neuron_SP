@@ -1777,7 +1777,7 @@ class DesLocEngine:
             # forward (maintaining FSDP sync) but skip backward to avoid
             # polluting gradients.
             _my_assigned = allocation.num_microbatches
-            num_microbatches = max(self.partition_plan.grad_accum_steps.values())
+            num_microbatches = max(self.plan.grad_accum_steps.values())
             if allocation.loc_cache_hint or _my_assigned != num_microbatches:
                 if _is_main:
                     logger.info(
