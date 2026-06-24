@@ -1756,31 +1756,27 @@ class DesLocEngine:
         loss_accum = 0.0
         t0 = time.time()
 
+        if _is_main:
+            print("[DBG] Entering training loop", flush=True)
+
         for step in range(self.global_step, cfg.total_steps):
+            if _is_main:
+                print(f"[DBG] step={step} START", flush=True)
             self.optimizer.zero_grad(set_to_none=True)
             step_loss = 0.0
 
-            # --- HeteroStepBatchScheduler: decide num_microbatches for this step ---
-            allocation: MicrobatchAllocation = self.hetero_scheduler.update(
-                consumed_samples=self.consumed_samples,
-                consistency_check=False,
-            )
-            # TEMPORARY: Force all ranks to 1 micro-batch to verify the
-            # forward→backward→optimizer pipeline works end-to-end.
-            # FSDP collectives require all ranks to call forward/backward
-            # the same number of times. Heterogeneous grad_accum (H100=22,
-            # A6000=1) causes deadlocks because dummy forwards under
-            # torch.no_grad() don't trigger the matching backward hooks
-            # that FSDP expects.
-            #
-            # TODO: Once loss output is confirmed, restore heterogeneous
-            # scheduling by replacing FSDP all-gather with LOC Cache
-            # (Neuron_SP's native communication layer).
+            if _is_main:
+                print(f"[DBG] step={step} after zero_grad", flush=True)
+
             num_microbatches = 1
 
             for micro in range(num_microbatches):
-                _real_micro = True  # all microbatches are real when num_microbatches=1
+                _real_micro = True
+                if _is_main:
+                    print(f"[DBG] step={step} micro={micro} fetching data", flush=True)
                 input_ids, labels = next(self.data_iter)
+                if _is_main:
+                    print(f"[DBG] step={step} micro={micro} data fetched, shape={input_ids.shape}", flush=True)
                 # Route cross-GPU activation transfers through
                 # PCIeP2PCommunicator: for tensors already on a different GPU,
                 # the communicator decides whether to use direct PCIe copy or
@@ -1820,7 +1816,11 @@ class DesLocEngine:
                             print(f"[DBG] step={step} micro={micro} AFTER forward loss={loss.item():.4f}", flush=True)
                         if self.fp32_grad_manager is not None:
                             self.fp32_grad_manager.before_backward()
+                        if _is_main:
+                            print(f"[DBG] step={step} micro={micro} BEFORE backward", flush=True)
                         scaled_loss.backward()
+                        if _is_main:
+                            print(f"[DBG] step={step} micro={micro} AFTER backward", flush=True)
                         if self.fp32_grad_manager is not None:
                             self.fp32_grad_manager.accumulate()
                         step_loss += loss.item()
