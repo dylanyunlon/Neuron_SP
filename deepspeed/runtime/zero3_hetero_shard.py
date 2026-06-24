@@ -417,7 +417,13 @@ class ShardState:
                 # parameter's shape, which is intentional: optimizer math
                 # runs on ``param_shard`` and the FP32 main_grad, not on
                 # ``param.grad`` directly.
-                param.grad = local_grad
+                # Move to param device (param may be on CPU after forward
+                # post-hook restores sharded storage).
+                if local_grad.numel() > 0:
+                    param.grad = local_grad.to(param.device)
+                else:
+                    # This rank owns no slice of this param — clear grad
+                    param.grad = None
 
                 # Optional FP32 accumulator integration. We only touch
                 # ``main_grad`` if the manager actually allocated one for
@@ -537,7 +543,7 @@ class ShardState:
             s_end = g_end - lo
             # The backward hook already reduce-scattered and stored the
             # local slice in param.grad. Its length should match (g_end - g_start).
-            grad_flat = p.grad.detach().reshape(-1).to(torch.float32)
+            grad_flat = p.grad.detach().reshape(-1).to(device=device, dtype=torch.float32)
             take = min(grad_flat.numel(), s_end - s_start)
             if take > 0:
                 self.param_shard.grad[s_start:s_start + take].copy_(grad_flat[:take])
