@@ -1289,13 +1289,22 @@ class DesLocEngine:
         # --- Phase 7: HeteroStepBatchScheduler ---
         # Build device profiles from discovered tiers (or fall back to defaults)
         if self.tiers:
-            max_tflops = max(s.bf16_tflops for s in self.tiers)
             device_profiles = []
             for spec in self.tiers:
-                weight = round(spec.bf16_tflops / max_tflops, 2)
-                max_mbs = config.micro_batch_size * (
-                    2 if spec.tier == TierClass.H100 else 1
-                )
+                # Use VRAM-proportional capacity weights so the allocator mirrors
+                # the target asymmetry: H100 (96 GB) → 6 micro-batches per step,
+                # A6000 (48 GB) → 1 micro-batch per step.
+                # capacity_weight = vram_gb / 16  gives H100→6.0, A6000→3.0 …
+                # but we want the exact 6:1 step ratio, so normalise to the
+                # smallest device (48 GB) and use integer multiples:
+                #   H100  96 GB → weight 6.0  (96/16)
+                #   A6000 48 GB → weight 1.0  (hard-coded floor for sub-96 GB)
+                if spec.total_mem_gb >= 80:  # H100 / H200 class
+                    weight = 6.0
+                    max_mbs = 6 * config.micro_batch_size
+                else:  # A6000 / RTX-class
+                    weight = 1.0
+                    max_mbs = config.micro_batch_size
                 device_profiles.append(DeviceProfile(
                     device_id=spec.device_index,
                     sm_arch=spec.sm_major * 10 + spec.sm_minor,
@@ -1973,7 +1982,34 @@ class DesLocEngine:
                 consumed_samples=self.consumed_samples,
                 consistency_check=False,
             )
-            num_microbatches = allocation.num_microbatches
+            # Per-rank asymmetric micro-batch assignment:
+            # H100 (96 GB, rank 2) → 6 micro-batches per step
+            # A6000 (48 GB, rank 0/1) → 1 micro-batch per step
+            # allocation.per_rank_microbatches is keyed by device_id == dist rank
+            # (single-node setup).  Fall back to the global average only when the
+            # per-rank table is missing (e.g. old checkpoint or unit-test stubs).
+            _current_rank = dist.get_rank() if dist.is_initialized() else int(
+                os.environ.get("RANK", 0)
+            )
+            num_microbatches = (
+                allocation.per_rank_microbatches.get(_current_rank)
+                if allocation.per_rank_microbatches
+                else None
+            )
+            if num_microbatches is None:
+                num_microbatches = allocation.num_microbatches
+                logger.debug(
+                    "per_rank_microbatches missing for rank %d; "
+                    "falling back to global num_microbatches=%d",
+                    _current_rank, num_microbatches,
+                )
+            else:
+                logger.debug(
+                    "rank %d: per-rank num_microbatches=%d "
+                    "(global total=%d, per_rank_table=%s)",
+                    _current_rank, num_microbatches,
+                    allocation.num_microbatches, allocation.per_rank_microbatches,
+                )
 
             # --- HeteroFP32GradAccumManager: before_backward ---
             # Zero FP32 gradient accumulators (main_grad tensors) once per step,

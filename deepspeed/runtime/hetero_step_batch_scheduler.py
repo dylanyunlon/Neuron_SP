@@ -193,13 +193,16 @@ class DeviceProfile:
 
 
 # DES-LOC 默认集群配置: 2x A6000 48GB SM86 + 1x H100 NVL 96GB SM90
+# capacity_weight 按目标微批比例设置：H100 跑 6 个微批，A6000 各跑 1 个。
+# 这样 HeteroMicrobatchAllocator 会按 1:1:6 的权重分配，消除 H100 等待 A6000 的
+# 同步瓶颈，将 MFU 从 ~8% 提升到接近 H100 峰值利用率。
 DEFAULT_DES_LOC_DEVICE_PROFILES: List[DeviceProfile] = [
     DeviceProfile(device_id=0, sm_arch=86, vram_gb=48.0, capacity_weight=1.0,
-                  max_micro_batch_size=4, loc_cache_size_mb=2048),
+                  max_micro_batch_size=1, loc_cache_size_mb=2048),
     DeviceProfile(device_id=1, sm_arch=86, vram_gb=48.0, capacity_weight=1.0,
-                  max_micro_batch_size=4, loc_cache_size_mb=2048),
-    DeviceProfile(device_id=2, sm_arch=90, vram_gb=96.0, capacity_weight=2.0,
-                  max_micro_batch_size=8, loc_cache_size_mb=8192),
+                  max_micro_batch_size=1, loc_cache_size_mb=2048),
+    DeviceProfile(device_id=2, sm_arch=90, vram_gb=96.0, capacity_weight=6.0,
+                  max_micro_batch_size=6, loc_cache_size_mb=8192),
 ]
 
 
@@ -236,11 +239,16 @@ class MicrobatchAllocation:
         global_batch_size: 当前全局批量大小。
         num_microbatches: 总微批数（= global_batch_size / micro_batch_size / dp_size）。
         per_device_assignment: 每个设备的微批分配 {device_id: num_microbatches}。
+        per_rank_microbatches: 每个分布式 rank 应执行的微批数 {rank: num_microbatches}。
+            在异构集群中 rank == device_id（单节点），因此本字段是
+            per_device_assignment 的别名，供 train() 直接按 dist.get_rank() 查找。
+            H100 (96GB, rank 2) 分配 6 个微批；A6000 (48GB, rank 0/1) 各分配 1 个。
         loc_cache_hint: LOC Cache 预取提示，True 表示刚发生步进，需要预热。
     """
     global_batch_size: int
     num_microbatches: int
     per_device_assignment: Dict[int, int]
+    per_rank_microbatches: Dict[int, int] = field(default_factory=dict)
     loc_cache_hint: bool = False
 
 
@@ -456,10 +464,16 @@ class HeteroMicrobatchAllocator:
             global_batch_size, num_microbatches, per_device,
         )
 
+        # per_rank_microbatches mirrors per_device_assignment.
+        # In a single-node heterogeneous setup device_id == dist rank, so
+        # train() can do a direct lookup: allocation.per_rank_microbatches[rank].
+        per_rank = dict(per_device)  # shallow copy; keys are device_id == rank
+
         return MicrobatchAllocation(
             global_batch_size=global_batch_size,
             num_microbatches=num_microbatches,
             per_device_assignment=per_device,
+            per_rank_microbatches=per_rank,
             loc_cache_hint=False,
         )
 
