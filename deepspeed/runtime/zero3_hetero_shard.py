@@ -474,6 +474,39 @@ class ShardState:
         )
         return handles
 
+    def allreduce_shard_grads(self) -> None:
+        """All-reduce param_shard.grad across ranks (upstream finalize_model_grads).
+
+        Each rank's backward hooks accumulate this rank's shard slice of the
+        gradient into param_shard.grad.  Before the optimizer step, we must
+        all-reduce so every rank's shard gradient is the average across all
+        data-parallel replicas — matching upstream Megatron's
+        finalize_model_grads / finish_grad_sync.
+
+        Heterogeneous shard sizes: param_shard.grad has DIFFERENT lengths on
+        different ranks.  We use the variable-size fallback: all_reduce a
+        full-length flat buffer, then slice back.
+        """
+        if self.world_size <= 1 or not dist.is_initialized():
+            return
+        g = self.param_shard.grad
+        if g is None:
+            return
+
+        device = g.device
+        # Assemble full-length gradient buffer from all ranks' shards
+        full_grad = torch.zeros(self.total_numel, dtype=torch.float32, device=device)
+        lo = self.shard_offsets[self.rank]
+        hi = self.shard_offsets[self.rank + 1]
+        full_grad[lo:hi].copy_(g.float())
+
+        # All-reduce (SUM) then average
+        dist.all_reduce(full_grad, op=dist.ReduceOp.SUM)
+        full_grad.div_(self.world_size)
+
+        # Extract this rank's averaged shard back
+        g.copy_(full_grad[lo:hi].to(g.dtype))
+
     def scatter_grads(self, model: nn.Module) -> torch.Tensor:
         """
         Reduce-scatter gradients across all ranks.
@@ -557,12 +590,11 @@ class ShardState:
                 self.param_shard.grad[s_start:s_start + take].copy_(grad_flat[:take])
 
     def sync_shard_to_model(self) -> None:
-        """Copy updated FP32 param_shard back to model's BF16 parameters.
+        """Copy updated FP32 param_shard back to model BF16 + all_gather.
 
-        Called after optimizer.step() updates param_shard. Each rank writes
-        only the slice of each parameter that it owns.  The full model now
-        lives on GPU (see ZeRO3ForwardHook.register), so we update p.data
-        in-place; cpu_param_data is no longer maintained.
+        Each rank writes its own shard slice into model params, then
+        all ranks broadcast their slices so the full model is consistent.
+        Without the broadcast, each rank's model has only 1/N updated.
         """
         lo = self.shard_offsets[self.rank]
         hi = self.shard_offsets[self.rank + 1]
@@ -579,30 +611,40 @@ class ShardState:
             s_end = g_end - lo
             with torch.no_grad():
                 updated = self.param_shard.data[s_start:s_end]
-                # Update model param in-place (p.data lives on GPU in BF16)
                 flat = p.data.reshape(-1)
                 flat[p_start:p_end].copy_(updated.to(p.dtype))
+
+        # Broadcast each rank's updated slices to all other ranks
+        if self.world_size > 1 and dist.is_initialized():
+            self._broadcast_model_params()
+
+    def _broadcast_model_params(self) -> None:
+        """Broadcast each rank's updated param slices to all ranks.
+
+        After each rank wrote its own shard slice into the BF16 model,
+        broadcast from each source rank so every rank has the full
+        updated model. Uses per-param broadcasts (handles uneven shards).
+        """
+        for _name, p in self.param_order:
+            sl = self.param_offsets[_name]
+            flat = p.data.reshape(-1)
+            for r in range(self.world_size):
+                r_lo = self.shard_offsets[r]
+                r_hi = self.shard_offsets[r + 1]
+                p_lo = max(sl.global_start, r_lo) - sl.global_start
+                p_hi = min(sl.global_end, r_hi) - sl.global_start
+                if p_hi > p_lo:
+                    dist.broadcast(flat[p_lo:p_hi], src=r)
 
     def sync_shard_to_model_async(
         self, stream: Optional["torch.cuda.Stream"] = None
     ) -> "torch.cuda.Stream":
-        """Launch async copy of updated FP32 param_shard → model BF16 params.
+        """Write local shard + broadcast to sync full model across ranks.
 
-        All ``p.data`` copies are issued on *stream* (or a freshly-created
-        stream when none is supplied) without waiting for them to complete.
-        The caller is responsible for synchronising before the next forward
-        pass, e.g.::
-
-            stream = shard_state.sync_shard_to_model_async()
-            # ... data preprocessing happens on the default stream ...
-            torch.cuda.current_stream().wait_stream(stream)  # before forward
-
-        Returns the CUDA stream on which the copies were issued so the caller
-        can wait on it at the appropriate point.
+        Local FP32→BF16 copies run on *stream*. The broadcast (NCCL) runs
+        on the default stream after waiting for copies to finish.
         """
         if not torch.cuda.is_available():
-            # Fallback: CPU path — just do the synchronous version and return
-            # a sentinel (None handled by caller).
             self.sync_shard_to_model()
             return None  # type: ignore[return-value]
 
@@ -626,8 +668,12 @@ class ShardState:
                     s_end = g_end - lo
                     updated = self.param_shard.data[s_start:s_end]
                     flat = p.data.reshape(-1)
-                    # non_blocking=True: copy proceeds asynchronously on *stream*
                     flat[p_start:p_end].copy_(updated.to(p.dtype), non_blocking=True)
+
+        # Broadcast must run after local copies finish
+        if self.world_size > 1 and dist.is_initialized():
+            torch.cuda.current_stream().wait_stream(stream)
+            self._broadcast_model_params()
 
         return stream
 

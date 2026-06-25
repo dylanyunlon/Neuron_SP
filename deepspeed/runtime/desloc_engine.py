@@ -564,22 +564,24 @@ class PartitionSolver:
     # Strategy A: ZeRO-3 + Heterogeneous Gradient Accumulation
     # ------------------------------------------------------------------
     def _plan_zero3(self) -> PartitionPlan:
-        """Build the ZeRO-3 heterogeneous gradient accumulation plan."""
+        """ZeRO-3 plan: uniform grad_accum, per-tier micro_batch_size.
+
+        Upstream Megatron pattern — num_microbatches is a single global value
+        identical on all ranks. Heterogeneous throughput comes from per-rank
+        micro_batch_size (H100 takes larger batches, A6000 takes smaller).
+        """
         cfg = self.config
         tier_layer_map: Dict[int, List[int]] = {}
         grad_accum: Dict[int, int] = {}
         micro_bs: Dict[int, int] = {}
 
-        # All devices participate in ZeRO-3; layers are replicated across all GPUs
-        # (ZeRO-3 partitions optimizer state + gradients, not layers)
         all_layers = list(range(cfg.num_layers))
         for spec in self.tiers:
             tier_layer_map[spec.device_index] = all_layers[:]
+            grad_accum[spec.device_index] = cfg.grad_accum_steps
             if spec.tier == TierClass.H100:
-                grad_accum[spec.device_index] = 22
-                micro_bs[spec.device_index] = cfg.micro_batch_size
+                micro_bs[spec.device_index] = min(cfg.micro_batch_size * 4, 4)
             else:
-                grad_accum[spec.device_index] = 1
                 micro_bs[spec.device_index] = cfg.micro_batch_size
 
         throughput = self._estimate_zero3_throughput(micro_bs, grad_accum)
@@ -590,7 +592,9 @@ class PartitionSolver:
             grad_accum_steps=grad_accum,
             micro_batch_sizes=micro_bs,
             estimated_throughput=throughput,
-            notes="ZeRO-3: H100 22 micro-batches, A6000 1 each, AllReduce sync",
+            notes=f"ZeRO-3: uniform grad_accum={cfg.grad_accum_steps}, "
+                  f"per-tier micro_bs (H100={min(cfg.micro_batch_size * 4, 4)}, "
+                  f"A6000={cfg.micro_batch_size})",
         )
 
     # ------------------------------------------------------------------
@@ -2167,14 +2171,12 @@ class DesLocEngine:
             if self.fp32_grad_manager is not None and self.param_shard_state is None:
                 self.fp32_grad_manager.after_backward(scale=1.0 / num_microbatches)
 
-            # Backward hooks have already written local grads into param_shard.grad.
-            # NOTE: No all_reduce on param_shard.grad here. Each rank runs
-            # the full model on its own micro-batches and extracts its shard
-            # slice of the gradient. The shards are DIFFERENT SIZES (hetero),
-            # so dist.all_reduce would cause illegal memory access.
-            # Gradient averaging across ranks happens implicitly: each rank
-            # sees different data but the same model, so the optimizer
-            # converges via independent shard updates + sync_shard_to_model.
+            # --- finalize_model_grads (upstream Megatron pattern) ---
+            # All-reduce param_shard.grad across ranks so every rank's shard
+            # gradient is the average over all data-parallel replicas.
+            # Must run BEFORE gradient clipping and optimizer.step().
+            if self.param_shard_state is not None:
+                self.param_shard_state.allreduce_shard_grads()
 
             # Gradient clipping — DeepSpeed ZeRO-3 style:
             # 1. Each rank computes local L2 norm² on its param_shard.grad
