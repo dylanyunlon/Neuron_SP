@@ -1846,6 +1846,10 @@ class DesLocEngine:
         # Rank guard: only rank 0 prints/logs to avoid 5x log spam
         _is_main = (not dist.is_initialized()) or (dist.get_rank() == 0)
 
+        # Suppress duplicate log messages from non-rank-0 processes
+        if not _is_main:
+            logging.getLogger("deepspeed").setLevel(logging.WARNING)
+
         # --- Optional logging backends (rank 0 only) ---
         import datetime as _dt  # noqa: PLC0415
         _ts = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -2286,19 +2290,13 @@ class DesLocEngine:
                 #
                 # We cache _n_params at logging time (cheap; model frozen during step).
                 # -------------------------------------------------------------------
-                _peak_flops_per_device = 835e12  # H100 NVL BF16 default
+                _peak_flops_cluster = 835e12  # single H100 NVL BF16 default
                 if self.tiers:
-                    # Sum peak TFLOPS across all participating GPUs to get total
-                    # cluster peak, then use per-rank share for MFU.
-                    _cluster_peak = sum(t.bf16_tflops * 1e12 for t in self.tiers)
-                    _world = dist.get_world_size() if dist.is_initialized() else 1
-                    _peak_flops_per_device = _cluster_peak / max(_world, 1)
+                    _peak_flops_cluster = sum(t.bf16_tflops * 1e12 for t in self.tiers)
                 _n_params = sum(p.numel() for p in self.model.parameters())
-                _t_tokens = tokens_this_step * cfg.log_every  # tokens over log window
-                # actual FLOPs = 2 * N_params * 6 * T_tokens
-                #   factor 6: forward (2) + backward (4) per token
+                _t_tokens = tokens_this_step * cfg.log_every
                 _actual_flops = 2 * _n_params * 6 * _t_tokens
-                _mfu = _actual_flops / max(elapsed * _peak_flops_per_device, 1.0)
+                _mfu = _actual_flops / max(elapsed * _peak_flops_cluster, 1.0)
 
                 logger.info(
                     "step=%6d | loss=%.4f | lr=%.2e | grad_norm=%.3f | "

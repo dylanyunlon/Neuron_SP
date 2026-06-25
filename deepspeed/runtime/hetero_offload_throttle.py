@@ -662,11 +662,19 @@ class DESLOCOffloadConfig:
         use_full_iter_cuda_graph: bool = False,
         device_tiers: Optional[Dict[int, str]] = None,
         offload_group_names: Optional[List[str]] = None,
+        base_cap_per_group: int = 4,
+        h100_cap_multiplier: float = 2.0,
+        enable_locality_cache: bool = True,
+        max_outstanding_bytes: int = 4 * 1024 ** 3,
     ) -> None:
         self.base_max_inflight = base_max_inflight
         self.use_full_iter_cuda_graph = use_full_iter_cuda_graph
         self.device_tiers = device_tiers or {}
         self.offload_group_names = offload_group_names or []
+        self.base_cap_per_group = base_cap_per_group
+        self.h100_cap_multiplier = h100_cap_multiplier
+        self.enable_locality_cache = enable_locality_cache
+        self.max_outstanding_bytes = max_outstanding_bytes
 
     def validate(self) -> None:
         """Replicate Megatron's ``__post_init__`` assertion in DES-LOC context.
