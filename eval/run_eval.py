@@ -9,11 +9,8 @@ import json
 import os
 import sys
 import time
-import random
-import re
 import subprocess
 import tempfile
-from pathlib import Path
 from typing import Optional
 
 try:
