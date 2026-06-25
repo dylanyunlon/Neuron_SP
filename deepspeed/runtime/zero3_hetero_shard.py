@@ -931,87 +931,79 @@ class GradBucketManager:
         self._buffers_allocated = True
 
     def on_grad_ready(self, name: str, param_grad: torch.Tensor):
-        """Called by backward hook when param.grad is computed.
-
-        Copies the FULL param gradient into the bucket buffer.
-        Does NOT fire all_reduce — call start_grad_sync() after all
-        microbatches to trigger the collective.
-        """
-        self._alloc_buffers()
+        """Store grad reference for deferred bucket processing."""
         bi = self._param_bucket[name]
         bucket = self.buckets[bi]
         start, end = bucket['offsets'][name]
-        flat = param_grad.detach().reshape(-1).to(dtype=torch.float32, device=self.device)
-        take = min(flat.numel(), end - start)
-        bucket['buffer'][start:start + take].add_(flat[:take])
+        if 'grads' not in bucket:
+            bucket['grads'] = {}
+        bucket['grads'][name] = (start, end, param_grad.detach().clone())
 
     def start_grad_sync(self):
-        """Fire all_reduce on all buckets. Call after last microbatch's backward.
+        """Process buckets sequentially with ONE shared FP32 buffer.
 
-        Uses _coalescing_manager if available (PyTorch >=2.0) to batch
-        all bucket all_reduces into ONE NCCL call.
+        For each bucket: zero buf → copy grads → all_reduce → div → extract shard.
+        Peak memory: max_bucket_size × FP32 ≈ 800MB (fits A6000).
         """
         if self.world_size <= 1 or not dist.is_initialized():
+            self._extract_local()
             return
 
-        try:
-            from torch.distributed.distributed_c10d import _coalescing_manager
-            _pg = dist.group.WORLD if hasattr(dist, 'group') else None
-            with _coalescing_manager(_pg, async_ops=True) as cm:
-                for bucket in self.buckets:
-                    if bucket['buffer'] is not None:
-                        dist.all_reduce(bucket['buffer'], op=dist.ReduceOp.SUM, async_op=True)
-            self._coalesced_handle = cm
-        except ImportError:
-            # Fallback: per-bucket async all_reduce
-            for bucket in self.buckets:
-                if bucket['buffer'] is not None:
-                    bucket['handle'] = dist.all_reduce(
-                        bucket['buffer'], op=dist.ReduceOp.SUM, async_op=True,
-                    )
-
-    def finish_grad_sync(self):
-        """Wait for all bucket all_reduces, extract shard slices to param_shard.grad."""
+        self._alloc_buffers()
         ss = self.ss
-        lo = ss.shard_offsets[ss.rank]
-        hi = ss.shard_offsets[ss.rank + 1]
+        lo, hi = ss.shard_offsets[ss.rank], ss.shard_offsets[ss.rank + 1]
+        buf = self._shared_buf
 
-        # Wait for coalesced or per-bucket handles
-        if hasattr(self, '_coalesced_handle') and self._coalesced_handle is not None:
-            self._coalesced_handle.wait()
-            self._coalesced_handle = None
-        else:
-            for bucket in self.buckets:
-                if bucket['handle'] is not None:
-                    bucket['handle'].wait()
-                    bucket['handle'] = None
-
-        # Average and extract shard slices for ALL buckets
         for bucket in self.buckets:
-            if bucket['buffer'] is None:
+            grads = bucket.get('grads', {})
+            if not grads:
                 continue
-            bucket['buffer'].div_(self.world_size)
+            size = bucket['total_size']
+            buf[:size].zero_()
 
-            for name in bucket['names']:
-                sl = ss.param_offsets[name]
-                bstart, bend = bucket['offsets'][name]
+            for gname, (start, end, grad_t) in grads.items():
+                flat = grad_t.reshape(-1).to(dtype=torch.float32, device=self.device)
+                take = min(flat.numel(), end - start)
+                buf[start:start + take].add_(flat[:take])
 
-                g_start = max(sl.global_start, lo)
-                g_end = min(sl.global_end, hi)
+            dist.all_reduce(buf[:size], op=dist.ReduceOp.SUM)
+            buf[:size].div_(self.world_size)
+
+            for gname in bucket['names']:
+                sl = ss.param_offsets[gname]
+                bstart, bend = bucket['offsets'][gname]
+                g_start, g_end = max(sl.global_start, lo), min(sl.global_end, hi)
                 if g_end <= g_start:
                     continue
                 p_lo = g_start - sl.global_start
                 p_hi = g_end - sl.global_start
                 s_lo = g_start - lo
-                s_hi = g_end - lo
-                ss.param_shard.grad[s_lo:s_hi].add_(
-                    bucket['buffer'][bstart + p_lo:bstart + p_hi]
-                )
+                ss.param_shard.grad[s_lo:s_lo + (p_hi - p_lo)].add_(
+                    buf[bstart + p_lo:bstart + p_hi])
+
+            bucket['grads'] = {}
+
+    def _extract_local(self):
+        """Fallback for world_size<=1."""
+        ss = self.ss
+        lo, hi = ss.shard_offsets[ss.rank], ss.shard_offsets[ss.rank + 1]
+        for bucket in self.buckets:
+            for gname, (start, end, grad_t) in bucket.get('grads', {}).items():
+                sl = ss.param_offsets[gname]
+                g_start, g_end = max(sl.global_start, lo), min(sl.global_end, hi)
+                if g_end <= g_start:
+                    continue
+                flat = grad_t.reshape(-1).to(dtype=torch.float32, device=self.device)
+                p_lo, p_hi = g_start - sl.global_start, g_end - sl.global_start
+                s_lo = g_start - lo
+                ss.param_shard.grad[s_lo:s_lo + (p_hi - p_lo)].add_(flat[p_lo:p_hi])
+            bucket['grads'] = {}
+
+    def finish_grad_sync(self):
+        """No-op — start_grad_sync processes synchronously."""
+        pass
 
     def reset(self):
-        """Reset for next step: zero buffers and pending counts."""
+        """Reset for next step."""
         for bucket in self.buckets:
-            bucket['pending'] = len(bucket['names'])
-            bucket['handle'] = None
-            if bucket['buffer'] is not None:
-                bucket['buffer'].zero_()
+            bucket['grads'] = {}
