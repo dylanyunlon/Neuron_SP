@@ -322,6 +322,206 @@ def _comm_reduction_ratio(run: RunInfo) -> float:
     return 1.0 - (1.0 / max(run.Kx, 1) + 1.0 / max(run.Ku, 1) + 1.0 / max(run.Kv, 1))
 
 
+def _build_best_config(groups: Dict[str, Dict[str, List[RunInfo]]]) -> dict:
+    """Find the best (lowest final_loss) DESLOC config per model_size and overall."""
+    best_per_size: Dict[str, dict] = {}
+    global_best: Optional[dict] = None
+
+    for model_size, methods in sorted(groups.items()):
+        desloc_runs = [r for r in methods.get("DESLOC", []) if len(r.losses) >= 5]
+        if not desloc_runs:
+            continue
+        best_run = min(desloc_runs, key=lambda r: r.final_loss)
+        entry = {
+            "model_size": best_run.model_size,
+            "Kx": best_run.Kx,
+            "Ku": best_run.Ku,
+            "Kv": best_run.Kv,
+            "final_loss": round(best_run.final_loss, 6),
+            "avg_loss": round(best_run.avg_loss, 6),
+            "comm_reduction_ratio": round(_comm_reduction_ratio(best_run), 4),
+            "mfu": round(best_run.mfu, 6),
+            "tokens_per_second_cluster": round(best_run.tokens_per_second_cluster, 1),
+            "timestamp": best_run.timestamp,
+        }
+        best_per_size[model_size] = entry
+        if global_best is None or best_run.final_loss < global_best["final_loss"]:
+            global_best = entry
+
+    return {
+        "overall": global_best,
+        "per_model_size": best_per_size,
+        "note": (
+            "best_config shows the DESLOC K-configuration achieving the lowest "
+            "final training loss for each model size across all benchmark runs"
+        ),
+    }
+
+
+def _build_throughput_comparison(groups: Dict[str, Dict[str, List[RunInfo]]]) -> dict:
+    """Compare throughput between DESLOC and DDP baseline per model_size."""
+    comparison: Dict[str, dict] = {}
+
+    for model_size in sorted(groups.keys()):
+        methods = groups[model_size]
+        ddp_runs = [r for r in methods.get("DDP", []) if r.tokens_per_second_cluster > 0]
+        desloc_runs = [r for r in methods.get("DESLOC", []) if r.tokens_per_second_cluster > 0]
+        localadam_runs = [r for r in methods.get("LocalAdam", []) if r.tokens_per_second_cluster > 0]
+
+        if not ddp_runs:
+            continue
+
+        def _agg(runs: List[RunInfo]) -> dict:
+            if not runs:
+                return {}
+            best = max(runs, key=lambda r: r.tokens_per_second_cluster)
+            return {
+                "max_tokens_per_second_cluster": round(best.tokens_per_second_cluster, 1),
+                "max_tokens_per_second_per_gpu": round(best.tokens_per_second_per_gpu, 1),
+                "max_mfu": round(best.mfu, 6),
+                "peak_memory_gb": round(best.peak_memory_gb, 3),
+                "n_runs": len(runs),
+            }
+
+        ddp_best_tps = max(r.tokens_per_second_cluster for r in ddp_runs)
+        desloc_ratio = (
+            round(max(r.tokens_per_second_cluster for r in desloc_runs) / ddp_best_tps, 4)
+            if desloc_runs else None
+        )
+        localadam_ratio = (
+            round(max(r.tokens_per_second_cluster for r in localadam_runs) / ddp_best_tps, 4)
+            if localadam_runs else None
+        )
+
+        comparison[model_size] = {
+            "DDP": _agg(ddp_runs),
+            "DESLOC": _agg(desloc_runs) if desloc_runs else None,
+            "LocalAdam": _agg(localadam_runs) if localadam_runs else None,
+            "desloc_vs_ddp_throughput_ratio": desloc_ratio,
+            "localadam_vs_ddp_throughput_ratio": localadam_ratio,
+        }
+
+    return {
+        "by_model_size": comparison,
+        "note": (
+            "throughput_comparison reports peak tokens/second for each method. "
+            "desloc_vs_ddp_throughput_ratio > 1 means DESLOC is faster than DDP baseline."
+        ),
+    }
+
+
+def _build_comm_reduction(runs: List[RunInfo]) -> dict:
+    """Compute weighted communication reduction across all DESLOC runs."""
+    config_stats: Dict[str, dict] = {}
+
+    for run in runs:
+        key = f"Kx={run.Kx}_Ku={run.Ku}_Kv={run.Kv}"
+        if key not in config_stats:
+            config_stats[key] = {
+                "Kx": run.Kx,
+                "Ku": run.Ku,
+                "Kv": run.Kv,
+                "comm_reduction_ratio": round(_comm_reduction_ratio(run), 4),
+                "n_runs": 0,
+                "model_sizes": set(),
+                "total_steps": 0,
+                "weighted_comm_reduction": 0.0,
+            }
+        s = config_stats[key]
+        s["n_runs"] += 1
+        s["model_sizes"].add(run.model_size)
+        steps = len(run.losses)
+        s["total_steps"] += steps
+        s["weighted_comm_reduction"] += _comm_reduction_ratio(run) * steps
+
+    # Compute overall weighted comm reduction (weighted by total training steps)
+    total_steps_all = sum(s["total_steps"] for s in config_stats.values())
+    weighted_avg = (
+        sum(s["weighted_comm_reduction"] for s in config_stats.values()) / total_steps_all
+        if total_steps_all > 0 else 0.0
+    )
+
+    # Serialize (convert sets to sorted lists)
+    serializable = {}
+    for k, s in sorted(config_stats.items()):
+        serializable[k] = {
+            "Kx": s["Kx"],
+            "Ku": s["Ku"],
+            "Kv": s["Kv"],
+            "comm_reduction_ratio": s["comm_reduction_ratio"],
+            "n_runs": s["n_runs"],
+            "model_sizes": sorted(s["model_sizes"]),
+            "total_training_steps": s["total_steps"],
+        }
+
+    baseline_key = "Kx=1_Ku=1_Kv=1"
+    return {
+        "formula": "comm_reduction = 1 - (1/Kx + 1/Ku + 1/Kv)",
+        "baseline": baseline_key,
+        "configs": serializable,
+        "overall_weighted_comm_reduction": round(weighted_avg, 4),
+        "note": (
+            "comm_reduction measures the fraction of communication rounds eliminated vs full sync. "
+            "overall_weighted_comm_reduction is weighted by total training steps across all runs."
+        ),
+    }
+
+
+def _build_loss_trajectories(groups: Dict[str, Dict[str, List[RunInfo]]]) -> dict:
+    """Build per-config grouped loss curves for plotting and analysis."""
+    trajectories: Dict[str, dict] = {}
+
+    for model_size in sorted(groups.keys()):
+        methods = groups[model_size]
+        trajectories[model_size] = {}
+
+        for method in sorted(methods.keys()):
+            method_runs = [r for r in methods[method] if len(r.losses) >= 5]
+            if not method_runs:
+                continue
+
+            # Group by K-config
+            k_groups: Dict[str, List[RunInfo]] = {}
+            for run in method_runs:
+                k_key = f"Kx={run.Kx}_Ku={run.Ku}_Kv={run.Kv}"
+                if k_key not in k_groups:
+                    k_groups[k_key] = []
+                k_groups[k_key].append(run)
+
+            method_entry = {}
+            for k_key, k_runs in sorted(k_groups.items()):
+                # Pick the longest run as the representative trajectory
+                rep = max(k_runs, key=lambda r: len(r.losses))
+                # Subsample losses to max 100 points for report size
+                losses = rep.losses
+                if len(losses) > 100:
+                    stride = len(losses) // 100
+                    losses = losses[::stride]
+
+                method_entry[k_key] = {
+                    "Kx": rep.Kx,
+                    "Ku": rep.Ku,
+                    "Kv": rep.Kv,
+                    "n_steps_total": len(rep.losses),
+                    "n_steps_sampled": len(losses),
+                    "final_loss": round(rep.final_loss, 6),
+                    "comm_reduction_ratio": round(_comm_reduction_ratio(rep), 4),
+                    "representative_timestamp": rep.timestamp,
+                    "n_runs_in_group": len(k_runs),
+                    "losses": [round(v, 6) for v in losses],
+                }
+
+            trajectories[model_size][method] = method_entry
+
+    return {
+        "by_model_size": trajectories,
+        "note": (
+            "loss_trajectories groups training loss curves by (model_size, method, K-config). "
+            "Losses are subsampled to ≤100 points using the longest representative run per group."
+        ),
+    }
+
+
 def compare_convergence(
     runs_a: List[RunInfo],
     runs_b: List[RunInfo],
@@ -536,11 +736,21 @@ def generate_report(
                 "max_steps": max(len(r.losses) for r in method_runs),
             })
 
+    # New required sections
+    best_config = _build_best_config(groups)
+    throughput_comparison = _build_throughput_comparison(groups)
+    comm_reduction = _build_comm_reduction(runs)
+    loss_trajectories = _build_loss_trajectories(groups)
+
     report = {
         "analysis": "DES-LOC Convergence Analysis",
         "log_directories_scanned": len(set(os.path.dirname(r.filepath) for r in runs)),
         "total_runs_parsed": len(runs),
         "total_runs_analyzed": len(run_summaries),
+        "best_config": best_config,
+        "throughput_comparison": throughput_comparison,
+        "comm_reduction": comm_reduction,
+        "loss_trajectories": loss_trajectories,
         "summary_table": summary_table,
         "convergence_comparisons": comparisons,
         "scaling_law_cross_reference": scaling_xref,
@@ -568,8 +778,8 @@ def main() -> None:
     )
     parser.add_argument(
         "--output",
-        default="convergence_report.json",
-        help="Path to write the convergence report JSON (default: convergence_report.json)",
+        default="experiments/convergence_report.json",
+        help="Path to write the convergence report JSON (default: experiments/convergence_report.json)",
     )
     parser.add_argument(
         "--scaling-predictions",
