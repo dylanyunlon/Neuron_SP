@@ -74,7 +74,7 @@ def download_and_iter(lang, max_samples, cache_dir="data/hf_cache"):
         subprocess.run(
             ["hf", "download",
              "--repo-type", "dataset",
-             "--resume-download",
+             
              repo_id,
              "--local-dir", local_dir],
             check=True, capture_output=True, text=True, timeout=600,
