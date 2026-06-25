@@ -1701,14 +1701,12 @@ class DesLocEngine:
         self._grad_bucket_mgr = None
         if self.param_shard_state is not None:
             try:
-                from deepspeed.runtime.zero3_hetero_shard import GradBucketManager
-                self._grad_bucket_mgr = GradBucketManager(
-                    self.param_shard_state, bucket_size_elems=200_000_000,
-                )
+                # Local SGD: no per-param all_reduce (1816 NCCL calls → 15.8s/step).
+                # Cross-rank sync via bucketed broadcast in sync_shard_to_model.
                 self._zero3_grad_hook_handles = (
                     self.param_shard_state.register_backward_hooks(
                         fp32_grad_manager=self.fp32_grad_manager,
-                        bucket_mgr=self._grad_bucket_mgr,
+                        bucket_mgr=None,
                     )
                 )
                 logger.info(
@@ -2087,6 +2085,7 @@ class DesLocEngine:
                     input_ids, labels = raw
 
                 # Apply capacity-weighted CP slice (mandatory — no fallback)
+                _orig_seq = input_ids.shape[-1]
                 batch_dict = {"tokens": input_ids}
                 if labels is not None:
                     batch_dict["labels"] = labels
@@ -2096,6 +2095,10 @@ class DesLocEngine:
                 )
                 input_ids = sliced.get("tokens", input_ids)
                 labels = sliced.get("labels", labels)
+                if micro == 0 and step < 3:
+                    logger.info("[CP-slice] rank=%d orig_seq=%d → sliced_seq=%d",
+                                dist.get_rank() if dist.is_initialized() else 0,
+                                _orig_seq, input_ids.shape[-1])
                 _local_dev = torch.device(f"cuda:{torch.cuda.current_device()}")
                 input_ids = input_ids.to(_local_dev, non_blocking=True)
                 if labels is not None:
