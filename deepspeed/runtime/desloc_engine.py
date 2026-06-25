@@ -1161,13 +1161,19 @@ class DesLocEngine:
             # We need it to be a leaf tensor with requires_grad for AdamW.
             _shard = self.param_shard_state.param_shard
             _shard.requires_grad_(True)
+            # foreach=True uses fused CUDA kernels (no temp buffer) but
+            # has int32 indexing — overflows at >2.1B elements (rank 0 H100
+            # shard has 3.26B). foreach=False is safe but allocates a temp
+            # denom buffer (6.19 GB) that OOMs on A6000.
+            # Fix: foreach=True when shard fits int32, False otherwise.
+            _use_foreach = _shard.numel() <= 2**31 - 1
             self.optimizer = AdamW(
                 [_shard],
                 lr=config.max_lr,
                 betas=(config.beta1, config.beta2),
                 eps=config.eps,
                 weight_decay=config.weight_decay,
-                foreach=False,  # shard can exceed INT32_MAX (2.1B) elements
+                foreach=_use_foreach,
             )
             logger.info(
                 "[zero3] Optimizer on param_shard: %d FP32 elements on %s",
