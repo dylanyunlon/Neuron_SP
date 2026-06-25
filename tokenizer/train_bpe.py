@@ -1,30 +1,32 @@
 # SPDX-License-Identifier: Apache-2.0
-# DeepSpeed / Neuron-SP Team
+# Neuron-SP Team
 """
 train_bpe.py — Train a ByteLevel BPE tokenizer on CommitPack (Python + JavaScript)
 
-Vocab layout (32 000 total accessible tokens):
-┌──────────────────────────────────────────────────────────────┐
-│  ByteLevel BPE model.vocab  = 31 744 entries                 │
-│    ├─ ids  0 – 255  : 256 built-in byte tokens (Ġ…)          │
-│    └─ ids 256 – 31743 : 31 488 learned BPE merges            │
-│  added_tokens (special / named byte aliases)                 │
-│    ├─ ids 31744 – 31999 : 256 explicit <byte_0> … <byte_255> │
-│    └─ ids 32000 – 32008 : 9  commit special tokens           │
-│  TOTAL get_vocab_size()   ≈ 32 009                           │
-│  "32 000" headline figure = 31 744 BPE + 256 byte aliases    │
-└──────────────────────────────────────────────────────────────┘
+Vocab layout (32 000 total):
+┌──────────────────────────────────────────────────────────────────┐
+│  ByteLevel BPE  vocab_size = 31 744                              │
+│    ids   0 –   255 : 256 raw-byte tokens (built-in to ByteLevel) │
+│    ids 256 – 31743 : 31 488 learned BPE merge tokens             │
+│  added_tokens                                                    │
+│    ids 31744 – 31999 : 256 explicit byte_0 … byte_255 aliases    │
+│    ids 32000 – 32008 :   9 commit special tokens                 │
+│  TOTAL  31 744 + 256 = 32 000  (headline figure)                 │
+│  get_vocab_size() ≈ 32 009     (including commit specials)       │
+└──────────────────────────────────────────────────────────────────┘
 
 Steps:
-  1. Stream 500K records from bigcode/commitpackft (python + javascript).
+  1. Stream 500 K records from bigcode/commitpack (python + javascript).
   2. Train ByteLevelBPETokenizer with vocab_size=31 744.
   3. Inject 256 named byte-fallback tokens  <byte_0> … <byte_255>.
-  4. Inject 9 commit special tokens from COMMIT_SPECIAL_TOKENS (incl. <pad>).
+  4. Inject 9 commit special tokens (mirrors pipeline/unified_tokenizer.py).
   5. Save to tokenizer/neuron_sp_32k/tokenizer.json.
 
 Usage:
     python tokenizer/train_bpe.py [--samples 500000] [--output tokenizer/neuron_sp_32k]
 """
+
+from __future__ import annotations
 
 import argparse
 import json
@@ -32,6 +34,7 @@ import logging
 import os
 import sys
 import time
+from typing import Iterator
 
 logging.basicConfig(
     level=logging.INFO,
@@ -40,11 +43,11 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-
 # ---------------------------------------------------------------------------
-# Commit special tokens (mirrors pipeline/unified_tokenizer.py)
+# Commit special tokens — mirrors pipeline/unified_tokenizer.py _LEGACY_COMMIT_TOKENS
+# + <pad> for padding support
 # ---------------------------------------------------------------------------
-COMMIT_SPECIAL_TOKENS = [
+COMMIT_SPECIAL_TOKENS: list[str] = [
     "<|diff_start|>",
     "<|diff_end|>",
     "<|old|>",
@@ -56,76 +59,110 @@ COMMIT_SPECIAL_TOKENS = [
     "<pad>",
 ]
 
-# Byte-fallback token names  (explicit named aliases for deterministic coverage)
-BYTE_FALLBACK_TOKENS = [f"<byte_{i}>" for i in range(256)]
-
+# 256 explicit byte-fallback token aliases for deterministic byte coverage
+BYTE_FALLBACK_TOKENS: list[str] = [f"<byte_{i}>" for i in range(256)]
 
 # ---------------------------------------------------------------------------
-# Data helpers
+# Dataset helpers
 # ---------------------------------------------------------------------------
 
-def iter_commit_texts(num_samples: int, batch_log: int = 50_000):
-    """Stream text from bigcode/commitpackft (python + javascript).
+_LANG_FILE_PATTERNS = {
+    "python":     "hf://datasets/bigcode/commitpack/data/python/python-{shard:04d}.jsonl",
+    "javascript": "hf://datasets/bigcode/commitpack/data/javascript/javascript-{shard:04d}.jsonl",
+}
 
-    Each commit record yields up to three text chunks:
-      - old_contents  (original file content before the commit)
-      - new_contents  (modified file content after the commit)
-      - message       (commit message / subject line)
+# Known shard counts (as of training time; fetched dynamically if huggingface_hub available)
+_KNOWN_SHARD_COUNTS = {"python": 458, "javascript": 516}
 
-    This gives the tokenizer realistic exposure to Python/JS code diffs as
-    well as natural-language commit summaries.
+
+def _resolve_data_files() -> list[str]:
+    """Return hf:// paths for all python + javascript shards in bigcode/commitpack."""
+    try:
+        from huggingface_hub import list_repo_tree  # type: ignore[import]
+
+        files: list[str] = []
+        for lang, prefix in [
+            ("python",     "data/python"),
+            ("javascript", "data/javascript"),
+        ]:
+            entries = list(list_repo_tree(
+                "bigcode/commitpack", repo_type="dataset", path_in_repo=prefix
+            ))
+            for entry in entries:
+                if entry.path.endswith(".jsonl"):
+                    files.append(f"hf://datasets/bigcode/commitpack/{entry.path}")
+        log.info("Resolved %d shard files via huggingface_hub.", len(files))
+        return files
+
+    except Exception as exc:  # noqa: BLE001
+        log.warning("huggingface_hub listing failed (%s); using hardcoded shard counts.", exc)
+
+    # Fallback: build paths from known shard counts
+    files = []
+    for lang, n_shards in _KNOWN_SHARD_COUNTS.items():
+        pattern = _LANG_FILE_PATTERNS[lang]
+        for i in range(1, n_shards + 1):
+            files.append(pattern.format(shard=i))
+    log.info("Built %d shard file paths from hardcoded counts.", len(files))
+    return files
+
+
+def iter_commit_texts(num_samples: int, batch_log: int = 50_000) -> Iterator[str]:
+    """Stream text from bigcode/commitpack (python + javascript).
+
+    Each record yields up to three text chunks:
+      - old_contents  (original file before commit)
+      - new_contents  (modified file after commit)
+      - message       (commit message / subject)
+
+    This exposes the tokenizer to real code diffs and natural-language summaries.
     """
     try:
-        from datasets import load_dataset
+        from datasets import load_dataset  # type: ignore[import]
     except ImportError:
-        log.error("datasets not installed; run:  pip install datasets")
+        log.error("datasets not installed — run:  pip install datasets")
         sys.exit(1)
 
+    data_files = _resolve_data_files()
     log.info(
-        "Loading bigcode/commitpackft (python + javascript) — streaming mode …"
+        "Loading bigcode/commitpack  langs=[python, javascript]  "
+        "shards=%d  streaming=True  target=%d records …",
+        len(data_files),
+        num_samples,
     )
 
     ds = load_dataset(
         "json",
-        data_files={
-            "train": [
-                "hf://datasets/bigcode/commitpackft/data/python/data.jsonl",
-                "hf://datasets/bigcode/commitpackft/data/javascript/data.jsonl",
-            ]
-        },
+        data_files={"train": data_files},
         split="train",
         streaming=True,
     )
 
     count = 0
-    t0 = time.time()
+    t0 = time.monotonic()
 
     for record in ds:
         if count >= num_samples:
             break
 
         for field in ("old_contents", "new_contents", "message"):
-            text = record.get(field, "")
-            if isinstance(text, str) and text.strip():
+            text: str = record.get(field, "") or ""
+            if text.strip():
                 yield text
 
         count += 1
 
         if count % batch_log == 0:
-            elapsed = time.time() - t0
+            elapsed = time.monotonic() - t0
             log.info(
                 "  … streamed %d / %d records  (%.1f rec/s)",
-                count,
-                num_samples,
-                count / max(elapsed, 1e-9),
+                count, num_samples, count / max(elapsed, 1e-9),
             )
 
-    elapsed = time.time() - t0
+    elapsed = time.monotonic() - t0
     log.info(
         "Streaming complete: %d records in %.1f s  (%.1f rec/s)",
-        count,
-        elapsed,
-        count / max(elapsed, 1e-9),
+        count, elapsed, count / max(elapsed, 1e-9),
     )
 
 
@@ -138,45 +175,26 @@ def train_tokenizer(
     bpe_vocab_size: int = 31_744,
     output_dir: str = "tokenizer/neuron_sp_32k",
 ) -> str:
-    """Train ByteLevelBPE, inject byte + special tokens, save tokenizer.json.
-
-    Vocab accounting
-    ----------------
-    ByteLevelBPETokenizer always allocates ids 0–255 for the 256 raw bytes,
-    then fills ids 256 … (bpe_vocab_size – 1) with learned merge tokens.
-    After training we append:
-      - 256 explicitly-named byte-fallback tokens  <byte_0> … <byte_255>
-        (ids bpe_vocab_size … bpe_vocab_size + 255)
-      - 9 commit special tokens
-        (ids bpe_vocab_size + 256 … bpe_vocab_size + 264)
-
-    So final tokenizer.get_vocab_size() == bpe_vocab_size + 256 + 9.
-    The headline "32 000" = bpe_vocab_size (31 744) + 256 byte aliases.
-
-    Args:
-        num_samples:   Number of commit records to stream.
-        bpe_vocab_size: vocab_size parameter passed to ByteLevelBPETokenizer.
-                        Default 31 744 gives the 31 744 + 256 = 32 000 total.
-        output_dir:    Directory where tokenizer.json is written.
+    """Train ByteLevelBPE, inject byte + commit tokens, save tokenizer.json.
 
     Returns:
-        Absolute path to the saved tokenizer.json.
+        Absolute path to the written tokenizer.json.
     """
     try:
-        from tokenizers import ByteLevelBPETokenizer
+        from tokenizers import ByteLevelBPETokenizer  # type: ignore[import]
+        from tokenizers import Tokenizer as _Tokenizer  # type: ignore[import]
     except ImportError:
-        log.error("tokenizers not installed; run:  pip install tokenizers")
+        log.error("tokenizers not installed — run:  pip install tokenizers")
         sys.exit(1)
 
     os.makedirs(output_dir, exist_ok=True)
 
-    # ------------------------------------------------------------------
+    # -----------------------------------------------------------------------
     # 1.  Train base ByteLevel BPE  (vocab_size = 31 744)
-    # ------------------------------------------------------------------
+    # -----------------------------------------------------------------------
     log.info(
         "Training ByteLevelBPETokenizer  bpe_vocab_size=%d  num_samples=%d",
-        bpe_vocab_size,
-        num_samples,
+        bpe_vocab_size, num_samples,
     )
 
     tokenizer = ByteLevelBPETokenizer(
@@ -185,7 +203,7 @@ def train_tokenizer(
         unicode_normalizer=None,
     )
 
-    # Reserve all special tokens so they are never split by the BPE algorithm
+    # Reserve all special tokens upfront so BPE never splits them
     all_reserved = BYTE_FALLBACK_TOKENS + COMMIT_SPECIAL_TOKENS
 
     tokenizer.train_from_iterator(
@@ -194,46 +212,48 @@ def train_tokenizer(
         min_frequency=2,
         show_progress=True,
         special_tokens=all_reserved,
-        length=num_samples * 3,   # hint for tqdm progress bar
+        length=num_samples * 3,  # tqdm hint: ~3 text chunks per record
     )
 
-    actual_base = tokenizer.get_vocab_size()
-    log.info("BPE training complete.  model.vocab size = %d", actual_base)
+    base_vocab_size = tokenizer.get_vocab_size()
+    log.info("BPE training complete.  model.vocab_size = %d", base_vocab_size)
 
-    # ------------------------------------------------------------------
-    # 2.  Serialise to JSON for direct manipulation of the token table
-    # ------------------------------------------------------------------
+    # -----------------------------------------------------------------------
+    # 2.  Serialise to JSON for surgical token injection
+    # -----------------------------------------------------------------------
     tmp_path = os.path.join(output_dir, "_tmp_base.json")
     tokenizer.save(tmp_path)
 
     with open(tmp_path, "r", encoding="utf-8") as fh:
-        tok_data = json.load(fh)
+        tok_data: dict = json.load(fh)
 
-    vocab: dict = tok_data["model"]["vocab"]
+    vocab: dict[str, int] = tok_data["model"]["vocab"]
+    added_tokens_list: list[dict] = tok_data.get("added_tokens", [])
 
-    # ------------------------------------------------------------------
-    # 3.  Inject 256 named byte-fallback tokens  <byte_0> … <byte_255>
-    # ------------------------------------------------------------------
-    added_tokens_list: list = tok_data.get("added_tokens", [])
-    existing_added_contents = {t["content"] for t in added_tokens_list}
-    existing_vocab_tokens = set(vocab.keys())
+    existing_added_contents: set[str] = {t["content"] for t in added_tokens_list}
+    existing_vocab_tokens: set[str] = set(vocab.keys())
 
-    next_id = max(vocab.values()) + 1
+    next_id: int = max(vocab.values()) + 1
 
-    new_byte_entries: list = []
-    for bname in BYTE_FALLBACK_TOKENS:
-        # Skip if already present in model vocab or added_tokens
-        if bname in existing_vocab_tokens or bname in existing_added_contents:
-            continue
-        entry = {
-            "id": next_id,
-            "content": bname,
+    def _make_special_entry(content: str, token_id: int) -> dict:
+        return {
+            "id": token_id,
+            "content": content,
             "single_word": False,
             "lstrip": False,
             "rstrip": False,
             "normalized": False,
             "special": True,
         }
+
+    # -----------------------------------------------------------------------
+    # 3.  Inject 256 named byte-fallback tokens  <byte_0> … <byte_255>
+    # -----------------------------------------------------------------------
+    new_byte_entries: list[dict] = []
+    for bname in BYTE_FALLBACK_TOKENS:
+        if bname in existing_vocab_tokens or bname in existing_added_contents:
+            continue
+        entry = _make_special_entry(bname, next_id)
         new_byte_entries.append(entry)
         existing_added_contents.add(bname)
         next_id += 1
@@ -243,30 +263,27 @@ def train_tokenizer(
         len(new_byte_entries),
     )
 
-    # ------------------------------------------------------------------
+    # -----------------------------------------------------------------------
     # 4.  Inject 9 commit special tokens
-    # ------------------------------------------------------------------
-    new_special_entries: list = []
+    # -----------------------------------------------------------------------
+    new_special_entries: list[dict] = []
     for stoken in COMMIT_SPECIAL_TOKENS:
         if stoken in existing_vocab_tokens or stoken in existing_added_contents:
             continue
-        entry = {
-            "id": next_id,
-            "content": stoken,
-            "single_word": False,
-            "lstrip": False,
-            "rstrip": False,
-            "normalized": False,
-            "special": True,
-        }
+        entry = _make_special_entry(stoken, next_id)
         new_special_entries.append(entry)
         existing_added_contents.add(stoken)
         next_id += 1
 
-    log.info("Injected %d commit special tokens", len(new_special_entries))
+    log.info(
+        "Injected %d commit special tokens  (%s … %s)",
+        len(new_special_entries),
+        COMMIT_SPECIAL_TOKENS[0],
+        COMMIT_SPECIAL_TOKENS[-1],
+    )
 
-    # Merge new entries into added_tokens (sorted by id)
-    existing_ids = {t["id"] for t in added_tokens_list}
+    # Merge and re-sort added_tokens by id
+    existing_ids: set[int] = {t["id"] for t in added_tokens_list}
     for entry in new_byte_entries + new_special_entries:
         if entry["id"] not in existing_ids:
             added_tokens_list.append(entry)
@@ -275,46 +292,43 @@ def train_tokenizer(
 
     tok_data["added_tokens"] = added_tokens_list
 
-    # ------------------------------------------------------------------
+    # -----------------------------------------------------------------------
     # 5.  Save final tokenizer.json
-    # ------------------------------------------------------------------
+    # -----------------------------------------------------------------------
     out_path = os.path.join(output_dir, "tokenizer.json")
     with open(out_path, "w", encoding="utf-8") as fh:
         json.dump(tok_data, fh, ensure_ascii=False, indent=2)
 
-    # Compute headline vocab size: BPE model vocab + the 256 byte aliases
-    byte_aliases_added = len(new_byte_entries)
-    # If byte aliases were already in vocab (= 0 new), they are in the base vocab
-    headline_vocab = actual_base + byte_aliases_added
+    headline_vocab = base_vocab_size + len(new_byte_entries)
     log.info(
-        "Saved tokenizer.json → %s  |  "
-        "BPE model vocab = %d  |  "
-        "byte aliases added = %d  |  "
-        "commit specials added = %d  |  "
-        "headline 31744+256 = %d",
+        "Saved → %s\n"
+        "        BPE model vocab        = %d\n"
+        "        byte aliases injected  = %d\n"
+        "        commit specials added  = %d\n"
+        "        headline 31744+256     = %d",
         out_path,
-        actual_base,
-        byte_aliases_added,
+        base_vocab_size,
+        len(new_byte_entries),
         len(new_special_entries),
         headline_vocab,
     )
 
-    # Clean up temporary file
+    # Clean up temp file
     os.remove(tmp_path)
 
-    # ------------------------------------------------------------------
+    # -----------------------------------------------------------------------
     # 6.  Sanity checks
-    # ------------------------------------------------------------------
+    # -----------------------------------------------------------------------
     log.info("Running sanity checks …")
-    from tokenizers import Tokenizer as _Tokenizer
     loaded = _Tokenizer.from_file(out_path)
 
     total_size = loaded.get_vocab_size()
     log.info("  tokenizer.get_vocab_size() = %d", total_size)
 
-    sample = "def hello():\n    return 'world'  # 42"
+    # Encode a typical Python snippet
+    sample = "def hello():\n    return 'world'  # 42\n"
     enc = loaded.encode(sample)
-    log.info("  encode test: %d tokens → %s", len(enc.ids), enc.tokens[:12])
+    log.info("  encode test: '%s' → %d tokens  %s", sample[:30], len(enc.ids), enc.tokens[:10])
 
     ok_special = True
     for stoken in COMMIT_SPECIAL_TOKENS:
@@ -338,21 +352,22 @@ def train_tokenizer(
     if ok_special and ok_bytes:
         log.info("All special and byte tokens verified ✓")
     else:
-        log.warning("Some tokens missing — inspect tokenizer.json")
+        log.warning("Some tokens missing — inspect tokenizer.json carefully")
 
-    log.info("Done.  tokenizer.json: %s", os.path.abspath(out_path))
-    return os.path.abspath(out_path)
+    abs_path = os.path.abspath(out_path)
+    log.info("Done.  tokenizer.json: %s", abs_path)
+    return abs_path
 
 
 # ---------------------------------------------------------------------------
-# Entry point
+# CLI entry point
 # ---------------------------------------------------------------------------
 
-def parse_args():
+def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description=(
-            "Train a ByteLevel BPE tokenizer on CommitPack (Python + JS) "
-            "and save to tokenizer/neuron_sp_32k/tokenizer.json"
+            "Train a ByteLevel BPE tokenizer on bigcode/commitpack "
+            "(Python + JavaScript) and save to tokenizer/neuron_sp_32k/tokenizer.json."
         )
     )
     p.add_argument(
@@ -365,8 +380,9 @@ def parse_args():
         "--vocab-size",
         type=int,
         default=31_744,
+        dest="vocab_size",
         help=(
-            "BPE vocab_size parameter (default: 31 744). "
+            "BPE vocab_size (default: 31 744). "
             "256 byte-fallback tokens are appended after training, "
             "giving a 31 744 + 256 = 32 000 headline vocabulary."
         ),
@@ -381,7 +397,7 @@ def parse_args():
 
 
 if __name__ == "__main__":
-    args = parse_args()
+    args = _parse_args()
     train_tokenizer(
         num_samples=args.samples,
         bpe_vocab_size=args.vocab_size,
