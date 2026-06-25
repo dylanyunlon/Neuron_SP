@@ -1167,6 +1167,7 @@ class DesLocEngine:
                 betas=(config.beta1, config.beta2),
                 eps=config.eps,
                 weight_decay=config.weight_decay,
+                foreach=False,  # shard can exceed INT32_MAX (2.1B) elements
             )
             logger.info(
                 "[zero3] Optimizer on param_shard: %d FP32 elements on %s",
