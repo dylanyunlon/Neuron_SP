@@ -2055,7 +2055,7 @@ class DesLocEngine:
                     _shard_sync_pending = False
 
 
-                if self.mimo_loop is not None:
+                if self.mimo_loop is not None and self.param_shard_state is None:
                     # MIMO path: forward/backward dispatched through
                     # HeteroMIMOTrainingLoop with P2P + LOC cache
                     batch = (input_ids, labels)
