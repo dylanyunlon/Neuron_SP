@@ -72,7 +72,7 @@ def download_and_iter(lang, max_samples, cache_dir="data/hf_cache"):
     print(f"  [download] huggingface-cli download {repo_id} ...")
     try:
         subprocess.run(
-            ["huggingface-cli", "download",
+            ["hf", "download",
              "--repo-type", "dataset",
              "--resume-download",
              repo_id,
@@ -85,7 +85,7 @@ def download_and_iter(lang, max_samples, cache_dir="data/hf_cache"):
         # Try without auth
         try:
             subprocess.run(
-                ["huggingface-cli", "download",
+                ["hf", "download",
                  "--repo-type", "dataset",
                  repo_id,
                  "--local-dir", local_dir],
@@ -101,7 +101,7 @@ def download_and_iter(lang, max_samples, cache_dir="data/hf_cache"):
                       check=False)
         try:
             subprocess.run(
-                ["huggingface-cli", "download", "--repo-type", "dataset",
+                ["hf", "download", "--repo-type", "dataset",
                  repo_id, "--local-dir", local_dir],
                 check=True, capture_output=True, text=True, timeout=600,
             )
