@@ -557,21 +557,16 @@ class ShardState:
                 self.param_shard.grad[s_start:s_start + take].copy_(grad_flat[:take])
 
     def sync_shard_to_model(self) -> None:
-        """Write local FP32 shard slice then all_gather to synchronise all ranks.
+        """Copy updated FP32 param_shard back to model's BF16 parameters.
 
-        Standard ZeRO-3 post-optimizer-step sequence:
-          1. Each rank writes its own updated FP32 shard slice into model BF16.
-          2. all_gather broadcasts every rank's BF16 slice to all ranks so
-             the full model is consistent everywhere.
-
-        Without step 2, each rank's model copy has only 1/N of parameters
-        updated — the remaining (N-1)/N are stale from the previous step,
-        causing NaN on the next forward pass.
+        Called after optimizer.step() updates param_shard. Each rank writes
+        only the slice of each parameter that it owns.  The full model now
+        lives on GPU (see ZeRO3ForwardHook.register), so we update p.data
+        in-place; cpu_param_data is no longer maintained.
         """
         lo = self.shard_offsets[self.rank]
         hi = self.shard_offsets[self.rank + 1]
 
-        # Step 1: write this rank's updated shard into model BF16 params
         for name, p in self.param_order:
             sl = self.param_offsets[name]
             if sl.global_end <= lo or sl.global_start >= hi:
@@ -584,64 +579,30 @@ class ShardState:
             s_end = g_end - lo
             with torch.no_grad():
                 updated = self.param_shard.data[s_start:s_end]
+                # Update model param in-place (p.data lives on GPU in BF16)
                 flat = p.data.reshape(-1)
                 flat[p_start:p_end].copy_(updated.to(p.dtype))
-
-        # Step 2: all_gather so every rank has the complete updated model.
-        # Each rank just wrote its own slice; now broadcast all slices.
-        if self.world_size > 1 and dist.is_initialized():
-            self._allgather_model_params()
-
-    def _allgather_model_params(self) -> None:
-        """All-gather BF16 model parameters across all ranks.
-
-        After each rank writes its own shard slice into model params,
-        this broadcasts every rank's slice to all ranks so the full
-        model is consistent. Uses per-parameter all_gather to handle
-        heterogeneous shard sizes correctly.
-        """
-        for _name, p in self.param_order:
-            # Each rank already wrote its slice; now sync the full param.
-            # broadcast from each rank in sequence is simpler than
-            # reassembling from shards — and correct for uneven splits.
-            flat = p.data.reshape(-1)
-            # Collect the full parameter from all ranks.
-            # Each rank has its own updated slice + stale slices from others.
-            # We use all_reduce with a mask approach: each rank zeros out
-            # the parts it didn't update, then SUM gives the full param.
-            # But simpler: just all_gather the flat BF16 and scatter back.
-            sl = self.param_offsets[_name]
-            # Build per-rank chunks and all_gather
-            chunks = []
-            for r in range(self.world_size):
-                r_lo = self.shard_offsets[r]
-                r_hi = self.shard_offsets[r + 1]
-                p_lo = max(sl.global_start, r_lo) - sl.global_start
-                p_hi = min(sl.global_end, r_hi) - sl.global_start
-                if p_hi > p_lo:
-                    chunks.append((r, p_lo, p_hi))
-
-            if len(chunks) <= 1:
-                continue  # param lives entirely on one rank
-
-            # Use broadcast from each rank that owns a slice
-            for (r, p_lo, p_hi) in chunks:
-                dist.broadcast(flat[p_lo:p_hi], src=r)
 
     def sync_shard_to_model_async(
         self, stream: Optional["torch.cuda.Stream"] = None
     ) -> "torch.cuda.Stream":
-        """Write local shard + all_gather to synchronise full model across ranks.
+        """Launch async copy of updated FP32 param_shard → model BF16 params.
 
-        Local FP32→BF16 copies are issued on *stream*. The all_gather
-        (NCCL broadcast per param) runs on the default stream after
-        waiting for the copies to finish, because NCCL collectives must
-        execute on the same stream across all ranks.
+        All ``p.data`` copies are issued on *stream* (or a freshly-created
+        stream when none is supplied) without waiting for them to complete.
+        The caller is responsible for synchronising before the next forward
+        pass, e.g.::
 
-        The caller must wait on the returned stream before the next
-        forward pass.
+            stream = shard_state.sync_shard_to_model_async()
+            # ... data preprocessing happens on the default stream ...
+            torch.cuda.current_stream().wait_stream(stream)  # before forward
+
+        Returns the CUDA stream on which the copies were issued so the caller
+        can wait on it at the appropriate point.
         """
         if not torch.cuda.is_available():
+            # Fallback: CPU path — just do the synchronous version and return
+            # a sentinel (None handled by caller).
             self.sync_shard_to_model()
             return None  # type: ignore[return-value]
 
@@ -651,7 +612,6 @@ class ShardState:
         lo = self.shard_offsets[self.rank]
         hi = self.shard_offsets[self.rank + 1]
 
-        # Step 1: async local shard → model BF16 copies
         with torch.cuda.stream(stream):
             with torch.no_grad():
                 for name, p in self.param_order:
@@ -666,13 +626,8 @@ class ShardState:
                     s_end = g_end - lo
                     updated = self.param_shard.data[s_start:s_end]
                     flat = p.data.reshape(-1)
+                    # non_blocking=True: copy proceeds asynchronously on *stream*
                     flat[p_start:p_end].copy_(updated.to(p.dtype), non_blocking=True)
-
-        # Step 2: all_gather — must run after local copies finish.
-        # Wait for copy stream, then broadcast on default stream.
-        if self.world_size > 1 and dist.is_initialized():
-            torch.cuda.current_stream().wait_stream(stream)
-            self._allgather_model_params()
 
         return stream
 
