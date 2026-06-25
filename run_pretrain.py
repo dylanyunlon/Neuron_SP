@@ -335,11 +335,11 @@ def synthetic_iter(
     batch_size: int,
     seq_len: int,
     device: torch.device,
-) -> Iterator[Tuple[torch.Tensor, torch.Tensor]]:
+) -> Iterator[Dict[str, torch.Tensor]]:
     """Infinite synthetic token iterator for smoke-testing without real data."""
     while True:
         tokens = torch.randint(0, vocab_size, (batch_size, seq_len + 1))
-        yield tokens[:, :-1].to(device), tokens[:, 1:].to(device)
+        yield {"tokens": tokens[:, :-1].to(device), "labels": tokens[:, 1:].to(device)}
 
 
 def real_data_iter(
