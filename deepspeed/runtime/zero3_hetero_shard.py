@@ -475,17 +475,13 @@ class ShardState:
         return handles
 
     def allreduce_shard_grads(self) -> None:
-        """All-reduce param_shard.grad across ranks (upstream finalize_model_grads).
+        """All-reduce gradients across ranks (upstream finalize_model_grads).
 
-        Each rank's backward hooks accumulate this rank's shard slice of the
-        gradient into param_shard.grad.  Before the optimizer step, we must
-        all-reduce so every rank's shard gradient is the average across all
-        data-parallel replicas — matching upstream Megatron's
-        finalize_model_grads / finish_grad_sync.
-
-        Heterogeneous shard sizes: param_shard.grad has DIFFERENT lengths on
-        different ranks.  We use the variable-size fallback: all_reduce a
-        full-length flat buffer, then slice back.
+        Per-parameter all_reduce: for each parameter, assemble the full
+        gradient from all ranks' shard slices, all_reduce(SUM), average,
+        then write back each rank's slice. Uses a temporary buffer sized
+        to the largest parameter (~180MB for 7B), not the full model
+        (~24GB), avoiding OOM on memory-constrained GPUs.
         """
         if self.world_size <= 1 or not dist.is_initialized():
             return
@@ -493,19 +489,34 @@ class ShardState:
         if g is None:
             return
 
-        device = g.device
-        # Assemble full-length gradient buffer from all ranks' shards
-        full_grad = torch.zeros(self.total_numel, dtype=torch.float32, device=device)
         lo = self.shard_offsets[self.rank]
         hi = self.shard_offsets[self.rank + 1]
-        full_grad[lo:hi].copy_(g.float())
+        device = g.device
 
-        # All-reduce (SUM) then average
-        dist.all_reduce(full_grad, op=dist.ReduceOp.SUM)
-        full_grad.div_(self.world_size)
+        for name, _p in self.param_order:
+            sl = self.param_offsets[name]
+            param_numel = sl.global_end - sl.global_start
 
-        # Extract this rank's averaged shard back
-        g.copy_(full_grad[lo:hi].to(g.dtype))
+            # Allocate a full-param-sized buffer (reused implicitly by PyTorch allocator)
+            full_param_grad = torch.zeros(param_numel, dtype=torch.float32, device=device)
+
+            # Fill this rank's slice
+            g_start = max(sl.global_start, lo)
+            g_end = min(sl.global_end, hi)
+            if g_end > g_start:
+                p_lo = g_start - sl.global_start
+                p_hi = g_end - sl.global_start
+                s_lo = g_start - lo
+                s_hi = g_end - lo
+                full_param_grad[p_lo:p_hi].copy_(g[s_lo:s_hi].float())
+
+            # All-reduce across ranks — all ranks have the same param layout
+            dist.all_reduce(full_param_grad, op=dist.ReduceOp.SUM)
+            full_param_grad.div_(self.world_size)
+
+            # Write back averaged gradient into this rank's shard
+            if g_end > g_start:
+                g[s_lo:s_hi].copy_(full_param_grad[p_lo:p_hi].to(g.dtype))
 
     def scatter_grads(self, model: nn.Module) -> torch.Tensor:
         """
