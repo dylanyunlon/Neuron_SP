@@ -1291,23 +1291,17 @@ class DesLocEngine:
         logger.info("Effective grad_accum_steps on primary: %d", self.grad_accum)
 
         # --- Phase 7: HeteroStepBatchScheduler ---
-        # Build device profiles from discovered tiers (or fall back to defaults)
+        # Upstream Megatron pattern: all ranks run the same num_microbatches.
+        # Heterogeneous throughput via per-rank micro_batch_size, not forward count.
+        # capacity_weight is uniform (1.0) so the allocator gives each device
+        # the same microbatch count.
         if self.tiers:
             device_profiles = []
             for spec in self.tiers:
-                # Use VRAM-proportional capacity weights so the allocator mirrors
-                # the target asymmetry: H100 (96 GB) → 6 micro-batches per step,
-                # A6000 (48 GB) → 1 micro-batch per step.
-                # capacity_weight = vram_gb / 16  gives H100→6.0, A6000→3.0 …
-                # but we want the exact 6:1 step ratio, so normalise to the
-                # smallest device (48 GB) and use integer multiples:
-                #   H100  96 GB → weight 6.0  (96/16)
-                #   A6000 48 GB → weight 1.0  (hard-coded floor for sub-96 GB)
-                if spec.total_mem_gb >= 80:  # H100 / H200 class
-                    weight = 6.0
-                    max_mbs = 6 * config.micro_batch_size
-                else:  # A6000 / RTX-class
-                    weight = 1.0
+                weight = 1.0  # uniform — all ranks same forward count
+                if spec.total_mem_gb >= 80:
+                    max_mbs = min(config.micro_batch_size * 4, 4)
+                else:
                     max_mbs = config.micro_batch_size
                 device_profiles.append(DeviceProfile(
                     device_id=spec.device_index,

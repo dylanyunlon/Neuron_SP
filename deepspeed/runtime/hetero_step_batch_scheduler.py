@@ -201,8 +201,8 @@ DEFAULT_DES_LOC_DEVICE_PROFILES: List[DeviceProfile] = [
                   max_micro_batch_size=1, loc_cache_size_mb=2048),
     DeviceProfile(device_id=1, sm_arch=86, vram_gb=48.0, capacity_weight=1.0,
                   max_micro_batch_size=1, loc_cache_size_mb=2048),
-    DeviceProfile(device_id=2, sm_arch=90, vram_gb=96.0, capacity_weight=6.0,
-                  max_micro_batch_size=6, loc_cache_size_mb=8192),
+    DeviceProfile(device_id=2, sm_arch=90, vram_gb=96.0, capacity_weight=1.0,
+                  max_micro_batch_size=4, loc_cache_size_mb=8192),
 ]
 
 
