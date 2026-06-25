@@ -1995,34 +1995,14 @@ class DesLocEngine:
                 consumed_samples=self.consumed_samples,
                 consistency_check=False,
             )
-            # Per-rank asymmetric micro-batch assignment:
-            # H100 (96 GB, rank 2) → 6 micro-batches per step
-            # A6000 (48 GB, rank 0/1) → 1 micro-batch per step
-            # allocation.per_rank_microbatches is keyed by device_id == dist rank
-            # (single-node setup).  Fall back to the global average only when the
-            # per-rank table is missing (e.g. old checkpoint or unit-test stubs).
-            _current_rank = dist.get_rank() if dist.is_initialized() else int(
-                os.environ.get("RANK", 0)
-            )
-            num_microbatches = (
-                allocation.per_rank_microbatches.get(_current_rank)
-                if allocation.per_rank_microbatches
-                else None
-            )
-            if num_microbatches is None:
-                num_microbatches = allocation.num_microbatches
-                logger.debug(
-                    "per_rank_microbatches missing for rank %d; "
-                    "falling back to global num_microbatches=%d",
-                    _current_rank, num_microbatches,
-                )
-            else:
-                logger.debug(
-                    "rank %d: per-rank num_microbatches=%d "
-                    "(global total=%d, per_rank_table=%s)",
-                    _current_rank, num_microbatches,
-                    allocation.num_microbatches, allocation.per_rank_microbatches,
-                )
+            # Upstream Megatron pattern (schedules.py / training.py):
+            # num_microbatches is a SINGLE global value, identical on all ranks.
+            # Every forward triggers per-layer ZeRO-3 all_gather collectives
+            # that require all ranks to call forward() the same number of times.
+            # Heterogeneous throughput is achieved via per-rank micro_batch_size
+            # differences (larger batches on faster GPUs), NOT via different
+            # iteration counts — which would cause NCCL collective mismatch.
+            num_microbatches = allocation.num_microbatches
 
             # --- HeteroFP32GradAccumManager: before_backward ---
             # Zero FP32 gradient accumulators (main_grad tensors) once per step,
@@ -2168,78 +2148,6 @@ class DesLocEngine:
             if _async_norm_handle is not None:
                 _async_norm_handle.wait()
                 _async_norm_handle = None
-
-            # ------------------------------------------------------------------
-            # Dummy forward padding for asymmetric micro-batch counts.
-            #
-            # Problem: in heterogeneous ZeRO-3 training each rank runs a
-            # different number of micro-batches (e.g. H100 runs 22, A6000
-            # runs 1).  Every model forward triggers one collective call per
-            # layer (all_gather inside gather_full_params).  NCCL
-            # requires *every* rank to call each collective the same number of
-            # times; a mismatch causes NCCL to hang indefinitely.
-            #
-            # Fix: after the real microbatch loop we determine the global
-            # maximum micro-batch count via a single all_reduce(MAX), then
-            # ranks that ran fewer micro-batches execute (max - local) dummy
-            # forward passes.  Each dummy pass:
-            #   1. Runs model(dummy_input) under torch.no_grad() so no
-            #      autograd graph is built and no parameters are modified.
-            #      This fires exactly the same per-layer all_gather collectives
-            #      as a real forward (triggered by ZeRO3ForwardHook /
-            #      gather_full_params hooks that are layer-level pre_forward
-            #      hooks; no_grad does not suppress them).
-            #   2. Does NOT fire a dummy grad-norm-sq all_reduce.  The
-            #      grad-norm-sq all_reduce was moved to the last microbatch
-            #      only (one per optimizer step), so all ranks emit exactly
-            #      one such collective per step and no padding is required.
-            #   3. Does NOT call backward, so gradients and param_shard.grad
-            #      are unaffected.
-            #
-            # The dummy_input uses the minimum sequence length of 1 to minimise
-            # memory and compute overhead on the fast rank while still driving
-            # the exact same collective call graph as a full-length forward.
-            # ------------------------------------------------------------------
-            if dist.is_initialized():
-                _local_mb_tensor = torch.tensor(
-                    [num_microbatches],
-                    dtype=torch.int64,
-                    device=self.primary_device,
-                )
-                dist.all_reduce(_local_mb_tensor, op=dist.ReduceOp.MAX)
-                _max_microbatches: int = int(_local_mb_tensor.item())
-                _padding_steps = _max_microbatches - num_microbatches
-
-                if _padding_steps > 0:
-                    logger.debug(
-                        "[dummy-fwd] rank needs %d dummy forward(s) to match "
-                        "max_microbatches=%d (local=%d)",
-                        _padding_steps, _max_microbatches, num_microbatches,
-                    )
-                    # Build a minimal (batch=1, seq=1) dummy input on the local device.
-                    _dummy_dev = torch.device(
-                        f"cuda:{torch.cuda.current_device()}"
-                    ) if torch.cuda.is_available() else self.primary_device
-                    _dummy_ids = torch.zeros(
-                        (1, 1), dtype=torch.long, device=_dummy_dev,
-                    )
-
-                    for _pad_i in range(_padding_steps):
-                        # Forward-only: fires all per-layer all_gather collectives
-                        # without constructing an autograd graph.
-                        with torch.no_grad():
-                            with torch.autocast(
-                                device_type=_dummy_dev.type,
-                                dtype=_DEFAULT_DTYPE,
-                                enabled=(_dummy_dev.type == "cuda"),
-                            ):
-                                _dummy_ids_dev = _dummy_ids.to(
-                                    self.model_device, non_blocking=True,
-                                )
-                                _ = self.model(_dummy_ids_dev)
-                        # No dummy grad-norm-sq all_reduce needed: the norm-sq
-                        # all_reduce now fires exactly once per step (on the last
-                        # real microbatch), so all ranks are already symmetric.
 
             # Post-microbatch: NaN guard
             if not math.isfinite(step_loss):

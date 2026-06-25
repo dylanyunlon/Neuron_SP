@@ -614,7 +614,7 @@ class HeteroOptimizerRouter:
                     foreach=True,
                 )
                 logger.info(
-                    "A6000 optimizer: Adam(foreach=True) for %s on device %d.",
+                    "A6000 optimizer: Adam(foreach=True) for %s on device %s.",
                     type(module).__name__, device_index,
                 )
             except TypeError:
@@ -950,7 +950,7 @@ class HeteroMIMOTrainingLoop:
         opt = self._opt_router.build_optimizer_for_module(self._model, device_index, config)
         self._module_optimizers = [opt]
         logger.info(
-            "HeteroMIMOTrainingLoop: built single optimizer (non-MIMO fallback) on device %d.",
+            "HeteroMIMOTrainingLoop: built single optimizer (non-MIMO fallback) on device %s.",
             device_index,
         )
 

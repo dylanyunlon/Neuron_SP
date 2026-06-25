@@ -94,6 +94,7 @@ import torch.distributed as dist
 # Module-level logger — DES-LOC uses a named logger so operators can filter
 # with  logging.getLogger("des_loc.hetero_reductions").setLevel(logging.DEBUG)
 # ---------------------------------------------------------------------------
+logger = logging.getLogger(__name__)
 _LOG = logging.getLogger("des_loc.hetero_reductions")
 
 # ---------------------------------------------------------------------------
