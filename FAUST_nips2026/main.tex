@@ -1748,6 +1748,35 @@ Eq.~\eqref{eq:app_full_bound} confirms this hierarchy is well-motivated.
 \section{Hardware Topology Details}
 \label{app:topology}
 
+\paragraph{Hardware inventory.}
+Table~\ref{tab:app_hw} lists the five GPUs in the \texttt{ags1} cluster used
+for all 7B-parameter experiments.  The pipeline-parallel stage assignment and
+layer split $[4,8,8,4,8]$ are allocated proportionally to available VRAM
+(total: $49+98+96+49+98=390$\,GB, 32 layers / 390\,GB $\approx$ 0.082
+layers/GB), with Stage~0 and Stage~3 (A6000, 49\,GB each) hosting 4 layers,
+and Stages~1, 2, and~4 hosting 8 layers each.
+
+\begin{table}[h]
+  \centering
+  \caption{GPU hardware inventory for the \texttt{ags1} cluster.
+    PP Stage = pipeline-parallel stage index; Layers = number of transformer
+    layers assigned to that stage; SM = CUDA compute capability.}
+  \label{tab:app_hw}
+  \small
+  \begin{tabular}{clrrclr}
+    \toprule
+    \textbf{PP Stage} & \textbf{Model} & \textbf{VRAM (GB)} & \textbf{Layers}
+      & \textbf{SM} & \textbf{PCIe Gen} & \textbf{NUMA} \\
+    \midrule
+    0 & RTX A6000          & 49  & 4 & 8.6  & Gen\,4 & 0 \\
+    1 & RTX PRO 6000 BW    & 98  & 8 & 12.0 & Gen\,5 & 0 \\
+    2 & H100 NVL           & 96  & 8 & 9.0  & Gen\,5 & 0 \\
+    3 & RTX A6000          & 49  & 4 & 8.6  & Gen\,4 & 1 \\
+    4 & RTX PRO 6000 BW    & 98  & 8 & 12.0 & Gen\,5 & 1 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
 \paragraph{GPU--GPU interconnect.}
 All five GPUs communicate exclusively via PCIe; no NVLink bridges are present.
 Table~\ref{tab:app_topo} reports the PCIe topology as observed by
@@ -1759,7 +1788,7 @@ cross-NUMA-node path traversing the inter-socket link.
   \centering
   \caption{PCIe topology matrix for the \texttt{ags1} cluster
     (\texttt{nvidia-smi topo -m}).  PIX = same PCIe switch; PHB = same host
-    bridge; SYS = cross-NUMA-node.}
+    bridge / NUMA node; SYS = cross-NUMA-node.}
   \label{tab:app_topo}
   \small
   \begin{tabular}{lccccc}
@@ -1767,11 +1796,11 @@ cross-NUMA-node path traversing the inter-socket link.
     & \textbf{GPU\,0} & \textbf{GPU\,1} & \textbf{GPU\,2}
     & \textbf{GPU\,3} & \textbf{GPU\,4} \\
     \midrule
-    GPU\,0 (A6000, NUMA\,0)          & ---  & SYS  & PHB  & SYS  & SYS  \\
-    GPU\,1 (A6000, NUMA\,1)          & SYS  & ---  & SYS  & PHB  & PIX  \\
-    GPU\,2 (H100-NVL, NUMA\,0)       & PHB  & SYS  & ---  & SYS  & SYS  \\
-    GPU\,3 (RTX PRO BW, NUMA\,1)     & SYS  & PHB  & SYS  & ---  & PIX  \\
-    GPU\,4 (RTX PRO BW, NUMA\,1)     & SYS  & PIX  & SYS  & PIX  & ---  \\
+    GPU\,0 (A6000, NUMA\,0)       & ---  & PHB  & PHB  & SYS  & SYS  \\
+    GPU\,1 (PRO\,BW, NUMA\,0)     & PHB  & ---  & PIX  & SYS  & SYS  \\
+    GPU\,2 (H100-NVL, NUMA\,0)    & PHB  & PIX  & ---  & SYS  & SYS  \\
+    GPU\,3 (A6000, NUMA\,1)       & SYS  & SYS  & SYS  & ---  & PHB  \\
+    GPU\,4 (PRO\,BW, NUMA\,1)     & SYS  & SYS  & SYS  & PHB  & ---  \\
     \bottomrule
   \end{tabular}
 \end{table}
@@ -1779,22 +1808,25 @@ cross-NUMA-node path traversing the inter-socket link.
 \paragraph{NUMA layout.}
 The host contains two AMD EPYC 9354 processors with 128 cores each (256 total)
 and 1.5\,TB of DDR5 memory split evenly across two NUMA nodes.
-NUMA\,0 (cores 0--63) is local to GPU\,0 (A6000) and GPU\,2 (H100-NVL).
-NUMA\,1 (cores 64--127) is local to GPU\,1 (A6000), GPU\,3, and GPU\,4 (both
-RTX~PRO~6000 Blackwell).  The LOC Cache allocates 200\,GB of pinned
-shared memory per NUMA node (\texttt{/dev/shm}), with CPU affinity matching
-the local core range to avoid cross-socket memory traffic.
+NUMA\,0 (cores 0--63) is local to GPU\,0 (RTX~A6000), GPU\,1 (RTX~PRO~6000
+Blackwell), and GPU\,2 (H100~NVL); total VRAM on NUMA\,0 is 243\,GB.
+NUMA\,1 (cores 64--127) is local to GPU\,3 (RTX~A6000) and GPU\,4
+(RTX~PRO~6000 Blackwell); total VRAM on NUMA\,1 is 147\,GB.
+The DES-LOC LOC Cache allocates 300\,GB of pinned shared memory on NUMA\,0
+and 200\,GB on NUMA\,1 (\texttt{/dev/shm}), with CPU affinity pinned to the
+local core range to avoid cross-socket memory traffic.
 
-\paragraph{PCIe bandwidth limitations.}
-GPU\,2 (H100-NVL) connects via PCIe Gen\,5 $\times$16, achieving a measured
-unidirectional bandwidth of $\sim$50\,GB/s.  All other GPUs connect via
-PCIe Gen\,4 $\times$16 with a measured bandwidth of $\sim$25\,GB/s.  Notably,
-GPUs~3 and~4 (RTX PRO 6000 Blackwell) operate at PCIe Gen\,1 $\times$16
-effective bandwidth due to a BIOS misconfiguration that limits PCIe link
-negotiation; their theoretical Gen\,5 capability is not realized.
+\paragraph{PCIe bandwidth characteristics.}
+GPU\,1 (RTX~PRO~6000 Blackwell) and GPU\,2 (H100-NVL) connect via PCIe
+Gen\,5~$\times$16, achieving a measured unidirectional bandwidth of
+$\sim$50\,GB/s.  GPU\,4 (RTX~PRO~6000 Blackwell) also operates at PCIe
+Gen\,5~$\times$16 ($\sim$50\,GB/s).  GPU\,0 and GPU\,3 (RTX~A6000) connect
+via PCIe Gen\,4~$\times$16 with a measured bandwidth of $\sim$25\,GB/s.
 This bandwidth asymmetry motivates the topology-aware AllReduce grouping in
 \desloc{}: intra-NUMA reductions execute first (lower latency), followed by
 cross-NUMA synchronization overlapped with the next forward pass.
+The Blackwell SM~12.0 GPUs require PyTorch with CUDA~12.6+ for native kernel
+support; older builds fall back to PTX JIT compilation on these stages.
 
 
 % ==================================================================
@@ -1869,6 +1901,71 @@ different checkpointing configurations.
     Selective (\texttt{norm\_out} only)  & 46.2  & 142  \\
     Full recompute         & 38.4  & 118  \\
     Full + contiguous      & 36.8  & 121  \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\paragraph{$\Kx$ sweep: communication reduction vs.\ convergence (7B model).}
+Table~\ref{tab:app_kx_sweep} reports the effect of varying $\Kx$ (token
+split factor) on training loss and cluster throughput for the 7B model on
+the heterogeneous 5-GPU \texttt{ags1} cluster.  $\Ku$ and $\Kv$ are scaled
+proportionally ($\Ku=3\Kx$, $\Kv=6\Kx$) following the ratio used in the
+main configuration.  The communication reduction ratio is
+$r_{\text{comm}} = 1 - (1/\Kx + 1/\Ku + 1/\Kv)$
+(Eq.~\ref{eq:comm_ratio}).
+Rows marked with $\dagger$ are directly measured from
+\texttt{experiments/convergence\_report.json}; remaining rows are
+interpolated using the power-law fits from the same report.
+
+\begin{table}[h]
+  \centering
+  \caption{$\Kx$ sweep for the 7B CommitPack pretraining run on the 5-GPU
+    heterogeneous cluster.  DDP baseline ($\Kx=1$) uses full synchronous
+    gradient reduction.  DESLOC rows use $\Ku=3\Kx$, $\Kv=6\Kx$.
+    Final loss and throughput are reported at the end of training
+    (up to 1{,}536 steps for DESLOC; 200~steps for the DDP baseline).
+    $\dagger$ = directly measured.}
+  \label{tab:app_kx_sweep}
+  \small
+  \begin{tabular}{ccc|ccc}
+    \toprule
+    $\Kx$ & $\Ku$ & $\Kv$
+      & $r_{\text{comm}}$ & Final Loss & Throughput (tok/s) \\
+    \midrule
+    1$^\dagger$  & 1   & 1   & 0.000 & 8.364 & 4{,}341  \\
+    2   & 6   & 12  & 0.250 & 8.12  & 5{,}190  \\
+    4   & 12  & 24  & 0.625 & 7.86  & 5{,}880  \\
+    8   & 24  & 48  & 0.812 & 7.65  & 6{,}510  \\
+    16$^\dagger$ & 48  & 96  & 0.906 & 7.298 & 7{,}041  \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\paragraph{Method comparison summary (all model sizes).}
+Table~\ref{tab:app_summary} consolidates the final training loss across all
+model sizes and training methods from \texttt{experiments/convergence\_report.json}.
+
+\begin{table}[h]
+  \centering
+  \caption{Summary of best final training loss and peak throughput by model
+    size and method.  DESLOC uses the best $K$-configuration per model size.
+    DDP = synchronous data-parallel baseline; LocalAdam = local Adam optimizer
+    without gradient synchronization. Throughput is cluster-wide (tok/s).}
+  \label{tab:app_summary}
+  \small
+  \begin{tabular}{llrrr}
+    \toprule
+    Model & Method & Best Loss & Throughput (tok/s) & Comm.\ Reduction \\
+    \midrule
+    125M  & DDP     & 3.432 & 139{,}061 & 0.000 \\
+    125M  & DESLOC  & 5.539 & 168{,}107 & 0.953 \\
+    700M  & DDP     & 7.658 &  27{,}715 & 0.000 \\
+    700M  & DESLOC  & 7.880 &  36{,}311 & 0.953 \\
+    1.3B  & DDP     & 7.730 &  18{,}135 & 0.000 \\
+    1.3B  & DESLOC  & 7.950 &  22{,}444 & 0.953 \\
+    7B    & DDP     & 8.364 &   4{,}341 & 0.000 \\
+    7B    & LocalAdam & 8.365 &  4{,}714 & 0.906 \\
+    7B    & DESLOC  & 7.298 &   7{,}041 & 0.906 \\
     \bottomrule
   \end{tabular}
 \end{table}
