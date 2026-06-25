@@ -42,6 +42,21 @@ echo "Log: $LOG"
 echo "GPUs: $CUDA_VISIBLE_DEVICES"
 echo "Note: Blackwell GPUs excluded (PyTorch cu118 < SM120). Upgrade to cu126+ for 5-GPU."
 
+# Auto-detect real data
+DATA_PATH="data/commitpack_train.npy"
+if [ ! -f "$DATA_PATH" ]; then
+    echo "⚠ Real data not found at $DATA_PATH — using synthetic. Run: bash prepare_data.sh"
+    DATA_PATH=""
+fi
+
+DATA_ARGS=()
+if [ -n "$DATA_PATH" ]; then
+    DATA_ARGS=(--data-path "$DATA_PATH")
+    echo "Data: $DATA_PATH"
+else
+    echo "Data: synthetic"
+fi
+
 numactl --interleave=all \
 torchrun --nproc_per_node=3 --master_port=29500 \
     run_pretrain.py \
@@ -54,5 +69,6 @@ torchrun --nproc_per_node=3 --master_port=29500 \
     --log-every 10 \
     --save-every 500 \
     --checkpoint-dir checkpoints/7b_3gpu_${TIMESTAMP} \
+    "${DATA_ARGS[@]}" \
     "${EXTRA_ARGS[@]}" \
     2>&1 | tee "$LOG"

@@ -401,7 +401,7 @@ def real_data_iter(
             idx = 0
             end = batch_size
         batch = token_t[idx:end].to(device)
-        yield batch[:, :-1], batch[:, 1:]
+        yield {"tokens": batch[:, :-1], "labels": batch[:, 1:]}
         idx = end
 
 
