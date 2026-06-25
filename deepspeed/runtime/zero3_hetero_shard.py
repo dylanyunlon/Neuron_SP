@@ -931,79 +931,42 @@ class GradBucketManager:
         self._buffers_allocated = True
 
     def on_grad_ready(self, name: str, param_grad: torch.Tensor):
-        """Store grad reference for deferred bucket processing."""
-        bi = self._param_bucket[name]
-        bucket = self.buckets[bi]
-        start, end = bucket['offsets'][name]
-        if 'grads' not in bucket:
-            bucket['grads'] = {}
-        bucket['grads'][name] = (start, end, param_grad.detach().clone())
+        """In-place all_reduce on param.grad, then extract shard. Zero extra memory.
+
+        param.grad is already allocated by autograd. We all_reduce it in-place,
+        extract this rank's shard slice into param_shard.grad, done.
+        No clone, no buffer, no OOM.
+        """
+        ss = self.ss
+        lo = ss.shard_offsets[ss.rank]
+        hi = ss.shard_offsets[ss.rank + 1]
+
+        # In-place all_reduce — zero extra memory
+        if self.world_size > 1 and dist.is_initialized():
+            dist.all_reduce(param_grad, op=dist.ReduceOp.SUM)
+
+        flat = param_grad.detach().reshape(-1)
+        flat.div_(self.world_size)
+
+        # Extract shard slice
+        sl = ss.param_offsets[name]
+        g_start = max(sl.global_start, lo)
+        g_end = min(sl.global_end, hi)
+        if g_end > g_start:
+            p_lo = g_start - sl.global_start
+            p_hi = g_end - sl.global_start
+            s_lo = g_start - lo
+            ss.param_shard.grad[s_lo:s_lo + (p_hi - p_lo)].add_(
+                flat[p_lo:p_hi].to(dtype=torch.float32))
 
     def start_grad_sync(self):
-        """Process buckets sequentially with ONE shared FP32 buffer.
-
-        For each bucket: zero buf → copy grads → all_reduce → div → extract shard.
-        Peak memory: max_bucket_size × FP32 ≈ 800MB (fits A6000).
-        """
-        if self.world_size <= 1 or not dist.is_initialized():
-            self._extract_local()
-            return
-
-        self._alloc_buffers()
-        ss = self.ss
-        lo, hi = ss.shard_offsets[ss.rank], ss.shard_offsets[ss.rank + 1]
-        buf = self._shared_buf
-
-        for bucket in self.buckets:
-            grads = bucket.get('grads', {})
-            if not grads:
-                continue
-            size = bucket['total_size']
-            buf[:size].zero_()
-
-            for gname, (start, end, grad_t) in grads.items():
-                flat = grad_t.reshape(-1).to(dtype=torch.float32, device=self.device)
-                take = min(flat.numel(), end - start)
-                buf[start:start + take].add_(flat[:take])
-
-            dist.all_reduce(buf[:size], op=dist.ReduceOp.SUM)
-            buf[:size].div_(self.world_size)
-
-            for gname in bucket['names']:
-                sl = ss.param_offsets[gname]
-                bstart, bend = bucket['offsets'][gname]
-                g_start, g_end = max(sl.global_start, lo), min(sl.global_end, hi)
-                if g_end <= g_start:
-                    continue
-                p_lo = g_start - sl.global_start
-                p_hi = g_end - sl.global_start
-                s_lo = g_start - lo
-                ss.param_shard.grad[s_lo:s_lo + (p_hi - p_lo)].add_(
-                    buf[bstart + p_lo:bstart + p_hi])
-
-            bucket['grads'] = {}
-
-    def _extract_local(self):
-        """Fallback for world_size<=1."""
-        ss = self.ss
-        lo, hi = ss.shard_offsets[ss.rank], ss.shard_offsets[ss.rank + 1]
-        for bucket in self.buckets:
-            for gname, (start, end, grad_t) in bucket.get('grads', {}).items():
-                sl = ss.param_offsets[gname]
-                g_start, g_end = max(sl.global_start, lo), min(sl.global_end, hi)
-                if g_end <= g_start:
-                    continue
-                flat = grad_t.reshape(-1).to(dtype=torch.float32, device=self.device)
-                p_lo, p_hi = g_start - sl.global_start, g_end - sl.global_start
-                s_lo = g_start - lo
-                ss.param_shard.grad[s_lo:s_lo + (p_hi - p_lo)].add_(flat[p_lo:p_hi])
-            bucket['grads'] = {}
+        """No-op — all_reduce happens inline in on_grad_ready."""
+        pass
 
     def finish_grad_sync(self):
-        """No-op — start_grad_sync processes synchronously."""
+        """No-op — all_reduce happens inline in on_grad_ready."""
         pass
 
     def reset(self):
-        """Reset for next step."""
-        for bucket in self.buckets:
-            bucket['grads'] = {}
+        """No-op — no state to reset."""
+        pass
