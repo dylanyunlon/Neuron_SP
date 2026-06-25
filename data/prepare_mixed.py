@@ -123,12 +123,11 @@ def prepare(
     t0 = time.time()
 
     for lang in languages:
-        print(f"[prepare_mixed] Loading commitpack/{lang} (streaming)...")
+        print(f"[prepare_mixed] Loading commitpackft/{lang} (streaming)...")
         try:
             ds = load_dataset(
-                "bigcode/commitpack", lang,
+                "bigcode/commitpackft", lang,
                 split="train", streaming=True,
-                trust_remote_code=True,
             )
         except Exception as e:
             print(f"[prepare_mixed] WARNING: {lang}: {e}", file=sys.stderr)
@@ -160,9 +159,13 @@ def prepare(
                       f"{total_tokens:,} tokens, "
                       f"span={span_count} causal={causal_count} ({elapsed:.0f}s)")
 
+    total_samples = span_count + causal_count
+    if total_samples == 0:
+        print("[prepare_mixed] ERROR: no samples loaded. Check HuggingFace access.")
+        sys.exit(1)
     print(f"\n[prepare_mixed] Total: {total_tokens:,} tokens")
-    print(f"  span_corruption: {span_count:,} ({span_count/(span_count+causal_count):.0%})")
-    print(f"  causal_lm:       {causal_count:,} ({causal_count/(span_count+causal_count):.0%})")
+    print(f"  span_corruption: {span_count:,} ({span_count/total_samples:.0%})")
+    print(f"  causal_lm:       {causal_count:,} ({causal_count/total_samples:.0%})")
 
     arr = np.array(all_ids, dtype=np.int32)
     split_idx = int(len(arr) * train_ratio)
