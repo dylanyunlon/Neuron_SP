@@ -884,11 +884,12 @@ def infinite_data_iter(
     batch_size: int,
     seq_len: int,
     device: torch.device,
-) -> Iterator[Tuple[torch.Tensor, torch.Tensor]]:
+) -> Iterator[Dict[str, torch.Tensor]]:
     """
     Infinite iterator of random token batches for smoke testing.
 
-    In production, replace with a real DataLoader.
+    Yields dicts with "tokens" and "labels" keys matching the BATCH_KEYS
+    contract expected by HeteroElasticBatch._fetch_from_iterator().
 
     Args:
         vocab_size: Vocabulary size for random token sampling.
@@ -897,11 +898,11 @@ def infinite_data_iter(
         device: Target device (tokens are on CPU, moved to GPU in the loop).
 
     Yields:
-        Tuples of (input_ids, labels) each of shape (batch_size, seq_len).
+        Dict with "tokens" and "labels" each of shape (batch_size, seq_len).
     """
     while True:
         tokens = torch.randint(0, vocab_size, (batch_size, seq_len + 1))
-        yield tokens[:, :-1], tokens[:, 1:]
+        yield {"tokens": tokens[:, :-1], "labels": tokens[:, 1:]}
 
 
 # ---------------------------------------------------------------------------
@@ -1289,6 +1290,30 @@ class DesLocEngine:
             else:
                 # Plain iterator: pass through unchanged (caller handles batching).
                 self.data_iter = data_iter
+
+        # --- Phase 6b: HeteroElasticBatch (capacity-weighted CP token split) ---
+        # Wraps data_iter with heterogeneous context-parallel slicing so that
+        # H100 gets more tokens per microbatch than A6000, proportional to
+        # capacity_weight. Uses compute_hetero_cp_offsets (commit 770e4567).
+        self._hetero_batch = None
+        if dist.is_initialized() and dist.get_world_size() > 1:
+            try:
+                from deepspeed.runtime.hetero_elastic_batch import (
+                    build_hetero_elastic_batch,
+                )
+                _cp_group = dist.GroupMember.WORLD  # all ranks in one CP group
+                self._hetero_batch = build_hetero_elastic_batch(
+                    tp_group=dist.GroupMember.WORLD,
+                    cp_group=_cp_group,
+                    device=self.primary_device,
+                    enable_hetero_cp=True,
+                )
+                logger.info(
+                    "HeteroElasticBatch built: capacity-weighted CP token split active"
+                )
+            except Exception as e:
+                logger.warning("HeteroElasticBatch init failed: %s — falling back to uniform", e)
+                self._hetero_batch = None
 
         # Gradient accumulation from plan (use primary device's setting)
         primary_idx = self.primary_device.index if self.primary_device.type == "cuda" else -1
@@ -2049,10 +2074,36 @@ class DesLocEngine:
                     _async_norm_handle.wait()
                     _async_norm_handle = None
 
-                input_ids, labels = next(self.data_iter)
+                # --- Data fetch: capacity-weighted CP token split ---
+                # HeteroElasticBatch.get_batch() slices tokens by capacity_weight:
+                # H100 gets more tokens (e.g. 512/1024), A6000 gets fewer (256 each).
+                # Each rank then runs standard attention on its own slice — no
+                # cross-rank attention needed (Phase 1: document-level parallelism).
+                if self._hetero_batch is not None:
+                    batch_out = self._hetero_batch.get_batch(
+                        data_iterator=self.data_iter,
+                        is_pipeline_first_stage=True,
+                        is_pipeline_last_stage=True,
+                    )
+                    # get_batch returns 7-tuple: (tokens, labels, loss_mask,
+                    # attention_mask, position_ids, cu_seqlens, max_seqlen)
+                    input_ids = batch_out[0]
+                    labels = batch_out[1]
+                    if input_ids is None:
+                        # End of data — should not happen with infinite iter
+                        continue
+                else:
+                    # Fallback: uniform token distribution (no CP)
+                    raw = next(self.data_iter)
+                    if isinstance(raw, dict):
+                        input_ids = raw["tokens"]
+                        labels = raw.get("labels")
+                    else:
+                        input_ids, labels = raw
                 _local_dev = torch.device(f"cuda:{torch.cuda.current_device()}")
                 input_ids = input_ids.to(_local_dev, non_blocking=True)
-                labels = labels.to(_local_dev, non_blocking=True)
+                if labels is not None:
+                    labels = labels.to(_local_dev, non_blocking=True)
 
                 # -----------------------------------------------------------------
                 # Wait for async ZeRO-3 shard sync (launched after optimizer.step
