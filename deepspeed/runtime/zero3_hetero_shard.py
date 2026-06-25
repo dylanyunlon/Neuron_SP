@@ -923,11 +923,11 @@ class GradBucketManager:
         })
 
     def _alloc_buffers(self):
-        """Lazy-allocate bucket buffers on first use."""
+        """Lazy-allocate ONE shared FP32 buffer (reused across buckets)."""
         if self._buffers_allocated:
             return
-        for b in self.buckets:
-            b['buffer'] = torch.zeros(b['total_size'], dtype=torch.float32, device=self.device)
+        max_size = max(b['total_size'] for b in self.buckets)
+        self._shared_buf = torch.zeros(max_size, dtype=torch.float32, device=self.device)
         self._buffers_allocated = True
 
     def on_grad_ready(self, name: str, param_grad: torch.Tensor):
