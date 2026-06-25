@@ -52,7 +52,7 @@ from megatron.core.datasets.commitpack_streaming_dataset import (
     CommitPackStreamingConfig,
     build_commitpack_dataloader,
 )
-from megatron.training.utils import (
+from megatron.core.utils import (
     get_batch_on_this_cp_rank,
     get_batch_on_this_tp_rank,
 )
