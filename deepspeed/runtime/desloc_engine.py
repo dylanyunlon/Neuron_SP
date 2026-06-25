@@ -2237,7 +2237,21 @@ class DesLocEngine:
                     f"ctrl_norm={_skip_info.combined_norm:.6f}"
                 )
             if not _should_skip:
+                # --- Diagnostic: check param health before/after optimizer step ---
+                if _is_main and step < 5:
+                    _ps = self.param_shard_state.param_shard
+                    _pg = _ps.grad
+                    print(f"[DBG-step{step}] BEFORE opt.step: "
+                          f"shard={_ps.data[:5].tolist()} "
+                          f"grad_norm={_pg.float().norm().item():.4f} "
+                          f"grad_has_nan={_pg.isnan().any().item()} "
+                          f"shard_has_nan={_ps.data.isnan().any().item()}", flush=True)
                 self.optimizer.step()
+                if _is_main and step < 5:
+                    print(f"[DBG-step{step}] AFTER opt.step: "
+                          f"shard={_ps.data[:5].tolist()} "
+                          f"shard_has_nan={_ps.data.isnan().any().item()} "
+                          f"shard_has_inf={_ps.data.isinf().any().item()}", flush=True)
                 self.scheduler.step()
                 # ZeRO-3: async sync updated FP32 shard back to model BF16 params.
                 # Copies are issued on _shard_sync_stream so they overlap with the
@@ -2250,6 +2264,12 @@ class DesLocEngine:
                             stream=_shard_sync_stream
                         )
                         _shard_sync_pending = True
+                        if _is_main and step < 5:
+                            torch.cuda.current_stream().wait_stream(_shard_sync_stream)
+                            _sample_p = list(self.model.parameters())[0]
+                            print(f"[DBG-step{step}] AFTER sync: "
+                                  f"model_p0={_sample_p.data.reshape(-1)[:5].tolist()} "
+                                  f"model_has_nan={_sample_p.data.isnan().any().item()}", flush=True)
                     else:
                         # CPU-only fallback: synchronous path
                         self.param_shard_state.sync_shard_to_model()
