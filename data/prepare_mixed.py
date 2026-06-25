@@ -14,8 +14,24 @@ import numpy as np
 
 EOS_ID = 257
 MASK_ID = 258
+_sp_model = None
+
+def load_tokenizer(model_path):
+    """Load SentencePiece model if provided."""
+    global _sp_model, EOS_ID, MASK_ID
+    if model_path and os.path.exists(model_path):
+        import sentencepiece as spm
+        _sp_model = spm.SentencePieceProcessor()
+        _sp_model.load(model_path)
+        EOS_ID = _sp_model.eos_id() if _sp_model.eos_id() >= 0 else _sp_model.piece_to_id("<eos>")
+        MASK_ID = _sp_model.piece_to_id("<mask>")
+        if MASK_ID < 0:
+            MASK_ID = _sp_model.get_piece_size() - 1
+        print(f"[tokenizer] Loaded {model_path}: vocab={_sp_model.get_piece_size()}, EOS={EOS_ID}, MASK={MASK_ID}")
 
 def encode(text: str) -> list:
+    if _sp_model is not None:
+        return _sp_model.encode(text) + [EOS_ID]
     return [b + 1 for b in text.encode("utf-8", errors="replace")] + [EOS_ID]
 
 def span_corrupt(text, mask_ratio=0.15, mean_span_len=3):
@@ -236,6 +252,9 @@ if __name__ == "__main__":
     p.add_argument("--output-dir", default="data")
     p.add_argument("--alpha", type=float, default=0.7)
     p.add_argument("--languages", nargs="+", default=["python", "javascript"])
+    p.add_argument("--tokenizer", default=None, help="SentencePiece .model file (default: byte-level)")
     a = p.parse_args()
+    if a.tokenizer:
+        load_tokenizer(a.tokenizer)
     prepare(output_dir=a.output_dir, num_samples=a.num_samples,
             alpha=a.alpha, languages=a.languages)
