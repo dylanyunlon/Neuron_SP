@@ -1,19 +1,19 @@
 #!/bin/bash
-# Neuron_SP 真实数据准备脚本
-# 从 HuggingFace 下载 CommitPack，用 CodeLlama tokenizer 分词
-# 输出: data/commitpack_train.npy (~500K samples, ~200M tokens)
 set -e
+cd "$(cd "$(dirname "$0")" && pwd)"
 
-echo "=== Installing dependencies ==="
-pip install datasets transformers sentencepiece protobuf --quiet
+echo "=== Neuron_SP 数据准备 ==="
+echo "下载 CommitPack + byte-level 分词（无需外部 tokenizer）"
 
-echo "=== Preparing CommitPack data ==="
-python3 data/prepare_commits.py \
-    --task npy \
-    --num-samples 500000 \
-    --tokenizer-name codellama/CodeLlama-7b-hf \
+pip install datasets --quiet 2>/dev/null
+
+python3 data/prepare_simple.py \
+    --num-samples 200000 \
     --output-dir data \
     --languages python javascript
 
-echo "=== Done ==="
-ls -lh data/commitpack_*.npy data/commitpack_meta.json 2>/dev/null
+echo ""
+echo "=== 完成 ==="
+ls -lh data/commitpack_*.npy 2>/dev/null
+echo ""
+echo "现在可以运行: bash launch_7b_3gpu.sh"
