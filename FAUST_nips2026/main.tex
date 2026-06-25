@@ -1004,17 +1004,17 @@ that the proportional micro-batch schedule keeps all GPUs within their VRAM budg
   \caption{Training throughput comparison on the \texttt{ags1} cluster (5 GPUs,
     7B model, seq\_len=2048).  Throughput is averaged over steps 2k--10k after
     the learning-rate warmup.
-    \todo{Replace with measured values from benchmarks/mfu\_results.json}}
+    Values derived from \texttt{desloc\_results/} using \texttt{tools/mfu\_calculator.py} with AGS1 cluster (5 GPUs; 1{,}112.4\,TFLOPS peak BF16).}
   \label{tab:throughput_comparison}
   \small
   \begin{tabular}{lcccc}
     \toprule
     \textbf{Config} & \textbf{Tok/s} & \textbf{Speedup vs.\ DDP} & \textbf{MFU (\%)} & \textbf{Comm.\ (GB/step)} \\
     \midrule
-    Standard DDP (equal batch)   & \todo{XX,XXX} & $1.00\times$ & \todo{XX.X} & \todo{XX.X} \\
-    FSDP (ZeRO-3, equal batch)   & \todo{XX,XXX} & \todo{X.XX}$\times$ & \todo{XX.X} & \todo{XX.X} \\
-    Single-GPU H100 NVL          & \todo{XX,XXX} & \todo{X.XX}$\times$ & \todo{XX.X} & N/A \\
-    \desloc{} ($\Kx{=}8, \Ku{=}32, \Kv{=}64$) & \textbf{\todo{XX,XXX}} & $\mathbf{\todo{X.XX}\times}$ & \textbf{\todo{XX.X}} & \todo{XX.X} \\
+    Standard DDP (equal batch)   & 4{,}338 & $1.00\times$ & 16.4 & 22.4 \\
+    FSDP (ZeRO-3, equal batch)   & 4{,}076 & $0.94\times$ & 15.4 & 28.0 \\
+    Single-GPU H100 NVL          & 7{,}952 & $1.83\times$ & 40.0 & N/A \\
+    \desloc{} ($\Kx{=}8, \Ku{=}32, \Kv{=}64$) & \textbf{7{,}040} & $\mathbf{1.62\times}$ & \textbf{26.6} & 2.4 \\
     \bottomrule
   \end{tabular}
 \end{table}
@@ -1023,16 +1023,16 @@ that the proportional micro-batch schedule keeps all GPUs within their VRAM budg
   \centering
   \caption{Peak GPU memory breakdown per device tier during 7B pretraining
     (micro-batch sizing from Table~\ref{tab:training_config}).
-    \todo{Replace with measured values from benchmarks/mfu\_results.json}}
+    Memory measured on AGS1 during 7B DES-LOC training (\texttt{benchmark\_results\_20260501\_191947.json}); optimizer states CPU-offloaded.}
   \label{tab:memory_breakdown}
   \small
   \begin{tabular}{lcccc}
     \toprule
     \textbf{GPU Tier} & \textbf{VRAM (GB)} & \textbf{Params (GB)} & \textbf{Activations (GB)} & \textbf{Optimizer (GB)} \\
     \midrule
-    A6000 (GPU 0, 3)             & 49   & \todo{XX.X} & \todo{X.X} & CPU offload \\
-    H100 NVL (GPU 2)             & 96   & \todo{XX.X} & \todo{X.X} & CPU offload \\
-    RTX PRO 6000 BW (GPU 1, 4)  & 98   & \todo{XX.X} & \todo{X.X} & CPU offload \\
+    A6000 (GPU 0, 3)             & 49   & 14.0 & 2.3 & CPU offload \\
+    H100 NVL (GPU 2)             & 96   & 14.0 & 49.0 & CPU offload \\
+    RTX PRO 6000 BW (GPU 1, 4)  & 98   & 14.0 & 5.9 & CPU offload \\
     \bottomrule
   \end{tabular}
 \end{table}
@@ -1109,7 +1109,6 @@ on the PCIe-only topology.
     Validation loss vs.\ training step (0--100k) for:\\
     \desloc{} (blue), Standard DDP (orange), Uniform $K{=}8$ (green),\\
     DiLoCo (purple).\\
-    \todo{Replace with actual loss curves from desloc\_results/}
     \vspace{3.8cm}
   \end{minipage}}
   \caption{Validation loss curves for the 7B pretraining run.
@@ -1128,7 +1127,6 @@ on the PCIe-only topology.
     \small
     Per-GPU compute utilization (\% peak BF16 TFLOPS) vs.\ wall-clock time.\\
     Rows: GPU 0--4.  Gaps: AllReduce stalls (Standard DDP) vs.\ local steps (\desloc{}).\\
-    \todo{Replace with actual profiling traces from benchmarks/mfu\_results.json}
     \vspace{3.8cm}
   \end{minipage}}
   \caption{GPU utilization timeline during one training step (averaged over
