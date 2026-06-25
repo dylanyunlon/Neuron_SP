@@ -1291,34 +1291,30 @@ class DesLocEngine:
                 # Plain iterator: pass through unchanged (caller handles batching).
                 self.data_iter = data_iter
 
-        # --- Phase 6b: HeteroElasticBatch (capacity-weighted CP token split) ---
-        # Wraps data_iter with heterogeneous context-parallel slicing so that
-        # H100 gets more tokens per microbatch than A6000, proportional to
-        # capacity_weight. Uses compute_hetero_cp_offsets (commit 770e4567).
+        # --- Phase 6b: Heterogeneous CP token split ---
+        # Pure DP (no TP): every rank fetches its own data independently.
+        # We only need the CP slice logic from HeteroElasticBatch to give
+        # H100 more tokens and A6000 fewer tokens per microbatch.
         from deepspeed.runtime.hetero_elastic_batch import (
-            build_hetero_elastic_batch,
+            HeteroElasticBatch, RankDeviceMap,
         )
+        self._hetero_batch = None
         if dist.is_initialized() and dist.get_world_size() > 1:
-            _cp_group = dist.GroupMember.WORLD  # all ranks in one CP group
-            self._hetero_batch = build_hetero_elastic_batch(
-                tp_group=dist.GroupMember.WORLD,
-                cp_group=_cp_group,
-                device=self.primary_device,
-                enable_hetero_cp=True,
-            )
-            logger.info(
-                "HeteroElasticBatch built: capacity-weighted CP token split active"
-            )
-        else:
-            # Single-GPU: no CP needed, but still use HeteroElasticBatch
-            # for consistent dict-based data interface
-            self._hetero_batch = build_hetero_elastic_batch(
-                tp_group=dist.GroupMember.WORLD,
-                cp_group=dist.GroupMember.WORLD,
-                device=self.primary_device,
-                enable_hetero_cp=False,
-            )
-            logger.info("HeteroElasticBatch built: single-GPU mode (no CP)")
+            try:
+                rank_device_map = RankDeviceMap.from_env()
+                self._hetero_batch = HeteroElasticBatch(
+                    rank_device_map=rank_device_map,
+                    tp_group=None,  # no TP — skip broadcast
+                    cp_group=dist.GroupMember.WORLD,
+                    device=self.primary_device,
+                    enable_hetero_cp=True,
+                )
+                logger.info(
+                    "HeteroElasticBatch built: capacity-weighted CP token split active"
+                )
+            except Exception as e:
+                logger.warning("HeteroElasticBatch init failed: %s", e)
+                self._hetero_batch = None
 
         # Gradient accumulation from plan (use primary device's setting)
         primary_idx = self.primary_device.index if self.primary_device.type == "cuda" else -1
@@ -2080,22 +2076,26 @@ class DesLocEngine:
                     _async_norm_handle = None
 
                 # --- Data fetch: capacity-weighted CP token split ---
-                # HeteroElasticBatch.get_batch() slices tokens by capacity_weight:
-                # H100 gets more tokens (e.g. 512/1024), A6000 gets fewer (256 each).
-                # Each rank then runs standard attention on its own slice — no
-                # cross-rank attention needed (Phase 1: document-level parallelism).
-                batch_out = self._hetero_batch.get_batch(
-                    data_iterator=self.data_iter,
-                    is_pipeline_first_stage=True,
-                    is_pipeline_last_stage=True,
-                )
-                # get_batch returns 7-tuple: (tokens, labels, loss_mask,
-                # attention_mask, position_ids, cu_seqlens, max_seqlen)
-                input_ids = batch_out[0]
-                labels = batch_out[1]
-                if input_ids is None:
-                    # End of data — should not happen with infinite iter
-                    continue
+                # Pure DP: every rank fetches independently, then applies
+                # hetero CP slice so H100 gets more tokens, A6000 fewer.
+                raw = next(self.data_iter)
+                if isinstance(raw, dict):
+                    input_ids = raw["tokens"]
+                    labels = raw.get("labels")
+                else:
+                    input_ids, labels = raw
+
+                # Apply capacity-weighted CP slice if available
+                if self._hetero_batch is not None:
+                    batch_dict = {"tokens": input_ids}
+                    if labels is not None:
+                        batch_dict["labels"] = labels
+                    sliced = self._hetero_batch._apply_hetero_cp_slice(
+                        batch_dict,
+                        cp_size=dist.get_world_size() if dist.is_initialized() else 1,
+                    )
+                    input_ids = sliced.get("tokens", input_ids)
+                    labels = sliced.get("labels", labels)
                 _local_dev = torch.device(f"cuda:{torch.cuda.current_device()}")
                 input_ids = input_ids.to(_local_dev, non_blocking=True)
                 if labels is not None:
