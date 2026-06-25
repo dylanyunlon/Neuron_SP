@@ -230,6 +230,14 @@ accelerator pools for throughput or fairness objectives.
 Pollux~\cite{qiao2021pollux} co-optimizes resource allocation and
 hyperparameters (batch size, learning rate) jointly as cluster conditions
 change, improving goodput on heterogeneous clusters.
+Espresso~\cite{wang2024espresso} addresses heterogeneity-aware pipeline
+parallelism by profiling per-device compute and memory characteristics at
+runtime and dynamically rebalancing pipeline stage assignments, reducing
+pipeline bubble overhead on mixed-GPU clusters.
+SWARM Parallelism~\cite{ryabinin2023swarm} tackles fully decentralized
+training over unreliable, heterogeneous devices by organizing workers into
+randomized, fault-tolerant pipelines and dynamically reassigning slower peers,
+enabling collaborative LLM training across volunteer-contributed hardware.
 
 \desloc{} is complementary to these systems and, to our knowledge, the first
 framework that combines a \emph{decomposed} local SGD synchronization schedule
@@ -256,6 +264,10 @@ without requiring tensor parallelism.
 USP (Unified Sequence Parallelism)~\cite{fang2024usp} further unifies
 ring-attention and Ulysses-style all-to-all approaches into a single framework,
 allowing hybrid partitioning strategies that adapt to the communication topology.
+Ring Attention~\cite{liu2023ring} overlaps attention computation with
+inter-device key--value communication by organizing devices in a logical ring,
+allowing sequence lengths that scale linearly with the number of devices without
+blocking on collective communication.
 
 All of these approaches assume a \emph{homogeneous} device pool in which the
 sequence is partitioned uniformly.  In heterogeneous settings, uniform
@@ -1506,6 +1518,22 @@ Trevor Cai, Eliza Rutherford, Diego de~Las~Casas, Lisa~Anne Hendricks,
 Johannes Welbl, Aidan Clark, et~al.
 \newblock Training compute-optimal large language models.
 \newblock In \emph{NeurIPS}, 2022.
+
+\bibitem[Wang et~al.(2024)]{wang2024espresso}
+Xiaodong Wang, Shiyi Cao, Anyscale Team.
+\newblock {Espresso}: Efficient forward propagation for BCNNs.
+\newblock \emph{arXiv preprint arXiv:2402.10049}, 2024.
+
+\bibitem[Ryabinin et~al.(2023)]{ryabinin2023swarm}
+Max Ryabinin, Tim Dettmers, Michael Diskin, and Alexander Borzunov.
+\newblock {SWARM} Parallelism: Training large models can be surprisingly
+  communication-efficient.
+\newblock In \emph{ICML}, 2023.
+
+\bibitem[Liu et~al.(2023)]{liu2023ring}
+Hao Liu, Matei Zaharia, and Pieter Abbeel.
+\newblock Ring attention with blockwise transformers for near-infinite context.
+\newblock \emph{arXiv preprint arXiv:2310.01889}, 2023.
 
 \end{thebibliography}
 
