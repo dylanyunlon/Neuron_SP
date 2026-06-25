@@ -1671,11 +1671,17 @@ class DesLocEngine:
         # accumulated into the FP32 ``main_grad`` of
         # ``fp32_grad_manager`` for selective-FP32 parameters.
         self._zero3_grad_hook_handles: List = []
+        self._grad_bucket_mgr = None
         if self.param_shard_state is not None:
             try:
+                from deepspeed.runtime.zero3_hetero_shard import GradBucketManager
+                self._grad_bucket_mgr = GradBucketManager(
+                    self.param_shard_state, bucket_size_elems=200_000_000,
+                )
                 self._zero3_grad_hook_handles = (
                     self.param_shard_state.register_backward_hooks(
                         fp32_grad_manager=self.fp32_grad_manager,
+                        bucket_mgr=self._grad_bucket_mgr,
                     )
                 )
                 logger.info(
@@ -1991,6 +1997,8 @@ class DesLocEngine:
             # Zero param_shard.grad — backward hooks accumulate into it
             if self.param_shard_state is not None:
                 self.param_shard_state.param_shard.grad.zero_()
+            if self._grad_bucket_mgr is not None:
+                self._grad_bucket_mgr.reset()
             step_loss = 0.0
 
             # Heterogeneous scheduling: each rank gets its own micro-batch count
@@ -2173,10 +2181,12 @@ class DesLocEngine:
             if self.fp32_grad_manager is not None and self.param_shard_state is None:
                 self.fp32_grad_manager.after_backward(scale=1.0 / num_microbatches)
 
-            # --- finalize_model_grads (upstream Megatron pattern) ---
-            # Gradient averaging across ranks is handled by the per-parameter
-            # all_reduce inside the backward hooks (upstream finalize_model_grads
-            # pattern). No separate allreduce_shard_grads() call needed here.
+            # --- finalize_model_grads (upstream _ParamAndGradBucketGroup) ---
+            # Bucketed gradient all_reduce: fire all_reduce on accumulated
+            # bucket buffers, wait, extract averaged shard slices.
+            if self._grad_bucket_mgr is not None:
+                self._grad_bucket_mgr.start_grad_sync()
+                self._grad_bucket_mgr.finish_grad_sync()
 
             # Gradient clipping — DeepSpeed ZeRO-3 style:
             # 1. Each rank computes local L2 norm² on its param_shard.grad

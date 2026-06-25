@@ -328,6 +328,7 @@ class ShardState:
     def register_backward_hooks(
         self,
         fp32_grad_manager: Optional[object] = None,
+        bucket_mgr: Optional["GradBucketManager"] = None,
     ) -> List[torch.utils.hooks.RemovableHandle]:
         """
         Register a post-accumulate-grad hook on every sharded parameter so
@@ -394,18 +395,18 @@ class ShardState:
                 if grad is None:
                     return
                 if _param_shard.grad is None:
-                    # Should never happen — pre-allocated in build()
                     return
+
+                # Bucketed grad sync (upstream _ParamAndGradBucketGroup):
+                # Copy full param.grad into bucket buffer. Shard extraction
+                # happens in finish_grad_sync() after all_reduce.
+                if bucket_mgr is not None:
+                    bucket_mgr.on_grad_ready(name, grad)
+                    param.grad = None
+                    return
+
+                # Fallback: local SGD — extract shard slice directly
                 flat = grad.detach().reshape(-1)
-
-                # Local SGD: each rank uses its own data's gradient for its
-                # shard slice. Cross-rank sync happens via _broadcast_model_params
-                # in sync_shard_to_model after optimizer.step(). This eliminates
-                # 227 per-param all_reduce calls × 8 microbatches = 1816 NCCL
-                # round-trips per step on PCIe-only topology.
-
-                # Extract this rank's shard slice of the local gradient
-                # and accumulate into param_shard.grad.
                 if _shard_end > _shard_start:
                     # Map from param-local flat indices to our shard window
                     p_lo = _g_start - sl.global_start
@@ -850,3 +851,168 @@ def vram_weights_from_tiers(tiers: Sequence[object]) -> List[float]:
     ordered = [by_idx[k] for k in sorted(by_idx)]
     return ordered
 
+
+
+# ---------------------------------------------------------------------------
+# GradBucketManager — Megatron-style bucketed grad sync for ZeRO-3
+# ---------------------------------------------------------------------------
+class GradBucketManager:
+    """Bucketed gradient all_reduce following upstream _ParamAndGradBucketGroup.
+
+    Instead of 227 per-param all_reduce calls per microbatch (1816/step),
+    this accumulates param gradients into flat FP32 buckets and fires
+    ONE all_reduce per bucket. With _coalescing_manager (PyTorch >=2.0),
+    all bucket all_reduces are batched into a single NCCL call.
+
+    Usage in training loop::
+
+        # After last microbatch's backward:
+        bucket_mgr.finish_grad_sync()  # wait + extract shard slices
+        optimizer.step()
+        bucket_mgr.reset()  # prepare for next step
+    """
+
+    def __init__(self, shard_state, bucket_size_elems: int = 200_000_000):
+        self.ss = shard_state
+        self.bucket_size = bucket_size_elems
+        self.device = shard_state.param_shard.device
+        self.world_size = shard_state.world_size
+        self.rank = shard_state.rank
+
+        # Assign params to buckets in forward order (backward fires reverse)
+        self.buckets = []       # list of dicts: {buffer, params, pending, handle}
+        self._param_bucket = {} # name → bucket_index
+
+        current_bucket_params = []
+        current_size = 0
+
+        for name, p in shard_state.param_order:
+            sl = shard_state.param_offsets[name]
+            numel = sl.global_end - sl.global_start
+            if current_size + numel > self.bucket_size and current_bucket_params:
+                self._finalize_bucket(current_bucket_params, current_size)
+                current_bucket_params = []
+                current_size = 0
+            current_bucket_params.append((name, numel))
+            self._param_bucket[name] = len(self.buckets)
+            current_size += numel
+        if current_bucket_params:
+            self._finalize_bucket(current_bucket_params, current_size)
+
+        # Lazy bucket buffer allocation (allocated on first backward)
+        self._buffers_allocated = False
+        logger.info(
+            "[GradBucketMgr] %d buckets, bucket_size=%dM elems, %d params",
+            len(self.buckets), self.bucket_size // 1_000_000, len(shard_state.param_order),
+        )
+
+    def _finalize_bucket(self, params, total_size):
+        """Register a bucket with its param list."""
+        offsets = {}
+        offset = 0
+        for name, numel in params:
+            offsets[name] = (offset, offset + numel)
+            offset += numel
+        self.buckets.append({
+            'buffer': None,         # lazy FP32 flat buffer
+            'total_size': total_size,
+            'offsets': offsets,      # name → (start, end) within bucket
+            'pending': len(params), # count of params not yet received
+            'handle': None,         # async all_reduce handle
+            'names': [n for n, _ in params],
+        })
+
+    def _alloc_buffers(self):
+        """Lazy-allocate bucket buffers on first use."""
+        if self._buffers_allocated:
+            return
+        for b in self.buckets:
+            b['buffer'] = torch.zeros(b['total_size'], dtype=torch.float32, device=self.device)
+        self._buffers_allocated = True
+
+    def on_grad_ready(self, name: str, param_grad: torch.Tensor):
+        """Called by backward hook when param.grad is computed.
+
+        Copies the FULL param gradient into the bucket buffer.
+        Does NOT fire all_reduce — call start_grad_sync() after all
+        microbatches to trigger the collective.
+        """
+        self._alloc_buffers()
+        bi = self._param_bucket[name]
+        bucket = self.buckets[bi]
+        start, end = bucket['offsets'][name]
+        flat = param_grad.detach().reshape(-1).to(dtype=torch.float32, device=self.device)
+        take = min(flat.numel(), end - start)
+        bucket['buffer'][start:start + take].add_(flat[:take])
+
+    def start_grad_sync(self):
+        """Fire all_reduce on all buckets. Call after last microbatch's backward.
+
+        Uses _coalescing_manager if available (PyTorch >=2.0) to batch
+        all bucket all_reduces into ONE NCCL call.
+        """
+        if self.world_size <= 1 or not dist.is_initialized():
+            return
+
+        try:
+            from torch.distributed.distributed_c10d import _coalescing_manager
+            with _coalescing_manager(None, async_ops=True) as cm:
+                for bucket in self.buckets:
+                    if bucket['buffer'] is not None:
+                        dist.all_reduce(bucket['buffer'], op=dist.ReduceOp.SUM, async_op=True)
+            self._coalesced_handle = cm
+        except ImportError:
+            # Fallback: per-bucket async all_reduce
+            for bucket in self.buckets:
+                if bucket['buffer'] is not None:
+                    bucket['handle'] = dist.all_reduce(
+                        bucket['buffer'], op=dist.ReduceOp.SUM, async_op=True,
+                    )
+
+    def finish_grad_sync(self):
+        """Wait for all bucket all_reduces, extract shard slices to param_shard.grad."""
+        ss = self.ss
+        lo = ss.shard_offsets[ss.rank]
+        hi = ss.shard_offsets[ss.rank + 1]
+
+        # Wait for coalesced or per-bucket handles
+        if hasattr(self, '_coalesced_handle') and self._coalesced_handle is not None:
+            self._coalesced_handle.wait()
+            self._coalesced_handle = None
+        else:
+            for bucket in self.buckets:
+                if bucket['handle'] is not None:
+                    bucket['handle'].wait()
+                    bucket['handle'] = None
+            if bucket['buffer'] is None:
+                continue
+            # Average
+            bucket['buffer'].div_(self.world_size)
+
+            # Extract shard slices for each param in this bucket
+            for name in bucket['names']:
+                sl = ss.param_offsets[name]
+                bstart, bend = bucket['offsets'][name]
+
+                g_start = max(sl.global_start, lo)
+                g_end = min(sl.global_end, hi)
+                if g_end <= g_start:
+                    continue
+                # Offset within param's flat layout
+                p_lo = g_start - sl.global_start
+                p_hi = g_end - sl.global_start
+                # Offset within shard
+                s_lo = g_start - lo
+                s_hi = g_end - lo
+                # Copy averaged gradient from bucket to param_shard.grad
+                ss.param_shard.grad[s_lo:s_hi].add_(
+                    bucket['buffer'][bstart + p_lo:bstart + p_hi]
+                )
+
+    def reset(self):
+        """Reset for next step: zero buffers and pending counts."""
+        for bucket in self.buckets:
+            bucket['pending'] = len(bucket['names'])
+            bucket['handle'] = None
+            if bucket['buffer'] is not None:
+                bucket['buffer'].zero_()
