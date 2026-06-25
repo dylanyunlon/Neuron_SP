@@ -1986,9 +1986,6 @@ class DesLocEngine:
         )
         _shard_sync_pending: bool = False
 
-        if _is_main:
-            print("[DBG] Entering training loop", flush=True)
-
         for step in range(self.global_step, cfg.total_steps):
             self.optimizer.zero_grad(set_to_none=False)
             # Zero param_shard.grad — backward hooks accumulate into it
@@ -2245,31 +2242,7 @@ class DesLocEngine:
                 )
             if not _should_skip:
                 # --- Diagnostic: check param health before/after optimizer step ---
-                if _is_main and step < 3:
-                    _ps = self.param_shard_state.param_shard
-                    _pg = _ps.grad
-                    print(f"[DBG-step{step}] BEFORE opt.step: "
-                          f"shard[:5]={_ps.data[:5].tolist()} "
-                          f"grad[:5]={_pg[:5].tolist()} "
-                          f"grad_norm={_pg.float().norm().item():.4f} "
-                          f"grad_has_nan={_pg.isnan().any().item()} "
-                          f"grad_nonzero={(_pg != 0).sum().item()}/{_pg.numel()} "
-                          f"shard_dtype={_ps.dtype} grad_dtype={_pg.dtype}", flush=True)
                 self.optimizer.step()
-                if _is_main and step < 3:
-                    # Check Adam states
-                    _st = self.optimizer.state[_ps]
-                    _exp_avg = _st.get('exp_avg')
-                    _exp_avg_sq = _st.get('exp_avg_sq')
-                    print(f"[DBG-step{step}] AFTER opt.step: "
-                          f"shard[:5]={_ps.data[:5].tolist()} "
-                          f"shard_has_nan={_ps.data.isnan().any().item()} "
-                          f"adam_step={_st.get('step')} "
-                          f"exp_avg[:5]={_exp_avg[:5].tolist() if _exp_avg is not None else 'None'} "
-                          f"exp_avg_sq[:5]={_exp_avg_sq[:5].tolist() if _exp_avg_sq is not None else 'None'} "
-                          f"exp_avg_nan={_exp_avg.isnan().any().item() if _exp_avg is not None else 'N/A'} "
-                          f"exp_avg_sq_nan={_exp_avg_sq.isnan().any().item() if _exp_avg_sq is not None else 'N/A'}",
-                          flush=True)
                 self.scheduler.step()
                 # ZeRO-3: async sync updated FP32 shard back to model BF16 params.
                 # Copies are issued on _shard_sync_stream so they overlap with the
@@ -2282,12 +2255,6 @@ class DesLocEngine:
                             stream=_shard_sync_stream
                         )
                         _shard_sync_pending = True
-                        if _is_main and step < 5:
-                            torch.cuda.current_stream().wait_stream(_shard_sync_stream)
-                            _sample_p = list(self.model.parameters())[0]
-                            print(f"[DBG-step{step}] AFTER sync: "
-                                  f"model_p0={_sample_p.data.reshape(-1)[:5].tolist()} "
-                                  f"model_has_nan={_sample_p.data.isnan().any().item()}", flush=True)
                     else:
                         # CPU-only fallback: synchronous path
                         self.param_shard_state.sync_shard_to_model()
