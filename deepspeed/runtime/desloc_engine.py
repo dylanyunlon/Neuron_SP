@@ -1295,26 +1295,27 @@ class DesLocEngine:
         # Pure DP (no TP): every rank fetches its own data independently.
         # We only need the CP slice logic from HeteroElasticBatch to give
         # H100 more tokens and A6000 fewer tokens per microbatch.
+        #
+        # TP group = size-1 (just this rank) so broadcast is a no-op.
+        # CP group = WORLD (all ranks participate in context-parallel slicing).
         from deepspeed.runtime.hetero_elastic_batch import (
             HeteroElasticBatch, RankDeviceMap,
         )
-        self._hetero_batch = None
-        if dist.is_initialized() and dist.get_world_size() > 1:
-            try:
-                rank_device_map = RankDeviceMap.from_env()
-                self._hetero_batch = HeteroElasticBatch(
-                    rank_device_map=rank_device_map,
-                    tp_group=None,  # no TP — skip broadcast
-                    cp_group=dist.GroupMember.WORLD,
-                    device=self.primary_device,
-                    enable_hetero_cp=True,
-                )
-                logger.info(
-                    "HeteroElasticBatch built: capacity-weighted CP token split active"
-                )
-            except Exception as e:
-                logger.warning("HeteroElasticBatch init failed: %s", e)
-                self._hetero_batch = None
+        _my_rank = dist.get_rank() if dist.is_initialized() else 0
+        _tp_group = dist.new_group([_my_rank]) if dist.is_initialized() else None
+        _cp_group = dist.GroupMember.WORLD if dist.is_initialized() else None
+        rank_device_map = RankDeviceMap.from_env()
+        self._hetero_batch = HeteroElasticBatch(
+            rank_device_map=rank_device_map,
+            tp_group=_tp_group if _tp_group is not None else dist.GroupMember.WORLD,
+            cp_group=_cp_group if _cp_group is not None else dist.GroupMember.WORLD,
+            device=self.primary_device,
+            enable_hetero_cp=dist.is_initialized() and dist.get_world_size() > 1,
+        )
+        logger.info(
+            "HeteroElasticBatch built: tp_group=size-1 (pure DP), cp_group=WORLD, "
+            "hetero_cp=%s", self._hetero_batch.enable_hetero_cp,
+        )
 
         # Gradient accumulation from plan (use primary device's setting)
         primary_idx = self.primary_device.index if self.primary_device.type == "cuda" else -1
@@ -2085,17 +2086,16 @@ class DesLocEngine:
                 else:
                     input_ids, labels = raw
 
-                # Apply capacity-weighted CP slice if available
-                if self._hetero_batch is not None:
-                    batch_dict = {"tokens": input_ids}
-                    if labels is not None:
-                        batch_dict["labels"] = labels
-                    sliced = self._hetero_batch._apply_hetero_cp_slice(
-                        batch_dict,
-                        cp_size=dist.get_world_size() if dist.is_initialized() else 1,
-                    )
-                    input_ids = sliced.get("tokens", input_ids)
-                    labels = sliced.get("labels", labels)
+                # Apply capacity-weighted CP slice (mandatory — no fallback)
+                batch_dict = {"tokens": input_ids}
+                if labels is not None:
+                    batch_dict["labels"] = labels
+                sliced = self._hetero_batch._apply_hetero_cp_slice(
+                    batch_dict,
+                    cp_size=dist.get_world_size() if dist.is_initialized() else 1,
+                )
+                input_ids = sliced.get("tokens", input_ids)
+                labels = sliced.get("labels", labels)
                 _local_dev = torch.device(f"cuda:{torch.cuda.current_device()}")
                 input_ids = input_ids.to(_local_dev, non_blocking=True)
                 if labels is not None:
