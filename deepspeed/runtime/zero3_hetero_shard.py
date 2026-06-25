@@ -398,12 +398,17 @@ class ShardState:
                     return
                 flat = grad.detach().reshape(-1)
 
-                # No NCCL here — just extract this rank's shard slice of
-                # the full gradient and accumulate into param_shard.grad.
-                # Gradient synchronisation across ranks happens once per
-                # step via all_reduce on param_shard.grad before the
-                # optimizer step (compatible with heterogeneous microbatch
-                # counts).
+                # Upstream finalize_model_grads pattern: all_reduce the FULL
+                # param gradient across ranks BEFORE extracting the shard slice.
+                # Without this, each rank's shard grad comes from only its local
+                # data — no cross-rank averaging occurs, causing divergence.
+                if world_size > 1 and dist.is_initialized():
+                    dist.all_reduce(grad, op=dist.ReduceOp.SUM)
+                    flat = grad.detach().reshape(-1)
+                    flat.div_(world_size)
+
+                # Extract this rank's shard slice of the averaged gradient
+                # and accumulate into param_shard.grad.
                 if _shard_end > _shard_start:
                     # Map from param-local flat indices to our shard window
                     p_lo = _g_start - sl.global_start

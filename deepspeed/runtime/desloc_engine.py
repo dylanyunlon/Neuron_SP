@@ -2170,11 +2170,9 @@ class DesLocEngine:
                 self.fp32_grad_manager.after_backward(scale=1.0 / num_microbatches)
 
             # --- finalize_model_grads (upstream Megatron pattern) ---
-            # All-reduce param_shard.grad across ranks so every rank's shard
-            # gradient is the average over all data-parallel replicas.
-            # Must run BEFORE gradient clipping and optimizer.step().
-            if self.param_shard_state is not None:
-                self.param_shard_state.allreduce_shard_grads()
+            # Gradient averaging across ranks is handled by the per-parameter
+            # all_reduce inside the backward hooks (upstream finalize_model_grads
+            # pattern). No separate allreduce_shard_grads() call needed here.
 
             # Gradient clipping — DeepSpeed ZeRO-3 style:
             # 1. Each rank computes local L2 norm² on its param_shard.grad
