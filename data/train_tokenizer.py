@@ -1,7 +1,7 @@
 """Train a BPE tokenizer from CommitPackFT data using sentencepiece.
 
 Trains on the raw commit text (not the byte-encoded .npy), produces a
-sentencepiece .model file with vocab_size=32000 matching our LlamaModel.
+sentencepiece .model file with vocab_size=8000 matching our LlamaModel.
 
 Usage:
     pip install sentencepiece

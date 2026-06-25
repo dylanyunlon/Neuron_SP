@@ -29,7 +29,7 @@ if [ ! -f "data/neuron_sp.model" ]; then
     echo ""
     echo "═══ Step 2/4: Training BPE tokenizer (vocab=32000) ═══"
     python3 data/train_tokenizer.py \
-        --vocab-size 32000 \
+        --vocab-size 8000 \
         --max-lines 500000 \
         --output-dir data
 else
