@@ -956,7 +956,8 @@ class GradBucketManager:
 
         try:
             from torch.distributed.distributed_c10d import _coalescing_manager
-            with _coalescing_manager(None, async_ops=True) as cm:
+            _pg = dist.group.WORLD if hasattr(dist, 'group') else None
+            with _coalescing_manager(_pg, async_ops=True) as cm:
                 for bucket in self.buckets:
                     if bucket['buffer'] is not None:
                         dist.all_reduce(bucket['buffer'], op=dist.ReduceOp.SUM, async_op=True)
@@ -984,12 +985,13 @@ class GradBucketManager:
                 if bucket['handle'] is not None:
                     bucket['handle'].wait()
                     bucket['handle'] = None
+
+        # Average and extract shard slices for ALL buckets
+        for bucket in self.buckets:
             if bucket['buffer'] is None:
                 continue
-            # Average
             bucket['buffer'].div_(self.world_size)
 
-            # Extract shard slices for each param in this bucket
             for name in bucket['names']:
                 sl = ss.param_offsets[name]
                 bstart, bend = bucket['offsets'][name]
@@ -998,13 +1000,10 @@ class GradBucketManager:
                 g_end = min(sl.global_end, hi)
                 if g_end <= g_start:
                     continue
-                # Offset within param's flat layout
                 p_lo = g_start - sl.global_start
                 p_hi = g_end - sl.global_start
-                # Offset within shard
                 s_lo = g_start - lo
                 s_hi = g_end - lo
-                # Copy averaged gradient from bucket to param_shard.grad
                 ss.param_shard.grad[s_lo:s_hi].add_(
                     bucket['buffer'][bstart + p_lo:bstart + p_hi]
                 )
