@@ -529,7 +529,7 @@ def pad_tensors(specs: List[Tuple[torch.Tensor, int, int]]) -> List[torch.Tensor
 
 def create_shard_offsets(gm: GraphModule, s0_node: Node) -> Tuple[Node, Node]:
     sp_size: int = sp_dp_registry.sp_size()
-    sp_rank: int = dist.get_rank() % sp_dp_registry.sp_size()
+    sp_rank: int = torch.distributed.get_rank() % sp_size
     with gm.graph.inserting_after(s0_node):
         chunk_size_node = gm.graph.call_function(operator.floordiv, args=(s0_node, sp_size))
     with gm.graph.inserting_after(chunk_size_node):
