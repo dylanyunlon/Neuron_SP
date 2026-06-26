@@ -140,7 +140,7 @@ class UlyssesSPLLMAttention(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        freqs_cis: torch.Tensor,
+        freqs_cis: Optional[torch.Tensor] = None,
         mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         B, T, D = x.shape
@@ -150,7 +150,6 @@ class UlyssesSPLLMAttention(nn.Module):
             # _CausalAttn: single fused qkv linear → split into q, k, v
             qkv = self.attn.qkv(x).reshape(B, T, 3, self.n_heads, self.head_dim)
             xq, xk, xv = qkv.unbind(2)  # each (B, T, n_heads, head_dim)
-            # For MHA, n_kv_heads == n_heads, so xk/xv are already correct
         else:
             # GroupedQueryAttention: separate q/k/v projections
             xq = self.attn.q_proj(x).view(B, T, self.n_heads, self.head_dim)
@@ -158,21 +157,21 @@ class UlyssesSPLLMAttention(nn.Module):
             xv = self.attn.v_proj(x).view(B, T, self.n_kv_heads, self.head_dim)
 
         # 2. All-to-all: scatter heads (dim=2), gather seq (dim=1)
-        # Uses dist.all_to_all_single directly (avoids deepspeed.__init__ → triton import)
         xq = self._scatter_heads_gather_seq(xq)
         xk = self._scatter_heads_gather_seq(xk)
         xv = self._scatter_heads_gather_seq(xv)
 
         T_full = xq.shape[1]  # T * sp_size
 
-        # 3. RoPE on full sequence
-        from models.llama_pretrain import apply_rotary_emb
-        if freqs_cis.shape[0] < T_full:
-            # Gather freqs_cis from all ranks
-            freqs_list = [torch.empty_like(freqs_cis) for _ in range(self.sp_size)]
-            dist.all_gather(freqs_list, freqs_cis.contiguous(), group=self.sp_group)
-            freqs_cis = torch.cat(freqs_list, dim=0)
-        xq, xk = apply_rotary_emb(xq, xk, freqs_cis[:T_full])
+        # 3. RoPE — only when freqs_cis is provided (GQA path has RoPE,
+        #    _CausalAttn uses learned positional embeddings instead)
+        if freqs_cis is not None:
+            from models.llama_pretrain import apply_rotary_emb
+            if freqs_cis.shape[0] < T_full:
+                freqs_list = [torch.empty_like(freqs_cis) for _ in range(self.sp_size)]
+                dist.all_gather(freqs_list, freqs_cis.contiguous(), group=self.sp_group)
+                freqs_cis = torch.cat(freqs_list, dim=0)
+            xq, xk = apply_rotary_emb(xq, xk, freqs_cis[:T_full])
 
         # 4. GQA expansion for local heads
         local_q_heads = xq.shape[2]
