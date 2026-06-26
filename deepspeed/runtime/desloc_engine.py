@@ -2014,6 +2014,13 @@ class DesLocEngine:
         if dist.is_initialized() and dist.get_world_size() > 1:
             try:
                 from deepspeed.sequence.auto_sp import auto_wrap_model_for_sp
+                # Diagnostic: log what attention modules exist
+                attn_classes = set()
+                for name, m in self.model.named_modules():
+                    cls = type(m).__name__
+                    if 'attn' in cls.lower() or 'attention' in cls.lower():
+                        attn_classes.add(cls)
+                logger.info("AutoSP: found attention classes in model: %s", attn_classes)
                 sp_group = dist.GroupMember.WORLD
                 auto_wrap_model_for_sp(self.model, sp_group)
                 self._sp_active = True
