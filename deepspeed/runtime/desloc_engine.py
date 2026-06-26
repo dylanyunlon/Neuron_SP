@@ -2006,34 +2006,38 @@ class DesLocEngine:
                 "(P2P + LOC cache active)."
             )
 
-        # --- AutoSP: Ulysses Sequence Parallelism (runtime wrapper) ---
-        # Uses UlyssesSPLLMAttention to wrap each attention module with A2A.
-        # Supports uneven head splits (e.g. 32 heads / 3 GPUs → [11,11,10]).
-        # Works with any attention class via fused-QKV detection.
-        #
-        # NOTE: The compiler-based path (deepspeed/compile/, upstream 5efb24a)
-        # requires HuggingFace-style model(input_ids, labels, position_ids)
-        # interface with prepare_autosp_inputs() tag mechanism. Our custom
-        # LlamaModel.forward(input_ids) has no separate label/position nodes
-        # in the FX graph, so the compiler path is not applicable here.
-        # The compile/ infrastructure is retained for future HF model support.
+        # --- AutoSP: compiler-based Ulysses Sequence Parallelism ---
+        # Uses torch.compile + FX graph passes to insert A2A around SDPA nodes.
+        # Adapted from upstream DeepSpeed 5efb24a for single-input models:
+        #   - label/position nodes are optional (not all models pass them)
+        #   - uneven head splits handled via padding in A2A op
+        #   - uses eager backend (gm.forward) on cu118 (no inductor)
         self._sp_active = False
-        self._autosp_compile_fn = None  # None = runtime wrapper, not compiler
+        self._autosp_compile_fn = None
         if dist.is_initialized() and dist.get_world_size() > 1:
             sp_size = dist.get_world_size()
             try:
-                from deepspeed.sequence.auto_sp import auto_wrap_model_for_sp
-                _sp_group = dist.group.WORLD
-                auto_wrap_model_for_sp(self.model, process_group=_sp_group)
-                from deepspeed.sequence.ulysses_llm_attention import UlyssesSPLLMAttention
-                n_wrapped = sum(1 for m in self.model.modules() if isinstance(m, UlyssesSPLLMAttention))
-                if n_wrapped > 0:
-                    self._sp_active = True
-                    logger.info("AutoSP: %d attention layers wrapped with Ulysses SP (sp_size=%d)", n_wrapped, sp_size)
-                else:
-                    logger.warning("AutoSP: found 0 attention layers to wrap")
+                from deepspeed.compile.custom_ops.sp_compat import _check_autosp_compatibility
+                _check_autosp_compatibility()
+
+                from deepspeed.compile.custom_ops.sp_dp_registry import populate_registry
+                dp_size = 1
+                populate_registry(sp_size, dp_size)
+
+                from deepspeed.compile.passes.long_context_checkpointing import register_long_context_checkpointing
+                register_long_context_checkpointing()
+
+                from deepspeed.compile.passes.sp_compile import apply_autosp
+                def _autosp_backend(gm, real_inputs):
+                    apply_autosp(gm, real_inputs, debug=False, sp_size=sp_size, dp_size=dp_size)
+                    return gm.forward  # eager fallback (no inductor on cu118)
+
+                self._autosp_compile_fn = _autosp_backend
+                self.model = torch.compile(self.model, backend=_autosp_backend, fullgraph=True, dynamic=True)
+                self._sp_active = True
+                logger.info("AutoSP: compiler-based SP enabled (sp_size=%d)", sp_size)
             except Exception as e:
-                logger.warning("AutoSP: wrapping failed (%s), continuing without SP", e)
+                logger.warning("AutoSP: compiler path failed (%s), continuing without SP", e)
 
         # Wire HeteroGradNormSkipController into this engine via
         # integrate_with_deepspeed_engine(). That function monkey-patches
@@ -2155,16 +2159,16 @@ class DesLocEngine:
                 if labels is not None:
                     labels = labels.to(_local_dev, non_blocking=True)
 
-                # AutoSP compiler path: tag inputs for FX graph pass (upstream 5efb24a)
+                # AutoSP compiler path: tag inputs for FX graph pass
                 if self._sp_active and self._autosp_compile_fn is not None:
                     from deepspeed.compile.passes.sp_compile import prepare_autosp_inputs
                     _autosp = prepare_autosp_inputs(
                         input_id=input_ids,
-                        label_id=labels if labels is not None else input_ids,
+                        label_id=labels,  # None for single-input models
                         seq_dim=1,
                     )
                     input_ids = _autosp.input_id
-                    if labels is not None:
+                    if _autosp.label_id is not None:
                         labels = _autosp.label_id
 
                 # -----------------------------------------------------------------

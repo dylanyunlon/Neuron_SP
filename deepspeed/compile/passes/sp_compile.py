@@ -28,14 +28,12 @@ class AutoSPInputs(NamedTuple):
 
 
 def prepare_autosp_inputs(input_id: torch.Tensor,
-                          label_id: torch.Tensor,
+                          label_id: torch.Tensor = None,
                           position_id: torch.Tensor = None,
                           attention_mask: torch.Tensor = None,
                           seq_dim: int = 1) -> AutoSPInputs:
     if input_id is None:
         raise ValueError("input_id is required")
-    if label_id is None:
-        raise ValueError("label_id is required")
     if seq_dim < 0 or seq_dim >= input_id.ndim:
         raise ValueError(f"seq_dim {seq_dim} must be a valid index for input_id with shape {input_id.shape}")
     if position_id is not None and seq_dim >= position_id.ndim:
@@ -48,7 +46,8 @@ def prepare_autosp_inputs(input_id: torch.Tensor,
             torch._dynamo.decorators.mark_dynamic(tensor, seq_dim)
 
     input_id.tag = constants.AUTOSP_INPUT_ID_KEY
-    label_id.tag = constants.AUTOSP_LABEL_ID_KEY
+    if label_id is not None:
+        label_id.tag = constants.AUTOSP_LABEL_ID_KEY
     if position_id is not None:
         position_id.tag = constants.AUTOSP_POSITION_ID_KEY
     if attention_mask is not None:
@@ -106,7 +105,7 @@ def pass_shard_seq_dim(gm: GraphModule, example_inputs):
 
 _SHARD_TARGETS = [
     (get_input_id_node, True),
-    (get_label_id_node, True),
+    (get_label_id_node, False),   # optional: custom models may not pass labels through graph
     (get_position_id_node, False),
 ]
 
@@ -267,10 +266,10 @@ def _validate_sdpa_nodes(gm, sp_sz, rank):
                 if meta is not None and hasattr(meta, 'shape') and len(meta.shape) >= 2:
                     n_heads = meta.shape[1]
                     if isinstance(n_heads, int) and n_heads % sp_sz != 0:
-                        raise RuntimeError(
-                            f"[AutoSP] {arg_name} n_heads={n_heads} not divisible "
-                            f"by sp_size={sp_sz}. For GQA models, "
-                            f"set sp_size to a divisor of num_kv_heads={n_heads}.")
+                        logger.warning(
+                            "[AutoSP] %s n_heads=%d not divisible by sp_size=%d. "
+                            "A2A will use head-padding for uneven split.",
+                            arg_name, n_heads, sp_sz)
     return n_sdpa
 
 

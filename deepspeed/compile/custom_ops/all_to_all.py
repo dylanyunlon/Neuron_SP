@@ -1,5 +1,6 @@
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 from torch.utils._sympy.functions import FloorDiv
 from .sp_dp_registry import get_group, is_setup, sp_size, track_a2a_handle, finalize_a2a_pass, is_loc_enabled
 
@@ -26,8 +27,20 @@ _SCATTER_SEQ = {
 }
 
 
-def _execute_a2a(input, B, dim1, dim2, H, group, plan):
+def _execute_a2a(input, B, dim1, dim2, H, group, plan, scatter_idx):
     P = sp_size()
+    # Pad the scatter dimension to next multiple of P if not divisible
+    if scatter_idx == 1:
+        pad_n = (P - dim1 % P) % P
+        if pad_n > 0:
+            input = F.pad(input, (0, 0, 0, 0, 0, pad_n))  # pad dim1 (heads)
+            dim1 = dim1 + pad_n
+    else:
+        pad_n = (P - dim2 % P) % P
+        if pad_n > 0:
+            input = F.pad(input, (0, 0, 0, pad_n))  # pad dim2 (seq)
+            dim2 = dim2 + pad_n
+
     input_t = input.reshape(*plan["pre_reshape"](B, P, dim1, dim2, H))
     input_t = input_t.permute(*plan["pre_permute"]).contiguous()
     output = torch.empty_like(input_t)
@@ -67,22 +80,18 @@ def all_to_all(
         f"[AutoSP] head_dim=0 in shape {input.shape}. Model config error.")
     B, dim1, dim2, H = input.shape
     _sp = sp_size()
-    if scatter_idx == 1:
-        assert dim1 % _sp == 0, (
-            f"[AutoSP] all_to_all forward: N={dim1} not divisible by sp_size={_sp}. "
-            f"For GQA models, set sequence_parallel_size to a divisor of num_kv_heads.")
-    else:
-        assert dim2 % _sp == 0, (
-            f"[AutoSP] all_to_all forward: S={dim2} not divisible by sp_size={_sp}. "
-            f"Sequence length must be divisible by sequence_parallel_size.")
 
     group = _resolve_group()
     plan = _SCATTER_HEADS if scatter_idx == 1 else _SCATTER_SEQ
-    return _execute_a2a(input, B, dim1, dim2, H, group, plan)
+    return _execute_a2a(input, B, dim1, dim2, H, group, plan, scatter_idx)
 
 
 @torch.library.register_fake("autosp::all_to_all")
 def all_to_all_fake(input, scatter_idx, gather_idx, name):
+
+    def _ceildiv(a, b):
+        """Ceiling division that works with both int and SymInt."""
+        return (a + b - 1) // b
 
     def maybe_restore_sharded_dim(dim, factor):
         node = getattr(dim, "node", None)
@@ -97,9 +106,14 @@ def all_to_all_fake(input, scatter_idx, gather_idx, name):
         return dim * factor
 
     B, dim1, dim2, H = input.shape
+    _sp = sp_size()
     if scatter_idx == 1:
-        return input.new_empty(B, dim1 // sp_size(), maybe_restore_sharded_dim(dim2, sp_size()), H)
-    return input.new_empty(B, dim1 * sp_size(), dim2 // sp_size(), H)
+        # scatter heads → each rank gets ceil(n_heads/P) heads, gather seq → full seq
+        local_heads = _ceildiv(dim1, _sp)
+        return input.new_empty(B, local_heads, maybe_restore_sharded_dim(dim2, _sp), H)
+    # scatter seq → each rank gets ceil(seq/P) seq, gather heads → full heads
+    local_seq = _ceildiv(dim2, _sp)
+    return input.new_empty(B, dim1 * _sp, local_seq, H)
 
 
 def _backward_setup(ctx, inputs, output):

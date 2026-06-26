@@ -555,12 +555,10 @@ def get_input_id_node(gm: GraphModule) -> Node:
     return node
 
 
-def get_label_id_node(gm: GraphModule) -> Node:
+def get_label_id_node(gm: GraphModule) -> Optional[Node]:
     from .fx import find_node_by_tag
     node = find_node_by_tag(gm, constants.AUTOSP_LABEL_ID_KEY)
-    if node is None:
-        raise RuntimeError("Failed to find a node for the label.")
-    return node
+    return node  # None if model has no label input (e.g. custom LlamaModel)
 
 
 def get_position_id_node(gm: GraphModule) -> Node:
