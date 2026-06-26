@@ -2386,14 +2386,40 @@ class DesLocEngine:
 
                 if self.param_shard_state is not None:
                     if _is_Kx:
-                        # Kx step: full cross-rank param sync
-                        if _shard_sync_stream is not None:
-                            self.param_shard_state.sync_shard_to_model_async(
-                                stream=_shard_sync_stream
-                            )
-                            _shard_sync_pending = True
+                        # DiLoCo-style Kx sync: Nesterov outer momentum on param_shard
+                        # Instead of raw broadcast (which causes loss spikes from
+                        # sudden parameter jumps), compute pseudo-gradient and apply
+                        # momentum-smoothed update.
+                        shard = self.param_shard_state.param_shard
+                        if not hasattr(self, '_kx_prev_shard'):
+                            # First Kx sync: initialize state, just do raw sync
+                            self._kx_prev_shard = shard.data.clone()
+                            self._kx_velocity = torch.zeros_like(shard.data)
+                            if _shard_sync_stream is not None:
+                                self.param_shard_state.sync_shard_to_model_async(
+                                    stream=_shard_sync_stream)
+                                _shard_sync_pending = True
+                            else:
+                                self.param_shard_state.sync_shard_to_model()
                         else:
-                            self.param_shard_state.sync_shard_to_model()
+                            _kx_beta = 0.9  # Nesterov momentum coefficient
+                            # pseudo-gradient: how much this rank's shard changed
+                            delta = shard.data.float() - self._kx_prev_shard.float()
+                            # Nesterov momentum update
+                            self._kx_velocity.mul_(_kx_beta).add_(delta)
+                            # Apply: prev + momentum_step (smoother than raw current)
+                            shard.data.copy_(
+                                (self._kx_prev_shard.float() + self._kx_velocity).to(shard.dtype)
+                            )
+                            # Save current as prev for next Kx
+                            self._kx_prev_shard.copy_(shard.data)
+                            # Now broadcast the smoothed shard to model
+                            if _shard_sync_stream is not None:
+                                self.param_shard_state.sync_shard_to_model_async(
+                                    stream=_shard_sync_stream)
+                                _shard_sync_pending = True
+                            else:
+                                self.param_shard_state.sync_shard_to_model()
                     else:
                         # Non-Kx step: local shard → model write only (no broadcast)
                         self.param_shard_state._write_shard_to_model()
