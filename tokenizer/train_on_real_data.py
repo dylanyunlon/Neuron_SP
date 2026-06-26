@@ -44,31 +44,73 @@ COMMIT_SPECIAL_TOKENS = [
 
 
 def stream_commitpack_texts(num_samples: int, languages=("python", "javascript")):
-    """Stream real commit texts from bigcode/commitpack."""
-    try:
-        from datasets import load_dataset
-    except ImportError:
-        log.error("pip install datasets")
-        sys.exit(1)
+    """Load commit texts — local parquet cache first, then HuggingFace streaming.
+
+    Priority:
+      1. Local parquets in data/hf_cache/commitpackft/ (from 'hf download')
+      2. HuggingFace streaming (bigcode/commitpack)
+    """
+    import glob as _glob
 
     texts = []
+    local_dir = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "data", "hf_cache", "commitpackft",
+    )
+
     for lang in languages:
+        per_lang = num_samples // len(languages)
+        count = 0
+
+        # Priority 1: local parquets
+        if os.path.isdir(local_dir):
+            parquets = sorted(_glob.glob(
+                os.path.join(local_dir, "**", "*.parquet"), recursive=True))
+            lang_parquets = [p for p in parquets if lang in p] or parquets
+            if lang_parquets:
+                log.info("Reading %d local parquets for %s", len(lang_parquets), lang)
+                try:
+                    import pyarrow.parquet as pq
+                except ImportError:
+                    os.system(f"{sys.executable} -m pip install -q pyarrow")
+                    import pyarrow.parquet as pq
+                for pf in lang_parquets:
+                    table = pq.read_table(pf)
+                    for i in range(len(table)):
+                        row = {c: table[c][i].as_py() for c in table.column_names}
+                        old = (row.get("old_contents") or "")[:3000]
+                        new = (row.get("new_contents") or "")[:3000]
+                        msg = (row.get("message") or row.get("subject") or "")[:500]
+                        text = (
+                            f"<|diff_start|>{old}<|old|>"
+                            f"{new}<|new|>"
+                            f"{msg}<|commit_msg|>"
+                            f"<|endoftext|>"
+                        )
+                        texts.append(text)
+                        count += 1
+                        if count >= per_lang:
+                            break
+                    if count >= per_lang:
+                        break
+                if count > 0:
+                    log.info("  %s: %d samples from local cache", lang, count)
+                    continue
+
+        # Priority 2: HuggingFace streaming
         log.info("Streaming bigcode/commitpack/%s ...", lang)
         try:
+            from datasets import load_dataset
             ds = load_dataset(
                 "bigcode/commitpack",
                 data_dir=lang,
                 split="train",
                 streaming=True,
             )
-            per_lang = num_samples // len(languages)
-            count = 0
             for sample in ds:
                 old = sample.get("old_contents", "") or ""
                 new = sample.get("new_contents", "") or ""
                 msg = sample.get("message", sample.get("subject", "")) or ""
-
-                # Format as commit training text
                 text = (
                     f"<|diff_start|>{old}<|old|>"
                     f"{new}<|new|>"
