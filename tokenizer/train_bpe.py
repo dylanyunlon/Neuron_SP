@@ -76,9 +76,27 @@ _KNOWN_SHARD_COUNTS = {"python": 458, "javascript": 516}
 
 
 def _resolve_data_files() -> list[str]:
-    """Return hf:// paths for all python + javascript shards in bigcode/commitpack."""
+    """Return data file paths — local cache first, then HuggingFace remote.
+
+    Priority:
+      1. Local parquet/jsonl files in data/hf_cache/commitpackft/ (from hf download)
+      2. HuggingFace hf:// paths (streaming)
+    """
+    import glob as _glob
+
+    # Priority 1: local cached files (from 'hf download bigcode/commitpackft')
+    local_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "hf_cache", "commitpackft")
+    if os.path.isdir(local_dir):
+        parquets = sorted(_glob.glob(os.path.join(local_dir, "**", "*.parquet"), recursive=True))
+        jsonls = sorted(_glob.glob(os.path.join(local_dir, "**", "*.jsonl"), recursive=True))
+        local_files = parquets + jsonls
+        if local_files:
+            log.info("Using %d local cached files from %s", len(local_files), local_dir)
+            return local_files
+
+    # Priority 2: HuggingFace remote
     try:
-        from huggingface_hub import list_repo_tree  # type: ignore[import]
+        from huggingface_hub import list_repo_tree
 
         files: list[str] = []
         for lang, prefix in [
@@ -94,7 +112,7 @@ def _resolve_data_files() -> list[str]:
         log.info("Resolved %d shard files via huggingface_hub.", len(files))
         return files
 
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         log.warning("huggingface_hub listing failed (%s); using hardcoded shard counts.", exc)
 
     # Fallback: build paths from known shard counts
@@ -125,14 +143,15 @@ def iter_commit_texts(num_samples: int, batch_log: int = 50_000) -> Iterator[str
 
     data_files = _resolve_data_files()
     log.info(
-        "Loading bigcode/commitpack  langs=[python, javascript]  "
-        "shards=%d  streaming=True  target=%d records …",
+        "Loading commit data  files=%d  streaming=True  target=%d records …",
         len(data_files),
         num_samples,
     )
 
+    # Auto-detect format: parquet (local cache) or json (remote hf://)
+    fmt = "parquet" if any(f.endswith(".parquet") for f in data_files) else "json"
     ds = load_dataset(
-        "json",
+        fmt,
         data_files={"train": data_files},
         split="train",
         streaming=True,

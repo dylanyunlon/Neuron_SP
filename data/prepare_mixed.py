@@ -10,6 +10,8 @@ import random
 import subprocess
 import json
 import glob
+import json
+import glob
 import numpy as np
 
 EOS_ID = 257
@@ -98,13 +100,46 @@ def format_span_corrupt(s):
     return CD + masked_ids + CM + encode(msg)[:-1] + TG + target_ids
 
 
+def _read_parquets(parquets, lang, max_samples):
+    """Read parquet files, filter by language if possible."""
+    try:
+        import pyarrow.parquet as pq
+    except ImportError:
+        os.system(f"{sys.executable} -m pip install -q pyarrow")
+        import pyarrow.parquet as pq
+
+    # Filter parquets by language name in path
+    lang_parquets = [p for p in parquets if lang in p]
+    if not lang_parquets:
+        lang_parquets = parquets  # use all if no lang-specific files
+
+    print(f"  [read] {len(lang_parquets)} parquet files for {lang}")
+    count = 0
+    for pf in lang_parquets:
+        table = pq.read_table(pf)
+        for i in range(len(table)):
+            row = {col: table[col][i].as_py() for col in table.column_names}
+            yield row
+            count += 1
+            if count >= max_samples:
+                return
+
+
 def download_and_iter(lang, max_samples, cache_dir="data/hf_cache"):
-    """Download CommitPackFT via huggingface-cli, then iterate parquet files."""
+    """Load CommitPackFT — local cache first, then hf download."""
     repo_id = "bigcode/commitpackft"
     local_dir = os.path.join(cache_dir, "commitpackft")
 
-    # Step 1: huggingface-cli download
-    print(f"  [download] huggingface-cli download {repo_id} ...")
+    # Check local cache first
+    if os.path.isdir(local_dir):
+        parquets = sorted(glob.glob(os.path.join(local_dir, "**", "*.parquet"), recursive=True))
+        if parquets:
+            print(f"  [cache] {len(parquets)} parquets in {local_dir}, skipping download")
+            yield from _read_parquets(parquets, lang, max_samples)
+            return
+
+    # Download if no cache
+    print(f"  [download] hf download {repo_id} ...")
     try:
         subprocess.run(
             ["hf", "download",
