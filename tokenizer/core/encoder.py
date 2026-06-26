@@ -24,7 +24,7 @@ Types
 from __future__ import annotations
 
 import sys
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 # ---------------------------------------------------------------------------
 # Public type aliases (used by callers and train_bpe.py)
@@ -68,6 +68,30 @@ class BPEEncoder:
         self.merge_ranks: Dict[Tuple[bytes, bytes], int] = {
             pair: i for i, pair in enumerate(merges)
         }
+
+    # ------------------------------------------------------------------
+    # Alternative constructor
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def from_vocab(cls, neuron_vocab: "Any", unk_id: Optional[int] = None) -> "BPEEncoder":
+        """Construct a :class:`BPEEncoder` from a :class:`vocab.Vocab` instance.
+
+        This bridges the structured ``Vocab`` object (which owns the ID layout)
+        and the flat ``Dict[bytes, int]`` that ``BPEEncoder.__init__`` expects,
+        so callers do not have to manually unpack the vocab internals.
+
+        Parameters
+        ----------
+        neuron_vocab:
+            A ``tokenizer.core.vocab.Vocab`` instance.
+        unk_id:
+            Passed through to ``BPEEncoder.__init__``.
+        """
+        # neuron_vocab._token_to_id is the flat Dict[bytes, int] we need.
+        flat_vocab: Vocab = dict(neuron_vocab._token_to_id)
+        merges: Merges = list(neuron_vocab._merges)
+        return cls(vocab=flat_vocab, merges=merges, unk_id=unk_id)
 
     # ------------------------------------------------------------------
     # Public API
