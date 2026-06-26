@@ -63,7 +63,7 @@ torchrun --nproc_per_node=3 --master_port=29500 \
     --model-size 7b \
     --steps 100000 \
     --batch-size 1 \
-    --seq-len 4096 \
+    --seq-len 2048 \
     --use-desloc \
     --gradient-checkpointing \
     --log-every 10 \
