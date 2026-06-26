@@ -6,7 +6,7 @@ from packaging.version import Version
 logger = logging.getLogger(__name__)
 
 _TRANSFORMERS_VALIDATED_CEILING = "4.50.3"
-_TORCH_MIN = "2.9"
+_TORCH_MIN = "2.7"
 _TORCH_MAX = "2.10"
 
 

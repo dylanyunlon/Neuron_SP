@@ -2007,26 +2007,35 @@ class DesLocEngine:
             )
 
         # --- AutoSP: wrap LLM attention with Ulysses SP ---
-        # Scans model for GroupedQueryAttention, wraps with UlyssesSPLLMAttention
-        # which uses _SeqAllToAll for sequence-parallel attention computation.
-        # Each rank processes n_heads/world_size heads on full sequence.
+        # AutoSP: compiler-based sequence parallelism (upstream DeepSpeed 5efb24a pattern)
+        # Uses torch.compile + FX graph passes to insert A2A around SDPA nodes.
+        # NOT runtime module wrapping — operates at Torch IR level.
         self._sp_active = False
+        self._autosp_compile_fn = None
         if dist.is_initialized() and dist.get_world_size() > 1:
             try:
-                from deepspeed.sequence.auto_sp import auto_wrap_model_for_sp
-                # Diagnostic: log what attention modules exist
-                attn_classes = set()
-                for name, m in self.model.named_modules():
-                    cls = type(m).__name__
-                    if 'attn' in cls.lower() or 'attention' in cls.lower():
-                        attn_classes.add(cls)
-                logger.info("AutoSP: found attention classes in model: %s", attn_classes)
-                sp_group = dist.GroupMember.WORLD
-                auto_wrap_model_for_sp(self.model, sp_group)
+                from deepspeed.compile.custom_ops.sp_compat import _check_autosp_compatibility
+                _check_autosp_compatibility()
+
+                from deepspeed.compile.custom_ops.sp_dp_registry import populate_registry
+                sp_size = dist.get_world_size()
+                dp_size = 1  # pure SP, no DP
+                populate_registry(sp_size, dp_size)
+
+                from deepspeed.compile.passes.long_context_checkpointing import register_long_context_checkpointing
+                register_long_context_checkpointing()
+
+                from deepspeed.compile.passes.sp_compile import apply_autosp
+                def _autosp_backend(gm, real_inputs):
+                    apply_autosp(gm, real_inputs, debug=False, sp_size=sp_size, dp_size=dp_size)
+                    return gm.forward  # eager fallback (no inductor on cu118)
+
+                self._autosp_compile_fn = _autosp_backend
+                self.model = torch.compile(self.model, backend=_autosp_backend, fullgraph=True, dynamic=True)
                 self._sp_active = True
-                logger.info("AutoSP: LLM attention wrapped with Ulysses SP (sp_size=%d)", dist.get_world_size())
+                logger.info("AutoSP: compiler-based SP enabled (sp_size=%d, upstream 5efb24a pattern)", sp_size)
             except Exception as e:
-                logger.warning("AutoSP: wrapping failed (%s), continuing without SP", e)
+                logger.warning("AutoSP: compiler path failed (%s), continuing without SP", e)
 
         # Wire HeteroGradNormSkipController into this engine via
         # integrate_with_deepspeed_engine(). That function monkey-patches
@@ -2147,6 +2156,18 @@ class DesLocEngine:
                 input_ids = input_ids.to(_local_dev, non_blocking=True)
                 if labels is not None:
                     labels = labels.to(_local_dev, non_blocking=True)
+
+                # AutoSP compiler path: tag inputs for FX graph pass (upstream 5efb24a)
+                if self._sp_active:
+                    from deepspeed.compile.passes.sp_compile import prepare_autosp_inputs
+                    _autosp = prepare_autosp_inputs(
+                        input_id=input_ids,
+                        label_id=labels if labels is not None else input_ids,
+                        seq_dim=1,
+                    )
+                    input_ids = _autosp.input_id
+                    if labels is not None:
+                        labels = _autosp.label_id
 
                 # -----------------------------------------------------------------
                 # Wait for async ZeRO-3 shard sync (launched after optimizer.step
