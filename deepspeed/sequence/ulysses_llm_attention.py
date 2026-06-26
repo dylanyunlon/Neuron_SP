@@ -19,7 +19,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
 
-from deepspeed.sequence.layer import _SeqAllToAll
 
 logger = logging.getLogger(__name__)
 
@@ -86,6 +85,32 @@ class UlyssesSPLLMAttention(nn.Module):
             self.local_n_kv,
         )
 
+    def _scatter_heads_gather_seq(self, x: torch.Tensor) -> torch.Tensor:
+        """All-to-all: scatter head dim (2), gather seq dim (1).
+        (B, T, H, D) → (B, T*P, H/P, D)"""
+        B, T, H, D = x.shape
+        P = self.sp_size
+        # (B, T, P, H//P, D) → (P, B, T, H//P, D)
+        hp = H // P
+        x = x.view(B, T, P, hp, D).permute(2, 0, 1, 3, 4).contiguous()
+        out = torch.empty_like(x)
+        dist.all_to_all_single(out, x, group=self.sp_group)
+        # (P, B, T, H//P, D) → (B, P*T, H//P, D)
+        return out.permute(1, 0, 2, 3, 4).contiguous().view(B, T * P, hp, D)
+
+    def _scatter_seq_gather_heads(self, x: torch.Tensor) -> torch.Tensor:
+        """All-to-all reverse: scatter seq dim (1), gather head dim (2).
+        (B, T*P, H/P, D) → (B, T, H, D)"""
+        B, TP, HP, D = x.shape
+        P = self.sp_size
+        T = TP // P
+        # (B, P, T, HP, D) → (P, B, T, HP, D)
+        x = x.view(B, P, T, HP, D).permute(1, 0, 2, 3, 4).contiguous()
+        out = torch.empty_like(x)
+        dist.all_to_all_single(out, x, group=self.sp_group)
+        # (P, B, T, HP, D) → (B, T, P*HP, D)
+        return out.permute(1, 2, 0, 3, 4).contiguous().view(B, T, P * HP, D)
+
     def forward(
         self,
         x: torch.Tensor,
@@ -100,24 +125,10 @@ class UlyssesSPLLMAttention(nn.Module):
         xv = self.attn.v_proj(x).view(B, T, self.n_kv_heads, self.head_dim)
 
         # 2. All-to-all: scatter heads (dim=2), gather seq (dim=1)
-        # Input: (B, T, n_heads, D) → Output: (B, T*P, local_heads, D)
-        # Uses _SeqAllToAll which handles autograd
-        xq = _SeqAllToAll.apply(
-            self.sp_group, xq,
-            2,  # scatter_idx = head dim
-            1,  # gather_idx = seq dim
-            0,  # batch_dim_idx
-        )
-        xk = _SeqAllToAll.apply(
-            self.sp_group, xk,
-            2,  # scatter kv_head dim
-            1,  # gather seq dim
-            0,
-        )
-        xv = _SeqAllToAll.apply(
-            self.sp_group, xv,
-            2, 1, 0,
-        )
+        # Uses dist.all_to_all_single directly (avoids deepspeed.__init__ → triton import)
+        xq = self._scatter_heads_gather_seq(xq)
+        xk = self._scatter_heads_gather_seq(xk)
+        xv = self._scatter_heads_gather_seq(xv)
 
         T_full = xq.shape[1]  # T * sp_size
 
@@ -150,13 +161,7 @@ class UlyssesSPLLMAttention(nn.Module):
         out = out.transpose(1, 2).contiguous()
 
         # 6. All-to-all reverse: scatter seq (dim=1), gather heads (dim=2)
-        # Input: (B, T_full, local_heads, D) → Output: (B, T, n_heads, D)
-        out = _SeqAllToAll.apply(
-            self.sp_group, out,
-            1,  # scatter_idx = seq dim
-            2,  # gather_idx = head dim
-            0,
-        )
+        out = self._scatter_seq_gather_heads(out)
 
         # 7. Output projection
         out = out.contiguous().view(B, T, -1)

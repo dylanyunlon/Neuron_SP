@@ -3,7 +3,6 @@ import logging
 import torch.nn as nn
 
 from deepspeed.sequence.autosp_detector import detect_model_sp_info, _VIT_HAS_CLS_TOKEN
-from deepspeed.sequence.autosp_vit import UlyssesSPViTAttention
 from deepspeed.sequence.ulysses_llm_attention import UlyssesSPLLMAttention
 
 logger = logging.getLogger(__name__)
@@ -18,6 +17,7 @@ def auto_wrap_model_for_sp(model: nn.Module, process_group) -> nn.Module:
                          "deepspeed/sequence/autosp_detector.py and retry.")
 
     for name, module in info.vit_attn_modules:
+        from deepspeed.sequence.autosp_vit import UlyssesSPViTAttention
         cls_name = type(module).__name__
         has_cls = _VIT_HAS_CLS_TOKEN.get(cls_name, True)
         wrapped = UlyssesSPViTAttention(module, process_group, has_cls_token=has_cls)
