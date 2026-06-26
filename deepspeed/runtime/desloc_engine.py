@@ -2006,36 +2006,70 @@ class DesLocEngine:
                 "(P2P + LOC cache active)."
             )
 
-        # --- AutoSP: wrap LLM attention with Ulysses SP ---
-        # AutoSP: compiler-based sequence parallelism (upstream DeepSpeed 5efb24a pattern)
-        # Uses torch.compile + FX graph passes to insert A2A around SDPA nodes.
-        # NOT runtime module wrapping — operates at Torch IR level.
+        # --- AutoSP: Ulysses Sequence Parallelism ---
+        # Two paths:
+        #   1. Compiler-based (upstream 5efb24a): torch.compile + FX graph pass
+        #      Requires n_heads % sp_size == 0 (no uneven split support)
+        #   2. Runtime wrapper (UlyssesSPLLMAttention): nn.Module wrapping
+        #      Supports uneven head splits (e.g. 32 heads / 3 GPUs → [11,11,10])
+        #      Works with any attention class via fused-QKV detection
+        # Strategy: try compiler first, fallback to runtime wrapper.
         self._sp_active = False
         self._autosp_compile_fn = None
         if dist.is_initialized() and dist.get_world_size() > 1:
+            sp_size = dist.get_world_size()
+            _compiler_ok = False
+
+            # --- Attempt 1: compiler path (needs n_heads divisible by sp_size) ---
             try:
                 from deepspeed.compile.custom_ops.sp_compat import _check_autosp_compatibility
                 _check_autosp_compatibility()
-
+                # Check head divisibility before committing to compiler path
+                _n_heads = getattr(self.model, 'n_heads', None)
+                if _n_heads is None:
+                    # Try to find from first attention layer
+                    for m in self.model.modules():
+                        if hasattr(m, 'n_heads'):
+                            _n_heads = m.n_heads
+                            break
+                if _n_heads is not None and _n_heads % sp_size != 0:
+                    raise RuntimeError(
+                        f"n_heads={_n_heads} not divisible by sp_size={sp_size}, "
+                        f"compiler path requires even split; falling back to runtime wrapper"
+                    )
                 from deepspeed.compile.custom_ops.sp_dp_registry import populate_registry
-                sp_size = dist.get_world_size()
-                dp_size = 1  # pure SP, no DP
+                dp_size = 1
                 populate_registry(sp_size, dp_size)
-
                 from deepspeed.compile.passes.long_context_checkpointing import register_long_context_checkpointing
                 register_long_context_checkpointing()
-
                 from deepspeed.compile.passes.sp_compile import apply_autosp
                 def _autosp_backend(gm, real_inputs):
                     apply_autosp(gm, real_inputs, debug=False, sp_size=sp_size, dp_size=dp_size)
-                    return gm.forward  # eager fallback (no inductor on cu118)
-
+                    return gm.forward
                 self._autosp_compile_fn = _autosp_backend
                 self.model = torch.compile(self.model, backend=_autosp_backend, fullgraph=True, dynamic=True)
                 self._sp_active = True
-                logger.info("AutoSP: compiler-based SP enabled (sp_size=%d, upstream 5efb24a pattern)", sp_size)
+                _compiler_ok = True
+                logger.info("AutoSP: compiler-based SP enabled (sp_size=%d)", sp_size)
             except Exception as e:
-                logger.warning("AutoSP: compiler path failed (%s), continuing without SP", e)
+                logger.info("AutoSP: compiler path unavailable (%s), trying runtime wrapper", e)
+
+            # --- Attempt 2: runtime wrapper (handles uneven heads) ---
+            if not _compiler_ok:
+                try:
+                    from deepspeed.sequence.auto_sp import auto_wrap_model_for_sp
+                    _sp_group = dist.group.WORLD
+                    auto_wrap_model_for_sp(self.model, process_group=_sp_group)
+                    # Count wrapped layers
+                    from deepspeed.sequence.ulysses_llm_attention import UlyssesSPLLMAttention
+                    n_wrapped = sum(1 for m in self.model.modules() if isinstance(m, UlyssesSPLLMAttention))
+                    if n_wrapped > 0:
+                        self._sp_active = True
+                        logger.info("AutoSP: runtime wrapper active — %d attention layers wrapped (sp_size=%d)", n_wrapped, sp_size)
+                    else:
+                        logger.warning("AutoSP: runtime wrapper found 0 attention layers to wrap")
+                except Exception as e2:
+                    logger.warning("AutoSP: runtime wrapper also failed (%s), continuing without SP", e2)
 
         # Wire HeteroGradNormSkipController into this engine via
         # integrate_with_deepspeed_engine(). That function monkey-patches
@@ -2158,7 +2192,7 @@ class DesLocEngine:
                     labels = labels.to(_local_dev, non_blocking=True)
 
                 # AutoSP compiler path: tag inputs for FX graph pass (upstream 5efb24a)
-                if self._sp_active:
+                if self._sp_active and self._autosp_compile_fn is not None:
                     from deepspeed.compile.passes.sp_compile import prepare_autosp_inputs
                     _autosp = prepare_autosp_inputs(
                         input_id=input_ids,
