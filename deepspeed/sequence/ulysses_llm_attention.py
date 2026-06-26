@@ -52,9 +52,16 @@ class UlyssesSPLLMAttention(nn.Module):
         self.sp_rank = dist.get_rank(sp_group)
 
         self.n_heads = original_attn.n_heads
-        self.n_kv_heads = original_attn.n_kv_heads
         self.head_dim = original_attn.head_dim
-        self.n_groups = original_attn.n_groups
+        # MHA (_CausalAttn) has no n_kv_heads; GQA has it
+        self.n_kv_heads = getattr(original_attn, 'n_kv_heads', self.n_heads)
+        self.n_groups = getattr(original_attn, 'n_groups', 1)
+
+        # Detect projection style: fused qkv+proj (_CausalAttn) vs separate q/k/v/o_proj (GQA)
+        self._fused_qkv = hasattr(original_attn, 'qkv') and not hasattr(original_attn, 'q_proj')
+        if self._fused_qkv:
+            self._hidden = self.n_heads * self.head_dim
+            logger.info("UlyssesSPLLMAttention: detected fused qkv+proj (_CausalAttn style)")
 
         # Head distribution (may be uneven): 32 heads / 3 ranks → [11, 11, 10]
         self.heads_per_rank = _get_shard_size_list(self.n_heads, self.sp_size)
@@ -87,29 +94,48 @@ class UlyssesSPLLMAttention(nn.Module):
 
     def _scatter_heads_gather_seq(self, x: torch.Tensor) -> torch.Tensor:
         """All-to-all: scatter head dim (2), gather seq dim (1).
-        (B, T, H, D) → (B, T*P, H/P, D)"""
+        (B, T, H, D) → (B, T*P, H_local, D)
+        Handles H % P != 0 by padding heads to next multiple."""
         B, T, H, D = x.shape
         P = self.sp_size
-        # (B, T, P, H//P, D) → (P, B, T, H//P, D)
-        hp = H // P
+        # Pad heads to multiple of P if needed
+        pad_h = (P - H % P) % P
+        if pad_h > 0:
+            x = F.pad(x, (0, 0, 0, pad_h))  # pad head dim
+            H_padded = H + pad_h
+        else:
+            H_padded = H
+        hp = H_padded // P
         x = x.view(B, T, P, hp, D).permute(2, 0, 1, 3, 4).contiguous()
         out = torch.empty_like(x)
         dist.all_to_all_single(out, x, group=self.sp_group)
-        # (P, B, T, H//P, D) → (B, P*T, H//P, D)
-        return out.permute(1, 0, 2, 3, 4).contiguous().view(B, T * P, hp, D)
+        # (P, B, T, hp, D) → (B, P*T, hp, D)
+        out = out.permute(1, 0, 2, 3, 4).contiguous().view(B, T * P, hp, D)
+        # Remove padded heads from this rank's slice
+        local_h = self.heads_per_rank[self.sp_rank]
+        return out[:, :, :local_h, :]
 
     def _scatter_seq_gather_heads(self, x: torch.Tensor) -> torch.Tensor:
         """All-to-all reverse: scatter seq dim (1), gather head dim (2).
-        (B, T*P, H/P, D) → (B, T, H, D)"""
+        (B, T*P, H_local, D) → (B, T, H, D)
+        Handles H % P != 0 by padding."""
         B, TP, HP, D = x.shape
         P = self.sp_size
         T = TP // P
-        # (B, P, T, HP, D) → (P, B, T, HP, D)
+        # Pad HP back to padded size for symmetric A2A
+        total_heads = sum(self.heads_per_rank)
+        pad_h = (P - total_heads % P) % P
+        hp_padded = (total_heads + pad_h) // P
+        if HP < hp_padded:
+            x = F.pad(x, (0, 0, 0, hp_padded - HP))
+            HP = hp_padded
         x = x.view(B, P, T, HP, D).permute(1, 0, 2, 3, 4).contiguous()
         out = torch.empty_like(x)
         dist.all_to_all_single(out, x, group=self.sp_group)
         # (P, B, T, HP, D) → (B, T, P*HP, D)
-        return out.permute(1, 2, 0, 3, 4).contiguous().view(B, T, P * HP, D)
+        out = out.permute(1, 2, 0, 3, 4).contiguous().view(B, T, P * HP, D)
+        # Trim padded heads
+        return out[:, :, :total_heads, :]
 
     def forward(
         self,
@@ -120,9 +146,16 @@ class UlyssesSPLLMAttention(nn.Module):
         B, T, D = x.shape
 
         # 1. QKV projection (all heads)
-        xq = self.attn.q_proj(x).view(B, T, self.n_heads, self.head_dim)
-        xk = self.attn.k_proj(x).view(B, T, self.n_kv_heads, self.head_dim)
-        xv = self.attn.v_proj(x).view(B, T, self.n_kv_heads, self.head_dim)
+        if self._fused_qkv:
+            # _CausalAttn: single fused qkv linear → split into q, k, v
+            qkv = self.attn.qkv(x).reshape(B, T, 3, self.n_heads, self.head_dim)
+            xq, xk, xv = qkv.unbind(2)  # each (B, T, n_heads, head_dim)
+            # For MHA, n_kv_heads == n_heads, so xk/xv are already correct
+        else:
+            # GroupedQueryAttention: separate q/k/v projections
+            xq = self.attn.q_proj(x).view(B, T, self.n_heads, self.head_dim)
+            xk = self.attn.k_proj(x).view(B, T, self.n_kv_heads, self.head_dim)
+            xv = self.attn.v_proj(x).view(B, T, self.n_kv_heads, self.head_dim)
 
         # 2. All-to-all: scatter heads (dim=2), gather seq (dim=1)
         # Uses dist.all_to_all_single directly (avoids deepspeed.__init__ → triton import)
@@ -165,4 +198,7 @@ class UlyssesSPLLMAttention(nn.Module):
 
         # 7. Output projection
         out = out.contiguous().view(B, T, -1)
-        return self.attn.o_proj(out)
+        if self._fused_qkv:
+            return self.attn.proj(out)
+        else:
+            return self.attn.o_proj(out)
