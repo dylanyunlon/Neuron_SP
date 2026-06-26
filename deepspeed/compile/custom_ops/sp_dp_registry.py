@@ -1,7 +1,7 @@
 import os
 import time
 import logging
-import deepspeed.comm as dist
+import torch.distributed as dist
 
 logger = logging.getLogger(__name__)
 

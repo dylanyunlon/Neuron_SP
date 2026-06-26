@@ -5,7 +5,7 @@ from collections import deque
 from typing import Optional, List, Callable, NamedTuple
 
 import torch
-import deepspeed.comm as dist
+import torch.distributed as dist
 
 logger = logging.getLogger(__name__)
 from torch._subclasses.fake_tensor import FakeTensorMode, maybe_get_fake_mode

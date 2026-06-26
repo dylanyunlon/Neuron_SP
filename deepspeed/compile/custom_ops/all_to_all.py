@@ -1,5 +1,5 @@
 import torch
-import deepspeed.comm as dist
+import torch.distributed as dist
 from torch.utils._sympy.functions import FloorDiv
 from .sp_dp_registry import get_group, is_setup, sp_size, track_a2a_handle, finalize_a2a_pass, is_loc_enabled
 

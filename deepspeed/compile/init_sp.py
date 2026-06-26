@@ -72,7 +72,7 @@ def _ensure_clean_state():
 
 
 def _resolve_sp_dp(config):
-    import deepspeed.comm as dist
+    import torch.distributed as dist
     sp_size, dp_size = extract_mesh_size(config._param_dict)
     n_heads, n_kv_heads, min_heads = _resolve_head_counts(config._param_dict)
 
