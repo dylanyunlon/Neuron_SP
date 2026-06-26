@@ -83,13 +83,19 @@ class UlyssesSPLLMAttention(nn.Module):
         # Cache sp_active flag (problem 3 fix)
         self._sp_active = True
 
+        # High-priority A2A stream (M3976-BF pattern: Megatron 54f90af)
+        # A2A runs on dedicated stream, compute on default stream — overlap.
+        _, high_pri = torch.cuda.Stream.priority_range()
+        self._a2a_stream = torch.cuda.Stream(priority=high_pri)
+        self._a2a_event = torch.cuda.Event()
+
         logger.info(
             "UlyssesSPLLMAttention: sp=%d rank=%d Q=[%d:%d](%d) KV=%s(%d) "
-            "using _SeqAllToAll (upstream layer.py)",
+            "a2a_stream=priority_%d (M3976-BF pattern)",
             self.sp_size, self.sp_rank,
             self.local_head_start, self.local_head_end, self.local_n_heads,
             "split" if not self._replicate_kv else "replicate",
-            self.local_n_kv,
+            self.local_n_kv, high_pri,
         )
 
     def _scatter_heads_gather_seq(self, x: torch.Tensor) -> torch.Tensor:
@@ -192,8 +198,12 @@ class UlyssesSPLLMAttention(nn.Module):
         # (B, local_heads, T_full, D) → (B, T_full, local_heads, D)
         out = out.transpose(1, 2).contiguous()
 
-        # 6. All-to-all reverse: scatter seq (dim=1), gather heads (dim=2)
-        out = self._scatter_seq_gather_heads(out)
+        # 6. All-to-all reverse on A2A stream (overlaps with next layer's norm)
+        self._a2a_stream.wait_stream(default_stream)
+        with torch.cuda.stream(self._a2a_stream):
+            out = self._scatter_seq_gather_heads(out)
+        self._a2a_event.record(self._a2a_stream)
+        default_stream.wait_event(self._a2a_event)
 
         # 7. Output projection
         out = out.contiguous().view(B, T, -1)
