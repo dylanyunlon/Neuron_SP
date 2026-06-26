@@ -603,6 +603,33 @@ class ShardState:
             if take > 0:
                 self.param_shard.grad[s_start:s_start + take].copy_(grad_flat[:take])
 
+    def _write_shard_to_model(self) -> None:
+        """Write this rank's FP32 shard to model BF16 — NO cross-rank broadcast.
+
+        DES-LOC non-Kx steps: each rank updates its own portion of the model
+        from the local optimizer state. The model becomes inconsistent across
+        ranks (each has only its shard updated), but this is fine because
+        the next forward pass uses the local model, and cross-rank sync
+        happens at the next Kx step.
+        """
+        lo = self.shard_offsets[self.rank]
+        hi = self.shard_offsets[self.rank + 1]
+
+        for name, p in self.param_order:
+            sl = self.param_offsets[name]
+            if sl.global_end <= lo or sl.global_start >= hi:
+                continue
+            g_start = max(sl.global_start, lo)
+            g_end = min(sl.global_end, hi)
+            p_start = g_start - sl.global_start
+            p_end = g_end - sl.global_start
+            s_start = g_start - lo
+            s_end = g_end - lo
+            with torch.no_grad():
+                updated = self.param_shard.data[s_start:s_end]
+                flat = p.data.reshape(-1)
+                flat[p_start:p_end].copy_(updated.to(p.dtype))
+
     def sync_shard_to_model(self) -> None:
         """Copy updated FP32 param_shard back to model BF16 + all_gather.
 

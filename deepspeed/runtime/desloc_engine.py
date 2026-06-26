@@ -1387,6 +1387,23 @@ class DesLocEngine:
         self.tokens_seen = 0
         self._start_time = time.time()
 
+        # --- DES-LOC: Decomposed Local SGD sync periods ---
+        # Ref: Algorithm 1 — Kx for params, Ku for m1 (exp_avg), Kv for m2 (exp_avg_sq)
+        # Kx=1 means standard DDP (sync every step). Kx>1 means local SGD with
+        # periodic sync. Must satisfy Kx <= Ku <= Kv.
+        # Config source: deepspeed/runtime/config.py line 801-806
+        self.desloc_Kx = getattr(config, 'desloc_Kx', 32)   # param sync period
+        self.desloc_Ku = getattr(config, 'desloc_Ku', 96)   # m1 sync period
+        self.desloc_Kv = getattr(config, 'desloc_Kv', 192)  # m2 sync period
+        assert self.desloc_Kx <= self.desloc_Ku <= self.desloc_Kv, \
+            f"DES-LOC requires Kx <= Ku <= Kv, got {self.desloc_Kx}/{self.desloc_Ku}/{self.desloc_Kv}"
+        logger.info(
+            "DES-LOC sync periods: Kx=%d (params), Ku=%d (m1), Kv=%d (m2) — "
+            "comm reduction %.1fx vs DDP",
+            self.desloc_Kx, self.desloc_Ku, self.desloc_Kv,
+            3.0 / (1.0/self.desloc_Kx + 1.0/self.desloc_Ku + 1.0/self.desloc_Kv),
+        )
+
         # --- Phase 7: Hetero Checkpoint System ---
         # IMPORTANT: this block runs BEFORE load_checkpoint() so that the
         # config (and in particular cfg.load_optim / cfg.load_rng /
@@ -2304,20 +2321,35 @@ class DesLocEngine:
                 # --- Diagnostic: check param health before/after optimizer step ---
                 self.optimizer.step()
                 self.scheduler.step()
-                # ZeRO-3: async sync updated FP32 shard back to model BF16 params.
-                # Copies are issued on _shard_sync_stream so they overlap with the
-                # next step's data preprocessing on the default stream.  The
-                # default stream will wait_stream() at the start of the next
-                # forward pass (top of the micro-batch loop above).
+
+                # --- DES-LOC: conditional sync (Algorithm 1, Kx/Ku/Kv) ---
+                # Non-Kx steps: skip cross-rank param broadcast, local update only.
+                _is_Kx = (step + 1) % self.desloc_Kx == 0
+                _is_Ku = (step + 1) % self.desloc_Ku == 0
+                _is_Kv = (step + 1) % self.desloc_Kv == 0
+
                 if self.param_shard_state is not None:
-                    if _shard_sync_stream is not None:
-                        self.param_shard_state.sync_shard_to_model_async(
-                            stream=_shard_sync_stream
-                        )
-                        _shard_sync_pending = True
+                    if _is_Kx:
+                        # Kx step: full cross-rank param sync
+                        if _shard_sync_stream is not None:
+                            self.param_shard_state.sync_shard_to_model_async(
+                                stream=_shard_sync_stream
+                            )
+                            _shard_sync_pending = True
+                        else:
+                            self.param_shard_state.sync_shard_to_model()
                     else:
-                        # CPU-only fallback: synchronous path
-                        self.param_shard_state.sync_shard_to_model()
+                        # Non-Kx step: local shard → model write only (no broadcast)
+                        self.param_shard_state._write_shard_to_model()
+
+                    if step < 10 or (step + 1) % cfg.log_every == 0:
+                        logger.info(
+                            "[DES-LOC] step=%d Kx=%s Ku=%s Kv=%s",
+                            step + 1,
+                            "SYNC" if _is_Kx else "skip",
+                            "SYNC" if _is_Ku else "skip",
+                            "SYNC" if _is_Kv else "skip",
+                        )
 
             # Accounting
             self.global_step = step + 1
