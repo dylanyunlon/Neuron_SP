@@ -880,6 +880,7 @@ def run_desloc(args: argparse.Namespace) -> None:
         log_every       = args.log_every,
         save_every      = getattr(args, "save_every", 1000),
         eval_every      = 0,
+        activation_checkpointing = getattr(args, "gradient_checkpointing", False),
         wandb_project   = getattr(args, "wandb_desloc_project", None),
         tensorboard_dir = getattr(args, "tensorboard_desloc_dir", None),
     )
