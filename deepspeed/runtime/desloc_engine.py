@@ -2114,21 +2114,30 @@ class DesLocEngine:
                 else:
                     input_ids, labels = raw
 
-                # Apply capacity-weighted CP slice (mandatory — no fallback)
+                # Apply capacity-weighted CP slice — ONLY if SP is not active.
+                # When Ulysses SP is on, all ranks need the same seq_len for
+                # symmetric all-to-all. Load balancing is done via
+                # micro_batch_size_per_gpu instead (H100 gets more batches).
                 _orig_seq = input_ids.shape[-1]
-                batch_dict = {"tokens": input_ids}
-                if labels is not None:
-                    batch_dict["labels"] = labels
-                sliced = self._hetero_batch._apply_hetero_cp_slice(
-                    batch_dict,
-                    cp_size=dist.get_world_size() if dist.is_initialized() else 1,
+                _sp_active = any(
+                    isinstance(m, nn.Module) and type(m).__name__ == 'UlyssesSPLLMAttention'
+                    for m in self.model.modules()
                 )
-                input_ids = sliced.get("tokens", input_ids)
-                labels = sliced.get("labels", labels)
+                if not _sp_active and self._hetero_batch is not None:
+                    batch_dict = {"tokens": input_ids}
+                    if labels is not None:
+                        batch_dict["labels"] = labels
+                    sliced = self._hetero_batch._apply_hetero_cp_slice(
+                        batch_dict,
+                        cp_size=dist.get_world_size() if dist.is_initialized() else 1,
+                    )
+                    input_ids = sliced.get("tokens", input_ids)
+                    labels = sliced.get("labels", labels)
                 if micro == 0 and step < 3:
-                    logger.info("[CP-slice] rank=%d orig_seq=%d → sliced_seq=%d",
+                    logger.info("[data] rank=%d seq=%d→%d sp=%s",
                                 dist.get_rank() if dist.is_initialized() else 0,
-                                _orig_seq, input_ids.shape[-1])
+                                _orig_seq, input_ids.shape[-1],
+                                "ON" if _sp_active else "OFF")
                 _local_dev = torch.device(f"cuda:{torch.cuda.current_device()}")
                 input_ids = input_ids.to(_local_dev, non_blocking=True)
                 if labels is not None:
