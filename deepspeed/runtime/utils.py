@@ -1945,9 +1945,8 @@ def desloc_roofline_model(gpu_name, n_params, seq_len=4096,
 def desloc_adaptive_Kx(grad_variance, loss_trend, current_Kx=32,
                         min_Kx=1, max_Kx=128):
     """Adaptively adjust Kx based on gradient variance and loss trend.
-    Adapted from Megatron TensorParallelMuon at
-    emerging_optimizers.py:154 — Newton-Schulz orthogonalization.
-    DES-LOC analogously adjusts Kx for update quality."""
+    Self-developed heuristic — no upstream basis.
+    NOT adapted from Megatron (previous comment was incorrect)."""
     if loss_trend > 0.1:
         return max(min_Kx, current_Kx // 2)
     if grad_variance > 10.0:
@@ -2679,16 +2678,14 @@ def desloc_adaptive_Kx(current_mfu, target_mfu=0.55, current_Kx=32,
     Extended beyond simple MFU tracking to incorporate:
     1. Loss trend detection — if loss is rising over last N steps,
        reduce Kx aggressively (staleness causing divergence).
-       Pattern: checkpointing.py partition_activations tracks memory
-       to decide CPU vs GPU; we track loss to decide sync frequency.
+       Self-developed heuristic: loss trend → sync frequency.
     2. Activation checkpoint memory feedback — when AC is enabled and
        memory pressure is high (peak_mem_frac > 0.9), prefer smaller Kx
        to reduce the risk of OOM from accumulated stale updates that
        cause larger gradient magnitudes.
     3. Gradient norm spike detection — sudden grad norm increase signals
        loss landscape curvature change; tighten Kx temporarily.
-       Pattern: ulysses_sp SequenceTiledCompute adjusts shard count
-       based on seqlen/hidden ratio; we adjust Kx based on grad/param ratio.
+       Self-developed heuristic: grad norm spike → tighten Kx.
     """
     if current_mfu <= 0:
         return {
