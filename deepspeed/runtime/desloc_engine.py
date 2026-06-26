@@ -2016,28 +2016,26 @@ class DesLocEngine:
         self._autosp_compile_fn = None
         if dist.is_initialized() and dist.get_world_size() > 1:
             sp_size = dist.get_world_size()
-            try:
-                from deepspeed.compile.custom_ops.sp_compat import _check_autosp_compatibility
-                _check_autosp_compatibility()
 
-                from deepspeed.compile.custom_ops.sp_dp_registry import populate_registry
-                dp_size = 1
-                populate_registry(sp_size, dp_size)
+            from deepspeed.compile.custom_ops.sp_compat import _check_autosp_compatibility
+            _check_autosp_compatibility()
 
-                from deepspeed.compile.passes.long_context_checkpointing import register_long_context_checkpointing
-                register_long_context_checkpointing()
+            from deepspeed.compile.custom_ops.sp_dp_registry import populate_registry
+            dp_size = 1
+            populate_registry(sp_size, dp_size)
 
-                from deepspeed.compile.passes.sp_compile import apply_autosp
-                def _autosp_backend(gm, real_inputs):
-                    apply_autosp(gm, real_inputs, debug=False, sp_size=sp_size, dp_size=dp_size)
-                    return gm.forward  # eager fallback (no inductor on cu118)
+            from deepspeed.compile.passes.long_context_checkpointing import register_long_context_checkpointing
+            register_long_context_checkpointing()
 
-                self._autosp_compile_fn = _autosp_backend
-                self.model = torch.compile(self.model, backend=_autosp_backend, fullgraph=True, dynamic=True)
-                self._sp_active = True
-                logger.info("AutoSP: compiler-based SP enabled (sp_size=%d)", sp_size)
-            except Exception as e:
-                logger.warning("AutoSP: compiler path failed (%s), continuing without SP", e)
+            from deepspeed.compile.passes.sp_compile import apply_autosp
+            def _autosp_backend(gm, real_inputs):
+                apply_autosp(gm, real_inputs, debug=False, sp_size=sp_size, dp_size=dp_size)
+                return gm.forward  # eager fallback (no inductor on cu118)
+
+            self._autosp_compile_fn = _autosp_backend
+            self.model = torch.compile(self.model, backend=_autosp_backend, fullgraph=True, dynamic=True)
+            self._sp_active = True
+            logger.info("AutoSP: compiler-based SP enabled (sp_size=%d)", sp_size)
 
         # Wire HeteroGradNormSkipController into this engine via
         # integrate_with_deepspeed_engine(). That function monkey-patches
@@ -2159,8 +2157,16 @@ class DesLocEngine:
                 if labels is not None:
                     labels = labels.to(_local_dev, non_blocking=True)
 
-                # AutoSP compiler path: tag inputs for FX graph pass
+                # AutoSP compiler path: pad seq to sp_size multiple, then tag for FX graph pass
                 if self._sp_active and self._autosp_compile_fn is not None:
+                    _sp = dist.get_world_size()
+                    _seq = input_ids.shape[1]
+                    _pad_n = (_sp - _seq % _sp) % _sp
+                    if _pad_n > 0:
+                        input_ids = F.pad(input_ids, (0, _pad_n), value=0)
+                        if labels is not None:
+                            labels = F.pad(labels, (0, _pad_n), value=-100)  # -100 = ignore in CE loss
+
                     from deepspeed.compile.passes.sp_compile import prepare_autosp_inputs
                     _autosp = prepare_autosp_inputs(
                         input_id=input_ids,

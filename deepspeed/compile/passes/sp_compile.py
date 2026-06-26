@@ -147,7 +147,24 @@ def _wire_sdpa_a2a(gm, attn_node, idx, n_total):
     _insert_a2a(gm, q, **_A2A_QKV_PLAN, name=f"q{suffix}")
     _insert_a2a(gm, k, **_A2A_QKV_PLAN, name=f"k{suffix}")
     _insert_a2a(gm, v, **_A2A_QKV_PLAN, name=f"v{suffix}")
-    _insert_a2a(gm, attn_node, **_A2A_O_PLAN, name=f"o{suffix}")
+    o_a2a = _insert_a2a(gm, attn_node, **_A2A_O_PLAN, name=f"o{suffix}")
+
+    # After reverse A2A, dim1 may be padded (e.g. 33 instead of 32).
+    # Insert a slice to trim back to the original n_heads if needed.
+    q_meta = q.meta.get("val") or q.meta.get("example_value")
+    if q_meta is not None and hasattr(q_meta, 'shape') and len(q_meta.shape) >= 2:
+        orig_n_heads = q_meta.shape[1]  # original n_heads before padding
+        _sp = sp_dp_registry.sp_size()
+        if isinstance(orig_n_heads, int) and orig_n_heads % _sp != 0:
+            # o_a2a output is [B, padded_heads, S_local, H] — trim dim1
+            with gm.graph.inserting_after(o_a2a):
+                trim_node = gm.graph.call_function(
+                    torch.ops.aten.narrow.default,
+                    args=(o_a2a, 1, 0, orig_n_heads),
+                )
+                trim_node.name = f"trim_heads{suffix}"
+                o_a2a.replace_all_uses_with(trim_node)
+                trim_node.update_arg(0, o_a2a)
 
 
 def pass_insert_attention_all_to_all(gm: GraphModule, real_inputs):
