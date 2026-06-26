@@ -122,6 +122,8 @@ def _backward_setup(ctx, inputs, output):
     ctx.gather_idx = scatter_idx
     ctx.name = name + "_grad"
     ctx.orig_dtype = inputs[0].dtype
+    # Save original input shape for trimming after reverse A2A
+    ctx.orig_input_shape = inputs[0].shape
 
 
 def _backward(ctx, grad):
@@ -136,9 +138,13 @@ def _backward(ctx, grad):
     if use_fp32:
         grad_fp32 = grad.float()
         out_fp32 = all_to_all(grad_fp32, ctx.scatter_idx, ctx.gather_idx, ctx.name)
+        out_fp32 = out_fp32.narrow(1, 0, ctx.orig_input_shape[1]).narrow(2, 0, ctx.orig_input_shape[2])
         return (out_fp32.to(ctx.orig_dtype), None, None, None)
 
-    return (all_to_all(grad, ctx.scatter_idx, ctx.gather_idx, ctx.name), None, None, None)
+    result = all_to_all(grad, ctx.scatter_idx, ctx.gather_idx, ctx.name)
+    # Trim padding introduced by forward's _execute_a2a
+    result = result.narrow(1, 0, ctx.orig_input_shape[1]).narrow(2, 0, ctx.orig_input_shape[2])
+    return (result, None, None, None)
 
 
 torch.library.register_autograd("autosp::all_to_all", _backward, setup_context=_backward_setup)
