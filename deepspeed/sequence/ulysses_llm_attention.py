@@ -199,11 +199,12 @@ class UlyssesSPLLMAttention(nn.Module):
         out = out.transpose(1, 2).contiguous()
 
         # 6. All-to-all reverse on A2A stream (overlaps with next layer's norm)
-        self._a2a_stream.wait_stream(default_stream)
+        _cur_stream = torch.cuda.current_stream()
+        self._a2a_stream.wait_stream(_cur_stream)
         with torch.cuda.stream(self._a2a_stream):
             out = self._scatter_seq_gather_heads(out)
         self._a2a_event.record(self._a2a_stream)
-        default_stream.wait_event(self._a2a_event)
+        _cur_stream.wait_event(self._a2a_event)
 
         # 7. Output projection
         out = out.contiguous().view(B, T, -1)
