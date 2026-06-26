@@ -4,6 +4,7 @@ import torch.nn as nn
 
 from deepspeed.sequence.autosp_detector import detect_model_sp_info, _VIT_HAS_CLS_TOKEN
 from deepspeed.sequence.autosp_vit import UlyssesSPViTAttention
+from deepspeed.sequence.ulysses_llm_attention import UlyssesSPLLMAttention
 
 logger = logging.getLogger(__name__)
 
@@ -26,15 +27,11 @@ def auto_wrap_model_for_sp(model: nn.Module, process_group) -> nn.Module:
     logger.info("AutoSP: wrapped %d ViT attention layer(s).", len(info.vit_attn_modules))
 
     for name, module in info.llm_attn_modules:
-        logger.warning(
-            "AutoSP: LLM attention '%s' (class %s) uses a HuggingFace hidden_states "
-            "interface that is incompatible with DistributedAttention's Q/K/V interface. "
-            "Skipping auto-wrap. Configure sequence parallelism for this layer manually.", name,
-            type(module).__name__)
+        wrapped = UlyssesSPLLMAttention(module, process_group)
+        _set_module_by_name(model, name, wrapped)
+        logger.info("AutoSP: wrapped LLM attention '%s' with UlyssesSPLLMAttention", name)
 
-    if info.llm_attn_modules:
-        logger.info("AutoSP: found %d LLM attention layer(s); skipped wrapping (see warnings above).",
-                    len(info.llm_attn_modules))
+    logger.info("AutoSP: wrapped %d LLM attention layer(s).", len(info.llm_attn_modules))
 
     if info.vision_projection_module is not None:
         proj_name, _ = info.vision_projection_module

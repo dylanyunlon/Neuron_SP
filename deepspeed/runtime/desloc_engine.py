@@ -2006,6 +2006,19 @@ class DesLocEngine:
                 "(P2P + LOC cache active)."
             )
 
+        # --- AutoSP: wrap LLM attention with Ulysses SP ---
+        # Scans model for GroupedQueryAttention, wraps with UlyssesSPLLMAttention
+        # which uses _SeqAllToAll for sequence-parallel attention computation.
+        # Each rank processes n_heads/world_size heads on full sequence.
+        if dist.is_initialized() and dist.get_world_size() > 1:
+            try:
+                from deepspeed.sequence.auto_sp import auto_wrap_model_for_sp
+                sp_group = dist.GroupMember.WORLD
+                auto_wrap_model_for_sp(self.model, sp_group)
+                logger.info("AutoSP: LLM attention wrapped with Ulysses SP (sp_size=%d)", dist.get_world_size())
+            except Exception as e:
+                logger.warning("AutoSP: wrapping failed (%s), continuing without SP", e)
+
         # Wire HeteroGradNormSkipController into this engine via
         # integrate_with_deepspeed_engine(). That function monkey-patches
         # engine.step(), but DesLocEngine has no .step() method — step logic

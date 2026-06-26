@@ -28,6 +28,7 @@ _LLM_ATTN_CLASSNAMES = {
     "Qwen2Attention",
     "InternLM2Attention",
     "GemmaAttention",
+    "GroupedQueryAttention",
     "Phi3Attention",
     "GPTNeoXAttention",
     "FalconAttention",
