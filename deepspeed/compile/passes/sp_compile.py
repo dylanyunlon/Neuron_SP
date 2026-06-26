@@ -93,14 +93,22 @@ def pass_shard_seq_dim(gm: GraphModule, example_inputs):
     with gm.graph.inserting_after(sym_seq_dim_node):
         sharded_node = gm.graph.call_function(operator.floordiv, args=(sym_seq_dim_node, sp_sz))
 
-    seed_nodes = set()
-    for getter in (get_input_id_node, get_label_id_node, get_position_id_node):
-        node = getter(gm)
-        if node is not None:
-            seed_nodes.add(node)
-
-    for user in _collect_sharded_consumers(seed_nodes, sym_seq_dim_node):
-        user.replace_input_with(sym_seq_dim_node, sharded_node)
+    # Global replacement: every node in the graph that references the original
+    # s0 symbolic dim should use s0//sp_size instead. This covers not just
+    # input_ids consumers but also torch.arange(T) where T = input_ids.shape[1],
+    # pos_embedding lookups, and any other op that derived a size from the
+    # unsharded sequence length.
+    #
+    # We skip the sharded_node itself (it needs s0 as its own input) and
+    # the SDPA attention nodes (A2A pass handles those separately).
+    sdpa_nodes = set(get_sdpa_nodes(gm))
+    for node in list(gm.graph.nodes):
+        if node is sharded_node:
+            continue
+        if node in sdpa_nodes:
+            continue
+        if sym_seq_dim_node in node.all_input_nodes:
+            node.replace_input_with(sym_seq_dim_node, sharded_node)
 
 
 _SHARD_TARGETS = [
