@@ -1945,8 +1945,12 @@ def desloc_roofline_model(gpu_name, n_params, seq_len=4096,
 def desloc_adaptive_Kx(grad_variance, loss_trend, current_Kx=32,
                         min_Kx=1, max_Kx=128):
     """Adaptively adjust Kx based on gradient variance and loss trend.
-    Self-developed heuristic — no upstream basis.
-    NOT adapted from Megatron (previous comment was incorrect)."""
+    Extends Megatron DDP.no_sync() pattern (skip reduce on non-final
+    microbatch) to step-level: skip param sync on non-Kx steps.
+    Threshold logic inspired by M4065 grad_norm_skip_threshold
+    (Megatron 180131620a: skip update when grad_norm exceeds threshold).
+    Adaptive tuning heuristic (loss trend / variance → Kx adjustment)
+    is project-specific, not directly from upstream."""
     if loss_trend > 0.1:
         return max(min_Kx, current_Kx // 2)
     if grad_variance > 10.0:
