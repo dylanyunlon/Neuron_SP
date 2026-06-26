@@ -16,43 +16,9 @@ import numpy as np
 
 EOS_ID = 257
 MASK_ID = 258
-_sp_model = None
-
-def load_tokenizer(model_path):
-    """Load tokenizer: HF tokenizer.json (from train_bpe.py) or SentencePiece .model."""
-    global _sp_model, EOS_ID, MASK_ID
-    if not model_path or not os.path.exists(model_path):
-        return
-    if model_path.endswith(".json"):
-        # HF tokenizers format (from tokenizer/train_bpe.py)
-        from tokenizers import Tokenizer
-        _sp_model = ("hf", Tokenizer.from_file(model_path))
-        vocab_size = _sp_model[1].get_vocab_size()
-        eos = _sp_model[1].token_to_id("<eos>")
-        mask = _sp_model[1].token_to_id("<mask>")
-        EOS_ID = eos if eos is not None else vocab_size - 1
-        MASK_ID = mask if mask is not None else vocab_size - 2
-        print(f"[tokenizer] HF tokenizer: {model_path}, vocab={vocab_size}, EOS={EOS_ID}, MASK={MASK_ID}")
-    else:
-        # SentencePiece format
-        import sentencepiece as spm
-        _sp_model = ("sp", spm.SentencePieceProcessor())
-        _sp_model[1].load(model_path)
-        sp = _sp_model[1]
-        EOS_ID = sp.eos_id() if sp.eos_id() >= 0 else sp.piece_to_id("<eos>")
-        MASK_ID = sp.piece_to_id("<mask>")
-        if MASK_ID < 0:
-            MASK_ID = sp.get_piece_size() - 1
-        print(f"[tokenizer] SentencePiece: {model_path}, vocab={sp.get_piece_size()}, EOS={EOS_ID}, MASK={MASK_ID}")
-
 def encode(text: str) -> list:
-    if _sp_model is not None:
-        kind, tok = _sp_model
-        if kind == "hf":
-            enc = tok.encode(text)
-            return enc.ids + [EOS_ID]
-        else:
-            return tok.encode(text) + [EOS_ID]
+    """Byte-level encoding: each byte → token ID 1-256, EOS=257, MASK=258.
+    All within vocab_size=32000. No external tokenizer dependency."""
     return [b + 1 for b in text.encode("utf-8", errors="replace")] + [EOS_ID]
 
 def span_corrupt(text, mask_ratio=0.15, mean_span_len=3):
@@ -306,9 +272,6 @@ if __name__ == "__main__":
     p.add_argument("--output-dir", default="data")
     p.add_argument("--alpha", type=float, default=0.7)
     p.add_argument("--languages", nargs="+", default=["python", "javascript"])
-    p.add_argument("--tokenizer", default=None, help="SentencePiece .model file (default: byte-level)")
     a = p.parse_args()
-    if a.tokenizer:
-        load_tokenizer(a.tokenizer)
     prepare(output_dir=a.output_dir, num_samples=a.num_samples,
             alpha=a.alpha, languages=a.languages)

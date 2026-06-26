@@ -27,7 +27,7 @@ import sys
 from typing import Any, Dict, List, Optional, Tuple
 
 # ---------------------------------------------------------------------------
-# Public type aliases (used by callers and train_bpe.py)
+# Public type aliases
 # ---------------------------------------------------------------------------
 Vocab = Dict[bytes, int]
 Merges = List[Tuple[bytes, bytes]]
@@ -291,7 +291,7 @@ class BPEEncoder:
 def build_encoder_from_json(tokenizer_json_path: str) -> BPEEncoder:
     """
     Build a :class:`BPEEncoder` from a HuggingFace ``tokenizer.json`` file
-    (as produced by ``tokenizers`` / ``train_bpe.py``).
+    (as produced by ``tokenizers``).
 
     Parameters
     ----------
