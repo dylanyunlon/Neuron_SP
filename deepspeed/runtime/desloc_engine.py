@@ -2364,7 +2364,7 @@ class DesLocEngine:
                         # Non-Kx step: local shard → model write only (no broadcast)
                         self.param_shard_state._write_shard_to_model()
 
-                    if step < 10 or (step + 1) % cfg.log_every == 0:
+                    if step < 10 or _is_Kx or _is_Ku or _is_Kv or (step + 1) % cfg.log_every == 0:
                         logger.info(
                             "[DES-LOC] step=%d Kx=%s Ku=%s Kv=%s",
                             step + 1,
