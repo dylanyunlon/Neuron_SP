@@ -22,6 +22,7 @@ from deepspeed.core.distributed.param_and_grad_buffer import (
     ParamAndGradBuffer,
     ParamAndGradBucketGroup,
 )
+import deepspeed.core.parallel_state as parallel_state
 
 logger = logging.getLogger(__name__)
 
@@ -78,11 +79,18 @@ class DistributedDataParallel(nn.Module):
         config: ModelParallelConfig,
         ddp_config: DistributedDataParallelConfig,
         module: nn.Module,
-        data_parallel_group: torch.distributed.ProcessGroup,
+        data_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
         expert_data_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
         disable_bucketing: bool = False,
     ) -> None:
         super().__init__()
+
+        # Resolve data_parallel_group from parallel_state when not explicitly given
+        if data_parallel_group is None:
+            if parallel_state.is_initialized():
+                data_parallel_group = parallel_state.get_data_parallel_group()
+            else:
+                data_parallel_group = torch.distributed.GroupMember.WORLD
 
         self.config = config
         self.ddp_config = ddp_config

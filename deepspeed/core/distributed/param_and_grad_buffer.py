@@ -18,6 +18,7 @@ from typing import Dict, List, Optional
 import torch
 
 from deepspeed.core.model_parallel_config import ModelParallelConfig
+import deepspeed.core.parallel_state as parallel_state
 
 logger = logging.getLogger(__name__)
 
@@ -293,11 +294,18 @@ class ParamAndGradBuffer:
         ddp_config,  # DistributedDataParallelConfig
         param_to_name: Dict[torch.nn.Parameter, str],
         params: List[torch.nn.Parameter],
-        data_parallel_group: torch.distributed.ProcessGroup,
+        data_parallel_group: Optional[torch.distributed.ProcessGroup],
         bucket_size: Optional[int],
         param_dtype: torch.dtype,
         grad_dtype: torch.dtype,
     ) -> None:
+        # Resolve data_parallel_group from parallel_state when not given
+        if data_parallel_group is None:
+            if parallel_state.is_initialized():
+                data_parallel_group = parallel_state.get_data_parallel_group()
+            else:
+                data_parallel_group = torch.distributed.GroupMember.WORLD
+
         self.config = config
         self.ddp_config = ddp_config
         self.param_to_name = param_to_name

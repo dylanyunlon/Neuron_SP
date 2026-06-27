@@ -48,6 +48,7 @@ from deepspeed.core.model_parallel_config import ModelParallelConfig
 from deepspeed.core.desloc_config import DesLocConfig, TierType
 from deepspeed.core.distributed import ParamAndGradBuffer
 from deepspeed.core.optimizer.optimizer_config import OptimizerConfig
+import deepspeed.core.parallel_state as parallel_state
 
 logger = logging.getLogger(__name__)
 
@@ -575,10 +576,19 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         params: List[torch.nn.Parameter],
         model_parallel_config: ModelParallelConfig,
         param_and_grad_buffers: List[ParamAndGradBuffer],
-        data_parallel_group: torch.distributed.ProcessGroup,
+        data_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
         data_parallel_group_gloo: Optional[torch.distributed.ProcessGroup] = None,
         tier_assignments: Optional[List[Optional[TierType]]] = None,
     ) -> None:
+        # Resolve data_parallel_group from parallel_state when not explicitly given
+        if data_parallel_group is None:
+            if parallel_state.is_initialized():
+                data_parallel_group = parallel_state.get_data_parallel_group()
+            else:
+                data_parallel_group = torch.distributed.GroupMember.WORLD
+        if data_parallel_group_gloo is None and parallel_state.is_initialized():
+            data_parallel_group_gloo = parallel_state.get_data_parallel_group_gloo()
+
         super().__init__(
             config=config,
             optimizer=optimizer,
