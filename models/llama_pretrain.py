@@ -327,6 +327,93 @@ class LlamaForCausalLM(nn.Module):
 # Public alias so callers can use the shorter name
 Llama = LlamaForCausalLM
 
+# ---------------------------------------------------------------------------
+# Task C wiring: expose GPTModel from core.models as the canonical LlamaModel
+# ---------------------------------------------------------------------------
+# Callers that do `from models.llama_pretrain import LlamaModel` now get a
+# thin wrapper backed by deepspeed.core.models.GPTModel.  The wrapper keeps
+# the same constructor signature and forward contract so existing call sites
+# in run_pretrain.py and desloc_engine.py need no changes.
+import sys as _sys
+import os as _os
+import types as _types
+
+def _ensure_core_stub() -> None:
+    """Register lightweight deepspeed.core namespace stub if not present."""
+    _root = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+    for _name in ("deepspeed", "deepspeed.core"):
+        if _name not in _sys.modules:
+            _stub = _types.ModuleType(_name)
+            _stub.__path__ = [_os.path.join(_root, *_name.split("."))]
+            _stub.__package__ = _name
+            _sys.modules[_name] = _stub
+
+try:
+    _ensure_core_stub()
+    from deepspeed.core.models import GPTModel as _GPTModel
+    from deepspeed.core.transformer import TransformerConfig as _TransformerConfig
+    import torch as _torch
+    import torch.nn as _nn
+
+    class LlamaModel(_nn.Module):
+        """GPTModel-backed causal LM; same API as the old hand-written model.
+
+        Constructor: LlamaModel(vocab_size, hidden_size, num_layers, num_heads, seq_len)
+        Forward:     model(input_ids) → logits [B, T, vocab_size]
+        """
+
+        def __init__(
+            self,
+            vocab_size: int = 32000,
+            hidden_size: int = 4096,
+            num_layers: int = 32,
+            num_heads: int = 32,
+            seq_len: int = 2048,
+        ) -> None:
+            super().__init__()
+            _cfg = _TransformerConfig(
+                num_layers=num_layers,
+                hidden_size=hidden_size,
+                num_attention_heads=num_heads,
+                num_query_groups=num_heads,
+                ffn_hidden_size=(int(hidden_size * 8 / 3) + 63) // 64 * 64,
+                normalization="RMSNorm",
+                hidden_dropout=0.0,
+                attention_dropout=0.0,
+                layernorm_epsilon=1e-6,
+                tensor_model_parallel_size=1,
+                pipeline_model_parallel_size=1,
+            )
+            _cfg.vocab_size = vocab_size                   # type: ignore[attr-defined]
+            _cfg.max_position_embeddings = seq_len         # type: ignore[attr-defined]
+            _cfg.position_embedding_type = "rope"          # type: ignore[attr-defined]
+            _cfg.rotary_base = 10000                       # type: ignore[attr-defined]
+
+            self._gpt = _GPTModel(
+                config=_cfg,
+                pre_process=True,
+                post_process=True,
+                share_embeddings_and_output_weights=True,
+            )
+
+        def enable_gradient_checkpointing(self) -> None:
+            if hasattr(self._gpt, "decoder") and hasattr(self._gpt.decoder, "_gradient_checkpointing"):
+                self._gpt.decoder._gradient_checkpointing = True
+
+        def forward(self, input_ids: "_torch.Tensor") -> "_torch.Tensor":
+            B, T = input_ids.shape
+            pos = _torch.arange(T, device=input_ids.device).unsqueeze(0).expand(B, -1)
+            return self._gpt(input_ids=input_ids, position_ids=pos, attention_mask=None, labels=None)
+
+        @property
+        def num_parameters(self) -> int:
+            return sum(p.numel() for p in self.parameters())
+
+except Exception:
+    # If core.models is unavailable (no torch, missing deps), keep
+    # LlamaModel pointing to the original LlamaForCausalLM so nothing breaks.
+    LlamaModel = LlamaForCausalLM  # type: ignore[misc,assignment]
+
 
 # ---------------------------------------------------------------------------
 # Quick sanity check

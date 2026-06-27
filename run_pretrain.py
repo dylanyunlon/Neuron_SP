@@ -181,10 +181,11 @@ import types as _types
 
 def _stub_deepspeed():
     """Create minimal package stubs so submodule import works."""
-    for name in ("deepspeed", "deepspeed.runtime"):
+    _root = os.path.dirname(os.path.abspath(__file__))
+    for name in ("deepspeed", "deepspeed.runtime", "deepspeed.core"):
         if name not in sys.modules:
             stub = _types.ModuleType(name)
-            stub.__path__ = [name.replace(".", "/")]
+            stub.__path__ = [os.path.join(_root, *name.split("."))]
             stub.__package__ = name
             sys.modules[name] = stub
 
@@ -208,6 +209,21 @@ except Exception as _desloc_import_err:
         _desloc_import_err,
     )
     _HAS_DESLOC = False
+
+# ---------------------------------------------------------------------------
+# core.models.GPTModel — replaces hand-written LlamaModel
+# ---------------------------------------------------------------------------
+try:
+    from deepspeed.core.models import GPTModel
+    from deepspeed.core.transformer import TransformerConfig, TransformerLayer
+    logger.info("deepspeed.core.models.GPTModel imported (wiring Task C)")
+    _HAS_CORE_MODELS = True
+except Exception as _core_err:
+    logger.warning("deepspeed.core.models unavailable (%s); using fallback LlamaModel.", _core_err)
+    GPTModel = None           # type: ignore[assignment,misc]
+    TransformerConfig = None  # type: ignore[assignment,misc]
+    TransformerLayer = None   # type: ignore[assignment,misc]
+    _HAS_CORE_MODELS = False
 
 # ---------------------------------------------------------------------------
 # Model size presets (Llama-style)
@@ -288,11 +304,16 @@ class _TransformerBlock(nn.Module):
 
 
 class LlamaModel(nn.Module):
-    """
-    7B / 1B / 70M Llama-style causal LM.
+    """GPTModel-backed causal LM with the same external API as the old hand-written model.
 
-    hidden_size=4096, layers=32, heads=32, vocab=32000 for 7B.
-    Weight-ties embedding ↔ lm_head (standard LLaMA practice).
+    Wiring Task C: delegates to deepspeed.core.models.GPTModel when available;
+    falls back to the original built-in layers otherwise so training never breaks.
+
+    Interface:
+        LlamaModel(vocab_size, hidden_size, num_layers, num_heads, seq_len)
+        model(input_ids)  →  logits [B, T, vocab_size]
+        model.num_parameters  (property)
+        model.enable_gradient_checkpointing()
     """
 
     def __init__(
@@ -304,22 +325,71 @@ class LlamaModel(nn.Module):
         seq_len: int = 2048,
     ) -> None:
         super().__init__()
-        self.embedding     = nn.Embedding(vocab_size, hidden_size)
-        self.pos_embedding = nn.Embedding(seq_len, hidden_size)
-        self.layers = nn.ModuleList(
-            [_TransformerBlock(hidden_size, num_heads) for _ in range(num_layers)]
-        )
-        self.norm    = _RMSNorm(hidden_size)
-        self.lm_head = nn.Linear(hidden_size, vocab_size, bias=False)
-        self.lm_head.weight = self.embedding.weight  # weight tie
+
+        if _HAS_CORE_MODELS:
+            # Map kwargs → TransformerConfig.  Fields not declared in the
+            # dataclass (vocab_size, max_position_embeddings, …) are attached
+            # as plain attributes; GPTModel reads them via getattr(..., default).
+            _cfg = TransformerConfig(
+                num_layers=num_layers,
+                hidden_size=hidden_size,
+                num_attention_heads=num_heads,
+                num_query_groups=num_heads,          # MHA (no GQA reduction)
+                ffn_hidden_size=(int(hidden_size * 8 / 3) + 63) // 64 * 64,
+                normalization="RMSNorm",
+                hidden_dropout=0.0,
+                attention_dropout=0.0,
+                layernorm_epsilon=1e-6,
+                tensor_model_parallel_size=1,
+                pipeline_model_parallel_size=1,
+            )
+            _cfg.vocab_size = vocab_size                    # type: ignore[attr-defined]
+            _cfg.max_position_embeddings = seq_len          # type: ignore[attr-defined]
+            _cfg.position_embedding_type = "rope"           # type: ignore[attr-defined]
+            _cfg.rotary_base = 10000                        # type: ignore[attr-defined]
+
+            self._gpt = GPTModel(
+                config=_cfg,
+                pre_process=True,
+                post_process=True,
+                share_embeddings_and_output_weights=True,
+            )
+            self._use_gpt = True
+        else:
+            # Fallback: original hand-written layers
+            self._use_gpt = False
+            self.embedding     = nn.Embedding(vocab_size, hidden_size)
+            self.pos_embedding = nn.Embedding(seq_len, hidden_size)
+            self.layers = nn.ModuleList(
+                [_TransformerBlock(hidden_size, num_heads) for _ in range(num_layers)]
+            )
+            self.norm    = _RMSNorm(hidden_size)
+            self.lm_head = nn.Linear(hidden_size, vocab_size, bias=False)
+            self.lm_head.weight = self.embedding.weight  # weight tie
+
+    def enable_gradient_checkpointing(self) -> None:
+        if self._use_gpt:
+            if hasattr(self._gpt, "decoder") and hasattr(self._gpt.decoder, "_gradient_checkpointing"):
+                self._gpt.decoder._gradient_checkpointing = True
+        else:
+            self._grad_ckpt = True
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
-        B, T = input_ids.shape
-        pos  = torch.arange(T, device=input_ids.device).unsqueeze(0)
-        x    = self.embedding(input_ids) + self.pos_embedding(pos)
-        for layer in self.layers:
-            x = layer(x)
-        return self.lm_head(self.norm(x))
+        if self._use_gpt:
+            B, T = input_ids.shape
+            pos = torch.arange(T, device=input_ids.device).unsqueeze(0).expand(B, -1)
+            # GPTModel returns [B, T, vocab] when labels=None
+            return self._gpt(input_ids=input_ids, position_ids=pos, attention_mask=None, labels=None)
+        else:
+            B, T = input_ids.shape
+            pos = torch.arange(T, device=input_ids.device).unsqueeze(0)
+            x = self.embedding(input_ids) + self.pos_embedding(pos)
+            for layer in self.layers:
+                if getattr(self, "_grad_ckpt", False) and self.training:
+                    x = torch.utils.checkpoint.checkpoint(layer, x, use_reentrant=False)
+                else:
+                    x = layer(x)
+            return self.lm_head(self.norm(x))
 
     @property
     def num_parameters(self) -> int:
@@ -535,12 +605,14 @@ def run_standalone(args: argparse.Namespace) -> None:
     # its own capacity to the collective pool.
     use_fsdp = is_dist and getattr(args, "fsdp", False)
     if use_fsdp:
-        # auto_wrap_policy: shard at _TransformerBlock boundaries so each block
-        # is an independent FSDP unit.  This gives fine-grained overlap of
-        # all-gather / computation and limits peak memory per unit.
+        # auto_wrap at layer boundaries for both GPTModel (TransformerLayer)
+        # and the fallback model (_TransformerBlock).
+        _wrap_cls = {_TransformerBlock}
+        if TransformerLayer is not None:
+            _wrap_cls.add(TransformerLayer)
         auto_wrap = functools.partial(
             transformer_auto_wrap_policy,
-            transformer_layer_cls={_TransformerBlock},
+            transformer_layer_cls=_wrap_cls,
         )
         # FULL_SHARD = ZeRO-3 equivalent: shards params + grads + optimizer states.
         # cpu_offload=True moves optimizer states (and optionally grads) to host
@@ -563,7 +635,7 @@ def run_standalone(args: argparse.Namespace) -> None:
         if is_main:
             logger.info(
                 "Model wrapped with FSDP (FULL_SHARD / ZeRO-3, cpu_offload=True, "
-                "auto_wrap=_TransformerBlock).  Heterogeneous-GPU safe."
+                "auto_wrap={TransformerLayer,_TransformerBlock}).  Heterogeneous-GPU safe."
             )
     elif is_dist:
         from torch.nn.parallel import DistributedDataParallel as DDP  # noqa: PLC0415
