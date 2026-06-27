@@ -1,0 +1,142 @@
+# SPDX-License-Identifier: Apache-2.0
+# DeepSpeed Team
+"""Optimizer configuration dataclass for Neuron_SP distributed optimizer.
+
+Mirrors Megatron's OptimizerConfig with DES-LOC moment-sync extensions.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Tuple
+
+import torch
+
+
+@dataclass
+class OptimizerConfig:
+    """Optimizer configuration.
+
+    Mirrors Megatron's OptimizerConfig with DES-LOC moment sync extensions.
+    All training hyper-parameters that control the distributed optimizer live
+    here so they can be serialised / passed around independently of the
+    optimizer instance itself.
+
+    Attributes:
+        lr:                       Peak learning rate (required).
+        min_lr:                   Minimum learning rate for LR schedule.
+        weight_decay:             L2 regularisation coefficient.
+        params_dtype:             dtype used for model parameters (bf16/fp16/fp32).
+        loss_scale:               Fixed loss scale. None → dynamic scaling.
+        initial_loss_scale:       Starting loss scale for dynamic scaling.
+        min_loss_scale:           Floor for dynamic loss scale.
+        loss_scale_window:        Steps over which scale is increased if no overflow.
+        hysteresis:               Number of consecutive overflow steps before scale drops.
+        fp16:                     Enable FP16 training (requires grad_scaler).
+        bf16:                     Enable BF16 training (no grad_scaler needed).
+        clip_grad:                Max gradient norm (0 → disabled).
+        use_distributed_optimizer: Use ZeRO-style distributed optimizer.
+        overlap_param_gather:     Overlap all-gather with next forward pass.
+        overlap_grad_reduce:      Overlap grad reduce-scatter with backward pass.
+        adam_beta1:               Adam first moment decay.
+        adam_beta2:               Adam second moment decay.
+        adam_eps:                 Adam numerical stability constant.
+
+    DES-LOC extensions:
+        desloc_enabled:           Enable DES-LOC Ku/Kv decomposed moment sync.
+        ku:                       First-moment sync period (steps).
+        kv:                       Second-moment sync period (steps).
+        kx:                       Parameter sync period (steps, ≡ Kx in paper).
+        heterogeneous_shard_sizing: Scale shard sizes by FLOPS ratio.
+
+    GPU tier FLOPS ratios (used by heterogeneous shard sizing):
+        h100_bf16_tflops:         H100 BF16 TFLOPS (default 989).
+        a6000_bf16_tflops:        A6000 BF16 TFLOPS (default 309.7).
+    """
+
+    # Learning rate
+    lr: Optional[float] = None
+    min_lr: Optional[float] = None
+
+    # Regularisation
+    weight_decay: float = 0.01
+
+    # Precision
+    params_dtype: torch.dtype = torch.float32
+    fp16: bool = False
+    bf16: bool = True
+
+    # Loss scaling (FP16 only)
+    loss_scale: Optional[float] = None
+    initial_loss_scale: float = 2 ** 32
+    min_loss_scale: float = 1.0
+    loss_scale_window: int = 1000
+    hysteresis: int = 2
+
+    # Gradient clipping
+    clip_grad: float = 1.0
+
+    # Distributed optimizer flags
+    use_distributed_optimizer: bool = True
+    overlap_param_gather: bool = False
+    overlap_grad_reduce: bool = False
+
+    # Adam hyperparameters
+    adam_beta1: float = 0.9
+    adam_beta2: float = 0.95
+    adam_eps: float = 1e-8
+
+    # -----------------------------------------------------------------------
+    # DES-LOC extensions
+    # -----------------------------------------------------------------------
+
+    # Master switch — set to True to enable decomposed moment synchronisation
+    desloc_enabled: bool = False
+
+    # Decomposed sync periods (in optimizer steps)
+    ku: int = 32   # First-moment (exp_avg) sync period
+    kv: int = 64   # Second-moment (exp_avg_sq) sync period
+    kx: int = 8    # Parameter sync period (Kx in DES-LOC paper)
+
+    # Heterogeneous shard sizing: distribute parameters proportionally to
+    # each GPU tier's BF16 FLOPS so that compute time is balanced.
+    heterogeneous_shard_sizing: bool = False
+
+    # Reference BF16 TFLOPS for the two tiers used in DES-LOC clusters:
+    #   H100 SXM5 ≈ 989 BF16 TFLOPS  (dense)
+    #   A6000 Ada ≈ 309.7 BF16 TFLOPS (dense, not sparse)
+    h100_bf16_tflops: float = 989.0
+    a6000_bf16_tflops: float = 309.7
+
+    # -----------------------------------------------------------------------
+    # Helpers
+    # -----------------------------------------------------------------------
+
+    def flops_ratio(self) -> float:
+        """Return H100:A6000 FLOPS ratio used for shard sizing.
+
+        H100 receives ``ratio / (1 + ratio)`` of the total shard; A6000
+        receives ``1 / (1 + ratio)``.
+        """
+        return self.h100_bf16_tflops / self.a6000_bf16_tflops
+
+    def h100_shard_fraction(self) -> float:
+        """Fraction of parameters owned by the H100 tier."""
+        r = self.flops_ratio()
+        return r / (1.0 + r)
+
+    def a6000_shard_fraction(self) -> float:
+        """Fraction of parameters owned by the A6000 tier."""
+        return 1.0 / (1.0 + self.flops_ratio())
+
+    def is_ku_step(self, step: int) -> bool:
+        """Return True if *step* is a first-moment sync step."""
+        return (step % self.ku) == 0
+
+    def is_kv_step(self, step: int) -> bool:
+        """Return True if *step* is a second-moment sync step."""
+        return (step % self.kv) == 0
+
+    def is_kx_step(self, step: int) -> bool:
+        """Return True if *step* is a parameter sync step (Kx)."""
+        return (step % self.kx) == 0
