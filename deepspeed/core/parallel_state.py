@@ -216,21 +216,36 @@ def initialize_model_parallel(
 
     # -----------------------------------------------------------------------
     # Build DES-LOC tier groups
-    # Each tier in desloc_config.tiers contains a list of gpu_indices.
-    # We create a process group for each tier containing those global ranks.
+    # Each tier in desloc_config.tiers contains a list of gpu_indices (global
+    # ranks).  We create one process group per distinct TierType.  Multiple
+    # TierSpec entries sharing the same TierType are merged into a single group.
+    # NCCL requires ALL ranks to call new_group() with the same ranks list,
+    # even non-members; we therefore iterate every tier unconditionally.
     # -----------------------------------------------------------------------
     global _TIER_GROUPS
     global _LOCAL_TIER
     if desloc_config is not None and desloc_config.tiers:
+        # Merge gpu_indices by tier_type name (handles duplicate TierType entries)
+        tier_indices_map: dict[str, List[int]] = {}
+        tier_spec_map: dict[str, TierSpec] = {}
         for tier_spec in desloc_config.tiers:
             tier_name = tier_spec.tier_type.name.lower()
-            gpu_indices = tier_spec.gpu_indices
-            # gpu_indices are global ranks in this context
-            if len(gpu_indices) > 0:
-                group = torch.distributed.new_group(ranks=gpu_indices)
-                _TIER_GROUPS[tier_name] = group
-                if rank in gpu_indices:
-                    _LOCAL_TIER = tier_spec
+            if tier_name not in tier_indices_map:
+                tier_indices_map[tier_name] = []
+                tier_spec_map[tier_name] = tier_spec
+            for idx in tier_spec.gpu_indices:
+                if idx not in tier_indices_map[tier_name]:
+                    tier_indices_map[tier_name].append(idx)
+
+        # All ranks must participate in every new_group call (NCCL collective)
+        for tier_name, gpu_indices in tier_indices_map.items():
+            if not gpu_indices:
+                continue
+            sorted_indices = sorted(gpu_indices)
+            group = torch.distributed.new_group(ranks=sorted_indices)
+            _TIER_GROUPS[tier_name] = group
+            if rank in sorted_indices:
+                _LOCAL_TIER = tier_spec_map[tier_name]
 
 
 def is_initialized() -> bool:
@@ -340,6 +355,20 @@ def get_sequence_parallel_rank() -> int:
 def get_context_parallel_group() -> Optional[torch.distributed.ProcessGroup]:
     """Get the context-parallel group the caller rank belongs to, or None."""
     return _CONTEXT_PARALLEL_GROUP
+
+
+def get_context_parallel_world_size() -> int:
+    """Return the world size of the context parallel group (1 if not initialized)."""
+    if _CONTEXT_PARALLEL_GROUP is None:
+        return 1
+    return torch.distributed.get_world_size(group=_CONTEXT_PARALLEL_GROUP)
+
+
+def get_context_parallel_rank() -> int:
+    """Return the rank of the current process in the context parallel group (0 if not initialized)."""
+    if _CONTEXT_PARALLEL_GROUP is None:
+        return 0
+    return torch.distributed.get_rank(group=_CONTEXT_PARALLEL_GROUP)
 
 
 # --- PP helpers ---
