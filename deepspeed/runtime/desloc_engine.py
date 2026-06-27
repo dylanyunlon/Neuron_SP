@@ -38,6 +38,20 @@ from torch.nn.utils import clip_grad_norm_
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
 
+# ---------------------------------------------------------------------------
+# core.parallel_state: replaces direct torch.distributed rank/world-size calls
+# ---------------------------------------------------------------------------
+import deepspeed.core.parallel_state as parallel_state
+
+# ---------------------------------------------------------------------------
+# core.distributed: DistributedDataParallel + finalize_model_grads
+# ---------------------------------------------------------------------------
+from deepspeed.core.distributed import (
+    DistributedDataParallel as CoreDDP,
+    DistributedDataParallelConfig as CoreDDPConfig,
+    finalize_model_grads,
+)
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -1107,11 +1121,15 @@ class DesLocEngine:
                 ShardState as _ShardState,
                 vram_weights_from_tiers as _vram_weights_from_tiers,
             )
-            _ws = dist.get_world_size() if dist.is_initialized() else int(
-                os.environ.get("WORLD_SIZE", 1)
+            _ws = (
+                parallel_state.get_data_parallel_world_size()
+                if parallel_state.is_initialized()
+                else (dist.get_world_size() if dist.is_initialized() else int(os.environ.get("WORLD_SIZE", 1)))
             )
-            _rk = dist.get_rank() if dist.is_initialized() else int(
-                os.environ.get("RANK", 0)
+            _rk = (
+                parallel_state.get_data_parallel_rank()
+                if parallel_state.is_initialized()
+                else (dist.get_rank() if dist.is_initialized() else int(os.environ.get("RANK", 0)))
             )
             if _ws > 1:
                 # Heterogeneous: weight shards by VRAM (H100 > A6000).
@@ -1301,7 +1319,11 @@ class DesLocEngine:
         from deepspeed.runtime.hetero_elastic_batch import (
             HeteroElasticBatch, RankDeviceMap,
         )
-        _my_rank = dist.get_rank() if dist.is_initialized() else 0
+        _my_rank = (
+            parallel_state.get_data_parallel_rank()
+            if parallel_state.is_initialized()
+            else (dist.get_rank() if dist.is_initialized() else 0)
+        )
         _tp_group = dist.new_group([_my_rank]) if dist.is_initialized() else None
         _cp_group = dist.GroupMember.WORLD if dist.is_initialized() else None
         rank_device_map = RankDeviceMap.from_env()
@@ -1310,7 +1332,10 @@ class DesLocEngine:
             tp_group=_tp_group if _tp_group is not None else dist.GroupMember.WORLD,
             cp_group=_cp_group if _cp_group is not None else dist.GroupMember.WORLD,
             device=self.primary_device,
-            enable_hetero_cp=dist.is_initialized() and dist.get_world_size() > 1,
+            enable_hetero_cp=(
+                (parallel_state.is_initialized() and parallel_state.get_data_parallel_world_size() > 1)
+                or (dist.is_initialized() and not parallel_state.is_initialized() and dist.get_world_size() > 1)
+            ),
         )
         logger.info(
             "HeteroElasticBatch built: tp_group=size-1 (pure DP), cp_group=WORLD, "
@@ -1351,8 +1376,10 @@ class DesLocEngine:
         schedule_str = config.batch_schedule or f"0:{config.global_batch_size}"
         seq_len_for_schedule = config.batch_schedule_seq_length
 
-        _rank = dist.get_rank() if dist.is_initialized() else int(
-            os.environ.get("RANK", 0)
+        _rank = (
+            parallel_state.get_data_parallel_rank()
+            if parallel_state.is_initialized()
+            else (dist.get_rank() if dist.is_initialized() else int(os.environ.get("RANK", 0)))
         )
         self.hetero_scheduler: HeteroStepBatchScheduler = HeteroStepBatchScheduler(
             rank=_rank,
@@ -1549,8 +1576,9 @@ class DesLocEngine:
         _ckpt_granularity = str(config.checkpoint_activations_granularity).lower()
 
         _local_rank = (
-            dist.get_rank() if dist.is_initialized()
-            else int(os.environ.get("RANK", 0))
+            parallel_state.get_data_parallel_rank()
+            if parallel_state.is_initialized()
+            else (dist.get_rank() if dist.is_initialized() else int(os.environ.get("RANK", 0)))
         )
 
         if block_list is not None:
@@ -1655,10 +1683,15 @@ class DesLocEngine:
             tier1_follow_patterns=True,
             offload_fp32_grads_to_cpu=False,
         )
-        # data_parallel_group: use the default process group if distributed is
-        # initialised, otherwise fall back to a single-rank gloo group so the
-        # manager can still be constructed without a real multi-GPU setup.
-        if dist.is_initialized():
+        # data_parallel_group: prefer the parallel_state DP group when initialised
+        # (ensures the correct process group is used for all-reduces in the
+        # FP32 grad accum manager).  When parallel_state is not yet set up but
+        # torch.distributed is, fall back to the global world group.
+        # If neither is available, bootstrap a single-rank gloo group so the
+        # manager can be constructed without a real multi-GPU setup.
+        if parallel_state.is_initialized():
+            _dp_group = parallel_state.get_data_parallel_group()
+        elif dist.is_initialized():
             _dp_group = dist.group.WORLD
         else:
             dist.init_process_group(
@@ -1706,7 +1739,7 @@ class DesLocEngine:
             self.primary_device,
         )
 
-        # --- Phase 8b: ZeRO-3 backward reduce-scatter hooks ---
+        # --- Phase 8b: ZeRO-3 backward reduce-scatter hooks + CoreDDP wiring ---
         # Register a post-accumulate-grad hook on every sharded parameter
         # so that each rank's ``.grad`` is reduced and scattered the
         # moment autograd produces it. After the hook each rank only
@@ -1714,8 +1747,13 @@ class DesLocEngine:
         # ``param_shard``, and (when applicable) those slices are
         # accumulated into the FP32 ``main_grad`` of
         # ``fp32_grad_manager`` for selective-FP32 parameters.
+        #
+        # For the non-ZeRO-3 path, we wire core.distributed.DistributedDataParallel
+        # so that finalize_model_grads() can drive bucketed all-reduce via the
+        # standard ParamAndGradBuffer interface.
         self._zero3_grad_hook_handles: List = []
         self._grad_bucket_mgr = None
+        self._core_ddp: Optional[CoreDDP] = None
         if self.param_shard_state is not None:
             try:
                 # Local SGD: no per-param all_reduce (1816 NCCL calls → 15.8s/step).
@@ -1738,14 +1776,57 @@ class DesLocEngine:
                     "post-backward scatter_grads() will still run.",
                     _hook_exc,
                 )
+        else:
+            # Non-ZeRO-3: wrap the model with core.distributed.DistributedDataParallel
+            # so finalize_model_grads() can bucket and all-reduce gradients properly.
+            # Only wraps when distributed training is actually active (world_size > 1).
+            _ddp_dp_group = (
+                parallel_state.get_data_parallel_group()
+                if parallel_state.is_initialized()
+                else (dist.group.WORLD if dist.is_initialized() else None)
+            )
+            _is_distributed = (
+                (parallel_state.is_initialized() and parallel_state.get_data_parallel_world_size() > 1)
+                or (dist.is_initialized() and dist.get_world_size() > 1)
+            )
+            if _is_distributed and _ddp_dp_group is not None:
+                try:
+                    from deepspeed.core.model_parallel_config import ModelParallelConfig  # noqa: PLC0415
+                    _mp_cfg = ModelParallelConfig()
+                    _ddp_cfg = CoreDDPConfig(
+                        grad_reduce_in_fp32=False,
+                        overlap_grad_reduce=False,
+                        use_distributed_optimizer=False,
+                        allow_skip_grad_sync=True,  # DES-LOC Kx gating
+                    )
+                    self._core_ddp = CoreDDP(
+                        config=_mp_cfg,
+                        ddp_config=_ddp_cfg,
+                        module=self.model,
+                        data_parallel_group=_ddp_dp_group,
+                    )
+                    logger.info(
+                        "[core_ddp] DistributedDataParallel wired: "
+                        "dp_group_size=%d, overlap_grad_reduce=%s",
+                        dist.get_world_size(group=_ddp_dp_group),
+                        _ddp_cfg.overlap_grad_reduce,
+                    )
+                except Exception as _ddp_exc:  # noqa: BLE001
+                    logger.warning(
+                        "[core_ddp] CoreDDP init failed (%s); "
+                        "finalize_model_grads will still run with plain model.",
+                        _ddp_exc,
+                    )
+                    self._core_ddp = None
 
         # --- Phase 9a: SharedLocalityCache (1.5 TB CPU DRAM ÷ world_size) ---
         # The training host has 2×EPYC 9354 with 1.5 TB DDR5.  Each rank
         # receives an equal share so that the aggregate cache footprint never
         # exceeds the physical 1.5 TB ceiling regardless of process count.
         _world_size = (
-            dist.get_world_size() if dist.is_initialized()
-            else int(os.environ.get("WORLD_SIZE", 1))
+            parallel_state.get_data_parallel_world_size()
+            if parallel_state.is_initialized()
+            else (dist.get_world_size() if dist.is_initialized() else int(os.environ.get("WORLD_SIZE", 1)))
         )
         _total_dram_bytes = int(1.5 * 1024 ** 4)          # 1.5 TiB in bytes
         _cache_max_bytes = _total_dram_bytes // _world_size
@@ -1899,7 +1980,13 @@ class DesLocEngine:
           - Periodic logging and checkpointing
         """
         # Rank guard: only rank 0 prints/logs to avoid 5x log spam
-        _is_main = (not dist.is_initialized()) or (dist.get_rank() == 0)
+        _is_main = (
+            not (parallel_state.is_initialized() or dist.is_initialized())
+        ) or (
+            parallel_state.get_data_parallel_rank() == 0
+            if parallel_state.is_initialized()
+            else dist.get_rank() == 0
+        )
 
         # Suppress duplicate log messages from non-rank-0 processes
         if not _is_main:
@@ -2014,8 +2101,13 @@ class DesLocEngine:
         #   - uses eager backend (gm.forward) on cu118 (no inductor)
         self._sp_active = False
         self._autosp_compile_fn = None
-        if dist.is_initialized() and dist.get_world_size() > 1:
-            sp_size = dist.get_world_size()
+        _sp_world_size = (
+            parallel_state.get_data_parallel_world_size()
+            if parallel_state.is_initialized()
+            else (dist.get_world_size() if dist.is_initialized() else 1)
+        )
+        if _sp_world_size > 1:
+            sp_size = _sp_world_size
 
             from deepspeed.compile.custom_ops.sp_compat import _check_autosp_compatibility
             _check_autosp_compatibility()
@@ -2070,8 +2162,9 @@ class DesLocEngine:
             # Zero param_shard.grad — backward hooks accumulate into it
             if self.param_shard_state is not None:
                 self.param_shard_state.param_shard.grad.zero_()
-            if self._grad_bucket_mgr is not None:
-                self._grad_bucket_mgr.reset()
+            if self._core_ddp is not None:
+                # Reset grad buffers in core DDP before next accumulation window
+                self._core_ddp.zero_grad_buffer(zero_buffer=(not self.optimizer.defaults.get("foreach", False)))
             step_loss = 0.0
 
             # Heterogeneous scheduling: each rank gets its own micro-batch count
@@ -2141,15 +2234,25 @@ class DesLocEngine:
                     batch_dict = {"tokens": input_ids}
                     if labels is not None:
                         batch_dict["labels"] = labels
+                    _cp_size = (
+                        parallel_state.get_data_parallel_world_size()
+                        if parallel_state.is_initialized()
+                        else (dist.get_world_size() if dist.is_initialized() else 1)
+                    )
                     sliced = self._hetero_batch._apply_hetero_cp_slice(
                         batch_dict,
-                        cp_size=dist.get_world_size() if dist.is_initialized() else 1,
+                        cp_size=_cp_size,
                     )
                     input_ids = sliced.get("tokens", input_ids)
                     labels = sliced.get("labels", labels)
                 if micro == 0 and step < 3:
+                    _log_rank = (
+                        parallel_state.get_data_parallel_rank()
+                        if parallel_state.is_initialized()
+                        else (dist.get_rank() if dist.is_initialized() else 0)
+                    )
                     logger.info("[data] rank=%d seq=%d→%d sp=%s",
-                                dist.get_rank() if dist.is_initialized() else 0,
+                                _log_rank,
                                 _orig_seq, input_ids.shape[-1],
                                 "ON" if self._sp_active else "OFF")
                 _local_dev = torch.device(f"cuda:{torch.cuda.current_device()}")
@@ -2159,7 +2262,11 @@ class DesLocEngine:
 
                 # AutoSP compiler path: pad seq to sp_size multiple, then tag for FX graph pass
                 if self._sp_active and self._autosp_compile_fn is not None:
-                    _sp = dist.get_world_size()
+                    _sp = (
+                        parallel_state.get_data_parallel_world_size()
+                        if parallel_state.is_initialized()
+                        else (dist.get_world_size() if dist.is_initialized() else 1)
+                    )
                     _seq = input_ids.shape[1]
                     _pad_n = (_sp - _seq % _sp) % _sp
                     if _pad_n > 0:
@@ -2304,12 +2411,29 @@ class DesLocEngine:
             if self.fp32_grad_manager is not None and self.param_shard_state is None:
                 self.fp32_grad_manager.after_backward(scale=1.0 / num_microbatches)
 
-            # --- finalize_model_grads (upstream _ParamAndGradBucketGroup) ---
-            # Bucketed gradient all_reduce: fire all_reduce on accumulated
-            # bucket buffers, wait, extract averaged shard slices.
-            if self._grad_bucket_mgr is not None:
-                self._grad_bucket_mgr.start_grad_sync()
-                self._grad_bucket_mgr.finish_grad_sync()
+            # --- finalize_model_grads (core.distributed) ---
+            # Routes bucketed gradient all-reduce through ParamAndGradBuffer
+            # groups when CoreDDP is active, handles embedding and SP grad
+            # collectives, and applies DES-LOC Kx/Ku/Kv skip logic.
+            # Called on every step for non-ZeRO-3 paths; skipped for ZeRO-3
+            # because backward hooks already handled reduce-scatter.
+            if self.param_shard_state is None:
+                _is_Kx_sync = (step + 1) % self.desloc_Kx == 0
+                try:
+                    from deepspeed.core.model_parallel_config import ModelParallelConfig  # noqa: PLC0415
+                    _fmg_model = [self._core_ddp if self._core_ddp is not None else self.model]
+                    finalize_model_grads(
+                        model=_fmg_model,
+                        config=ModelParallelConfig(),
+                        num_tokens=None,
+                        skip_grad_sync=not _is_Kx_sync,
+                    )
+                except Exception as _fmg_exc:  # noqa: BLE001
+                    logger.warning(
+                        "[finalize_model_grads] failed (%s); "
+                        "falling back to no-op (grads may be unreduced).",
+                        _fmg_exc,
+                    )
 
             # Gradient clipping — DeepSpeed ZeRO-3 style:
             # 1. Each rank computes local L2 norm² on its param_shard.grad
@@ -2785,8 +2909,16 @@ class DesLocEngine:
         # Synchronous per-rank save.  Each rank saves its own shard to a
         # rank-suffixed file.  No collective communication needed.
         # ------------------------------------------------------------------
-        _rank = dist.get_rank() if dist.is_initialized() else 0
-        _world = dist.get_world_size() if dist.is_initialized() else 1
+        _rank = (
+            parallel_state.get_data_parallel_rank()
+            if parallel_state.is_initialized()
+            else (dist.get_rank() if dist.is_initialized() else 0)
+        )
+        _world = (
+            parallel_state.get_data_parallel_world_size()
+            if parallel_state.is_initialized()
+            else (dist.get_world_size() if dist.is_initialized() else 1)
+        )
         # For rank 0 (or single-GPU), save full payload.
         # For other ranks, save only param_shard + step (optimizer is redundant
         # since each rank has its own shard's Adam states).
