@@ -1106,97 +1106,160 @@ class DesLocEngine:
         n_params = sum(p.numel() for p in self.model.parameters())
         logger.info("Model: %.2fM parameters (BF16 on CPU, ZeRO-3 sharded)", n_params / 1e6)
 
-        # --- Phase 4b: ZeRO-3 heterogeneous parameter sharding ---
-        # Each rank keeps only a 1/N (or VRAM-proportional) slice of the
-        # flattened FP32 master parameter buffer. The full BF16 params
-        # are gathered on-demand via param_shard_state.gather_full_params
-        # during forward / backward.
+        # --- Phase 4b + 5: ZeRO-3 via core.optimizer.DistributedOptimizer ---
+        # Replaces the hand-written zero3_hetero_shard.ShardState + manual AdamW.
+        # DistributedOptimizer owns:
+        #   • FLOPS-proportional heterogeneous FP32 shard boundaries
+        #   • reduce-scatter of BF16 grads → FP32 shard grads (prepare_grads)
+        #   • local Adam step on FP32 shards
+        #   • DES-LOC Ku/Kv moment sync via sync_moments()
+        #   • all-gather FP32 shards → BF16 model (shard_to_model_broadcast)
         #
-        # Skipped entirely when world_size <= 1 (backward compatible).
-        self.param_shard_state = None
-        self.param_shard = None
-        self.param_offsets = None
-        try:
-            from deepspeed.runtime.zero3_hetero_shard import (
-                ShardState as _ShardState,
-                vram_weights_from_tiers as _vram_weights_from_tiers,
-            )
-            _ws = (
-                parallel_state.get_data_parallel_world_size()
-                if parallel_state.is_initialized()
-                else (dist.get_world_size() if dist.is_initialized() else int(os.environ.get("WORLD_SIZE", 1)))
-            )
-            _rk = (
-                parallel_state.get_data_parallel_rank()
-                if parallel_state.is_initialized()
-                else (dist.get_rank() if dist.is_initialized() else int(os.environ.get("RANK", 0)))
-            )
-            if _ws > 1:
-                # Heterogeneous: weight shards by VRAM (H100 > A6000).
-                _weights = _vram_weights_from_tiers(self.tiers) if getattr(
-                    self, "tiers", None
-                ) else None
-                if _weights and len(_weights) != _ws:
-                    # World size doesn't match discovered tier count —
-                    # fall back to an even split to stay safe.
-                    _weights = None
-                self.param_shard_state = _ShardState.build(
-                    model=self.model,
-                    rank=_rk,
-                    world_size=_ws,
-                    device=_local_device,
-                    vram_weights=_weights,
-                )
-                if self.param_shard_state is not None:
-                    self.param_shard = self.param_shard_state.param_shard
-                    self.param_offsets = self.param_shard_state.param_offsets
-                    # Sanity check (T127 acceptance criterion): the sum
-                    # of per-rank shard sizes must equal the original
-                    # total parameter count (up to alignment padding).
-                    _orig_total = sum(p.numel() for p in self.model.parameters())
-                    _shard_total = sum(self.param_shard_state.shard_sizes)
-                    assert _shard_total >= _orig_total, (
-                        f"shard total {_shard_total} < orig {_orig_total}"
-                    )
-                    logger.info(
-                        "[zero3] Sharding active: %d ranks, local=%d, "
-                        "total=%d (orig=%d, pad=%d)",
-                        _ws, self.param_shard.numel(),
-                        _shard_total, _orig_total,
-                        self.param_shard_state.pad,
-                    )
-        except Exception as _shard_exc:  # noqa: BLE001
-            logger.warning(
-                "[zero3] Sharding init failed (%s); continuing with "
-                "full-replica parameters.", _shard_exc,
-            )
-            self.param_shard_state = None
+        # self.param_shard_state is kept as a not-None sentinel so all
+        # downstream `if self.param_shard_state is not None:` guards work
+        # without change.  self._dist_optimizer holds the actual instance.
+        self._dist_optimizer = None        # core.optimizer.DistributedOptimizer
+        self.param_shard_state = None      # sentinel: not-None ↔ ZeRO-3 active
+        self.param_shard = None            # compat alias → _dist_optimizer._fp32_shards[0]
+        self.param_offsets = None          # compat alias → synthetic param_index_map
 
-        # --- Phase 5: Optimizer & Scheduler ---
-        # When ZeRO-3 is active, optimizer operates on param_shard (FP32
-        # master copy on GPU), not model.parameters() (BF16 on CPU).
-        if self.param_shard_state is not None:
-            # param_shard is a 1-D FP32 tensor holding this rank's slice.
-            # We need it to be a leaf tensor with requires_grad for AdamW.
-            _shard = self.param_shard_state.param_shard
-            _shard.requires_grad_(True)
-            # foreach=True uses fused CUDA kernels (no temp buffer) but
-            # has int32 indexing — overflows at >2.1B elements (rank 0 H100
-            # shard has 3.26B). foreach=False is safe but allocates a temp
-            # denom buffer (6.19 GB) that OOMs on A6000.
-            # Fix: foreach=True when shard fits int32, False otherwise.
-            _use_foreach = _shard.numel() <= 2**31 - 1
-            self.optimizer = AdamW(
-                [_shard],
-                lr=config.max_lr,
-                betas=(config.beta1, config.beta2),
-                eps=config.eps,
-                weight_decay=config.weight_decay,
-                foreach=_use_foreach,
-            )
+        _ws = (
+            parallel_state.get_data_parallel_world_size()
+            if parallel_state.is_initialized()
+            else (dist.get_world_size() if dist.is_initialized() else int(os.environ.get("WORLD_SIZE", 1)))
+        )
+        _rk = (
+            parallel_state.get_data_parallel_rank()
+            if parallel_state.is_initialized()
+            else (dist.get_rank() if dist.is_initialized() else int(os.environ.get("RANK", 0)))
+        )
+
+        if _ws > 1:
+            try:
+                from deepspeed.core.optimizer import DistributedOptimizer as _DistOpt  # noqa: PLC0415
+                from deepspeed.core.optimizer import OptimizerConfig as _OptCfg  # noqa: PLC0415
+                from deepspeed.core.desloc_config import TierType as _TierType  # noqa: PLC0415
+                from deepspeed.core.model_parallel_config import ModelParallelConfig as _MPCfg  # noqa: PLC0415
+
+                # Build per-rank tier_assignments for FLOPS-proportional shard sizing.
+                _tier_assignments = None
+                if getattr(self, "tiers", None):
+                    try:
+                        _ta: List = []
+                        for _t in self.tiers:
+                            _name = getattr(getattr(_t, "tier", None), "value", "")
+                            _ta.append(
+                                _TierType.DATACENTER if "H100" in _name else _TierType.EDGE
+                            )
+                        if len(_ta) == _ws:
+                            _tier_assignments = _ta
+                    except Exception:
+                        _tier_assignments = None
+
+                # OptimizerConfig mirrors TrainingConfig LR/Adam params + DES-LOC periods.
+                _opt_cfg = _OptCfg(
+                    lr=config.max_lr,
+                    min_lr=config.min_lr,
+                    weight_decay=config.weight_decay,
+                    adam_beta1=config.beta1,
+                    adam_beta2=config.beta2,
+                    adam_eps=config.eps,
+                    clip_grad=config.grad_clip,
+                    bf16=True,
+                    use_distributed_optimizer=True,
+                    desloc_enabled=True,
+                    ku=getattr(config, "desloc_Ku", 96),
+                    kv=getattr(config, "desloc_Kv", 192),
+                    kx=getattr(config, "desloc_Kx", 32),
+                    heterogeneous_shard_sizing=(_tier_assignments is not None),
+                )
+
+                # Build a synthetic ParamAndGradBuffer shim over the flat model layout.
+                _param_order = [
+                    (n, p) for n, p in self.model.named_parameters() if p.requires_grad
+                ]
+                if not _param_order:
+                    raise RuntimeError("No trainable parameters for DistributedOptimizer")
+
+                _total_numel = sum(p.numel() for _, p in _param_order)
+                _grad_data = torch.zeros(_total_numel, dtype=torch.float32, device=_local_device)
+
+                _param_index_map: Dict[Any, Any] = {}
+                _cursor = 0
+                for _n, _p in _param_order:
+                    _end = _cursor + _p.numel()
+                    _param_index_map[_p] = (_cursor, _end, None)
+                    _cursor = _end
+
+                class _SynBuf:
+                    """Minimal ParamAndGradBuffer shim for DistributedOptimizer."""
+                    def __init__(self, gd, pim):
+                        self.grad_data = gd
+                        self.param_index_map = pim
+
+                _syn_buf = _SynBuf(_grad_data, _param_index_map)
+
+                # DP process group — use parallel_state when available.
+                _dp_grp = (
+                    parallel_state.get_data_parallel_group()
+                    if parallel_state.is_initialized()
+                    else (dist.group.WORLD if dist.is_initialized() else None)
+                )
+
+                # Inner AdamW; DistributedOptimizer rewires param_groups in _build_shards.
+                _est_shard = _total_numel // _ws
+                _inner_adam = AdamW(
+                    [],
+                    lr=config.max_lr,
+                    betas=(config.beta1, config.beta2),
+                    eps=config.eps,
+                    weight_decay=config.weight_decay,
+                    foreach=(_est_shard <= 2 ** 31 - 1),
+                )
+
+                self._dist_optimizer = _DistOpt(
+                    config=_opt_cfg,
+                    optimizer=_inner_adam,
+                    params=[p for _, p in _param_order],
+                    model_parallel_config=_MPCfg(),
+                    param_and_grad_buffers=[_syn_buf],
+                    data_parallel_group=_dp_grp,
+                    data_parallel_group_gloo=None,
+                    tier_assignments=_tier_assignments,
+                )
+
+                # Populate compat aliases.
+                self.param_shard_state = self._dist_optimizer   # sentinel (not None)
+                self.param_shard = self._dist_optimizer._fp32_shards[0]
+                self.param_offsets = _param_index_map
+
+                _local_numel = sum(s.numel() for s in self._dist_optimizer._fp32_shards)
+                logger.info(
+                    "[zero3] core.optimizer.DistributedOptimizer active: "
+                    "%d ranks, local_shard=%d, total=%d, hetero=%s",
+                    _ws, _local_numel, _total_numel,
+                    _opt_cfg.heterogeneous_shard_sizing,
+                )
+
+            except Exception as _shard_exc:  # noqa: BLE001
+                logger.warning(
+                    "[zero3] DistributedOptimizer init failed (%s); "
+                    "continuing with full-replica parameters.", _shard_exc,
+                )
+                self._dist_optimizer = None
+                self.param_shard_state = None
+
+        # --- Phase 5: Optimizer ---
+        # When DistributedOptimizer is active it IS self.optimizer; its step()
+        # drives: reduce-scatter → Adam → Ku/Kv sync_moments → broadcast.
+        # For the non-ZeRO-3 path we fall through to plain AdamW.
+        if self._dist_optimizer is not None:
+            self.optimizer = self._dist_optimizer
             logger.info(
-                "[zero3] Optimizer on param_shard: %d FP32 elements on %s",
-                _shard.numel(), _shard.device,
+                "[zero3] self.optimizer = DistributedOptimizer "
+                "(shard=%d elems on %s)",
+                sum(s.numel() for s in self._dist_optimizer._fp32_shards),
+                _local_device,
             )
         else:
             self.optimizer = AdamW(
@@ -1705,15 +1768,14 @@ class DesLocEngine:
         # Each rank allocates FP32 grad buffer on its own device, not on primary_device
         _local_device = torch.device(f"cuda:{torch.cuda.current_device()}")
         _local_mem_gb = torch.cuda.get_device_properties(_local_device).total_memory / (1 << 30)
-        # When ZeRO-3 param sharding is active, param_shard IS the FP32
-        # master copy and backward hooks handle reduce-scatter. The
-        # fp32_grad_manager would duplicate FP32 grad buffers (~24GB on
-        # H100) and conflict with the ZeRO-3 gradient flow.
-        if self.param_shard_state is not None:
+        # When DistributedOptimizer is active, it owns all FP32 shard state.
+        # fp32_grad_manager would duplicate those buffers (~24 GB on H100) and
+        # conflict with DistributedOptimizer.prepare_grads() reduce-scatter.
+        if self._dist_optimizer is not None:
             self.fp32_grad_manager = None
             logger.info(
-                "HeteroFP32GradAccumManager SKIPPED — ZeRO-3 param_shard "
-                "is the FP32 master copy (device=%s)",
+                "HeteroFP32GradAccumManager SKIPPED — "
+                "core.optimizer.DistributedOptimizer owns FP32 shards (device=%s)",
                 _local_device,
             )
         elif _local_mem_gb < 60:
@@ -1739,43 +1801,22 @@ class DesLocEngine:
             self.primary_device,
         )
 
-        # --- Phase 8b: ZeRO-3 backward reduce-scatter hooks + CoreDDP wiring ---
-        # Register a post-accumulate-grad hook on every sharded parameter
-        # so that each rank's ``.grad`` is reduced and scattered the
-        # moment autograd produces it. After the hook each rank only
-        # retains the gradient slice corresponding to its own
-        # ``param_shard``, and (when applicable) those slices are
-        # accumulated into the FP32 ``main_grad`` of
-        # ``fp32_grad_manager`` for selective-FP32 parameters.
-        #
-        # For the non-ZeRO-3 path, we wire core.distributed.DistributedDataParallel
-        # so that finalize_model_grads() can drive bucketed all-reduce via the
-        # standard ParamAndGradBuffer interface.
+        # --- Phase 8b: gradient reduce-scatter ---
+        # core.optimizer.DistributedOptimizer handles reduce-scatter internally
+        # via _reduce_scatter_grads() called from prepare_grads() / step().
+        # No per-parameter post-accumulate-grad hooks are needed.
+        # The hook-handle list and bucket-mgr are kept as empty stubs so any
+        # downstream code that iterates them remains a safe no-op.
         self._zero3_grad_hook_handles: List = []
         self._grad_bucket_mgr = None
         self._core_ddp: Optional[CoreDDP] = None
-        if self.param_shard_state is not None:
-            try:
-                # Local SGD: no per-param all_reduce (1816 NCCL calls → 15.8s/step).
-                # Cross-rank sync via bucketed broadcast in sync_shard_to_model.
-                self._zero3_grad_hook_handles = (
-                    self.param_shard_state.register_backward_hooks(
-                        fp32_grad_manager=self.fp32_grad_manager,
-                        bucket_mgr=None,
-                    )
-                )
-                logger.info(
-                    "[zero3] backward reduce-scatter hooks registered: %d "
-                    "(fp32_grad_manager=%s)",
-                    len(self._zero3_grad_hook_handles),
-                    self.fp32_grad_manager is not None,
-                )
-            except Exception as _hook_exc:  # noqa: BLE001
-                logger.warning(
-                    "[zero3] backward hook registration failed (%s); "
-                    "post-backward scatter_grads() will still run.",
-                    _hook_exc,
-                )
+        if self._dist_optimizer is not None:
+            logger.info(
+                "[zero3] core.optimizer.DistributedOptimizer active — "
+                "reduce-scatter via prepare_grads() "
+                "(fp32_grad_manager=%s)",
+                self.fp32_grad_manager is not None,
+            )
         else:
             # Non-ZeRO-3: wrap the model with core.distributed.DistributedDataParallel
             # so finalize_model_grads() can bucket and all-reduce gradients properly.
@@ -2036,34 +2077,42 @@ class DesLocEngine:
         logger.info("Training start: %d steps, grad_accum=%d",
                     cfg.total_steps, self.grad_accum)
 
-        # --- Claude-128: ZeRO-3 per-layer forward all-gather hooks ---
-        # When ZeRO-3 sharding is active each rank only holds 1/N of the
-        # flat parameter buffer. We install layer-by-layer all-gather
-        # hooks so that the full BF16 params for the *currently
-        # executing* nn.Module are materialized on entry and freed on
-        # exit. Peak memory: model_shard + max(per_layer_full_params).
-        # zero3_hetero_shard forward hooks: per-layer all-gather on entry,
-        # release on exit. This is Neuron_SP's native parameter gathering.
+        # --- ZeRO-3 model GPU materialisation ---
+        # DistributedOptimizer holds FP32 shards; the full BF16 model must
+        # also live on GPU for forward/backward.  ZeRO3ForwardHook.register()
+        # moves it there once (no per-layer hooks — full BF16 fits on both tiers).
         self._zero3_forward_hook = None
-        if getattr(self, "param_shard_state", None) is not None:
+        if self._dist_optimizer is not None:
             try:
                 from deepspeed.runtime.zero3_hetero_shard import (  # noqa: PLC0415
-                    install_zero3_forward_hooks as _install_z3_hooks,
+                    ZeRO3ForwardHook as _Z3Hook,
                 )
-                self._zero3_forward_hook = _install_z3_hooks(
-                    self.model, self.param_shard_state,
+
+                class _ShardAdapter:
+                    """Minimal ShardState duck-type for ZeRO3ForwardHook.__init__."""
+                    def __init__(self, rank, world_size, device):
+                        self.rank = rank
+                        self.world_size = world_size
+                        self.param_shard = torch.empty(0, device=device)
+
+                _adapter = _ShardAdapter(
+                    rank=self._dist_optimizer.data_parallel_rank,
+                    world_size=self._dist_optimizer.data_parallel_world_size,
+                    device=_local_device,
                 )
-                if self._zero3_forward_hook is not None and _is_main:
+                self._zero3_forward_hook = _Z3Hook(self.model, _adapter)
+                self._zero3_forward_hook.register()
+                if _is_main:
                     logger.info(
-                        "[zero3-hook] per-layer forward all-gather active "
-                        "(rank=%d/%d)",
-                        self.param_shard_state.rank,
-                        self.param_shard_state.world_size,
+                        "[zero3-hook] full BF16 model loaded to GPU "
+                        "(rank=%d/%d) — DistributedOptimizer path",
+                        self._dist_optimizer.data_parallel_rank,
+                        self._dist_optimizer.data_parallel_world_size,
                     )
             except Exception as _hook_exc:  # noqa: BLE001
                 logger.warning(
-                    "[zero3-hook] failed to install forward hooks (%s); "
-                    "continuing without per-layer gather.", _hook_exc,
+                    "[zero3-hook] BF16 model GPU load failed (%s); "
+                    "model may remain on CPU.", _hook_exc,
                 )
                 self._zero3_forward_hook = None
 
@@ -2152,16 +2201,15 @@ class DesLocEngine:
         # _shard_sync_pending : True iff a sync was launched but not yet waited
         _shard_sync_stream: Optional[torch.cuda.Stream] = (
             torch.cuda.Stream()
-            if torch.cuda.is_available() and getattr(self, "param_shard_state", None) is not None
+            if torch.cuda.is_available() and self._dist_optimizer is not None
             else None
         )
         _shard_sync_pending: bool = False
 
         for step in range(self.global_step, cfg.total_steps):
+            # DistributedOptimizer.zero_grad() zeroes its grad_data buffers +
+            # shard param grads.  Plain AdamW zero_grad() on the non-ZeRO-3 path.
             self.optimizer.zero_grad(set_to_none=False)
-            # Zero param_shard.grad — backward hooks accumulate into it
-            if self.param_shard_state is not None:
-                self.param_shard_state.param_shard.grad.zero_()
             if self._core_ddp is not None:
                 # Reset grad buffers in core DDP before next accumulation window
                 self._core_ddp.zero_grad_buffer(zero_buffer=(not self.optimizer.defaults.get("foreach", False)))
@@ -2373,19 +2421,19 @@ class DesLocEngine:
                 # Only active when dist is initialized and ZeRO-3 sharding is on.
                 # -----------------------------------------------------------------
                 _is_last_micro = (micro == num_microbatches - 1)
-                if _is_last_micro and dist.is_initialized() and self.param_shard_state is not None:
-                    _g_mb = self.param_shard_state.param_shard.grad
-                    if _g_mb is not None:
-                        # Compute norm-sq on the fully-accumulated gradient shard.
-                        # Clone to a standalone scalar so the reduction buffer is
-                        # independent of param_shard.grad.
-                        _micro_norm_sq = _g_mb.float().norm(2).to(torch.float64).pow(2).clone()
-                        _async_norm_tensor = _micro_norm_sq
-                        _async_norm_handle = dist.all_reduce(
-                            _micro_norm_sq,
-                            op=dist.ReduceOp.SUM,
-                            async_op=True,
-                        )
+                if _is_last_micro and dist.is_initialized() and self._dist_optimizer is not None:
+                    # Accumulate norm-sq across all FP32 shard params' grads.
+                    _micro_norm_sq = torch.zeros(1, dtype=torch.float64, device=_local_device)
+                    for _sp in self._dist_optimizer._shard_params:
+                        _g_mb = _sp.grad
+                        if _g_mb is not None:
+                            _micro_norm_sq += _g_mb.float().norm(2).to(torch.float64).pow(2)
+                    _async_norm_tensor = _micro_norm_sq
+                    _async_norm_handle = dist.all_reduce(
+                        _micro_norm_sq,
+                        op=dist.ReduceOp.SUM,
+                        async_op=True,
+                    )
 
             # Drain any outstanding async handle from the final microbatch.
             # (The last iteration has no successor microbatch to wait at its start.)
@@ -2405,19 +2453,14 @@ class DesLocEngine:
                 continue
 
             # --- HeteroFP32GradAccumManager: after_backward ---
-            # Scale gradients and run synchronous all-reduce across all buckets.
-            # Runs for both MIMO and standard paths; skipped when ZeRO-3 is
-            # active (ZeRO-3 backward hooks handle gradient reduction directly).
-            if self.fp32_grad_manager is not None and self.param_shard_state is None:
+            # Skipped when DistributedOptimizer active (it owns grad reduction).
+            if self.fp32_grad_manager is not None and self._dist_optimizer is None:
                 self.fp32_grad_manager.after_backward(scale=1.0 / num_microbatches)
 
             # --- finalize_model_grads (core.distributed) ---
-            # Routes bucketed gradient all-reduce through ParamAndGradBuffer
-            # groups when CoreDDP is active, handles embedding and SP grad
-            # collectives, and applies DES-LOC Kx/Ku/Kv skip logic.
-            # Called on every step for non-ZeRO-3 paths; skipped for ZeRO-3
-            # because backward hooks already handled reduce-scatter.
-            if self.param_shard_state is None:
+            # Called only on non-ZeRO-3 paths; DistributedOptimizer.prepare_grads()
+            # handles reduce-scatter internally.
+            if self._dist_optimizer is None:
                 _is_Kx_sync = (step + 1) % self.desloc_Kx == 0
                 try:
                     from deepspeed.core.model_parallel_config import ModelParallelConfig  # noqa: PLC0415
@@ -2435,51 +2478,42 @@ class DesLocEngine:
                         _fmg_exc,
                     )
 
-            # Gradient clipping — DeepSpeed ZeRO-3 style:
-            # 1. Each rank computes local L2 norm² on its param_shard.grad
-            # 2. all_reduce(SUM) a single scalar across ranks async, overlapping
-            #    with the non-ZeRO3 clip_grad_norm_ path below (comm/compute overlap)
-            # 3. wait() → sqrt → global norm → clip
-            # This avoids torch.nn.utils.clip_grad_norm_ which uses
-            # torch._foreach_norm that can trigger CUDA illegal memory access
-            # on large (3.26B element) FP32 buffers (INT_MAX overflow).
+            # Gradient clipping — ZeRO-3 distributed style:
+            # 1. Each rank computes local norm² on its FP32 shard param grads.
+            # 2. all_reduce(SUM) async across ranks.
+            # 3. wait() → sqrt → global norm → clip coefficients on local shards.
+            # Avoids torch._foreach_norm INT_MAX overflow on large shard tensors.
             _norm_sq_handle: Optional[dist.Work] = None
-            if self.param_shard_state is not None:
-                _g = self.param_shard_state.param_shard.grad
-                if _g is not None:
-                    # FP32 norm — no extra allocation (grad is already FP32)
-                    local_norm_sq = _g.float().norm(2).to(torch.float64).pow(2)
-                else:
-                    local_norm_sq = torch.tensor(0.0, dtype=torch.float64,
-                                                  device=self.param_shard_state.param_shard.device)
+            if self._dist_optimizer is not None:
+                local_norm_sq = torch.zeros(
+                    1, dtype=torch.float64, device=_local_device
+                )
+                for _sp in self._dist_optimizer._shard_params:
+                    _g = _sp.grad
+                    if _g is not None:
+                        local_norm_sq += _g.float().norm(2).to(torch.float64).pow(2)
                 if dist.is_initialized():
-                    # Launch async all_reduce on the scalar norm-sq.
-                    # While this communication is in-flight we fall through to
-                    # the clip_grad_norm_ branch (which is a no-op for ZeRO-3)
-                    # — effectively overlapping the scalar reduce with any CPU
-                    # bookkeeping that follows before wait() is called.
                     _norm_sq_handle = dist.all_reduce(
                         local_norm_sq,
                         op=dist.ReduceOp.SUM,
                         async_op=True,
                     )
             else:
-                # Non-ZeRO-3 path: synchronous grad clip (no distributed norm needed)
+                # Non-ZeRO-3: synchronous clip on model parameters.
                 gnorm = clip_grad_norm_(self.model.parameters(), cfg.grad_clip)
                 if torch.is_tensor(gnorm):
                     gnorm = gnorm.item()
 
-            # Wait for the async scalar norm all_reduce to complete, then clip.
-            if self.param_shard_state is not None:
+            # Wait for async norm all_reduce then clip.
+            if self._dist_optimizer is not None:
                 if _norm_sq_handle is not None:
                     _norm_sq_handle.wait()
                 gnorm = local_norm_sq.sqrt().float().item()
-                # Clip: scale gradients if norm exceeds max
                 if gnorm > cfg.grad_clip and gnorm > 0:
                     clip_coef = cfg.grad_clip / gnorm
-                    _g = self.param_shard_state.param_shard.grad
-                    if _g is not None:
-                        _g.mul_(clip_coef)
+                    for _sp in self._dist_optimizer._shard_params:
+                        if _sp.grad is not None:
+                            _sp.grad.mul_(clip_coef)
 
             # HeteroGradNorm skip decision via HeteroGradNormSkipController
             # (wired through integrate_with_deepspeed_engine at train() setup).
@@ -2498,36 +2532,36 @@ class DesLocEngine:
                     f"ctrl_norm={_skip_info.combined_norm:.6f}"
                 )
             if not _should_skip:
-                # --- Diagnostic: check param health before/after optimizer step ---
                 self.optimizer.step()
                 self.scheduler.step()
 
-                # --- DES-LOC: conditional sync (Algorithm 1, Kx/Ku/Kv) ---
-                # Non-Kx steps: skip cross-rank param broadcast, local update only.
+                # --- DES-LOC: Algorithm 1 — Kx/Ku/Kv conditional sync ---
                 _is_Kx = (step + 1) % self.desloc_Kx == 0
                 _is_Ku = (step + 1) % self.desloc_Ku == 0
                 _is_Kv = (step + 1) % self.desloc_Kv == 0
 
-                if self.param_shard_state is not None:
-                    # Every step: write local shard to model AND broadcast to
-                    # all ranks. ZeRO-3 splits params across ranks — without
-                    # broadcast, each rank's model has 2/3 stale params from
-                    # the last sync, causing forward to train on an inconsistent
-                    # model. 32 steps of drift → Frankenstein params at Kx sync
-                    # → loss spike (1.6x→30x, worsening over training).
-                    #
-                    # DES-LOC comm reduction comes from skipping GRADIENT
-                    # all-reduce on non-Kx steps, not from skipping param
-                    # broadcast. Param broadcast is BF16 (~12GB) and necessary
-                    # for model consistency. Gradient all-reduce is FP32 (~24GB)
-                    # and is what DDP does every step — skipping it is the win.
-                    if _shard_sync_stream is not None:
-                        self.param_shard_state.sync_shard_to_model_async(
-                            stream=_shard_sync_stream
+                if self._dist_optimizer is not None:
+                    # Ku/Kv: all-reduce first/second Adam moments across DP ranks.
+                    # This is the DES-LOC core innovation — decoupled moment sync
+                    # reduces communication by (1 − 1/Ku) + (1 − 1/Kv) vs DDP.
+                    if _is_Ku or _is_Kv:
+                        self._dist_optimizer.sync_moments(
+                            sync_first=_is_Ku,
+                            sync_second=_is_Kv,
                         )
+
+                    # Every step: broadcast updated FP32 shards → BF16 model on
+                    # all ranks.  Without this each rank's model contains only its
+                    # own 1/N shard updated — "Frankenstein model" divergence.
+                    # DES-LOC communication savings come from skipping GRADIENT
+                    # all-reduce on non-Kx steps, not from skipping this broadcast.
+                    # (optimizer.step() already called shard_to_model_broadcast()
+                    # internally; we call it again on the async stream to overlap
+                    # the BF16 copies with the next step's data preprocessing.)
+                    if _shard_sync_stream is not None:
+                        with torch.cuda.stream(_shard_sync_stream):
+                            self._dist_optimizer.shard_to_model_broadcast()
                         _shard_sync_pending = True
-                    else:
-                        self.param_shard_state.sync_shard_to_model()
 
                     if step < 10 or _is_Kx or _is_Ku or _is_Kv or (step + 1) % cfg.log_every == 0:
                         logger.info(
@@ -2819,20 +2853,17 @@ class DesLocEngine:
                         lc_path, self.global_step,
                     )
 
-            # Step 3b (WORKER tier): CPU-stage param shard to locality cache so
-            # that the persistent async write can proceed from CPU memory and the
-            # GPU's PCIe bandwidth is freed for gradient all-reduce traffic.
-            # Optimizer state is omitted here when worker_offload_optim=True.
+            # Step 3b (WORKER tier): CPU-stage FP32 shard to locality cache.
             if (
                 tier_role == _TierRole.WORKER
                 and cfg.locality_cache_dir is not None
-                and self.param_shard_state is not None
+                and self._dist_optimizer is not None
             ):
                 lc_path_w = cfg.locality_cache_path(self.global_step)
                 if lc_path_w is not None:
                     _shard_cpu = (
-                        self.param_shard_state.param_shard.cpu().detach().clone()
-                        if self.param_shard_state.param_shard is not None
+                        self._dist_optimizer._fp32_shards[0].cpu().detach().clone()
+                        if self._dist_optimizer._fp32_shards
                         else None
                     )
                     if _shard_cpu is not None:
