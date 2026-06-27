@@ -342,6 +342,69 @@ def get_context_parallel_group() -> Optional[torch.distributed.ProcessGroup]:
     return _CONTEXT_PARALLEL_GROUP
 
 
+# --- PP helpers ---
+def get_pipeline_model_parallel_first_rank() -> int:
+    """Return the global rank of the first stage in the current rank's pipeline group."""
+    assert _PIPELINE_GLOBAL_RANKS is not None, \
+        "pipeline parallel group is not initialized"
+    return _PIPELINE_GLOBAL_RANKS[0]
+
+
+def get_pipeline_model_parallel_last_rank() -> int:
+    """Return the global rank of the last stage in the current rank's pipeline group."""
+    assert _PIPELINE_GLOBAL_RANKS is not None, \
+        "pipeline parallel group is not initialized"
+    last_rank_local = get_pipeline_model_parallel_world_size() - 1
+    return _PIPELINE_GLOBAL_RANKS[last_rank_local]
+
+
+def get_pipeline_model_parallel_next_rank() -> int:
+    """Return the global rank of the next stage in the current rank's pipeline group."""
+    assert _PIPELINE_GLOBAL_RANKS is not None, \
+        "pipeline parallel group is not initialized"
+    rank_in_pipeline = get_pipeline_model_parallel_rank()
+    world_size = get_pipeline_model_parallel_world_size()
+    return _PIPELINE_GLOBAL_RANKS[(rank_in_pipeline + 1) % world_size]
+
+
+def get_pipeline_model_parallel_prev_rank() -> int:
+    """Return the global rank of the previous stage in the current rank's pipeline group."""
+    assert _PIPELINE_GLOBAL_RANKS is not None, \
+        "pipeline parallel group is not initialized"
+    rank_in_pipeline = get_pipeline_model_parallel_rank()
+    world_size = get_pipeline_model_parallel_world_size()
+    return _PIPELINE_GLOBAL_RANKS[(rank_in_pipeline - 1) % world_size]
+
+
+# --- TP / DP src-rank helpers (used for weight broadcast) ---
+def get_tensor_model_parallel_src_rank() -> int:
+    """Return the global rank of the first member in the caller's TP group.
+
+    Used to broadcast RNG states and model weights from rank-0 of the TP
+    group to all other TP ranks.  In the canonical rank layout::
+
+        global_rank = tp_rank + dp_rank * tp_size + pp_rank * tp_size * dp_size
+
+    the first TP rank in each group shares the same integer-division bucket
+    when dividing by tp_size.
+    """
+    global_rank = torch.distributed.get_rank()
+    tp_world_size = get_tensor_model_parallel_world_size()
+    return (global_rank // tp_world_size) * tp_world_size
+
+
+def get_data_parallel_src_rank(with_context_parallel: bool = False) -> int:
+    """Return the global rank of the first member in the caller's DP group.
+
+    Used to broadcast model weights from the canonical source replica.
+    """
+    assert _DATA_PARALLEL_GROUP is not None, \
+        "data parallel group is not initialized"
+    dp_group = get_data_parallel_group(with_context_parallel=with_context_parallel)
+    dp_ranks = torch.distributed.get_process_group_ranks(dp_group)
+    return min(dp_ranks)
+
+
 # --- DES-LOC tier groups ---
 def get_tier_group(tier_name: str) -> Optional[torch.distributed.ProcessGroup]:
     """Get process group for a DES-LOC tier (e.g. 'datacenter', 'professional')."""
@@ -360,26 +423,49 @@ def get_local_tier() -> Optional[TierSpec]:
 
 # --- Cleanup ---
 def destroy_model_parallel() -> None:
-    """Destroy all model-parallel process groups and reset module state."""
+    """Destroy all model-parallel process groups and reset module state.
+
+    Calls ``torch.distributed.destroy_process_group`` on every group that
+    was created by ``initialize_model_parallel`` before clearing the
+    module-level references, so that NCCL communicators are released
+    immediately rather than waiting for garbage collection.
+    """
+    def _destroy(group: Optional[torch.distributed.ProcessGroup]) -> None:
+        if group is not None and torch.distributed.is_initialized():
+            try:
+                torch.distributed.destroy_process_group(group)
+            except Exception:
+                pass
+
     global _TENSOR_MODEL_PARALLEL_GROUP
+    _destroy(_TENSOR_MODEL_PARALLEL_GROUP)
     _TENSOR_MODEL_PARALLEL_GROUP = None
 
     global _PIPELINE_MODEL_PARALLEL_GROUP
+    _destroy(_PIPELINE_MODEL_PARALLEL_GROUP)
     _PIPELINE_MODEL_PARALLEL_GROUP = None
 
     global _DATA_PARALLEL_GROUP
+    _destroy(_DATA_PARALLEL_GROUP)
     _DATA_PARALLEL_GROUP = None
 
     global _DATA_PARALLEL_GROUP_WITH_CP
+    # Only destroy if it is a distinct group (CP==1 reuses _DATA_PARALLEL_GROUP)
+    if _DATA_PARALLEL_GROUP_WITH_CP is not _DATA_PARALLEL_GROUP:
+        _destroy(_DATA_PARALLEL_GROUP_WITH_CP)
     _DATA_PARALLEL_GROUP_WITH_CP = None
 
     global _SEQUENCE_PARALLEL_GROUP
+    _destroy(_SEQUENCE_PARALLEL_GROUP)
     _SEQUENCE_PARALLEL_GROUP = None
 
     global _CONTEXT_PARALLEL_GROUP
+    _destroy(_CONTEXT_PARALLEL_GROUP)
     _CONTEXT_PARALLEL_GROUP = None
 
     global _TIER_GROUPS
+    for _tier_group in _TIER_GROUPS.values():
+        _destroy(_tier_group)
     _TIER_GROUPS = {}
 
     global _TENSOR_MODEL_PARALLEL_RANK
