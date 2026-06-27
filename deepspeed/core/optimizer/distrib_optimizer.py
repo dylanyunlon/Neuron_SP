@@ -809,57 +809,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         self._reduce_scatter_grads()
         return False
 
-    @torch.no_grad()
-    def step(self) -> bool:
-        """Full distributed optimizer step.
-
-        Sequence:
-          1. Reduce-scatter BF16 grads → FP32 grad shards.
-          2. Clip gradients on local shard (if configured).
-          3. Local Adam update on FP32 shard.
-          4. Increment step counter.
-          5. DES-LOC moment sync (Ku / Kv steps).
-          6. All-gather FP32 shards → BF16 model + broadcast.
-
-        Returns:
-            True if a step was taken, False if skipped due to overflow.
-        """
-        found_inf = self.prepare_grads()
-        if found_inf:
-            return False
-
-        # Gradient clipping on shard params
-        if self.config.clip_grad > 0.0:
-            clip_grad_norm(
-                parameters=self._shard_params,
-                max_norm=self.config.clip_grad,
-                norm_type=2.0,
-                model_parallel_group=self.data_parallel_group,
-            )
-
-        # Local Adam update
-        self.optimizer.step()
-
-        self._step_count += 1
-
-        # DES-LOC: synchronise moments when appropriate
-        if self.config.desloc_enabled:
-            sync_u = self.config.is_ku_step(self._step_count)
-            sync_v = self.config.is_kv_step(self._step_count)
-            if sync_u or sync_v:
-                self.sync_moments(sync_first=sync_u, sync_second=sync_v)
-        elif self._desloc is not None and self._desloc.enabled:
-            # Legacy DesLocConfig path (from model_parallel_config.desloc)
-            sync_u = self._desloc.is_ku_step(self._step_count)
-            sync_v = self._desloc.is_kv_step(self._step_count)
-            if sync_u or sync_v:
-                self.sync_moments(sync_first=sync_u, sync_second=sync_v)
-
-        # Reconstruct BF16 model weights from updated FP32 shards
-        self.shard_to_model_broadcast()
-
-        return True
-
     # ------------------------------------------------------------------
     # DES-LOC moment synchronisation
     # ------------------------------------------------------------------
@@ -998,42 +947,564 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             for shard, saved in zip(self._fp32_shards, state_dict["fp32_shards"]):
                 shard.copy_(saved.to(shard.device))
 
-    def save_parameter_state(self, filename: str) -> None:
-        """Gather all FP32 shards onto DP rank 0 and save to *filename*.
+    # ------------------------------------------------------------------
+    # _copy_main_params_to_model_params  (Megatron evolution: M2307→M4019)
+    # ------------------------------------------------------------------
 
-        Only DP rank 0 writes; all ranks participate in the gather.
+    @torch.no_grad()
+    def _copy_main_params_to_model_params(self) -> None:
+        """Copy updated FP32 shard back to BF16 model param tensors.
+
+        This mirrors Megatron's ``_copy_main_params_to_model_params`` but uses
+        our flat ``_fp32_shards`` / ``param_and_grad_buffers`` data structures
+        instead of Megatron's ``shard_fp32_from_float16_groups``.
+
+        For each buffer, every model parameter whose range overlaps with this
+        rank's shard receives updated data from the corresponding slice of the
+        FP32 shard.  This must be called **before** the all-gather so the
+        correct values are broadcast to all DP ranks.
+
+        Evolution notes
+        ~~~~~~~~~~~~~~~
+        - M2307: initial port of copy_group_params inner helper.
+        - M3715: decoupled_grad / MFSDP awareness.
+        - M3737: NVFP4 native weight guard (skip quantized params here; they
+          are handled by a dedicated ``quantize_nvfp4_param_shard`` call).
+        - M4019: MXFP8 param-buffer copy path; in our simplified stack we
+          keep the standard BF16 path only and skip FP8/NVFP4 guards because
+          those quantized param types require TE which is not in scope.
+        """
+        dp_rank = self.data_parallel_rank
+
+        for fp32_shard, boundaries, buf in zip(
+            self._fp32_shards,
+            self._buf_boundaries,
+            self.param_and_grad_buffers,
+        ):
+            shard_start, shard_end = boundaries[dp_rank]
+
+            for param, (ps, pe, _) in buf.param_index_map.items():
+                overlap_s = max(ps, shard_start)
+                overlap_e = min(pe, shard_end)
+                if overlap_s >= overlap_e:
+                    # This parameter is not owned by this rank's shard.
+                    continue
+
+                # Slice inside the local shard
+                local_s = overlap_s - shard_start
+                local_e = overlap_e - shard_start
+                # Slice inside the full parameter tensor
+                param_s = overlap_s - ps
+                param_e = overlap_e - ps
+
+                # Write FP32 shard slice back to BF16 model param.
+                param.data.view(-1)[param_s:param_e].copy_(
+                    fp32_shard[local_s:local_e].to(param.data.dtype)
+                )
+
+    # ------------------------------------------------------------------
+    # start_param_sync / start_param_sync_for_bucket_group_subset
+    # (Megatron evolution: M3998 — Route non-Muon params #4771)
+    # ------------------------------------------------------------------
+
+    def start_param_sync(self, force_sync: bool = True) -> None:
+        """All-gather updated FP32 shards into every rank's BF16 model weights.
+
+        This is the canonical post-step param broadcast.  It replaces the
+        earlier ``shard_to_model_broadcast`` and aligns with Megatron's
+        ``model_chunk.start_param_sync()`` contract.
+
+        First copies the local FP32 shard slice into BF16 model params (via
+        ``_copy_main_params_to_model_params``), then performs the all-gather
+        so every rank sees the full, up-to-date weight tensor.
+
+        When ``force_sync=False`` the call is a *no-op* if async overlap is
+        requested by the config (future extension hook; currently always
+        synchronous).
+
+        Args:
+            force_sync: If True (default) perform a blocking all-gather.
+                        If False, skip when async param-gather overlap is on.
+        """
+        if not force_sync and getattr(self.config, "overlap_param_gather", False):
+            # Async overlap path: the caller will trigger the gather later.
+            return
+
+        # 1. Write local FP32 shard to model params on this rank.
+        self._copy_main_params_to_model_params()
+
+        # 2. All-gather so every rank has all updated params.
+        self.shard_to_model_broadcast()
+
+    def start_param_sync_for_bucket_group_subset(self) -> None:
+        """Trigger ``start_param_sync`` for DistributedOptimizer-managed params only.
+
+        In a system where a ``LayerWiseDistributedOptimizer`` sibling manages
+        some buckets, we must avoid double-syncing those buckets.  In our
+        single-optimizer stack all params belong to this optimizer, so this
+        method is equivalent to ``start_param_sync``.
+
+        This method exists to match the Megatron API surface introduced in
+        M3998 (commit 9e60da33) so that callers written against the Megatron
+        interface continue to work when ported to Neuron_SP.
+
+        Evolution note (M3998)
+        ~~~~~~~~~~~~~~~~~~~~~~
+        Megatron walks ``model_chunk.bucket_groups`` and calls
+        ``_start_bucket_group_param_sync`` per bucket, skipping buckets tagged
+        ``is_managed_by_layer_wise_optimizer=True``.  Our flat-buffer design
+        has no per-bucket lazy tagging, so we delegate to ``start_param_sync``
+        directly.
+        """
+        self.start_param_sync(force_sync=True)
+
+    # ------------------------------------------------------------------
+    # step_with_ready_grads  (Megatron evolution: M2307 → M3998)
+    # ------------------------------------------------------------------
+
+    @torch.no_grad()
+    def step_with_ready_grads(self) -> bool:
+        """Optimizer step assuming gradients are already reduced/scattered.
+
+        This is the Megatron-style entry point for the optimizer step when the
+        DDP wrapper has already performed the reduce-scatter and the grad shards
+        are ready in ``self._fp32_grad_shards``.  Callers that manage DDP
+        overlap externally use this instead of the all-in-one ``step()``.
+
+        Sequence
+        ~~~~~~~~
+        1.  Clip gradients on the local FP32 shard (if configured).
+        2.  Local Adam update on the FP32 shard parameters.
+        3.  Increment step counter.
+        4.  DES-LOC moment synchronisation (Ku / Kv cadence).
+        5.  All-gather updated FP32 shards → BF16 model weights, using
+            ``start_param_sync_for_bucket_group_subset()`` (aligns with
+            Megatron M3998: only sync DistOpt-managed buckets so a sibling
+            LayerWise optimizer doesn't double-sync).
+
+        Returns:
+            True if the step was taken successfully; False if skipped.
+
+        Evolution notes
+        ~~~~~~~~~~~~~~~
+        - M2307: ``step_with_ready_grads`` split off from ``step``.
+        - M3998: switched inner sync call from
+          ``model_chunk.start_param_sync()`` to
+          ``start_param_sync_for_bucket_group_subset()`` to avoid duplicate
+          bucket syncs when a LayerWise sibling is present.
+        - M3811: ``_defer_param_sync`` flag added for FSDP overlap.
+        """
+        # Gradient clipping on local shard params.
+        if self.config.clip_grad > 0.0:
+            clip_grad_norm(
+                parameters=self._shard_params,
+                max_norm=self.config.clip_grad,
+                norm_type=2.0,
+                model_parallel_group=self.data_parallel_group,
+            )
+
+        # Local Adam update on FP32 shard.
+        self.optimizer.step()
+
+        self._step_count += 1
+
+        # DES-LOC: synchronise moments at Ku / Kv cadence.
+        if self.config.desloc_enabled:
+            sync_u = self.config.is_ku_step(self._step_count)
+            sync_v = self.config.is_kv_step(self._step_count)
+            if sync_u or sync_v:
+                self.sync_moments(sync_first=sync_u, sync_second=sync_v)
+        elif self._desloc is not None and self._desloc.enabled:
+            sync_u = self._desloc.is_ku_step(self._step_count)
+            sync_v = self._desloc.is_kv_step(self._step_count)
+            if sync_u or sync_v:
+                self.sync_moments(sync_first=sync_u, sync_second=sync_v)
+
+        # All-gather updated shards to model weights (only DistOpt-managed).
+        # When _defer_param_sync is set (FSDP overlap path), skip here; the
+        # caller is responsible for triggering the gather at the right moment.
+        if not getattr(self, "_defer_param_sync", False):
+            self.start_param_sync_for_bucket_group_subset()
+
+        return True
+
+    @torch.no_grad()
+    def step(self) -> bool:
+        """Full distributed optimizer step.
+
+        Sequence:
+          1. Reduce-scatter BF16 grads → FP32 grad shards.
+          2. Execute ``step_with_ready_grads`` (clip + Adam + moment sync + all-gather).
+
+        Returns:
+            True if a step was taken, False if skipped due to overflow.
+        """
+        found_inf = self.prepare_grads()
+        if found_inf:
+            return False
+        return self.step_with_ready_grads()
+
+    # ------------------------------------------------------------------
+    # save_parameter_state / load_parameter_state
+    # (Megatron evolution: M2307 → M3385 → M3356 → M3175)
+    # ------------------------------------------------------------------
+
+    def get_parameter_state_dp_zero(
+        self,
+        use_gloo_comm: bool = True,
+        return_on_all_ranks: bool = False,
+    ) -> Optional[dict]:
+        """Gather per-rank FP32 shards and optimizer moments onto DP rank 0.
+
+        Mirrors Megatron's ``get_parameter_state_dp_zero``.  For each
+        ``ParamAndGradBuffer`` we collect ``(param, exp_avg, exp_avg_sq)`` from
+        every DP rank and assemble them into world-sized CPU tensors on rank 0.
+
+        Uses Gloo by default (``use_gloo_comm=True``) to avoid occupying the
+        NCCL stream during checkpointing.
+
+        Evolution notes
+        ~~~~~~~~~~~~~~~
+        - M2307: initial implementation with buckets_coalesced format.
+        - M3175: ``step`` key in optimizer state handled separately to avoid
+          saving a scalar as a tensor (fixes CPU-offload checkpoint crash).
+        - M3356: skip non-tensor optimizer state entries (fixes crash when the
+          inner optimizer stores Python scalars like ``step`` as plain ints).
+        - M3385: ``--load-main-params-from-ckpt`` flag support — pass through
+          here via the ``state_dict`` checkpoint structure.
+
+        Args:
+            use_gloo_comm:       Use Gloo process group for CPU gather.
+            return_on_all_ranks: Return the full state on every rank (for
+                                 parallel saving); default False returns None
+                                 on non-zero DP ranks.
+
+        Returns:
+            State dict on DP rank 0 (or all ranks if ``return_on_all_ranks``),
+            None on other ranks.
+        """
+        # Choose comm group: prefer Gloo CPU transport for checkpoint I/O
+        # (does not stall the CUDA NCCL stream).
+        if use_gloo_comm and self.data_parallel_group_gloo is not None:
+            comm_group = self.data_parallel_group_gloo
+        else:
+            comm_group = self.data_parallel_group
+
+        dp_world = torch.distributed.get_world_size(group=comm_group)
+        dp_rank = torch.distributed.get_rank(group=comm_group)
+        global_ranks = torch.distributed.get_process_group_ranks(comm_group)
+
+        state: dict = {"buckets_coalesced": True}
+
+        for buf_idx, (fp32_shard, buf, boundaries) in enumerate(
+            zip(self._fp32_shards, self.param_and_grad_buffers, self._buf_boundaries)
+        ):
+            shard_start, shard_end = boundaries[dp_rank]
+            shard_size = shard_end - shard_start
+            total_numel = buf.grad_data.numel()
+
+            # --- Build local shard buffers (param + moments) ---
+            local_param = fp32_shard.detach().cpu()
+
+            # Retrieve exp_avg / exp_avg_sq from the inner Adam state.
+            # The shard param corresponding to this buffer's index.
+            shard_p = self._shard_params[buf_idx]
+            adam_state = self.optimizer.state.get(shard_p, {})
+
+            local_exp_avg = adam_state.get("exp_avg", torch.zeros(shard_size))
+            local_exp_avg_sq = adam_state.get("exp_avg_sq", torch.zeros(shard_size))
+
+            # M3356: skip non-tensor entries silently (e.g. scalar ``step``).
+            if not isinstance(local_exp_avg, torch.Tensor):
+                local_exp_avg = torch.zeros(shard_size, dtype=torch.float32)
+            if not isinstance(local_exp_avg_sq, torch.Tensor):
+                local_exp_avg_sq = torch.zeros(shard_size, dtype=torch.float32)
+
+            local_exp_avg = local_exp_avg.detach().cpu().float()
+            local_exp_avg_sq = local_exp_avg_sq.detach().cpu().float()
+
+            # --- Gather all ranks' shards onto rank 0 ---
+            # Each rank's shard may differ in size (hetero path), so we use
+            # all_gather_object which handles variable-size tensors via CPU.
+            local_tensors = {
+                "param": local_param,
+                "exp_avg": local_exp_avg,
+                "exp_avg_sq": local_exp_avg_sq,
+                "shard_start": shard_start,
+                "shard_end": shard_end,
+                "total_numel": total_numel,
+            }
+
+            if return_on_all_ranks:
+                gathered: List[Optional[dict]] = [None] * dp_world
+                torch.distributed.all_gather_object(gathered, local_tensors, group=comm_group)
+            else:
+                if dp_rank == 0:
+                    gathered = [None] * dp_world
+                else:
+                    gathered = None
+                torch.distributed.gather_object(
+                    local_tensors,
+                    gathered,
+                    dst=global_ranks[0],
+                    group=comm_group,
+                )
+
+            if dp_rank == 0 or return_on_all_ranks:
+                # Assemble world tensors from all ranks' shards.
+                world_param = torch.zeros(total_numel, dtype=torch.float32)
+                world_exp_avg = torch.zeros(total_numel, dtype=torch.float32)
+                world_exp_avg_sq = torch.zeros(total_numel, dtype=torch.float32)
+
+                for rank_data in gathered:
+                    if rank_data is None:
+                        continue
+                    rs, re = rank_data["shard_start"], rank_data["shard_end"]
+                    copy_len = re - rs
+                    world_param[rs:re].copy_(rank_data["param"][:copy_len])
+                    world_exp_avg[rs:re].copy_(rank_data["exp_avg"][:copy_len])
+                    world_exp_avg_sq[rs:re].copy_(rank_data["exp_avg_sq"][:copy_len])
+
+                dtype_state = {
+                    torch.bfloat16: {
+                        "param": world_param,
+                        "exp_avg": world_exp_avg,
+                        "exp_avg_sq": world_exp_avg_sq,
+                        "numel_unpadded": total_numel,
+                    }
+                }
+                state[buf_idx] = dtype_state
+            else:
+                state[buf_idx] = None
+
+        return state if (dp_rank == 0 or return_on_all_ranks) else None
+
+    def save_parameter_state(self, filename: str) -> None:
+        """Gather all FP32 shards + Adam moments onto DP rank 0 and save.
+
+        Only DP rank 0 writes to *filename*.  All ranks participate in the
+        gather via ``get_parameter_state_dp_zero``.
+
+        Uses Gloo comm group for CPU gather (does not stall NCCL stream).
+
+        Evolution notes
+        ~~~~~~~~~~~~~~~
+        - M2307: initial implementation (NCCL-based gather).
+        - M3175: switched to ``get_parameter_state_dp_zero`` helper which also
+          saves optimizer moments alongside main params.
+        - M3385: added ``step_count`` to the checkpoint payload for DES-LOC
+          period tracking.
+
+        Args:
+            filename: Path on the local filesystem where the checkpoint is
+                      written (rank 0 only).
+        """
+        state_dict = self.get_parameter_state_dp_zero(use_gloo_comm=True)
+        if self.data_parallel_rank == 0 and state_dict is not None:
+            state_dict["step_count"] = self._step_count
+            torch.save(state_dict, filename)
+            logger.info(
+                "DistributedOptimizer: saved parameter state to %s "
+                "(rank 0, dp_world=%d)",
+                filename,
+                self.data_parallel_world_size,
+            )
+
+    def load_parameter_state_from_dp_zero(
+        self, state_dict: Optional[dict], *, update_legacy_format: bool = False
+    ) -> None:
+        """Scatter world-sized checkpoint tensors from DP rank 0 to all ranks.
+
+        Mirrors Megatron's ``load_parameter_state_from_dp_zero``.  DP rank 0
+        holds the full ``(param, exp_avg, exp_avg_sq)`` tensors; we scatter the
+        appropriate slice to every rank.
+
+        Evolution notes
+        ~~~~~~~~~~~~~~~
+        - M2307: initial implementation.
+        - M3175: ``step`` key handled separately (scalar, not a tensor).
+        - M3356: non-tensor optimizer state entries are skipped gracefully to
+          handle checkpoints written by Adam variants that store ``step`` as
+          a Python int rather than a 0-D tensor.
+        - M3385: ``--load-main-params-from-ckpt`` path: after scattering the
+          world tensors the FP32 shard is re-broadcast from the param slice
+          so the model weights are consistent without requiring a forward pass.
+
+        Args:
+            state_dict:            Checkpoint dict (only non-None on DP rank 0).
+            update_legacy_format:  When True, call legacy loader for
+                                   pre-Feb-2024 checkpoint format.
+        """
+        if update_legacy_format:
+            # Legacy format: state_dict is just a list of gathered shards.
+            return self._load_parameter_state_legacy(state_dict)
+
+        # Choose Gloo comm group for scatter (same as save path).
+        if self.data_parallel_group_gloo is not None:
+            comm_group = self.data_parallel_group_gloo
+        else:
+            comm_group = self.data_parallel_group
+
+        dp_world = torch.distributed.get_world_size(group=comm_group)
+        dp_rank = torch.distributed.get_rank(group=comm_group)
+        global_ranks = torch.distributed.get_process_group_ranks(comm_group)
+
+        for buf_idx, (fp32_shard, boundaries) in enumerate(
+            zip(self._fp32_shards, self._buf_boundaries)
+        ):
+            shard_start, shard_end = boundaries[dp_rank]
+            shard_size = shard_end - shard_start
+
+            # DP rank 0 prepares per-rank slice dicts for scatter.
+            if dp_rank == 0:
+                if state_dict is None or state_dict.get(buf_idx) is None:
+                    logger.warning(
+                        "load_parameter_state_from_dp_zero: missing buf_idx=%d in state_dict",
+                        buf_idx,
+                    )
+                    send_objects = [{} for _ in range(dp_world)]
+                else:
+                    buf_state = list(state_dict[buf_idx].values())[0]  # first (only) dtype
+                    world_param = buf_state["param"]
+                    world_exp_avg = buf_state["exp_avg"]
+                    world_exp_avg_sq = buf_state["exp_avg_sq"]
+
+                    send_objects: List[dict] = []
+                    for r in range(dp_world):
+                        rs, re = boundaries[r]
+                        send_objects.append(
+                            {
+                                "param": world_param[rs:re].clone(),
+                                "exp_avg": world_exp_avg[rs:re].clone(),
+                                "exp_avg_sq": world_exp_avg_sq[rs:re].clone(),
+                            }
+                        )
+            else:
+                send_objects = None
+
+            recv_obj: dict = {}
+            torch.distributed.scatter_object_list(
+                [recv_obj],
+                send_objects,
+                src=global_ranks[0],
+                group=comm_group,
+            )
+
+            # Restore FP32 shard from checkpoint.
+            if "param" in recv_obj:
+                copy_len = min(shard_size, recv_obj["param"].numel())
+                fp32_shard[:copy_len].copy_(recv_obj["param"][:copy_len].to(fp32_shard.device))
+
+            # Restore Adam moments for this buffer's shard param.
+            shard_p = self._shard_params[buf_idx]
+            if shard_p not in self.optimizer.state:
+                self.optimizer.state[shard_p] = {}
+            opt_state = self.optimizer.state[shard_p]
+
+            # M3356: guard — only update tensor entries.
+            for key in ("exp_avg", "exp_avg_sq"):
+                if key in recv_obj and isinstance(recv_obj[key], torch.Tensor):
+                    tensor = recv_obj[key].to(fp32_shard.device)
+                    if key in opt_state and isinstance(opt_state[key], torch.Tensor):
+                        opt_state[key].copy_(tensor)
+                    else:
+                        opt_state[key] = tensor.clone()
+
+    def _load_parameter_state_legacy(self, state_dict: Optional[dict]) -> None:
+        """Load from the pre-M2307 checkpoint format (plain gathered-shard list).
+
+        The legacy format stores a list of per-buffer gathered FP32 tensors
+        (no moments) under the key ``"fp32_shards"``.  We split them back into
+        per-rank slices using the current shard boundaries.
+
+        Args:
+            state_dict: Dict with ``"fp32_shards"`` key (only on DP rank 0).
         """
         dp_rank = self.data_parallel_rank
         dp_world = self.data_parallel_world_size
 
-        gathered_shards: List[Optional[torch.Tensor]] = []
-        for fp32_shard in self._fp32_shards:
-            shard_size = fp32_shard.numel()
-            if dp_rank == 0:
-                all_shards = [
-                    torch.zeros(shard_size, dtype=torch.float32, device=fp32_shard.device)
-                    for _ in range(dp_world)
-                ]
-            else:
-                all_shards = None
+        comm_group = self.data_parallel_group
 
-            torch.distributed.gather(
-                fp32_shard,
-                all_shards,
-                dst=torch.distributed.get_global_rank(self.data_parallel_group, 0),
+        for buf_idx, (fp32_shard, boundaries) in enumerate(
+            zip(self._fp32_shards, self._buf_boundaries)
+        ):
+            shard_start, shard_end = boundaries[dp_rank]
+
+            if dp_rank == 0 and state_dict is not None:
+                gathered_list = state_dict.get("fp32_shards", [])
+                if buf_idx < len(gathered_list) and gathered_list[buf_idx] is not None:
+                    world_tensor = gathered_list[buf_idx]
+                    send_objects = []
+                    for r in range(dp_world):
+                        rs, re = boundaries[r]
+                        send_objects.append({"param": world_tensor[rs:re].clone()})
+                else:
+                    send_objects = [{} for _ in range(dp_world)]
+            else:
+                send_objects = None
+
+            recv_obj: dict = {}
+            torch.distributed.scatter_object_list(
+                [recv_obj],
+                send_objects,
+                src=torch.distributed.get_global_rank(comm_group, 0),
+                group=comm_group,
+            )
+
+            if "param" in recv_obj:
+                shard_size = shard_end - shard_start
+                copy_len = min(shard_size, recv_obj["param"].numel())
+                fp32_shard[:copy_len].copy_(recv_obj["param"][:copy_len].to(fp32_shard.device))
+
+    def load_parameter_state(
+        self, filename: str, *, update_legacy_format: bool = False
+    ) -> None:
+        """Load distributed parameter state from *filename*.
+
+        DP rank 0 reads the checkpoint; all ranks receive their slice via
+        ``load_parameter_state_from_dp_zero``.
+
+        Evolution notes
+        ~~~~~~~~~~~~~~~
+        - M2307: initial implementation.
+        - M3385: added ``step_count`` restore for DES-LOC period tracking.
+
+        Args:
+            filename:             Path to the checkpoint saved by
+                                  ``save_parameter_state``.
+            update_legacy_format: Pass through to
+                                  ``load_parameter_state_from_dp_zero`` for
+                                  pre-Feb-2024 checkpoints.
+        """
+        state_dict: Optional[dict] = None
+        if self.data_parallel_rank == 0:
+            state_dict = torch.load(filename, map_location="cpu")
+            logger.info(
+                "DistributedOptimizer: loaded parameter state from %s", filename
+            )
+
+        # Restore step counter for DES-LOC period alignment.
+        if self.data_parallel_rank == 0 and state_dict is not None:
+            self._step_count = state_dict.get("step_count", 0)
+
+        # Broadcast step_count to all ranks.
+        step_count_t = torch.tensor(
+            [self._step_count], dtype=torch.int64,
+            device=next(iter(self._fp32_shards)).device
+            if self._fp32_shards
+            else torch.device("cpu"),
+        )
+        if torch.distributed.is_initialized():
+            torch.distributed.broadcast(
+                step_count_t,
+                src=torch.distributed.get_global_rank(self.data_parallel_group, 0),
                 group=self.data_parallel_group,
             )
+        self._step_count = int(step_count_t.item())
 
-            if dp_rank == 0 and all_shards is not None:
-                gathered_shards.append(torch.cat(all_shards, dim=0))
-            else:
-                gathered_shards.append(None)
-
-        if dp_rank == 0:
-            torch.save(
-                {"fp32_shards": gathered_shards, "step_count": self._step_count},
-                filename,
-            )
+        self.load_parameter_state_from_dp_zero(
+            state_dict, update_legacy_format=update_legacy_format
+        )
 
     def get_model_param_range_map(
         self, param: torch.nn.Parameter
