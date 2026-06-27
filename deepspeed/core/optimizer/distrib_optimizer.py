@@ -103,14 +103,14 @@ def clip_grad_norm(
     else:
         total_norm_t = torch.zeros(1, dtype=torch.float32, device=device)
         for g in grads:
-            total_norm_t += g.float().norm(norm_type) ** norm_type
+            total_norm_t += g.float().norm(norm_type)**norm_type
         if model_parallel_group is not None and torch.distributed.is_initialized():
             torch.distributed.all_reduce(
                 total_norm_t,
                 op=torch.distributed.ReduceOp.SUM,
                 group=model_parallel_group,
             )
-        total_norm = float(total_norm_t.item() ** (1.0 / norm_type))
+        total_norm = float(total_norm_t.item()**(1.0 / norm_type))
 
     clip_coeff = max_norm / (total_norm + 1e-6)
     if clip_coeff < 1.0:
@@ -292,10 +292,8 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
                 elif param.dtype == torch.float32:
                     fp32_model_grp.append(param)
                 else:
-                    raise TypeError(
-                        f"Unsupported param dtype {param.dtype}. "
-                        "Expected float16, bfloat16, or float32."
-                    )
+                    raise TypeError(f"Unsupported param dtype {param.dtype}. "
+                                    "Expected float16, bfloat16, or float32.")
 
             self.bf16_model_params.extend(bf16_grp)
             self.fp32_master_params.extend(fp32_master_grp)
@@ -332,19 +330,13 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
         if self.grad_scaler is None:
             return False
         main_grads = [
-            fp32.grad.data
-            for fp32 in (self.fp32_master_params + self.fp32_model_params)
-            if fp32.grad is not None
+            fp32.grad.data for fp32 in (self.fp32_master_params + self.fp32_model_params) if fp32.grad is not None
         ]
         self._found_inf.fill_(0.0)
         if main_grads:
-            torch._amp_foreach_non_finite_check_and_unscale_(
-                main_grads, self._found_inf, self.grad_scaler.inv_scale
-            )
+            torch._amp_foreach_non_finite_check_and_unscale_(main_grads, self._found_inf, self.grad_scaler.inv_scale)
         if torch.distributed.is_initialized():
-            torch.distributed.all_reduce(
-                self._found_inf, op=torch.distributed.ReduceOp.MAX
-            )
+            torch.distributed.all_reduce(self._found_inf, op=torch.distributed.ReduceOp.MAX)
         return bool(self._found_inf.item() > 0)
 
     # ------------------------------------------------------------------
@@ -414,9 +406,7 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
         if "grad_scaler" in state_dict and self.grad_scaler is not None:
             self.grad_scaler.load_state_dict(state_dict["grad_scaler"])
         if "fp32_master_params" in state_dict:
-            for cur, saved in zip(
-                self.fp32_master_params, state_dict["fp32_master_params"]
-            ):
+            for cur, saved in zip(self.fp32_master_params, state_dict["fp32_master_params"]):
                 cur.data.copy_(saved)
 
 
@@ -458,11 +448,7 @@ def _compute_hetero_shard_boundaries(
     """
     ALIGN = 16  # elements; 16 × 2 bytes = 32 bytes aligns to cache line
 
-    if (
-        not config.heterogeneous_shard_sizing
-        or tier_assignments is None
-        or len(tier_assignments) != dp_world_size
-    ):
+    if (not config.heterogeneous_shard_sizing or tier_assignments is None or len(tier_assignments) != dp_world_size):
         # Uniform equal-slice partitioning (original behaviour)
         padded = _round_up(total_numel, dp_world_size)
         shard_size = padded // dp_world_size
@@ -480,25 +466,18 @@ def _compute_hetero_shard_boundaries(
     a6000_tflops = config.a6000_bf16_tflops
 
     # Tflops weight for each rank
-    rank_tflops = [
-        h100_tflops if t == TierType.DATACENTER else a6000_tflops
-        for t in tier_assignments
-    ]
+    rank_tflops = [h100_tflops if t == TierType.DATACENTER else a6000_tflops for t in tier_assignments]
     total_tflops = sum(rank_tflops)
 
     # Raw (unaligned) shard sizes proportional to FLOPS
-    raw_sizes = [
-        int(total_numel * w / total_tflops) for w in rank_tflops
-    ]
+    raw_sizes = [int(total_numel * w / total_tflops) for w in rank_tflops]
 
     # Align each shard to ALIGN; distribute rounding error to first rank
     aligned_sizes = [_round_up(s, ALIGN) for s in raw_sizes]
     allocated = sum(aligned_sizes)
     if allocated > total_numel:
         # Trim back from the last rank's padding
-        aligned_sizes[-1] = max(
-            aligned_sizes[-1] - (allocated - total_numel), 0
-        )
+        aligned_sizes[-1] = max(aligned_sizes[-1] - (allocated - total_numel), 0)
 
     # Build [start, end) pairs
     boundaries = []
@@ -602,17 +581,11 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         self.data_parallel_group_gloo = data_parallel_group_gloo
         self.tier_assignments = tier_assignments
 
-        self.data_parallel_world_size: int = torch.distributed.get_world_size(
-            group=data_parallel_group
-        )
-        self.data_parallel_rank: int = torch.distributed.get_rank(
-            group=data_parallel_group
-        )
+        self.data_parallel_world_size: int = torch.distributed.get_world_size(group=data_parallel_group)
+        self.data_parallel_rank: int = torch.distributed.get_rank(group=data_parallel_group)
 
         # DES-LOC legacy config (DesLocConfig on model_parallel_config, may be None)
-        self._desloc: Optional[DesLocConfig] = getattr(
-            model_parallel_config, "desloc", None
-        )
+        self._desloc: Optional[DesLocConfig] = getattr(model_parallel_config, "desloc", None)
 
         # Global step counter — incremented after each successful Adam step.
         self._step_count: int = 0
@@ -671,9 +644,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 local_e = overlap_e - shard_start
                 model_s = overlap_s - ps
                 model_e = overlap_e - ps
-                fp32_shard[local_s:local_e].copy_(
-                    param.data.view(-1)[model_s:model_e].float()
-                )
+                fp32_shard[local_s:local_e].copy_(param.data.view(-1)[model_s:model_e].float())
 
             # FP32 grad scratch (receives reduce-scattered grads)
             fp32_grad_shard = torch.zeros(shard_size, dtype=torch.float32, device=_device)
@@ -683,18 +654,15 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
         # Rewire the inner optimizer's param_groups to point at FP32 shards.
         shard_params: List[torch.nn.Parameter] = [
-            torch.nn.Parameter(shard, requires_grad=True)
-            for shard in self._fp32_shards
+            torch.nn.Parameter(shard, requires_grad=True) for shard in self._fp32_shards
         ]
-        self.optimizer.param_groups = [
-            {
-                "params": shard_params,
-                "lr": self.config.lr or 1e-4,
-                "betas": (self.config.adam_beta1, self.config.adam_beta2),
-                "eps": self.config.adam_eps,
-                "weight_decay": self.config.weight_decay,
-            }
-        ]
+        self.optimizer.param_groups = [{
+            "params": shard_params,
+            "lr": self.config.lr or 1e-4,
+            "betas": (self.config.adam_beta1, self.config.adam_beta2),
+            "eps": self.config.adam_eps,
+            "weight_decay": self.config.weight_decay,
+        }]
         self._shard_params = shard_params
 
         logger.debug(
@@ -705,13 +673,15 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             self.config.heterogeneous_shard_sizing,
             len(self.param_and_grad_buffers),
         )
-        for i, (buf, boundaries) in enumerate(
-            zip(self.param_and_grad_buffers, self._buf_boundaries)
-        ):
+        for i, (buf, boundaries) in enumerate(zip(self.param_and_grad_buffers, self._buf_boundaries)):
             s, e = boundaries[self.data_parallel_rank]
             logger.debug(
                 "  buf[%d]: total=%d, my_shard=[%d,%d) size=%d",
-                i, buf.grad_data.numel(), s, e, e - s,
+                i,
+                buf.grad_data.numel(),
+                s,
+                e,
+                e - s,
             )
 
     # ------------------------------------------------------------------
@@ -730,12 +700,11 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         dp_rank = self.data_parallel_rank
 
         for buf_idx, (buf, fp32_grad_shard, boundaries) in enumerate(
-            zip(
-                self.param_and_grad_buffers,
-                self._fp32_grad_shards,
-                self._buf_boundaries,
-            )
-        ):
+                zip(
+                    self.param_and_grad_buffers,
+                    self._fp32_grad_shards,
+                    self._buf_boundaries,
+                )):
             total_numel = buf.grad_data.numel()
             shard_start, shard_end = boundaries[dp_rank]
             shard_size = shard_end - shard_start
@@ -785,14 +754,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     op=torch.distributed.ReduceOp.SUM,
                     group=self.data_parallel_group,
                 )
-                fp32_grad_shard.copy_(
-                    grad_work[shard_start:shard_end].float().div_(dp_world)
-                )
+                fp32_grad_shard.copy_(grad_work[shard_start:shard_end].float().div_(dp_world))
 
         # Attach grad shards to shard params for the Adam step
-        for shard_param, fp32_grad_shard in zip(
-            self._shard_params, self._fp32_grad_shards
-        ):
+        for shard_param, fp32_grad_shard in zip(self._shard_params, self._fp32_grad_shards):
             shard_param.grad = fp32_grad_shard
 
     # ------------------------------------------------------------------
@@ -813,9 +778,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
     # DES-LOC moment synchronisation
     # ------------------------------------------------------------------
 
-    def sync_moments(
-        self, sync_first: bool = False, sync_second: bool = False
-    ) -> None:
+    def sync_moments(self, sync_first: bool = False, sync_second: bool = False) -> None:
         """All-reduce optimizer moments across data-parallel ranks.
 
         This implements the DES-LOC Ku / Kv synchronisation protocol:
@@ -880,9 +843,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         dp_rank = self.data_parallel_rank
 
         for fp32_shard, boundaries, buf in zip(
-            self._fp32_shards,
-            self._buf_boundaries,
-            self.param_and_grad_buffers,
+                self._fp32_shards,
+                self._buf_boundaries,
+                self.param_and_grad_buffers,
         ):
             total_numel = buf.grad_data.numel()
             _device = buf.grad_data.device
@@ -972,14 +935,14 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
           are handled by a dedicated ``quantize_nvfp4_param_shard`` call).
         - M4019: MXFP8 param-buffer copy path; in our simplified stack we
           keep the standard BF16 path only and skip FP8/NVFP4 guards because
-          those quantized param types require TE which is not in scope.
+          those quantized param types require TE (Transformer Engine) which is not in scope.
         """
         dp_rank = self.data_parallel_rank
 
         for fp32_shard, boundaries, buf in zip(
-            self._fp32_shards,
-            self._buf_boundaries,
-            self.param_and_grad_buffers,
+                self._fp32_shards,
+                self._buf_boundaries,
+                self.param_and_grad_buffers,
         ):
             shard_start, shard_end = boundaries[dp_rank]
 
@@ -998,9 +961,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 param_e = overlap_e - ps
 
                 # Write FP32 shard slice back to BF16 model param.
-                param.data.view(-1)[param_s:param_e].copy_(
-                    fp32_shard[local_s:local_e].to(param.data.dtype)
-                )
+                param.data.view(-1)[param_s:param_e].copy_(fp32_shard[local_s:local_e].to(param.data.dtype))
 
     # ------------------------------------------------------------------
     # start_param_sync / start_param_sync_for_bucket_group_subset
@@ -1197,8 +1158,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         state: dict = {"buckets_coalesced": True}
 
         for buf_idx, (fp32_shard, buf, boundaries) in enumerate(
-            zip(self._fp32_shards, self.param_and_grad_buffers, self._buf_boundaries)
-        ):
+                zip(self._fp32_shards, self.param_and_grad_buffers, self._buf_boundaries)):
             shard_start, shard_end = boundaries[dp_rank]
             shard_size = shard_end - shard_start
             total_numel = buf.grad_data.numel()
@@ -1310,9 +1270,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 self.data_parallel_world_size,
             )
 
-    def load_parameter_state_from_dp_zero(
-        self, state_dict: Optional[dict], *, update_legacy_format: bool = False
-    ) -> None:
+    def load_parameter_state_from_dp_zero(self,
+                                          state_dict: Optional[dict],
+                                          *,
+                                          update_legacy_format: bool = False) -> None:
         """Scatter world-sized checkpoint tensors from DP rank 0 to all ranks.
 
         Mirrors Megatron's ``load_parameter_state_from_dp_zero``.  DP rank 0
@@ -1349,9 +1310,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         dp_rank = torch.distributed.get_rank(group=comm_group)
         global_ranks = torch.distributed.get_process_group_ranks(comm_group)
 
-        for buf_idx, (fp32_shard, boundaries) in enumerate(
-            zip(self._fp32_shards, self._buf_boundaries)
-        ):
+        for buf_idx, (fp32_shard, boundaries) in enumerate(zip(self._fp32_shards, self._buf_boundaries)):
             shard_start, shard_end = boundaries[dp_rank]
             shard_size = shard_end - shard_start
 
@@ -1372,13 +1331,11 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     send_objects: List[dict] = []
                     for r in range(dp_world):
                         rs, re = boundaries[r]
-                        send_objects.append(
-                            {
-                                "param": world_param[rs:re].clone(),
-                                "exp_avg": world_exp_avg[rs:re].clone(),
-                                "exp_avg_sq": world_exp_avg_sq[rs:re].clone(),
-                            }
-                        )
+                        send_objects.append({
+                            "param": world_param[rs:re].clone(),
+                            "exp_avg": world_exp_avg[rs:re].clone(),
+                            "exp_avg_sq": world_exp_avg_sq[rs:re].clone(),
+                        })
             else:
                 send_objects = None
 
@@ -1425,9 +1382,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
         comm_group = self.data_parallel_group
 
-        for buf_idx, (fp32_shard, boundaries) in enumerate(
-            zip(self._fp32_shards, self._buf_boundaries)
-        ):
+        for buf_idx, (fp32_shard, boundaries) in enumerate(zip(self._fp32_shards, self._buf_boundaries)):
             shard_start, shard_end = boundaries[dp_rank]
 
             if dp_rank == 0 and state_dict is not None:
@@ -1456,9 +1411,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 copy_len = min(shard_size, recv_obj["param"].numel())
                 fp32_shard[:copy_len].copy_(recv_obj["param"][:copy_len].to(fp32_shard.device))
 
-    def load_parameter_state(
-        self, filename: str, *, update_legacy_format: bool = False
-    ) -> None:
+    def load_parameter_state(self, filename: str, *, update_legacy_format: bool = False) -> None:
         """Load distributed parameter state from *filename*.
 
         DP rank 0 reads the checkpoint; all ranks receive their slice via
@@ -1479,9 +1432,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         state_dict: Optional[dict] = None
         if self.data_parallel_rank == 0:
             state_dict = torch.load(filename, map_location="cpu")
-            logger.info(
-                "DistributedOptimizer: loaded parameter state from %s", filename
-            )
+            logger.info("DistributedOptimizer: loaded parameter state from %s", filename)
 
         # Restore step counter for DES-LOC period alignment.
         if self.data_parallel_rank == 0 and state_dict is not None:
@@ -1489,10 +1440,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
         # Broadcast step_count to all ranks.
         step_count_t = torch.tensor(
-            [self._step_count], dtype=torch.int64,
-            device=next(iter(self._fp32_shards)).device
-            if self._fp32_shards
-            else torch.device("cpu"),
+            [self._step_count],
+            dtype=torch.int64,
+            device=next(iter(self._fp32_shards)).device if self._fp32_shards else torch.device("cpu"),
         )
         if torch.distributed.is_initialized():
             torch.distributed.broadcast(
@@ -1502,13 +1452,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             )
         self._step_count = int(step_count_t.item())
 
-        self.load_parameter_state_from_dp_zero(
-            state_dict, update_legacy_format=update_legacy_format
-        )
+        self.load_parameter_state_from_dp_zero(state_dict, update_legacy_format=update_legacy_format)
 
-    def get_model_param_range_map(
-        self, param: torch.nn.Parameter
-    ) -> Optional[Dict[str, Range]]:
+    def get_model_param_range_map(self, param: torch.nn.Parameter) -> Optional[Dict[str, Range]]:
         """Return the grad-buffer range info for *param* on this rank.
 
         Returns a dict with key ``"gbuf_local"`` containing the Range of
@@ -1517,9 +1463,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         """
         dp_rank = self.data_parallel_rank
 
-        for buf, boundaries in zip(
-            self.param_and_grad_buffers, self._buf_boundaries
-        ):
+        for buf, boundaries in zip(self.param_and_grad_buffers, self._buf_boundaries):
             if param not in buf.param_index_map:
                 continue
             ps, pe, _ = buf.param_index_map[param]
