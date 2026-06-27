@@ -43,6 +43,53 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# DES-LOC tier annotation helper (Neuron_SP extension)
+# ---------------------------------------------------------------------------
+
+def annotate_desloc_tiers(module: torch.nn.Module, config: TransformerConfig) -> None:
+    """Annotate every parameter in *module* with a ``desloc_tier`` attribute.
+
+    The tier determines which all-reduce schedule is used by ``DESLOCAdamW``
+    and ``engine.py::_desloc_tiered_ar``:
+
+      - ``'x'``: norms / embeddings / positional encodings (synced every Kx steps)
+      - ``'u'``: attention weights (q/k/v projections, synced every Ku steps)
+      - ``'v'``: MLP / FFN / expert weights (synced every Kv steps)
+
+    Keyword matching uses *first-match* priority in the order:
+    ``desloc_tier_u_keywords`` → ``desloc_tier_v_keywords`` → ``desloc_tier_x_keywords``
+    → ``desloc_default_tier``.  This ordering means attention ('u') and MLP ('v')
+    weights are classified before the broader 'x' catch-all.
+
+    Args:
+        module: The ``torch.nn.Module`` whose parameters will be annotated.
+        config: The ``TransformerConfig`` providing keyword lists and the default tier.
+    """
+    if not config.desloc_tier_enabled:
+        return
+
+    u_kw = config.desloc_tier_u_keywords or []
+    v_kw = config.desloc_tier_v_keywords or []
+    x_kw = config.desloc_tier_x_keywords or []
+    default = config.desloc_default_tier
+
+    for name, param in module.named_parameters(recurse=True):
+        name_lower = name.lower()
+        if any(kw in name_lower for kw in u_kw):
+            tier = 'u'
+        elif any(kw in name_lower for kw in v_kw):
+            tier = 'v'
+        elif any(kw in name_lower for kw in x_kw):
+            tier = 'x'
+        else:
+            tier = default
+        # Attach as a Python attribute so the DES-LOC scheduler can read it with
+        # ``getattr(p, 'desloc_tier', 'x')`` without importing anything from Neuron_SP.
+        param.desloc_tier = tier  # type: ignore[attr-defined]
+
+
+
 def get_transformer_layer_offset(
     config: TransformerConfig, vp_stage: Optional[int] = None, pp_rank: Optional[int] = None
 ):
@@ -519,6 +566,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # use_nvfuser = TORCH_MAJOR > 1 or (TORCH_MAJOR == 1 and TORCH_MINOR >= 10)
         # self.bias_dropout_add_exec_handler = nullcontext if use_nvfuser else torch.enable_grad
         self.bias_dropout_add_exec_handler = torch.enable_grad
+
+        # DES-LOC tier annotation (Neuron_SP extension).
+        # Annotate parameters with desloc_tier so the tiered all-reduce scheduler
+        # (DESLOCAdamW / engine.py::_desloc_tiered_ar) can bucket communications.
+        annotate_desloc_tiers(self, config)
 
     def create_mcore_cudagraph_manager(self, config):
         """Register the transformer layer for cudagraphs."""

@@ -1110,6 +1110,42 @@ class TransformerConfig(ModelParallelConfig):
     """Whether to use heterogenous layers in distributed checkpoint."""
 
     ####################
+    # DES-LOC tier config (Neuron_SP extension)
+    ####################
+    desloc_tier_enabled: bool = False
+    """If True, annotate each named parameter with a ``desloc_tier`` attribute during
+    model construction so the DES-LOC tiered all-reduce scheduler can bucket comms by tier.
+
+    Three tiers are defined:
+      - ``'x'``: weight/embedding/norm (synced every Kx steps)
+      - ``'u'``: attention-related (q/k/v projections, synced every Ku steps)
+      - ``'v'``: MLP/FFN weights (fc1/fc2/gate, synced every Kv steps)
+
+    See ``engine.py::_desloc_tiered_ar`` and ``DESLOCAdamW.sync_if_needed``.
+    """
+
+    desloc_tier_x_keywords: Optional[List[str]] = None
+    """Name substrings that map a parameter to tier ``'x'`` (params/norms/embeddings).
+    Defaults to ``['norm', 'embed', 'wpe', 'wte', 'ln_', 'position']`` when
+    ``desloc_tier_enabled`` is True.  Earlier entries take priority during keyword matching.
+    """
+
+    desloc_tier_u_keywords: Optional[List[str]] = None
+    """Name substrings that map a parameter to tier ``'u'`` (attention weights).
+    Defaults to ``['attn', 'attention', 'query', 'key', 'value', 'qkv', 'linear_q',
+    'linear_k', 'linear_v', 'linear_proj', 'out_proj']`` when ``desloc_tier_enabled`` is True.
+    """
+
+    desloc_tier_v_keywords: Optional[List[str]] = None
+    """Name substrings that map a parameter to tier ``'v'`` (MLP/FFN weights).
+    Defaults to ``['mlp', 'ffn', 'fc', 'dense', 'expert', 'router', 'linear_fc1',
+    'linear_fc2', 'gate']`` when ``desloc_tier_enabled`` is True.
+    """
+
+    desloc_default_tier: str = 'x'
+    """Fallback tier assigned when no keyword matches. One of ``'x'``, ``'u'``, ``'v'``."""
+
+    ####################
     # Quantization
     ####################
     quant_recipe: Optional[RecipeConfig] = None
@@ -2581,6 +2617,28 @@ class TransformerConfig(ModelParallelConfig):
             assert (
                 self.attention_backend == AttnBackend.flash
             ), "Batch invariant mode only supports FlashAttention"
+
+        # DES-LOC tier configuration (Neuron_SP extension)
+        # Populate default keyword lists so callers can override per-deployment.
+        if self.desloc_tier_enabled:
+            if self.desloc_tier_x_keywords is None:
+                self.desloc_tier_x_keywords = [
+                    'norm', 'embed', 'wpe', 'wte', 'ln_', 'position',
+                ]
+            if self.desloc_tier_u_keywords is None:
+                self.desloc_tier_u_keywords = [
+                    'attn', 'attention', 'query', 'key', 'value', 'qkv',
+                    'linear_q', 'linear_k', 'linear_v', 'linear_proj', 'out_proj',
+                ]
+            if self.desloc_tier_v_keywords is None:
+                self.desloc_tier_v_keywords = [
+                    'mlp', 'ffn', 'fc', 'dense', 'expert', 'router',
+                    'linear_fc1', 'linear_fc2', 'gate',
+                ]
+            assert self.desloc_default_tier in ('x', 'u', 'v'), (
+                f"desloc_default_tier must be one of 'x', 'u', 'v', "
+                f"got {self.desloc_default_tier!r}."
+            )
 
 
 @dataclass
