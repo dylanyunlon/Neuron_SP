@@ -1,6 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 # DeepSpeed Team
-"""Model definitions — GPT and hybrid architectures."""
+"""Model definitions — GPT and hybrid architectures.
+
+Wiring (Task G partial):
+  GPTModel now uses core.tensor_parallel components for its embedding and
+  output-projection layers:
+    * word_embeddings  → VocabParallelEmbedding   (TP-sharded vocab dim)
+    * output_layer     → ColumnParallelLinear      (TP-sharded output dim,
+                                                    gather_output=True so
+                                                    every rank gets full logits)
+
+  The rest of the model (TransformerBlock, attention, MLP) comes from
+  core.transformer, which was wired in earlier Task D.
+"""
 
 from __future__ import annotations
 
@@ -14,6 +26,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from deepspeed.core.transformer import TransformerConfig, TransformerBlock, MegatronModule
+
+# ---------------------------------------------------------------------------
+# Tensor-parallel components wired in for Task F/G
+# ---------------------------------------------------------------------------
+from deepspeed.core.tensor_parallel import (
+    VocabParallelEmbedding,
+    ColumnParallelLinear,
+)
 
 
 # ===========================================================================
@@ -239,22 +259,24 @@ class GPTModel(LanguageModule):
         # Output projection (last PP stage only)
         # ------------------------------------------------------------------ #
         if self.post_process:
-            # Linear: hidden_size → vocab_size (no bias, matching GPT convention).
+            # ColumnParallelLinear: hidden_size → vocab_size (no bias).
+            # gather_output=True so every TP rank holds the full [s, b, vocab]
+            # logit tensor — required for loss computation on all ranks.
             # When weights are shared the parameter is owned by the embedding;
-            # we allocate it here only when NOT sharing or when this rank also
-            # owns the embedding (pre_process=True).
-            skip_alloc = (
-                share_embeddings_and_output_weights and self.pre_process
-            )
-            self.output_layer = nn.Linear(
-                config.hidden_size,
-                vocab_size,
+            # we wire the tie below after allocation.
+            self.output_layer = ColumnParallelLinear(
+                input_size=config.hidden_size,
+                output_size=vocab_size,
+                config=config,
                 bias=False,
+                gather_output=True,
+                skip_bias_add=False,
             )
-            if skip_alloc and self.pre_process:
-                # Tie weights in-place: share the embedding tensor.
-                # This replaces the freshly allocated parameter with the
-                # embedding weight so they always stay in sync.
+            if share_embeddings_and_output_weights and self.pre_process:
+                # Tie weights in-place: the output_layer weight is replaced by
+                # the VocabParallelEmbedding weight so they stay in sync.
+                # Both are sharded on dim-0 (vocab / output dim), which is
+                # consistent for a ColumnParallelLinear with gather_output=True.
                 del self.output_layer.weight
                 self.output_layer.weight = (  # type: ignore[assignment]
                     self.embedding.word_embeddings.weight
@@ -336,7 +358,9 @@ class GPTModel(LanguageModule):
             # Use F.linear so we can pass an external weight tensor.
             logits = F.linear(hidden_states, output_weight)  # [s, b, vocab]
         else:
-            logits = self.output_layer(hidden_states)  # [s, b, vocab]
+            # ColumnParallelLinear returns (output, bias); bias is None here
+            # because output_layer was constructed with bias=False.
+            logits, _ = self.output_layer(hidden_states)  # [s, b, vocab]
 
         if labels is None:
             # Inference: return [b, s, vocab] for caller convenience.
@@ -412,7 +436,11 @@ class GPTModel(LanguageModule):
 # ===========================================================================
 
 class _EmbeddingLayer(nn.Module):
-    """Lightweight word + positional embedding.
+    """Word + positional embedding with TP-parallel vocab sharding.
+
+    Word embeddings are now backed by ``VocabParallelEmbedding`` which splits
+    the vocabulary across the tensor-parallel group.  When TP=1 this is
+    identical to ``nn.Embedding``.
 
     Produces output in seq-first layout: [seq_len, batch, hidden_size].
     """
@@ -427,15 +455,20 @@ class _EmbeddingLayer(nn.Module):
         self.hidden_size = config.hidden_size
         self.max_sequence_length = max_sequence_length
 
-        # Word embeddings — TP-sharded across the vocab dimension when using
-        # tensor parallelism.  For simplicity we allocate the full vocab here;
-        # a production implementation would use ColumnParallelEmbedding.
-        self.word_embeddings = nn.Embedding(vocab_size, config.hidden_size)
+        # Word embeddings — TP-sharded across the vocab dimension.
+        # VocabParallelEmbedding handles the all-reduce in forward()
+        # and falls back to standard nn.Embedding when TP=1.
+        self.word_embeddings = VocabParallelEmbedding(
+            num_embeddings=vocab_size,
+            embedding_dim=config.hidden_size,
+            config=config,
+        )
 
         # Learned absolute position embeddings (used when RoPE is disabled).
         position_embedding_type = getattr(config, "position_embedding_type", "rope")
         self.use_position_embeddings = (position_embedding_type == "learned_absolute")
         if self.use_position_embeddings:
+            # Position embeddings are not vocab-sharded; use standard Embedding.
             self.position_embeddings = nn.Embedding(max_sequence_length, config.hidden_size)
 
         self.embedding_dropout = nn.Dropout(config.hidden_dropout)
@@ -443,7 +476,7 @@ class _EmbeddingLayer(nn.Module):
     def forward(
         self, input_ids: torch.Tensor, position_ids: torch.Tensor
     ) -> torch.Tensor:
-        # [b, s] → [b, s, h]
+        # [b, s] → [b, s, h]  (VocabParallelEmbedding returns this shape)
         words_emb = self.word_embeddings(input_ids)
         if self.use_position_embeddings:
             pos_emb = self.position_embeddings(position_ids)
