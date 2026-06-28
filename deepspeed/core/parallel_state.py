@@ -198,7 +198,11 @@ def update_pg_timeout(
     timeout: timedelta,
     pg: Optional[torch.distributed.ProcessGroup] = None,
 ) -> None:
-    """Update timeout on one or all process groups."""
+    """Update timeout on one or all process groups.
+
+    Fix from Megatron M3728: log the failing pg, timeout value, and global
+    process-group list before re-raising so timeouts are diagnosable.
+    """
     if hasattr(torch.distributed.distributed_c10d, "_set_pg_timeout"):
         torch.distributed.barrier(pg)
         torch.cuda.synchronize()
@@ -211,7 +215,19 @@ def update_pg_timeout(
                 torch.distributed.distributed_c10d._set_pg_timeout(timeout, pg)
         except Exception as exc:
             logger.error("Error updating pg timeout: %s", exc)
+            logger.error("Process group: %s", pg)
+            logger.error("Timeout: %s", timeout)
+            logger.error("Global process group list: %s", _global_process_group_list)
             raise
+
+
+def _torch_version_ge(major: int, minor: int) -> bool:
+    """Return True if torch.__version__ >= major.minor (ignores patch/pre-release)."""
+    try:
+        v = torch.__version__.split(".")
+        return (int(v[0]), int(v[1].split("+")[0].split("a")[0].split("b")[0])) >= (major, minor)
+    except Exception:
+        return False
 
 
 def create_group(
@@ -222,7 +238,14 @@ def create_group(
     use_local_synchronization: bool = False,
     group_desc: Optional[str] = None,
 ) -> torch.distributed.ProcessGroup:
-    """Create a ProcessGroup and register it for timeout updates."""
+    """Create a ProcessGroup and register it for timeout updates.
+
+    Fix from Megatron M3728: use explicit version check instead of
+    try/except TypeError to strip unsupported kwargs. The try/except approach
+    can swallow real TypeErrors from within new_group, masking bugs. We also
+    strip timeout=None on old PyTorch (< 2.4) because older versions expect a
+    timedelta default rather than accepting None.
+    """
     kwargs: dict = {
         "ranks": ranks,
         "timeout": timeout,
@@ -231,14 +254,12 @@ def create_group(
         "use_local_synchronization": use_local_synchronization,
         "group_desc": group_desc,
     }
-    # Older PyTorch versions don't support group_desc or None timeout
-    try:
-        group = torch.distributed.new_group(**kwargs)
-    except TypeError:
+    # group_desc and None-timeout accepted only in torch >= 2.4
+    if not _torch_version_ge(2, 4):
         kwargs.pop("group_desc", None)
         if kwargs.get("timeout") is None:
             kwargs.pop("timeout", None)
-        group = torch.distributed.new_group(**kwargs)
+    group = torch.distributed.new_group(**kwargs)
 
     global _global_process_group_list
     if _global_process_group_list is None:

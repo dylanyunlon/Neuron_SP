@@ -191,15 +191,26 @@ def linear_with_grad_accumulation_and_async_allreduce(
     This is a simplified version of Megatron's implementation that provides
     the same interface but falls back to standard F.linear when advanced
     features are unavailable.
+
+    Fix from Megatron M2802/M3191: when sequence_parallel=True the input is a
+    local sequence shard; all-gather across TP ranks before the GEMM using
+    all_gather_into_tensor (contiguous pre-allocated buffer) rather than the
+    deprecated all_gather(list) + torch.cat pattern, which is both slower and
+    allocates extra memory proportional to TP degree.
     """
-    # When sequence_parallel, reduce-scatter input first
+    # When sequence_parallel, all-gather input shards first (dim 0 = sequence)
     if sequence_parallel and tp_group is not None:
         world_size = torch.distributed.get_world_size(group=tp_group)
         if world_size > 1:
-            # All-gather across TP ranks (gathering sequence dimension)
-            input_list = [torch.empty_like(input) for _ in range(world_size)]
-            torch.distributed.all_gather(input_list, input, group=tp_group)
-            input = torch.cat(input_list, dim=0)
+            # Pre-allocate contiguous gather buffer — avoids the extra torch.cat
+            # allocation that the old all_gather(list) + cat pattern required.
+            gather_shape = list(input.shape)
+            gather_shape[0] = gather_shape[0] * world_size
+            gather_buffer = torch.empty(
+                gather_shape, dtype=input.dtype, device=input.device
+            )
+            torch.distributed.all_gather_into_tensor(gather_buffer, input.contiguous(), group=tp_group)
+            input = gather_buffer
 
     output = F.linear(input, weight, bias)
 
@@ -494,7 +505,8 @@ class RowParallelLinear(nn.Module):
     """Linear layer with row parallelism.
 
     Splits weight matrix along the input dimension across TP ranks.
-    Each rank computes a partial result, then all-reduce.
+    Each rank computes a partial result, then all-reduce (or reduce-scatter
+    when sequence_parallel=True).
 
     Y = X A^T + b   where A is [output_size, input_size].
     A is partitioned row-wise (input dimension) so each rank holds
@@ -513,6 +525,11 @@ class RowParallelLinear(nn.Module):
         init_method: Weight initialiser callable.
         skip_bias_add: If True, return bias as second element instead of
             adding it in forward.
+
+    Fix from Megatron M3191/M2802: when config.sequence_parallel=True the
+    output reduction must be reduce_scatter (not all_reduce) so that each TP
+    rank holds the shard of the sequence dimension it is responsible for.
+    Using all_reduce with SP produces incorrect gradients and divergent training.
     """
 
     def __init__(
@@ -610,15 +627,25 @@ class RowParallelLinear(nn.Module):
 
         Args:
             input_: Input tensor.
-              * If ``input_is_parallel=True``: shape ``[*, input_size // tp]``
+              * If ``input_is_parallel=True``: shape ``[seq/tp, batch, input_size // tp]``
                 (already scattered by the preceding ColumnParallelLinear).
-              * Otherwise: shape ``[*, input_size]`` which will be scattered
-                to ``[*, input_size // tp]`` locally.
+              * Otherwise: shape ``[seq, batch, input_size]`` which will be scattered
+                to ``[seq, batch, input_size // tp]`` locally.
 
         Returns:
             Tuple of:
-            * output tensor of shape ``[*, output_size]``.
+            * output tensor:
+              - ``sequence_parallel=False``: full shape ``[seq, batch, output_size]``.
+              - ``sequence_parallel=True``:  sharded ``[seq/tp, batch, output_size]``
+                (each TP rank owns its sequence shard after reduce-scatter).
             * bias tensor when ``skip_bias_add=True``, else ``None``.
+
+        Fix from Megatron M3191/M2802: with sequence_parallel=True we must use
+        reduce_scatter_tensor (reduce then scatter along dim 0) so each TP rank
+        receives only its local sequence shard.  The previous all_reduce path
+        replicated the full result on every rank, producing incorrect activations
+        and gradients when the downstream ColumnParallelLinear expects a scattered
+        input.
         """
         tp_world_size = _get_tp_world_size()
         tp_group = _get_tp_group()
@@ -632,16 +659,42 @@ class RowParallelLinear(nn.Module):
         # Local GEMM: [*, in/tp] x [in/tp, out]^T → [*, out]
         output_parallel = F.linear(input_parallel, self.weight)
 
-        # All-reduce partial results across TP ranks
+        # Reduce partial results across TP ranks.
+        # Fix from Megatron M3191/M2802: sequence_parallel path must use
+        # reduce_scatter so downstream layers receive the correct sharded input.
         if tp_world_size > 1:
-            torch.distributed.all_reduce(output_parallel, group=tp_group)
+            sequence_parallel = getattr(self.config, 'sequence_parallel', False)
+            if sequence_parallel:
+                # reduce_scatter: sum across TP ranks, scatter along dim 0 (sequence).
+                # Mirrors Megatron's reduce_scatter_to_sequence_parallel_region().
+                # Each TP rank receives its own [seq/tp, ...] shard.
+                output_parallel = output_parallel.contiguous()
+                output_shape = list(output_parallel.shape)
+                assert output_shape[0] % tp_world_size == 0, (
+                    f"Sequence dim {output_shape[0]} not divisible by "
+                    f"tp_world_size {tp_world_size}"
+                )
+                output_shape[0] = output_shape[0] // tp_world_size
+                output = torch.empty(
+                    output_shape,
+                    dtype=output_parallel.dtype,
+                    device=output_parallel.device,
+                )
+                torch.distributed.reduce_scatter_tensor(
+                    output, output_parallel, group=tp_group
+                )
+            else:
+                # Standard path: all_reduce replicates the full result on every TP rank
+                torch.distributed.all_reduce(output_parallel, group=tp_group)
+                output = output_parallel
+        else:
+            output = output_parallel
 
         # Add non-parallelised bias
         if not self.skip_bias_add:
-            output = (output_parallel + self.bias) if self.bias is not None else output_parallel
+            output = (output + self.bias) if self.bias is not None else output
             output_bias = None
         else:
-            output = output_parallel
             output_bias = self.bias
 
         return output, output_bias
