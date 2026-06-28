@@ -1901,7 +1901,16 @@ class SelfAttention(Attention):
     # ------------------------------------------------------------------
 
     def set_for_recompute_input_layernorm(self) -> None:
-        """Set save_original_input on the QKV linear for fp8/fp4 recompute."""
+        """Set save_original_input on the QKV linear for fp8/fp4 recompute.
+
+        From Megatron M2797: skip this call when fp8_recipe == 'delayed' because
+        set_save_original_input is incompatible with delayed scaling and corrupts
+        the amax/scale state used by TE's delayed scaling recipe.
+        """
+        # From Megatron M2797: guard against delayed scaling recipe
+        fp8_recipe = getattr(self.config, 'fp8_recipe', None)
+        if fp8_recipe == 'delayed':
+            return
         if set_save_original_input is not None:
             set_save_original_input(self.linear_qkv)
         else:

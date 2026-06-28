@@ -743,6 +743,26 @@ class DistributedDataParallel(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# Checkpoint param-sync helper
+# ---------------------------------------------------------------------------
+
+def force_param_sync(model_chunks: list) -> None:
+    """Force synchronous parameter sync (all-gather) for all DDP model chunks.
+
+    From Megatron M2853: simplifies parameter sync for checkpoint save.
+    Previously the code called disable_forward_pre_hook/enable_forward_pre_hook
+    which had additional side-effects. Using start_param_sync(force_sync=True)
+    directly is cleaner and correct.
+
+    Call this before saving a checkpoint when overlap_param_gather is enabled,
+    to ensure all parameters are fully gathered before serialisation.
+    """
+    for model_chunk in model_chunks:
+        if isinstance(model_chunk, DistributedDataParallel):
+            model_chunk.start_param_sync(force_sync=True)
+
+
+# ---------------------------------------------------------------------------
 # Process-group setup helpers
 # ---------------------------------------------------------------------------
 

@@ -23,6 +23,14 @@ COMMON_STATE_FNAME = 'common.pt'
 logger = logging.getLogger(__name__)
 
 
+# From Megatron M2848: dummy class needed to load mcore v0.15 checkpoints with
+# optimizer states that were pickled when MCoreMetadata existed as a real class.
+# Without this stub, torch.load raises AttributeError on old checkpoints.
+class MCoreMetadata:
+    """ Backward-compat stub for loading mcore 0.15 checkpoints. """
+    pass
+
+
 def load(sharded_state_dict: ShardedStateDict,
          checkpoint_dir: str,
          sharded_strategy: Union[LoadShardedStrategy, None] = None,
