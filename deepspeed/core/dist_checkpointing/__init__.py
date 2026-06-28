@@ -21,6 +21,20 @@ try:
 except Exception:
     pass  # older PyTorch versions do not have add_safe_globals
 
+# Insight I4: versioned checkpoint schema (Megatron ab-3.3)
+# Re-export CheckpointManifest and its I/O helpers so callers can do:
+#   from deepspeed.core.dist_checkpointing import CheckpointManifest, load_manifest, save_manifest
+from deepspeed.core.dist_checkpointing.core import (  # noqa: F401
+    CheckpointManifest,
+    CheckpointingConfig,
+    CheckpointingException,
+    load_manifest,
+    save_manifest,
+    maybe_load_config,
+    save_config,
+    check_is_distributed_checkpoint,
+)
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------

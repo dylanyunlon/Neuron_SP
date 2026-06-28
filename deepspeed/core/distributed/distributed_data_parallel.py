@@ -102,6 +102,12 @@ class DistributedDataParallelConfig:
         pad_buckets_for_high_nccl_busbw: Pad buckets for NCCL bus-bandwidth.
         use_megatron_fsdp: Use Megatron-FSDP (FSDP integration).
         allow_skip_grad_sync: DES-LOC: allow skipping grad collective on non-Kx steps.
+        use_pcie_aware_overlap: Insight I6 — recalculate bucket_size and overlap
+            trigger points assuming PCIe bandwidth instead of NVLink.
+        pcie_bw_gbps: Effective PCIe bandwidth in GB/s used for bucket sizing
+            (Insight I6; default 16 GB/s ≈ PCIe 4.0 ×16 unidirectional).
+        pcie_latency_us: PCIe round-trip latency in microseconds used to set
+            the overlap trigger threshold (Insight I6; default 10 µs).
     """
 
     grad_reduce_in_fp32: bool = False
@@ -132,6 +138,19 @@ class DistributedDataParallelConfig:
     megatron_fsdp_main_params_dtype: Optional[torch.dtype] = torch.float32
     """Data type for the main weight buffer in Megatron-FSDP distributed
     optimization. If None, compute weights serve as main weights."""
+
+    # Insight I6: PCIe-aware overlap (Megatron aa-3.5)
+    # When True, bucket_size and the overlap trigger threshold are computed
+    # from PCIe bandwidth/latency rather than NVLink assumptions.
+    # PCIe parameters to tune:
+    #   pcie_bw_gbps:    effective unidirectional PCIe bandwidth (GB/s).
+    #                    PCIe 4.0 ×16 ≈ 16 GB/s; set lower for shared lanes.
+    #   pcie_latency_us: round-trip PCIe latency (µs); used to compute the
+    #                    minimum bucket size whose transfer time dominates
+    #                    latency (overlap threshold).
+    use_pcie_aware_overlap: bool = False
+    pcie_bw_gbps: float = 16.0    # GB/s — PCIe 4.0 ×16 unidirectional
+    pcie_latency_us: float = 10.0  # µs — typical host↔device round-trip
 
     megatron_fsdp_main_grads_dtype: Optional[torch.dtype] = None
     """Data type for the main gradient buffer in Megatron-FSDP. If None,
@@ -220,9 +239,54 @@ class DistributedDataParallel(nn.Module):
 
         # ------------------------------------------------------------------
         # Bucket size (M2974: scale with dp_size).
+        # Insight I6: PCIe-aware overlap (Megatron aa-3.5)
         # ------------------------------------------------------------------
         if ddp_config.bucket_size is None:
-            ddp_config.bucket_size = max(40_000_000, 1_000_000 * dp_group.size())
+            if getattr(ddp_config, 'use_pcie_aware_overlap', False):
+                # PCIe-aware bucket sizing.
+                #
+                # Rationale: The original formula (40M + 1M*dp_size) was tuned
+                # for NVLink (≥600 GB/s bidirectional), where large buckets
+                # amortise NCCL launch overhead.  Over PCIe (typ. 16 GB/s
+                # unidirectional) smaller buckets are better because:
+                #
+                #  1. Smaller bucket → shorter transfer time → collective
+                #     completes sooner → more backward compute can be overlapped.
+                #  2. PCIe latency (≈10 µs) is much larger relative to transfer
+                #     time than NVLink latency, so the minimum useful bucket is
+                #     larger than NVLink latency-amortised minimum but still much
+                #     smaller than the NVLink-tuned 40 M default.
+                #
+                # Formula: choose the bucket large enough that transfer time ≥
+                # 4× PCIe round-trip latency (so overlap is worthwhile), but at
+                # most the NVLink default so we don't over-buffer.
+                #
+                #   min_bytes = 4 × latency_s × bw_bytes_per_s
+                #   bucket_elements = min_bytes / bytes_per_element (fp16/bf16 → 2 B)
+                #
+                bytes_per_elem = 2  # assume bf16/fp16 grad dtype as worst case
+                pcie_bw_bytes = ddp_config.pcie_bw_gbps * 1e9
+                latency_s = ddp_config.pcie_latency_us * 1e-6
+                # Minimum bucket to make overlap worthwhile over PCIe.
+                min_bucket_bytes = 4.0 * latency_s * pcie_bw_bytes
+                min_bucket_elems = int(min_bucket_bytes / bytes_per_elem)
+                # Scale slightly with dp_size (more ranks → larger reduce payload).
+                pcie_bucket = max(min_bucket_elems, 500_000 * dp_group.size())
+                # Cap at NVLink default so we don't regress on NVLink nodes.
+                nvlink_default = max(40_000_000, 1_000_000 * dp_group.size())
+                ddp_config.bucket_size = min(pcie_bucket, nvlink_default)
+                logger.info(
+                    # Insight I6: PCIe-aware overlap (Megatron aa-3.5)
+                    "I6 PCIe-aware bucket_size=%d elements "
+                    "(bw=%.1f GB/s, latency=%.1f µs, dp=%d)",
+                    ddp_config.bucket_size,
+                    ddp_config.pcie_bw_gbps,
+                    ddp_config.pcie_latency_us,
+                    dp_group.size(),
+                )
+            else:
+                # Original NVLink-tuned default (Megatron M2974).
+                ddp_config.bucket_size = max(40_000_000, 1_000_000 * dp_group.size())
         if not ddp_config.overlap_grad_reduce:
             ddp_config.bucket_size = None
 

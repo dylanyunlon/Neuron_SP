@@ -149,3 +149,61 @@ class OptimizerConfig:
     def is_kx_step(self, step: int) -> bool:
         """Return True if *step* is a parameter sync step (Kx)."""
         return (step % self.kx) == 0
+
+    # -----------------------------------------------------------------------
+    # Insight I6: PCIe-aware overlap (Megatron aa-3.5)
+    # -----------------------------------------------------------------------
+    # When use_pcie_aware_overlap=True the distributed optimizer recalculates
+    # bucket_size and the overlap-trigger threshold using PCIe bandwidth and
+    # latency instead of NVLink-tuned defaults.
+    #
+    # Background: Megatron's default bucket_size of 40M–125M+ elements was
+    # calibrated for NVLink (≥600 GB/s), where the per-collective launch
+    # overhead is negligible relative to the bandwidth.  Over PCIe (typ.
+    # 16 GB/s unidirectional for PCIe 4.0 ×16) the transfer time for a
+    # 40M-element bf16 bucket is ≈80 ms — far larger than the backward-pass
+    # segment time on typical models, meaning overlap is impossible.  Using
+    # smaller buckets allows the collective to finish before the next
+    # backward segment completes, restoring meaningful overlap.
+    #
+    # The overlap-trigger threshold is the minimum bucket size (in elements)
+    # at which launching a collective makes sense, i.e. where the transfer
+    # time exceeds the NCCL launch overhead (~10 µs).
+    use_pcie_aware_overlap: bool = False
+    pcie_bw_gbps: float = 16.0    # GB/s — PCIe 4.0 ×16 unidirectional
+    pcie_latency_us: float = 10.0  # µs — typical PCIe host↔device round-trip
+
+    def pcie_bucket_size(self, dp_world_size: int = 1) -> int:
+        """Compute PCIe-aware bucket_size in elements.
+
+        Returns the smaller of:
+         - A size where transfer time ≥ 4× PCIe latency (useful-overlap floor).
+         - The NVLink default (so we don't regress on NVLink nodes).
+
+        Args:
+            dp_world_size: DP world size; used to scale the floor slightly.
+        """
+        # Insight I6: PCIe-aware overlap (Megatron aa-3.5)
+        bytes_per_elem = 2  # bf16 / fp16
+        pcie_bw_bytes = self.pcie_bw_gbps * 1e9
+        latency_s = self.pcie_latency_us * 1e-6
+        min_bucket_bytes = 4.0 * latency_s * pcie_bw_bytes
+        min_bucket_elems = int(min_bucket_bytes / bytes_per_elem)
+        pcie_bucket = max(min_bucket_elems, 500_000 * dp_world_size)
+        nvlink_default = max(40_000_000, 1_000_000 * dp_world_size)
+        return min(pcie_bucket, nvlink_default)
+
+    def pcie_overlap_trigger_elems(self) -> int:
+        """Minimum bucket size in elements that justifies a PCIe collective.
+
+        Below this threshold the NCCL launch overhead (~latency) dominates
+        transfer time, so launching the collective asynchronously does not
+        provide meaningful overlap benefit.
+        """
+        # Insight I6: PCIe-aware overlap (Megatron aa-3.5)
+        bytes_per_elem = 2  # bf16 / fp16
+        pcie_bw_bytes = self.pcie_bw_gbps * 1e9
+        latency_s = self.pcie_latency_us * 1e-6
+        trigger_bytes = latency_s * pcie_bw_bytes
+        return max(1, int(trigger_bytes / bytes_per_elem))
+

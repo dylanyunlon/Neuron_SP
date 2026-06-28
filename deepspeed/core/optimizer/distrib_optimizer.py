@@ -904,9 +904,24 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         Uses ``reduce_scatter_tensor`` for a single contiguous operation
         when the total buffer size is a multiple of dp_world_size.
         Otherwise falls back to an equivalent chunked scatter.
+
+        Insight I6: PCIe-aware overlap (Megatron aa-3.5)
+        When ``config.use_pcie_aware_overlap`` is True the collective is issued
+        *asynchronously* only for buffers whose element count exceeds the PCIe
+        overlap-trigger threshold (i.e. transfer time ≥ PCIe latency).  Buckets
+        below the threshold are reduced synchronously to avoid the overhead of
+        an async launch that can't meaningfully overlap with compute.
         """
         dp_world = self.data_parallel_world_size
         dp_rank = self.data_parallel_rank
+
+        # Insight I6: PCIe-aware overlap (Megatron aa-3.5)
+        pcie_aware = getattr(self.config, 'use_pcie_aware_overlap', False)
+        pcie_trigger_elems: int = (
+            self.config.pcie_overlap_trigger_elems()
+            if pcie_aware
+            else 0
+        )
 
         for buf_idx, (buf, fp32_grad_shard, boundaries) in enumerate(
                 zip(
@@ -917,6 +932,16 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             total_numel = buf.grad_data.numel()
             shard_start, shard_end = boundaries[dp_rank]
             shard_size = shard_end - shard_start
+
+            # Insight I6: PCIe-aware overlap (Megatron aa-3.5)
+            # Use async only when buffer is large enough to make overlap
+            # worthwhile over PCIe.  For small buffers the launch overhead
+            # exceeds the transfer time, so sync mode is more efficient.
+            _async_op = (
+                pcie_aware
+                and getattr(self.config, 'overlap_grad_reduce', False)
+                and total_numel >= pcie_trigger_elems
+            )
 
             # Maximum shard size across ranks (needed for equal-shard collectives)
             max_shard_size = max(e - s for s, e in boundaries)
@@ -941,12 +966,17 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     dtype=grad_padded.dtype,
                     device=grad_padded.device,
                 )
-                torch.distributed.reduce_scatter_tensor(
+                # Insight I6: PCIe-aware overlap (Megatron aa-3.5)
+                # async_op=True only for buffers above the PCIe latency threshold.
+                handle = torch.distributed.reduce_scatter_tensor(
                     output_shard,
                     grad_padded,
                     op=torch.distributed.ReduceOp.SUM,
                     group=self.data_parallel_group,
+                    async_op=_async_op,
                 )
+                if _async_op and handle is not None:
+                    handle.wait()
                 fp32_grad_shard.copy_(output_shard[:shard_size].float().div_(dp_world))
 
             else:
@@ -958,11 +988,15 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 # reduce_scatter would be more efficient.
                 # -------------------------------------------------------
                 grad_work = buf.grad_data.clone()
-                torch.distributed.all_reduce(
+                # Insight I6: PCIe-aware overlap (Megatron aa-3.5)
+                handle = torch.distributed.all_reduce(
                     grad_work,
                     op=torch.distributed.ReduceOp.SUM,
                     group=self.data_parallel_group,
+                    async_op=_async_op,
                 )
+                if _async_op and handle is not None:
+                    handle.wait()
                 fp32_grad_shard.copy_(grad_work[shard_start:shard_end].float().div_(dp_world))
 
         # Attach grad shards to shard params for the Adam step
@@ -2152,6 +2186,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         params: List[torch.nn.Parameter],
         bucket_size: Optional[int],
         data_parallel_world_size: int,
+        optimizer_config=None,
     ) -> Dict:
         """Compute parameter layouts for all buffer groups.
 
@@ -2162,11 +2197,38 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             params:                    All model parameters.
             bucket_size:               Approx elements per bucket (None = 1 bucket).
             data_parallel_world_size:  For bucket-end alignment.
+            optimizer_config:          Optional OptimizerConfig; when provided and
+                ``use_pcie_aware_overlap=True``, bucket_size is recalculated using
+                PCIe bandwidth and latency parameters.
+                Insight I6: PCIe-aware overlap (Megatron aa-3.5).
 
         Returns:
             Dict mapping dtype → per-buffer layout dict from
             ``_compute_per_buffer_param_layout``.
         """
+        # Insight I6: PCIe-aware overlap (Megatron aa-3.5)
+        # When optimizer_config requests PCIe-aware sizing and no explicit
+        # bucket_size override was given, compute a PCIe-adapted bucket_size
+        # that is much smaller than the NVLink-tuned default so that gradient
+        # collectives complete within a single backward segment and meaningful
+        # overlap is achievable.
+        if (
+            bucket_size is None
+            and optimizer_config is not None
+            and getattr(optimizer_config, 'use_pcie_aware_overlap', False)
+        ):
+            bucket_size = optimizer_config.pcie_bucket_size(data_parallel_world_size)
+            import logging as _logging
+            _logging.getLogger(__name__).info(
+                # Insight I6: PCIe-aware overlap (Megatron aa-3.5)
+                "I6 PCIe-aware bucket_size=%d elements for DistributedOptimizer "
+                "(bw=%.1f GB/s, latency=%.1f µs, dp=%d)",
+                bucket_size,
+                optimizer_config.pcie_bw_gbps,
+                optimizer_config.pcie_latency_us,
+                data_parallel_world_size,
+            )
+
         # Group by dtype.
         dtype_groups: Dict[torch.dtype, List[torch.nn.Parameter]] = {}
         for p in params:

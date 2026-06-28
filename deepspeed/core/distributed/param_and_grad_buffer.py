@@ -117,6 +117,92 @@ class BufferType(Enum):
 
 
 # ---------------------------------------------------------------------------
+# Insight I5: buffer ownership FSM (Megatron M3061/M3116)
+# ---------------------------------------------------------------------------
+# The grad buffer of a ParamAndGradBucketGroup transitions through three
+# ownership states during a training step:
+#
+#   FREE  ──(zero() / alloc)──►  PARAM_OWNED  ──(register_grad_ready)──►  GRAD_OWNED
+#    ▲                                                                           │
+#    └──────────────────────(finish_grad_sync / reset)───────────────────────────┘
+#
+# Invariants:
+#   PARAM_OWNED  – buffer holds param values (layer-wise AG reuse path).
+#                  Grad writes are FORBIDDEN.  See M3739.
+#   GRAD_OWNED   – buffer holds gradient data ready for or undergoing a
+#                  collective.  Param writes are FORBIDDEN.
+#   FREE         – buffer is zeroed / idle (start of iteration after reset).
+#
+# Assertions at each transition guard against the grad-corruption bugs fixed
+# in Megatron M3904 and the layerwise-optimizer races in M3948.
+# ---------------------------------------------------------------------------
+
+class BufferOwnership(Enum):
+    """Explicit ownership state for the shared param/grad contiguous buffer.
+
+    Tracks which consumer currently "owns" the flat buffer so that use-after-
+    free and double-write bugs are caught as assertions rather than silent
+    data corruption.
+
+    States
+    ------
+    PARAM_OWNED
+        The buffer is being used as a parameter all-gather receive buffer
+        (overlap_param_gather / layer-wise optimizer path, M3739).
+        Gradient accumulation into this buffer is forbidden until ownership
+        is released.
+    GRAD_OWNED
+        The buffer holds live gradient data that is ready for (or currently
+        undergoing) a reduce-scatter / all-reduce collective.  Overwriting
+        with parameter data is forbidden.
+    FREE
+        The buffer has been zeroed and is not actively owned by either
+        the forward (param) or backward (grad) pass.  This is the initial
+        state at the start of each training iteration.
+    """
+    # Insight I5: buffer ownership FSM (Megatron M3061/M3116)
+    PARAM_OWNED = "param"   # buffer holds gathered param values
+    GRAD_OWNED  = "grad"    # buffer holds gradient data for collective
+    FREE        = "free"    # buffer idle / zeroed
+
+    def assert_is(self, expected: "BufferOwnership", context: str = "") -> None:
+        """Assert this state equals *expected*; raise with context on mismatch.
+
+        Args:
+            expected: The required ownership state.
+            context:  Human-readable label for the call site (for debugging).
+
+        Raises:
+            AssertionError: if ``self != expected``.
+        """
+        # Insight I5: buffer ownership FSM (Megatron M3061/M3116)
+        assert self == expected, (
+            f"Buffer ownership violation{' at ' + context if context else ''}: "
+            f"expected {expected.value!r}, got {self.value!r}. "
+            "This indicates a use-after-free or double-write on the flat "
+            "param/grad buffer (see Megatron M3061/M3116/M3904)."
+        )
+
+    def assert_not(self, forbidden: "BufferOwnership", context: str = "") -> None:
+        """Assert this state is NOT *forbidden*.
+
+        Args:
+            forbidden: The disallowed ownership state.
+            context:   Human-readable label for the call site.
+
+        Raises:
+            AssertionError: if ``self == forbidden``.
+        """
+        # Insight I5: buffer ownership FSM (Megatron M3061/M3116)
+        assert self != forbidden, (
+            f"Buffer ownership violation{' at ' + context if context else ''}: "
+            f"buffer must not be in state {forbidden.value!r} here. "
+            "This indicates a lifecycle ordering error "
+            "(see Megatron M3061/M3116/M3904)."
+        )
+
+
+# ---------------------------------------------------------------------------
 # shard_buffer
 # ---------------------------------------------------------------------------
 
@@ -348,6 +434,12 @@ class ParamAndGradBucketGroup:
         # DES-LOC: gate on Kx steps.
         self._skip_sync: bool = False
 
+        # Insight I5: buffer ownership FSM (Megatron M3061/M3116)
+        # Track which consumer owns the shared flat buffer so that param-AG
+        # reuse of grad_data (M3739) and grad-reduce collectives never
+        # silently corrupt each other's data.
+        self._buffer_ownership: BufferOwnership = BufferOwnership.FREE
+
     # ------------------------------------------------------------------
     # Reset
     # ------------------------------------------------------------------
@@ -362,6 +454,10 @@ class ParamAndGradBucketGroup:
         self.is_last_microbatch = True
         self.grad_reduce_finished = False
         self._skip_sync = False
+        # Insight I5: buffer ownership FSM (Megatron M3061/M3116)
+        # After each iteration the buffer is zeroed externally (ParamAndGradBuffer.reset())
+        # so we release ownership back to FREE unconditionally.
+        self._buffer_ownership = BufferOwnership.FREE
 
     # ------------------------------------------------------------------
     # Post-param-sync processing (M2777)
@@ -454,6 +550,15 @@ class ParamAndGradBucketGroup:
         overlap_pg = getattr(self.ddp_config, 'overlap_param_gather', False)
         assert use_dist_opt or overlap_pg, \
             "start_param_sync called without use_distributed_optimizer or overlap_param_gather"
+
+        # Insight I5: buffer ownership FSM (Megatron M3061/M3116)
+        # Buffer must NOT be in GRAD_OWNED state when we start using it for
+        # parameter all-gather.  GRAD_OWNED → PARAM_OWNED is illegal without
+        # an intervening finish_grad_sync / reset (M3904 corruption fix).
+        self._buffer_ownership.assert_not(
+            BufferOwnership.GRAD_OWNED, "start_param_sync"
+        )
+        self._buffer_ownership = BufferOwnership.PARAM_OWNED
 
         if force_sync:
             if self.param_gather_handle is not None:
@@ -603,6 +708,14 @@ class ParamAndGradBucketGroup:
 
             self._post_param_sync()
 
+            # Insight I5: buffer ownership FSM (Megatron M3061/M3116)
+            # AG is done and grad_data has been zeroed (M3904); the buffer is
+            # now idle and ready for gradient accumulation → FREE.
+            self._buffer_ownership.assert_is(
+                BufferOwnership.PARAM_OWNED, "finish_param_sync (post-wait)"
+            )
+            self._buffer_ownership = BufferOwnership.FREE
+
     # ------------------------------------------------------------------
     # Grad sync
     # ------------------------------------------------------------------
@@ -658,6 +771,15 @@ class ParamAndGradBucketGroup:
         if skip_sync and getattr(self.ddp_config, 'allow_skip_grad_sync', True):
             self.grad_reduce_finished = True
             return
+
+        # Insight I5: buffer ownership FSM (Megatron M3061/M3116)
+        # Buffer must be FREE (not PARAM_OWNED) before we hand it to the
+        # grad collective.  PARAM_OWNED → GRAD_OWNED without zeroing first
+        # would corrupt the reduce result (see M3904).
+        self._buffer_ownership.assert_not(
+            BufferOwnership.PARAM_OWNED, "start_grad_sync"
+        )
+        self._buffer_ownership = BufferOwnership.GRAD_OWNED
 
         # Copy FP32 extra main_grads into grad_data (M3616).
         self._copy_in_extra_main_grads()
@@ -816,6 +938,14 @@ class ParamAndGradBucketGroup:
         self.grad_reduce_handle = None
         self._copy_back_extra_main_grads()
         self.grad_reduce_finished = True
+        # Insight I5: buffer ownership FSM (Megatron M3061/M3116)
+        # Collective is complete; the caller will zero grad_data at the next
+        # reset() boundary.  Release ownership so param-AG can reuse the
+        # buffer in the next forward pass.
+        self._buffer_ownership.assert_is(
+            BufferOwnership.GRAD_OWNED, "finish_grad_sync (post-wait)"
+        )
+        self._buffer_ownership = BufferOwnership.FREE
 
     def free_overlap_buffers(self) -> None:
         """Free temporary all-gather buffers (M3904 async checkpoint OOM fix)."""
