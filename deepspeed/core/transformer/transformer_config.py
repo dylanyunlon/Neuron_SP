@@ -1492,14 +1492,11 @@ class TransformerConfig(ModelParallelConfig):
                 self.recompute_modules is None or "moe" not in self.recompute_modules
             ), "disable moe in recompute_modules when enabling overlap_moe_expert_parallel_comm"
             # M2924 (a56a0b001): with MTP enabled, PP > 1 is required for A2A overlap.
+            # From Megatron M4044: removed the PP>1 assertion; EP A2A overlap with MTP
+            # and PP=1 is now supported.
             assert (
                 self.mtp_num_layers is None or self.mtp_num_layers == 1
             ), "MTP layernum only supports 1 when enabling overlap_moe_expert_parallel_comm."
-            if self.mtp_num_layers == 1:
-                assert self.pipeline_model_parallel_size > 1, (
-                    "Pipeline model parallel size must be larger than 1 "
-                    "when enabling overlap_moe_expert_parallel_comm with MTP layer."
-                )
 
         if self.delay_wgrad_compute:
             assert self.overlap_moe_expert_parallel_comm, (
