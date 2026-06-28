@@ -471,6 +471,8 @@ class ParamAndGradBucketGroup:
             # Layer-wise optimizer path: variable-size per-rank all_gather (M3443).
             dp_size = self.intra_distributed_optimizer_instance_size
             if dp_size == 1:
+                # Fix from Megatron M3695: single-rank group needs no all-gather.
+                # Mark dispatched so finish_param_sync sees a clean state.
                 if force_sync and overlap_pg:
                     self._post_param_sync()
                 self.param_gather_dispatched = True
@@ -521,6 +523,9 @@ class ParamAndGradBucketGroup:
                         for upd_p, mod_p in zip(updated, params):
                             mod_p.data.copy_(upd_p)
                     bucket.layerwise_gather_list = None
+                    # Fix from Megatron M3904: zero grad_data after using it as the
+                    # all-gather receive buffer so that subsequent gradient accumulation
+                    # starts from zero rather than the stale gathered param values.
                     bucket.grad_data.zero_()
                 self.param_gather_handle = None
         else:
@@ -592,6 +597,8 @@ class ParamAndGradBucketGroup:
                         for upd_p, mod_p in zip(updated, params):
                             mod_p.data.copy_(upd_p)
                     bucket.layerwise_gather_list = None
+                    # Fix from Megatron M3904: zero grad_data (reused as AG receive
+                    # buffer) so gradient accumulation starts clean.
                     bucket.grad_data.zero_()
 
             self._post_param_sync()

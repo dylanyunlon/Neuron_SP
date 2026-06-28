@@ -2455,7 +2455,8 @@ class DesLocEngine:
             # --- HeteroFP32GradAccumManager: after_backward ---
             # Skipped when DistributedOptimizer active (it owns grad reduction).
             if self.fp32_grad_manager is not None and self._dist_optimizer is None:
-                self.fp32_grad_manager.after_backward(scale=1.0 / num_microbatches)
+                # Fix from Megatron M3313: clamp to avoid 1/0 when num_microbatches==0.
+                self.fp32_grad_manager.after_backward(scale=1.0 / max(num_microbatches, 1))
 
             # --- finalize_model_grads (core.distributed) ---
             # Called only on non-ZeRO-3 paths; DistributedOptimizer.prepare_grads()
@@ -2559,6 +2560,12 @@ class DesLocEngine:
                     # internally; we call it again on the async stream to overlap
                     # the BF16 copies with the next step's data preprocessing.)
                     if _shard_sync_stream is not None:
+                        # Fix from Megatron M3561: the secondary stream must wait
+                        # for the current (default) stream — where optimizer.step()
+                        # ran — before launching the BF16 broadcast.  Without this
+                        # fence the all-gather can start before Adam has written the
+                        # updated FP32 values, causing stale-weight corruption.
+                        _shard_sync_stream.wait_stream(torch.cuda.current_stream())
                         with torch.cuda.stream(_shard_sync_stream):
                             self._dist_optimizer.shard_to_model_broadcast()
                         _shard_sync_pending = True
@@ -2580,7 +2587,11 @@ class DesLocEngine:
             self.tokens_seen += tokens_this_step
             self.consumed_samples += num_microbatches * cfg.micro_batch_size
 
-            avg_loss = step_loss / num_microbatches
+            # Fix from Megatron M3313: guard against zero num_microbatches
+            # (hetero scheduler can return 0 for an idle rank on edge-case
+            # batch sizes), which would cause NaN/ZeroDivisionError here.
+            safe_num_microbatches = max(num_microbatches, 1)
+            avg_loss = step_loss / safe_num_microbatches
             loss_accum += avg_loss
 
             # Logging

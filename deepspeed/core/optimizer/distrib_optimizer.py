@@ -2638,6 +2638,12 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
         In our flat-shard design we expose the per-shard state directly.
 
+        Evolution notes
+        ~~~~~~~~~~~~~~~
+        - M3356: only tensor-valued optimizer state entries are included;
+          scalar entries like ``step`` (plain int/float in some optimizers)
+          are silently skipped to prevent crash during save/load.
+
         Returns:
             Dict with ``per_bucket_numel``, ``per_bucket_numel_unpadded``,
             and per-buffer per-bucket parameter states.
