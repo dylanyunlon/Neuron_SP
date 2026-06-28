@@ -1171,15 +1171,24 @@ class Attention(MegatronModule, ABC):
             try:
                 from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
                 mscale = _yarn_get_concentration_factor_from_config(self.config)
+                # M4090: multi_latent_attention (old kwarg name) is now
+                # mla_rotary_interleaved in rope_utils.apply_rotary_pos_emb.
+                # Pass it explicitly so DSA/MLA layers get correct interleaving
+                # even after the upstream Megatron removed the old kwarg.
+                mla_rotary_interleaved = bool(
+                    getattr(self.config, "multi_latent_attention", False)
+                )
                 if q_pos_emb is not None:
                     query = apply_rotary_pos_emb(
                         query, q_pos_emb, config=self.config,
                         mscale=mscale,
+                        mla_rotary_interleaved=mla_rotary_interleaved,
                     )
                 if k_pos_emb is not None:
                     key = apply_rotary_pos_emb(
                         key, k_pos_emb, config=self.config,
                         mscale=mscale,
+                        mla_rotary_interleaved=mla_rotary_interleaved,
                     )
             except ImportError:
                 # Fallback to built-in rotary if megatron not available
@@ -1812,7 +1821,11 @@ class SelfAttention(Attention):
 
         current_max = getattr(self.core_attention, "current_max_attn_logits", None)
         if current_max is None:
-            raise ValueError("current_max_attn_logits is None")
+            # Logits not yet populated (e.g. first step before any forward pass,
+            # or layer skipped under gradient checkpointing).  Mirror Megatron's
+            # qk_clip.py fix (M3217 / cherry-pick #2776): silently skip rather
+            # than raising, so the outer loop can continue to the next layer.
+            return
 
         assert current_max.shape == (self.num_attention_heads_per_partition,), (
             f"current_max_attn_logits shape is not "

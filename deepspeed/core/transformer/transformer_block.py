@@ -599,33 +599,118 @@ class TransformerBlock(MegatronModule):
 
         with rng_context:
             if recompute_granularity == "full" and self.training:
-                # Full recompute: checkpoint the entire block's sequential pass
-                intermediate_hidden_states: List[Tensor] = []
-                try:
-                    from megatron.core import tensor_parallel as _tp
+                recompute_method = getattr(self.config, "recompute_method", None)
+                recompute_num_layers = getattr(self.config, "recompute_num_layers", None)
 
-                    def _checkpointed(*args):
-                        h = args[0]
-                        for i, layer in enumerate(self.layers):
+                if recompute_method == "uniform" and recompute_num_layers is not None:
+                    # M3591 fix: compute chunk_end *before* calling checkpoint so
+                    # that the clamped boundary is used inside the custom() closure.
+                    # Without this, when num_layers_per_pipeline_rank is not
+                    # divisible by recompute_num_layers the last chunk would pass
+                    # an out-of-range end index causing an IndexError.
+                    intermediate_hidden_states: List[Tensor] = []
+                    num_layers_local = self.num_layers_per_pipeline_rank
+
+                    def _make_chunk_fn(start: int, end: int):
+                        """Return a no-arg callable that runs layers[start:end]."""
+                        def _fn(h):
+                            for layer in self.layers[start:end]:
+                                h = layer(
+                                    h,
+                                    attention_mask=attention_mask,
+                                    rotary_pos_emb=rotary_pos_emb,
+                                    rotary_pos_cos=rotary_pos_cos,
+                                    rotary_pos_sin=rotary_pos_sin,
+                                    attention_bias=attention_bias,
+                                    inference_context=inference_context,
+                                    packed_seq_params=packed_seq_params,
+                                )
+                            return h
+                        return _fn
+
+                    layer_idx = 0
+                    while layer_idx < num_layers_local:
+                        # M3591: clamp chunk_end BEFORE passing to checkpoint
+                        chunk_end = min(
+                            layer_idx + recompute_num_layers, num_layers_local
+                        )
+                        chunk_fn = _make_chunk_fn(layer_idx, chunk_end)
+                        hidden_states = torch.utils.checkpoint.checkpoint(
+                            chunk_fn, hidden_states, use_reentrant=False
+                        )
+                        # Collect intermediate embeddings at chunk boundary
+                        for idx in range(layer_idx, chunk_end):
+                            if (idx + layer_offset) in extract_layer_indices:
+                                intermediate_hidden_states.append(hidden_states)
+                        layer_idx = chunk_end
+
+                elif recompute_method == "block" and recompute_num_layers is not None:
+                    # Block recompute: checkpoint the first recompute_num_layers layers,
+                    # run the rest without checkpointing.
+                    intermediate_hidden_states = []
+                    num_layers_local = self.num_layers_per_pipeline_rank
+                    num_layers_to_recompute = min(recompute_num_layers, num_layers_local)
+
+                    def _make_chunk_fn(start: int, end: int):
+                        def _fn(h):
+                            for layer in self.layers[start:end]:
+                                h = layer(
+                                    h,
+                                    attention_mask=attention_mask,
+                                    rotary_pos_emb=rotary_pos_emb,
+                                    rotary_pos_cos=rotary_pos_cos,
+                                    rotary_pos_sin=rotary_pos_sin,
+                                    attention_bias=attention_bias,
+                                    inference_context=inference_context,
+                                    packed_seq_params=packed_seq_params,
+                                )
+                            return h
+                        return _fn
+
+                    # Checkpointed block
+                    chunk_fn = _make_chunk_fn(0, num_layers_to_recompute)
+                    hidden_states = torch.utils.checkpoint.checkpoint(
+                        chunk_fn, hidden_states, use_reentrant=False
+                    )
+                    for idx in range(0, num_layers_to_recompute):
+                        if (idx + layer_offset) in extract_layer_indices:
+                            intermediate_hidden_states.append(hidden_states)
+
+                    # Remaining layers without checkpointing
+                    for l_no in range(num_layers_to_recompute, num_layers_local):
+                        hidden_states = self.layers[l_no](
+                            hidden_states,
+                            attention_mask=attention_mask,
+                            rotary_pos_emb=rotary_pos_emb,
+                            rotary_pos_cos=rotary_pos_cos,
+                            rotary_pos_sin=rotary_pos_sin,
+                            attention_bias=attention_bias,
+                            inference_context=inference_context,
+                            packed_seq_params=packed_seq_params,
+                        )
+                        if (l_no + layer_offset) in extract_layer_indices:
+                            intermediate_hidden_states.append(hidden_states)
+
+                else:
+                    # Fallback: checkpoint the entire block as one unit
+                    intermediate_hidden_states = []
+
+                    def _full_block(h):
+                        for layer in self.layers:
                             h = layer(
                                 h,
                                 attention_mask=attention_mask,
                                 rotary_pos_emb=rotary_pos_emb,
-                                inference_context=None,
+                                rotary_pos_cos=rotary_pos_cos,
+                                rotary_pos_sin=rotary_pos_sin,
+                                attention_bias=attention_bias,
+                                inference_context=inference_context,
                                 packed_seq_params=packed_seq_params,
                             )
                         return h
 
-                    hidden_states = _tp.checkpoint(
-                        _checkpointed, False, hidden_states
-                    )
-                except Exception:
-                    # Fallback to standard sequential if Megatron unavailable
-                    hidden_states, intermediate_hidden_states = self._forward_layers(
-                        hidden_states, attention_mask, rotary_pos_emb,
-                        rotary_pos_cos, rotary_pos_sin, attention_bias,
-                        inference_context, packed_seq_params,
-                        extract_layer_indices, layer_offset,
+                    hidden_states = torch.utils.checkpoint.checkpoint(
+                        _full_block, hidden_states, use_reentrant=False
                     )
             else:
                 hidden_states, intermediate_hidden_states = self._forward_layers(
