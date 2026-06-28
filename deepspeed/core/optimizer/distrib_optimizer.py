@@ -102,11 +102,19 @@ def clip_grad_norm(
             grads.append(grad.detach())
 
     norm_type = float(norm_type)
-    device = grads[0].device if grads else torch.device("cpu")
+    # Insight I1: unconditional collective (Megatron M2316 lesson)
+    # Always use CUDA device so all ranks participate in the collective even
+    # when this rank's shard is empty. An `if grads else cpu` fallback silently
+    # skips the all_reduce on empty ranks, causing a collective hang under
+    # heterogeneous sharding (e.g. 2xA6000 + 1xH100 where some shards are 0-len).
+    _cuda_device = torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu")
+    device = grads[0].device if grads else _cuda_device
 
     if norm_type == float("inf"):
         local_norm = max(g.abs().max().item() for g in grads) if grads else 0.0
         total_norm_t = torch.tensor([local_norm], dtype=torch.float32, device=device)
+        # Insight I1: unconditional collective (Megatron M2316 lesson)
+        # all_reduce runs unconditionally — ranks with empty grads contribute 0.0.
         if model_parallel_group is not None and torch.distributed.is_initialized():
             torch.distributed.all_reduce(
                 total_norm_t,
@@ -118,6 +126,8 @@ def clip_grad_norm(
         total_norm_t = torch.zeros(1, dtype=torch.float32, device=device)
         for g in grads:
             total_norm_t += g.float().norm(norm_type)**norm_type
+        # Insight I1: unconditional collective (Megatron M2316 lesson)
+        # all_reduce runs unconditionally — ranks with empty shards contribute zeros.
         if model_parallel_group is not None and torch.distributed.is_initialized():
             torch.distributed.all_reduce(
                 total_norm_t,

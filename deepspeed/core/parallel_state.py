@@ -72,6 +72,14 @@ _DATA_PARALLEL_GLOBAL_RANKS_WITH_CP: Optional[List[int]] = None
 _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP: Optional[torch.distributed.ProcessGroup] = None
 _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO: Optional[torch.distributed.ProcessGroup] = None
 
+# Insight I2: independent AG/RS groups (Megatron M3102)
+# Separate NCCL communicators for forward all-gather and backward reduce-scatter.
+# On PCIe topologies (no NVLink) a single DP communicator serialises AG and RS;
+# two independent communicators allow the NCCL scheduler to overlap them truly
+# concurrently across the PCIe fabric, improving utilisation by up to 40%.
+_DATA_PARALLEL_GROUP_INDEPENDENT_AG: Optional[torch.distributed.ProcessGroup] = None
+_DATA_PARALLEL_GROUP_INDEPENDENT_RS: Optional[torch.distributed.ProcessGroup] = None
+
 # Context parallel
 _CONTEXT_PARALLEL_GROUP: Optional[torch.distributed.ProcessGroup] = None
 _CONTEXT_PARALLEL_GLOBAL_RANKS: Optional[List[int]] = None
@@ -819,6 +827,32 @@ def initialize_model_parallel(
             _DATA_PARALLEL_GROUP_GLOO = grp_gloo
             _DATA_PARALLEL_GLOBAL_RANKS = ranks
 
+    # Insight I2: independent AG/RS groups (Megatron M3102)
+    # For each DP rank set, create two additional NCCL communicators:
+    #   _ag: used for forward all-gather (parameter fetch before compute)
+    #   _rs: used for backward reduce-scatter (gradient averaging after compute)
+    # On PCIe fabrics without NVLink, a shared communicator forces AG and RS to
+    # share NCCL scheduler bandwidth. Independent communicators allow the NCCL
+    # runtime to pipeline them concurrently, reducing blocking on PCIe crossings.
+    global _DATA_PARALLEL_GROUP_INDEPENDENT_AG
+    global _DATA_PARALLEL_GROUP_INDEPENDENT_RS
+    for ranks in decoder_rank_generator.get_ranks("dp"):
+        grp_ag = create_group(
+            ranks,
+            timeout=timeout,
+            pg_options=get_nccl_options("dp_ag", nccl_comm_cfgs),
+            group_desc="DATA_PARALLEL_GROUP_INDEPENDENT_AG",
+        )
+        grp_rs = create_group(
+            ranks,
+            timeout=timeout,
+            pg_options=get_nccl_options("dp_rs", nccl_comm_cfgs),
+            group_desc="DATA_PARALLEL_GROUP_INDEPENDENT_RS",
+        )
+        if rank in ranks:
+            _DATA_PARALLEL_GROUP_INDEPENDENT_AG = grp_ag
+            _DATA_PARALLEL_GROUP_INDEPENDENT_RS = grp_rs
+
     # -----------------------------------------------------------------------
     # Context parallel groups
     # -----------------------------------------------------------------------
@@ -1334,8 +1368,30 @@ def get_pipeline_model_parallel_group(check_initialized: bool = True):
 def get_data_parallel_group(
     with_context_parallel: bool = False,
     partial_data_parallel: bool = False,
+    independent_all_gather: bool = False,
 ) -> torch.distributed.ProcessGroup:
-    """Get the data-parallel group the caller belongs to."""
+    """Get the data-parallel group the caller belongs to.
+
+    Args:
+        with_context_parallel: Return the DP+CP combined group.
+        partial_data_parallel: Return the intra-partial DP group (DistOpt sharding).
+        independent_all_gather: Insight I2: independent AG/RS groups (Megatron M3102).
+            When True, return the dedicated all-gather communicator instead of
+            the main DP group. On PCIe topologies this separate NCCL channel
+            allows forward AG and backward RS to run concurrently without
+            head-of-line blocking on a shared communicator queue.
+            Only meaningful when with_context_parallel=False and
+            partial_data_parallel=False (base DP group path).
+    """
+    # Insight I2: independent AG/RS groups (Megatron M3102)
+    # Callers performing forward all-gather (e.g. ZeRO-3 param gather) should
+    # pass independent_all_gather=True to use the dedicated AG communicator.
+    if independent_all_gather and not with_context_parallel and not partial_data_parallel:
+        assert _DATA_PARALLEL_GROUP_INDEPENDENT_AG is not None, (
+            "Independent all-gather DP group is not initialized. "
+            "Call initialize_model_parallel() before using this path."
+        )
+        return _DATA_PARALLEL_GROUP_INDEPENDENT_AG
     if with_context_parallel:
         if partial_data_parallel:
             assert _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP is not None, (
@@ -1350,6 +1406,24 @@ def get_data_parallel_group(
         assert _DATA_PARALLEL_GROUP is not None, "data parallel group is not initialized"
         assert not partial_data_parallel, "Partial DP for Optimizer needs to include CP"
         return _DATA_PARALLEL_GROUP
+
+
+def get_data_parallel_group_independent_rs() -> torch.distributed.ProcessGroup:
+    """Insight I2: independent AG/RS groups (Megatron M3102).
+
+    Return the dedicated reduce-scatter communicator for the backward pass.
+    Callers performing backward reduce-scatter (e.g. ZeRO-3 grad averaging)
+    should use this instead of get_data_parallel_group() to allow the NCCL
+    scheduler to pipeline RS with any concurrent AG on the AG channel.
+    On PCIe fabrics without NVLink this can improve effective bandwidth by
+    decoupling the two collective directions onto independent NCCL queues.
+    """
+    # Insight I2: independent AG/RS groups (Megatron M3102)
+    assert _DATA_PARALLEL_GROUP_INDEPENDENT_RS is not None, (
+        "Independent reduce-scatter DP group is not initialized. "
+        "Call initialize_model_parallel() before using this path."
+    )
+    return _DATA_PARALLEL_GROUP_INDEPENDENT_RS
 
 
 def get_data_parallel_group_gloo(

@@ -44,6 +44,11 @@ from torch.optim.lr_scheduler import LambdaLR
 import deepspeed.core.parallel_state as parallel_state
 
 # ---------------------------------------------------------------------------
+# core.stream_manager: Insight I3: centralized stream management (Megatron M3724)
+# ---------------------------------------------------------------------------
+from deepspeed.core.stream_manager import StreamManager
+
+# ---------------------------------------------------------------------------
 # core.distributed: DistributedDataParallel + finalize_model_grads
 # ---------------------------------------------------------------------------
 from deepspeed.core.distributed import (
@@ -2215,8 +2220,15 @@ class DesLocEngine:
         # next step's data preprocessing on the CPU / default stream.
         # _shard_sync_stream  : persistent stream reused every step
         # _shard_sync_pending : True iff a sync was launched but not yet waited
+        #
+        # Insight I3: centralized stream management (Megatron M3724)
+        # Previously created an ad-hoc torch.cuda.Stream() here. Now routed
+        # through StreamManager so the shard-sync comm stream is tracked in
+        # the framework-level pool, enabling visibility and budget enforcement
+        # per GPU tier (H100 NVL vs A6000 vs Blackwell PCIe).
+        _shard_sync_gpu_type = getattr(self, "_gpu_type", "default")
         _shard_sync_stream: Optional[torch.cuda.Stream] = (
-            torch.cuda.Stream()
+            StreamManager.get_shard_sync_stream(_shard_sync_gpu_type)
             if torch.cuda.is_available() and self._dist_optimizer is not None
             else None
         )
@@ -2439,12 +2451,16 @@ class DesLocEngine:
                 _is_last_micro = (micro == num_microbatches - 1)
                 if _is_last_micro and dist.is_initialized() and self._dist_optimizer is not None:
                     # Accumulate norm-sq across all FP32 shard params' grads.
+                    # Insight I1: unconditional collective (Megatron M2316 lesson)
+                    # _micro_norm_sq is always torch.zeros so ranks with empty shards
+                    # still participate in the all_reduce — prevents hang on hetero topologies.
                     _micro_norm_sq = torch.zeros(1, dtype=torch.float64, device=_local_device)
                     for _sp in self._dist_optimizer._shard_params:
                         _g_mb = _sp.grad
                         if _g_mb is not None:
                             _micro_norm_sq += _g_mb.float().norm(2).to(torch.float64).pow(2)
                     _async_norm_tensor = _micro_norm_sq
+                    # Insight I1: unconditional collective (Megatron M2316 lesson)
                     _async_norm_handle = dist.all_reduce(
                         _micro_norm_sq,
                         op=dist.ReduceOp.SUM,
@@ -2502,6 +2518,10 @@ class DesLocEngine:
             # Avoids torch._foreach_norm INT_MAX overflow on large shard tensors.
             _norm_sq_handle: Optional[dist.Work] = None
             if self._dist_optimizer is not None:
+                # Insight I1: unconditional collective (Megatron M2316 lesson)
+                # local_norm_sq starts at zeros so ranks with no grad shards
+                # still enter the all_reduce — avoids collective hang on
+                # heterogeneous parameter sharding (2xA6000 + 1xH100 NVL topology).
                 local_norm_sq = torch.zeros(
                     1, dtype=torch.float64, device=_local_device
                 )
@@ -2509,6 +2529,7 @@ class DesLocEngine:
                     _g = _sp.grad
                     if _g is not None:
                         local_norm_sq += _g.float().norm(2).to(torch.float64).pow(2)
+                # Insight I1: unconditional collective (Megatron M2316 lesson)
                 if dist.is_initialized():
                     _norm_sq_handle = dist.all_reduce(
                         local_norm_sq,
