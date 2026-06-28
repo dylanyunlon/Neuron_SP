@@ -1467,6 +1467,20 @@ class TransformerConfig(ModelParallelConfig):
             assert not self.moe_shared_expert_overlap, (
                 "Disable moe_shared_expert_overlap when enabling overlap_moe_expert_parallel_comm."
             )
+            # M3573 (45b8eac95): recompute_modules must not include "moe" when A2A overlap is on,
+            # because the MoE recompute path re-runs dispatch which is incompatible with overlap.
+            assert (
+                self.recompute_modules is None or "moe" not in self.recompute_modules
+            ), "disable moe in recompute_modules when enabling overlap_moe_expert_parallel_comm"
+            # M2924 (a56a0b001): with MTP enabled, PP > 1 is required for A2A overlap.
+            assert (
+                self.mtp_num_layers is None or self.mtp_num_layers == 1
+            ), "MTP layernum only supports 1 when enabling overlap_moe_expert_parallel_comm."
+            if self.mtp_num_layers == 1:
+                assert self.pipeline_model_parallel_size > 1, (
+                    "Pipeline model parallel size must be larger than 1 "
+                    "when enabling overlap_moe_expert_parallel_comm with MTP layer."
+                )
 
         if self.delay_wgrad_compute:
             assert self.overlap_moe_expert_parallel_comm, (
@@ -1504,6 +1518,14 @@ class TransformerConfig(ModelParallelConfig):
             assert not self.add_bias_linear
             assert not self.add_qkv_bias
             assert not self.use_kitchen
+            # M3617 (09cce75b1): MXFP8 with inference_optimized requires fp8_param (param AG).
+            if self.fp8 == "mxfp8":
+                if not self.fp8_param:
+                    raise ValueError(
+                        "fp8_param must be enabled when using "
+                        "--transformer-impl='inference_optimized' with --fp8-recipe='mxfp8'. "
+                        "Please set --fp8-param-gather."
+                    )
 
         if self.inference_fuse_tp_communication:
             assert self.transformer_impl == "inference_optimized", (
