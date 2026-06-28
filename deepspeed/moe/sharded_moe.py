@@ -189,13 +189,29 @@ def top1gating(logits: Tensor,
                drop_tokens: bool = True,
                use_rts: bool = True,
                ep_group: Union[torch.distributed.ProcessGroup, None] = None,
-               use_tutel: bool = False) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
-    """Implements Top1Gating on logits."""
+               use_tutel: bool = False,
+               score_function: str = 'softmax') -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+    """Implements Top1Gating on logits.
+
+    Args:
+        score_function: 'softmax' (default) or 'sigmoid'.
+            When 'sigmoid', scores are computed in FP32 regardless of input
+            dtype to avoid BF16 numerical instability in aux_loss computation.
+            # Insight I9: FP32 aux_loss (Megatron M3394)
+    """
     if noisy_gate_policy == 'RSample':
         logits_w_noise = logits + gumbel_rsample(logits.shape, device=logits.device)
     # everything is in fp32 in this function
 
-    gates = F.softmax(logits, dim=1)
+    if score_function == 'sigmoid':
+        # Insight I9: FP32 aux_loss (Megatron M3394)
+        # sigmoid in BF16 loses precision on small logit differences, causing
+        # uniform scores that defeat load balancing — cast to FP32 first.
+        # On A6000 this matters more than H100 due to narrower memory bandwidth
+        # amplifying BF16 rounding in the accumulation path.
+        gates = torch.sigmoid(logits.float())  # FP32
+    else:
+        gates = F.softmax(logits, dim=1)
     capacity = _capacity(gates, torch.tensor(capacity_factor), torch.tensor(min_capacity))
 
     # Create a mask for 1st's expert per token

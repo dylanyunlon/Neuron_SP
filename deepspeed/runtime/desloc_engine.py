@@ -259,6 +259,22 @@ class TrainingConfig:
     wandb_project: Optional[str] = None
     tensorboard_dir: Optional[str] = None
 
+    # Insight I8: default flight_recorder for PCIe (Megatron M3499)
+    # Megatron M3499 introduced flight_recorder_dump_on_timeout to capture NCCL
+    # collective traces when a hang is detected.  In PCIe topologies (our cluster:
+    # 2×A6000 + 1×H100 + 2×Blackwell, no NVLink) hangs are far more frequent than
+    # on NVLink clusters due to longer all-reduce latency and noisier fabric.
+    # We therefore default flight_recorder on here rather than requiring users to
+    # opt in.  Buffer size 65536 > Megatron's default 36864 to capture longer traces
+    # across the slower PCIe all-reduce steps before the timeout fires.
+    flight_recorder_dump_on_timeout: bool = True
+    """Dump NCCL flight-recorder traces when a collective timeout is detected.
+    Defaults True for PCIe topologies where hangs are more likely than on NVLink."""
+
+    flight_recorder_trace_buffer_size: int = 65536
+    """NCCL flight-recorder ring-buffer size (entries). 65536 > Megatron default 36864
+    to capture enough history across slow PCIe all-reduce steps before timeout."""
+
 
 # ---------------------------------------------------------------------------
 # HeteroRegistry: discovers and loads hetero_*.py modules

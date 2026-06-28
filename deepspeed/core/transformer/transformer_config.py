@@ -546,6 +546,25 @@ class TransformerConfig(ModelParallelConfig):
     moe_expert_rank_capacity_factor: Optional[float] = None
     """Capacity factor for each expert rank; None = no token drop."""
 
+    # Insight I7: per-GPU align_size (Megatron M3707)
+    # M3707 revealed that a global align_size=16 caused unnecessary padding on
+    # non-quantized paths and broke non-FP8 dispatch on A6000 (no TE quantization).
+    # In our heterogeneous topology (A6000 / H100 / Blackwell) each GPU type has
+    # different memory-alignment requirements:
+    #   A6000  → 0   (non-quantized; padding is wasteful and triggers TE compat issues)
+    #   H100   → 16  (FP8 quantized dispatch; TE fused_permute_and_pad_with_probs)
+    #   Blackwell → 16 (FP4 quantized dispatch)
+    # Using a per-GPU-type dict instead of a global constant prevents the mismatch
+    # where one GPU type's alignment requirement is silently imposed on the others,
+    # which in DES-LOC produces divergent tensor strides across tiers.
+    moe_align_size: Dict[str, int] = field(default_factory=lambda: {
+        "A6000": 0, "H100": 16, "Blackwell": 16
+    })
+    """Per-GPU-type token alignment size for MoE dispatch/permute.
+    Zero means no padding (non-quantized path); 16 activates TE fused
+    permute+pad kernels required for FP8/FP4 quantized dispatch.
+    Keys: 'A6000', 'H100', 'Blackwell'."""
+
     # Paged stash
     moe_paged_stash: bool = False
     """If True, enable paged stash for all routed-expert activations needed for backward."""
@@ -951,6 +970,23 @@ class TransformerConfig(ModelParallelConfig):
     # ------------------------------------------------------------------
     # DES-LOC: per-layer GPU tier assignment
     # ------------------------------------------------------------------
+
+    # Insight I8: default flight_recorder for PCIe (Megatron M3499)
+    # PCIe clusters (our 2×A6000 + 1×H100 NVL + 2×Blackwell topology) are
+    # significantly more prone to NCCL collective hangs than NVLink clusters:
+    # higher latency, noisier fabric, and asymmetric bandwidth across tiers all
+    # increase the probability of a timeout.  Megatron M3499 added
+    # flight_recorder_dump_on_timeout as an opt-in; we default it ON here because
+    # silent hangs are much harder to debug than verbose dumps.
+    # Buffer size 65536 > Megatron default 36864 to retain enough trace history
+    # over the slower PCIe all-reduce steps that precede a timeout event.
+    flight_recorder_dump_on_timeout: bool = True
+    """Dump NCCL flight-recorder traces on collective timeout (PCIe topology default).
+    Set False on NVLink clusters where hangs are rare and dump overhead matters."""
+
+    flight_recorder_trace_buffer_size: int = 65536
+    """NCCL flight-recorder ring-buffer capacity (entries). Default 65536 exceeds
+    Megatron's 36864 to capture sufficient history across slow PCIe all-reduces."""
 
     desloc_h100_layers: Optional[List[int]] = field(default=None, repr=False)
     """Zero-based global layer indices assigned to H100 GPUs.

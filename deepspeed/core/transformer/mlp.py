@@ -132,6 +132,44 @@ def _quick_gelu(x: torch.Tensor) -> torch.Tensor:
     return x * torch.sigmoid(1.702 * x)
 
 
+# Insight I9: FP32 aux_loss (Megatron M3394)
+# Megatron M3394 found that computing aux_loss sigmoid scores in BF16 causes
+# numerical instability at scale: small logit differences get flushed to zero in
+# BF16 (11-bit mantissa) and the resulting uniform scores defeat load balancing.
+# This is acutely worse in DES-LOC because A6000 (narrower memory bandwidth)
+# accumulates BF16 rounding error faster than H100, so the two tiers would
+# diverge in their routing distributions even for the same logits.
+# Fix: always cast router_logits to FP32 before sigmoid.  The cost is a single
+# upcast per router call — negligible compared to GEMM — but the stability gain
+# is significant, especially in early training when logits are small and noisy.
+def moe_router_sigmoid_fp32(router_logits: torch.Tensor) -> torch.Tensor:
+    """Compute MoE routing sigmoid scores in FP32 for numerical stability.
+
+    Always upcasts to FP32 regardless of input dtype (BF16 / FP16 / FP32).
+    The output is kept in FP32 so that the subsequent aux_loss computation
+    inherits the full-precision scores; callers that need BF16 output for
+    dispatch weight application should cast back explicitly after loss accounting.
+
+    Example::
+
+        # In BF16 forward pass
+        scores = moe_router_sigmoid_fp32(router_logits)  # FP32
+        aux_loss = (scores * token_frac).sum()            # FP32 loss
+        scores_bf16 = scores.to(router_logits.dtype)      # back to BF16 for dispatch
+
+    Args:
+        router_logits: Raw router logits of any dtype, shape [T, E].
+
+    Returns:
+        Sigmoid-normalised routing scores in FP32, shape [T, E].
+    """
+    # Insight I9: FP32 aux_loss (Megatron M3394)
+    # Cast to FP32 before sigmoid to avoid BF16 precision loss in aux_loss.
+    scores = torch.sigmoid(router_logits.float())  # FP32
+    return scores
+
+
+
 def _bias_quick_geglu_impl(
     x: torch.Tensor, bias: Optional[torch.Tensor]
 ) -> torch.Tensor:
