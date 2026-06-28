@@ -375,13 +375,26 @@ class TransformerConfig(ModelParallelConfig):
     """MoE Feed-Forward Network hidden size. Defaults to ffn_hidden_size."""
 
     moe_shared_expert_intermediate_size: Optional[int] = None
-    """Shared expert total FFN hidden size.  None = no shared expert."""
+    """Shared expert total FFN hidden size.  None = no shared expert.
+    It should be equal to 'num_shared_experts * ffn_size_of_each_shared_expert' if
+    there are multiple shared experts.
+    By default, the shared experts execute before the router. However, when
+    moe_shared_expert_overlap or overlap_moe_expert_parallel_comm is set,
+    the shared experts execute after the router, before the routed experts.
+    This makes the gradients from the router and the shared experts added in
+    different orders to the hidden_states, causing minor numerical differences
+    in the hidden_states gradient.
+    # From Megatron M2444: document shared-expert-before-router default execution order."""
 
     moe_shared_expert_gate: bool = False
-    """Enable gate for shared expert."""
+    """Enable gate for shared expert. Only effective when
+    moe_shared_expert_intermediate_size is set."""
 
     moe_shared_expert_overlap: bool = False
-    """Enable overlapping shared expert computations with dispatcher comms."""
+    """Enable overlapping between shared expert computations and dispatcher communications.
+    Without this, the shared experts execute before the router.
+    Only effective when moe_shared_expert_intermediate_size is set.
+    # From Megatron M2444: shared experts run before router by default; overlap changes order."""
 
     moe_router_load_balancing_type: Union[str, List[str]] = "aux_loss"
     """Load balancing strategy for the router (aux_loss / seq_aux_loss /
@@ -455,7 +468,13 @@ class TransformerConfig(ModelParallelConfig):
     """Scaling coefficient for the z-loss."""
 
     moe_input_jitter_eps: Optional[float] = None
-    """Add noise to the input tensor by applying jitter with a specified epsilon."""
+    """Add noise to the input tensor by applying jitter with a specified epsilon.
+    # From Megatron M2378: router jitter Uniform distribution bounds must be created
+    # with dtype=input.dtype to avoid float32/bf16 mismatch when input is bf16.
+    # Correct: torch.distributions.uniform.Uniform(
+    #     torch.tensor(1.0 - eps, dtype=input.dtype, device=input.device),
+    #     torch.tensor(1.0 + eps, dtype=input.dtype, device=input.device),
+    # ) — both bounds must match input dtype, not default float32."""
 
     moe_token_dropping: bool = False
     """Selectively drop and pad tokens for each expert (unsupported, must be False)."""

@@ -61,6 +61,15 @@ class OptimizerConfig:
     # Regularisation
     weight_decay: float = 0.01
 
+    # From Megatron M2356: Add setting to support using either Adam or AdamW.
+    # If True (default), weight decay is decoupled from the gradient update (AdamW behavior).
+    # If False, original Adam update rule is used (weight decay applied via L2 gradient).
+    # When using PyTorch Adam: True → torch.optim.AdamW, False → torch.optim.Adam.
+    # When using TE/Apex Adam: passed as adam_w_mode kwarg.
+    decoupled_weight_decay: bool = True
+    """If True, decouple weight decay from the gradient update (AdamW). If False,
+    use original Adam update rule. Defaults to True (AdamW behavior)."""
+
     # Precision
     params_dtype: torch.dtype = torch.float32
     fp16: bool = False
