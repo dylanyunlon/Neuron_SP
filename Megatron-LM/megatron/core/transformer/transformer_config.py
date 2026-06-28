@@ -2640,6 +2640,90 @@ class TransformerConfig(ModelParallelConfig):
                 f"got {self.desloc_default_tier!r}."
             )
 
+    # Insight I11: single layer offset source (Megatron M3116)
+    # Root cause: TransformerConfig and MambaStack each computed the pipeline layer
+    # offset independently, leading to disagreements between PP ranks on which layers
+    # they own (M3150/M3295 bug class).  The fix is a single canonical method on
+    # TransformerConfig so every consumer (schedules.py, transformer_layer, checkpointing)
+    # reads the offset from one authoritative place instead of re-deriving it.
+    def get_transformer_layer_offset(
+        self,
+        pipeline_model_parallel_rank: Optional[int] = None,
+        virtual_pipeline_model_parallel_rank: Optional[int] = None,
+    ) -> int:
+        """Return the global layer index of the first layer on the given PP rank.
+
+        This is the **single source of truth** for pipeline layer offsets.
+        All subsystems (schedules, model construction, checkpointing) MUST call
+        this method instead of computing ``pp_rank * layers_per_rank`` locally.
+
+        Args:
+            pipeline_model_parallel_rank: PP rank to query.  When None the
+                current rank's PP rank is used (requires parallel state to be
+                initialised).
+            virtual_pipeline_model_parallel_rank: VPP chunk index.  When None
+                the current rank's VPP rank is used (or 0 if VPP is disabled).
+
+        Returns:
+            int: zero-based global layer index of the first transformer layer
+                assigned to the requested PP (and VPP) rank.
+        """
+        # Resolve defaults from parallel state when not explicitly provided.
+        if pipeline_model_parallel_rank is None:
+            try:
+                from megatron.core import parallel_state  # noqa: PLC0415
+                pipeline_model_parallel_rank = (
+                    parallel_state.get_pipeline_model_parallel_rank()
+                )
+            except Exception:
+                pipeline_model_parallel_rank = 0
+
+        if virtual_pipeline_model_parallel_rank is None:
+            try:
+                from megatron.core import parallel_state  # noqa: PLC0415
+                virtual_pipeline_model_parallel_rank = (
+                    parallel_state.get_virtual_pipeline_model_parallel_rank() or 0
+                )
+            except Exception:
+                virtual_pipeline_model_parallel_rank = 0
+
+        pp_size = max(self.pipeline_model_parallel_size, 1)
+        vpp_size = self.virtual_pipeline_model_parallel_size or 1
+        num_layers = self.num_layers
+
+        if self.pipeline_model_parallel_layout is not None:
+            # Layout object knows the per-rank assignment explicitly.
+            # Use it to compute the cumulative offset up to this rank/chunk.
+            layout = self.pipeline_model_parallel_layout
+            chunk_idx = (
+                pipeline_model_parallel_rank
+                + virtual_pipeline_model_parallel_rank * pp_size
+            )
+            try:
+                # Sum layers of all earlier chunks.
+                offset = sum(
+                    layout.get_num_layers_for_virtual_rank(r, c)
+                    for c in range(virtual_pipeline_model_parallel_rank)
+                    for r in range(pp_size)
+                ) + sum(
+                    layout.get_num_layers_for_virtual_rank(pipeline_model_parallel_rank, c2)
+                    for c2 in range(virtual_pipeline_model_parallel_rank)
+                )
+            except Exception:
+                # Fallback to uniform distribution if layout query fails.
+                layers_per_chunk = num_layers // (pp_size * vpp_size)
+                offset = chunk_idx * layers_per_chunk
+            return offset
+
+        # Uniform distribution (the common case).
+        layers_per_pp_rank = num_layers // pp_size
+        layers_per_chunk = layers_per_pp_rank // vpp_size
+        offset = (
+            virtual_pipeline_model_parallel_rank * pp_size * layers_per_chunk
+            + pipeline_model_parallel_rank * layers_per_chunk
+        )
+        return offset
+
 
 @dataclass
 class MLATransformerConfig(TransformerConfig):

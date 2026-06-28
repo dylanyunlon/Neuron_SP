@@ -31,6 +31,38 @@ if TYPE_CHECKING:
     from megatron.core.dist_checkpointing.serialization import CkptShardedMetadata
 
 
+# Insight I10: checkpoint TP validation (Megatron af-last)
+# Motivated by M3669: TP sharding attributes missing when perform_initialization=False.
+# In heterogeneous clusters (A6000/H100/Blackwell) checkpoint conversion silently
+# mishandles params that lack tensor_model_parallel metadata, producing wrong shards.
+# Solution: assert every param carries the attribute before save begins.
+def validate_tp_metadata(model: "torch.nn.Module") -> None:
+    """Validate that every model parameter carries tensor_model_parallel metadata.
+
+    This guard must be called at checkpoint-save time, not at load time.
+    Silent missing-attribute bugs only manifest during checkpoint resharding
+    between heterogeneous GPU tiers (e.g. A6000 → H100), where the shard
+    size differs and the wrong default assumption is used.
+
+    Args:
+        model: The nn.Module whose parameters will be checkpointed.
+
+    Raises:
+        AssertionError: if any parameter is missing the ``tensor_model_parallel``
+            attribute, listing the first offending parameter name.
+    """
+    missing = []
+    for name, param in model.named_parameters():
+        if not hasattr(param, 'tensor_model_parallel'):
+            missing.append(name)
+    assert not missing, (
+        f"[I10] checkpoint TP validation failed: {len(missing)} parameter(s) are missing "
+        f"the 'tensor_model_parallel' attribute. First offender: '{missing[0]}'. "
+        "Ensure initialize_model_parallel() has run and that no parameter was created "
+        "via a code path that skips TP metadata assignment (e.g. perform_initialization=False)."
+    )
+
+
 logger = logging.getLogger(__name__)
 # pylint: disable=line-too-long
 # list of local saved/loaded ShardedBase objects

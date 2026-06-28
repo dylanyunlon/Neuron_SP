@@ -1,5 +1,14 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+# Insight I11: single layer offset source (Megatron M3116)
+# POLICY: This module MUST NOT compute pipeline layer offsets locally.
+# All layer-offset arithmetic (e.g. pp_rank * layers_per_rank) belongs
+# exclusively in TransformerConfig.get_transformer_layer_offset().
+# Rationale: M3150 / M3295 showed that independent per-module offset
+# computations diverge under uneven PP splits and Mamba hybrid layouts.
+# Violation of this policy will re-introduce the same class of silent
+# correctness bug in heterogeneous DES-LOC clusters.
+
 import contextlib
 from functools import partial
 from typing import Callable, Dict, Iterator, List, Optional, Union

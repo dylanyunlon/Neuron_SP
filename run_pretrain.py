@@ -508,6 +508,129 @@ def _gpu_mem_str(device: torch.device) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Insight I12: heterogeneous eval batch (Megatron M3731)
+# Rationale (from MEGATRON_INSIGHTS Sweep-af §3.3):
+#   - M3731 decoupled eval_global_batch_size from train_global_batch_size.
+#   - In DES-LOC heterogeneous clusters the eval micro_batch_size should
+#     track GPU compute tier: H100 NVL can process more eval samples per step,
+#     A6000 fewer (memory-bandwidth constrained on PCIe).
+#   - Keeping train and eval batch sizes coupled wastes H100 capacity during
+#     eval and risks OOM on A6000 if the training batch is sized for H100.
+#
+# GPU tiers are classified by compute capability (SM version):
+#   SM 9.0+ → "H100-class"  (H100, H200) — large eval batch
+#   SM 8.0–8.9 → "A-class"  (A100, A6000, etc.) — medium eval batch
+#   SM 12.0+   → "Blackwell" — large eval batch (like H100-class)
+#   Below SM 8.0 → conservative eval batch
+# ---------------------------------------------------------------------------
+
+def get_eval_micro_batch_size(
+    train_micro_batch_size: int,
+    device: "torch.device",
+) -> int:
+    """Compute an eval micro-batch size scaled to the current GPU's compute tier.
+
+    H100-class and Blackwell GPUs receive 2× the training batch during eval
+    (they have spare capacity since eval has no backward pass).  A6000-class
+    GPUs receive the training batch unchanged (PCIe bandwidth-limited).
+    Older GPUs receive a conservative half-batch to avoid OOM.
+
+    Args:
+        train_micro_batch_size: The micro-batch size used during training.
+        device: The CUDA device for the current rank.
+
+    Returns:
+        int: The recommended eval micro-batch size (always ≥ 1).
+    """
+    if device.type != "cuda":
+        return train_micro_batch_size
+
+    try:
+        props = torch.cuda.get_device_properties(device)
+        sm_major = props.major
+        gpu_name = props.name.lower()
+    except Exception:
+        return train_micro_batch_size
+
+    # Blackwell (SM 12+) or H100-class (SM 9.x) → can handle larger eval batches
+    # because no activation memory is needed without a backward pass.
+    if sm_major >= 9:
+        # H100 NVL / H200 / Blackwell — high-bandwidth, large VRAM
+        scale = 2
+    elif sm_major == 8:
+        # A100, A6000, A40 — PCIe or NVLink depending on config
+        # A6000 is PCIe only (48 GB), keep eval batch == train batch
+        if "a6000" in gpu_name or "a40" in gpu_name:
+            scale = 1
+        else:
+            # A100 (80 GB, typically NVLink in datacenter) — modest bump
+            scale = 2
+    else:
+        # Older Ampere / Volta / Turing — be conservative
+        scale = 1
+
+    eval_bs = max(1, train_micro_batch_size * scale)
+    logger.debug(
+        "I12 eval_micro_batch_size: gpu=%s sm=%d.%d  train_bs=%d → eval_bs=%d (scale=%d×)",
+        props.name, props.major, props.minor, train_micro_batch_size, eval_bs, scale,
+    )
+    return eval_bs
+
+
+def build_eval_data_iter(
+    train_data_iter: "Iterator",
+    train_micro_batch_size: int,
+    device: "torch.device",
+    vocab_size: int,
+    seq_len: int,
+) -> "Iterator":
+    """Wrap a training data iterator to yield heterogeneous eval batches.
+
+    When the eval micro-batch size exceeds the training micro-batch size the
+    iterator accumulates multiple training batches and concatenates them along
+    the batch dimension.  When the eval batch is smaller (conservative GPUs)
+    it yields a slice of the accumulated buffer.
+
+    Args:
+        train_data_iter: Existing data iterator that yields ``(tokens, labels)``
+            pairs of shape ``[train_bs, seq_len]``.
+        train_micro_batch_size: Batch size used by the training iterator.
+        device: CUDA device for the current rank.
+        vocab_size: Vocabulary size (used only when falling back to synthetic).
+        seq_len: Sequence length.
+
+    Yields:
+        Tuple[torch.Tensor, torch.Tensor]: ``(tokens, labels)`` tensors of
+            shape ``[eval_bs, seq_len]``.
+    """
+    eval_bs = get_eval_micro_batch_size(train_micro_batch_size, device)
+
+    if eval_bs == train_micro_batch_size:
+        # No change needed — pass through directly.
+        yield from train_data_iter
+        return
+
+    # Accumulate until we have eval_bs samples, then yield the batch.
+    buffer_tokens: Optional[torch.Tensor] = None
+    buffer_labels: Optional[torch.Tensor] = None
+
+    for batch in train_data_iter:
+        if isinstance(batch, dict):
+            tokens = batch["tokens"]
+            labels = batch["labels"]
+        else:
+            tokens, labels = batch
+
+        buffer_tokens = tokens if buffer_tokens is None else torch.cat([buffer_tokens, tokens], dim=0)
+        buffer_labels = labels if buffer_labels is None else torch.cat([buffer_labels, labels], dim=0)
+
+        while buffer_tokens.shape[0] >= eval_bs:
+            yield buffer_tokens[:eval_bs], buffer_labels[:eval_bs]
+            buffer_tokens = buffer_tokens[eval_bs:]
+            buffer_labels = buffer_labels[eval_bs:]
+
+
+# ---------------------------------------------------------------------------
 # Distributed helpers
 # ---------------------------------------------------------------------------
 
@@ -937,6 +1060,20 @@ def run_desloc(args: argparse.Namespace) -> None:
     # Compute world size from torchrun env; fallback to 1 for single-GPU
     _world = int(os.environ.get("WORLD_SIZE", 1))
     _grad_accum = getattr(args, "grad_accum_steps", 8)
+
+    # Insight I12: heterogeneous eval batch (Megatron M3731)
+    # Derive eval_micro_batch_size from the GPU tier of this rank so that
+    # H100 ranks process more eval samples (spare capacity; no backward pass)
+    # while A6000 ranks keep the same batch (PCIe / memory-bandwidth limited).
+    # eval_micro_batch_size and micro_batch_size are kept separate so the
+    # training loop does not silently inherit the wrong size for either phase.
+    _eval_micro_batch_size = get_eval_micro_batch_size(args.batch_size, device)
+    if _eval_micro_batch_size != args.batch_size:
+        logger.info(
+            "I12 heterogeneous eval: train_bs=%d → eval_bs=%d on %s",
+            args.batch_size, _eval_micro_batch_size,
+            torch.cuda.get_device_name(device) if torch.cuda.is_available() else "cpu",
+        )
 
     tc = TrainingConfig(
         vocab_size      = cfg["vocab_size"],
