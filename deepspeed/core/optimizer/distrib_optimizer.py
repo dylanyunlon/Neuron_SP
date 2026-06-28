@@ -40,7 +40,7 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 
@@ -62,6 +62,7 @@ def clip_grad_norm(
     max_norm: float,
     norm_type: float = 2.0,
     model_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+    use_decoupled_grad: bool = False,
 ) -> float:
     """Clip gradient norm across model-parallel ranks.
 
@@ -70,9 +71,15 @@ def clip_grad_norm(
         max_norm:             Maximum gradient norm after clipping.
         norm_type:            Lp norm type (default L2).
         model_parallel_group: Process group over which to reduce the norm.
+        use_decoupled_grad:   When True, read from ``param.decoupled_grad``
+                              instead of ``param.grad``.  Required for
+                              Megatron-FSDP params whose DTensor gradient is
+                              stored on a separate attribute.
 
     Returns:
         Total gradient norm *before* clipping.
+
+    # From Megatron M4145: fix zero-counter not working with decoupled grads.
     """
     if isinstance(parameters, torch.Tensor):
         parameters = [parameters]
@@ -81,9 +88,16 @@ def clip_grad_norm(
     for p in parameters:
         if not isinstance(p, torch.Tensor):
             continue
+        # M4145: choose grad attribute based on use_decoupled_grad flag.
+        grad_attr = "decoupled_grad" if use_decoupled_grad else "grad"
         grad = getattr(p, "main_grad", None)
         if grad is None:
-            grad = p.grad
+            grad = getattr(p, grad_attr, None)
+        # M4145: for FSDP params, the gradient is a sharded DTensor;
+        # use the local shard for norm computation.
+        if grad is not None and getattr(p, "__fsdp_param__", False):
+            if hasattr(grad, '_local_tensor'):
+                grad = grad._local_tensor
         if grad is not None:
             grads.append(grad.detach())
 
@@ -118,6 +132,65 @@ def clip_grad_norm(
             g.mul_(clip_coeff)
 
     return total_norm
+
+
+# ---------------------------------------------------------------------------
+# Separate grad-norm groups (From Megatron M4171: Clip mtp grads separately)
+# ---------------------------------------------------------------------------
+# Parameters tagged with `grad_norm_group='mtp'` are excluded from the main
+# gradient norm and clipped independently using their own group norm.  This
+# prevents MTP auxiliary heads from distorting the primary model's grad-norm
+# estimate when mtp_detach_heads=True decouples their gradients.
+
+MTP_GRAD_NORM_GROUP: str = 'mtp'
+GRAD_NORM_GROUP_ATTR: str = 'grad_norm_group'
+SEPARATE_GRAD_NORM_GROUPS: Tuple[str, ...] = (MTP_GRAD_NORM_GROUP,)
+
+
+def _get_param_grad_norm_group(param: torch.nn.Parameter) -> Optional[str]:
+    """Return the separate gradient-norm group for *param*, if any.
+
+    # From Megatron M4171: tag params via param.grad_norm_group = 'mtp'
+    """
+    return getattr(param, GRAD_NORM_GROUP_ATTR, None)
+
+
+def _validate_grad_norm_group(grad_norm_group: str) -> None:
+    """Raise ValueError if *grad_norm_group* is not a registered group.
+
+    # From Megatron M4171: guards against typos in group names.
+    """
+    if grad_norm_group not in SEPARATE_GRAD_NORM_GROUPS:
+        raise ValueError(
+            f"Unknown grad_norm_group '{grad_norm_group}'. "
+            "Register it in SEPARATE_GRAD_NORM_GROUPS before tagging parameters."
+        )
+
+
+def _is_separate_grad_norm_group(grad_norm_group: Optional[str]) -> bool:
+    """Return whether *grad_norm_group* denotes a separately-clipped group.
+
+    # From Megatron M4171: None → False (belongs to main norm).
+    """
+    if grad_norm_group is None:
+        return False
+    _validate_grad_norm_group(grad_norm_group)
+    return True
+
+
+def copy_optimizer_param_metadata(destination: torch.Tensor, source: torch.Tensor) -> None:
+    """Copy optimizer-relevant metadata when creating param views or copies.
+
+    Megatron's DistributedOptimizer creates shard views / FP32 copies of model
+    parameters; without this helper the ``shared`` flag and grad-norm group tag
+    would be silently lost, causing double-counted gradients or wrong clipping.
+
+    # From Megatron M4171: copy both .shared and .grad_norm_group attributes.
+    """
+    if hasattr(source, 'shared'):
+        destination.shared = source.shared  # type: ignore[assignment]
+    if hasattr(source, GRAD_NORM_GROUP_ATTR):
+        setattr(destination, GRAD_NORM_GROUP_ATTR, getattr(source, GRAD_NORM_GROUP_ATTR))
 
 
 # ---------------------------------------------------------------------------
@@ -208,6 +281,94 @@ class MegatronOptimizer(ABC):
             model_parallel_group=None,
         )
 
+    def _filter_grads_for_norm(
+        self,
+        params: List[torch.nn.Parameter],
+        param_filter: Optional[Callable[[torch.nn.Parameter], bool]] = None,
+    ) -> List[torch.Tensor]:
+        """Filter parameter gradients for norm computation.
+
+        Filters parameters based on:
+          - *param_filter* predicate when provided.
+          - grad must not be None.
+          - parameter must not be shared (avoids double-counting).
+          - must not be a TP replica.
+
+        # From Megatron M4171: extracted so get_grads_for_grad_norm can reuse it.
+        """
+        grads: List[torch.Tensor] = []
+        for param in params:
+            if param_filter is not None and not param_filter(param):
+                continue
+            grad = getattr(param, 'main_grad', param.grad)
+            if grad is None:
+                continue
+            if getattr(param, 'shared', False):
+                continue
+            # Skip TP replicas (sequence_parallel / tensor_model_parallel attr)
+            if getattr(param, 'tensor_model_parallel', False) and not getattr(
+                param, 'sequence_parallel', False
+            ):
+                continue
+            grads.append(grad.detach())
+        return grads
+
+    def get_grads_for_grad_norm(
+        self, grad_norm_group: Optional[str] = None
+    ) -> List[torch.Tensor]:
+        """Return gradients to use for norm computation.
+
+        When *grad_norm_group* is ``None``, returns gradients for the main
+        norm, **excluding** parameters that belong to a registered separate
+        grad-norm group (e.g. MTP heads).
+
+        When *grad_norm_group* is given, returns only gradients from that group.
+
+        # From Megatron M4171: enables independent grad-norm + clipping for MTP.
+        """
+        if grad_norm_group is not None:
+            _validate_grad_norm_group(grad_norm_group)
+            param_filter: Callable[[torch.nn.Parameter], bool] = (
+                lambda p: _get_param_grad_norm_group(p) == grad_norm_group
+            )
+        else:
+            param_filter = lambda p: not _is_separate_grad_norm_group(
+                _get_param_grad_norm_group(p)
+            )
+        return self._filter_grads_for_norm(self.get_parameters(), param_filter=param_filter)
+
+    # Legacy alias kept for backwards compat (callers that used the old name).
+    def get_main_grads_for_grad_norm(self) -> List[torch.Tensor]:
+        """Deprecated alias — use get_grads_for_grad_norm() instead."""
+        return self.get_grads_for_grad_norm()
+
+    def has_grad_norm_group(self, grad_norm_group: str) -> bool:
+        """Whether any rank globally owns params for *grad_norm_group*.
+
+        Performs a one-time global all-reduce and caches the result.  Gating
+        the per-step group-norm collectives on a *globally consistent* flag
+        keeps reductions balanced across ranks that may locally own no shard.
+
+        # From Megatron M4171: avoids collective mismatch for MTP detach heads.
+        """
+        _validate_grad_norm_group(grad_norm_group)
+        if getattr(self, '_has_grad_norm_group_cache', None) is None:
+            self._has_grad_norm_group_cache: Dict[str, bool] = {}
+        cache = self._has_grad_norm_group_cache
+        if grad_norm_group not in cache:
+            local = any(
+                _get_param_grad_norm_group(p) == grad_norm_group
+                for p in self.get_parameters()
+                if _is_separate_grad_norm_group(_get_param_grad_norm_group(p))
+            )
+            flag = torch.tensor([1 if local else 0], dtype=torch.int, device='cuda')
+            if torch.distributed.is_initialized():
+                torch.distributed.all_reduce(
+                    flag, op=torch.distributed.ReduceOp.MAX, group=None
+                )
+            cache[grad_norm_group] = bool(flag.item() > 0)
+        return cache[grad_norm_group]
+
     def get_loss_scale(self) -> torch.Tensor:
         """Current loss scale (1.0 for BF16, dynamic for FP16)."""
         return self._scale_one
@@ -286,6 +447,9 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
                     master.requires_grad_(True)
                     param_group["params"][i] = master
                     param.main_param = master
+                    # M4171: propagate .shared and .grad_norm_group so that
+                    # MTP heads can be clipped independently of the main norm.
+                    copy_optimizer_param_metadata(master, param)  # type: ignore[arg-type]
                     fp32_master_grp.append(master)
                     if param in self.optimizer.state:
                         self.optimizer.state[master] = self.optimizer.state.pop(param)
@@ -653,9 +817,21 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             self._fp32_grad_shards.append(fp32_grad_shard)
 
         # Rewire the inner optimizer's param_groups to point at FP32 shards.
-        shard_params: List[torch.nn.Parameter] = [
-            torch.nn.Parameter(shard, requires_grad=True) for shard in self._fp32_shards
-        ]
+        # M4171: copy_optimizer_param_metadata propagates .shared and
+        # .grad_norm_group from the model params that overlap each shard so
+        # that independent MTP grad clipping works correctly on the shard view.
+        shard_params: List[torch.nn.Parameter] = []
+        for buf_idx, (fp32_shard, buf, boundaries) in enumerate(
+            zip(self._fp32_shards, self.param_and_grad_buffers, self._buf_boundaries)
+        ):
+            sp = torch.nn.Parameter(fp32_shard, requires_grad=True)
+            shard_start, shard_end = boundaries[dp_rank]
+            # Propagate metadata from the first model param that overlaps.
+            for param, (ps, pe, _) in buf.param_index_map.items():
+                if max(ps, shard_start) < min(pe, shard_end):
+                    copy_optimizer_param_metadata(sp, param)  # type: ignore[arg-type]
+                    break
+            shard_params.append(sp)
         self.optimizer.param_groups = [{
             "params": shard_params,
             "lr": self.config.lr or 1e-4,

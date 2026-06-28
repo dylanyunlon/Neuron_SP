@@ -36,6 +36,13 @@ from deepspeed.core.optimizer.distrib_optimizer import (
     # Shard sizing helper (useful for external callers)
     _compute_hetero_shard_boundaries,
     _round_up,
+    # From Megatron M4171: separate grad-norm groups for MTP detach heads
+    copy_optimizer_param_metadata,
+    MTP_GRAD_NORM_GROUP,
+    GRAD_NORM_GROUP_ATTR,
+    SEPARATE_GRAD_NORM_GROUPS,
+    _get_param_grad_norm_group,
+    _is_separate_grad_norm_group,
 )
 
 __all__ = [
@@ -47,4 +54,11 @@ __all__ = [
     "Range",
     "_compute_hetero_shard_boundaries",
     "_round_up",
+    # From Megatron M4171
+    "copy_optimizer_param_metadata",
+    "MTP_GRAD_NORM_GROUP",
+    "GRAD_NORM_GROUP_ATTR",
+    "SEPARATE_GRAD_NORM_GROUPS",
+    "_get_param_grad_norm_group",
+    "_is_separate_grad_norm_group",
 ]
