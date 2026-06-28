@@ -146,11 +146,26 @@ def validate_sharding_integrity(sharded_tensors: Iterable[ShardedTensor]):
     for rank, rank_shardings in enumerate(all_sharding):
         for sharding in rank_shardings:
             key_shardings[sharding.key].append((rank, sharding))
+    # M3225 fix: collect all errors across all keys and raise once, so the
+    # full set of sharding violations is visible in a single exception rather
+    # than stopping at the first one (upstream: Megatron fc61ce5a6 / #3203).
+    errors = []
     for key, shardings in key_shardings.items():
-        _validate_sharding_for_key(shardings)
+        errors.extend(_validate_sharding_for_key(shardings))
+
+    if errors:
+        errors_str = '\n'.join(str(e) for e in errors)
+        raise CheckpointingException(
+            f'Invalid sharding pattern validation. Errors:\n{errors_str}')
 
 
-def _validate_sharding_for_key(rank_sharding: List[Tuple[int, ShardedTensor]]):
+def _validate_sharding_for_key(rank_sharding: List[Tuple[int, ShardedTensor]]) -> List[CheckpointingException]:
+    """Validate sharding consistency for a single key.
+
+    Returns a list of CheckpointingException instead of raising immediately so
+    the caller can collect errors from all keys before surfacing them.
+    Port of Megatron fix #3203 (reapplied in #3285).
+    """
     global_shape = rank_sharding[0][1].global_shape
     local_shape = rank_sharding[0][1].local_shape
     dtype = rank_sharding[0][1].dtype
@@ -161,6 +176,7 @@ def _validate_sharding_for_key(rank_sharding: List[Tuple[int, ShardedTensor]]):
         assert sharding.local_shape == local_shape, (sharding.local_shape, local_shape)
         assert (sharding.flattened_range is not None) == has_flattened_range, ((sharding.flattened_range is not None), has_flattened_range)
 
+    errors = []
     shard_access_cnt = _compute_shards_access(rank_sharding)
     if has_flattened_range:
         map_reduce(rank_sharding,
@@ -171,8 +187,9 @@ def _validate_sharding_for_key(rank_sharding: List[Tuple[int, ShardedTensor]]):
         if not torch.all(shard_access_cnt == 1):
             logger.error(
                 f'Invalid access pattern for {rank_sharding[0][1]}: {shard_access_cnt}')
-            raise CheckpointingException(
-                f'Invalid access pattern for {rank_sharding[0][1]}')
+            errors.append(CheckpointingException(
+                f'Invalid access pattern for {rank_sharding[0][1]}: {shard_access_cnt}'))
+    return errors
 
 
 def _compute_shards_access(rank_sharding):

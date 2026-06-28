@@ -61,6 +61,7 @@ Author: Neuron_SP dev team (reinterpretation of Megatron 69f3b34)
 
 from __future__ import annotations
 
+import gc
 import logging
 import os
 import threading
@@ -335,9 +336,15 @@ class HeteroAsyncRequest:
         Called by :func:`schedule_hetero_async_save` in a coordinator thread.
         """
         _t0 = time.monotonic()
+        # M3628 fix: hold a strong reference to the preload_fn() result for the
+        # entire duration of the async write.  preload_fn() typically returns
+        # CPU-pinned buffers staging GPU tensors; without this reference the GC
+        # can reclaim them before the background writer finishes, causing SIGBUS.
+        # (upstream: Megatron fc61ce5a6 / #2288 — TemporalAsyncCaller fix)
+        _preloaded_holder = None
         if self.preload_fn is not None:
             logger.debug("[DES-LOC] Running preload_fn for metadata prefetch.")
-            self.preload_fn()
+            _preloaded_holder = self.preload_fn()
 
         logger.info(
             "[DES-LOC/%s] Starting background IO with %d thread(s).",
@@ -376,6 +383,9 @@ class HeteroAsyncRequest:
 
         if self.locality_cache is not None:
             self.locality_cache.flush()
+
+        # M3628 fix: release the pinned buffer reference now that IO is done.
+        _preloaded_holder = None  # noqa: F841
 
         logger.info(
             "[DES-LOC] Checkpoint save complete in %.2fs total.",
@@ -416,16 +426,24 @@ def _stage_state_dict_to_cache(
     for k, v in state_dict.items():
         full_key = f"{prefix}/{k}" if prefix else k
         if isinstance(v, torch.Tensor) and v.is_cuda:
+            # M3609 fix: dequantize quantized CUDA tensors before staging.
+            # PyTorch quantized tensors are not supported by the async writer;
+            # calling dequantize() converts them to a standard float tensor.
+            # (upstream: Megatron a8530db43 / #3845)
+            if hasattr(type(v), 'dequantize'):
+                v = v.dequantize()
             staged[k] = cache.stage(full_key, v)
         elif isinstance(v, dict):
             staged[k] = _stage_state_dict_to_cache(v, cache, prefix=full_key)
         elif isinstance(v, (list, tuple)):
-            staged[k] = type(v)(
-                cache.stage(f"{full_key}[{i}]", item)
-                if isinstance(item, torch.Tensor) and item.is_cuda
-                else item
-                for i, item in enumerate(v)
-            )
+            def _stage_item(i: int, item: Any) -> Any:
+                if isinstance(item, torch.Tensor) and item.is_cuda:
+                    # M3609 fix: dequantize quantized tensors in sequences too.
+                    if hasattr(type(item), 'dequantize'):
+                        item = item.dequantize()
+                    return cache.stage(f"{full_key}[{i}]", item)
+                return item
+            staged[k] = type(v)(_stage_item(i, item) for i, item in enumerate(v))
         else:
             staged[k] = v
     return staged
@@ -682,6 +700,14 @@ class HeteroAsyncCheckpointScheduler:
             return
 
         def _run() -> None:
+            # M2932 fix: set CUDA device to the appropriate local rank so that
+            # any CUDA allocations in the worker (e.g. temporary D2H copies)
+            # land on the correct device rather than defaulting to device 0,
+            # which would burden device 0 with undue memory pressure.
+            # (upstream: Megatron 595097120 — PersistentAsyncCaller fix)
+            if torch.cuda.is_available() and torch.cuda.device_count() > 0:
+                _local_rank = dist.get_rank() % torch.cuda.device_count() if dist.is_initialized() else 0
+                torch.cuda.set_device(_local_rank)
             logger.debug("[DES-LOC/Scheduler] Worker thread started.")
             while True:
                 try:
@@ -718,6 +744,13 @@ class HeteroAsyncCheckpointScheduler:
                         self._error = exc
                 finally:
                     self._queue.task_done()
+                # M3393 fix: explicitly drop the request and trigger GC after
+                # each checkpoint completes.  Without this, the tensor staging
+                # buffers (potentially several GB) remain reachable until the
+                # next GC cycle, causing OOM on the next checkpoint save.
+                # (upstream: Megatron e1a9ac94a / #3591)
+                del request, iteration
+                gc.collect()
 
         self._worker_thread = threading.Thread(
             target=_run, daemon=True, name=f"deslocSched-{self._device_class.name}"
@@ -808,7 +841,12 @@ def _execute_nvrx_request(request: "NVRxAsyncRequest") -> None:
     order as the NVRx executor.
     """
     if hasattr(request, "preload_fn") and request.preload_fn is not None:
-        request.preload_fn()
+        # M3628 fix: retain the preload_fn() result for the lifetime of the
+        # save call so pin_memory buffers are not GC'd before the writer
+        # finishes reading them.  (upstream: Megatron fc61ce5a6 / #2288)
+        _preloaded_holder = request.preload_fn()
+    else:
+        _preloaded_holder = None
 
     # NVRxAsyncRequest stores save args as positional
     save_fn = request.save_fn if hasattr(request, "save_fn") else request.async_fn
@@ -819,6 +857,9 @@ def _execute_nvrx_request(request: "NVRxAsyncRequest") -> None:
 
     for fn in getattr(request, "finalize_fns", []):
         fn()
+
+    # Release the pinned buffer after IO is complete.
+    _preloaded_holder = None  # noqa: F841
 
 
 # ---------------------------------------------------------------------------

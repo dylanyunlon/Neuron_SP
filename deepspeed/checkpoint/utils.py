@@ -53,6 +53,13 @@ def clone_tensors_for_torch_save(item, device=torch.device('cpu')):
     if torch.is_tensor(item):
         if type(device) is str:
             device = torch.device(device)
+        # M3609 fix: dequantize quantized tensors before cloning/moving.
+        # torch.save() and .to(device) do not support PyTorch quantized tensors
+        # (e.g. produced by zero_quantized_weights).  Dequantize first to obtain
+        # a standard float tensor that can be serialized normally.
+        # (upstream: Megatron a8530db43 / #3845 — _clone_or_dequantize_if_needed)
+        if hasattr(type(item), 'dequantize'):
+            item = item.dequantize()
         if device == item.device:
             return item.detach().clone()
         else:
