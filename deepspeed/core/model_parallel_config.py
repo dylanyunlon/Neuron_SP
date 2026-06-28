@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import warnings  # From Megatron M2576: add missing warnings import
 from dataclasses import dataclass, field
 from typing import Callable, List, Literal, Optional
 

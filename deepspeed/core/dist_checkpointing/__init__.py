@@ -13,6 +13,14 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 
+# From Megatron M2620: Add BytesIO to safe_globals so that torch.load
+# with weights_only=True does not fail when BytesIO objects are in the
+# checkpoint. This mirrors megatron.core.safe_globals.SAFE_GLOBALS.
+try:
+    torch.serialization.add_safe_globals([io.BytesIO])
+except Exception:
+    pass  # older PyTorch versions do not have add_safe_globals
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
