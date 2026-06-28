@@ -70,6 +70,23 @@ class ModelParallelConfig:
     # --- Timers ---
     timers: Optional[Callable] = None
 
+    # --- NCCL flight recorder (From Megatron M3499) ---
+    # Set these to enable NCCL flight recorder for debugging hangs/timeouts.
+    # Priority: pre-existing env vars > these fields.
+    flight_recorder_dump_path: Optional[str] = None
+    """Path prefix for NCCL flight recorder dumps. If set, enables flight
+    recorder and sets TORCH_FR_DUMP_TEMP_FILE / TORCH_NCCL_DEBUG_INFO_TEMP_FILE."""
+    flight_recorder_trace_buffer_size: int = 36864
+    """NCCL trace buffer size (TORCH_NCCL_TRACE_BUFFER_SIZE)."""
+    flight_recorder_dump_on_timeout: bool = True
+    """Dump flight recorder on NCCL timeout (TORCH_NCCL_DUMP_ON_TIMEOUT)."""
+    flight_recorder_include_stack_trace: bool = True
+    """Include stack traces in flight recorder (TORCH_INCLUDE_STACK_TRACE)."""
+    flight_recorder_include_only_active: bool = False
+    """Only include active ops in flight recorder (TORCH_INCLUDE_ONLY_ACTIVE)."""
+    flight_recorder_extra_dump_on_exec: bool = False
+    """Extra dump on exec in flight recorder (TORCH_NCCL_EXTRA_DUMP_ON_EXEC)."""
+
     @property
     def desloc_enabled(self) -> bool:
         return self.desloc is not None and self.desloc.enabled

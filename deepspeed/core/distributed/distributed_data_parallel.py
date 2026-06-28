@@ -123,6 +123,24 @@ class DistributedDataParallelConfig:
     pad_buckets_for_high_nccl_busbw: bool = False
     use_megatron_fsdp: bool = False
 
+    # From Megatron M3321: all-gather in start_param_sync for better overlap
+    fsdp_all_gather_in_start_param_sync: bool = True
+    """If True, use all-gather during the initial Megatron-FSDP parameter
+    synchronization step to better overlap first param AG with computation."""
+
+    # From Megatron M3574: MFSDP mixed-precision dtype customization
+    megatron_fsdp_main_params_dtype: Optional[torch.dtype] = torch.float32
+    """Data type for the main weight buffer in Megatron-FSDP distributed
+    optimization. If None, compute weights serve as main weights."""
+
+    megatron_fsdp_main_grads_dtype: Optional[torch.dtype] = None
+    """Data type for the main gradient buffer in Megatron-FSDP. If None,
+    main grads match the model compute parameter dtype."""
+
+    megatron_fsdp_grad_comm_dtype: Optional[torch.dtype] = None
+    """Data type for gradient gather/scatter communication in Megatron-FSDP.
+    If None, uses main_grads_dtype. Setting to BF16 can reduce comm latency."""
+
     # DES-LOC: allow skipping grad sync on non-Kx steps.
     allow_skip_grad_sync: bool = True
 
