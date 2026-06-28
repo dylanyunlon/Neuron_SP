@@ -550,12 +550,19 @@ class Attention(MegatronModule, ABC):
         packed_seq_params=None,
         **extra_kwargs,
     ) -> Tensor:
-        """Run the configured core attention module."""
+        """Run the configured core attention module.
+
+        # From Megatron M3730: extracted as a separate method so that
+        # MLA subclasses can override to pad V when Q/V head dims differ
+        # for THD-format packed sequences (Q head_dim != V head_dim).
+        # The base implementation simply forwards to core_attention.
+        """
         return self.core_attention(
             query,
             key,
             value,
             attention_mask,
+            attn_mask_type=attn_mask_type,
             attention_bias=attention_bias,
             packed_seq_params=packed_seq_params,
             **extra_kwargs,
