@@ -103,7 +103,12 @@ class LanguageModule(MegatronModule, ABC):
         if torch.distributed.is_initialized():
             weight = self.shared_embedding_or_output_weight()
             if weight is not None and (self.pre_process or self.post_process):
-                weight.data = weight.data.cuda()
+                # From Megatron M3220: avoid .cuda() call when model is initialised
+                # on meta device — the tensor doesn't exist on GPU yet at this point,
+                # and calling .cuda() on a meta tensor is a no-op that will silently
+                # produce wrong results after materialisation.
+                if not self.config.init_model_with_meta_device:
+                    weight.data = weight.data.cuda()
                 # Use the default process group — a proper embedding group
                 # would be wired in by the runtime; here we use all-reduce
                 # over the global group which is safe because only the first

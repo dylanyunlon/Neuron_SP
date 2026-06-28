@@ -227,6 +227,39 @@ class Range:
 
 
 # ---------------------------------------------------------------------------
+# LR logging helper
+# ---------------------------------------------------------------------------
+
+
+def get_canonical_lr_for_logging(param_groups: List[Dict]) -> Optional[float]:
+    """Return the lr of the first ``default_config=True`` param group.
+
+    All ``default_config`` groups share the same LR schedule, so the first one
+    is representative. This includes empty rank-alignment stub groups, which
+    the scheduler still writes a valid lr onto.
+
+    Under model parallelism some ranks may have no trainable params (empty
+    default_config groups). We still read lr from them because the scheduler
+    writes the lr value regardless of whether the group holds parameters.
+
+    # From Megatron M3286: fix LR logging under model parallelism — skip empty
+    # param groups check, read lr from default_config groups regardless of
+    # whether they hold parameters (important for TP/PP ranks with no params).
+
+    Args:
+        param_groups: parameter groups from the optimizer.
+
+    Returns:
+        The canonical learning rate, or None if no ``default_config=True``
+        group is found.
+    """
+    for param_group in param_groups:
+        if param_group.get('default_config', False):
+            return param_group.get('lr')
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Abstract base
 # ---------------------------------------------------------------------------
 

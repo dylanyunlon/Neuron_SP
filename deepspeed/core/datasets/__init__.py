@@ -359,6 +359,9 @@ class GPTDataset(Dataset):
             return seq[: self.config.sequence_length + 1]
 
         # mmap path
+        # From Megatron M3247: cast to Python int before use as a slice index
+        # to avoid numpy integer overflow on very large datasets (numpy uint32/int32
+        # arithmetic can silently overflow when multiplied by seq_len > 2^15).
         offset = int(self._offsets[raw_idx])
         chunk = self.config.sequence_length + 1
         end = offset + chunk

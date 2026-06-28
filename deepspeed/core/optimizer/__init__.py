@@ -43,6 +43,8 @@ from deepspeed.core.optimizer.distrib_optimizer import (
     SEPARATE_GRAD_NORM_GROUPS,
     _get_param_grad_norm_group,
     _is_separate_grad_norm_group,
+    # LR logging helper (From Megatron M3286)
+    get_canonical_lr_for_logging,
 )
 
 __all__ = [
@@ -61,4 +63,5 @@ __all__ = [
     "SEPARATE_GRAD_NORM_GROUPS",
     "_get_param_grad_norm_group",
     "_is_separate_grad_norm_group",
+    "get_canonical_lr_for_logging",
 ]
