@@ -173,7 +173,14 @@ class TransformerConfig(ModelParallelConfig):
     mtp_detach_heads: bool = False
     """If True, detach MTP head inputs from the main model graph.
     This prevents MTP loss gradients from flowing back to the main model,
-    only training the MTP heads themselves."""
+    only training the MTP heads themselves.
+
+    When True, MTP model parameters should be tagged with
+    ``param.grad_norm_group = 'mtp'`` so that the optimizer clips their
+    gradients independently from the main model norm.  See
+    ``MTP_GRAD_NORM_GROUP`` in ``deepspeed.core.optimizer``.
+    # From Megatron M4171: Clip mtp grads separately when mtp_detach_heads=True.
+    """
 
     mtp_hybrid_override_pattern: Optional[str] = None
     """DEPRECATED: Use unified hybrid_layer_pattern instead.
