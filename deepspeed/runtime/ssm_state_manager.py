@@ -95,11 +95,35 @@ from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Dict, List, Optional, Tuple
 
-import torch
+# torch and deepspeed.utils are imported lazily so that
+# ``from deepspeed.runtime.core_adapters import build_moe_adapter``
+# (and any other lightweight import) does not trigger the CUDA .so chain
+# when torch is not available (e.g. CPU-only CI, partial installs).
+# All public functions/classes that actually *use* torch call _require_torch()
+# which imports it on first real use.
+try:
+    import torch  # noqa: F401 – available at runtime, may be absent in CI
+    _TORCH_AVAILABLE = True
+except (ImportError, OSError):
+    torch = None  # type: ignore[assignment]
+    _TORCH_AVAILABLE = False
 
-from deepspeed.utils import logger as ds_logger
+try:
+    from deepspeed.utils import logger as ds_logger  # noqa: F401
+except (ImportError, OSError):
+    import logging as _logging
+    ds_logger = _logging.getLogger("deepspeed.utils")  # type: ignore[assignment]
 
 _LOG_PREFIX = "[DS-SSM]"
+
+
+def _require_torch() -> None:
+    """Raise a clean error when torch is absent instead of crashing mid-operation."""
+    if not _TORCH_AVAILABLE:
+        raise ImportError(
+            "SSMStateManager requires PyTorch.  "
+            "Install torch before using SSM state offloading."
+        )
 
 log = logging.getLogger(__name__)
 
