@@ -2317,28 +2317,7 @@ class DesLocEngine:
                 self.fp32_grad_manager.before_backward()
 
             # --- Async grad all_reduce state ---
-            # We overlap the per-microbatch grad-norm-sq partial all_reduce with
-            # the *next* microbatch's forward pass.  After backward of micro[i]
-            # we fire an async all_reduce on a per-micro partial norm-sq scalar;
-            # we wait() on it at the very start of micro[i+1] before the forward
-            # runs.  This hides PCIe latency behind GPU compute.
-            # Note: param_shard.grad all_reduce is skipped (hetero shard sizes
-            # differ across ranks — would cause illegal memory access).  Only the
-            # scalar norm-sq accumulator is reduced per microbatch.
-            _async_norm_handle: Optional[dist.Work] = None  # pending async handle
-            _async_norm_tensor: Optional[torch.Tensor] = None  # tensor being reduced
-
             for micro in range(num_microbatches):
-                # -----------------------------------------------------------------
-                # Wait for previous microbatch's async grad-norm-sq all_reduce
-                # before starting this microbatch's forward pass.
-                # This achieves comm/compute overlap: the all_reduce from micro[i]
-                # runs while micro[i+1]'s forward is being set up; we synchronise
-                # here so the result is ready before we need it (post-loop norm).
-                # -----------------------------------------------------------------
-                if _async_norm_handle is not None:
-                    _async_norm_handle.wait()
-                    _async_norm_handle = None
 
                 # --- Data fetch: capacity-weighted CP token split ---
                 # Pure DP: every rank fetches independently, then applies
@@ -2478,50 +2457,6 @@ class DesLocEngine:
                         self.fp32_grad_manager.accumulate()
                     step_loss += loss.item()
 
-                # -----------------------------------------------------------------
-                # Async grad-norm-sq all_reduce (comm/compute overlap).
-                # After backward completes on the *last* microbatch of the
-                # accumulation window, compute the local full norm-sq on
-                # param_shard.grad (which now holds the fully-accumulated
-                # gradient) and fire an async all_reduce.
-                #
-                # Previously this fired after every microbatch, costing
-                # num_microbatches NCCL round-trips per optimizer step.  By
-                # deferring to the final microbatch we emit exactly one
-                # all_reduce per step — reducing NCCL synchronisation overhead
-                # on H100 by up to (grad_accum_steps - 1) round-trips.
-                #
-                # The handle is waited on immediately below (post-loop drain),
-                # so the allreduce communication from the final backward
-                # overlaps with any CPU bookkeeping between the loop exit and
-                # the wait() call.
-                # Only active when dist is initialized and ZeRO-3 sharding is on.
-                # -----------------------------------------------------------------
-                _is_last_micro = (micro == num_microbatches - 1)
-                if _is_last_micro and dist.is_initialized() and self._dist_optimizer is not None:
-                    # Accumulate norm-sq across all FP32 shard params' grads.
-                    # Insight I1: unconditional collective (Megatron M2316 lesson)
-                    # _micro_norm_sq is always torch.zeros so ranks with empty shards
-                    # still participate in the all_reduce — prevents hang on hetero topologies.
-                    _micro_norm_sq = torch.zeros(1, dtype=torch.float64, device=_local_device)
-                    for _sp in self._dist_optimizer._shard_params:
-                        _g_mb = _sp.grad
-                        if _g_mb is not None:
-                            _micro_norm_sq += _g_mb.float().norm(2).to(torch.float64).pow(2)
-                    _async_norm_tensor = _micro_norm_sq
-                    # Insight I1: unconditional collective (Megatron M2316 lesson)
-                    _async_norm_handle = dist.all_reduce(
-                        _micro_norm_sq,
-                        op=dist.ReduceOp.SUM,
-                        async_op=True,
-                    )
-
-            # Drain any outstanding async handle from the final microbatch.
-            # (The last iteration has no successor microbatch to wait at its start.)
-            if _async_norm_handle is not None:
-                _async_norm_handle.wait()
-                _async_norm_handle = None
-
             # Post-microbatch: NaN guard
             if not math.isfinite(step_loss):
                 _nan_count = getattr(self, '_nan_count', 0) + 1
@@ -2540,67 +2475,33 @@ class DesLocEngine:
                 self.fp32_grad_manager.after_backward(scale=1.0 / max(num_microbatches, 1))
 
             # --- finalize_model_grads (core.distributed) ---
-            # Called only on non-ZeRO-3 paths; DistributedOptimizer.prepare_grads()
-            # handles reduce-scatter internally.
-            if self._dist_optimizer is None:
-                _is_Kx_sync = (step + 1) % self.desloc_Kx == 0
-                try:
-                    from deepspeed.core.model_parallel_config import ModelParallelConfig  # noqa: PLC0415
-                    _fmg_model = [self._core_ddp if self._core_ddp is not None else self.model]
-                    finalize_model_grads(
-                        model=_fmg_model,
-                        config=ModelParallelConfig(),
-                        num_tokens=None,
-                        skip_grad_sync=not _is_Kx_sync,
-                    )
-                except Exception as _fmg_exc:  # noqa: BLE001
-                    logger.warning(
-                        "[finalize_model_grads] failed (%s); "
-                        "falling back to no-op (grads may be unreduced).",
-                        _fmg_exc,
-                    )
-
-            # Gradient clipping — ZeRO-3 distributed style:
-            # 1. Each rank computes local norm² on its FP32 shard param grads.
-            # 2. all_reduce(SUM) async across ranks.
-            # 3. wait() → sqrt → global norm → clip coefficients on local shards.
-            # Avoids torch._foreach_norm INT_MAX overflow on large shard tensors.
-            _norm_sq_handle: Optional[dist.Work] = None
-            if self._dist_optimizer is not None:
-                # Insight I1: unconditional collective (Megatron M2316 lesson)
-                # local_norm_sq starts at zeros so ranks with no grad shards
-                # still enter the all_reduce — avoids collective hang on
-                # heterogeneous parameter sharding (2xA6000 + 1xH100 NVL topology).
-                local_norm_sq = torch.zeros(
-                    1, dtype=torch.float64, device=_local_device
+            # Unified grad-sync path for both ZeRO-3 and non-ZeRO-3.
+            # On ZeRO-3: force_all_reduce=True triggers direct allreduce across
+            # shard params; on non-ZeRO-3: DDP bucket finish_grad_sync runs.
+            # DES-LOC Kx gating: skip_grad_sync=True on non-Kx steps.
+            _is_Kx_sync = (step + 1) % self.desloc_Kx == 0
+            try:
+                from deepspeed.core.model_parallel_config import ModelParallelConfig  # noqa: PLC0415
+                _fmg_model = [self._core_ddp if self._core_ddp is not None else self.model]
+                finalize_model_grads(
+                    model=_fmg_model,
+                    config=ModelParallelConfig(),
+                    num_tokens=None,
+                    skip_grad_sync=not _is_Kx_sync,
+                    force_all_reduce=self._dist_optimizer is not None,
                 )
-                for _sp in self._dist_optimizer._shard_params:
-                    _g = _sp.grad
-                    if _g is not None:
-                        local_norm_sq += _g.float().norm(2).to(torch.float64).pow(2)
-                # Insight I1: unconditional collective (Megatron M2316 lesson)
-                if dist.is_initialized():
-                    _norm_sq_handle = dist.all_reduce(
-                        local_norm_sq,
-                        op=dist.ReduceOp.SUM,
-                        async_op=True,
-                    )
-            else:
-                # Non-ZeRO-3: synchronous clip on model parameters.
-                gnorm = clip_grad_norm_(self.model.parameters(), cfg.grad_clip)
-                if torch.is_tensor(gnorm):
-                    gnorm = gnorm.item()
+            except Exception as _fmg_exc:  # noqa: BLE001
+                logger.warning(
+                    "[finalize_model_grads] failed (%s); "
+                    "falling back to no-op (grads may be unreduced).",
+                    _fmg_exc,
+                )
 
-            # Wait for async norm all_reduce then clip.
-            if self._dist_optimizer is not None:
-                if _norm_sq_handle is not None:
-                    _norm_sq_handle.wait()
-                gnorm = local_norm_sq.sqrt().float().item()
-                if gnorm > cfg.grad_clip and gnorm > 0:
-                    clip_coef = cfg.grad_clip / gnorm
-                    for _sp in self._dist_optimizer._shard_params:
-                        if _sp.grad is not None:
-                            _sp.grad.mul_(clip_coef)
+            # Gradient clipping — unified via clip_grad_norm_ on all paths.
+            # finalize_model_grads has already all-reduced grads; clip globally.
+            gnorm = clip_grad_norm_(self.model.parameters(), cfg.grad_clip)
+            if torch.is_tensor(gnorm):
+                gnorm = gnorm.item()
 
             # HeteroGradNorm skip decision via HeteroGradNormSkipController
             # (wired through integrate_with_deepspeed_engine at train() setup).
