@@ -1275,6 +1275,31 @@ class DesLocEngine:
         else:
             logger.info("MoE disabled (use_moe=False); model stays dense.")
 
+        # --- Phase 4d: MLA adapter (gated by config.use_mla) ---
+        # Must run AFTER MoE patching (Phase 4c) and BEFORE optimizer init so
+        # ZeRO-3 sees the updated Q/KV projection parameters introduced by
+        # _LightweightMLA.  When use_mla=False this is a complete no-op.
+        # MLA and MoE are orthogonal: MLA patches .attn, MoE patches .mlp.
+        from deepspeed.runtime.core_adapters import build_mla_adapter  # noqa: PLC0415
+        self.mla_adapter = build_mla_adapter(
+            config=config,
+            model=self.model,
+        )
+        if self.mla_adapter is not None:
+            _mla_params = sum(p.numel() for p in self.model.parameters())
+            logger.info(
+                "MLA active: model now has %.2fM parameters "
+                "(+%.2fM vs pre-MLA, q_lora_rank=%d, kv_lora_rank=%d)",
+                _mla_params / 1e6,
+                (_mla_params - n_params) / 1e6,
+                getattr(config, "mla_q_lora_rank",
+                        getattr(config, "hidden_size", 0) // 4),
+                getattr(config, "mla_kv_lora_rank",
+                        getattr(config, "hidden_size", 0) // 8),
+            )
+        else:
+            logger.info("MLA disabled (use_mla=False); standard attention kept.")
+
         # --- Phase 4b + 5: ZeRO-3 via core.optimizer.DistributedOptimizer ---
         # Replaces the hand-written zero3_hetero_shard.ShardState + manual AdamW.
         # DistributedOptimizer owns:
