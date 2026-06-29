@@ -1937,6 +1937,7 @@ class DesLocEngine:
                         overlap_grad_reduce=False,
                         use_distributed_optimizer=False,
                         allow_skip_grad_sync=True,  # DES-LOC Kx gating
+                        megatron_fsdp_grad_comm_dtype=torch.bfloat16,  # M3574: PCIe BW reduction
                     )
                     # From Megatron M2928: wrap DDP init in a dedicated side-stream
                     # to avoid race conditions that leave parameter buffers empty.
