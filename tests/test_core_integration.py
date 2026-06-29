@@ -79,10 +79,7 @@ KNOWN_ACCEPTABLE: dict[str, tuple[type[Exception], ...]] = {
     # circular / partial-init import errors (within-process isolation)
     "optimizer/distrib_optimizer.py":     (ImportError, RuntimeError),
     "optimizer/__init__.py":              (ImportError, RuntimeError),
-    # distributed/__init__ has a symbol-mismatch bug:
-    #   imports _allreduce_sequence_parallel_grads from finalize_model_grads,
-    #   but that function was renamed to _allreduce_non_tensor_model_parallel_grads.
-    "distributed/__init__.py":            (ImportError, RuntimeError),
+    # model_parallel_config has optional deps that may not be installed.
     "model_parallel_config.py":           (ImportError,),
     # torch._symmetric_memory kernel re-registration (RuntimeError) in same process
     "parallel_state.py":                  (RuntimeError,),
@@ -261,3 +258,117 @@ print("OK")
         f"STDOUT: {result.stdout}\nSTDERR: {result.stderr}"
     )
     assert "OK" in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# Test 5 — DDPConfig.cuda_graph_mode field exists and defaults to False (M4041)
+# ---------------------------------------------------------------------------
+
+def test_ddp_config_cuda_graph_mode_default() -> None:
+    """DDPConfig must have cuda_graph_mode=False by default (M4041)."""
+    import types, importlib.util
+    sys.modules.setdefault("deepspeed", _make_ds_stub())
+
+    # Load the file directly to avoid the torch._symmetric_memory side-effect
+    # that makes in-process imports fail (RuntimeError on re-registration).
+    spec = importlib.util.spec_from_file_location(
+        "deepspeed.core.distributed.distributed_data_parallel",
+        str(REPO_ROOT / "deepspeed" / "core" / "distributed" / "distributed_data_parallel.py"),
+    )
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["deepspeed.core.distributed.distributed_data_parallel"] = mod
+
+    # Stub out torch so we can load the dataclass without CUDA.
+    import dataclasses
+    torch_stub = types.ModuleType("torch")
+    torch_stub.dtype = type("dtype", (), {})
+    torch_stub.bfloat16 = None
+    torch_stub.nn = types.ModuleType("torch.nn")
+    torch_stub.nn.Module = object
+    torch_stub.distributed = types.ModuleType("torch.distributed")
+    torch_stub.distributed.ProcessGroup = object
+    sys.modules.setdefault("torch", torch_stub)
+    sys.modules.setdefault("torch.nn", torch_stub.nn)
+    sys.modules.setdefault("torch.distributed", torch_stub.distributed)
+
+    try:
+        spec.loader.exec_module(mod)
+    except Exception:
+        pytest.skip("Cannot load DDP module without full torch — skipping dataclass check")
+        return
+
+    cfg = mod.DistributedDataParallelConfig()
+    assert hasattr(cfg, "cuda_graph_mode"), \
+        "DistributedDataParallelConfig must have cuda_graph_mode field (M4041)"
+    assert cfg.cuda_graph_mode is False, \
+        "cuda_graph_mode must default to False"
+
+
+# ---------------------------------------------------------------------------
+# Test 6 — distributed/__init__.py exports correct non-sequence-parallel name
+#           (regression guard for the _allreduce_sequence_parallel_grads rename)
+# ---------------------------------------------------------------------------
+
+def test_distributed_init_exports_correct_allreduce_name() -> None:
+    """__init__.py must not import the old _allreduce_sequence_parallel_grads name."""
+    init_path = REPO_ROOT / "deepspeed" / "core" / "distributed" / "__init__.py"
+    source = init_path.read_text()
+
+    # The old name must not appear as an imported symbol (comments are OK).
+    import re
+    bad_import = re.search(
+        r"^\s+_allreduce_sequence_parallel_grads\s*,?\s*$",
+        source,
+        re.MULTILINE,
+    )
+    assert bad_import is None, (
+        "distributed/__init__.py still imports _allreduce_sequence_parallel_grads "
+        "as a symbol; use _allreduce_non_tensor_model_parallel_grads"
+    )
+    assert "_allreduce_non_tensor_model_parallel_grads" in source, (
+        "distributed/__init__.py must export _allreduce_non_tensor_model_parallel_grads"
+    )
+    assert "_update_router_expert_bias" in source, (
+        "distributed/__init__.py must export _update_router_expert_bias (M3981)"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test 7 — M3981: tp_dp_cp_group assert fires when expert_bias enabled without group
+# ---------------------------------------------------------------------------
+
+def test_finalize_model_grads_moe_tp_dp_cp_assert() -> None:
+    """pg_collection without tp_dp_cp must raise AssertionError when MoE expert bias is on."""
+    import types, importlib.util
+
+    # We test the assertion logic statically by reading the source, since we
+    # cannot run the function without torch. This guards against accidental
+    # removal of the M3981 group-threading assert.
+    src_path = REPO_ROOT / "deepspeed" / "core" / "distributed" / "finalize_model_grads.py"
+    source = src_path.read_text()
+
+    # The M3981 assert must be present in source.
+    assert "pg_collection.tp_dp_cp" in source, \
+        "finalize_model_grads must assert pg_collection.tp_dp_cp for MoE expert bias (M3981)"
+    assert "moe_router_enable_expert_bias" in source, \
+        "finalize_model_grads must gate tp_dp_cp assertion on moe_router_enable_expert_bias"
+    assert "tp_dp_cp_group=tp_dp_cp_group" in source, \
+        "_update_router_expert_bias must receive tp_dp_cp_group kwarg (M3981 threading)"
+
+
+# ---------------------------------------------------------------------------
+# Test 8 — M4041: safe_num_tokens clamp present (no host-side branch on device tensor)
+# ---------------------------------------------------------------------------
+
+def test_finalize_model_grads_safe_num_tokens_clamp() -> None:
+    """finalize_model_grads must use torch.clamp for num_tokens, not if num_tokens > 0."""
+    src_path = REPO_ROOT / "deepspeed" / "core" / "distributed" / "finalize_model_grads.py"
+    source = src_path.read_text()
+
+    assert "safe_num_tokens = torch.clamp(num_tokens, min=1)" in source, \
+        "M4041: finalize_model_grads must use torch.clamp(num_tokens, min=1) " \
+        "to avoid host-side sync during CUDA graph capture"
+    # The old pattern must NOT be present.
+    assert "if num_tokens > 0" not in source, \
+        "M4041: host-side 'if num_tokens > 0' branch must be removed — " \
+        "breaks CUDA graph capture by triggering a device-to-host sync"
