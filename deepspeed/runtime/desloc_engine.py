@@ -295,10 +295,25 @@ class TrainingConfig:
     """NCCL flight-recorder ring-buffer size (entries). 65536 > Megatron default 36864
     to capture enough history across slow PCIe all-reduce steps before timeout."""
 
+    # From Megatron M2833 (PR #2306): TrainingConfig dataclass fields ported
+    # to DES-LOC. These are the fields most relevant to heterogeneous training.
 
-# ---------------------------------------------------------------------------
-# HeteroRegistry: discovers and loads hetero_*.py modules
-# ---------------------------------------------------------------------------
+    empty_unused_memory_level: int = 0
+    """Call torch.cuda.empty_cache() each iteration to reduce fragmentation.
+    0=off, 1=moderate (every step boundary), 2=aggressive (every micro-step).
+    From Megatron M2833 (PR #2306).
+    On DES-LOC A6000×2 (48 GB, PCIe) memory fragmentation is a key failure
+    mode under long training runs — level 1 or 2 is recommended when OOM
+    errors occur in the middle of a run rather than at startup."""
+
+    decrease_batch_size_if_needed: bool = False
+    """If True, reduce global_batch_size when micro_batch_size * dp_size does
+    not evenly divide global_batch_size.  Original batch size is restored if
+    training is restarted with a dp_size that does divide it.
+    From Megatron M2833 (PR #2306).
+    Relevant for DES-LOC when tier failures reduce effective dp_size mid-run."""
+
+
 class HeteroRegistry:
     """
     Auto-discovers all hetero_*.py modules under the deepspeed package tree

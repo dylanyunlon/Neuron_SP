@@ -952,6 +952,14 @@ def _forward_cutlass_bf16(
     assert (
         hidden_states.dtype == torch.bfloat16
     ), f"_forward_cutlass_bf16 requires BF16 input, got {hidden_states.dtype}"
+    # From Megatron M2891 (PR #2495): upstream removed the blanket
+    # `assert not args.fp16` that prevented any EP+GroupedGEMM run under fp16.
+    # DES-LOC does not support fp16 training (A6000/H100/Blackwell all have
+    # efficient BF16 Tensor Cores; fp16 would offer no advantage and risks
+    # gradient underflow on A6000's smaller exponent range).  The BF16 dtype
+    # assertion above is intentional and matches the M2891 spirit: enforce
+    # dtype at the kernel level rather than at argument-parse time, so that
+    # the check travels with the actual tensor rather than a global flag.
     assert HAVE_TRITON, "_forward_cutlass_bf16 requires Triton; install triton>=2.2"
 
     max_tokens = hidden_states.size(0)
