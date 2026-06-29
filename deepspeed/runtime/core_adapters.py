@@ -5,10 +5,10 @@ single config change, no code edits to desloc_engine.py required.
 
 Usage in desloc_engine.py:
     from deepspeed.runtime.core_adapters import (
-        maybe_build_core_scheduler,
-        maybe_get_pipeline_forward_backward,
-        maybe_build_dist_checkpoint_saver,
-        maybe_use_hybrid_cp_schedule,
+        build_core_scheduler,
+        get_pipeline_forward_backward,
+        build_dist_checkpoint_saver,
+        build_hybrid_cp_schedule,
     )
 """
 from __future__ import annotations
@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # 1. LR Scheduler adapter
 # ---------------------------------------------------------------------------
-def maybe_build_core_scheduler(
+def build_core_scheduler(
     optimizer: Any,
     config: Any,
 ) -> Optional[Any]:
@@ -70,7 +70,7 @@ def maybe_build_core_scheduler(
 # ---------------------------------------------------------------------------
 # 2. Pipeline schedule adapter
 # ---------------------------------------------------------------------------
-def maybe_get_pipeline_forward_backward(
+def get_pipeline_forward_backward(
     config: Any,
     default_fn: Callable,
 ) -> Callable:
@@ -108,7 +108,7 @@ def maybe_get_pipeline_forward_backward(
 # ---------------------------------------------------------------------------
 # 3. dist_checkpointing adapter
 # ---------------------------------------------------------------------------
-def maybe_build_dist_checkpoint_saver(
+def build_dist_checkpoint_saver(
     config: Any,
 ) -> Optional[Any]:
     """If config.use_dist_checkpointing is True, return a wrapper that
@@ -197,7 +197,7 @@ class BridgeToP2PWrapper:
         return result
 
 
-def maybe_build_bridge_communicator(
+def build_bridge_communicator(
     config: Any,
     existing_p2p: Any,
 ) -> Any:
@@ -254,7 +254,7 @@ def maybe_build_bridge_communicator(
 # 5. Hybrid Context Parallel schedule adapter
 # ---------------------------------------------------------------------------
 
-def maybe_use_hybrid_cp_schedule(
+def build_hybrid_cp_schedule(
     config: Any,
 ) -> Optional[Callable]:
     """If config.use_context_parallel is True, return a wrapper around

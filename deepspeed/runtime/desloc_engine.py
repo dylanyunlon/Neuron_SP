@@ -1370,8 +1370,8 @@ class DesLocEngine:
             min_lr_ratio=config.min_lr / config.max_lr,
         )
         # --- Core scheduler adapter (gated by config.use_core_scheduler) ---
-        from deepspeed.runtime.core_adapters import maybe_build_core_scheduler
-        _core_sched = maybe_build_core_scheduler(self.optimizer, config)
+        from deepspeed.runtime.core_adapters import build_core_scheduler
+        _core_sched = build_core_scheduler(self.optimizer, config)
         if _core_sched is not None:
             self.scheduler = _core_sched
 
@@ -2014,8 +2014,8 @@ class DesLocEngine:
             len(self._device_registry.all_profiles),
         )
         # --- Core bridge communicator adapter (gated by config.use_bridge_communicator) ---
-        from deepspeed.runtime.core_adapters import maybe_build_bridge_communicator
-        self.p2p_communicator = maybe_build_bridge_communicator(
+        from deepspeed.runtime.core_adapters import build_bridge_communicator
+        self.p2p_communicator = build_bridge_communicator(
             config, self.p2p_communicator,
         )
 
@@ -2336,12 +2336,12 @@ class DesLocEngine:
         _shard_sync_pending: bool = False
 
         # --- Core pipeline schedule adapter (gated by config.use_pipeline_schedule) ---
-        from deepspeed.runtime.core_adapters import maybe_get_pipeline_forward_backward
-        _pipeline_fb_func = maybe_get_pipeline_forward_backward(cfg, default_fn=None)
+        from deepspeed.runtime.core_adapters import get_pipeline_forward_backward
+        _pipeline_fb_func = get_pipeline_forward_backward(cfg, default_fn=None)
 
         # --- Context Parallel schedule adapter (gated by config.use_context_parallel) ---
-        from deepspeed.runtime.core_adapters import maybe_use_hybrid_cp_schedule
-        _cp_fb = maybe_use_hybrid_cp_schedule(cfg)
+        from deepspeed.runtime.core_adapters import build_hybrid_cp_schedule
+        _cp_fb = build_hybrid_cp_schedule(cfg)
 
         for step in range(self.global_step, cfg.total_steps):
             # DistributedOptimizer.zero_grad() zeroes its grad_data buffers +
@@ -2839,8 +2839,8 @@ class DesLocEngine:
         path.parent.mkdir(parents=True, exist_ok=True)
 
         # --- Core dist_checkpointing adapter (gated by config.use_dist_checkpointing) ---
-        from deepspeed.runtime.core_adapters import maybe_build_dist_checkpoint_saver
-        _dc_saver = maybe_build_dist_checkpoint_saver(self.config)
+        from deepspeed.runtime.core_adapters import build_dist_checkpoint_saver
+        _dc_saver = build_dist_checkpoint_saver(self.config)
 
         payload = {
             "global_step":       self.global_step,
