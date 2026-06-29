@@ -172,6 +172,22 @@ class DistributedDataParallelConfig:
     # cudagraphs are active to prevent this.
     training_cuda_graphs_enabled: bool = False
 
+    # M4041 (Megatron 67b2f3878): When True, skip ``param.grad = None`` in the
+    # backward post-hook so that live tensor addresses captured during CUDA graph
+    # recording remain valid on every replay iteration.  Setting grad to None
+    # during replay would break the captured compute graph because PyTorch stores
+    # the grad pointer at capture time; subsequent replays would dereference a
+    # freed (or re-allocated) tensor.
+    #
+    # Conflict with DES-LOC Kx sync: the Kx non-sync path still calls the same
+    # backward hook.  On non-Kx steps the grad accumulates but is not cleared
+    # until the next Kx boundary.  This is intentional — the Kx design already
+    # relies on grad persistence across micro-steps, so cuda_graph_mode=True is
+    # compatible with DES-LOC's non-Kx accumulation.
+    #
+    # Set to True automatically when cuda_graph_impl == 'full_iteration'.
+    cuda_graph_mode: bool = False
+
 
 # ---------------------------------------------------------------------------
 # DistributedDataParallel
@@ -647,7 +663,14 @@ class DistributedDataParallel(nn.Module):
                     or getattr(param, 'zero_out_wgrad', False)
                 ):
                     param.main_grad.add_(param.grad.data)
-                param.grad = None
+                # M4041 (Megatron 67b2f3878): Conditional param.grad deref.
+                # In full-iteration CUDA graph mode we must NOT set param.grad
+                # to None here: the graph was recorded with a live grad tensor
+                # address, and overwriting the attribute would break replay.
+                # On non-graph paths (and non-Kx DES-LOC steps) the usual
+                # eager deref frees the gradient storage immediately.
+                if not self.ddp_config.cuda_graph_mode:
+                    param.grad = None
                 if self.ddp_config.overlap_grad_reduce:
                     self.param_to_bucket_group[param].register_grad_ready(
                         param, self.force_all_reduce
