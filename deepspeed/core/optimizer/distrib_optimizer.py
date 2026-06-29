@@ -901,7 +901,10 @@ def _compute_hetero_shard_boundaries(
         shard_size = padded // dp_world_size
         boundaries: List[Tuple[int, int]] = []
         for r in range(dp_world_size):
-            s = r * shard_size
+            # Clamp start so that when dp_world_size > total_numel (degenerate
+            # but defensive), extra ranks get an empty shard (N, N) instead of
+            # an inverted boundary (s > total_numel) that would break callers.
+            s = min(r * shard_size, total_numel)
             e = min(s + shard_size, total_numel)
             boundaries.append((s, e))
         return boundaries
