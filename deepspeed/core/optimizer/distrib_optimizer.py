@@ -1376,45 +1376,155 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         Avoids the "Frankenstein model" bug where only 1/N of params get
         updated on each rank.
 
-        Protocol (per buffer):
-          1. Convert this rank's FP32 shard to BF16 and zero-fill the rest
-             of a padded world-size buffer.
-          2. All-reduce (SUM) — only one rank has non-zero in each slot.
-          3. Copy reconstructed BF16 values back to model param tensors.
-          4. Refresh the local FP32 shard from the broadcast result.
+        Bucketed all-gather (ported from c37ea95f / ShardState._broadcast_model_params):
+        Instead of one all_reduce per ParamAndGradBuffer (which can be many
+        small calls when the model has many small buffers), we accumulate
+        buffer segments into large flat BF16 buckets (up to BUCKET_BYTES each)
+        and fire a single all_reduce(SUM) per bucket.  Each rank fills only
+        its owned shard slice; non-owned positions stay zero; SUM reconstructs
+        the full tensor.  This reduces NCCL calls from O(num_buffers) to
+        O(total_param_bytes / BUCKET_BYTES) — typically ~9 calls for a 7B
+        model on a 3-rank PCIe topology.
 
-        For heterogeneous shards the buffer is assembled with each rank's
-        slice at the correct offset before the all-reduce.
+        Protocol (per bucket):
+          1. Allocate a zero-filled BF16 flat buffer sized to the bucket.
+          2. Each rank copies its owned shard slice (FP32→BF16) into the
+             corresponding positions; unowned positions stay zero.
+          3. all_reduce(SUM) — exactly one rank has non-zero per position.
+          4. Scatter bucket back to model param tensors.
+          5. Refresh the FP32 shard from the broadcast result.
+
+        For heterogeneous shards the shard boundaries are per-rank so each
+        rank knows exactly which global positions it owns.
         """
+        # perf(optimizer): bucketed shard_to_model_broadcast — port c37ea95f
+        # BUCKET_BYTES: 2 GB matches A6000 headroom; BF16 → 2 bytes/elem.
+        BUCKET_BYTES: int = 2 * 1024 * 1024 * 1024  # 2 GB
+        bucket_elems: int = BUCKET_BYTES // 2        # BF16 = 2 bytes/elem
+
         dp_rank = self.data_parallel_rank
 
+        # ----------------------------------------------------------------
+        # Step 1: flatten all (fp32_shard, boundaries, buf, param_index_map)
+        # into a linear sequence of (param, global_start, global_end,
+        # shard_start, shard_end, fp32_shard, device) records, then
+        # pack them into variable-length buckets.
+        #
+        # We treat the union of all buffers as a single virtual address space
+        # with per-buffer base offsets so that params from different buffers
+        # can coexist in one bucket without aliasing.
+        # ----------------------------------------------------------------
+
+        # Each entry: (param, ps, pe, shard_start, shard_end, fp32_shard, device)
+        # where ps/pe are buffer-local param offsets (same as param_index_map values),
+        # and shard_start/shard_end are this rank's shard boundaries in that buffer.
+        all_entries: List[Tuple] = []
         for fp32_shard, boundaries, buf in zip(
                 self._fp32_shards,
                 self._buf_boundaries,
                 self.param_and_grad_buffers,
         ):
-            total_numel = buf.grad_data.numel()
-            _device = buf.grad_data.device
-
-            full_bf16 = torch.zeros(total_numel, dtype=torch.bfloat16, device=_device)
-
             shard_start, shard_end = boundaries[dp_rank]
-            copy_len = shard_end - shard_start
-            full_bf16[shard_start:shard_end].copy_(fp32_shard[:copy_len].bfloat16())
+            _device = buf.grad_data.device
+            for param, (ps, pe, _) in buf.param_index_map.items():
+                all_entries.append((param, ps, pe, shard_start, shard_end,
+                                    fp32_shard, _device))
 
-            # SUM all-reduce: each rank contributes to its own region only
+        if not all_entries:
+            return
+
+        # ----------------------------------------------------------------
+        # Step 2: pack entries into buckets of at most bucket_elems elements.
+        # ----------------------------------------------------------------
+        buckets: List[List[Tuple]] = []
+        current_bucket: List[Tuple] = []
+        current_size: int = 0
+
+        for entry in all_entries:
+            param, ps, pe, *_ = entry
+            numel = pe - ps
+            if current_size + numel > bucket_elems and current_bucket:
+                buckets.append(current_bucket)
+                current_bucket = []
+                current_size = 0
+            current_bucket.append(entry)
+            current_size += numel
+
+        if current_bucket:
+            buckets.append(current_bucket)
+
+        logger.debug(
+            "shard_to_model_broadcast: %d params → %d NCCL bucket(s) "
+            "(bucket_elems=%d, dp_rank=%d)",
+            len(all_entries),
+            len(buckets),
+            bucket_elems,
+            dp_rank,
+        )
+
+        # ----------------------------------------------------------------
+        # Step 3: for each bucket, build flat BF16 buffer, fill owned slices,
+        # all_reduce(SUM), scatter back to model params, refresh FP32 shards.
+        # ----------------------------------------------------------------
+        for bucket in buckets:
+            total_bucket_elems: int = sum(pe - ps for _, ps, pe, *_ in bucket)
+            # Infer device from the first entry (all params in a training run
+            # live on the same device within a DP rank).
+            _dev = bucket[0][6]
+            flat = torch.zeros(total_bucket_elems, dtype=torch.bfloat16,
+                               device=_dev)
+
+            # Fill: this rank writes its owned portion into flat; rest = 0.
+            offset: int = 0
+            for param, ps, pe, shard_start, shard_end, fp32_shard, _device in bucket:
+                numel = pe - ps
+
+                # Intersection of [ps, pe) with this rank's shard [shard_start, shard_end)
+                owned_start = max(ps, shard_start)
+                owned_end   = min(pe, shard_end)
+                if owned_end > owned_start:
+                    # Position inside the param tensor (buffer-local)
+                    p_lo = owned_start - ps
+                    p_hi = owned_end   - ps
+                    # Position inside the FP32 shard (shard-local)
+                    s_lo = owned_start - shard_start
+                    s_hi = owned_end   - shard_start
+                    # Write FP32 shard slice (cast to BF16) into the bucket buffer.
+                    flat[offset + p_lo:offset + p_hi].copy_(
+                        fp32_shard[s_lo:s_hi].bfloat16()
+                    )
+
+                offset += numel
+
+            # ONE all_reduce for the entire bucket — reduces NCCL call count
+            # from O(num_buffers) to O(total_bytes / BUCKET_BYTES).
             torch.distributed.all_reduce(
-                full_bf16,
+                flat,
                 op=torch.distributed.ReduceOp.SUM,
                 group=self.data_parallel_group,
             )
 
-            # Write back to model param tensors
-            for param, (ps, pe, _) in buf.param_index_map.items():
-                param.data.copy_(full_bf16[ps:pe].view(param.data.shape))
+            # Scatter bucket back to model param tensors and refresh FP32 shard.
+            offset = 0
+            for param, ps, pe, shard_start, shard_end, fp32_shard, _device in bucket:
+                numel = pe - ps
+                param_slice = flat[offset:offset + numel]
 
-            # Keep FP32 shard consistent with the broadcast result
-            fp32_shard[:copy_len].copy_(full_bf16[shard_start:shard_end].float())
+                # Update model BF16 param in-place.
+                param.data.view(-1).copy_(param_slice)
+
+                # Refresh the FP32 shard for the owned slice so the master
+                # weights stay consistent with the all_reduced result.
+                owned_start = max(ps, shard_start)
+                owned_end   = min(pe, shard_end)
+                if owned_end > owned_start:
+                    p_lo = owned_start - ps
+                    p_hi = owned_end   - ps
+                    s_lo = owned_start - shard_start
+                    s_hi = owned_end   - shard_start
+                    fp32_shard[s_lo:s_hi].copy_(param_slice[p_lo:p_hi].float())
+
+                offset += numel
 
     # ------------------------------------------------------------------
     # Zero grad
