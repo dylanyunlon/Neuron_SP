@@ -34,7 +34,9 @@ import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 # GradScaler removed — BF16 does not need loss scaling
-from torch.nn.utils import clip_grad_norm_
+# clip_grad_norm_ replaced by core implementation: avoids host/device sync,
+# computes norm across model-parallel group (Megatron M2335 pattern).
+from deepspeed.core.optimizer.clip_grads import clip_grad_norm
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
 
@@ -2667,9 +2669,11 @@ class DesLocEngine:
                     _fmg_exc,
                 )
 
-            # Gradient clipping — unified via clip_grad_norm_ on all paths.
+            # Gradient clipping — unified via core clip_grad_norm on all paths.
             # finalize_model_grads has already all-reduced grads; clip globally.
-            gnorm = clip_grad_norm_(self.model.parameters(), cfg.grad_clip)
+            # core clip_grad_norm avoids host/device sync and handles model-parallel
+            # norm reduction — replaces torch.nn.utils.clip_grad_norm_ (M2335).
+            gnorm = clip_grad_norm(self.model.parameters(), cfg.grad_clip)
             if torch.is_tensor(gnorm):
                 gnorm = gnorm.item()
 
