@@ -704,6 +704,15 @@ def clip_grad_by_norm_des_loc(
     Mirrors Megatron's ``clip_grad_by_total_norm_fp32`` but is
     device-tier aware.
 
+    From Megatron M2273 (972553db3): Fix use_decoupled_grad incorrectly set
+    to False for BF16 + use_precision_aware_optimizer.  In the Megatron
+    optimizer init, when bf16=True the decoupled_grad path must be enabled
+    so that the main-param FP32 copy and the BF16 model param stay in sync.
+    In DES-LOC this is critical: A6000 and H100 both run BF16; if
+    use_decoupled_grad is False the gradient norm is computed on stale BF16
+    .grad tensors instead of the FP32 decoupled_grad, causing divergent
+    clipping across tiers and training instability.
+
     Parameters
     ----------
     params:
@@ -714,6 +723,8 @@ def clip_grad_by_norm_des_loc(
         The pre-computed global norm for this parameter set.
     use_decoupled_grad:
         If True, clip ``param.decoupled_grad`` instead of ``param.grad``.
+        Must be True when bf16=True and use_precision_aware_optimizer=True
+        (see M2273).
     """
     if max_norm <= 0.0 or total_norm <= 0.0:
         return

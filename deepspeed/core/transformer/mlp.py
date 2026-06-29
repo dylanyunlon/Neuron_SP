@@ -355,6 +355,13 @@ class MLP(MegatronModule):
       When ``config.moe_latent_size`` is set and this is a routed expert,
       fc1 input → latent projection → ffn, and fc2 output → latent.
 
+    From Megatron M2272 (30751977f): Fused MLP as subclass of unfused MLP —
+      the fused TE-based MLP now inherits from this class so that checkpoint
+      loading, sharded_state_dict, and tier-assignment logic are shared.
+      In DES-LOC this matters because the H100 tier can use the TE fused path
+      while A6000 (SM86, no TE FP8) falls back to the unfused path; both must
+      produce identical state-dict keys for cross-tier checkpoint compatibility.
+
     DES-LOC integration:
       Logs tier assignment at construction via ``config.get_layer_tier()``.
 
