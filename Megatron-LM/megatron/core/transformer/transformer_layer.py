@@ -394,7 +394,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         attention_optional_kwargs = {}
         if config.context_parallel_size > 1 and config.cp_comm_type is not None:
             if isinstance(config.cp_comm_type, list):
-                # layer_number is 1-indexed, so we need to subtract 1 to get the correct index
+                # From Megatron M3432: layer_number is 1-based; subtract 1 for list indexing
                 attention_optional_kwargs["cp_comm_type"] = config.cp_comm_type[
                     self.layer_number - 1
                 ]
