@@ -91,3 +91,60 @@ This skip should be revisited if any of the following occur:
 `start_param_sync_for_bucket_group_subset` stub already provide the necessary
 API compatibility.  Full routing logic is not needed until a Muon integration
 is planned.
+
+---
+
+## M4065 — Skip gradient updates when grad norm exceeds threshold
+**Upstream commit:** `8fff54f8` (Megatron PR #3460, internal ref `180131620`)
+**Audit date:** 2026-06-29
+**Status:** ✅ SKIP — fully ported and extended; no further action required
+
+### What the upstream commit does
+
+Megatron adds a guard in `ChainedOptimizer.step()` that compares the
+computed global gradient norm against a new config field
+`grad_norm_skip_threshold` (default `inf`, i.e. disabled).  If the norm
+exceeds the threshold the optimizer step is skipped entirely
+(`update_successful = False`), preserving Adam's moment state from
+corruption by a runaway gradient spike.  The change touches three files:
+
+| File | Change |
+|---|---|
+| `optimizer_config.py` | `grad_norm_skip_threshold: float = float('inf')` added after `clip_grad` |
+| `optimizer.py` | `should_skip_update` flag set when `grad_norm > threshold`; `step_with_ready_grads()` short-circuited |
+| `clip_grads.py` | Whitespace / trailing-newline cleanup only (no logic change) |
+
+### What Neuron_SP has
+
+The feature is **fully present and extended** across four commits:
+
+| Commit | What it does |
+|---|---|
+| `9caf71e0` | `deepspeed/runtime/hetero_grad_norm_skip.py` (1 343 lines) — DES-LOC reinterpretation as `HeteroGradNormSkipController`: per-device-class FP64 norm accumulation (A6000 vs H100), LOC-cache invalidation on skip, consecutive-skip detection, per-class thresholds |
+| `e4c5f49b` | `grad_norm_skip_threshold: float = float('inf')` added to `OptimizerConfig` (the missing config field that would have caused `AttributeError` at runtime) |
+| `d580f49a` | `step()` added to `DesLocEngine` to serve as the monkey-patch entry point for `HeteroGradNormSkipController` |
+| `ecc5811a` | Engine-level wiring: `integrate_with_deepspeed_engine` plumbs `HeteroGradNormSkipController` into the training loop via `desloc_engine.py` |
+
+Our `ChainedOptimizer.step()` (`optimizer.py:1575`) already has the
+upstream skip guard, with one deliberate extension: the condition is
+`grad_norm > threshold and main_params` (we gate on `main_params` to
+avoid false skips when a stub optimizer with no real parameters is the
+sole optimizer in the chain).
+
+### Delta vs upstream
+
+| Upstream Megatron | Neuron_SP |
+|---|---|
+| Single global `float` threshold | Per-device-class thresholds (`HeteroGradNormConfig`) |
+| Skip decision in `ChainedOptimizer.step` | Skip decision delegated to `HeteroGradNormSkipController`, hooked via `DesLocEngine.step()` |
+| No LOC coherence concern | `invalidate_loc_cache()` called on skip to flush stale PCIe-in-flight gradient fragments |
+| No consecutive-skip tracking | Controller tracks consecutive skips; warns / raises after configurable limit |
+| `clip_grads.py` whitespace only | Not ported (no-op) |
+
+### Verdict
+
+**No further action required.**  The upstream feature is fully present
+(`grad_norm_skip_threshold` in config, skip guard in `ChainedOptimizer.step`)
+and significantly extended with DES-LOC heterogeneous-hardware logic in
+`hetero_grad_norm_skip.py`.  The `clip_grads.py` whitespace-only changes
+from upstream are intentionally not ported.
