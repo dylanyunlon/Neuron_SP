@@ -112,6 +112,11 @@ class OptimizerConfig:
     """If True, decouple weight decay from the gradient update (AdamW). If False,
     use original Adam update rule. Defaults to True (AdamW behavior)."""
 
+    # From Megatron M3543 (PR #3813): Lion optimizer support
+    optimizer_type: str = "adamw"
+    lion_beta1: float = 0.9
+    lion_beta2: float = 0.99
+
     # Precision
     params_dtype: torch.dtype = torch.float32
     fp16: bool = False

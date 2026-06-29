@@ -47,6 +47,48 @@ from deepspeed.core.optimizer.distrib_optimizer import (
     get_canonical_lr_for_logging,
 )
 
+
+def build_optimizer(params, config: OptimizerConfig):
+    """Construct an optimizer from *config*.
+
+    From Megatron M3543 (PR #3813): dispatches to Lion when
+    ``config.optimizer_type == 'lion'``, falling back to AdamW if
+    lion-pytorch is not installed.  All other values of optimizer_type
+    route to AdamW (default).
+
+    Args:
+        params: Iterable of parameters or param-groups passed to the optimizer.
+        config: :class:`OptimizerConfig` instance.
+
+    Returns:
+        A :class:`torch.optim.Optimizer`.
+    """
+    import logging
+    import torch
+
+    if getattr(config, 'optimizer_type', 'adamw') == 'lion':
+        try:
+            from lion_pytorch import Lion
+            return Lion(
+                params,
+                lr=config.lr,
+                betas=(getattr(config, 'lion_beta1', 0.9), getattr(config, 'lion_beta2', 0.99)),
+                weight_decay=getattr(config, 'weight_decay', 0.1),
+            )
+        except ImportError:
+            logging.getLogger(__name__).warning(
+                'Lion optimizer (M3543) requested but lion-pytorch not installed. '
+                'Falling back to AdamW. Install: pip install lion-pytorch'
+            )
+
+    return torch.optim.AdamW(
+        params,
+        lr=config.lr,
+        betas=(config.adam_beta1, config.adam_beta2),
+        eps=config.adam_eps,
+        weight_decay=config.weight_decay,
+    )
+
 __all__ = [
     "OptimizerConfig",
     "MegatronOptimizer",
@@ -64,4 +106,6 @@ __all__ = [
     "_get_param_grad_norm_group",
     "_is_separate_grad_norm_group",
     "get_canonical_lr_for_logging",
+    # From Megatron M3543: Lion optimizer factory
+    "build_optimizer",
 ]
