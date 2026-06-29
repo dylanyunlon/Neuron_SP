@@ -169,6 +169,8 @@ def save(
                             be empty (enforced by rank 0).
         async_save:         reserved for future async-IO support; currently
                             ignored (save is always synchronous).
+                            # From Megatron M3407: if adding async support, use async_save_checkpoint()
+                            # below — never use multiprocessing.Process (fails in daemon contexts).
 
     Returns:
         None (``async_save`` future handle when async is implemented).
@@ -457,3 +459,52 @@ def load(
     result.update(common_state)
     result.update(loaded)
     return result
+
+
+# ---------------------------------------------------------------------------
+# Async checkpoint helpers  (M3407 / M3461)
+# ---------------------------------------------------------------------------
+
+import os as _os
+import threading as _threading
+
+
+def _background_checkpoint_worker(save_fn, *args, **kwargs):
+    """Run save_fn in a background thread with lowered CPU/IO priority.
+
+    From Megatron M3407 (PR #3633): async checkpoint saves MUST use
+    threading.Thread, NOT multiprocessing.Process. Python daemon processes
+    (e.g. DES-LOC tier coordinators) cannot spawn child processes:
+        AssertionError: daemonic processes are not allowed to have children
+    threading.Thread does not have this restriction.
+
+    From Megatron M3461 (PR #3262): lower CPU and IO priority of the
+    checkpoint worker to prevent write-back from starving the training process.
+    On PCIe clusters (no NVLink) this is especially important since storage
+    and GPU interconnect share bandwidth.
+    """
+    _os.nice(19)  # lowest CPU priority
+    try:
+        import subprocess as _sp
+        _sp.run(['ionice', '-c', '3', '-p', str(_os.getpid())],
+                check=False, capture_output=True)
+    except Exception:
+        pass
+    save_fn(*args, **kwargs)
+
+
+def async_save_checkpoint(save_fn, *args, **kwargs):
+    """Launch save_fn in a background thread (daemon-safe async checkpoint).
+
+    From Megatron M3407: use Thread not Process for daemon-process safety.
+    Returns the Thread object so caller can join() if needed.
+    """
+    t = _threading.Thread(
+        target=_background_checkpoint_worker,
+        args=(save_fn,) + args,
+        kwargs=kwargs,
+        daemon=False,  # non-daemon so the thread completes even if main exits
+        name="checkpoint-async-save",
+    )
+    t.start()
+    return t
