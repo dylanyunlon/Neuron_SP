@@ -216,7 +216,12 @@ def get_tensor_device(tensor):
 
 
 def _get_mtp_loss_scale(config, device):
-    """Get MTP loss scale, preferring mtp_grad_scale_func (M4083)."""
+    """Get MTP loss scale, preferring mtp_grad_scale_func (M4083).
+
+    Known issue (From Megatron M3312, PR #3159): calculate_per_token_loss=True时,
+    MTP scale应额外除以rolling后减少的有效token比例。当前未修正，MTP梯度相对过重。
+    TODO: track original_num_tokens to apply correction factor.
+    """
     def _normalize(ls, name):
         ls = torch.as_tensor(ls, device=device)
         if ls.numel() != 1:
@@ -696,6 +701,7 @@ def forward_backward_no_pipelining(
             del output_tensor  # M4063
 
     if config.finalize_model_grads_func is not None and not forward_only:
+        total_num_tokens = torch.clamp(total_num_tokens, min=1)  # From Megatron M3531: guard all-padding batches
         config.finalize_model_grads_func(
             [model],
             total_num_tokens if config.calculate_per_token_loss else None,
@@ -1807,6 +1813,7 @@ def forward_backward_pipelining_with_interleaving(
         # data parallelism, layernorm all-reduce for sequence parallelism, and
         # embedding all-reduce for pipeline parallelism).
 
+        total_num_tokens = torch.clamp(total_num_tokens, min=1)  # From Megatron M3531: guard all-padding batches
         config.finalize_model_grads_func(
             model,
             total_num_tokens if config.calculate_per_token_loss else None,
@@ -2214,6 +2221,7 @@ def forward_backward_pipelining_without_interleaving(
         # Finalize model grads (perform full grad all-reduce / reduce-scatter for
         # data parallelism, layernorm all-reduce for sequence parallelism, and
         # embedding all-reduce for pipeline parallelism).
+        total_num_tokens = torch.clamp(total_num_tokens, min=1)  # From Megatron M3531: guard all-padding batches
         config.finalize_model_grads_func(
             [model],
             total_num_tokens if config.calculate_per_token_loss else None,
