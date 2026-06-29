@@ -242,7 +242,11 @@ class TopKRouter(Router):
 
         def _sinkhorn_activation(logits):
             if self.topk == 1:
+                # From Megatron M3394: cast to fp32 for numerical stability (BF16 saturates at extremes)
+                _logits_dtype = logits.dtype
+                logits = logits.float()
                 logits = torch.sigmoid(logits)
+                logits = logits.to(_logits_dtype)
             else:  # k > 1
                 logits = torch.softmax(logits, dim=-1, dtype=torch.float32).type_as(logits)
             return logits
