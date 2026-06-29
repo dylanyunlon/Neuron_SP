@@ -219,9 +219,38 @@ class TransformerConfig(ModelParallelConfig):
     """If set, the loss layer will be treated as a standard transformer
     layer in the context of partition and placement for pipeline parallelism."""
 
+    pipeline_model_parallel_layout: Optional[Union[str, list, object]] = None
+    """Custom definition of the pipeline parallel partitioning.
+    Mirrors Megatron's PipelineParallelLayerLayout feature (M3096+).
+    Supported types:
+    - str:  e.g. 'Et*3|(tt|)*29,m|L'. Stages split by '|'; replicated
+            stages/layers via '*'; commas are cosmetic.
+    - list: e.g. [['embedding', 'decoder'], ['decoder', 'decoder', 'loss']].
+    - PipelineParallelLayerLayout object (Megatron).
+    When a str or list is provided it is normalised in __post_init__.
+    Let i = a * pp_size + b; layout[i] gives the layers for vpp-rank a,
+    pp-rank b.  Valid layer tokens: 'embedding'/'E', 'decoder'/'t',
+    'loss'/'L', 'mtp'/'m'.
+    If None, the standard equal-division heuristic is used.
+    From Megatron M3096 (PR #???).
+    """
+
     # ------------------------------------------------------------------
     # Attention
     # ------------------------------------------------------------------
+
+    attention_backend: Optional[str] = None
+    """Attention backend to use.  Mirrors Megatron's ``AttnBackend`` enum
+    (M3063+) but stored as a plain str so we don't hard-depend on the
+    Megatron enum at import time.
+    Recognised values:
+      ``None`` / ``"auto"``  — let Transformer Engine choose (default).
+      ``"flash"``            — force FlashAttention (FA2/FA3).
+      ``"fused"``            — force TE FusedAttention.
+      ``"unfused"``          — force TE UnfusedDotProductAttention.
+      ``"local"``            — force the native mcore DotProductAttention.
+    From Megatron HEAD (post-M3063).
+    """
 
     softmax_scale: Optional[float] = None
     """Softmax scale for attention. If None, defaults to 1/sqrt(kv_channels)."""
@@ -2044,3 +2073,204 @@ class TransformerConfig(ModelParallelConfig):
         logit_fwd = 2 * batch_size * seq_len * h * vocab if vocab else 0
 
         return (attn_fwd + dense_fwd + moe_fwd + logit_fwd) * 3
+
+
+# ---------------------------------------------------------------------------
+# MLATransformerConfig
+# ---------------------------------------------------------------------------
+# Ported from Megatron-LM megatron/core/transformer/transformer_config.py
+# (class MLATransformerConfig, added ~M3900+).
+#
+# Extends TransformerConfig with the extra fields required by DeepSeek-style
+# Multi-Latent Attention (MLA) layers:
+#   * Low-rank Q/KV projections (q_lora_rank, kv_lora_rank)
+#   * Separate head dimensions for position-aware and position-free parts
+#     (qk_head_dim, qk_pos_emb_head_dim, v_head_dim)
+#   * YaRN RoPE hyperparameters (rotary_base, rotary_percent, rotary_scaling_factor,
+#     original_max_position_embeddings, beta_fast, beta_slow, mscale, mscale_all_dim)
+#   * Inference optimisations: cache_mla_latents, mla_down_proj_fusion
+#
+# DES-LOC note: all inherited DES-LOC tier fields (desloc_*) remain valid
+# for MLATransformerConfig — MLA layers are assigned to tiers the same way
+# dense attention layers are.
+
+@dataclass
+class MLATransformerConfig(TransformerConfig):
+    """TransformerConfig extension for Multi-Latent Attention (MLA) models.
+
+    Adds the per-layer low-rank projection dimensions, YaRN RoPE parameters,
+    and inference-optimisation flags required by DeepSeek / MLA architectures.
+    All standard TransformerConfig fields (including DES-LOC tier fields) are
+    inherited unchanged.
+
+    Ported from Megatron-LM ``MLATransformerConfig`` (post-M3900).
+
+    Usage example::
+
+        cfg = MLATransformerConfig(
+            num_layers=28,
+            hidden_size=4096,
+            num_attention_heads=32,
+            multi_latent_attention=True,   # inherited from TransformerConfig
+            q_lora_rank=512,
+            kv_lora_rank=512,
+            qk_head_dim=128,
+            qk_pos_emb_head_dim=64,
+            v_head_dim=128,
+            rope_type="yarn",
+            rotary_scaling_factor=40,
+            original_max_position_embeddings=4096,
+        )
+    """
+
+    # ------------------------------------------------------------------
+    # MLA always enabled for this subconfig
+    # ------------------------------------------------------------------
+    multi_latent_attention: bool = True
+    """Whether to use Multi-Latent Attention. Always True for MLATransformerConfig."""
+
+    # ------------------------------------------------------------------
+    # Low-rank projection dimensions
+    # ------------------------------------------------------------------
+    q_lora_rank: int = 512
+    """Rank of the Query tensor's low-rank compressed representation (c_q).
+    The query is first projected to this bottleneck dimension before being
+    expanded back to the full QK space.
+    From Megatron MLATransformerConfig."""
+
+    kv_lora_rank: int = 512
+    """Rank of the combined Key+Value low-rank representation (c_kv).
+    Both K and V are recovered from a single latent vector of this rank,
+    which is what makes MLA memory-efficient for long contexts.
+    From Megatron MLATransformerConfig."""
+
+    qk_head_dim: int = 128
+    """Per-head dimension for the non-positional part of QK projections.
+    Total q head dim = qk_head_dim + qk_pos_emb_head_dim.
+    From Megatron MLATransformerConfig."""
+
+    qk_pos_emb_head_dim: int = 64
+    """Per-head dimension for the positional (RoPE) part of QK projections.
+    Added to qk_head_dim to form the full query head dimension.
+    From Megatron MLATransformerConfig."""
+
+    v_head_dim: int = 128
+    """Per-head dimension for the Value projections.
+    May differ from qk_head_dim (unlike standard MHA).
+    From Megatron MLATransformerConfig."""
+
+    # ------------------------------------------------------------------
+    # Normalization override
+    # ------------------------------------------------------------------
+    normalization: str = "RMSNorm"
+    """Default normalization layer for MLA models. MLA uses RMSNorm by
+    default (consistent with DeepSeek / LLaMA conventions).
+    Overrides the TransformerConfig default of 'LayerNorm'."""
+
+    # ------------------------------------------------------------------
+    # RoPE type
+    # ------------------------------------------------------------------
+    rope_type: str = "yarn"
+    """Type of Rotary Position Embedding to apply.
+    'yarn' — YaRN extended-context RoPE (default for MLA / DeepSeek).
+    'rope' — standard non-scaled RoPE.
+    From Megatron MLATransformerConfig."""
+
+    # ------------------------------------------------------------------
+    # YaRN / standard RoPE hyperparameters
+    # ------------------------------------------------------------------
+    rotary_base: float = 10000.0
+    """Base frequency for RoPE / YaRN rotary embeddings.
+    DeepSeek-V2 uses 10000; some variants use 500000.
+    From Megatron MLATransformerConfig."""
+
+    rotary_percent: float = 1.0
+    """Fraction of head dimensions that receive RoPE (standard RoPE only).
+    Set < 1.0 to apply partial RoPE.  Not used by YaRN.
+    From Megatron MLATransformerConfig."""
+
+    rotary_scaling_factor: float = 40.0
+    """YaRN scaling factor s — controls how aggressively frequencies are
+    extrapolated beyond original_max_position_embeddings.
+    From Megatron MLATransformerConfig."""
+
+    original_max_position_embeddings: int = 4096
+    """The sequence length the base RoPE was trained with.
+    YaRN interpolates frequencies w.r.t. this reference length.
+    From Megatron MLATransformerConfig."""
+
+    beta_fast: float = 32.0
+    """YaRN beta_fast — high-frequency boundary for frequency interpolation.
+    Dimensions with wavelength < 2π * beta_fast are kept unchanged.
+    From Megatron MLATransformerConfig."""
+
+    beta_slow: float = 1.0
+    """YaRN beta_slow — low-frequency boundary for frequency interpolation.
+    Dimensions with wavelength > 2π * beta_slow are fully scaled.
+    From Megatron MLATransformerConfig."""
+
+    mscale: float = 1.0
+    """YaRN magnitude scale factor applied to attention logits.
+    Compensates for the reduced magnitude of extrapolated embeddings.
+    From Megatron MLATransformerConfig."""
+
+    mscale_all_dim: float = 0.0
+    """YaRN mscale factor applied across all head dimensions (not just
+    the positional part).  Set > 0 to enable the full-dimension variant.
+    From Megatron MLATransformerConfig."""
+
+    # ------------------------------------------------------------------
+    # Inference optimisations
+    # ------------------------------------------------------------------
+    cache_mla_latents: bool = False
+    """Cache the low-dimensional latent tensors (c_kv) in the KV cache
+    instead of materialised K and V.  Reduces KV cache memory by ~10x at
+    the cost of extra compute during decode.
+    Requires Flash-MLA to be installed.
+    Only valid for the dynamic inference backend (inference_context mode).
+    From Megatron MLATransformerConfig."""
+
+    mla_down_proj_fusion: bool = False
+    """Enable fused Q/KV down-projection + fused input LayerNorm when the
+    backend supports it (Transformer Engine only).
+    Falls back silently to unfused MLA when False or when the fused kernel
+    is unavailable.
+    From Megatron MLATransformerConfig."""
+
+    # ------------------------------------------------------------------
+    # Post-init validation
+    # ------------------------------------------------------------------
+    def __post_init__(self) -> None:
+        super().__post_init__()
+
+        if self.multi_latent_attention and getattr(self, "apply_rope_fusion", False):
+            if self.rope_type != "yarn":
+                raise ValueError(
+                    "apply_rope_fusion for MLA only works with YaRN RoPE "
+                    f"(rope_type='yarn'), got rope_type={self.rope_type!r}."
+                )
+
+        if getattr(self, "attention_output_gate", False):
+            raise NotImplementedError(
+                "attention_output_gate is not supported for MLATransformerConfig / MLA yet."
+            )
+
+        if self.cache_mla_latents:
+            if getattr(self, "apply_rope_fusion", False):
+                raise ValueError(
+                    "apply_rope_fusion is incompatible with cache_mla_latents=True. "
+                    "Set apply_rope_fusion=False when caching MLA latents."
+                )
+
+        # Derived head-dim consistency checks
+        if self.kv_channels is not None:
+            # kv_channels in standard MHA = hidden_size // num_attention_heads;
+            # for MLA it should equal qk_head_dim + qk_pos_emb_head_dim.
+            expected = self.qk_head_dim + self.qk_pos_emb_head_dim
+            if self.kv_channels != expected:
+                raise ValueError(
+                    f"kv_channels ({self.kv_channels}) must equal "
+                    f"qk_head_dim + qk_pos_emb_head_dim "
+                    f"({self.qk_head_dim} + {self.qk_pos_emb_head_dim} = {expected}) "
+                    "for MLATransformerConfig."
+                )

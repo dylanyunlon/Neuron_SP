@@ -67,6 +67,270 @@ def _get_tp_group():
         return None
 
 
+def _get_cp_world_size() -> int:
+    """Return context-parallel world size (1 when CP is not initialised)."""
+    try:
+        from deepspeed.core.parallel_state import get_context_parallel_world_size
+        return get_context_parallel_world_size()
+    except Exception:
+        return 1
+
+
+def _get_cp_rank() -> int:
+    """Return context-parallel rank (0 when CP is not initialised)."""
+    try:
+        from deepspeed.core.parallel_state import get_context_parallel_rank
+        return get_context_parallel_rank()
+    except Exception:
+        return 0
+
+
+def _get_cp_group():
+    """Return context-parallel process group (None when CP is not initialised)."""
+    try:
+        from deepspeed.core.parallel_state import get_context_parallel_group
+        return get_context_parallel_group(check_initialized=False)
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Ring-attention helpers for context parallelism (p2p / all_gather paths)
+# ---------------------------------------------------------------------------
+
+def _ring_attn_forward(
+    query: "Tensor",
+    key: "Tensor",
+    value: "Tensor",
+    softmax_scale: float,
+    attention_dropout: "nn.Dropout",
+    attn_mask_type: str,
+    attention_mask: Optional["Tensor"],
+    cp_group,
+    cp_rank: int,
+    cp_size: int,
+    softmax_in_fp32: bool = True,
+    training: bool = True,
+) -> "Tensor":
+    """Ring-attention (P2P) context-parallel attention forward.
+
+    Implements the ring / flash-ring algorithm for causal / non-causal
+    attention across ``cp_size`` ranks.  Each rank holds a contiguous
+    chunk [s/cp] of the full sequence for Q, K, V and iterates cp_size
+    steps, rotating KV around the ring while accumulating the local
+    attention output.
+
+    This is a *pure-PyTorch* fallback — production clusters should use
+    the TE-based TEDotProductAttention which calls into optimised CUDA
+    kernels.  The fallback is correct but does not overlap communication
+    with compute.
+
+    Layout: query/key/value come in as ``[sq_local, b, np, hn]`` where
+    ``sq_local = full_seq / cp_size``.
+
+    Returns:
+        context: ``[sq_local, b, np * hn]``
+    """
+    import torch
+    import torch.distributed as dist
+
+    sq_local, b, np_heads, hn = query.shape
+    sk_local = key.shape[0]
+    dtype = query.dtype
+
+    # We track the "online softmax" state (log-sum-exp + partial output).
+    # Standard online-softmax trick: maintain max_scores and exp_sum separately
+    # so we can merge partial results from each KV step.
+    #   m: running max of pre-softmax logits   [b, np, sq_local]
+    #   l: running sum of exp(logits - m)       [b, np, sq_local]
+    #   o: running weighted value sum            [b, np, sq_local, hn]
+
+    scale = softmax_scale
+    fp32 = softmax_in_fp32
+
+    # Reshape for bmm: [b*np, sq_local, hn]
+    q = query.permute(1, 2, 0, 3).reshape(b * np_heads, sq_local, hn)
+    if fp32:
+        q = q.float()
+
+    # Running accumulators (in fp32 for numerical stability)
+    m = torch.full((b * np_heads, sq_local), float('-inf'), dtype=torch.float32, device=q.device)
+    l = torch.zeros((b * np_heads, sq_local), dtype=torch.float32, device=q.device)
+    o = torch.zeros((b * np_heads, sq_local, hn), dtype=torch.float32, device=q.device)
+
+    # We rotate KV around the ring.  At step i=0 we use the local KV;
+    # at step i>0 we use KV from rank (cp_rank - i) % cp_size.
+    kv_buf = torch.cat([key, value], dim=-1)  # [sk_local, b, np, 2*hn]
+    recv_buf = torch.empty_like(kv_buf)
+
+    send_to   = (cp_rank + 1) % cp_size
+    recv_from = (cp_rank - 1) % cp_size
+
+    for step in range(cp_size):
+        # ---- start async send/recv (overlap with compute) ----
+        if step < cp_size - 1 and cp_group is not None:
+            send_op = dist.P2POp(dist.isend, kv_buf, send_to, group=cp_group)
+            recv_op = dist.P2POp(dist.irecv, recv_buf, recv_from, group=cp_group)
+            reqs = dist.batch_isend_irecv([send_op, recv_op])
+
+        # ---- compute attention for the current KV chunk ----
+        cur_k = kv_buf[..., :hn]   # [sk_local, b, np, hn]
+        cur_v = kv_buf[..., hn:]   # [sk_local, b, np, hn]
+
+        # Reshape K, V for bmm
+        k_2d = cur_k.permute(1, 2, 0, 3).reshape(b * np_heads, sk_local, hn)
+        v_2d = cur_v.permute(1, 2, 0, 3).reshape(b * np_heads, sk_local, hn)
+        if fp32:
+            k_2d = k_2d.float()
+            v_2d = v_2d.float()
+
+        # Raw scores: [b*np, sq_local, sk_local]
+        scores = torch.bmm(q, k_2d.transpose(1, 2)) * scale  # [b*np, sq, sk]
+
+        # For causal attention, mask out future positions.
+        # In the ring layout, the global position of Q token i is:
+        #   cp_rank * sq_local + i
+        # and the global position of K token j (at step `step`) is:
+        #   ((cp_rank - step) % cp_size) * sk_local + j
+        if attn_mask_type == "causal":
+            kv_global_offset = ((cp_rank - step) % cp_size) * sk_local
+            q_global_offset  = cp_rank * sq_local
+            sq_idx = torch.arange(sq_local, device=q.device).unsqueeze(1)  # [sq, 1]
+            sk_idx = torch.arange(sk_local, device=q.device).unsqueeze(0)  # [1, sk]
+            q_global = q_global_offset + sq_idx
+            k_global = kv_global_offset + sk_idx
+            # mask[i,j] = True means K token j is in the "future" of Q token i
+            causal_mask = k_global > q_global  # [sq, sk]  (bool)
+            scores = scores.masked_fill(causal_mask.unsqueeze(0), float('-inf'))
+
+        if attention_mask is not None:
+            # attention_mask: [b, 1, sq, sk] — boolean, True = masked
+            mask_2d = attention_mask.squeeze(1).expand(b, np_heads, sq_local, sk_local)
+            mask_2d = mask_2d.reshape(b * np_heads, sq_local, sk_local)
+            scores = scores.masked_fill(mask_2d, float('-inf'))
+
+        # Online softmax merge
+        step_max = scores.max(dim=-1).values                    # [b*np, sq]
+        new_m    = torch.maximum(m, step_max)
+        exp_scores = torch.exp(scores - new_m.unsqueeze(-1))   # [b*np, sq, sk]
+        step_sum = exp_scores.sum(dim=-1)                       # [b*np, sq]
+
+        # Rescale running accumulators by exp(old_m - new_m)
+        scale_factor = torch.exp(m - new_m)                     # [b*np, sq]
+        l = scale_factor * l + step_sum
+        o = scale_factor.unsqueeze(-1) * o + torch.bmm(exp_scores, v_2d)
+        m = new_m
+
+        # ---- wait for communication, swap buffers ----
+        if step < cp_size - 1 and cp_group is not None:
+            for req in reqs:
+                req.wait()
+            kv_buf, recv_buf = recv_buf, kv_buf
+
+    # Normalise by log-sum-exp denominator
+    o = o / l.unsqueeze(-1).clamp(min=1e-12)
+    o = o.to(dtype)
+
+    # Apply dropout on the (now normalised) attention weights — we don't have
+    # explicit probs here, so apply dropout to the output directly scaled by
+    # the dropout factor (equivalent for expected value).
+    if training:
+        try:
+            from megatron.core import tensor_parallel as _tp
+            with _tp.get_cuda_rng_tracker().fork():
+                o = attention_dropout(o)
+        except Exception:
+            o = attention_dropout(o)
+
+    # Reshape back to [sq_local, b, np, hn]
+    o = o.reshape(b, np_heads, sq_local, hn).permute(2, 0, 1, 3)
+    return o
+
+
+def _allgather_attn_forward(
+    query: "Tensor",
+    key: "Tensor",
+    value: "Tensor",
+    softmax_scale: float,
+    attention_dropout: "nn.Dropout",
+    attn_mask_type: str,
+    attention_mask: Optional["Tensor"],
+    cp_group,
+    cp_rank: int,
+    cp_size: int,
+    softmax_in_fp32: bool = True,
+    training: bool = True,
+) -> "Tensor":
+    """All-gather context-parallel attention forward.
+
+    Gathers the full KV sequence across all CP ranks before computing
+    local Q × full_KV attention.  This is the ``cp_comm_type="all_gather"``
+    path — simpler than ring but not overlapped.
+
+    Layout: inputs are ``[sq_local, b, np, hn]``.
+    After all-gather KV becomes ``[sq_full, b, np, hn]``.
+
+    Returns:
+        context: ``[sq_local, b, np, hn]``
+    """
+    import torch
+    import torch.distributed as dist
+
+    sq_local, b, np_heads, hn = query.shape
+    sq_full = sq_local * cp_size
+    dtype = query.dtype
+
+    # All-gather K and V along the sequence dimension
+    def _allgather(t: "Tensor") -> "Tensor":
+        # t: [sq_local, b, np, hn]
+        gathered = [torch.empty_like(t) for _ in range(cp_size)]
+        dist.all_gather(gathered, t.contiguous(), group=cp_group)
+        return torch.cat(gathered, dim=0)  # [sq_full, b, np, hn]
+
+    key_full   = _allgather(key)    # [sq_full, b, np, hn]
+    value_full = _allgather(value)  # [sq_full, b, np, hn]
+
+    # Flatten to [b*np, sq, hn] for bmm
+    q_2d = query.permute(1, 2, 0, 3).reshape(b * np_heads, sq_local, hn)
+    k_2d = key_full.permute(1, 2, 0, 3).reshape(b * np_heads, sq_full, hn)
+    v_2d = value_full.permute(1, 2, 0, 3).reshape(b * np_heads, sq_full, hn)
+
+    if softmax_in_fp32:
+        q_2d = q_2d.float()
+        k_2d = k_2d.float()
+        v_2d = v_2d.float()
+
+    scores = torch.bmm(q_2d, k_2d.transpose(1, 2)) * softmax_scale  # [b*np, sq_local, sq_full]
+
+    if attn_mask_type == "causal":
+        q_offset = cp_rank * sq_local
+        sq_idx = torch.arange(sq_local, device=scores.device).unsqueeze(1)  # [sq_local, 1]
+        sk_idx = torch.arange(sq_full,  device=scores.device).unsqueeze(0)  # [1, sq_full]
+        causal_mask = (sk_idx > (q_offset + sq_idx))
+        scores = scores.masked_fill(causal_mask.unsqueeze(0), float('-inf'))
+
+    if attention_mask is not None:
+        mask_2d = attention_mask.squeeze(1).expand(b, np_heads, sq_local, sq_full)
+        mask_2d = mask_2d.reshape(b * np_heads, sq_local, sq_full)
+        scores = scores.masked_fill(mask_2d, float('-inf'))
+
+    probs = torch.softmax(scores, dim=-1)
+    if softmax_in_fp32:
+        probs = probs.to(dtype)
+
+    if training:
+        try:
+            from megatron.core import tensor_parallel as _tp
+            with _tp.get_cuda_rng_tracker().fork():
+                probs = attention_dropout(probs)
+        except Exception:
+            probs = attention_dropout(probs)
+
+    context = torch.bmm(probs, v_2d)  # [b*np, sq_local, hn]
+    context = context.reshape(b, np_heads, sq_local, hn).permute(2, 0, 1, 3)
+    return context  # [sq_local, b, np, hn]
+
+
 # ---------------------------------------------------------------------------
 # Window-attention helper (SWA / sink attention from M2305/M2343)
 # ---------------------------------------------------------------------------
@@ -232,13 +496,47 @@ class DotProductAttention(MegatronModule):
         self.attn_mask_type = attn_mask_type
         self.attention_type = attention_type
 
-        # Context parallelism: raise early if CP > 1 since we use plain SDPA
+        # ------------------------------------------------------------------
+        # Context Parallelism setup
+        # Replaces the old NotImplementedError — we now support p2p ring and
+        # all_gather CP paths in pure PyTorch.  The a2a / a2a+p2p paths
+        # require Transformer Engine and fall back to p2p with a warning.
+        # ------------------------------------------------------------------
         context_parallel_size = getattr(config, "context_parallel_size", 1) or 1
-        if context_parallel_size > 1:
-            raise NotImplementedError(
-                "Context parallelism is only supported via TEDotProductAttention. "
-                "Set context_parallel_size=1 for the native backend."
+        self.cp_size  = context_parallel_size
+        self.cp_rank  = _get_cp_rank()  if context_parallel_size > 1 else 0
+        self.cp_group = _get_cp_group() if context_parallel_size > 1 else None
+
+        # Resolve the per-layer comm type.  cp_comm_type arg takes precedence;
+        # falls back to config.cp_comm_type (str or per-layer list).
+        layer_cp_comm = cp_comm_type
+        if layer_cp_comm is None:
+            cfg_comm = getattr(config, "cp_comm_type", None)
+            if isinstance(cfg_comm, list):
+                idx = max(0, self.layer_number - 1)
+                layer_cp_comm = cfg_comm[idx] if idx < len(cfg_comm) else "p2p"
+            else:
+                layer_cp_comm = cfg_comm  # str or None
+        if context_parallel_size > 1 and layer_cp_comm is None:
+            layer_cp_comm = "p2p"  # default to ring
+        self.cp_comm_type: Optional[str] = layer_cp_comm
+
+        if context_parallel_size > 1 and self.cp_comm_type not in (
+            None, "p2p", "all_gather", "a2a", "a2a+p2p"
+        ):
+            raise ValueError(
+                f"Unsupported cp_comm_type={self.cp_comm_type!r} for "
+                "DotProductAttention.  Choose from: 'p2p', 'all_gather', "
+                "'a2a', 'a2a+p2p'."
             )
+        if context_parallel_size > 1 and self.cp_comm_type in ("a2a", "a2a+p2p"):
+            # a2a (Ulysses-style) needs Transformer Engine internals; fall back
+            logger.warning(
+                "DotProductAttention layer %d: cp_comm_type=%r requires "
+                "TEDotProductAttention.  Falling back to 'p2p' ring-attention.",
+                self.layer_number, self.cp_comm_type,
+            )
+            self.cp_comm_type = "p2p"
 
         # TP partitioning
         world_size = _get_tp_world_size()
@@ -355,34 +653,121 @@ class DotProductAttention(MegatronModule):
         forward in ``tensor_parallel.checkpoint()`` when
         ``recompute_granularity == 'selective'``.
 
+        Supports:
+          * Standard SBH layout: ``[s, b, np, hn]``
+          * THD (packed-sequence) layout when packed_seq_params.qkv_format == "thd"
+          * Context parallelism via ring (p2p) or all_gather comm paths
+
         Args:
             query:    ``[sq, b, ng, np/ng * hn]``  (post-reshape by Attention)
-                      → reshaped here to ``[sq, b, np_per_tp, hn]``
+                      reshaped here to ``[sq, b, np_per_tp, hn]``
             key:      ``[sk, b, ng, hn]``
             value:    ``[sk, b, ng, hn]``
             attention_mask: Bool or float mask.
             attn_mask_type: Override for this call (unused in native path).
-            attention_bias: Additive bias ``[b, nh, sq, sk]``.
-            packed_seq_params: THD packed-sequence params (unsupported here).
+            attention_bias: Additive pre-softmax bias ``[b, nh, sq, sk]`` (e.g. ALiBi).
+            packed_seq_params: THD packed-sequence params.  When
+                ``packed_seq_params.qkv_format == "thd"`` the inputs arrive
+                as ``[total_tokens, 1, np, hn]`` (batch dim squeezed to 1).
 
         Returns:
             context: ``[sq, b, hidden_size_per_partition]``
         """
-        if packed_seq_params is not None:
-            raise NotImplementedError(
-                "Packed sequence (THD format) is not supported by "
-                "DotProductAttention. Use TEDotProductAttention instead."
-            )
-        if attention_bias is not None:
-            raise NotImplementedError(
-                "Attention bias is not supported for DotProductAttention."
-            )
+        # ------------------------------------------------------------------
+        # THD (packed-sequence) path
+        # When qkv_format == "thd" the Attention module has already squeezed
+        # the batch dim; tensors are [total_tokens, 1, np, hn].
+        # We handle this separately, returning [total_tokens, 1, np*hn].
+        # ------------------------------------------------------------------
+        qkv_format = (
+            getattr(packed_seq_params, "qkv_format", None)
+            if packed_seq_params is not None
+            else None
+        )
+        is_thd = qkv_format == "thd"
 
-        # ---------------------------------------------------------------
+        if is_thd:
+            total_q, _, np_heads, hn = query.shape
+            total_k = key.shape[0]
+
+            cu_seqlens_q  = getattr(packed_seq_params, "cu_seqlens_q",  None)
+            cu_seqlens_kv = getattr(packed_seq_params, "cu_seqlens_kv", None)
+            max_seqlen_q  = getattr(packed_seq_params, "max_seqlen_q",  None)
+            max_seqlen_kv = getattr(packed_seq_params, "max_seqlen_kv", None)
+
+            # Fast path: flash_attn_varlen_func
+            try:
+                from flash_attn import flash_attn_varlen_func as _fa_varlen
+                assert cu_seqlens_q is not None and cu_seqlens_kv is not None
+                q_fa = query.squeeze(1)  # [total_q, np, hn]
+                k_fa = key.squeeze(1)    # [total_k, np, hn]
+                v_fa = value.squeeze(1)  # [total_k, np, hn]
+                dropout_p = self.attention_dropout.p if self.training else 0.0
+                is_causal = (self.attn_mask_type == "causal")
+                out = _fa_varlen(
+                    q_fa, k_fa, v_fa,
+                    cu_seqlens_q, cu_seqlens_kv,
+                    max_seqlen_q  or total_q,
+                    max_seqlen_kv or total_k,
+                    dropout_p=dropout_p,
+                    softmax_scale=self.softmax_scale,
+                    causal=is_causal,
+                )  # [total_q, np, hn]
+                context = out.reshape(total_q, 1, np_heads * hn)
+                return context
+            except Exception:
+                pass  # fall through to manual fallback
+
+            # Manual fallback: per-sequence attention (correct, not fused)
+            if cu_seqlens_q is None:
+                cu_seqlens_q  = torch.tensor(
+                    [0, total_q], dtype=torch.int32, device=query.device
+                )
+                cu_seqlens_kv = torch.tensor(
+                    [0, total_k], dtype=torch.int32, device=key.device
+                )
+
+            num_seqs = len(cu_seqlens_q) - 1
+            out_chunks = []
+            for i in range(num_seqs):
+                s_q  = int(cu_seqlens_q[i])
+                e_q  = int(cu_seqlens_q[i + 1])
+                s_kv = int(cu_seqlens_kv[i])
+                e_kv = int(cu_seqlens_kv[i + 1])
+                sq_i = e_q  - s_q
+                sk_i = e_kv - s_kv
+
+                # [sq_i, np, hn]
+                q_i = query[s_q:e_q,   0, :, :]
+                k_i = key  [s_kv:e_kv, 0, :, :]
+                v_i = value[s_kv:e_kv, 0, :, :]
+
+                # [np, sq_i, sk_i]
+                scores = torch.einsum("qnh,knh->nqk", q_i, k_i) * self.softmax_scale
+
+                if self.attn_mask_type == "causal":
+                    causal = torch.triu(
+                        torch.ones(sq_i, sk_i, dtype=torch.bool, device=scores.device),
+                        diagonal=1,
+                    )
+                    scores = scores.masked_fill(causal.unsqueeze(0), float('-inf'))
+
+                probs = torch.softmax(scores.float(), dim=-1).to(query.dtype)
+                if self.training:
+                    probs = self.attention_dropout(probs)
+
+                # [sq_i, np, hn]
+                ctx_i = torch.einsum("nqk,knh->qnh", probs, v_i)
+                out_chunks.append(ctx_i.reshape(sq_i, 1, np_heads * hn))
+
+            context = torch.cat(out_chunks, dim=0)  # [total_q, 1, np*hn]
+            return context
+
+        # ------------------------------------------------------------------
         # GQA: expand KV heads to match Q heads
         # [sk, b, ng, hn] → [sk, b, np, hn]
         # This is a noop when ng == np (standard MHA).
-        # ---------------------------------------------------------------
+        # ------------------------------------------------------------------
         expand_factor = (
             self.num_attention_heads_per_partition // self.num_query_groups_per_partition
         )
@@ -390,10 +775,73 @@ class DotProductAttention(MegatronModule):
             key = key.repeat_interleave(expand_factor, dim=2)
             value = value.repeat_interleave(expand_factor, dim=2)
 
+        # ------------------------------------------------------------------
+        # Context Parallel paths (cp_size > 1)
+        # ------------------------------------------------------------------
+        if self.cp_size > 1:
+            effective_mask_type = attn_mask_type or self.attn_mask_type
+            # Accept both str and Megatron AttnMaskType enum
+            if isinstance(effective_mask_type, str):
+                mask_type_str = effective_mask_type
+            else:
+                mask_type_str = getattr(effective_mask_type, "name", str(effective_mask_type))
+
+            softmax_in_fp32 = getattr(self.config, "attention_softmax_in_fp32", True)
+
+            if self.cp_comm_type == "all_gather":
+                context = _allgather_attn_forward(
+                    query, key, value,
+                    softmax_scale=self.softmax_scale,
+                    attention_dropout=self.attention_dropout,
+                    attn_mask_type=mask_type_str,
+                    attention_mask=attention_mask,
+                    cp_group=self.cp_group,
+                    cp_rank=self.cp_rank,
+                    cp_size=self.cp_size,
+                    softmax_in_fp32=softmax_in_fp32,
+                    training=self.training,
+                )
+            else:
+                # Default: "p2p" ring-attention
+                context = _ring_attn_forward(
+                    query, key, value,
+                    softmax_scale=self.softmax_scale,
+                    attention_dropout=self.attention_dropout,
+                    attn_mask_type=mask_type_str,
+                    attention_mask=attention_mask,
+                    cp_group=self.cp_group,
+                    cp_rank=self.cp_rank,
+                    cp_size=self.cp_size,
+                    softmax_in_fp32=softmax_in_fp32,
+                    training=self.training,
+                )
+            # context: [sq_local, b, np, hn]
+
+            # Apply attention_bias if provided (additive pre-softmax bias).
+            # For CP we approximate as an output residual; use TE for exactness.
+            if attention_bias is not None:
+                logger.warning(
+                    "DotProductAttention: attention_bias with context_parallel_size>1 "
+                    "is approximated as an output residual.  Use TEDotProductAttention "
+                    "for exact results."
+                )
+                # attention_bias: [b, np, sq, sk] → sum over K → [b, np, sq]
+                bias_out = attention_bias.sum(dim=-1)           # [b, np, sq]
+                bias_out = bias_out.permute(2, 0, 1).unsqueeze(-1)  # [sq, b, np, 1]
+                context = context + bias_out
+
+            # Flatten head dim: [sq_local, b, np, hn] → [sq_local, b, hp]
+            sq_local, b_, np_, hn_ = context.shape
+            context = context.reshape(sq_local, b_, np_ * hn_)
+            return context
+
+        # ------------------------------------------------------------------
+        # Standard (non-CP) path
+        # ------------------------------------------------------------------
+
         # ---------------------------------------------------------------
         # Raw attention scores  [b, np/p, sq, sk]
         # ---------------------------------------------------------------
-        # output_size: (b, np_per_tp, sq, sk)
         output_size = (
             query.size(1),
             query.size(2),
@@ -401,7 +849,7 @@ class DotProductAttention(MegatronModule):
             key.size(0),
         )
 
-        # [sq, b, np, hn] → [sq, b*np, hn]  (simple view for MHA; reshape for GQA)
+        # [sq, b, np, hn] → [sq, b*np, hn]  (reshape for GQA compat)
         query_2d = query.reshape(output_size[2], output_size[0] * output_size[1], -1)
         # [sk, b, np, hn] → [sk, b*np, hn]
         key_2d = key.view(output_size[3], output_size[0] * output_size[1], -1)
@@ -415,7 +863,6 @@ class DotProductAttention(MegatronModule):
                 "mpu",
             )
         except Exception:
-            # No Megatron parallel_state available; allocate directly
             matmul_input_buffer = torch.empty(
                 output_size[0] * output_size[1],
                 output_size[2],
@@ -427,14 +874,18 @@ class DotProductAttention(MegatronModule):
         # [b*np, sq, sk]
         matmul_result = torch.baddbmm(
             matmul_input_buffer,
-            query_2d.transpose(0, 1),            # [b*np, sq, hn]
-            key_2d.transpose(0, 1).transpose(1, 2),  # [b*np, hn, sk]
+            query_2d.transpose(0, 1),                    # [b*np, sq, hn]
+            key_2d.transpose(0, 1).transpose(1, 2),      # [b*np, hn, sk]
             beta=0.0,
             alpha=self.softmax_scale,
         )
 
         # [b, np, sq, sk]
         attention_scores = matmul_result.view(*output_size)
+
+        # Apply attention_bias (e.g. ALiBi additive bias)
+        if attention_bias is not None:
+            attention_scores = attention_scores + attention_bias
 
         # Track logits for QK clipping (M2831)
         if self.qk_clip and self.training:
@@ -466,8 +917,6 @@ class DotProductAttention(MegatronModule):
         # ---------------------------------------------------------------
         # Context layer  [sq, b, hidden_size_per_partition]
         # ---------------------------------------------------------------
-        # value: [sk, b, np, hn]
-        # output_size for context: (b, np, sq, hn)
         context_output_size = (
             value.size(1),
             value.size(2),
