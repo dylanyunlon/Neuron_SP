@@ -11,6 +11,13 @@ from deepspeed.core.transformer.moe.moe_utils import (
     z_loss_func,
 )
 from deepspeed.core.transformer.moe.router import TopKRouter
+from deepspeed.core.transformer.moe.token_dispatcher import (
+    MoEAllGatherTokenDispatcher,
+    MoEAlltoAllTokenDispatcher,
+    MoEFlexTokenDispatcher,
+    MoETokenDispatcher,
+    PCIeAwareAlltoAll,
+)
 
 __all__ = [
     "MoELayer",
@@ -21,4 +28,10 @@ __all__ = [
     "topk_softmax_with_capacity",
     "permute_tokens",
     "unpermute_tokens",
+    # Token dispatchers (ported from Megatron + PCIe-aware A2A)
+    "MoETokenDispatcher",
+    "MoEAllGatherTokenDispatcher",
+    "MoEAlltoAllTokenDispatcher",
+    "MoEFlexTokenDispatcher",
+    "PCIeAwareAlltoAll",
 ]
