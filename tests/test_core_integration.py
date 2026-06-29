@@ -372,3 +372,33 @@ def test_finalize_model_grads_safe_num_tokens_clamp() -> None:
     assert "if num_tokens > 0" not in source, \
         "M4041: host-side 'if num_tokens > 0' branch must be removed — " \
         "breaks CUDA graph capture by triggering a device-to-host sync"
+
+
+# ---------------------------------------------------------------------------
+# Test 9 — M4172: finalize_model_grads call-site passes pg_collection
+#           (regression guard against parallel_state singleton fallback)
+# ---------------------------------------------------------------------------
+
+def test_finalize_model_grads_pg_collection_wired() -> None:
+    """desloc_engine must pass pg_collection to finalize_model_grads (M4172)."""
+    import re
+    engine_path = REPO_ROOT / "deepspeed" / "runtime" / "desloc_engine.py"
+    source = engine_path.read_text()
+
+    # The call must include pg_collection= keyword.
+    pg_kwarg = re.search(r"finalize_model_grads\s*\(.*?pg_collection\s*=", source, re.DOTALL)
+    assert pg_kwarg is not None, (
+        "desloc_engine.py must pass pg_collection= to finalize_model_grads "
+        "(M4172: remove parallel_state singleton dependency)"
+    )
+
+    # The _ddp_dp_group attribute must be persisted on self.
+    assert "self._ddp_dp_group" in source, (
+        "desloc_engine must persist self._ddp_dp_group for pg_collection threading (M4172)"
+    )
+
+    # The pg_collection must include all five required keys.
+    for attr in ("tp=", "pp=", "embd=", "pos_embd=", "dp_cp="):
+        assert attr in source, (
+            f"pg_collection SimpleNamespace in desloc_engine must include '{attr}' (M4172)"
+        )

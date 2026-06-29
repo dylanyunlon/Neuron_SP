@@ -2009,6 +2009,7 @@ class DesLocEngine:
         self._zero3_grad_hook_handles: List = []
         self._grad_bucket_mgr = None
         self._core_ddp: Optional[CoreDDP] = None
+        self._ddp_dp_group = None  # M4172: persisted for pg_collection threading
         if self._dist_optimizer is not None:
             logger.info(
                 "[zero3] core.optimizer.DistributedOptimizer active — "
@@ -2066,6 +2067,10 @@ class DesLocEngine:
                             module=self.model,
                             data_parallel_group=_ddp_dp_group,
                         )
+                    # Persist the DP group so finalize_model_grads can receive
+                    # an explicit pg_collection rather than falling back to
+                    # parallel_state globals (M4172/M4168 pg_collection threading).
+                    self._ddp_dp_group = _ddp_dp_group
                     # Sync back so subsequent ops on the default stream see the
                     # DDP-registered buckets (M2928 correctness requirement).
                     if _ddp_init_stream is not None:
@@ -2683,9 +2688,25 @@ class DesLocEngine:
             # On ZeRO-3: force_all_reduce=True triggers direct allreduce across
             # shard params; on non-ZeRO-3: DDP bucket finish_grad_sync runs.
             # DES-LOC Kx gating: skip_grad_sync=True on non-Kx steps.
+            #
+            # M4172 (Megatron de6305c0a): Thread explicit pg_collection through
+            # so finalize_model_grads does not fall back to parallel_state globals.
+            # We build a minimal SimpleNamespace carrying only the groups that
+            # finalize_model_grads requires; any field left as None will cause
+            # the function to skip the corresponding embedding/SP collectives,
+            # which is correct for the DesLoc single-tier-per-rank design.
             _is_Kx_sync = (step + 1) % self.desloc_Kx == 0
             try:
+                import types as _types  # noqa: PLC0415
                 from deepspeed.core.model_parallel_config import ModelParallelConfig  # noqa: PLC0415
+                _dp_grp = getattr(self, '_ddp_dp_group', None)
+                _fmg_pg = _types.SimpleNamespace(
+                    tp=None,
+                    pp=None,
+                    embd=None,
+                    pos_embd=None,
+                    dp_cp=_dp_grp,
+                ) if _dp_grp is not None else None
                 _fmg_model = [self._core_ddp if self._core_ddp is not None else self.model]
                 finalize_model_grads(
                     model=_fmg_model,
@@ -2693,6 +2714,7 @@ class DesLocEngine:
                     num_tokens=None,
                     skip_grad_sync=not _is_Kx_sync,
                     force_all_reduce=self._dist_optimizer is not None,
+                    pg_collection=_fmg_pg,
                 )
             except Exception as _fmg_exc:  # noqa: BLE001
                 logger.warning(
