@@ -1861,12 +1861,29 @@ class DesLocEngine:
                         use_distributed_optimizer=False,
                         allow_skip_grad_sync=True,  # DES-LOC Kx gating
                     )
-                    self._core_ddp = CoreDDP(
-                        config=_mp_cfg,
-                        ddp_config=_ddp_cfg,
-                        module=self.model,
-                        data_parallel_group=_ddp_dp_group,
-                    )
+                    # From Megatron M2928: wrap DDP init in a dedicated side-stream
+                    # to avoid race conditions that leave parameter buffers empty.
+                    # On PCIe-only topology (no NVLink) the default stream may
+                    # still be draining peer copies when DDP registers its hooks;
+                    # synchronising ensures all tensors are visible before
+                    # bucket registration.  M2940 later reduced the scope of
+                    # this stream to DDP init only (not the full model build),
+                    # which is the pattern we follow here.
+                    _ddp_init_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
+                    if _ddp_init_stream is not None:
+                        _ddp_init_stream.wait_stream(torch.cuda.current_stream())
+                    with (torch.cuda.stream(_ddp_init_stream) if _ddp_init_stream is not None
+                          else __import__("contextlib").nullcontext()):
+                        self._core_ddp = CoreDDP(
+                            config=_mp_cfg,
+                            ddp_config=_ddp_cfg,
+                            module=self.model,
+                            data_parallel_group=_ddp_dp_group,
+                        )
+                    # Sync back so subsequent ops on the default stream see the
+                    # DDP-registered buckets (M2928 correctness requirement).
+                    if _ddp_init_stream is not None:
+                        torch.cuda.current_stream().wait_stream(_ddp_init_stream)
                     logger.info(
                         "[core_ddp] DistributedDataParallel wired: "
                         "dp_group_size=%d, overlap_grad_reduce=%s",
