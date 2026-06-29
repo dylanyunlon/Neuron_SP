@@ -38,3 +38,4 @@ class LayerType(enum.Enum):
     retro_encoder = 3
     retro_decoder = 4
     retro_decoder_with_retriever = 5
+    mtp = 6  # Multi-Token Prediction depth layer (ported from Megatron)

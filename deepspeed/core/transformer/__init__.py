@@ -42,6 +42,24 @@ from deepspeed.core.transformer.attention import (
 )
 from deepspeed.core.transformer.mlp import MLP
 from deepspeed.core.transformer.module import MegatronModule
+from deepspeed.core.transformer.multi_token_prediction import (
+    MultiTokenPredictionLayer,
+    MultiTokenPredictionLayerSubmodules,
+    MultiTokenPredictionBlock,
+    MultiTokenPredictionBlockSubmodules,
+    MTPLossAutoScaler,
+    MTPLossLoggingHelper,
+    process_mtp_loss,
+    roll_tensor,
+    get_mtp_layer_spec,
+    get_mtp_layer_spec_for_backend,
+    get_mtp_layer_offset,
+    get_mtp_num_layers_to_build,
+    get_mtp_ranks,
+    mtp_on_this_rank,
+    tie_word_embeddings_state_dict,
+    tie_output_layer_state_dict,
+)
 
 __all__ = [
     # Configuration
@@ -57,4 +75,21 @@ __all__ = [
     "MLP",
     # Base
     "MegatronModule",
+    # Multi-Token Prediction (MTP)
+    "MultiTokenPredictionLayer",
+    "MultiTokenPredictionLayerSubmodules",
+    "MultiTokenPredictionBlock",
+    "MultiTokenPredictionBlockSubmodules",
+    "MTPLossAutoScaler",
+    "MTPLossLoggingHelper",
+    "process_mtp_loss",
+    "roll_tensor",
+    "get_mtp_layer_spec",
+    "get_mtp_layer_spec_for_backend",
+    "get_mtp_layer_offset",
+    "get_mtp_num_layers_to_build",
+    "get_mtp_ranks",
+    "mtp_on_this_rank",
+    "tie_word_embeddings_state_dict",
+    "tie_output_layer_state_dict",
 ]
