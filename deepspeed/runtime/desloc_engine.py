@@ -348,6 +348,13 @@ class TrainingConfig:
     deepspeed/core/pipeline_parallel/p2p_communication.py for
     cross-grid activation transfer when PP > 1."""
 
+    use_context_parallel: bool = False
+    """Replace the default micro-batch forward/backward loop with
+    hybrid_context_parallel_forward_backward from
+    deepspeed/core/pipeline_parallel/hybrid_cp_schedule.py.
+    Enables variable-length sub-sample packing across the DPxCP domain
+    with balanced workload scheduling. Requires PP=1."""
+
 
 class HeteroRegistry:
     """
@@ -2332,6 +2339,10 @@ class DesLocEngine:
         from deepspeed.runtime.core_adapters import maybe_get_pipeline_forward_backward
         _pipeline_fb_func = maybe_get_pipeline_forward_backward(cfg, default_fn=None)
 
+        # --- Context Parallel schedule adapter (gated by config.use_context_parallel) ---
+        from deepspeed.runtime.core_adapters import maybe_use_hybrid_cp_schedule
+        _cp_fb = maybe_use_hybrid_cp_schedule(cfg)
+
         for step in range(self.global_step, cfg.total_steps):
             # DistributedOptimizer.zero_grad() zeroes its grad_data buffers +
             # shard param grads.  Plain AdamW zero_grad() on the non-ZeRO-3 path.
@@ -2493,16 +2504,34 @@ class DesLocEngine:
                     step_loss += mimo_result.loss
                 else:
                     # Standard forward/backward path
-                    loss, scaled_loss = self.forward(
-                        input_ids, labels, num_microbatches=num_microbatches,
-                    )
-                    scaled_loss.backward()
-                    # --- HeteroFP32GradAccumManager: accumulate (standard path) ---
-                    # Promote BF16 param.grad into FP32 main_grad accumulators
-                    # after each micro-batch backward.
-                    if self.fp32_grad_manager is not None:
-                        self.fp32_grad_manager.accumulate()
-                    step_loss += loss.item()
+                    # If the hybrid CP schedule adapter is active, delegate the
+                    # entire micro-batch forward+backward to it; otherwise fall
+                    # through to the default self.forward() / .backward() pair.
+                    if _cp_fb is not None:
+                        _cp_losses = _cp_fb(
+                            forward_only=False,
+                            p2p_communicator=self.p2p_communicator,
+                            data_iterator=iter([(input_ids, labels)]),
+                            model=self.model,
+                            config=cfg,
+                            iteration=step * num_microbatches + micro,
+                        )
+                        _cp_loss_val = float(_cp_losses[0]) if _cp_losses else 0.0
+                        # --- HeteroFP32GradAccumManager: accumulate (CP path) ---
+                        if self.fp32_grad_manager is not None:
+                            self.fp32_grad_manager.accumulate()
+                        step_loss += _cp_loss_val
+                    else:
+                        loss, scaled_loss = self.forward(
+                            input_ids, labels, num_microbatches=num_microbatches,
+                        )
+                        scaled_loss.backward()
+                        # --- HeteroFP32GradAccumManager: accumulate (standard path) ---
+                        # Promote BF16 param.grad into FP32 main_grad accumulators
+                        # after each micro-batch backward.
+                        if self.fp32_grad_manager is not None:
+                            self.fp32_grad_manager.accumulate()
+                        step_loss += loss.item()
 
             # Post-microbatch: NaN guard
             if not math.isfinite(step_loss):

@@ -8,6 +8,7 @@ Usage in desloc_engine.py:
         maybe_build_core_scheduler,
         maybe_get_pipeline_forward_backward,
         maybe_build_dist_checkpoint_saver,
+        maybe_use_hybrid_cp_schedule,
     )
 """
 from __future__ import annotations
@@ -247,3 +248,144 @@ def maybe_build_bridge_communicator(
     except Exception as exc:
         logger.warning("core_adapter: BridgeCommunicator failed (%s), keeping PCIeP2P", exc)
         return existing_p2p
+
+
+# ---------------------------------------------------------------------------
+# 5. Hybrid Context Parallel schedule adapter
+# ---------------------------------------------------------------------------
+
+def maybe_use_hybrid_cp_schedule(
+    config: Any,
+) -> Optional[Callable]:
+    """If config.use_context_parallel is True, return a wrapper around
+    hybrid_context_parallel_forward_backward that is signature-compatible
+    with desloc_engine's forward_backward_func calls.
+
+    The wrapper signature is::
+
+        _cp_fb(
+            forward_only,
+            p2p_communicator,
+            data_iterator,
+            model,
+            config,
+            iteration,
+        ) -> list[torch.Tensor]   # per-sample losses
+
+    When config.use_context_parallel is False (or the module cannot be
+    imported), returns None so the caller falls back to the default
+    micro-batch loop.
+    """
+    if not getattr(config, "use_context_parallel", False):
+        return None
+
+    try:
+        from deepspeed.core.pipeline_parallel.hybrid_cp_schedule import (
+            hybrid_context_parallel_forward_backward,
+        )
+
+        def _hybrid_cp_wrapper(
+            forward_only: bool,
+            p2p_communicator: Any,
+            data_iterator: Any,
+            model: Any,
+            config: Any,  # TrainingConfig passed at call-site
+            iteration: int,
+        ):
+            """Thin shim that maps desloc_engine's calling convention to
+            hybrid_context_parallel_forward_backward's parameter list.
+
+            Required positional args for hybrid_context_parallel_forward_backward:
+                forward_step_func       – per-sample forward callable
+                data_iterator           – iterator over batches
+                model                   – nn.Module
+                num_microbatches        – total micro-batches in this step
+                input_tensor            – pipeline input (None for PP=1)
+                output_tensor_grad      – upstream grad  (None for PP=1)
+                forward_data_store      – accumulator list (modified in-place)
+                config                  – ModelParallelConfig / TrainingConfig
+                collect_non_loss_data   – bool flag (False in training)
+                first_val_step          – bool (False in training)
+                forward_only            – passed through
+                no_sync_func            – DDP no-sync context manager
+                total_num_tokens        – running token counter (int)
+                check_first_val_step    – callable(first_val_step, fw_only, is_first)
+                model_type              – str tag for schedule variant selection
+            """
+            # Resolve model-parallel config for no_sync_func.
+            # When CoreDDP is active it provides a no_sync() context manager;
+            # otherwise we use a no-op context so the shim is safe in all modes.
+            import contextlib
+
+            _no_sync_fn: Callable
+            if hasattr(model, "no_sync"):
+                _no_sync_fn = model.no_sync
+            else:
+                @contextlib.contextmanager
+                def _noop_sync():
+                    yield
+                _no_sync_fn = _noop_sync
+
+            # forward_data_store accumulates per-sample loss tensors returned
+            # by forward_step_func.  We create a fresh list each call so that
+            # the caller (desloc_engine) can read back the losses.
+            _fwd_store: list = []
+
+            # Resolve num_microbatches from the config when possible.
+            _num_mb = getattr(config, "num_microbatches", 1)
+
+            # Minimal forward_step_func compatible with hybrid_cp's expectations:
+            # must return (loss_tensor, num_tokens_tensor).
+            def _forward_step(data_iter, _model):
+                import torch
+                batch = next(data_iter)
+                if isinstance(batch, dict):
+                    input_ids = batch["tokens"]
+                    labels = batch.get("labels")
+                else:
+                    input_ids, labels = batch[0], (batch[1] if len(batch) > 1 else None)
+                # Use model's own forward; assume it returns a scalar loss.
+                if labels is not None:
+                    loss = _model(input_ids, labels)
+                else:
+                    loss = _model(input_ids)
+                # Scalar loss → 0-dim tensor; token count ≈ sequence length
+                if not isinstance(loss, tuple):
+                    loss_t = loss if isinstance(loss, type(loss)) and hasattr(loss, "shape") else loss
+                else:
+                    loss_t = loss[0]
+                seq_len = input_ids.shape[-1]
+                import torch as _t
+                num_tokens = _t.tensor(seq_len, dtype=_t.int64, device=input_ids.device)
+                _fwd_store.append(loss_t.detach())
+                return loss_t, num_tokens
+
+            hybrid_context_parallel_forward_backward(
+                forward_step_func=_forward_step,
+                data_iterator=data_iterator,
+                model=model,
+                num_microbatches=_num_mb,
+                input_tensor=None,          # PP=1: no pipeline input tensor
+                output_tensor_grad=None,    # PP=1: no upstream gradient
+                forward_data_store=_fwd_store,
+                config=config,
+                collect_non_loss_data=False,
+                first_val_step=False,
+                forward_only=forward_only,
+                no_sync_func=_no_sync_fn,
+                total_num_tokens=0,
+                check_first_val_step=lambda fvs, fw, is_first: is_first,
+                model_type="decoder",
+            )
+
+            return _fwd_store
+
+        logger.info("core_adapter: hybrid_context_parallel_forward_backward active")
+        return _hybrid_cp_wrapper
+
+    except Exception as exc:
+        logger.warning(
+            "core_adapter: hybrid_cp_schedule failed (%s), fallback to default microbatch loop",
+            exc,
+        )
+        return None
