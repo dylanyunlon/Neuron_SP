@@ -173,11 +173,17 @@ try:
         TELinear,
         set_save_original_input,
     )
+    try:
+        from transformer_engine.pytorch.cpp_extensions import get_workspace as _te_get_workspace
+    except ImportError:
+        # From Megatron M3457: get_workspace is optional in newer TE versions
+        _te_get_workspace = None
 except ImportError:
     HAVE_TE = False
     SplitAlongDim = None        # type: ignore[assignment]
     TELinear = None             # type: ignore[assignment]
     set_save_original_input = None  # type: ignore[assignment]
+    _te_get_workspace = None    # type: ignore[assignment]
 
 # YaRN mscale helper
 try:

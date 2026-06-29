@@ -572,3 +572,44 @@ class BlendedDataset(Dataset):
 
 
 __all__ = ["GPTDatasetConfig", "GPTDataset", "BlendedDataset"]
+
+
+# ---------------------------------------------------------------------------
+# Fix M3552: DataLoader worker GPU FD leak
+# ---------------------------------------------------------------------------
+
+import os as _os
+import glob as _glob
+
+
+def _close_inherited_gpu_fds() -> None:
+    """Close GPU device FDs inherited from parent in DataLoader worker processes.
+
+    From Megatron M3552 (PR #3684): forked DataLoader workers inherit open
+    CUDA device FDs (/dev/nvidia*, nvidiactl, nvidia-uvm) from the parent.
+    On some driver versions this causes memory leaks or incorrect device counts.
+    Call at the start of worker_init_fn before any CUDA operation.
+    """
+    for fd_path in _glob.glob('/proc/self/fd/*'):
+        try:
+            link = _os.readlink(fd_path)
+            if any(x in link for x in ('/dev/nvidia', 'nvidiactl', 'nvidia-uvm')):
+                _os.close(int(_os.path.basename(fd_path)))
+        except Exception:
+            pass
+
+
+def build_dataloader_worker_init_fn(seed: int = 0):
+    """Return a DataLoader worker_init_fn closing GPU FDs and seeding RNG.
+
+    From Megatron M3552: must close inherited GPU FDs before any CUDA call
+    in the forked worker process.
+
+    Usage::
+        loader = DataLoader(dataset, worker_init_fn=build_dataloader_worker_init_fn(seed=42))
+    """
+    def _init(worker_id: int) -> None:
+        _close_inherited_gpu_fds()
+        import torch
+        torch.manual_seed(seed + worker_id)
+    return _init
