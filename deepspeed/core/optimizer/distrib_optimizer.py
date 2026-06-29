@@ -102,13 +102,15 @@ def clip_grad_norm(
             grads.append(grad.detach())
 
     norm_type = float(norm_type)
-    # Insight I1: unconditional collective (Megatron M2316 lesson)
-    # Always use CUDA device so all ranks participate in the collective even
-    # when this rank's shard is empty. An `if grads else cpu` fallback silently
-    # skips the all_reduce on empty ranks, causing a collective hang under
-    # heterogeneous sharding (e.g. 2xA6000 + 1xH100 where some shards are 0-len).
-    _cuda_device = torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu")
-    device = grads[0].device if grads else _cuda_device
+    # From Megatron M2316: always use CUDA device for norm tensor so all ranks
+    # participate in all_reduce with the same device type. Using CPU on empty-grad
+    # ranks while others use CUDA causes mixed-device collective errors/hangs.
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif grads:
+        device = grads[0].device
+    else:
+        device = torch.device("cpu")
 
     if norm_type == float("inf"):
         local_norm = max(g.abs().max().item() for g in grads) if grads else 0.0
