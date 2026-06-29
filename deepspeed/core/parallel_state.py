@@ -229,6 +229,72 @@ def update_pg_timeout(
             raise
 
 
+def update_pg_timeout_per_tier(
+    intra_tier_timeout: timedelta,
+    inter_tier_timeout: timedelta,
+) -> None:
+    """Update NCCL timeouts with per-tier granularity for DES-LOC topologies.
+
+    In heterogeneous topologies (2xA6000 + 1xH100 + 2xBlackwell PCIe),
+    the same collective completes in very different times depending on whether
+    it crosses tier boundaries (slow PCIe) or stays within a tier (fast NVLink
+    or local bus). A single global timeout causes false positives on slow paths
+    or misses real hangs on fast paths.
+
+    - intra_tier_timeout: for PGs whose members all fall within one hardware tier
+    - inter_tier_timeout: for PGs spanning multiple tiers (DP, PP cross-tier).
+      Should be 3-5x intra_tier_timeout.
+
+    From Megatron M2674: EP group was missing timeout; we generalise the fix
+    to make timeout a per-tier first-class concept rather than a global setting.
+
+    Args:
+        intra_tier_timeout: timeout for same-tier process groups.
+        inter_tier_timeout: timeout for cross-tier process groups.
+    """
+    global _global_process_group_list, _TIER_GROUPS
+    if _global_process_group_list is None:
+        logger.warning("update_pg_timeout_per_tier: called before initialize_model_parallel()")
+        return
+
+    import torch.distributed as _dist
+
+    # Build set of ranks per tier from _TIER_GROUPS
+    tier_rank_sets = []
+    if _TIER_GROUPS:
+        for tier_name, pg in _TIER_GROUPS.items():
+            try:
+                tier_rank_sets.append(set(_dist.get_process_group_ranks(pg)))
+            except Exception:
+                pass
+
+    updated_intra = updated_inter = 0
+    for pg in _global_process_group_list:
+        if pg is None:
+            continue
+        try:
+            pg_ranks = set(_dist.get_process_group_ranks(pg))
+            is_intra = (
+                any(pg_ranks.issubset(ts) for ts in tier_rank_sets)
+                if tier_rank_sets else False
+            )
+            timeout = intra_tier_timeout if is_intra else inter_tier_timeout
+            if hasattr(torch.distributed.distributed_c10d, "_set_pg_timeout"):
+                torch.distributed.distributed_c10d._set_pg_timeout(timeout, pg)
+            if is_intra:
+                updated_intra += 1
+            else:
+                updated_inter += 1
+        except Exception as exc:
+            logger.warning("update_pg_timeout_per_tier: skipping pg: %s", exc)
+
+    logger.info(
+        "update_pg_timeout_per_tier: intra=%s (%d PGs), inter=%s (%d PGs)",
+        intra_tier_timeout, updated_intra, inter_tier_timeout, updated_inter,
+    )
+    # From Megatron M2674: generalise timeout fix to per-tier for DES-LOC
+
+
 def _torch_version_ge(major: int, minor: int) -> bool:
     """Return True if torch.__version__ >= major.minor (ignores patch/pre-release)."""
     try:
