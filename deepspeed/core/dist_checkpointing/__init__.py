@@ -13,13 +13,9 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 
-# From Megatron M2620: Add BytesIO to safe_globals so that torch.load
-# with weights_only=True does not fail when BytesIO objects are in the
-# checkpoint. This mirrors megatron.core.safe_globals.SAFE_GLOBALS.
-try:
-    torch.serialization.add_safe_globals([io.BytesIO])
-except Exception:
-    pass  # older PyTorch versions do not have add_safe_globals
+# From Megatron M2620: delegate to central safe_globals registry.
+from deepspeed.core.safe_globals import register_safe_globals as _rsg
+_rsg()
 
 # Insight I4: versioned checkpoint schema (Megatron ab-3.3)
 # Re-export CheckpointManifest and its I/O helpers so callers can do:

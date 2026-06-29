@@ -571,9 +571,6 @@ class BlendedDataset(Dataset):
             logger.warning("[BlendedDataset] Could not save blending indices: %s", exc)
 
 
-__all__ = ["GPTDatasetConfig", "GPTDataset", "BlendedDataset"]
-
-
 # ---------------------------------------------------------------------------
 # Fix M3552: DataLoader worker GPU FD leak
 # ---------------------------------------------------------------------------
@@ -613,3 +610,66 @@ def build_dataloader_worker_init_fn(seed: int = 0):
         import torch
         torch.manual_seed(seed + worker_id)
     return _init
+
+
+# ---------------------------------------------------------------------------
+# DataLoader factory with per-worker signal handling
+# ---------------------------------------------------------------------------
+
+def build_pretraining_data_loader(
+    dataset: Dataset,
+    batch_size: int,
+    num_workers: int = 4,
+    seed: int = 42,
+    exit_signal: Optional[int] = None,
+) -> "torch.utils.data.DataLoader":
+    """Build a DataLoader with graceful signal handling in workers.
+
+    From Megatron M2639: DataLoader workers run in separate processes and miss
+    SIGTERM when the main process dies (e.g. A6000 OOM in a DES-LOC job).
+    Without a signal handler they become zombies holding shared-memory buffers,
+    blocking the next training restart.
+
+    Args:
+        dataset:      Dataset instance (GPTDataset, BlendedDataset, etc.).
+        batch_size:   Per-rank micro-batch size.
+        num_workers:  Number of worker processes (0 = main-process loading).
+        seed:         Base RNG seed; each worker uses seed + worker_id.
+        exit_signal:  If set, workers exit cleanly on this signal number.
+                      Typically signal.SIGUSR1 or signal.SIGTERM.
+    """
+    import torch.utils.data as _tdata
+
+    worker_init_fn = None
+    if exit_signal is not None and num_workers > 0:
+        _sig = exit_signal
+
+        def _worker_init(worker_id: int) -> None:
+            import signal as _sig_mod
+            import numpy as _np
+            _np.random.seed(seed + worker_id)
+            def _exit_handler(signum, frame):
+                raise SystemExit(0)
+            try:
+                _sig_mod.signal(_sig, _exit_handler)
+            except (OSError, ValueError):
+                pass  # not supported in this context
+        worker_init_fn = _worker_init
+
+    return _tdata.DataLoader(
+        dataset,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        pin_memory=True,
+        worker_init_fn=worker_init_fn,
+        persistent_workers=(num_workers > 0),
+    )
+
+
+__all__ = [
+    "GPTDatasetConfig",
+    "GPTDataset",
+    "BlendedDataset",
+    "build_dataloader_worker_init_fn",
+    "build_pretraining_data_loader",
+]
