@@ -45,11 +45,16 @@ def load(sharded_state_dict: ShardedStateDict,
         sharded_strategy: configures loading behavior for sharded tensors
         common_strategy: configures loading behavior for common data
     """
-    if common_strategy is not None:
-        raise NotImplementedError('The only supported common strategy is torch')
-
     checkpoint_dir = Path(checkpoint_dir)
-    common_state_dict = load_common_state_dict(checkpoint_dir)
+
+    if common_strategy is not None:
+        # Delegate to the caller-supplied common strategy.  The strategy must
+        # implement LoadCommonStrategy.load(checkpoint_dir) and return a plain
+        # state dict.  All subsequent logic (sharded loading, merging) proceeds
+        # as normal with the returned common state dict.
+        common_state_dict = common_strategy.load(checkpoint_dir)
+    else:
+        common_state_dict = load_common_state_dict(checkpoint_dir)
     if not sharded_state_dict:
         return common_state_dict
 
@@ -112,7 +117,21 @@ def save(sharded_state_dict: ShardedStateDict,
                 f'Checkpoint destination directory ({checkpoint_dir}) is not empty')
 
     if common_strategy is not None:
-        raise NotImplementedError('The only supported common strategy is torch')
+        # Use the caller-supplied common strategy to persist the non-sharded
+        # portion of the state dict.  The strategy must implement
+        # SaveCommonStrategy.save(state_dict, checkpoint_dir).  After calling
+        # it we fall through to the sharded-tensor saving logic below.
+        sharded_state_dict, state_dict = extract_sharded_tensors_or_nonpersistent(sharded_state_dict)
+        sharded_state_dict, _ = extract_sharded_tensors(sharded_state_dict)
+        sharded_tensors = list(nested_values(sharded_state_dict))
+        validate_sharding_integrity(sharded_tensors)
+        common_strategy.save(state_dict, checkpoint_dir)
+        if sharded_strategy is None:
+            sharded_strategy = get_default_strategy(StrategyAction.SAVE_SHARDED, 'zarr', 1)
+        sharded_strategy.save(sharded_tensors, checkpoint_dir)
+        save_config(CheckpointingConfig(sharded_strategy.backend, sharded_strategy.version),
+                    checkpoint_dir)
+        return
 
     if sharded_strategy is None:
         sharded_strategy = get_default_strategy(StrategyAction.SAVE_SHARDED, 'zarr', 1)

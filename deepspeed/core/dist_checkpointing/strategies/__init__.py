@@ -2,6 +2,9 @@
 
 """ Various loading and saving strategies """
 
+# Always register the plain torch strategy (no optional deps required).
+from . import torch  # noqa: F401  registers default_strategies entries
+
 try:
     import zarr
     import tensorstore
