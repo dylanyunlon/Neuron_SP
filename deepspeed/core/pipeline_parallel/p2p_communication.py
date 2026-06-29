@@ -750,3 +750,155 @@ __all__ = [
     "_batched_p2p_ops",
     "_p2p_ops",
 ]
+
+
+# --- BridgeCommunicator (ported from Megatron M2349+M2417) ---
+
+import enum
+import torch
+import torch.distributed as dist
+from typing import Optional
+
+
+class CommRole(enum.Enum):
+    SENDER = "sender"
+    RECEIVER = "receiver"
+    BOTH = "both"
+    NONE = "none"
+
+
+class BridgeCommunicator:
+    def __init__(self, model_parallel_config, bridge_pg, my_role: CommRole, peer_rank: int, tensor_ndim: int = 3):
+        """
+        bridge_pg: 跨grid的torch.distributed ProcessGroup
+        my_role: CommRole
+        peer_rank: 对端rank（全局rank）
+        tensor_ndim: 激活tensor维度(一般3: [seq, batch, hidden])
+        """
+        self.config = model_parallel_config
+        self.bridge_pg = bridge_pg
+        self.my_role = my_role
+        self.peer_rank = peer_rank
+        self.tensor_ndim = tensor_ndim
+
+        # 根据config决定通信dtype
+        if hasattr(model_parallel_config, 'pipeline_dtype') and model_parallel_config.pipeline_dtype is not None:
+            self.dtype = model_parallel_config.pipeline_dtype
+        elif hasattr(model_parallel_config, 'params_dtype'):
+            self.dtype = model_parallel_config.params_dtype
+        else:
+            self.dtype = torch.bfloat16
+
+        self._shape_buf = torch.zeros(tensor_ndim, dtype=torch.int64)
+
+    def _send_tensor(self, tensor: torch.Tensor) -> None:
+        """发送tensor：先发shape，再发data（异步，等待完成）"""
+        shape = torch.tensor(tensor.shape, dtype=torch.int64)
+        # 发shape
+        req_shape = dist.isend(shape, dst=self.peer_rank, group=self.bridge_pg)
+        req_shape.wait()
+        # 发data（确保contiguous且dtype正确）
+        data = tensor.contiguous().to(self.dtype)
+        req_data = dist.isend(data, dst=self.peer_rank, group=self.bridge_pg)
+        req_data.wait()
+
+    def _recv_tensor(self) -> torch.Tensor:
+        """接收tensor：先收shape，再收data（异步，等待完成）"""
+        shape_buf = torch.zeros(self.tensor_ndim, dtype=torch.int64)
+        req_shape = dist.irecv(shape_buf, src=self.peer_rank, group=self.bridge_pg)
+        req_shape.wait()
+        shape = tuple(shape_buf.tolist())
+        data_buf = torch.empty(shape, dtype=self.dtype)
+        req_data = dist.irecv(data_buf, src=self.peer_rank, group=self.bridge_pg)
+        req_data.wait()
+        return data_buf
+
+    def send_forward(self, tensor: torch.Tensor) -> None:
+        """发送前向激活给对端"""
+        assert self.my_role in (CommRole.SENDER, CommRole.BOTH), \
+            f"send_forward called but role is {self.my_role}"
+        self._send_tensor(tensor)
+
+    def recv_forward(self) -> torch.Tensor:
+        """接收对端的前向激活"""
+        assert self.my_role in (CommRole.RECEIVER, CommRole.BOTH), \
+            f"recv_forward called but role is {self.my_role}"
+        return self._recv_tensor()
+
+    def send_backward(self, tensor: torch.Tensor) -> None:
+        """发送反向梯度给对端"""
+        assert self.my_role in (CommRole.RECEIVER, CommRole.BOTH), \
+            f"send_backward called but role is {self.my_role}"
+        self._send_tensor(tensor)
+
+    def recv_backward(self) -> torch.Tensor:
+        """接收对端的反向梯度"""
+        assert self.my_role in (CommRole.SENDER, CommRole.BOTH), \
+            f"recv_backward called but role is {self.my_role}"
+        return self._recv_tensor()
+
+    def send_forward_recv_backward(self, tensor: torch.Tensor) -> torch.Tensor:
+        """
+        同时发前向激活 + 收反向梯度（BOTH角色，或SENDER在pipeline边界）
+        先异步发shape+data，再异步收shape+data，overlap通信。
+        """
+        assert self.my_role in (CommRole.SENDER, CommRole.BOTH), \
+            f"send_forward_recv_backward called but role is {self.my_role}"
+
+        # --- 发送前向：先发shape ---
+        send_shape = torch.tensor(tensor.shape, dtype=torch.int64)
+        req_send_shape = dist.isend(send_shape, dst=self.peer_rank, group=self.bridge_pg)
+
+        # --- 接收反向：先收shape ---
+        recv_shape_buf = torch.zeros(self.tensor_ndim, dtype=torch.int64)
+        req_recv_shape = dist.irecv(recv_shape_buf, src=self.peer_rank, group=self.bridge_pg)
+
+        req_send_shape.wait()
+        req_recv_shape.wait()
+
+        # --- 发送前向：发data ---
+        send_data = tensor.contiguous().to(self.dtype)
+        req_send_data = dist.isend(send_data, dst=self.peer_rank, group=self.bridge_pg)
+
+        # --- 接收反向：收data ---
+        recv_shape = tuple(recv_shape_buf.tolist())
+        recv_buf = torch.empty(recv_shape, dtype=self.dtype)
+        req_recv_data = dist.irecv(recv_buf, src=self.peer_rank, group=self.bridge_pg)
+
+        req_send_data.wait()
+        req_recv_data.wait()
+
+        return recv_buf
+
+    def recv_forward_send_backward(self, tensor: torch.Tensor) -> torch.Tensor:
+        """
+        同时收前向激活 + 发反向梯度（BOTH角色，或RECEIVER在pipeline边界）
+        先异步收shape+data，再异步发shape+data，overlap通信。
+        """
+        assert self.my_role in (CommRole.RECEIVER, CommRole.BOTH), \
+            f"recv_forward_send_backward called but role is {self.my_role}"
+
+        # --- 接收前向：先收shape ---
+        recv_shape_buf = torch.zeros(self.tensor_ndim, dtype=torch.int64)
+        req_recv_shape = dist.irecv(recv_shape_buf, src=self.peer_rank, group=self.bridge_pg)
+
+        # --- 发送反向：先发shape ---
+        send_shape = torch.tensor(tensor.shape, dtype=torch.int64)
+        req_send_shape = dist.isend(send_shape, dst=self.peer_rank, group=self.bridge_pg)
+
+        req_recv_shape.wait()
+        req_send_shape.wait()
+
+        # --- 接收前向：收data ---
+        recv_shape = tuple(recv_shape_buf.tolist())
+        recv_buf = torch.empty(recv_shape, dtype=self.dtype)
+        req_recv_data = dist.irecv(recv_buf, src=self.peer_rank, group=self.bridge_pg)
+
+        # --- 发送反向：发data ---
+        send_data = tensor.contiguous().to(self.dtype)
+        req_send_data = dist.isend(send_data, dst=self.peer_rank, group=self.bridge_pg)
+
+        req_recv_data.wait()
+        req_send_data.wait()
+
+        return recv_buf

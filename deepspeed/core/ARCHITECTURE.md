@@ -77,3 +77,45 @@ Each module must expose hooks for the DES-LOC engine:
 - `transformer/attention.py`: sequence dim must be shardable via A2A
 - `parallel_state.py`: must support SP process groups alongside TP/PP/DP
 - `tensor_parallel/`: must route A2A through SP groups when SP is active
+
+## Phase 2 Task Assignments (skeleton → implementation)
+
+Each task reads the FULL evolution history of the corresponding Megatron module
+(from first commit to HEAD), then fills the skeleton implementation. NO new
+`hetero_xxx.py` files. All code goes into existing files.
+
+### Task A: recompute.py + fusions/
+- Megatron source: `megatron/core/recompute.py`, `megatron/core/fusions/`
+- Skeleton: `deepspeed/core/recompute.py`, `deepspeed/core/fusions/`
+- Key: tier-aware activation checkpointing (A6000=full recompute, H100=selective)
+- Must integrate with: `transformer/transformer_layer.py` forward pass
+
+### Task B: optimizer_param_scheduler.py
+- Megatron source: `megatron/core/optimizer_param_scheduler.py`
+- Skeleton: `deepspeed/core/optimizer_param_scheduler.py`
+- Key: cosine/WSD LR schedule with per-tier LR multiplier
+- Must integrate with: `optimizer/distrib_optimizer.py`, `desloc_engine.py`
+
+### Task C: distrib_optimizer.py completion
+- Megatron source: `megatron/core/optimizer/distrib_optimizer.py` (4700+ lines)
+- Target: `deepspeed/core/optimizer/distrib_optimizer.py` (current 3886 lines)
+- Key: verify grad bucket allreduce, param shard sync, CPU offload
+- Must verify: compatible with `zero3_hetero_shard.py` and `hetero_optimizer_router.py`
+
+### Task D: pipeline_parallel/schedules.py completion
+- Megatron source: `megatron/core/pipeline_parallel/schedules.py`
+- Target: `deepspeed/core/pipeline_parallel/schedules.py` (current 2314 lines)
+- Key: interleaved 1F1B, unequal micro-batch per stage (critical for hetero PP)
+- Must integrate with: `desloc_engine.py` training loop
+
+### Task E: distributed/ finalize_model_grads.py audit
+- Megatron source: `megatron/core/distributed/finalize_model_grads.py`
+- Target: `deepspeed/core/distributed/finalize_model_grads.py`
+- Key: Kx sync gating, PCIe-aware allreduce fusion
+- Must verify: no gradient norm mismatch between tiers
+
+### Task F: dist_checkpointing/ completion
+- Megatron source: `megatron/core/dist_checkpointing/` (full directory)
+- Target: `deepspeed/core/dist_checkpointing/`
+- Key: async save, per-tier state sharding, resume from heterogeneous layout
+- Must integrate with: `checkpoint/hetero_async_checkpoint_save.py`
