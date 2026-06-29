@@ -55,6 +55,20 @@ from deepspeed.core.optimizer.distrib_optimizer import (
     # LR logging helper (From Megatron M3286)
     get_canonical_lr_for_logging,
 )
+# From Megatron M3811: parameter layout dataclasses and padding helpers.
+# These are consumed by DDP buffer construction and the NVFP4 packed layout
+# path in param_and_grad_buffer.py, which imports them directly from
+# deepspeed.core.optimizer.param_layout (or megatron.core.optimizer.param_layout
+# with a no-op ImportError fallback).
+from deepspeed.core.optimizer.param_layout import (
+    BufferKey,
+    PerBufferParamLayout,
+    FullParamLayout,
+    pad_param_start,
+    pad_bucket_end,
+    pad_to_divisor,
+    bucket_end_divisor,
+)
 
 # Megatron optimizer wrappers ported to deepspeed.core (optimizer.py)
 from deepspeed.core.optimizer.optimizer import (
@@ -142,4 +156,12 @@ __all__ = [
     "param_group_identifier_keys",
     "_zero_grad_group_helper",
     "_multi_tensor_copy_this_to_that",
+    # From Megatron M3811: param layout dataclasses + padding helpers
+    "BufferKey",
+    "PerBufferParamLayout",
+    "FullParamLayout",
+    "pad_param_start",
+    "pad_bucket_end",
+    "pad_to_divisor",
+    "bucket_end_divisor",
 ]

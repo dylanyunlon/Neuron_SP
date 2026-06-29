@@ -2528,11 +2528,20 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         per_bucket_numel_unpadded: List[int],
         bucket_indices: List[Tuple[int, int]],
         data_parallel_world_size: int,
+        pad_for_high_nccl_busbw: bool = False,
     ) -> Tuple[int, int]:
         """Finalise one bucket: record unpadded numel, compute padded end, append.
 
-        Pads the bucket end to the nearest multiple of ``data_parallel_world_size``
-        so that each rank gets an equal slice during reduce-scatter / all-gather.
+        Pads the bucket end to lcm(dp_world_size, 128) so that:
+          - reduce-scatter slices divide evenly across DP ranks, and
+          - the bucket is at minimum 128-element aligned for NCCL efficiency.
+
+        When ``pad_for_high_nccl_busbw`` is True the divisor is extended to
+        lcm(dp_world_size, 128, 2^16) for peak NCCL bus-bandwidth on large-
+        message collectives.
+
+        Upgraded from plain ``dp_world_size`` alignment to
+        ``lcm(dp_size, 128)`` in M3811 (Megatron 55b8111ad / c6a886ed).
 
         Args:
             param_end_index:           Unpadded end index of last param in bucket.
@@ -2541,14 +2550,18 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             per_bucket_numel_unpadded: List to append unpadded numel to.
             bucket_indices:            List to append (start, padded_end) to.
             data_parallel_world_size:  DP world size (for alignment).
+            pad_for_high_nccl_busbw:  Extend alignment to 2^16 (default False).
 
         Returns:
             (padded_bucket_end, next_bucket_id) pair.
         """
+        from .param_layout import pad_bucket_end as _pad_bucket_end
         numel_unpadded = param_end_index - bucket_start_index
         per_bucket_numel_unpadded.append(numel_unpadded)
-        # Pad to DP-world-size multiple.
-        padded_end = _round_up(param_end_index, data_parallel_world_size)
+        # Pad to lcm(dp_world_size, 128) — matches Megatron M3811 pad_bucket_end.
+        padded_end = _pad_bucket_end(
+            param_end_index, data_parallel_world_size, pad_for_high_nccl_busbw
+        )
         bucket_indices.append((bucket_start_index, padded_end))
         return padded_end, bucket_id + 1
 
@@ -2557,6 +2570,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         params: List[torch.nn.Parameter],
         bucket_size: Optional[int],
         data_parallel_world_size: int,
+        pad_for_high_nccl_busbw: bool = False,
     ) -> Dict:
         """Compute flat-buffer param layout (index map + bucket boundaries).
 
@@ -2565,14 +2579,24 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         buckets when the accumulated size exceeds ``bucket_size`` or a param
         requires its own bucket.
 
+        Alignment rules (matching Megatron M3811 / param_layout.py):
+          - Each param start is aligned to a **64-element** boundary via
+            ``pad_param_start`` so that every parameter lives on a
+            cache-line-friendly address inside the flat buffer.
+          - Each bucket end is aligned to ``lcm(dp_world_size, 128)`` (or
+            ``lcm(dp_world_size, 128, 2^16)`` when
+            ``pad_for_high_nccl_busbw=True``) via ``_finalize_bucket``.
+
         Params that require new buckets (shared embeddings) are isolated.
-        Each bucket end is padded to be divisible by ``data_parallel_world_size``.
 
         Args:
             params:                    Parameters to lay out.
             bucket_size:               Approx max elements per bucket;
                                        ``None`` → single bucket.
             data_parallel_world_size:  For bucket-end alignment.
+            pad_for_high_nccl_busbw:  When True, extend bucket-end alignment
+                                       to ``lcm(dp_size, 128, 2^16)`` for
+                                       peak NCCL bus-bandwidth. Default False.
 
         Returns:
             Dict with keys:
@@ -2580,6 +2604,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
               - ``bucket_indices``:  [(start, end), ...] per bucket.
               - ``per_bucket_numel_unpadded``: unpadded numel per bucket.
         """
+        from .param_layout import pad_param_start as _pad_param_start
+
         param_index_map: Dict[torch.nn.Parameter, Tuple[int, int, int]] = {}
         bucket_indices: List[Tuple[int, int]] = []
         per_bucket_numel_unpadded: List[int] = []
@@ -2597,9 +2623,14 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 per_bucket_numel_unpadded,
                 bucket_indices,
                 data_parallel_world_size,
+                pad_for_high_nccl_busbw,
             )
 
         for param in params[::-1]:
+            # M3811: align each param start to a 64-element boundary so params
+            # begin on cache-line-friendly addresses within the flat buffer.
+            param_start_index = _pad_param_start(param_start_index)
+
             # Split shared embedding params into a separate bucket.
             if DistributedOptimizer._does_param_require_new_bucket(param) and bucket_params:
                 bucket_start_index, bucket_id = _finalize(
@@ -2607,6 +2638,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 )
                 bucket_params = set()
                 param_start_index = bucket_start_index
+                # Re-align after bucket boundary advance.
+                param_start_index = _pad_param_start(param_start_index)
 
             param_numel = param.data.nelement()
             param_end_index = param_start_index + param_numel
@@ -2641,6 +2674,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         bucket_size: Optional[int],
         data_parallel_world_size: int,
         optimizer_config=None,
+        ddp_config=None,
     ) -> Dict:
         """Compute parameter layouts for all buffer groups.
 
@@ -2655,6 +2689,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 ``use_pcie_aware_overlap=True``, bucket_size is recalculated using
                 PCIe bandwidth and latency parameters.
                 Insight I6: PCIe-aware overlap (Megatron aa-3.5).
+            ddp_config:                Optional DDP config; when provided,
+                ``pad_buckets_for_high_nccl_busbw`` is forwarded to bucket-end
+                padding (M3811: lcm(dp_size, 128, 2^16) when True).
 
         Returns:
             Dict mapping dtype → per-buffer layout dict from
@@ -2683,6 +2720,11 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 data_parallel_world_size,
             )
 
+        # M3811: read pad_for_high_nccl_busbw from ddp_config when provided.
+        pad_for_high_nccl_busbw = bool(
+            getattr(ddp_config, 'pad_buckets_for_high_nccl_busbw', False)
+        )
+
         # Group by dtype.
         dtype_groups: Dict[torch.dtype, List[torch.nn.Parameter]] = {}
         for p in params:
@@ -2693,7 +2735,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         layouts: Dict[torch.dtype, Dict] = {}
         for dtype, dtype_params in dtype_groups.items():
             layouts[dtype] = DistributedOptimizer._compute_per_buffer_param_layout(
-                dtype_params, bucket_size, data_parallel_world_size
+                dtype_params, bucket_size, data_parallel_world_size,
+                pad_for_high_nccl_busbw,
             )
         return layouts
 
