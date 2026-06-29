@@ -77,6 +77,12 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 try:
     from megatron.core.rerun_state_machine import get_rerun_state_machine as _get_rerun
+    # From Megatron M2811 (PR #2307): RerunStateMachine now uses _reduce_any()
+    # to batch multiple boolean all-reduces into a single collective, reducing
+    # synchronization overhead.  This DES-LOC port already uses fatal=False for
+    # check_for_large (line ~531), which is the key correctness fix from M2811.
+    # On PCIe-only DES-LOC the all-reduce batching is doubly important: each
+    # collective traverses the CPU interconnect rather than NVLink.
 except ImportError:
     _get_rerun = None
 

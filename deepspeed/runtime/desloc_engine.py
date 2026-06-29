@@ -2851,6 +2851,37 @@ class DesLocEngine:
             "config":            self.config,
         }
 
+        # From Megatron M2869 (PR #2658): RNG state must be sharded by
+        # (PP, TP, DP) when EP > 1 to avoid aliased RNG state across EP ranks,
+        # which causes different experts to use the same dropout / noise seeds.
+        # On DES-LOC (heterogeneous tiers, no NVLink), EP ranks may live on
+        # different GPU models, making RNG aliasing especially hard to debug.
+        # We save (pp_rank, tp_rank, ep_rank) as a shard key alongside the
+        # RNG tensors so the loader can broadcast the correct state per-rank.
+        try:
+            import torch
+            from deepspeed.core import parallel_state as _ps
+            _ep_size = _ps.get_expert_model_parallel_world_size() \
+                if hasattr(_ps, "get_expert_model_parallel_world_size") else 1
+            _rng_shard_key = {
+                "pp_rank": _ps.get_pipeline_model_parallel_rank()
+                    if hasattr(_ps, "get_pipeline_model_parallel_rank") else 0,
+                "tp_rank": _ps.get_tensor_model_parallel_rank()
+                    if hasattr(_ps, "get_tensor_model_parallel_rank") else 0,
+                # Include ep_rank when EP>1 so each expert-parallel rank saves
+                # a distinct RNG state (M2869: avoid RNG aliasing across EP).
+                "ep_rank": _ps.get_expert_model_parallel_rank()
+                    if (_ep_size > 1 and hasattr(_ps, "get_expert_model_parallel_rank")) else 0,
+                "ep_size": _ep_size,
+            }
+            payload["rng_state"] = {
+                "cpu": torch.get_rng_state(),
+                "cuda": torch.cuda.get_rng_state() if torch.cuda.is_available() else None,
+                "shard_key": _rng_shard_key,
+            }
+        except Exception:
+            pass  # RNG state save is best-effort
+
         cfg = self._hetero_ckpt_cfg  # may be None in CPU-only mode
 
         if cfg is not None and False:  # DISABLED: DCP async save deadlocks with training all_reduce (dcp.save calls gather_object→allgather in background thread while main thread does grad all_reduce)

@@ -184,6 +184,72 @@ def _configure_nccl_flight_recorder(config) -> None:
 # Utility: GlobalMemoryBuffer (lightweight replacement for Megatron's version)
 # ---------------------------------------------------------------------------
 
+# From Megatron M2804: NVLS symmetric memory for sequence parallelism.
+# NVLS (NVLink SHARP) collective kernels require NVLink between all ranks.
+# DES-LOC runs on PCIe-only (A6000×2 + H100 NVL + Blackwell×2, no NVLink),
+# so GlobalSymmetricMemoryBuffer must fail gracefully (symm_mem_hdl stays None).
+# Any call to maybe_get_tensor will return None and callers must fall back to
+# standard all-gather / reduce-scatter over NCCL.
+try:
+    import torch.distributed._symmetric_memory as _symm_mem_mod  # type: ignore
+    _HAVE_TORCH_SYMM_MEM = True
+except ImportError:
+    _symm_mem_mod = None
+    _HAVE_TORCH_SYMM_MEM = False
+
+
+class GlobalSymmetricMemoryBuffer:
+    """Symmetric-memory buffer for NVLS all-gather / reduce-scatter collectives.
+
+    From Megatron M2804 (PR #1997): low-latency NVLS kernels for sequence
+    parallelism.  On DES-LOC's PCIe-only topology this always falls back to
+    symm_mem_hdl = None, so callers transparently use standard NCCL collectives.
+    """
+
+    def __init__(self, size_in_mb: int = 256,
+                 process_group: Optional[torch.distributed.ProcessGroup] = None) -> None:
+        self.symm_buffer = None
+        self.symm_mem_hdl = None
+
+        if not _HAVE_TORCH_SYMM_MEM:
+            return  # older PyTorch — no symmetric memory API
+
+        try:
+            numel = int(size_in_mb * 1024 * 1024)
+            pg_name = getattr(process_group, "group_name", None)
+            if pg_name is None:
+                return  # cannot name the group
+            _symm_mem_mod.enable_symm_mem_for_group(pg_name)
+            buf = _symm_mem_mod.empty(numel, dtype=torch.uint8, device="cuda")
+            self.symm_mem_hdl = _symm_mem_mod.rendezvous(buf, process_group)
+            self.symm_buffer = buf
+        except RuntimeError:
+            # Expected on PCIe-only topologies (no NVLink / no NVLS support).
+            # DES-LOC A6000×2 + H100 NVL + Blackwell×2 all share PCIe switches,
+            # so this branch is the normal code path in production.
+            self.symm_buffer = None
+            self.symm_mem_hdl = None
+
+    def maybe_get_tensor(
+        self,
+        tensor_shape: List[int],
+        dtype: torch.dtype,
+    ) -> Optional[torch.Tensor]:
+        """Return a symmetric-memory view if available, else None."""
+        if self.symm_mem_hdl is None or self.symm_buffer is None:
+            return None
+        numel = 1
+        for d in tensor_shape:
+            numel *= d
+        required_bytes = numel * torch.tensor([], dtype=dtype).element_size()
+        if required_bytes > self.symm_buffer.numel():
+            return None
+        return self.symm_buffer[:required_bytes].view(dtype).view(numel).view(tensor_shape)
+
+
+_GLOBAL_SYMMETRIC_MEMORY_BUFFER: Optional[GlobalSymmetricMemoryBuffer] = None
+
+
 class GlobalMemoryBuffer:
     """A simple memory buffer that re-uses the same tensor across calls."""
 
@@ -1351,6 +1417,12 @@ def initialize_model_parallel(
     # Global memory buffer
     # -----------------------------------------------------------------------
     _set_global_memory_buffer()
+    # From Megatron M2804/M2850: GlobalSymmetricMemoryBuffer for NVLS SP
+    # kernels is NOT initialized eagerly here (M2850 reverts M2804's eager
+    # init).  DES-LOC PCIe-only topology (A6000×2+H100 NVL+Blackwell×2)
+    # has no NVLink between ranks, so NVLS collectives are unavailable.
+    # Callers that need NVLS should call _set_global_symmetric_memory_buffer()
+    # explicitly and check maybe_get_tensor() returns non-None before use.
     _configure_nccl_flight_recorder(config)
 
 
@@ -2178,6 +2250,41 @@ def destroy_global_memory_buffer() -> None:
     """Release the global memory buffer."""
     global _GLOBAL_MEMORY_BUFFER
     _GLOBAL_MEMORY_BUFFER = None
+
+
+# From Megatron M2804 (PR #1997): NVLS symmetric-memory buffer helpers.
+# On DES-LOC PCIe-only topology all NVLS paths fall back to standard NCCL.
+def _set_global_symmetric_memory_buffer(size_in_mb: int = 256) -> None:
+    """Initialize the global symmetric-memory buffer.
+
+    From Megatron M2804: supports NVLS low-latency all-gather / reduce-scatter
+    for sequence parallelism.  On DES-LOC's PCIe-only topology (A6000×2 +
+    H100 NVL + Blackwell×2) the buffer's symm_mem_hdl will be None because
+    NVLink is absent; callers must fall back to standard NCCL collectives.
+    Per M2850, call this explicitly only when NVLS is desired — not eagerly
+    inside initialize_model_parallel().
+    """
+    global _GLOBAL_SYMMETRIC_MEMORY_BUFFER
+    assert _GLOBAL_SYMMETRIC_MEMORY_BUFFER is None, \
+        "global symmetric memory buffer is already initialized"
+    pg = get_tensor_model_parallel_group() if is_initialized() else None
+    _GLOBAL_SYMMETRIC_MEMORY_BUFFER = GlobalSymmetricMemoryBuffer(
+        size_in_mb=size_in_mb, process_group=pg
+    )
+
+
+def get_global_symmetric_memory_buffer() -> Optional[GlobalSymmetricMemoryBuffer]:
+    """Return the global symmetric-memory buffer, or None if not initialized.
+
+    From Megatron M2804.  Callers must handle None (PCIe topology / not inited).
+    """
+    return _GLOBAL_SYMMETRIC_MEMORY_BUFFER
+
+
+def destroy_global_symmetric_memory_buffer() -> None:
+    """Release the global symmetric-memory buffer."""
+    global _GLOBAL_SYMMETRIC_MEMORY_BUFFER
+    _GLOBAL_SYMMETRIC_MEMORY_BUFFER = None
 
 
 # ---------------------------------------------------------------------------

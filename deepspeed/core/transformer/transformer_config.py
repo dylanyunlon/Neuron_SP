@@ -182,6 +182,18 @@ class TransformerConfig(ModelParallelConfig):
     # From Megatron M4171: Clip mtp grads separately when mtp_detach_heads=True.
     """
 
+    # From Megatron M2805 (PR #2173): MTP packed-sequence support.
+    # When True, the MTP token-roll operation respects packed-sequence boundaries
+    # (cu_seqlens_q from PackedSeqParams) so that the last token of one packed
+    # sequence cannot "look ahead" into the first token of the next sequence.
+    # On DES-LOC this matters because we use sequence packing to improve GPU
+    # utilisation across the heterogeneous A6000/H100/Blackwell tier ranks,
+    # and incorrect boundary crossing would silently corrupt MTP targets.
+    mtp_support_packed_seq: bool = False
+    """If True, MTP roll operations respect packed-sequence boundaries.
+    Requires PackedSeqParams.cu_seqlens_q to be set at forward time.
+    From Megatron M2805 (PR #2173)."""
+
     mtp_hybrid_override_pattern: Optional[str] = None
     """DEPRECATED: Use unified hybrid_layer_pattern instead.
     Legacy argument for loading old checkpoints. Force a specific hybrid layer
@@ -555,6 +567,20 @@ class TransformerConfig(ModelParallelConfig):
 
     moe_hybridep_num_sms_preprocessing: int = 108
     """Number of SMs for HybridEP preprocessing (metadata scan kernel)."""
+
+    # From Megatron M2830 (PR #2479): HybridEP A2A dispatch no longer requires
+    # num_dispatched_tokens as a separate argument that forces a D2H sync to
+    # read dispatch counts.  Instead, when num_permuted_tokens is provided the
+    # dispatch can proceed non-blocking.
+    # On DES-LOC's PCIe-only topology every D2H synchronization stalls ALL
+    # ranks because the CPU is the only path between GPU tiers; eliminating
+    # this sync is especially important for A6000 ranks whose PCIe bandwidth
+    # is much lower than H100/Blackwell.
+    moe_hybridep_non_blocking_dispatch: bool = True
+    """Use non-blocking HybridEP dispatch (requires num_permuted_tokens to be
+    provided at dispatch time, avoiding D2H sync to read dispatch counts).
+    From Megatron M2830 (PR #2479).  On DES-LOC PCIe-only clusters this
+    eliminates a costly CPU synchronisation point on every MoE forward pass."""
 
     moe_mlp_glu_interleave_size: Optional[int] = None
     """Block-interleaved GLU activations in the MoE grouped MLP layer."""
