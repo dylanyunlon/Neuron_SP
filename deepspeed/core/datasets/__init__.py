@@ -455,13 +455,19 @@ class BlendedDataset(Dataset):
         global ``idx``, then delegates to that sub-dataset.
 
         Returns:
-            Dict with same keys as ``GPTDataset.__getitem__`` plus
-            ``"dataset_id"`` (int tensor scalar).
+            Dict with same keys as ``GPTDataset.__getitem__``. Provenance
+            info (``dataset_id``) is stored under ``sample["_meta"]`` so it
+            does not pollute the top-level keys and break sorted-key unpack.
         """
         dataset_id = int(self._dataset_index[idx])
         sample_id  = int(self._dataset_sample_index[idx])
         sample = self.datasets[dataset_id][sample_id]
-        sample["dataset_id"] = torch.tensor(dataset_id, dtype=torch.long)
+        # From Megatron M4024: store provenance under "_meta" rather than
+        # injecting "dataset_id" into the top-level dict. A direct top-level
+        # injection changes sorted(batch.keys()) order and silently misassigns
+        # fields when callers do positional unpack (tokens, labels, loss_mask =
+        # get_batch(...)). "_meta" is ignored by all existing unpack paths.
+        sample["_meta"] = {"dataset_id": torch.tensor(dataset_id, dtype=torch.long)}
         return sample
 
     # ---------------------------------------------------------------- index building

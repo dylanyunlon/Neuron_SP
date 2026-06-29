@@ -312,8 +312,16 @@ def forward_step_calc_loss(
         if config.calculate_per_token_loss:
             MoEAuxLossAutoScaler.set_loss_scale(loss_scale)
         else:
+            # From Megatron M4098: aux_loss is computed per-TP-rank (each rank sees
+            # seq_len/TP tokens), so its gradient is implicitly divided by TP relative
+            # to the main loss. Multiply by tp_size to restore correct relative scale.
+            # Previously only CP was accounted for, silently underscaling aux_loss
+            # gradients by tp_size when TP > 1, degrading MoE load-balancing.
             cp_size_for_scaling = cp_group_size if cp_group_size is not None else 1
-            MoEAuxLossAutoScaler.set_loss_scale(loss_scale * cp_size_for_scaling / num_microbatches)
+            tp_size_for_scaling = getattr(config, 'tensor_model_parallel_size', 1) or 1
+            MoEAuxLossAutoScaler.set_loss_scale(
+                loss_scale * cp_size_for_scaling * tp_size_for_scaling / num_microbatches
+            )
 
     # MTP loss scaling (M3213, M4083)
     if _has_mtp and hasattr(config, 'mtp_num_layers') and config.mtp_num_layers is not None:

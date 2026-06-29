@@ -1534,9 +1534,8 @@ class TransformerConfig(ModelParallelConfig):
             assert (
                 self.recompute_modules is None or "moe" not in self.recompute_modules
             ), "disable moe in recompute_modules when enabling overlap_moe_expert_parallel_comm"
-            # M2924 (a56a0b001): with MTP enabled, PP > 1 is required for A2A overlap.
-            # From Megatron M4044: removed the PP>1 assertion; EP A2A overlap with MTP
-            # and PP=1 is now supported.
+            # From Megatron M4044 (supersedes M2924): EP A2A overlap with MTP is
+            # supported even with PP=1. Only mtp_num_layers <= 1 is required.
             assert (
                 self.mtp_num_layers is None or self.mtp_num_layers == 1
             ), "MTP layernum only supports 1 when enabling overlap_moe_expert_parallel_comm."
