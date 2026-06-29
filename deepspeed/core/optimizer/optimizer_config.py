@@ -8,7 +8,7 @@ Mirrors Megatron's OptimizerConfig with DES-LOC moment-sync extensions.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple, Type, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Type, Union
 
 import torch
 
@@ -20,8 +20,12 @@ class ParamKey:
     From Megatron M2654: enables different lr/wd/etc. for different param groups
     without requiring separate optimizer instances.
 
+    From Megatron M2933: extended with an optional ``predicate`` field for
+    arbitrary lambda-based matching (e.g. match all length-1 tensors).
+
     A parameter matches if EITHER its name contains a substring in ``name``
-    OR it has a truthy attribute named by ``attr``.
+    OR it has a truthy attribute named by ``attr``
+    OR the optional ``predicate`` returns True.
 
     Examples::
 
@@ -30,14 +34,19 @@ class ParamKey:
 
         # Separate config for expert-parallel params
         ParamKey(attr='is_expert_parallel')
+
+        # Match bias and length-1 tensors (M2933 pattern)
+        ParamKey(name='*.bias', predicate=ParamPredicate('len1', lambda p: len(p.shape)==1))
     """
     name: Union[str, List[str]] = ""
     """Param name substring(s). Empty string skips name matching."""
     attr: Union[str, List[str]] = ""
     """Param attribute name(s) to check for truthiness. Empty skips."""
+    predicate: Optional[Any] = field(default=None, compare=False, hash=False)
+    """From Megatron M2933: optional ParamPredicate for arbitrary matching."""
 
     def matches(self, param: "torch.nn.Parameter", param_name: str) -> bool:
-        """Return True if param matches this key by name or attribute."""
+        """Return True if param matches this key by name, attribute, or predicate."""
         names = [self.name] if isinstance(self.name, str) else list(self.name)
         for n in names:
             if n and n in param_name:
@@ -46,7 +55,143 @@ class ParamKey:
         for a in attrs:
             if a and getattr(param, a, False):
                 return True
+        # From Megatron M2933: predicate-based matching
+        if self.predicate is not None and self.predicate(param):
+            return True
         return False
+
+
+# From Megatron M2933: more flexible optimizer/scheduler override system.
+# ParamPredicate allows arbitrary lambda-based parameter matching beyond name/attr.
+@dataclass
+class ParamPredicate:
+    """Callable predicate for matching parameters by arbitrary criterion.
+
+    From Megatron M2933: supplements ParamKey with lambda-based matching so
+    callers can express constraints like "all length-1 tensors" without adding
+    a new attribute to every parameter.
+
+    Examples::
+
+        # Match all bias and length-1 parameters (for weight-decay zeroing)
+        ParamPredicate(name="no_wd", fn=lambda p: len(p.shape) == 1)
+    """
+    name: str
+    """Human-readable label for debugging / logging."""
+    fn: Callable[["torch.nn.Parameter"], bool] = field(default=lambda p: False)
+    """Callable that returns True if parameter matches."""
+
+    def __call__(self, param: "torch.nn.Parameter") -> bool:
+        return self.fn(param)
+
+    # ParamPredicate is used as a dict key inside ParamKey; make it hashable.
+    def __hash__(self) -> int:
+        return hash(self.name)
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, ParamPredicate):
+            return self.name == other.name
+        return NotImplemented
+
+
+# From Megatron M2933: TypedDict-style override applied to a matched param group.
+# Using a plain dict alias here to stay compatible with Megatron's usage pattern.
+#
+# Supported keys (all optional):
+#   "max_lr"   : float  — override peak learning rate
+#   "min_lr"   : float  — override minimum learning rate
+#   "wd_mult"  : float  — multiply weight decay by this factor (0.0 = no decay)
+#
+# DES-LOC extension: on PCIe topology without NVLink, embedding tables live on
+# A6000 GPUs; using a smaller decoupled_lr for those params reduces gradient
+# all-reduce magnitude and PCIe bandwidth pressure during embedding all-reduces.
+ParamGroupOverride = Dict[str, Any]
+
+
+def combine_param_group_overrides(
+    overrides: List["ParamGroupOverride"],
+) -> "ParamGroupOverride":
+    """Merge a list of ParamGroupOverrides into one by taking the last value per key.
+
+    From Megatron M2933: when multiple ParamKey entries match the same parameter,
+    their overrides are merged so that all matching constraints apply.
+
+    Args:
+        overrides: List of ParamGroupOverride dicts to merge.
+
+    Returns:
+        Single merged ParamGroupOverride dict.
+    """
+    merged: ParamGroupOverride = {}
+    for ov in overrides:
+        merged.update(ov)
+    return merged
+
+
+def param_group_override_to_tuple(override: "ParamGroupOverride") -> tuple:
+    """Convert a ParamGroupOverride to a sorted tuple for use as a dict key.
+
+    From Megatron M2933: parameter groups that share identical overrides should
+    be collapsed into a single optimizer param group; this tuple enables that.
+
+    Args:
+        override: ParamGroupOverride dict.
+
+    Returns:
+        Sorted tuple of (key, value) pairs.
+    """
+    return tuple(sorted(override.items()))
+
+
+def get_standard_config_overrides(
+    decoupled_lr: Optional[float] = None,
+    decoupled_min_lr: Optional[float] = None,
+) -> Dict["ParamKey", "ParamGroupOverride"]:
+    """Build standard DES-LOC param-group overrides.
+
+    From Megatron M2933: replaces scattered ad-hoc per-param-group logic with a
+    single function that produces the canonical set of overrides.  DES-LOC adds
+    PCIe-topology awareness: embeddings on A6000 GPUs use ``decoupled_lr`` to
+    reduce gradient all-reduce magnitude over slow PCIe fabric.
+
+    Standard overrides produced:
+      1. Embedding/output params → ``decoupled_lr`` (if provided).
+      2. Bias params and length-1 tensors → ``wd_mult=0.0`` (no weight decay).
+
+    Args:
+        decoupled_lr:     Separate peak LR for embedding/output parameters.
+                          Pass None to skip this override.
+        decoupled_min_lr: Matching minimum LR for embedding/output parameters.
+                          Only used when ``decoupled_lr`` is set.
+
+    Returns:
+        Dict mapping ParamKey → ParamGroupOverride, ready to pass as
+        ``config_overrides`` to the distributed optimizer.
+
+    Example::
+
+        overrides = get_standard_config_overrides(
+            decoupled_lr=1e-4, decoupled_min_lr=1e-5
+        )
+        optimizer = build_optimizer(model, config, config_overrides=overrides)
+    """
+    # From Megatron M2933: embedding/output params get a separate (lower) LR.
+    config_overrides: Dict[ParamKey, ParamGroupOverride] = {}
+
+    if decoupled_lr is not None:
+        decoupled_cfg: ParamGroupOverride = {"max_lr": decoupled_lr}
+        if decoupled_min_lr is not None:
+            decoupled_cfg["min_lr"] = decoupled_min_lr
+        config_overrides[ParamKey(attr="is_embedding_or_output_parameter")] = decoupled_cfg
+
+    # From Megatron M2933: bias params and all length-1 tensors skip weight decay.
+    # On DES-LOC heterogeneous cluster this also avoids needless PCIe traffic for
+    # tiny bias vectors whose decay contribution is negligible.
+    no_wd_predicate = ParamPredicate(name="param_len_1", fn=lambda p: len(p.shape) == 1)
+    no_wd_key = ParamKey(name="*.bias", predicate=no_wd_predicate)
+    config_overrides[no_wd_key] = ParamGroupOverride(wd_mult=0.0)
+
+    return config_overrides
 
 
 @dataclass

@@ -24,7 +24,16 @@ Guaranteed import paths
     from deepspeed.core.optimizer.distrib_optimizer import DistributedOptimizer
 """
 
-from deepspeed.core.optimizer.optimizer_config import OptimizerConfig, ParamKey
+from deepspeed.core.optimizer.optimizer_config import (
+    OptimizerConfig,
+    ParamKey,
+    # From Megatron M2933: flexible optimizer/scheduler override system
+    ParamPredicate,
+    ParamGroupOverride,
+    combine_param_group_overrides,
+    param_group_override_to_tuple,
+    get_standard_config_overrides,
+)
 from deepspeed.core.optimizer.distrib_optimizer import (
     # Core optimizer hierarchy
     MegatronOptimizer,
