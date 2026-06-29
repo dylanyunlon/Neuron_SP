@@ -188,6 +188,11 @@ class LinearFc1Interface(Protocol):
     """Interface for linear_fc1 module in MLP."""
 
     def forward(self, hidden_states: torch.Tensor, /) -> tuple[torch.Tensor, torch.Tensor | None]:
+        # From Megatron M2967: in FP8 MoE grouped GEMM, bias MUST be applied
+        # BEFORE unpadding. Post-unpad bias corrupts FP8 amax statistics
+        # (padding activations pollute quantization scale computation).
+        # Correct: gemm(padded) -> apply_bias -> unpad
+        # Wrong:   gemm(padded) -> unpad -> apply_bias  <- BUG
         """Forward method for linear_fc1 module."""
         ...
 

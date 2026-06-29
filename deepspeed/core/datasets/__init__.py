@@ -679,3 +679,48 @@ __all__ = [
     "build_dataloader_worker_init_fn",
     "build_pretraining_data_loader",
 ]
+
+import time as _retry_time
+import logging as _retry_logging
+_retry_logger = _retry_logging.getLogger(__name__)
+
+
+def retry_with_backoff(fn, max_retries=3, base_delay=10.0, description='operation'):
+    """Retry fn with exponential backoff on exception.
+
+    From Megatron M2963: fault-tolerant dataset reads for distributed training.
+    Uses 10s/20s/40s delays. In DES-LOC heterogeneous multi-node setups
+    (2xA6000 + H100 NVL + 2xBlackwell PCIe) filesystem timeouts are frequent.
+
+    Args:
+        fn: Zero-argument callable to retry.
+        max_retries: Retry attempts after first failure (default 3).
+        base_delay: Initial delay seconds, doubles each retry (default 10).
+        description: Label for log messages.
+    Returns: fn() result on success.
+    Raises: Last exception if all retries exhausted.
+    """
+    last_exc = None
+    for attempt in range(max_retries + 1):
+        try:
+            return fn()
+        except Exception as exc:
+            last_exc = exc
+            if attempt == max_retries:
+                break
+            delay = base_delay * (2 ** attempt)
+            _retry_logger.warning(
+                '%s failed (attempt %d/%d), retrying in %.0fs: %s',
+                description, attempt + 1, max_retries + 1, delay, exc,
+            )
+            _retry_time.sleep(delay)
+    raise last_exc
+
+
+# From Megatron M2893: dataloader init-time optimizations for large scale.
+# Both flags require pre-built caches in --data-cache-path.
+# FAST_CACHE_LOAD: skip warmup, mmap pre-built indexes directly.
+# DEFER_NPY_INDEX_MMAP: lazily mmap .npy index files on first access.
+# DES-LOC: use DEFER=True so fast GPU nodes dont idle waiting for slow ones.
+DATALOADER_FAST_CACHE_LOAD: bool = False       # From Megatron M2893
+DATALOADER_DEFER_NPY_INDEX_MMAP: bool = False  # From Megatron M2893
