@@ -140,14 +140,68 @@ def maybe_build_dist_checkpoint_saver(
 
 
 # ---------------------------------------------------------------------------
-# 4. BridgeCommunicator adapter
+# 4. BridgeCommunicator adapter + duck-typing wrapper
 # ---------------------------------------------------------------------------
+
+class BridgeToP2PWrapper:
+    """Duck-typing wrapper: makes BridgeCommunicator quack like PCIeP2PCommunicator.
+
+    PCIeP2PCommunicator interface (used by desloc_engine + hetero_mimo_training_loop):
+        send_activation(tensor, src_device, dst_device, cache_key=None) -> Tensor
+
+    BridgeCommunicator interface (Megatron pipeline):
+        send_forward(tensor) / recv_forward() -> Tensor
+        send_backward(tensor) / recv_backward() -> Tensor
+
+    Mapping: src_device < dst_device ⇒ forward direction (lower stage → higher stage).
+             src_device > dst_device ⇒ backward direction.
+             src_device == dst_device ⇒ local copy, no bridge needed.
+    """
+
+    def __init__(self, bridge, locality_cache=None):
+        self._bridge = bridge
+        self._cache = locality_cache
+
+    def send_activation(
+        self,
+        tensor: "torch.Tensor",
+        src_device: int,
+        dst_device: int,
+        cache_key: Optional[str] = None,
+    ) -> "torch.Tensor":
+        import torch
+
+        # Cache hit → skip transfer
+        if cache_key is not None and self._cache is not None:
+            cached = self._cache.get(cache_key)
+            if cached is not None:
+                return cached.to(f"cuda:{dst_device}", non_blocking=True)
+
+        if src_device == dst_device:
+            # Local copy, no bridge needed
+            result = tensor.to(f"cuda:{dst_device}", non_blocking=True)
+        elif src_device < dst_device:
+            # Forward direction: this rank sends, peer receives
+            self._bridge.send_forward(tensor)
+            result = self._bridge.recv_forward()
+        else:
+            # Backward direction: this rank sends grad, peer receives
+            self._bridge.send_backward(tensor)
+            result = self._bridge.recv_backward()
+
+        # Cache the result
+        if cache_key is not None and self._cache is not None:
+            self._cache.put(cache_key, result.detach())
+
+        return result
+
+
 def maybe_build_bridge_communicator(
     config: Any,
     existing_p2p: Any,
 ) -> Any:
     """If config.use_bridge_communicator is True AND pipeline_parallel_size > 1,
-    wrap or replace the existing PCIeP2PCommunicator with BridgeCommunicator.
+    wrap BridgeCommunicator in BridgeToP2PWrapper so it exposes send_activation().
 
     Otherwise return existing_p2p unchanged.
     """
@@ -168,13 +222,8 @@ def maybe_build_bridge_communicator(
         if pp_size <= 1:
             return existing_p2p
 
-        # BridgeCommunicator needs a bridge_pg. For now, use the DP group
-        # as cross-grid bridge (will be replaced with dedicated bridge PG later).
         bridge_pg = ps.get_data_parallel_group()
         my_rank = ps.get_data_parallel_rank()
-
-        # In a 2-tier setup: rank 0,1 = A6000 pool, rank 2 = H100 pool
-        # The bridge connects the last rank of pool 0 to the first rank of pool 1
         peer_rank = (my_rank + 1) % ps.get_data_parallel_world_size()
 
         from deepspeed.core.model_parallel_config import ModelParallelConfig
@@ -184,8 +233,17 @@ def maybe_build_bridge_communicator(
             my_role=CommRole.BOTH,
             peer_rank=peer_rank,
         )
-        logger.info("core_adapter: BridgeCommunicator active (peer=%d)", peer_rank)
-        return bridge
+
+        # Extract locality_cache from existing_p2p if it has one
+        locality_cache = getattr(existing_p2p, "_cache", None)
+
+        wrapper = BridgeToP2PWrapper(bridge, locality_cache=locality_cache)
+        logger.info(
+            "core_adapter: BridgeToP2PWrapper active (peer=%d, cache=%s)",
+            peer_rank,
+            locality_cache is not None,
+        )
+        return wrapper
     except Exception as exc:
         logger.warning("core_adapter: BridgeCommunicator failed (%s), keeping PCIeP2P", exc)
         return existing_p2p
