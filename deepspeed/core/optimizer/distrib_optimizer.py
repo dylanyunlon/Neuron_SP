@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
@@ -51,6 +52,156 @@ from deepspeed.core.optimizer.optimizer_config import OptimizerConfig
 import deepspeed.core.parallel_state as parallel_state
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# ParamMeta dataclass and ParamRegistry (M4171 followup)
+# ---------------------------------------------------------------------------
+# Replaces monkey-patching .shared / .grad_norm_group attributes directly
+# onto tensor objects, which is fragile when views/copies are created.
+# All metadata lives in a central registry keyed by id(param).
+
+
+@dataclass
+class ParamMeta:
+    """Metadata record stored in :class:`ParamRegistry` for each parameter.
+
+    Attributes:
+        shared:          True if this param is shared across model-parallel
+                         ranks (prevents double-counting in grad norm).
+        grad_norm_group: Optional group name ('mtp') for separate clipping.
+                         None → belongs to the main gradient norm group.
+        tier:            DES-LOC hardware tier ('h100', 'a6000', 'blackwell',
+                         …) derived from TierType at registration time.
+                         None → tier unknown / homogeneous setup.
+        is_fsdp_param:   True when the param is an FSDP-sharded DTensor
+                         whose gradient is stored in ``param.decoupled_grad``.
+    """
+    shared: bool = False
+    grad_norm_group: Optional[str] = None
+    tier: Optional[str] = None        # From DES-LOC tier_assignments
+    is_fsdp_param: bool = False
+
+
+# Mapping from TierType enum → human-readable tier string stored in ParamMeta.
+_TIER_TYPE_TO_STR: Dict[TierType, str] = {
+    TierType.DATACENTER:   'h100',
+    TierType.PROFESSIONAL: 'a6000',
+    TierType.CONSUMER:     'blackwell',
+}
+
+
+class ParamRegistry:
+    """Central parameter metadata table — avoids monkey-patching attributes.
+
+    Key:   id(param)  (int — the CPython object identity)
+    Value: :class:`ParamMeta` dataclass
+
+    The registry is designed to be process-global (one instance shared by all
+    optimisers in the process) so that metadata set during model construction
+    is visible inside the optimiser without an explicit handoff.
+
+    Thread-safety: no locking; mutated only from the training main thread.
+    """
+
+    def __init__(self) -> None:
+        self._table: Dict[int, ParamMeta] = {}
+        # Cache for has_group() global all-reduce results.
+        self._group_cache: Dict[str, bool] = {}
+
+    # ------------------------------------------------------------------
+    # Core CRUD
+    # ------------------------------------------------------------------
+
+    def register(self, param: torch.Tensor, **kwargs: Any) -> None:
+        """Register *param* with the provided metadata keyword arguments.
+
+        Keyword arguments are forwarded to :class:`ParamMeta`; unknown keys
+        raise ``TypeError`` at dataclass construction time.
+
+        Diagnostic print is intentional — traces registration during init.
+
+        Args:
+            param:   The parameter (or tensor view) to register.
+            **kwargs: Fields of :class:`ParamMeta` to set explicitly.
+        """
+        pid = id(param)
+        meta = ParamMeta(**kwargs)
+        self._table[pid] = meta
+        print(
+            f"[ParamRegistry] register id={pid} "
+            f"tier={meta.tier!r} group={meta.grad_norm_group!r} "
+            f"shared={meta.shared} fsdp={meta.is_fsdp_param}"
+        )
+
+    def get(self, param: torch.Tensor) -> ParamMeta:
+        """Return the :class:`ParamMeta` for *param*, or a default instance.
+
+        Never raises — unregistered params return a zero-initialised meta.
+        """
+        return self._table.get(id(param), ParamMeta())
+
+    def copy_from_param(self, dst: torch.Tensor, src: torch.Tensor) -> None:
+        """Copy metadata from *src* to *dst* (replaces copy_optimizer_param_metadata).
+
+        The dst entry is created if it does not yet exist; if *src* is not
+        registered the dst entry is populated with defaults so the registry
+        entry always exists after this call.
+
+        Args:
+            dst: Destination tensor (a view, copy, or shard derived from src).
+            src: Source tensor whose metadata should be propagated.
+        """
+        src_meta = self.get(src)
+        dst_meta = ParamMeta(
+            shared=src_meta.shared,
+            grad_norm_group=src_meta.grad_norm_group,
+            tier=src_meta.tier,
+            is_fsdp_param=src_meta.is_fsdp_param,
+        )
+        self._table[id(dst)] = dst_meta
+        print(
+            f"[ParamRegistry] copy_from_param src_id={id(src)} -> dst_id={id(dst)} "
+            f"tier={dst_meta.tier!r} group={dst_meta.grad_norm_group!r}"
+        )
+
+    # ------------------------------------------------------------------
+    # Query helpers
+    # ------------------------------------------------------------------
+
+    def has_group(self, grad_norm_group: str) -> bool:
+        """Whether *any* registered param belongs to *grad_norm_group*.
+
+        Result is cached after the first call; does NOT perform a distributed
+        all-reduce — use :meth:`MegatronOptimizer.has_grad_norm_group` for the
+        global (cross-rank) check.
+        """
+        if grad_norm_group not in self._group_cache:
+            self._group_cache[grad_norm_group] = any(
+                m.grad_norm_group == grad_norm_group
+                for m in self._table.values()
+            )
+        return self._group_cache[grad_norm_group]
+
+    def get_params_by_group(
+        self,
+        params: List[torch.nn.Parameter],
+        grad_norm_group: str,
+    ) -> List[torch.nn.Parameter]:
+        """Filter *params* to those registered in *grad_norm_group*.
+
+        Args:
+            params:          Candidate parameter list.
+            grad_norm_group: Group name to filter by (e.g. ``'mtp'``).
+
+        Returns:
+            Subset of *params* whose registry entry has
+            ``grad_norm_group == grad_norm_group``.
+        """
+        return [p for p in params if self.get(p).grad_norm_group == grad_norm_group]
+
+
+# Module-level singleton — shared across all optimiser instances in the process.
+_GLOBAL_PARAM_REGISTRY: ParamRegistry = ParamRegistry()
 
 # ---------------------------------------------------------------------------
 # Gradient clipping
@@ -198,7 +349,15 @@ def copy_optimizer_param_metadata(destination: torch.Tensor, source: torch.Tenso
     would be silently lost, causing double-counted gradients or wrong clipping.
 
     # From Megatron M4171: copy both .shared and .grad_norm_group attributes.
+    # M4171 followup: delegates to _GLOBAL_PARAM_REGISTRY.copy_from_param so
+    # metadata is stored centrally rather than monkey-patched on tensors.
+    # The legacy attribute writes below are kept for backward-compat with any
+    # code that still reads param.shared / param.grad_norm_group directly.
     """
+    _GLOBAL_PARAM_REGISTRY.copy_from_param(destination, source)
+    # Backward-compat: also mirror on the tensor object so that existing
+    # getattr(param, 'shared', False) / getattr(param, GRAD_NORM_GROUP_ATTR, None)
+    # callers outside the registry still see the correct values.
     if hasattr(source, 'shared'):
         destination.shared = source.shared  # type: ignore[assignment]
     if hasattr(source, GRAD_NORM_GROUP_ATTR):
@@ -348,7 +507,11 @@ class MegatronOptimizer(ABC):
             grad = getattr(param, 'main_grad', param.grad)
             if grad is None:
                 continue
-            if getattr(param, 'shared', False):
+            # M4171 followup: prefer registry for shared flag; fall back to
+            # getattr for params registered before the registry was available.
+            _meta = _GLOBAL_PARAM_REGISTRY.get(param)
+            _shared = _meta.shared or getattr(param, 'shared', False)
+            if _shared:
                 continue
             # Skip TP replicas (sequence_parallel / tensor_model_parallel attr)
             if getattr(param, 'tensor_model_parallel', False) and not getattr(
@@ -373,13 +536,19 @@ class MegatronOptimizer(ABC):
         """
         if grad_norm_group is not None:
             _validate_grad_norm_group(grad_norm_group)
-            param_filter: Callable[[torch.nn.Parameter], bool] = (
-                lambda p: _get_param_grad_norm_group(p) == grad_norm_group
-            )
+            # M4171 followup: check registry first, then fall back to attr.
+            def param_filter(p: torch.nn.Parameter) -> bool:  # type: ignore[misc]
+                reg_group = _GLOBAL_PARAM_REGISTRY.get(p).grad_norm_group
+                if reg_group is not None:
+                    return reg_group == grad_norm_group
+                return _get_param_grad_norm_group(p) == grad_norm_group
         else:
-            param_filter = lambda p: not _is_separate_grad_norm_group(
-                _get_param_grad_norm_group(p)
-            )
+            # Exclude params that belong to any separate grad-norm group.
+            def param_filter(p: torch.nn.Parameter) -> bool:  # type: ignore[misc]
+                reg_group = _GLOBAL_PARAM_REGISTRY.get(p).grad_norm_group
+                if reg_group is not None:
+                    return not _is_separate_grad_norm_group(reg_group)
+                return not _is_separate_grad_norm_group(_get_param_grad_norm_group(p))
         return self._filter_grads_for_norm(self.get_parameters(), param_filter=param_filter)
 
     # Legacy alias kept for backwards compat (callers that used the old name).
@@ -401,11 +570,15 @@ class MegatronOptimizer(ABC):
             self._has_grad_norm_group_cache: Dict[str, bool] = {}
         cache = self._has_grad_norm_group_cache
         if grad_norm_group not in cache:
-            local = any(
-                _get_param_grad_norm_group(p) == grad_norm_group
-                for p in self.get_parameters()
-                if _is_separate_grad_norm_group(_get_param_grad_norm_group(p))
-            )
+            # M4171 followup: check registry first (more reliable than attr),
+            # then fall back to getattr for unregistered params.
+            def _local_has_group(p: torch.nn.Parameter) -> bool:
+                reg_group = _GLOBAL_PARAM_REGISTRY.get(p).grad_norm_group
+                if reg_group is not None:
+                    return reg_group == grad_norm_group
+                pg = _get_param_grad_norm_group(p)
+                return _is_separate_grad_norm_group(pg) and pg == grad_norm_group
+            local = any(_local_has_group(p) for p in self.get_parameters())
             flag = torch.tensor([1 if local else 0], dtype=torch.int, device='cuda')
             if torch.distributed.is_initialized():
                 torch.distributed.all_reduce(
@@ -492,8 +665,20 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
                     master.requires_grad_(True)
                     param_group["params"][i] = master
                     param.main_param = master
+                    # M4171 followup: register original BF16 param in registry
+                    # (infer metadata from existing tensor attributes for compat
+                    # with callers that set param.shared / param.grad_norm_group
+                    # before the optimizer is constructed).
+                    _GLOBAL_PARAM_REGISTRY.register(
+                        param,
+                        shared=getattr(param, 'shared', False),
+                        grad_norm_group=getattr(param, GRAD_NORM_GROUP_ATTR, None),
+                        tier=None,           # tier populated by DistributedOptimizer
+                        is_fsdp_param=getattr(param, '__fsdp_param__', False),
+                    )
                     # M4171: propagate .shared and .grad_norm_group so that
                     # MTP heads can be clipped independently of the main norm.
+                    # copy_from_param now also updates the registry for master.
                     copy_optimizer_param_metadata(master, param)  # type: ignore[arg-type]
                     fp32_master_grp.append(master)
                     if param in self.optimizer.state:
@@ -875,20 +1060,44 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             self._fp32_grad_shards.append(fp32_grad_shard)
 
         # Rewire the inner optimizer's param_groups to point at FP32 shards.
-        # M4171: copy_optimizer_param_metadata propagates .shared and
-        # .grad_norm_group from the model params that overlap each shard so
-        # that independent MTP grad clipping works correctly on the shard view.
+        # M4171 followup: copy_optimizer_param_metadata (now registry-backed)
+        # propagates .shared and .grad_norm_group from the model params that
+        # overlap each shard so that independent MTP grad clipping works.
+        # Additionally, DES-LOC tier is inferred from tier_assignments so that
+        # per-tier routing logic can query shard params via the registry.
         shard_params: List[torch.nn.Parameter] = []
         for buf_idx, (fp32_shard, buf, boundaries) in enumerate(
             zip(self._fp32_shards, self.param_and_grad_buffers, self._buf_boundaries)
         ):
             sp = torch.nn.Parameter(fp32_shard, requires_grad=True)
             shard_start, shard_end = boundaries[dp_rank]
-            # Propagate metadata from the first model param that overlaps.
+            # Determine DES-LOC tier for this rank from tier_assignments.
+            _tier_str: Optional[str] = None
+            if self.tier_assignments is not None and dp_rank < len(self.tier_assignments):
+                _ta = self.tier_assignments[dp_rank]
+                if _ta is not None:
+                    _tier_str = _TIER_TYPE_TO_STR.get(_ta)
+            # Find first overlapping model param and propagate its metadata.
+            _src_param = None
             for param, (ps, pe, _) in buf.param_index_map.items():
                 if max(ps, shard_start) < min(pe, shard_end):
-                    copy_optimizer_param_metadata(sp, param)  # type: ignore[arg-type]
+                    _src_param = param
                     break
+            if _src_param is not None:
+                # copy_from_param propagates shared / grad_norm_group / is_fsdp_param.
+                copy_optimizer_param_metadata(sp, _src_param)  # type: ignore[arg-type]
+                # Patch in tier derived from tier_assignments (not on model param).
+                _sp_meta = _GLOBAL_PARAM_REGISTRY.get(sp)
+                _GLOBAL_PARAM_REGISTRY.register(
+                    sp,
+                    shared=_sp_meta.shared,
+                    grad_norm_group=_sp_meta.grad_norm_group,
+                    tier=_tier_str,
+                    is_fsdp_param=_sp_meta.is_fsdp_param,
+                )
+            else:
+                # Shard with no overlapping model param: register defaults + tier.
+                _GLOBAL_PARAM_REGISTRY.register(sp, tier=_tier_str)
             shard_params.append(sp)
         self.optimizer.param_groups = [{
             "params": shard_params,
