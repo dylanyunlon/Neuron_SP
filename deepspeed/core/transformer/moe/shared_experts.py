@@ -369,10 +369,12 @@ class SharedExpertMLP(MLP):
             sequence_parallel = getattr(self.config, "sequence_parallel", False)
             if sequence_parallel:
                 self.cached_fc1_input = gather_from_sequence_parallel_region(
-                    input, tensor_parallel_output_grad=True
+                    input, tensor_parallel_output_grad=True, group=self.tp_group  # M3981
                 )
             else:
-                self.cached_fc1_input = copy_to_tensor_model_parallel_region(input)
+                self.cached_fc1_input = copy_to_tensor_model_parallel_region(
+                    input, group=self.tp_group  # M3981
+                )
             set_tensor_grad_fn_sequence_sr(self.cached_fc1_input, torch.iinfo(torch.int).max)
 
     @overlap_state_check(

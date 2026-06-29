@@ -100,9 +100,16 @@ def gather_split_1d_tensor(tensor: torch.Tensor) -> torch.Tensor:
 # Tensor-parallel region functions (mirrors Megatron's mappings.py API)
 # ---------------------------------------------------------------------------
 
-def copy_to_tensor_model_parallel_region(input_: torch.Tensor) -> torch.Tensor:
-    """Identity in forward; all-reduce in backward (for column-parallel input)."""
-    return _CopyToModelParallelRegion.apply(input_)
+def copy_to_tensor_model_parallel_region(
+    input_: torch.Tensor,
+    group: Optional[torch.distributed.ProcessGroup] = None,
+) -> torch.Tensor:
+    """Identity in forward; all-reduce in backward (for column-parallel input).
+
+    M3981: ``group`` overrides the global TP group so callers that carry an
+    explicit ``pg_collection.tp`` reference no longer rely on parallel_state.
+    """
+    return _CopyToModelParallelRegion.apply(input_, group)
 
 
 def reduce_from_tensor_model_parallel_region(input_: torch.Tensor) -> torch.Tensor:
@@ -128,9 +135,14 @@ def scatter_to_sequence_parallel_region(input_: torch.Tensor) -> torch.Tensor:
 def gather_from_sequence_parallel_region(
     input_: torch.Tensor,
     tensor_parallel_output_grad: bool = True,
+    group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> torch.Tensor:
-    """All-gather along sequence (dim 0) in forward."""
-    return _GatherFromSequenceParallelRegion.apply(input_, tensor_parallel_output_grad)
+    """All-gather along sequence (dim 0) in forward.
+
+    M3981: ``group`` overrides the global TP group so SharedExpertMLP can
+    pass ``self.tp_group`` rather than relying on parallel_state.
+    """
+    return _GatherFromSequenceParallelRegion.apply(input_, tensor_parallel_output_grad, group)
 
 
 def reduce_scatter_to_sequence_parallel_region(input_: torch.Tensor) -> torch.Tensor:
@@ -202,15 +214,17 @@ def all_to_all_sp2hp(input_: torch.Tensor) -> torch.Tensor:
 
 class _CopyToModelParallelRegion(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, input_):
+    def forward(ctx, input_, group=None):
+        # M3981: store explicit group (None → fall back to _get_tp_group() in bwd)
+        ctx.group = group
         return input_
 
     @staticmethod
     def backward(ctx, grad_output):
-        group = _get_tp_group()
-        if group is not None and _tp_world_size() > 1:
+        group = ctx.group if ctx.group is not None else _get_tp_group()
+        if group is not None and torch.distributed.get_world_size(group=group) > 1:
             torch.distributed.all_reduce(grad_output, group=group)
-        return grad_output
+        return grad_output, None
 
 
 class _ReduceFromModelParallelRegion(torch.autograd.Function):
@@ -303,31 +317,33 @@ class _ScatterToSequenceParallelRegion(torch.autograd.Function):
 
 class _GatherFromSequenceParallelRegion(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, input_, tensor_parallel_output_grad):
+    def forward(ctx, input_, tensor_parallel_output_grad, group=None):
         ctx.tensor_parallel_output_grad = tensor_parallel_output_grad
-        group = _get_tp_group()
-        world_size = _tp_world_size()
+        # M3981: explicit group overrides parallel_state singleton
+        ctx.group = group
+        _group = group if group is not None else _get_tp_group()
+        world_size = 1 if _group is None else torch.distributed.get_world_size(group=_group)
         if world_size == 1:
             return input_
         input_ = input_.contiguous()
         chunks = [torch.empty_like(input_) for _ in range(world_size)]
-        torch.distributed.all_gather(chunks, input_, group=group)
+        torch.distributed.all_gather(chunks, input_, group=_group)
         return torch.cat(chunks, dim=0)
 
     @staticmethod
     def backward(ctx, grad_output):
-        world_size = _tp_world_size()
+        _group = ctx.group if ctx.group is not None else _get_tp_group()
+        world_size = 1 if _group is None else torch.distributed.get_world_size(group=_group)
+        rank = 0 if _group is None else torch.distributed.get_rank(group=_group)
         if world_size == 1:
-            return grad_output, None
-        rank = _tp_rank()
+            return grad_output, None, None
         seq_len = grad_output.shape[0]
         per_rank = seq_len // world_size
         if ctx.tensor_parallel_output_grad:
-            group = _get_tp_group()
             local_grad = grad_output[rank * per_rank:(rank + 1) * per_rank].contiguous()
-            torch.distributed.all_reduce(local_grad, group=group)
-            return local_grad, None
-        return grad_output[rank * per_rank:(rank + 1) * per_rank].contiguous(), None
+            torch.distributed.all_reduce(local_grad, group=_group)
+            return local_grad, None, None
+        return grad_output[rank * per_rank:(rank + 1) * per_rank].contiguous(), None, None
 
 
 class _ReduceScatterToSequenceParallelRegion(torch.autograd.Function):
