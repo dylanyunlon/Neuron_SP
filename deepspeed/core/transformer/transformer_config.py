@@ -434,9 +434,13 @@ class TransformerConfig(ModelParallelConfig):
 
     # From Megatron M2767: CHECKPOINT-CRITICAL. Must be in checkpoint metadata or
     # router silently reverts to default on training resume.
+    # From Megatron M2767: CHECKPOINT-CRITICAL. Must be in checkpoint metadata or
+    # router silently reverts to default on training resume.
     moe_router_topk_scaling_factor: Optional[float] = None
     """Scaling factor for routing score in top-k selection (pre_softmax only)."""
 
+    # From Megatron M2767: CHECKPOINT-CRITICAL. Must be in checkpoint metadata or
+    # router silently reverts to default on training resume.
     # From Megatron M2767: CHECKPOINT-CRITICAL. Must be in checkpoint metadata or
     # router silently reverts to default on training resume.
     moe_router_score_function: Literal['softmax', 'sigmoid', 'sqrtsoftplus'] = "softmax"
@@ -445,6 +449,8 @@ class TransformerConfig(ModelParallelConfig):
     moe_router_dtype: Optional[Literal['fp32', 'fp64']] = None
     """Data type for routing and expert output weighted averaging."""
 
+    # From Megatron M2767: CHECKPOINT-CRITICAL. Must be in checkpoint metadata or
+    # router silently reverts to default on training resume.
     # From Megatron M2767: CHECKPOINT-CRITICAL. Must be in checkpoint metadata or
     # router silently reverts to default on training resume.
     moe_router_enable_expert_bias: bool = False
