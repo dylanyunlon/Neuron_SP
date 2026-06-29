@@ -208,6 +208,8 @@ _GLOBAL_PARAM_REGISTRY: ParamRegistry = ParamRegistry()
 # ---------------------------------------------------------------------------
 
 
+# From Megatron M2813: prefer param.main_param over param.data.float() for norm.
+# In bf16 training avoids extra fp32 temp — critical on A6000 48GB VRAM.
 def clip_grad_norm(
     parameters: Union[torch.Tensor, List[torch.Tensor]],
     max_norm: float,

@@ -611,6 +611,10 @@ def overwrite_nccl_comm_cfgs(nccl_comm_cfgs: dict, pg_name: str, key_value_pair:
 # initialize_model_parallel  (core entry point)
 # ---------------------------------------------------------------------------
 
+# From Megatron M2821: NEVER use LOCAL_RANK as global rank in init_process_group.
+# LOCAL_RANK is node-local (0..N-1). Global rank must be os.environ["RANK"].
+# Using LOCAL_RANK causes world_size mismatch and deadlock in multi-node training.
+# Only use LOCAL_RANK for: torch.cuda.set_device(local_rank)
 def initialize_model_parallel(
     tensor_model_parallel_size: int = 1,
     pipeline_model_parallel_size: int = 1,
