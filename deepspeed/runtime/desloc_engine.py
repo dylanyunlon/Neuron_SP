@@ -2033,12 +2033,19 @@ class DesLocEngine:
                 try:
                     from deepspeed.core.model_parallel_config import ModelParallelConfig  # noqa: PLC0415
                     _mp_cfg = ModelParallelConfig()
+                    # M4041: when full-iteration CUDA graphs are active we must not
+                    # dereference param.grad in the backward hook — the graph was
+                    # recorded with live grad tensor addresses and zeroing the
+                    # attribute on the first replay would corrupt subsequent iterations.
+                    _cg_impl = getattr(self, 'config', None)
+                    _cg_impl = getattr(_cg_impl, 'cuda_graph_impl', 'none') if _cg_impl else 'none'
                     _ddp_cfg = CoreDDPConfig(
                         grad_reduce_in_fp32=False,
                         overlap_grad_reduce=False,
                         use_distributed_optimizer=False,
                         allow_skip_grad_sync=True,  # DES-LOC Kx gating
                         megatron_fsdp_grad_comm_dtype=torch.bfloat16,  # M3574: PCIe BW reduction
+                        cuda_graph_mode=(_cg_impl == 'full_iteration'),  # M4041
                     )
                     # From Megatron M2928: wrap DDP init in a dedicated side-stream
                     # to avoid race conditions that leave parameter buffers empty.
