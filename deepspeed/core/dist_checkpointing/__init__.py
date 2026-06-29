@@ -7,7 +7,7 @@ from __future__ import annotations
 import io
 import os
 import logging
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, replace, field, fields
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -32,6 +32,37 @@ from deepspeed.core.dist_checkpointing.core import (  # noqa: F401
 )
 
 logger = logging.getLogger(__name__)
+
+CHECKPOINT_FORMAT_VERSION = 2
+# From Megatron M2566/M2701: versioned manifest avoids getattr-soup on load.
+
+
+@dataclass
+class CheckpointManifest:
+    """Versioned checkpoint manifest (metadata.json).
+
+    Replaces ad-hoc dict + getattr(ckpt_args, field, default) pattern.
+    Version 1: world_size only. Version 2: full topology + iteration.
+    """
+    format: str = "neuron_sp_dist_ckpt"
+    version: int = CHECKPOINT_FORMAT_VERSION
+    world_size: int = 0
+    tensor_model_parallel_size: int = 1
+    pipeline_model_parallel_size: int = 1
+    data_parallel_size: int = 1
+    expert_model_parallel_size: int = 1
+    tier_topology: Dict[str, List[int]] = field(default_factory=dict)
+    iteration: int = 0  # 0 is valid for pretrained/release checkpoints (M2701)
+
+    def to_dict(self) -> Dict[str, Any]:
+        from dataclasses import asdict
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "CheckpointManifest":
+        known = {f.name for f in fields(cls)}
+        return cls(**{k: v for k, v in d.items() if k in known})
+
 
 # ---------------------------------------------------------------------------
 # ShardedTensor
@@ -215,16 +246,35 @@ def save(
     _barrier()  # wait for all shard files to be flushed
 
     if rank == 0:
-        import json
-        meta = {
-            "format": "neuron_sp_dist_ckpt",
-            "version": 1,
-            "world_size": _world_size(),
-        }
+        # From M2566/M2701: CheckpointManifest instead of ad-hoc dict.
+        try:
+            from deepspeed.core import parallel_state as _ps
+            _init = _ps.model_parallel_is_initialized()
+            tp = _ps.get_tensor_model_parallel_world_size() if _init else 1
+            pp = _ps.get_pipeline_model_parallel_world_size() if _init else 1
+            dp = _ps.get_data_parallel_world_size() if _init else 1
+            ep = _ps.get_expert_model_parallel_world_size() if _init else 1
+            tier_topo: Dict[str, List[int]] = {}
+            if _init and hasattr(_ps, '_TIER_GROUPS') and _ps._TIER_GROUPS:
+                import torch.distributed as _td
+                for tn, tpg in _ps._TIER_GROUPS.items():
+                    try:
+                        tier_topo[tn] = _td.get_process_group_ranks(tpg)
+                    except Exception:
+                        pass
+        except Exception:
+            tp = pp = dp = ep = 1
+            tier_topo = {}
+        manifest = CheckpointManifest(
+            world_size=_world_size(), tensor_model_parallel_size=tp,
+            pipeline_model_parallel_size=pp, data_parallel_size=dp,
+            expert_model_parallel_size=ep, tier_topology=tier_topo,
+        )
         meta_path = ckpt_path / "metadata.json"
         with meta_path.open("w") as f:
-            json.dump(meta, f, indent=2)
-        logger.debug("rank 0: saved metadata.json")
+            import json as _json
+            _json.dump(manifest.to_dict(), f, indent=2)
+        logger.debug("rank 0: saved metadata.json (manifest v%d)", manifest.version)
 
     _barrier()  # ensure metadata is visible before returning
     return None
@@ -272,6 +322,25 @@ def load(
     if common_path.exists():
         common_state = torch.load(str(common_path), map_location="cpu")
         logger.debug("rank %d: loaded common.pt", rank)
+
+    # ------------------------------------------------------------------ #
+    # Read and parse metadata.json via CheckpointManifest.
+    # ------------------------------------------------------------------ #
+    meta_path = ckpt_path / "metadata.json"
+    if meta_path.exists():
+        import json as _json
+        with meta_path.open("r") as _f:
+            meta = _json.load(_f)
+        try:
+            manifest = CheckpointManifest.from_dict(meta)
+            logger.info(
+                "ckpt manifest v%d: world=%d TP=%d PP=%d DP=%d EP=%d tier=%s",
+                manifest.version, manifest.world_size,
+                manifest.tensor_model_parallel_size, manifest.pipeline_model_parallel_size,
+                manifest.data_parallel_size, manifest.expert_model_parallel_size,
+                manifest.tier_topology)
+        except Exception as e:
+            logger.warning("Could not parse checkpoint manifest: %s", e)
 
     # ------------------------------------------------------------------ #
     # Collect ShardedTensor descriptors from the target state dict.
