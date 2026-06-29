@@ -3221,36 +3221,56 @@ class DesLocEngine:
                 )
 
         # ------------------------------------------------------------------
-        # Synchronous per-rank save.  Each rank saves its own shard to a
-        # rank-suffixed file.  No collective communication needed.
+        # Dispatch: dist_checkpointing (when adapter is active) or legacy
+        # synchronous per-rank torch.save.
         # ------------------------------------------------------------------
-        _rank = (
-            parallel_state.get_data_parallel_rank()
-            if parallel_state.is_initialized()
-            else (dist.get_rank() if dist.is_initialized() else 0)
-        )
-        _world = (
-            parallel_state.get_data_parallel_world_size()
-            if parallel_state.is_initialized()
-            else (dist.get_world_size() if dist.is_initialized() else 1)
-        )
-        # For rank 0 (or single-GPU), save full payload.
-        # For other ranks, save only param_shard + step (optimizer is redundant
-        # since each rank has its own shard's Adam states).
-        if _world == 1:
-            torch.save(payload, path)
-            logger.info("Checkpoint saved: %s (step %d)", path, self.global_step)
-        else:
-            path = Path(path)
-            ckpt_dir = path.parent / path.stem
+        if _dc_saver is not None:
+            # Phase-1 wire-up (PROPOSAL_checkpoint_migration.md §3 Step 1):
+            # route S3/S4 through the DistCheckpointAdapter so that
+            # dist_checkpointing.save() handles sharded IO instead of each
+            # rank writing a full monolithic .pt file.
+            #
+            # path must be a directory for dist_checkpointing; create it here
+            # (empty) so serialization.save()'s non-empty check passes.
+            ckpt_dir = Path(path) if not Path(path).suffix else Path(path).parent / Path(path).stem
             ckpt_dir.mkdir(parents=True, exist_ok=True)
-            rank_path = ckpt_dir / f"rank_{_rank}.pt"
-            torch.save(payload, rank_path)
+            _dc_saver.save(payload, ckpt_dir)
             logger.info(
-                "Checkpoint saved: %s (rank %d/%d, step %d, %.1f MB)",
-                rank_path, _rank, _world, self.global_step,
-                rank_path.stat().st_size / (1 << 20),
+                "dist_checkpoint saved: %s (step %d)",
+                ckpt_dir, self.global_step,
             )
+        else:
+            # ------------------------------------------------------------------
+            # Legacy synchronous per-rank save.  Each rank saves its own shard
+            # to a rank-suffixed file.  No collective communication needed.
+            # ------------------------------------------------------------------
+            _rank = (
+                parallel_state.get_data_parallel_rank()
+                if parallel_state.is_initialized()
+                else (dist.get_rank() if dist.is_initialized() else 0)
+            )
+            _world = (
+                parallel_state.get_data_parallel_world_size()
+                if parallel_state.is_initialized()
+                else (dist.get_world_size() if dist.is_initialized() else 1)
+            )
+            # For rank 0 (or single-GPU), save full payload.
+            # For other ranks, save only param_shard + step (optimizer is redundant
+            # since each rank has its own shard's Adam states).
+            if _world == 1:
+                torch.save(payload, path)
+                logger.info("Checkpoint saved: %s (step %d)", path, self.global_step)
+            else:
+                path = Path(path)
+                ckpt_dir = path.parent / path.stem
+                ckpt_dir.mkdir(parents=True, exist_ok=True)
+                rank_path = ckpt_dir / f"rank_{_rank}.pt"
+                torch.save(payload, rank_path)
+                logger.info(
+                    "Checkpoint saved: %s (rank %d/%d, step %d, %.1f MB)",
+                    rank_path, _rank, _world, self.global_step,
+                    rank_path.stat().st_size / (1 << 20),
+                )
         if dist.is_initialized():
             dist.barrier()  # all ranks wait for IO to finish
 
