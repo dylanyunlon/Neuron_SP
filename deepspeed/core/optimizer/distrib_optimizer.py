@@ -785,6 +785,19 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             grad_scaler=None,  # BF16 path: no dynamic loss scale
         )
 
+        # From Megatron M2356: guard against double weight-decay when
+        # decoupled_weight_decay=True but the inner optimizer also applies L2.
+        if self.config.decoupled_weight_decay and self.config.weight_decay > 0:
+            for pg in self.optimizer.param_groups:
+                if pg.get('weight_decay', 0.0) != 0.0:
+                    import warnings
+                    warnings.warn(
+                        'decoupled_weight_decay=True but optimizer also has '
+                        f'weight_decay={pg["weight_decay"]}. Double decay! '
+                        'Set optimizer weight_decay=0. From Megatron M2356.',
+                        UserWarning)
+                    break
+
         self.param_and_grad_buffers = param_and_grad_buffers
         self.data_parallel_group = data_parallel_group
         self.data_parallel_group_gloo = data_parallel_group_gloo
@@ -1275,6 +1288,39 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         self.start_param_sync(force_sync=True)
 
     # ------------------------------------------------------------------
+    # Decoupled weight decay  (From Megatron M2356)
+    # ------------------------------------------------------------------
+
+    def _apply_decoupled_weight_decay(self) -> None:
+        """Apply AdamW-style decoupled weight decay before the Adam update.
+
+        From Megatron M2356: AdamW vs Adam weight decay selection.
+        Adam:  L2 gradient term before adaptive scaling (rank-size-dependent).
+        AdamW: param *= (1 - lr * wd) after update (rank-size-independent).
+
+        DES-LOC: decoupled decay is rank-size-independent, critical for
+        heterogeneous 2xA6000+H100+2xBlackwell sharding where different ranks
+        own different shard sizes — L2 regularisation via Adam's gradient term
+        would produce different effective weight-decay magnitudes per rank.
+
+        This method is called BEFORE ``self.optimizer.step()`` so that the
+        weight decay is applied to the FP32 shard values before the Adam
+        moment update, matching the AdamW formulation.
+        """
+        # From Megatron M2356: AdamW vs Adam weight decay selection.
+        if not self.config.decoupled_weight_decay:
+            return
+        wd = self.config.weight_decay
+        if wd == 0.0:
+            return
+        lr = self.optimizer.param_groups[0].get('lr', self.config.lr or 1e-4)
+        decay = 1.0 - lr * wd
+        for group in self.optimizer.param_groups:
+            for p in group['params']:
+                if p.data is not None and p.requires_grad:
+                    p.data.mul_(decay)
+
+    # ------------------------------------------------------------------
     # step_with_ready_grads  (Megatron evolution: M2307 → M3998)
     # ------------------------------------------------------------------
 
@@ -1318,6 +1364,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 norm_type=2.0,
                 model_parallel_group=self.data_parallel_group,
             )
+
+        # From Megatron M2356: apply AdamW decoupled weight decay before Adam step.
+        self._apply_decoupled_weight_decay()
 
         # Local Adam update on FP32 shard.
         self.optimizer.step()
