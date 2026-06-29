@@ -367,6 +367,13 @@ def forward_step(
     """Forward step through the model for one microbatch."""
     if config.timers is not None:
         config.timers('forward-compute', log_level=2).start()
+    # From Megatron M2300 (323051030): Fix is_first_microbatch not correctly set
+    # with CUDA graph enabled.  set_is_first_microbatch() must be called BEFORE
+    # set_current_microbatch() so that FP8 / CUDA-graph replay correctly identifies
+    # the first microbatch even when replaying from a graph.  In DES-LOC the H100
+    # may use CUDA graphs for the high-throughput inference tier while A6000 runs
+    # eager mode; both paths must set is_first_microbatch consistently to avoid
+    # mismatched FP8 scale updates at microbatch boundaries.
     if is_first_microbatch and hasattr(model, 'set_is_first_microbatch'):
         model.set_is_first_microbatch()
     if current_microbatch is not None:
