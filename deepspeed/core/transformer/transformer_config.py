@@ -1969,3 +1969,51 @@ class TransformerConfig(ModelParallelConfig):
                 return 'v'
 
         return self.desloc_default_tier
+
+    def estimate_training_flops(self, batch_size: int, seq_len: int) -> float:
+        """Estimate training FLOPs per step (fwd + bwd = ~3x fwd).
+
+        From Megatron M2658: accounts for MoE layers separately from dense
+        layers in hybrid models, using hybrid_override_pattern 'E' count.
+
+        Args:
+            batch_size: Global batch size.
+            seq_len:    Sequence length in tokens.
+
+        Returns:
+            Estimated FLOPs for one full training step.
+        """
+        h = self.hidden_size
+        ffn_h = (self.ffn_hidden_size or 4 * h)
+        vocab = getattr(self, 'vocab_size', 0) or 0
+        swiglu = getattr(self, 'gated_linear_unit', False)
+        scale = 1.5 if swiglu else 1.0
+        n = self.num_layers
+
+        pattern = getattr(self, 'hybrid_override_pattern', None)
+        if pattern:
+            # From M2658: count 'E' (MoE) layers in addition to dense/attn
+            n_moe  = pattern.count('E')
+            n_attn = pattern.count('*')
+            n_dense = n - n_moe  # remaining layers are dense
+        else:
+            n_moe  = 0
+            n_attn = n
+            n_dense = n
+
+        # Attention: QKV proj + output proj + scores
+        attn_fwd = n_attn * (4 * batch_size * seq_len * h * h
+                             + 2 * batch_size * seq_len * seq_len * h)
+        # Dense MLP: two linear layers, possibly SwiGLU
+        dense_fwd = n_dense * 4 * scale * batch_size * seq_len * h * ffn_h
+        # MoE MLP: topk routed + optional shared expert
+        moe_ffn_h = getattr(self, 'moe_ffn_hidden_size', None) or ffn_h
+        topk = getattr(self, 'moe_router_topk', 2)
+        shared_h = getattr(self, 'moe_shared_expert_intermediate_size', 0) or 0
+        moe_fwd = n_moe * (4 * scale * batch_size * seq_len * h * moe_ffn_h * topk
+                           + (4 * scale * batch_size * seq_len * h * shared_h
+                              if shared_h else 0))
+        # Logit projection
+        logit_fwd = 2 * batch_size * seq_len * h * vocab if vocab else 0
+
+        return (attn_fwd + dense_fwd + moe_fwd + logit_fwd) * 3

@@ -563,6 +563,13 @@ def reset_model_temporary_tensors(
         for module in inner.modules():
             if getattr(config, 'moe_router_enable_expert_bias', False) and \
                     hasattr(module, 'expert_bias'):
+                # From Megatron M2675: router must only accumulate
+                # local_tokens_per_expert when torch.is_grad_enabled() is True.
+                # Activation recompute runs forward twice; without this guard,
+                # counts are doubled, corrupting expert bias load balancing.
+                # Any router implementation MUST wrap accumulation as:
+                #   if torch.is_grad_enabled():
+                #       self.local_tokens_per_expert += routing_map.sum(dim=0)
                 module.local_tokens_per_expert.zero_()
             load_type = getattr(config, 'moe_router_load_balancing_type', '')
             if (
