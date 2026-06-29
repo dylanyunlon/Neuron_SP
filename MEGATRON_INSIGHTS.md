@@ -1229,3 +1229,78 @@ Megatron 这批 commit 揭示的核心矛盾是：**一个为同构 GPU 集群�
 
 我们 DES-LOC 的异构拓扑从一开始就是"异构"的，这反而让我们有机会做出更干净的设计：显式进程组、统一梯度访问接口、单一 DDP 实现、结构化的参数元数据。这些不是"优化"，是从第一天起就应该做对的事情。
 
+
+## M2456–M2536 Review Log (Batch 2026-06-29)
+
+### SKIP list
+- M2536: ci — Approval gate rule (GitLab CI YAML only)
+- M2535: ci — Approval gate fix (GitLab CI YAML only)
+- M2534: ci — Approval bot fix (GitHub workflow only)
+- M2533: ci — Approvalbot other branches (GitHub workflow only)
+- M2532: ci — Fix branch approval bot (GitLab YAML only)
+- M2531: ci — internal MRs CI (PR template + GitLab YAML)
+- M2529: chore — Add description who can merge (PR template)
+- M2528: chore — Update PR template
+- M2525: ci — PR template community bot
+- M2524: ci — Allow skipping on main (GitHub workflow)
+- M2523: ci — Bump pre-flight for main/dev (GitHub workflow)
+- M2522: ci — Update nightly schedule (GitHub workflow)
+- M2521: ci — Approve dev (GitLab YAML)
+- M2520: ci — Configure cherrypick bot (GitHub workflow)
+- M2519: ci — Fix approval bot (GitLab YAML)
+- M2517: ci — Container image tag SHA (GitHub workflow)
+- M2516: ci — Remove attribute (GitHub workflow)
+- M2515: ci — Parametrize workflow
+- M2514: ci — Parametrize workflow
+- M2513: ci — Adjust approval-bot
+- M2512: ci — Update function name
+- M2511: ci — Use matrix approval-bot
+- M2510: ci — Move test optimizer into own bucket
+- M2509: ci — Extend queue-manager dev branch
+- M2508: ci — No copyright on push
+- M2507: chore — Update CODEOWNERS
+- M2506: chore — Add CODEOWNERS
+- M2505: ci — Do not run linting on push
+- M2504: ci — Fix linting
+- M2503: ci — HAS_RUN_TESTS_LABEL fix
+- M2502: ci — Linting on main
+- M2501: ci — Fix copyright checker
+- M2500: ci — Fix linter
+- M2499: ci — Run on dev
+- M2498: ci — Fix copyright checker
+- M2497: ci — Add copyright checker GitHub CI
+- M2495: SKIP — NSys NVTX context cleanup (profiling-only, training.py Megatron-specific)
+- M2494: ci — Temporarily block external contributions
+- M2491: build — Bump TE (pyproject.toml/uv.lock only)
+- M2490: SKIP — Convert static→dynamic inference engine (inference-path only, no DES-LOC training relevance)
+- M2489: build — Upgrade JET (docker/CI)
+- M2488: build — Upgrade jet-client (docker/CI)
+- M2487: ci — Refactor testsystem JET artifacts removal
+- M2486: chore — Version bump 0.16.0 (package_info.py only)
+- M2485: chore — Version bump 0.16.0
+- M2484: SKIP — Rename Chunk→Block inference KV allocator (inference-only)
+- M2482: SKIP — Inference throughput tests (examples/inference only)
+- M2481: ci — Build for sm80 (Dockerfile only)
+- M2479: SKIP — Automate ModelOpt restore (post_training checkpointing only)
+- M2473: SKIP — Revert Chunk→Block rename (inference-only revert)
+- M2472: docs — Update installation docs
+- M2471: SKIP — Rename Chunk→Block inference (inference-only)
+- M2470: ci — Cherrypick main→dev (GitLab YAML)
+- M2468: build — Upgrade dependencies (pyproject.toml/uv.lock)
+- M2467: SKIP — Sequence packing for RL train_rl.py (RL-specific training.py args, no DES-LOC distributed change)
+- M2465: SKIP — Mamba refactor train/prefill/decode paths (SSM-specific, no DES-LOC relevance)
+- M2464: chore — Tool for upgrading deps
+- M2461: ci — No batch short anymore
+- M2460: build — Bump PyTorch base container 25.09
+- M2458: SKIP — Disable singleton_local_shards default (dist_checkpointing/mapping.py, deprecation removal only)
+- M2457: SKIP — Fix Yarn superclass init (positional→keyword args, embedding-only)
+
+### APPLIED list
+- M2527: sequence packing RLRuntimeState — see deepspeed/runtime/des_loc_mimo_training_loop.py
+- M2496: FSDP Expert Parallel — see deepspeed/core/parallel_state.py
+- M2492: cpu-offloading-num-layers interface — see deepspeed/runtime/desloc_engine.py
+- M2480: Sink Attention TP sharded_state_dict — see deepspeed/core/transformer/
+- M2475: MoE deterministic index_add_ — see deepspeed/core/transformer/moe/
+- M2469: DCP FP8 extra_state strip — see deepspeed/core/dist_checkpointing/
+- M2466: FSDP overwrite_main_grad TE — see deepspeed/core/distributed/
+- M2456: ProcessGroupCollection + check_initialized — see deepspeed/core/parallel_state.py + optimizer/

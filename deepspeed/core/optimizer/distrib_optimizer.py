@@ -1005,6 +1005,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         data_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
         data_parallel_group_gloo: Optional[torch.distributed.ProcessGroup] = None,
         tier_assignments: Optional[List[Optional[TierType]]] = None,
+        # From Megatron M2456: pass intra_dist_opt_group explicitly so callers
+        # do not rely on parallel_state.get_intra_distributed_optimizer_instance_group()
+        # being initialized yet (avoids assertion crash during multi-instance init order).
+        intra_dist_opt_group: Optional[torch.distributed.ProcessGroup] = None,
     ) -> None:
         # Resolve data_parallel_group from parallel_state when not explicitly given
         if data_parallel_group is None:
@@ -1040,6 +1044,18 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         self.data_parallel_group = data_parallel_group
         self.data_parallel_group_gloo = data_parallel_group_gloo
         self.tier_assignments = tier_assignments
+
+        # From Megatron M2456: set grad_stats_parallel_group from the explicitly-passed
+        # intra_dist_opt_group rather than calling parallel_state accessor (which may
+        # not be initialized yet when multiple optimizer instances are created).
+        # On DES-LOC PCIe clusters this avoids assertion failures during engine init.
+        if intra_dist_opt_group is not None:
+            self.grad_stats_parallel_group = intra_dist_opt_group
+        elif parallel_state.is_initialized():
+            self.grad_stats_parallel_group = parallel_state.get_intra_distributed_optimizer_instance_group(
+                check_initialized=False
+            )
+        # If still None, get_grad_stats_parallel_group() falls back to data_parallel_group.
 
         self.data_parallel_world_size: int = torch.distributed.get_world_size(group=data_parallel_group)
         self.data_parallel_rank: int = torch.distributed.get_rank(group=data_parallel_group)
