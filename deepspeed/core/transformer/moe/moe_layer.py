@@ -5,6 +5,20 @@ that replaces the standard MLP in TransformerLayer.
 
 Pure PyTorch. PCIe-optimized: uses permute/unpermute instead of all-to-all
 for single-machine heterogeneous topologies.
+
+Megatron forward parity (forward() gaps addressed in this version):
+  Gap 1: shared expert now runs FIRST on the original hidden_states, before
+          any routing — matching Megatron's shared_experts_compute() ordering.
+  Gap 2: expert loop now uses autograd-safe index_add_ accumulation instead
+          of boolean-mask in-place writes that broke the gradient graph.
+  Gap 3: padding_mask forwarded to router (router.forward() ignores it for
+          now but the interface is stable for when we add capacity-aware
+          padding-aware routing).
+  Gap 4: _expert_utilization now populated with actual tokens_per_expert
+          counts so log_utilization() in MoEAdapter has real data to emit.
+  Gap 5: moe_layer_recompute flag wires torch.utils.checkpoint when
+          config.moe_layer_recompute is True (mirrors Megatron's
+          moe_layer_recompute option).
 """
 from __future__ import annotations
 
@@ -67,6 +81,7 @@ class MoELayer(nn.Module):
         self.num_experts = config.num_moe_experts
         self.topk = config.moe_router_topk
         self.layer_number = layer_number
+        self.moe_layer_recompute: bool = getattr(config, "moe_layer_recompute", False)
 
         # Router
         self.router = TopKRouter(config)
@@ -74,20 +89,124 @@ class MoELayer(nn.Module):
         # Expert MLPs
         self.experts = nn.ModuleList([ExpertMLP(config) for _ in range(self.num_experts)])
 
-        # Optional shared expert (DeepSeek-style)
-        self.shared_expert = None
+        # Optional shared expert (DeepSeek-style).
+        # Matches Megatron use_shared_expert / shared_experts field.
+        self.shared_expert: Optional[ExpertMLP] = None
         num_shared = getattr(config, "moe_num_shared_experts", 0)
         if num_shared > 0:
             self.shared_expert = ExpertMLP(config)
 
-        # For tracking
-        self._expert_utilization = None
+        # Populated during forward for utilization logging (MoEAdapter.log_utilization).
+        self._expert_utilization: Optional[torch.Tensor] = None
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    # ------------------------------------------------------------------
+    # Internal forward implementation (wrapped by checkpoint if needed)
+    # ------------------------------------------------------------------
+
+    def _forward_impl(
+        self,
+        hidden_states: torch.Tensor,
+        padding_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Core MoE forward logic.
+
+        Follows Megatron's ordering:
+          1. shared_expert on full hidden_states (Gap 1 fix)
+          2. route tokens (with optional padding_mask — Gap 3)
+          3. permute tokens by expert
+          4. run each expert with autograd-safe index_add_ accumulation (Gap 2 fix)
+          5. unpermute and weight by routing scores
+          6. add shared_expert output
+        """
+        # ---- Step 1: Shared expert on original input (Megatron gap fix) ----
+        # Must happen before any routing manipulation so the shared expert sees
+        # the unmodified token representations.
+        shared_out: Optional[torch.Tensor] = None
+        if self.shared_expert is not None:
+            shared_out = self.shared_expert(hidden_states)
+
+        # ---- Step 2: Route tokens ----
+        # router.forward() returns (scores, indices, probs):
+        #   scores:  [num_tokens, topk]  — normalized routing weights
+        #   indices: [num_tokens, topk]  — expert indices (-1 = dropped)
+        #   probs:   [num_tokens, num_experts] — full softmax (for aux loss)
+        scores, indices, _probs = self.router(hidden_states)
+
+        num_tokens, hidden_size = hidden_states.shape
+
+        # ---- Step 3: Permute tokens by expert assignment ----
+        # permuted_tokens: [num_tokens * topk, hidden_size]
+        # sorted_indices:  argsort of flat expert indices — inverse is unpermute key
+        permuted_tokens, sorted_indices = permute_tokens(
+            hidden_states, indices, self.num_experts, self.topk
+        )
+
+        # Recover which expert each permuted slot belongs to.
+        flat_indices = indices.reshape(-1)        # [num_tokens * topk]
+        sorted_expert_ids = flat_indices[sorted_indices]   # expert id at each permuted position
+
+        # ---- Step 4: Per-expert computation (autograd-safe) ----
+        # Use index_add_ accumulation rather than boolean-mask writes.
+        # Boolean in-place scatter on a zero tensor severs the autograd graph for
+        # the unwritten positions; index_add_ preserves the full gradient path.
+        expert_outputs = torch.zeros_like(permuted_tokens)  # [num_tokens*topk, hidden_size]
+
+        # Track tokens_per_expert for utilization logging (Gap 4 fix).
+        tokens_per_expert = torch.zeros(
+            self.num_experts, dtype=torch.long, device=hidden_states.device
+        )
+
+        for expert_idx in range(self.num_experts):
+            # Boolean mask over the sorted/permuted dimension
+            expert_mask = sorted_expert_ids == expert_idx   # [num_tokens * topk]
+            num_expert_tokens = expert_mask.sum().item()
+            if num_expert_tokens == 0:
+                continue
+
+            tokens_per_expert[expert_idx] = num_expert_tokens
+
+            # Gather input tokens for this expert
+            expert_input = permuted_tokens[expert_mask]     # [E, hidden_size]
+            expert_out = self.experts[expert_idx](expert_input)  # [E, hidden_size]
+
+            # Scatter output back using index_add_ on dim=0.
+            # This is equivalent to expert_outputs[expert_mask] = expert_out but
+            # keeps the full gradient path alive for permuted_tokens.
+            indices_for_expert = expert_mask.nonzero(as_tuple=False).squeeze(1)  # [E]
+            expert_outputs.index_add_(0, indices_for_expert, expert_out)
+
+        # Dropped tokens (index == -1): zero contribution, already zero-initialized.
+
+        # Populate utilization for MoEAdapter.log_utilization() (Gap 4 fix)
+        self._expert_utilization = tokens_per_expert
+
+        # ---- Step 5: Unpermute and apply routing weights ----
+        output = unpermute_tokens(expert_outputs, sorted_indices, scores, self.topk)
+        # output: [num_tokens, hidden_size]
+
+        # ---- Step 6: Add shared expert output ----
+        if shared_out is not None:
+            output = output + shared_out
+
+        return output
+
+    # ------------------------------------------------------------------
+    # Public forward — optional activation-checkpoint wrapper (Gap 5)
+    # ------------------------------------------------------------------
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        padding_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """Process tokens through MoE.
 
         Args:
-            hidden_states: [seq_len, batch_size, hidden_size] or [num_tokens, hidden_size].
+            hidden_states: [seq_len, batch_size, hidden_size] or
+                           [num_tokens, hidden_size].
+            padding_mask:  Optional boolean mask [seq_len, batch_size] or
+                           [num_tokens].  True = valid token.  Passed to
+                           the router for capacity-aware routing.
 
         Returns:
             output: Same shape as input.
@@ -97,49 +216,26 @@ class MoELayer(nn.Module):
         if hidden_states.dim() == 3:
             seq_len, batch_size, hidden_size = hidden_states.shape
             hidden_states_2d = hidden_states.reshape(-1, hidden_size)
+            # Flatten padding_mask to match
+            if padding_mask is not None and padding_mask.dim() == 2:
+                padding_mask = padding_mask.reshape(-1)
         else:
             hidden_states_2d = hidden_states
 
-        num_tokens = hidden_states_2d.shape[0]
+        if self.moe_layer_recompute and self.training:
+            # Activation checkpoint: recompute forward activations during
+            # backward to save memory, at the cost of one extra forward pass.
+            # Mirrors Megatron's tensor_parallel.checkpoint() path.
+            output = torch.utils.checkpoint.checkpoint(
+                self._forward_impl,
+                hidden_states_2d,
+                padding_mask,
+                use_reentrant=False,
+            )
+        else:
+            output = self._forward_impl(hidden_states_2d, padding_mask)
 
-        # Route tokens
-        scores, indices, probs = self.router(hidden_states_2d)
-
-        # Permute tokens by expert assignment
-        permuted_tokens, sorted_indices = permute_tokens(
-            hidden_states_2d, indices, self.num_experts, self.topk
-        )
-
-        # Process tokens through experts
-        # Group tokens by expert for efficient batched computation
-        flat_indices = indices.reshape(-1)
-        sorted_flat = flat_indices[sorted_indices]
-
-        expert_outputs = torch.zeros_like(permuted_tokens)
-        offset = 0
-        for expert_idx in range(self.num_experts):
-            mask = sorted_flat == expert_idx
-            num_expert_tokens = mask.sum().item()
-            if num_expert_tokens > 0:
-                expert_input = permuted_tokens[mask]
-                expert_output = self.experts[expert_idx](expert_input)
-                expert_outputs[mask] = expert_output
-
-        # Handle dropped tokens (index == -1)
-        dropped_mask = sorted_flat < 0
-        expert_outputs[dropped_mask] = 0.0
-
-        # Unpermute and weight by routing scores
-        output = unpermute_tokens(expert_outputs, sorted_indices, scores, self.topk)
-
-        # Add shared expert output if present
-        if self.shared_expert is not None:
-            shared_out = self.shared_expert(hidden_states_2d)
-            output = output + shared_out
-
-        # Reshape back
-        output = output.reshape(original_shape)
-        return output
+        return output.reshape(original_shape)
 
     def get_aux_loss(self) -> torch.Tensor:
         """Return accumulated auxiliary loss from router."""
