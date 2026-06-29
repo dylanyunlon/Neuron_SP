@@ -127,14 +127,14 @@ def save(sharded_state_dict: ShardedStateDict,
         validate_sharding_integrity(sharded_tensors)
         common_strategy.save(state_dict, checkpoint_dir)
         if sharded_strategy is None:
-            sharded_strategy = get_default_strategy(StrategyAction.SAVE_SHARDED, 'zarr', 1)
+            sharded_strategy = get_default_strategy(StrategyAction.SAVE_SHARDED, 'torch', 1)
         sharded_strategy.save(sharded_tensors, checkpoint_dir)
         save_config(CheckpointingConfig(sharded_strategy.backend, sharded_strategy.version),
                     checkpoint_dir)
         return
 
     if sharded_strategy is None:
-        sharded_strategy = get_default_strategy(StrategyAction.SAVE_SHARDED, 'zarr', 1)
+        sharded_strategy = get_default_strategy(StrategyAction.SAVE_SHARDED, 'torch', 1)
 
 
     sharded_state_dict, state_dict = extract_sharded_tensors_or_nonpersistent(sharded_state_dict)

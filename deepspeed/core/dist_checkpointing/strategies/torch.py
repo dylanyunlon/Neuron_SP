@@ -221,11 +221,11 @@ default_strategies[StrategyAction.SAVE_SHARDED.value][('torch', 1)] = (
     TorchSaveShardedStrategy('torch', 1)
 )
 default_strategies[StrategyAction.LOAD_SHARDED.value][('torch', 1)] = (
-    TorchLoadShardedStrategy('torch', 1)
+    TorchLoadShardedStrategy()
 )
 default_strategies[StrategyAction.SAVE_COMMON.value][('torch', 1)] = (
     TorchSaveCommonStrategy('torch', 1)
 )
 default_strategies[StrategyAction.LOAD_COMMON.value][('torch', 1)] = (
-    TorchLoadCommonStrategy('torch', 1)
+    TorchLoadCommonStrategy()
 )
