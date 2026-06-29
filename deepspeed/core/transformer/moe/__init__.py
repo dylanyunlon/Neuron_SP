@@ -3,6 +3,7 @@
 Adapted from Megatron megatron/core/transformer/moe/.
 """
 from deepspeed.core.transformer.moe.moe_layer import ExpertMLP, MoELayer
+from deepspeed.core.transformer.moe.shared_experts import SharedExpertMLP, SharedExpertState
 from deepspeed.core.transformer.moe.moe_utils import (
     permute_tokens,
     switch_load_balancing_loss_func,
@@ -23,6 +24,8 @@ __all__ = [
     "MoELayer",
     "TopKRouter",
     "ExpertMLP",
+    "SharedExpertMLP",
+    "SharedExpertState",
     "switch_load_balancing_loss_func",
     "z_loss_func",
     "topk_softmax_with_capacity",
