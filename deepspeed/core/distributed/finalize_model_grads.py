@@ -23,6 +23,9 @@ Evolution summary (ported from Megatron-LM finalize_model_grads.py, 15 commits):
       param.grad dereferencing in finalize (param.grad = None for FSDP path).
   M4173 (277c4f804): Offline logits-based knowledge distillation support
       (knowledge-distillation teacher gradient handling).
+  M4149 (DES-LOC):  Fuse per-embedding AllReduce into unified call for PCIe
+      topology (fuse_grad_reductions + _allreduce_all_embedding_grads).
+      Inspired by Megatron M4149 "Fuse per-sequence AlltoAll into unified".
 
 DES-LOC extensions (Algorithm 1):
   - finalize_model_grads(... desloc_step, desloc_config):
@@ -40,6 +43,7 @@ Public API:
 
   _allreduce_word_embedding_grads
   _allreduce_position_embedding_grads
+  _allreduce_all_embedding_grads  (fused word+pos for PCIe, M4149 pattern)
   _allreduce_non_tensor_model_parallel_grads
   _allreduce_layernorm_grads  (alias for legacy tests)
   _allreduce_conditional_embedding_grads
@@ -401,8 +405,252 @@ def _allreduce_position_embedding_grads(
 
 
 # ---------------------------------------------------------------------------
-# Flextron router grad sync (M3871)
+# PCIe-friendly grad reduction fusion helper (M4149 pattern / DES-LOC)
 # ---------------------------------------------------------------------------
+
+def fuse_grad_reductions(
+    grad_tensors: List[torch.Tensor],
+    process_group: Optional[torch.distributed.ProcessGroup] = None,
+    op: torch.distributed.ReduceOp = torch.distributed.ReduceOp.SUM,
+) -> None:
+    """Fuse multiple independent AllReduce calls into a single communication.
+
+    PCIe interconnects carry a fixed launch overhead (~5-20 µs) per collective
+    regardless of tensor size.  Fusing N small tensors into one flat buffer
+    reduces that overhead from O(N) to O(1) while sending the same bytes.
+
+    From Megatron M4149: "Fuse per-sequence AlltoAll into unified".
+    DES-LOC: adapted for PCIe-constrained heterogeneous topology
+    (2×A6000 + 1×H100 NVL + 2×Blackwell, all PCIe, no cross-device NVLink).
+
+    Args:
+        grad_tensors: List of gradient tensors to reduce together.
+                      They may have different shapes but MUST be the same dtype
+                      within each fusion group (enforced internally by dtype
+                      bucketing).
+        process_group: The process group for the collective.  None → default
+                       (WORLD) group.
+        op: Reduction operator, defaults to SUM.
+
+    Notes:
+        - Tensors of different dtypes are bucketed and each bucket is fused
+          separately (cross-dtype flatten is unsupported by PyTorch).
+        - A single-tensor group skips flatten/copy to avoid unnecessary
+          allocation and kernel launches.
+        - Writeback is in-place via Tensor.copy_(); no new memory is retained
+          after the call returns.
+        - Empty input is a no-op.
+
+    Implementation note — why not torch.distributed._coalescing_manager?
+        The coalescing manager batches *kernel launches* but still issues N
+        individual NCCL ops under the hood, which on PCIe still costs N
+        NCCL enqueue round-trips.  Flattening to a single tensor achieves a
+        true single NCCL call, which is what PCIe needs.
+    """
+    if not grad_tensors:
+        return
+
+    # Bucket by dtype — same dtype required for torch.cat / flatten.
+    from collections import defaultdict
+    dtype_groups: Dict[torch.dtype, List[torch.Tensor]] = defaultdict(list)
+    for t in grad_tensors:
+        if t is None:
+            continue
+        dtype_groups[t.dtype].append(t)
+
+    for dtype, grads in dtype_groups.items():
+        if len(grads) == 1:
+            # Single tensor: direct reduce, no flatten overhead.
+            torch.distributed.all_reduce(grads[0], op=op, group=process_group)
+            logger.debug(
+                "[fuse_grad_reductions] single %s tensor shape=%s",
+                dtype, list(grads[0].shape),
+            )
+            continue
+
+        # Fuse: flatten → cat → all_reduce → scatter back in-place.
+        shapes = [g.shape for g in grads]
+        sizes  = [g.numel() for g in grads]
+        flat   = torch.cat([g.flatten() for g in grads])
+
+        logger.debug(
+            "[fuse_grad_reductions] fusing %d %s tensors, "
+            "total_numel=%d, sizes=%s%s",
+            len(grads), dtype, flat.numel(),
+            sizes[:5], "..." if len(sizes) > 5 else "",
+        )
+
+        torch.distributed.all_reduce(flat, op=op, group=process_group)
+
+        # Write reduced values back into the original tensors (in-place).
+        offset = 0
+        for g, sz, sh in zip(grads, sizes, shapes):
+            g.copy_(flat[offset:offset + sz].view(sh))
+            offset += sz
+
+
+# ---------------------------------------------------------------------------
+# Fused word + position embedding grad all-reduce (M4149 PCIe optimisation)
+# ---------------------------------------------------------------------------
+
+def _allreduce_all_embedding_grads(
+    model: List[nn.Module],
+    config: ModelParallelConfig,
+    embd_group: Optional[torch.distributed.ProcessGroup],
+    pos_emb_group: Optional[torch.distributed.ProcessGroup],
+    pp_group: torch.distributed.ProcessGroup,
+) -> None:
+    """Fuse word-embedding and position-embedding AllReduce into one call.
+
+    In the standard code path these two reductions are issued sequentially as
+    separate collectives, each incurring PCIe launch overhead.  When both
+    tensors live on the same process group we flatten them into a single buffer
+    and issue one AllReduce, halving overhead.
+
+    When the groups differ (encoder-decoder models where pos_embd_group ≠
+    embd_group) we fall back to the original two-call sequence — correctness
+    is never sacrificed for throughput.
+
+    From Megatron M4149: Fuse per-sequence AlltoAll into unified.
+    DES-LOC: adapted for PCIe heterogeneous topology.
+
+    Args:
+        model: List of model chunks (PP/VPP).
+        config: Model parallel config.
+        embd_group: Process group for word-embedding all-reduce.
+        pos_emb_group: Process group for position-embedding all-reduce.
+        pp_group: Pipeline-parallel group (for first/last stage detection).
+    """
+    # ------------------------------------------------------------------
+    # Collect word-embedding grad
+    # ------------------------------------------------------------------
+    word_grad: Optional[torch.Tensor] = None
+    word_weight: Optional[torch.nn.Parameter] = None
+    word_orig_grad = None
+
+    word_embd_size = get_pg_size(embd_group)
+    pos_embd_size  = get_pg_size(pos_emb_group)
+
+    if word_embd_size > 1:
+        # Replicate the eligibility logic from _allreduce_embedding_grad.
+        try:
+            rank_in_embd = torch.distributed.get_rank() in \
+                torch.distributed.get_process_group_ranks(embd_group)
+        except Exception:
+            rank_in_embd = True
+
+        if rank_in_embd:
+            mtp_layers = getattr(config, 'mtp_num_layers', None) if config is not None else None
+            if is_pp_first_stage(pp_group):
+                model_module = model[0]
+            elif is_pp_last_stage(pp_group):
+                model_module = model[-1]
+            elif mtp_layers is not None and mtp_layers > 0:
+                model_module = model[-1]
+            else:
+                model_module = model[0]
+
+            ddp_config = getattr(model_module, 'ddp_config', None)
+            use_fsdp_w = ddp_config is not None and getattr(ddp_config, 'use_megatron_fsdp', False)
+            model_module_inner = get_attr_wrapped_model(
+                model_module, 'pre_process', return_model_obj=True
+            )
+            word_weight = _get_shared_word_embedding_weight(model_module_inner, config=config)
+            if word_weight is not None:
+                grad_attr = _get_main_grad_attr(word_weight)
+                word_orig_grad = getattr(word_weight, grad_attr)
+                if use_fsdp_w and word_orig_grad is not None:
+                    word_orig_grad = getattr(word_orig_grad, '_local_tensor', word_orig_grad)
+                word_grad = _unshard_if_dtensor(word_orig_grad)
+
+    # ------------------------------------------------------------------
+    # Collect position-embedding grad
+    # ------------------------------------------------------------------
+    pos_grad: Optional[torch.Tensor] = None
+    pos_weight: Optional[torch.nn.Parameter] = None
+    pos_orig_grad = None
+
+    if pos_embd_size > 1:
+        try:
+            rank_in_pos = torch.distributed.get_rank() in \
+                torch.distributed.get_process_group_ranks(pos_emb_group)
+        except Exception:
+            rank_in_pos = True
+
+        if rank_in_pos:
+            mtp_layers = getattr(config, 'mtp_num_layers', None) if config is not None else None
+            if is_pp_first_stage(pp_group):
+                model_module = model[0]
+            elif is_pp_last_stage(pp_group):
+                model_module = model[-1]
+            elif mtp_layers is not None and mtp_layers > 0:
+                model_module = model[-1]
+            else:
+                model_module = model[0]
+
+            ddp_config = getattr(model_module, 'ddp_config', None)
+            use_fsdp_p = ddp_config is not None and getattr(ddp_config, 'use_megatron_fsdp', False)
+            model_module_inner = get_attr_wrapped_model(
+                model_module, 'pre_process', return_model_obj=True
+            )
+            try:
+                pos_weight = _get_position_embedding_weight(model_module_inner)
+            except AttributeError:
+                pos_weight = None
+
+            if pos_weight is not None:
+                grad_attr = _get_main_grad_attr(pos_weight)
+                pos_orig_grad = getattr(pos_weight, grad_attr)
+                if use_fsdp_p and pos_orig_grad is not None:
+                    pos_orig_grad = getattr(pos_orig_grad, '_local_tensor', pos_orig_grad)
+                pos_grad = _unshard_if_dtensor(pos_orig_grad)
+
+    # ------------------------------------------------------------------
+    # Decide: fuse when both grads exist and share the same process group.
+    # ------------------------------------------------------------------
+    same_group = (embd_group is pos_emb_group) or (
+        embd_group is not None
+        and pos_emb_group is not None
+        and embd_group == pos_emb_group
+    )
+
+    if word_grad is not None and pos_grad is not None and same_group and word_embd_size > 1:
+        # Both embeddings live on the same group → fuse into one AllReduce.
+        logger.debug(
+            "[_allreduce_all_embedding_grads] fusing word_embd(%s) + pos_embd(%s) "
+            "into single AllReduce on shared group (PCIe M4149)",
+            list(word_grad.shape), list(pos_grad.shape),
+        )
+        fuse_grad_reductions(
+            [word_grad, pos_grad],
+            process_group=embd_group,
+            op=torch.distributed.ReduceOp.SUM,
+        )
+        # Writeback for DTensor (fuse_grad_reductions wrote into the raw tensor
+        # views; reshard only when the original was a DTensor).
+        if word_weight is not None:
+            setattr(
+                word_weight,
+                _get_main_grad_attr(word_weight),
+                _reshard_if_dtensor(word_grad, word_orig_grad),
+            )
+        if pos_weight is not None:
+            setattr(
+                pos_weight,
+                _get_main_grad_attr(pos_weight),
+                _reshard_if_dtensor(pos_grad, pos_orig_grad),
+            )
+    else:
+        # Groups differ or one grad is absent — fall back to separate calls.
+        # This preserves full correctness for encoder-decoder architectures.
+        logger.debug(
+            "[_allreduce_all_embedding_grads] groups differ or grad absent; "
+            "falling back to separate AllReduce calls "
+            "(word_grad=%s, pos_grad=%s, same_group=%s)",
+            word_grad is not None, pos_grad is not None, same_group,
+        )
+        _allreduce_word_embedding_grads(model, config, embd_group, pp_group)
+        _allreduce_position_embedding_grads(model, config, pos_emb_group, pp_group)
 
 def _allreduce_router_grads(
     model: List[nn.Module],
@@ -945,13 +1193,15 @@ def finalize_model_grads(
 
     # ------------------------------------------------------------------
     # 5. Embedding grad all-reduce across first and last PP stages.
+    #    M4149 (DES-LOC): fuse word + position embedding AllReduce into one
+    #    collective when both live on the same process group, cutting PCIe
+    #    launch overhead from 2× to 1× for these small tensors.
     # ------------------------------------------------------------------
     if config is not None and getattr(config, 'timers', None) is not None:
         config.timers('embedding-grads-all-reduce', log_level=1).start(
             barrier=getattr(config, 'barrier_with_L1_time', False)
         )
-    _allreduce_word_embedding_grads(model, config, embd_group, pp_group)
-    _allreduce_position_embedding_grads(model, config, pos_emb_group, pp_group)
+    _allreduce_all_embedding_grads(model, config, embd_group, pos_emb_group, pp_group)
     if config is not None and getattr(config, 'timers', None) is not None:
         config.timers('embedding-grads-all-reduce').stop()
 
