@@ -276,6 +276,8 @@ class OptimizerConfig:
 
     # Gradient clipping
     clip_grad: float = 1.0
+    # M4065: Megatron 180131620 — skip update when grad norm exceeds this. Default inf = disabled.
+    grad_norm_skip_threshold: float = float('inf')
 
     # Distributed optimizer flags
     use_distributed_optimizer: bool = True
