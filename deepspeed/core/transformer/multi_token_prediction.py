@@ -818,6 +818,13 @@ class MTPLossAutoScaler(torch.autograd.Function):
 
     main_loss_backward_scale: torch.Tensor = torch.tensor(1.0)
 
+    # From Megatron M3312 (PR #3159): track original_num_tokens (before any
+    # MTP roll) so that _get_mtp_loss_scale in schedules.py can apply the
+    # correct token-ratio correction when calculate_per_token_loss=True.
+    # Set by process_mtp_loss() at the start of each forward pass; read by
+    # _get_mtp_loss_scale() to fold the ratio into the AutoScaler scale.
+    original_num_tokens: Optional[torch.Tensor] = None
+
     @staticmethod
     def forward(ctx, output: torch.Tensor, mtp_loss: torch.Tensor):
         ctx.save_for_backward(mtp_loss)
@@ -834,6 +841,19 @@ class MTPLossAutoScaler(torch.autograd.Function):
     def set_loss_scale(scale: torch.Tensor):
         """Set the backward scale for the MTP loss."""
         MTPLossAutoScaler.main_loss_backward_scale = scale
+
+    @staticmethod
+    def set_original_num_tokens(num_tokens: Optional[torch.Tensor]) -> None:
+        """Record the pre-roll token count for use by the schedule-level scaler.
+
+        Called once per forward pass by ``process_mtp_loss`` before the first
+        roll, so that ``_get_mtp_loss_scale`` in
+        ``deepspeed.core.pipeline_parallel.schedules`` can read it back and
+        apply the ``original_num_tokens / rolled_num_tokens`` correction factor
+        required by Megatron M3312 (PR #3159) when
+        ``config.calculate_per_token_loss=True``.
+        """
+        MTPLossAutoScaler.original_num_tokens = num_tokens
 
 
 # ---------------------------------------------------------------------------
@@ -907,6 +927,10 @@ def process_mtp_loss(
         )
 
     original_num_tokens = loss_mask.sum()
+    # M3312: publish the pre-roll token count so schedules._get_mtp_loss_scale
+    # can apply the original/rolled ratio correction when
+    # calculate_per_token_loss=True.
+    MTPLossAutoScaler.set_original_num_tokens(original_num_tokens)
 
     for mtp_layer_number in range(config.mtp_num_layers):
         mtp_logits, _ = output_layer(
