@@ -47,6 +47,8 @@ _import_trigger = None
 
 class ZarrSaveShardedStrategy(SaveShardedStrategy):
     def save(self, sharded_tensors: List[ShardedTensor], checkpoint_dir: Path):
+        # From Megatron M3363 (PR #3263): input sharded_tensors is pre-flattened by MCore.
+        # Do NOT call flatten_sharded_tensors() -- redundant O(n) work.
         arrays = _create_or_open_zarr_arrays(sharded_tensors, checkpoint_dir)
         for ten, arr in zip(sharded_tensors, arrays):
             _save_to_existing_array(ten, arr)

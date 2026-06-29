@@ -1617,6 +1617,7 @@ class TransformerConfig(ModelParallelConfig):
         # --- Context parallelism checks ------------------------------------
         if self.context_parallel_size > 1 and self.cp_comm_type is not None:
             if isinstance(self.cp_comm_type, list):
+                # From Megatron M3432: all callers index this list with layer_number-1 (0-based).
                 assert len(self.cp_comm_type) == self.num_layers, (
                     f"Length of cp_comm_type ({len(self.cp_comm_type)}) should equal "
                     f"the total number of transformer layers ({self.num_layers})!"
