@@ -303,8 +303,31 @@ except ImportError:
 
 print(f'[M2000] HAVE_APEX_OR_TE={HAVE_APEX_OR_TE}')
 
-from apex.multi_tensor_apply import multi_tensor_applier
-import amp_C
+# apex / amp_C are optional NVIDIA packages (fused CUDA kernels).
+# Provide a pure-Python fallback so the module loads on CPU/CI environments.
+try:
+    from apex.multi_tensor_apply import multi_tensor_applier as _apex_mta
+    import amp_C as _amp_C
+    _APEX_AVAILABLE = True
+except (ImportError, ModuleNotFoundError):
+    _APEX_AVAILABLE = False
+    _apex_mta = None
+    _amp_C = None
+
+
+def _multi_tensor_scale_fallback(overflow_buf, tensor_lists, scale):
+    """Pure-Python fallback for amp_C.multi_tensor_scale when apex is absent."""
+    src_list, dst_list = tensor_lists
+    for src, dst in zip(src_list, dst_list):
+        dst.copy_(src.float().mul_(scale))
+
+
+def _apply_multi_tensor_scale(overflow_buf, tensor_lists, scale):
+    """Dispatch to apex fused kernel when available, otherwise fallback."""
+    if _APEX_AVAILABLE:
+        _apex_mta(_amp_C.multi_tensor_scale, overflow_buf, tensor_lists, scale)
+    else:
+        _multi_tensor_scale_fallback(overflow_buf, tensor_lists, scale)
 
 from megatron import get_timers
 from megatron import mpu
@@ -456,7 +479,7 @@ def _multi_tensor_copy_this_to_that(this, that, overflow_buf=None):
     if overflow_buf:
         overflow_buf.fill_(0)
         # Scaling with factor `1.0` is equivalent to copy.
-        multi_tensor_applier(amp_C.multi_tensor_scale, overflow_buf, [this, that], 1.0)
+        _apply_multi_tensor_scale( overflow_buf, [this, that], 1.0)
     else:
         for this_, that_ in zip(this, that):
             that_.copy_(this_)

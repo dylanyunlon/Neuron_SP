@@ -15,7 +15,10 @@
 import math
 import einops
 import torch
-import apex
+try:
+    import apex
+except (ImportError, ModuleNotFoundError):
+    apex = None  # type: ignore[assignment]
 import torch.nn.functional as F
 from megatron import get_args
 from megatron.model import LayerNorm

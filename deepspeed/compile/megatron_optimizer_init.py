@@ -17,8 +17,12 @@
 
 print('[M1013]')
 
-from apex.optimizers import FusedAdam as Adam
-from apex.optimizers import FusedSGD as SGD
+try:
+    from apex.optimizers import FusedAdam as Adam
+    from apex.optimizers import FusedSGD as SGD
+except (ImportError, ModuleNotFoundError):
+    Adam = None  # type: ignore[assignment,misc]
+    SGD = None   # type: ignore[assignment,misc]
 
 from megatron import get_args
 from megatron.model import LayerNorm

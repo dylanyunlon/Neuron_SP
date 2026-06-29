@@ -29,8 +29,32 @@ from deepspeed.runtime.config_utils import DeepSpeedConfigObject
 from deepspeed import comm as dist
 from deepspeed.utils import logger
 
-from apex.multi_tensor_apply import multi_tensor_applier
-import amp_C
+# apex / amp_C are optional NVIDIA packages (fused CUDA kernels).
+# We provide a pure-Python fallback so the module can be imported
+# without apex on CPU-only or CI environments.
+try:
+    from apex.multi_tensor_apply import multi_tensor_applier as _apex_mta
+    import amp_C as _amp_C
+    _APEX_AVAILABLE = True
+except (ImportError, ModuleNotFoundError):
+    _APEX_AVAILABLE = False
+    _apex_mta = None
+    _amp_C = None
+
+
+def _multi_tensor_scale_fallback(overflow_buf, tensor_lists, scale):
+    """Pure-Python fallback for amp_C.multi_tensor_scale when apex is absent."""
+    src_list, dst_list = tensor_lists
+    for src, dst in zip(src_list, dst_list):
+        dst.copy_(src.float().mul_(scale))
+
+
+def _apply_multi_tensor_scale(overflow_buf, tensor_lists, scale):
+    """Dispatch to apex fused kernel when available, otherwise use fallback."""
+    if _APEX_AVAILABLE:
+        _apex_mta(_amp_C.multi_tensor_scale, overflow_buf, tensor_lists, scale)
+    else:
+        _multi_tensor_scale_fallback(overflow_buf, tensor_lists, scale)
 
 INITIAL_LOSS_SCALE = 'init_scale'
 SCALE_WINDOW = 'scale_window'
@@ -165,10 +189,9 @@ class LossScalerBase(DeepSpeedConfigObject):
         # M158: Megatron 99410264a — multi_tensor_applier replaces scalar loop
         print('[M158]')
         _overflow_buf = torch.cuda.IntTensor([0])
-        multi_tensor_applier(amp_C.multi_tensor_scale,
-                             _overflow_buf,
-                             [list(grad_in), list(grad_in)],
-                             self.loss_scale)
+        _apply_multi_tensor_scale(_overflow_buf,
+                                  [list(grad_in), list(grad_in)],
+                                  self.loss_scale)
         return grad_in
         # M125: DES-LOC tracked.
 

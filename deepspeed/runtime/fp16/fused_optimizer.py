@@ -10,8 +10,31 @@ This file is adapted from FP16_Optimizer in NVIDIA/apex
 import torch
 from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 
-from apex.multi_tensor_apply import multi_tensor_applier
-import amp_C
+# apex / amp_C are optional NVIDIA packages (fused CUDA kernels).
+# Provide a pure-Python fallback so the module loads on CPU/CI environments.
+try:
+    from apex.multi_tensor_apply import multi_tensor_applier as _apex_mta
+    import amp_C as _amp_C
+    _APEX_AVAILABLE = True
+except (ImportError, ModuleNotFoundError):
+    _APEX_AVAILABLE = False
+    _apex_mta = None
+    _amp_C = None
+
+
+def _multi_tensor_scale_fallback(overflow_buf, tensor_lists, scale):
+    """Pure-Python fallback for amp_C.multi_tensor_scale when apex is absent."""
+    src_list, dst_list = tensor_lists
+    for src, dst in zip(src_list, dst_list):
+        dst.copy_(src.float().mul_(scale))
+
+
+def _apply_multi_tensor_scale(overflow_buf, tensor_lists, scale):
+    """Dispatch to apex fused kernel when available, otherwise fallback."""
+    if _APEX_AVAILABLE:
+        _apex_mta(_amp_C.multi_tensor_scale, overflow_buf, tensor_lists, scale)
+    else:
+        _multi_tensor_scale_fallback(overflow_buf, tensor_lists, scale)
 from deepspeed.runtime.base_optimizer import DeepSpeedOptimizer
 from deepspeed.runtime.utils import get_global_norm, get_flattened_grad_norm, CheckOverflow, get_weight_norm, get_norm_with_moe_layers, is_model_parallel_parameter
 from deepspeed.runtime.fp16.loss_scaler import LossScaleConfig, LossScaleProfile
@@ -127,7 +150,7 @@ def model_grads_to_master_grads_flat(fp16_group_flat, fp32_master_flat, fp16_gro
     master_grads = [p.grad for p in [fp32_master_flat] if p.grad is not None]
     if model_grads and master_grads:
         _overflow_buf = torch.cuda.IntTensor([0])
-        multi_tensor_applier(amp_C.multi_tensor_scale,
+        _apply_multi_tensor_scale(
                              _overflow_buf,
                              [model_grads, model_grads],
                              1.0)
@@ -544,7 +567,7 @@ class FP16_Optimizer(DeepSpeedOptimizer):
             # M158: Megatron 99410264a — multi_tensor_applier replaces per-grad mul_
             print('[M158]')
             _overflow_buf = torch.cuda.IntTensor([0])
-            multi_tensor_applier(amp_C.multi_tensor_scale,
+            _apply_multi_tensor_scale(
                                  _overflow_buf,
                                  [grad_groups_flat, grad_groups_flat],
                                  1. / combined_scale)
@@ -669,7 +692,7 @@ class FP16_Optimizer(DeepSpeedOptimizer):
         # so master params stay consistent with the freshly loaded fp16 weights.
         model_data, master_data = self._get_fp16_model_and_master_params_data()
         _overflow_buf = torch.cuda.IntTensor([0])
-        multi_tensor_applier(amp_C.multi_tensor_scale,
+        _apply_multi_tensor_scale(
                              _overflow_buf,
                              [model_data, master_data],
                              1.0)
