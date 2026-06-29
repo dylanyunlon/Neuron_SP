@@ -423,10 +423,22 @@ def topkgating(
     gates = F.softmax(logits, dim=1)
     num_experts = int(gates.shape[1])
 
-    # get topk mask
-    topk_masked_gates = torch.zeros_like(logits).scatter(1, top_idx, top_gate)
-
-    mask = torch.zeros_like(gates, dtype=torch.bool).scatter_(1, top_idx, 1)
+    # From Megatron M2475: use index_put_ when deterministic algorithms are enabled
+    # instead of scatter/scatter_, which are non-deterministic on CUDA.
+    # On DES-LOC PCIe clusters (A6000×2 + H100 NVL + Blackwell×2, no NVLink)
+    # deterministic mode is used for reproducibility across heterogeneous GPU tiers
+    # where non-determinism would differ per tier and corrupt loss comparisons.
+    if torch.are_deterministic_algorithms_enabled():
+        num_tokens = logits.shape[0]
+        rows = torch.arange(num_tokens, device=logits.device).unsqueeze(1)
+        topk_masked_gates = torch.zeros_like(logits)
+        topk_masked_gates.index_put_((rows, top_idx), top_gate, accumulate=False)
+        mask = torch.zeros_like(gates, dtype=torch.bool)
+        mask.index_put_((rows, top_idx), torch.ones_like(top_gate, dtype=torch.bool), accumulate=False)
+    else:
+        # get topk mask
+        topk_masked_gates = torch.zeros_like(logits).scatter(1, top_idx, top_gate)
+        mask = torch.zeros_like(gates, dtype=torch.bool).scatter_(1, top_idx, 1)
 
     exp_counts = torch.sum(mask, dim=0).detach().to(logits.device)
 

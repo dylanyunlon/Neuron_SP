@@ -42,6 +42,7 @@ from torch import Tensor
 
 from deepspeed.core.transformer.module import MegatronModule
 from deepspeed.core.transformer.transformer_config import TransformerConfig
+from deepspeed.core.dist_checkpointing.mapping import ShardedTensor, ShardedStateDict
 
 logger = logging.getLogger(__name__)
 
@@ -504,11 +505,35 @@ class DotProductAttention(MegatronModule):
         prefix: str = "",
         sharded_offsets: tuple = (),
         metadata: Optional[dict] = None,
-    ) -> dict:
-        """Sharded state dict — only has content for learnable softmax_offset."""
+    ) -> ShardedStateDict:
+        """Sharded state dict for the learnable softmax_offset parameter.
+
+        From Megatron M2480: Fix Sink Attention TP — softmax_offset is sharded
+        along axis 0 (num_attention_heads) by TP rank, so it must be represented
+        as a ShardedTensor with the TP fragmentation on axis 0.  Without this,
+        saving/restoring with TP>1 would silently duplicate/truncate the parameter.
+        On DES-LOC PCIe clusters with TP across heterogeneous tiers this is
+        especially important since checkpoint round-trips are expensive over PCIe.
+        """
         softmax_type = getattr(self.config, "softmax_type", "vanilla")
         if softmax_type != "learnable":
             return {}
+        # softmax_offset shape: [num_attention_heads_per_tp_rank]
+        # global shape: [num_attention_heads_total] sharded on axis 0 by TP
+        param = self.softmax_offset
+        tp_size = getattr(self, "_tp_size", 1)
+        tp_rank = getattr(self, "_tp_rank", 0)
+        local_size = param.shape[0]
+        global_size = local_size * tp_size
+        key = f"{prefix}softmax_offset"
         return {
-            f"{prefix}softmax_offset": self.softmax_offset,
+            key: ShardedTensor(
+                key=key,
+                data=param.data,
+                dtype=param.dtype,
+                local_shape=(local_size,),
+                global_shape=(global_size,),
+                global_offset=(tp_rank * local_size,),
+                axis_fragmentations=(tp_size,),
+            )
         }
