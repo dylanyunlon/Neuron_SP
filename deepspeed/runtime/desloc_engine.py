@@ -313,6 +313,41 @@ class TrainingConfig:
     From Megatron M2833 (PR #2306).
     Relevant for DES-LOC when tier failures reduce effective dp_size mid-run."""
 
+    # --- Core module adapter switches ---
+    # Each switch gates a deepspeed/core/ module that replaces the inline
+    # implementation in desloc_engine. Adapters in core_adapters.py handle
+    # the wiring; all fallback gracefully when the module isn't ready.
+
+    use_core_scheduler: bool = False
+    """Replace torch LambdaLR with OptimizerParamScheduler from
+    deepspeed/core/optimizer_param_scheduler.py. Enables WSD decay,
+    per-tier LR multipliers, and weight decay scheduling."""
+
+    lr_decay_style: str = "cosine"
+    """LR decay style when use_core_scheduler=True. 'cosine', 'linear', 'WSD'."""
+
+    tier_lr_multiplier: float = 1.0
+    """Per-tier LR scaling factor when use_core_scheduler=True.
+    A6000 tiers should use ~0.8, H100 tiers use 1.0."""
+
+    use_pipeline_schedule: bool = False
+    """Replace inline forward_backward_func closure with Megatron-style
+    pipeline schedule from deepspeed/core/pipeline_parallel/schedules.py.
+    Enables combined_1f1b, interleaved 1F1B, A2A overlap."""
+
+    virtual_pipeline_model_parallel_size: Optional[int] = None
+    """Virtual pipeline model parallel size for interleaved 1F1B.
+    Only used when use_pipeline_schedule=True."""
+
+    use_dist_checkpointing: bool = False
+    """Replace torch.save/load with async sharded checkpointing from
+    deepspeed/core/dist_checkpointing/. Enables non-blocking saves."""
+
+    use_bridge_communicator: bool = False
+    """Replace PCIeP2PCommunicator with BridgeCommunicator from
+    deepspeed/core/pipeline_parallel/p2p_communication.py for
+    cross-grid activation transfer when PP > 1."""
+
 
 class HeteroRegistry:
     """
@@ -1327,6 +1362,11 @@ class DesLocEngine:
             total_steps=config.total_steps,
             min_lr_ratio=config.min_lr / config.max_lr,
         )
+        # --- Core scheduler adapter (gated by config.use_core_scheduler) ---
+        from deepspeed.runtime.core_adapters import maybe_build_core_scheduler
+        _core_sched = maybe_build_core_scheduler(self.optimizer, config)
+        if _core_sched is not None:
+            self.scheduler = _core_sched
 
         # --- Phase 6: Data ---
         if data_iter is None:
@@ -1965,6 +2005,11 @@ class DesLocEngine:
             "PCIeP2PCommunicator initialized: staging_threshold=64.0 MB, "
             "registry has %d device(s).",
             len(self._device_registry.all_profiles),
+        )
+        # --- Core bridge communicator adapter (gated by config.use_bridge_communicator) ---
+        from deepspeed.runtime.core_adapters import maybe_build_bridge_communicator
+        self.p2p_communicator = maybe_build_bridge_communicator(
+            config, self.p2p_communicator,
         )
 
         # --- Phase 9: Hetero MIMO training loop bootstrap ---
@@ -2722,6 +2767,11 @@ class DesLocEngine:
     def save_checkpoint(self, path: Path) -> None:
         """
         Save a full training checkpoint to disk.
+
+        When config.use_dist_checkpointing is True, delegates to the async
+        sharded strategy from deepspeed/core/dist_checkpointing/ (faster,
+        non-blocking saves). Otherwise falls through to the existing
+        hetero/torch.save path.
 
         When a :class:`HeteroCheckpointConfig` is active the save is routed
         through the per-tier async pipeline:
