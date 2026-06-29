@@ -149,6 +149,38 @@ _LOCAL_TIER: Optional[TierSpec] = None
 
 
 # ---------------------------------------------------------------------------
+# NCCL flight recorder auto-configuration  (Megatron M3499 / PR #3806)
+# ---------------------------------------------------------------------------
+
+def _configure_nccl_flight_recorder(config) -> None:
+    """Set NCCL flight recorder env vars from ModelParallelConfig.
+
+    From Megatron M3499 (PR #3806): configure via training config rather
+    than manual os.environ before launch. Uses setdefault — never overwrites
+    pre-existing env vars.
+
+    Critical for PCIe topologies (DES-LOC: A6000+H100+Blackwell no NVLink)
+    where higher latency makes NCCL hangs more frequent.
+    """
+    if config is None:
+        return
+    dump_path = getattr(config, 'flight_recorder_dump_path', None)
+    if dump_path is not None:
+        os.environ.setdefault('TORCH_FR_DUMP_TEMP_FILE', str(dump_path))
+        os.environ.setdefault('TORCH_NCCL_DEBUG_INFO_TEMP_FILE', str(dump_path))
+    buf = getattr(config, 'flight_recorder_trace_buffer_size', 36864)
+    os.environ.setdefault('TORCH_NCCL_TRACE_BUFFER_SIZE', str(buf))
+    dot = getattr(config, 'flight_recorder_dump_on_timeout', True)
+    os.environ.setdefault('TORCH_NCCL_DUMP_ON_TIMEOUT', '1' if dot else '0')
+    ist = getattr(config, 'flight_recorder_include_stack_trace', True)
+    os.environ.setdefault('TORCH_INCLUDE_STACK_TRACE', '1' if ist else '0')
+    oa = getattr(config, 'flight_recorder_include_only_active', False)
+    os.environ.setdefault('TORCH_INCLUDE_ONLY_ACTIVE', '1' if oa else '0')
+    ed = getattr(config, 'flight_recorder_extra_dump_on_exec', False)
+    os.environ.setdefault('TORCH_NCCL_EXTRA_DUMP_ON_EXEC', '1' if ed else '0')
+
+
+# ---------------------------------------------------------------------------
 # Utility: GlobalMemoryBuffer (lightweight replacement for Megatron's version)
 # ---------------------------------------------------------------------------
 
@@ -603,6 +635,7 @@ def initialize_model_parallel(
     local_world_size: Optional[int] = None,
     # DES-LOC extension
     desloc_config: Optional[DesLocConfig] = None,
+    config=None,
 ) -> None:
     """Initialize all model-parallel process groups.
 
@@ -1314,6 +1347,7 @@ def initialize_model_parallel(
     # Global memory buffer
     # -----------------------------------------------------------------------
     _set_global_memory_buffer()
+    _configure_nccl_flight_recorder(config)
 
 
 # ---------------------------------------------------------------------------
