@@ -1975,6 +1975,8 @@ class DesLocEngine:
                 _reg_exc,
             )
 
+        self._checkpoint_thread = None  # From M3407: track async checkpoint Thread
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -2704,6 +2706,10 @@ class DesLocEngine:
             # Checkpointing
             if self.global_step % cfg.save_every == 0:
                 ckpt_path = cfg.checkpoint_dir / f"step_{self.global_step:07d}.pt"
+                # From M3407: join previous async checkpoint before writing new one
+                if self._checkpoint_thread is not None:
+                    self._checkpoint_thread.join()
+                    self._checkpoint_thread = None
                 self.save_checkpoint(ckpt_path)
 
             # --- Eval hook: every eval_every steps call eval/run_eval.py ---
@@ -2760,6 +2766,12 @@ class DesLocEngine:
             if _tb_writer is not None:
                 _tb_writer.close()
                 logger.info("TensorBoard writer closed.")
+
+    def close(self):
+        '''Finalize engine. From M3407: join async checkpoint thread before exit.'''
+        if getattr(self, '_checkpoint_thread', None) is not None:
+            self._checkpoint_thread.join()
+            self._checkpoint_thread = None
 
     def save_checkpoint(self, path: Path) -> None:
         """
