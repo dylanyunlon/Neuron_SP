@@ -944,6 +944,30 @@ class TransformerConfig(ModelParallelConfig):
     is_hybrid_model: bool = False
     """Indicates whether this is a hybrid model."""
 
+    # -----------------------------------------------------------------------
+    # Experimental feature flags
+    # -----------------------------------------------------------------------
+    experimental_features: List[str] = field(default_factory=list)
+    """Opt-in experimental features by name. Anti-revert pattern from Megatron.
+
+    Instead of git-reverting unstable features (Megatron M2695 graph config,
+    M2631 UVM allocator, M2659 MoE layer type all reverted within same batch),
+    gate them at runtime with a string flag. Toggle without code changes.
+
+    Known values:
+      'per_tier_timeout'    - enable update_pg_timeout_per_tier() (M2674)
+      'checkpoint_manifest' - versioned CheckpointManifest logging (M2566)
+      'jit_moe_router'      - torch.jit.script for MoE router (M2675)
+      'dynamic_inference'   - dynamic inference engine (M2631)
+    """
+
+    def has_experimental(self, feature: str) -> bool:
+        """Return True if feature is enabled. Usage:
+            if config.has_experimental('jit_moe_router'):
+                ...
+        """
+        return feature in self.experimental_features
+
     # Mamba
     mamba_state_dim: int = 128
     mamba_head_dim: int = 64
@@ -1070,6 +1094,19 @@ class TransformerConfig(ModelParallelConfig):
 
     def __post_init__(self) -> None:
         """Validate and derive fields; mirrors Megatron TransformerConfig.__post_init__."""
+        # Validate experimental_features (anti-revert pattern, M2695/M2631/M2659)
+        _known_experimental = frozenset({
+            'per_tier_timeout', 'checkpoint_manifest',
+            'jit_moe_router', 'dynamic_inference',
+        })
+        unknown_exp = set(self.experimental_features) - _known_experimental
+        if unknown_exp:
+            warnings.warn(
+                f"TransformerConfig: unknown experimental_features={unknown_exp}. "
+                f"Known: {_known_experimental}",
+                UserWarning, stacklevel=2,
+            )
+
         # Call parent __post_init__ only if it exists.
         parent_post = getattr(super(), '__post_init__', None)
         if callable(parent_post):
