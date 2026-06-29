@@ -1424,8 +1424,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             shard_p = self._shard_params[buf_idx]
             adam_state = self.optimizer.state.get(shard_p, {})
 
-            local_exp_avg = adam_state.get("exp_avg", torch.zeros(shard_size))
-            local_exp_avg_sq = adam_state.get("exp_avg_sq", torch.zeros(shard_size))
+            local_exp_avg = adam_state.get("exp_avg", torch.zeros(shard_size, dtype=torch.float32))  # From Megatron M2378: explicit dtype prevents silent float32 upcast
+            local_exp_avg_sq = adam_state.get("exp_avg_sq", torch.zeros(shard_size, dtype=torch.float32))  # From Megatron M2378: explicit dtype prevents silent float32 upcast
 
             # M3356: skip non-tensor entries silently (e.g. scalar ``step``).
             if not isinstance(local_exp_avg, torch.Tensor):

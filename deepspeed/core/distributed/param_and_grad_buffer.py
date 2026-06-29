@@ -1264,7 +1264,7 @@ class ParamAndGradBuffer:
                 )
                 # Warmup NCCL comm buffers.
                 torch.distributed.barrier()
-                tmp = torch.zeros([1], device="cuda")
+                tmp = torch.zeros([1], dtype=torch.float32, device="cuda")  # From Megatron M2378: explicit dtype prevents silent float32 upcast
                 torch.distributed.all_reduce(tmp, group=self.data_parallel_group)
                 torch.distributed.barrier()
             except (ImportError, AttributeError):
