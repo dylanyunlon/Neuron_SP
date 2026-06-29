@@ -35,6 +35,12 @@ Evolution summary (ported from Megatron-LM commit history, 32 commits):
   M3998 (0044db1f2): Route non-Muon params through DistributedOptimizer.
   M4020 (08bad7a48): MXFP8/FP4-param-gather post-processing after forced AG.
   M4036 (88e7ab091): Drain predecessor reduce-scatter at dispatch time.
+  M4153 (55638bc44): [AUDITED — N/A] Fix wgrad race condition when using double
+      buffers (Megatron-FSDP only: relocate _enforce_double_buffer_limit from
+      backward hook to main_grad_getter; off-by-one > 1 → > 2 in eviction loop;
+      _megatron_fsdp_model ref attachment after DTensor param replacement).
+      Our DDP uses predecessor-drain (M4036) + ownership FSM (M3061/M3116)
+      instead of FSDP double-buffering; these bugs do not apply.
   M4163 (1af933d15): Remove duplicate nccl_allocator import.
 
 DES-LOC extensions:

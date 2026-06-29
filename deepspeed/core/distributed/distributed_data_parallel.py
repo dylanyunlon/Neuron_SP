@@ -213,6 +213,8 @@ class DistributedDataParallel(nn.Module):
       - M3834: reduce_scatter_with_fp32_accumulation knob.
       - M3948: LayerWiseDistributedOptimizer integration.
       - M4036: previous_grad_reduce_bucket_group drain linkage.
+      - M4041: DDPConfig.cuda_graph_mode — conditional param.grad deref
+               in backward hook for full-iteration CUDA graph compatibility.
 
     Args:
         config: Model parallel configuration.
