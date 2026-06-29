@@ -451,6 +451,12 @@ class Attention(MegatronModule, ABC):
 
         self.hidden_size_per_attention_head: int = config.kv_channels
 
+        # From Megatron M1510 (d4878ef01): Multi-query attention (GQA/MQA) —
+        # num_query_groups < num_attention_heads enables MQA (groups=1) and GQA
+        # (1 < groups < heads).  In DES-LOC this is critical because A6000 and H100
+        # tiers have different VRAM budgets; GQA reduces KV-cache footprint by
+        # (num_attention_heads / num_query_groups)× which is essential for fitting
+        # large models across our PCIe-connected 48 GB + 96 GB topology.
         # GQA sub-sharding (M2807): when kv_heads < tp_size each rank handles 1 kv_head
         if config.num_query_groups < tp_size:
             self.num_query_groups_per_partition = 1
@@ -701,6 +707,11 @@ class Attention(MegatronModule, ABC):
                 rotary_pos_sin_k = rotary_pos_sin_q
 
             if rotary_pos_sin_k is not None:
+                # From Megatron M2020 (5b7374a8d): Fix RoPE backward compatibility —
+                # apply_rotary_pos_emb_with_cos_sin may not exist in older TE/Megatron
+                # versions; graceful fallback prevents crashes on A6000 nodes with older
+                # CUDA environments.  The try/except preserves the pre-M2020 behaviour
+                # so PCIe-only clusters running mixed software versions stay stable.
                 try:
                     from megatron.core.models.common.embeddings.rope_utils import (
                         apply_rotary_pos_emb_with_cos_sin,

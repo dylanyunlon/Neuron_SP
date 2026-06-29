@@ -131,6 +131,13 @@ class LanguageModule(MegatronModule, ABC):
         # logits: [s, b, vocab] → labels need [s, b] for F.cross_entropy
         labels = labels.transpose(0, 1).contiguous()  # [s, b]
 
+        # From Megatron M2070 (0f60adbd3): Add option for parallel cross entropy —
+        # vocab-parallel CE avoids a full all-gather of logits across TP ranks by
+        # computing the log-sum-exp denominator distributedly.  In DES-LOC this is
+        # critical: an all-gather of 128K-vocab logits over PCIe (no NVLink) would
+        # consume ~50 MB per step per rank; the log-sum-exp trick reduces this to
+        # two scalar all-reduces.  The implementation below mirrors Megatron's
+        # vocab_parallel_cross_entropy with DES-LOC tier-aware process group handling.
         # Standard vocab-parallel cross-entropy: each TP rank holds a slice
         # of the vocabulary.  We approximate the full softmax by reducing
         # across TP ranks using the log-sum-exp trick, identical to Megatron's

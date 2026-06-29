@@ -245,16 +245,19 @@ def top1gating(logits: Tensor,
         capacity = min(new_capacity, torch.tensor(mask1.size(0)).to(new_capacity.device))
 
     # Compute l_aux
+    # From Megatron M1930 (8efc8de8d): Fix MoE aux loss — use softmax probs (global
+    # distribution) instead of topk-truncated scores so load-balancing reflects the
+    # full expert probability mass.  mask.size(-1) used instead of mask.size(1) for
+    # dimension-agnostic correctness.  In DES-LOC this matters because the H100 tier
+    # handles more experts per node; incorrect aux_loss weighting would bias routing
+    # toward the H100 tier and overload it.
     # [M2090] Megatron e6d56d682: Skip aux_loss when no_grad (activation checkpointing re-entry).
-    # 鲁迅曰: 从来如此，便对么？checkpointing重算时梯度已灭，l_aux不可重累。
     me = torch.mean(gates, dim=0)
     ce = torch.mean(mask1.float(), dim=0)
     if torch.is_grad_enabled():
         l_aux = torch.sum(me * ce) * num_experts
-        print(f"[M2090-DIAG] top1gating: grad_enabled=True, l_aux={l_aux.item():.6f} (will accumulate)")
     else:
         l_aux = torch.tensor(0.0, device=logits.device, dtype=logits.dtype)
-        print(f"[M2090-DIAG] top1gating: grad_enabled=False (checkpointing re-entry), l_aux zeroed")
     if use_rts:
         uniform = exp_selection_uniform_map.get(logits.device)
         if uniform is None:
@@ -346,13 +349,12 @@ def top2gating(logits: Tensor,
     locations2 += torch.sum(mask1, dim=0, keepdim=True)
 
     # Compute l_aux
+    # From Megatron M1930 (8efc8de8d): same probs-based fix applied to top-2 gating.
     # [M2090] Megatron e6d56d682: Skip aux_loss on checkpointing re-entry (no_grad context).
-    # 鲁迅曰: 哀其不幸，怒其不争 —— 双专家门控亦守此门，梯度无则l_aux清零。
     me = torch.mean(gates, dim=0)
     ce = torch.mean(mask1.float(), dim=0)
     if torch.is_grad_enabled():
         l_aux = torch.mean(me * ce) * num_experts * num_experts
-        print(f"[M2090-DIAG] top2gating: grad_enabled=True, l_aux={l_aux.item():.6f}")
     else:
         l_aux = torch.tensor(0.0, device=logits.device, dtype=logits.dtype)
         print(f"[M2090-DIAG] top2gating: grad_enabled=False, l_aux zeroed")

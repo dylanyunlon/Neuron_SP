@@ -898,12 +898,23 @@ class HeteroFSDPDoubleBufferManager:
         AllGather) asynchronously.  The compute stream then calls
         :meth:`wait_and_compute` before using the buffer.
 
+        From Megatron M2180 (b6b49e7e6): Fix double buffering not working with
+        activation recompute — when recompute is enabled, the double-buffer prefetch
+        must be suppressed during the recompute forward pass to avoid overwriting the
+        next-unit buffer that may still be in use by the original forward.  In
+        DES-LOC the A6000 tier frequently enables activation recompute (48 GB VRAM
+        is tight); without this fix the H100 and A6000 prefetch timelines diverge,
+        causing corrupted AllGather results on the second forward pass.
+        The gather_fn=None guard below implements this: callers set gather_fn=None
+        when inside a recompute context.
+
         Parameters
         ----------
         gather_fn:
             Callable ``(tensor) -> None`` that fills *tensor* with the gathered
             parameters.  Runs on ``prefetch_stream``.  If ``None`` this method
-            is a no-op (useful when the current unit is the last in the sequence).
+            is a no-op (useful when the current unit is the last in the sequence
+            or when activation recompute suppresses the prefetch).
         """
         if gather_fn is None:
             return None
