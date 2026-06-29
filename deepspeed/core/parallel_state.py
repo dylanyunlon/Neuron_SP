@@ -2321,3 +2321,45 @@ def destroy_model_parallel() -> None:
     _TIER_GROUPS = {}
     global _LOCAL_TIER
     _LOCAL_TIER = None
+
+
+def dump_process_groups(rank: Optional[int] = None) -> str:
+    """Return a readable summary of all PGs for this rank.
+
+    From Megatron M2638: add debug repr for process groups, adapted for
+    DES-LOC where different hardware tiers join different PGs.
+
+    Args:
+        rank: If set, only that rank produces output. If None, all ranks do.
+    """
+    import torch.distributed as _dist
+    current_rank = _dist.get_rank() if _dist.is_initialized() else -1
+    if rank is not None and current_rank != rank:
+        return ''
+
+    def _pg_info(label: str, pg) -> str:
+        if pg is None:
+            return f"  {label:<20}: [not initialized]"
+        try:
+            ranks = _dist.get_process_group_ranks(pg)
+            backend = _dist.get_backend(pg)
+            return f"  {label:<20}: ranks={ranks}  world_size={len(ranks)}  backend={backend}"
+        except Exception as exc:
+            return f"  {label:<20}: [error: {exc}]"
+
+    lines = [f"=== Process Group Dump (rank={current_rank}) ==="]
+    lines.append(_pg_info("TP",         _TENSOR_MODEL_PARALLEL_GROUP))
+    lines.append(_pg_info("PP",         _PIPELINE_MODEL_PARALLEL_GROUP))
+    lines.append(_pg_info("DP",         _DATA_PARALLEL_GROUP))
+    lines.append(_pg_info("CP",         _CONTEXT_PARALLEL_GROUP))
+    lines.append(_pg_info("EP",         _EXPERT_MODEL_PARALLEL_GROUP))
+    lines.append(_pg_info("Embedding",  _EMBEDDING_GROUP))
+    lines.append(_pg_info("PosEmb",     _POSITION_EMBEDDING_GROUP))
+    if _TIER_GROUPS:
+        for tname, tpg in _TIER_GROUPS.items():
+            lines.append(_pg_info(f"TIER[{tname}]", tpg))
+        lines.append(f"  {'LOCAL_TIER':<20}: {_LOCAL_TIER}")
+    else:
+        lines.append(f"  {'TIER groups':<20}: [not initialized]")
+    return "\n".join(lines)
+    # From Megatron M2638: debug repr for process groups (DES-LOC adaptation)
