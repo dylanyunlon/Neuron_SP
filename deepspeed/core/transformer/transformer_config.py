@@ -432,15 +432,21 @@ class TransformerConfig(ModelParallelConfig):
     moe_router_pre_softmax: bool = False
     """Enable pre-softmax(pre-sigmoid) routing for MoE."""
 
+    # From Megatron M2767: CHECKPOINT-CRITICAL. Must be in checkpoint metadata or
+    # router silently reverts to default on training resume.
     moe_router_topk_scaling_factor: Optional[float] = None
     """Scaling factor for routing score in top-k selection (pre_softmax only)."""
 
+    # From Megatron M2767: CHECKPOINT-CRITICAL. Must be in checkpoint metadata or
+    # router silently reverts to default on training resume.
     moe_router_score_function: Literal['softmax', 'sigmoid', 'sqrtsoftplus'] = "softmax"
     """Score function for MoE routing."""
 
     moe_router_dtype: Optional[Literal['fp32', 'fp64']] = None
     """Data type for routing and expert output weighted averaging."""
 
+    # From Megatron M2767: CHECKPOINT-CRITICAL. Must be in checkpoint metadata or
+    # router silently reverts to default on training resume.
     moe_router_enable_expert_bias: bool = False
     """TopK routing with dynamic per-expert bias (aux-loss-free load balancing)."""
 
@@ -469,6 +475,8 @@ class TransformerConfig(ModelParallelConfig):
     """Use GroupedLinear(num_groups=1) for dense MLP to trigger TEFusedDenseMLP fusion."""
 
     moe_aux_loss_coeff: Union[float, List[float]] = 0.0
+    # From Megatron M2760: reduce aux_loss ONCE across full DP group. With EP: reduce
+    # within EP first then DP. Double-reduce inflates by 2x, corrupting load-balancing.
     """Scaling coefficient for the aux loss."""
 
     moe_z_loss_coeff: Optional[float] = None
@@ -502,6 +510,8 @@ class TransformerConfig(ModelParallelConfig):
     """Enable per-layer logging for MoE (aux loss and z loss)."""
 
     moe_expert_capacity_factor: Optional[float] = None
+    # From Megatron M2796: callers MUST clamp before topk: effective_capacity = min(expert_capacity, num_tokens)
+    # In DES-LOC heterogeneous training, unequal token counts make expert_capacity > num_tokens likely.
     """Capacity factor for each expert; None = no token drop."""
 
     moe_pad_expert_input_to_capacity: bool = False
