@@ -355,6 +355,56 @@ class TrainingConfig:
     Enables variable-length sub-sample packing across the DPxCP domain
     with balanced workload scheduling. Requires PP=1."""
 
+    # --- MoE (Mixture-of-Experts) subsystem ---
+    # Wired via deepspeed/runtime/core_adapters.py::build_moe_adapter().
+    # When use_moe=False (default) the MoE path is completely skipped and
+    # all models remain dense — no overhead.
+
+    use_moe: bool = False
+    """Replace every moe_layer_freq-th TransformerBlock MLP with a MoELayer
+    from deepspeed/core/transformer/moe/. Disabled by default so existing
+    dense-model training runs are completely unaffected."""
+
+    num_moe_experts: int = 8
+    """Number of expert MLPs per MoE layer. Effective for both A6000 and H100
+    tiers. Production Mixtral-style: 8 experts, top-2 routing."""
+
+    moe_router_topk: int = 2
+    """Number of experts each token is routed to (top-k routing)."""
+
+    moe_aux_loss_coeff: float = 0.01
+    """Auxiliary load-balancing loss coefficient (Switch Transformer / Megatron
+    convention). Added to the main cross-entropy loss at each micro-batch."""
+
+    moe_z_loss_coeff: float = 0.0
+    """Router z-loss weight (ST-MoE). Penalises large router logits to improve
+    training stability. 0.0 = disabled."""
+
+    moe_token_capacity_factor: Optional[float] = None
+    """Expert capacity factor (tokens per expert = capacity_factor * num_tokens /
+    num_experts). None = no capacity cap (drop no tokens)."""
+
+    moe_layer_freq: int = 1
+    """Replace every N-th TransformerBlock MLP with a MoELayer. 1 = every layer,
+    2 = every other layer, etc. Useful for hybrid dense-MoE architectures."""
+
+    moe_on_all_tiers: bool = True
+    """When True, apply MoE to layers on A6000 tiers as well as H100 tiers.
+    When False, only H100 (high-VRAM) layers get MoE; A6000 layers stay dense.
+    Set False when VRAM on A6000 (48 GB) is the binding constraint."""
+
+    moe_num_shared_experts: int = 0
+    """DeepSeek-style shared (always-active) expert count per MoE layer. 0 = none."""
+
+    moe_log_every: int = 100
+    """Log per-expert token-utilisation statistics every this many steps."""
+
+    ffn_hidden_size: Optional[int] = None
+    """Expert intermediate (FFN) hidden size. None → defaults to hidden_size * 4."""
+
+    activation_func_type: str = "swiglu"
+    """Expert activation function: 'swiglu' (default, matches LLaMA/Mixtral) or 'gelu'."""
+
 
 class HeteroRegistry:
     """
@@ -1198,6 +1248,30 @@ class DesLocEngine:
 
         n_params = sum(p.numel() for p in self.model.parameters())
         logger.info("Model: %.2fM parameters (BF16 on CPU, ZeRO-3 sharded)", n_params / 1e6)
+
+        # --- Phase 4c: MoE adapter (gated by config.use_moe) ---
+        # Must run BEFORE optimizer init so ZeRO-3 sees the full parameter set
+        # including the new router weights and expert MLP parameters introduced
+        # by MoELayer.patch_model().  When use_moe=False this is a no-op.
+        from deepspeed.runtime.core_adapters import build_moe_adapter  # noqa: PLC0415
+        self.moe_adapter = build_moe_adapter(
+            config=config,
+            model=self.model,
+            tiers=self.tiers,
+        )
+        if self.moe_adapter is not None:
+            # Recount params: MoE adds router weights + expert MLPs.
+            _moe_params = sum(p.numel() for p in self.model.parameters())
+            logger.info(
+                "MoE active: model now has %.2fM parameters "
+                "(+%.2fM vs dense, experts=%d, topk=%d)",
+                _moe_params / 1e6,
+                (_moe_params - n_params) / 1e6,
+                getattr(config, "num_moe_experts", 8),
+                getattr(config, "moe_router_topk", 2),
+            )
+        else:
+            logger.info("MoE disabled (use_moe=False); model stays dense.")
 
         # --- Phase 4b + 5: ZeRO-3 via core.optimizer.DistributedOptimizer ---
         # Replaces the hand-written zero3_hetero_shard.ShardState + manual AdamW.
