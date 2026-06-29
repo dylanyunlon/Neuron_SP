@@ -2316,9 +2316,7 @@ class DesLocEngine:
             if self.fp32_grad_manager is not None:
                 self.fp32_grad_manager.before_backward()
 
-            # --- Async grad all_reduce state ---
             for micro in range(num_microbatches):
-
                 # --- Data fetch: capacity-weighted CP token split ---
                 # Pure DP: every rank fetches independently, then applies
                 # hetero CP slice so H100 gets more tokens, A6000 fewer.
