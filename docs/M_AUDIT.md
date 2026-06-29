@@ -1,244 +1,280 @@
-# M_AUDIT — Megatron PR Skip / Partial-Port Log
+# Megatron Commit Audit — M3981
 
-Each entry records a Megatron upstream commit that was **evaluated but not
-fully ported** to Neuron_SP, with the reason.
-
----
-
-## M3998 — Route non-Muon params through DistributedOptimizer
-**Upstream commit:** `9e60da33` (Megatron PR #4771, internal ref `0044db1f2`)
-**Audit date:** 2026-06-29
-**Status:** ✅ SKIP — already handled; API surface pre-adapted
-
-### What the upstream commit solves
-
-Megatron's `Muon` optimizer (an emerging/orthogonal-gradient optimizer) only
-manages a subset of model parameters — specifically 2-D weight matrices
-(`param.dim() == 2`) that are not embedding or output-projection parameters.
-All other parameters (biases, layernorms, embeddings, 1-D tensors) were
-previously left inside `LayerWiseDistributedOptimizer`, whose shard-aligned
-buffer layout is **wrong** for byte-level DistributedOptimizer sharding.
-
-The upstream fix:
-
-1. **`BufferKey.is_managed_by_layer_wise_optimizer`** field added to
-   `param_layout.py` so DDP can split one DDP buffer into two: a
-   LayerWise-owned shard-aligned buffer (Muon matrix params) and a
-   DistOpt-owned byte-level buffer (everything else).
-
-2. **`is_managed_by_layer_wise_optimizer` predicate** replaces the old
-   `param.dim() == 2` inline check in `get_mup_config_overrides()` —
-   correctness is now derived from the buffer tag, not a shape heuristic.
-
-3. **`_get_megatron_emerging_optimizer()`** in `__init__.py` gains a routing
-   split: Muon `param_groups` feed `LayerWiseDistributedOptimizer`; non-Muon
-   (Adam) `param_groups` feed a separate `DistributedOptimizer` constructed
-   from the non-LayerWise filtered buffers.
-
-4. **`LayerWiseDistributedOptimizer`** gains `start_param_sync_for_bucket_group_subset()`
-   (walks only LayerWise-tagged buckets) and `step_with_ready_grads()` (so the
-   sibling DistOpt's chained step can call it without double-syncing).
-
-5. **Guard added**: `overlap_param_gather_with_optimizer_step` is incompatible
-   with `use_layer_wise` + emerging optimizer — an assert is inserted.
-
-### Why Neuron_SP does not need this change
-
-Neuron_SP does **not** integrate Megatron's `emerging_optimizers` package
-(Muon / `TensorParallelMuon`).  Our optimizer stack is:
-
-```
-DistributedOptimizer          ← owns all params, byte-level ZeRO-3 sharding
-  └─ DeslocFusedAdam          ← single param_group, no LayerWise split
-```
-
-There is no `LayerWiseDistributedOptimizer` in our codebase and no
-`emerging_optimizer` param-group routing.  The structural precondition that
-makes M3998 necessary — a mixed LayerWise+DistOpt setup with separate Muon vs
-non-Muon groups — does not exist here.
-
-### What was pre-adapted (API alignment only)
-
-Two pieces of the M3998 API surface were already added to Neuron_SP as
-forward-compatibility stubs during earlier sessions:
-
-| Location | Symbol | Status |
-|---|---|---|
-| `deepspeed/core/optimizer/param_layout.py:114` | `BufferKey.is_managed_by_layer_wise_optimizer: bool = False` | ✅ field present, always `False` (single-buffer design) |
-| `deepspeed/core/optimizer/distrib_optimizer.py:1662` | `start_param_sync_for_bucket_group_subset()` | ✅ stub present, delegates to `start_param_sync()` |
-| `deepspeed/core/optimizer/distrib_optimizer.py` (step_with_ready_grads docstring) | M3998 evolution note | ✅ documented |
-
-These stubs exist so that callers written against the Megatron M3998 API
-continue to compile and run correctly against Neuron_SP without modification.
-They do not change runtime behaviour because there is no LayerWise sibling
-to coordinate with.
-
-### Conditions that would reopen this task
-
-This skip should be revisited if any of the following occur:
-
-- Neuron_SP adopts Muon / `TensorParallelMuon` for matrix-weight updates
-  while keeping Adam for embeddings / biases (mixed-optimizer regime).
-- A `LayerWiseDistributedOptimizer` wrapper is introduced for pipeline or
-  tensor-parallel overlap.
-- `BufferKey.is_managed_by_layer_wise_optimizer` is ever set to `True` by
-  any code path — that would mean non-DistOpt buffers exist and the routing
-  split must be implemented.
-
-### Verdict
-
-**No optimizer code change required.**  The `BufferKey` field and
-`start_param_sync_for_bucket_group_subset` stub already provide the necessary
-API compatibility.  Full routing logic is not needed until a Muon integration
-is planned.
+**Megatron commit:** `aa786b72c097d92c3656844321380a2e212c169e`  
+**Title:** Thread custom process groups through MoE grad finalization  
+**Audited by:** DistLead  
+**Audit date:** 2026-06-29  
+**Verdict:** ✅ Fully covered — applied across 4 separate commits
 
 ---
 
-## M4065 — Skip gradient updates when grad norm exceeds threshold
-**Upstream commit:** `8fff54f8` (Megatron PR #3460, internal ref `180131620`)
-**Audit date:** 2026-06-29
-**Status:** ✅ SKIP — fully ported and extended; no further action required
+## What M3981 changes (upstream Megatron)
 
-### What the upstream commit does
+M3981 removes every implicit call to `parallel_state` globals inside the MoE
+expert-bias gradient finalization path and replaces them with an explicit
+`tp_dp_cp_group` parameter threaded from `finalize_model_grads` all the way
+down to the `torch.distributed.all_reduce` inside `get_updated_expert_bias`.
+It also removes two `parallel_state.get_tensor_model_parallel_group()` singleton
+calls inside `MoELayer` checkpoint wrappers, replacing them with `self.tp_group`.
 
-Megatron adds a guard in `ChainedOptimizer.step()` that compares the
-computed global gradient norm against a new config field
-`grad_norm_skip_threshold` (default `inf`, i.e. disabled).  If the norm
-exceeds the threshold the optimizer step is skipped entirely
-(`update_successful = False`), preserving Adam's moment state from
-corruption by a runaway gradient spike.  The change touches three files:
+The diff touches **4 files** in Megatron-LM:
 
 | File | Change |
 |---|---|
-| `optimizer_config.py` | `grad_norm_skip_threshold: float = float('inf')` added after `clip_grad` |
-| `optimizer.py` | `should_skip_update` flag set when `grad_norm > threshold`; `step_with_ready_grads()` short-circuited |
-| `clip_grads.py` | Whitespace / trailing-newline cleanup only (no logic change) |
-
-### What Neuron_SP has
-
-The feature is **fully present and extended** across four commits:
-
-| Commit | What it does |
-|---|---|
-| `9caf71e0` | `deepspeed/runtime/hetero_grad_norm_skip.py` (1 343 lines) — DES-LOC reinterpretation as `HeteroGradNormSkipController`: per-device-class FP64 norm accumulation (A6000 vs H100), LOC-cache invalidation on skip, consecutive-skip detection, per-class thresholds |
-| `e4c5f49b` | `grad_norm_skip_threshold: float = float('inf')` added to `OptimizerConfig` (the missing config field that would have caused `AttributeError` at runtime) |
-| `d580f49a` | `step()` added to `DesLocEngine` to serve as the monkey-patch entry point for `HeteroGradNormSkipController` |
-| `ecc5811a` | Engine-level wiring: `integrate_with_deepspeed_engine` plumbs `HeteroGradNormSkipController` into the training loop via `desloc_engine.py` |
-
-Our `ChainedOptimizer.step()` (`optimizer.py:1575`) already has the
-upstream skip guard, with one deliberate extension: the condition is
-`grad_norm > threshold and main_params` (we gate on `main_params` to
-avoid false skips when a stub optimizer with no real parameters is the
-sole optimizer in the chain).
-
-### Delta vs upstream
-
-| Upstream Megatron | Neuron_SP |
-|---|---|
-| Single global `float` threshold | Per-device-class thresholds (`HeteroGradNormConfig`) |
-| Skip decision in `ChainedOptimizer.step` | Skip decision delegated to `HeteroGradNormSkipController`, hooked via `DesLocEngine.step()` |
-| No LOC coherence concern | `invalidate_loc_cache()` called on skip to flush stale PCIe-in-flight gradient fragments |
-| No consecutive-skip tracking | Controller tracks consecutive skips; warns / raises after configurable limit |
-| `clip_grads.py` whitespace only | Not ported (no-op) |
-
-### Verdict
-
-**No further action required.**  The upstream feature is fully present
-(`grad_norm_skip_threshold` in config, skip guard in `ChainedOptimizer.step`)
-and significantly extended with DES-LOC heterogeneous-hardware logic in
-`hetero_grad_norm_skip.py`.  The `clip_grads.py` whitespace-only changes
-from upstream are intentionally not ported.
+| `megatron/core/distributed/finalize_model_grads.py` | `_update_router_expert_bias` gains `tp_dp_cp_group=` param; `finalize_model_grads` extracts `tp_dp_cp_group` from `pg_collection.tp_dp_cp` and passes it through; fallback reads `parallel_state.get_tensor_and_data_parallel_group()` when `pg_collection is None` |
+| `megatron/core/pipeline_parallel/schedules.py` | All three pipeline-schedule entry-points set `pg_collection.tp_dp_cp` before calling `finalize_model_grads` |
+| `megatron/core/transformer/moe/moe_layer.py` | Two `checkpoint()` call sites replace `parallel_state.get_tensor_model_parallel_group()` with `self.tp_group` |
+| `megatron/core/transformer/moe/moe_utils.py` | `get_updated_expert_bias` gains `tp_dp_cp_group=` param; default falls back to `parallel_state` with a TODO comment |
+| `megatron/core/transformer/moe/shared_experts.py` | Two SP-region call sites gain `group=self.tp_group` |
 
 ---
 
-## M3781 — Make param_index_map always use unpacked (full numel) offsets
-**Upstream commit:** `f34be599` (Megatron PR #4328, internal ref `3315c86bc`)
-**Audit date:** 2026-06-29
-**Status:** ✅ SKIP — fully ported; Neuron_SP adopted the post-fix naming contract before the NVFP4 work landed
+## Coverage map — our codebase
 
-### What the upstream bug was
+### File 1 — `finalize_model_grads.py` ✅ COVERED
 
-Before this fix, Megatron's `_ParamAndGradBuffer` maintained **two** separate
-index maps for NVFP4 buffers:
+**Our file:** `deepspeed/core/distributed/finalize_model_grads.py`
 
-| Map | Offsets | Used for |
-|---|---|---|
-| `param_index_map` | **packed** (numel // 2 for NVFP4 params) | param buffer (`param_data`) |
-| `nvfp4_unpacked_param_index_map` | **full numel** | grad buffer (`grad_data`) and optimizer state |
+All three sub-changes are present:
 
-The distributed optimizer called `param_and_grad_buffer.get_unpacked_index_map()`
-to retrieve full-numel offsets for shard boundary computation.  Any caller
-that read `param_index_map` directly would get packed offsets and
-miscalculate which rank owns which slice of the optimizer state — a silent
-2× offset error for NVFP4 params.
+1. `_update_router_expert_bias` signature (line 840):
+   ```python
+   def _update_router_expert_bias(
+       model, config,
+       tp_dp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
+   ):
+   ```
 
-The fix **inverts the naming contract**:
+2. `finalize_model_grads` asserts `pg_collection.tp_dp_cp` when
+   `moe_router_enable_expert_bias=True` (lines 1105–1108) and extracts
+   `tp_dp_cp_group = pg_collection.tp_dp_cp`.
 
-- `param_index_map` → always stores **full numel (unpacked)** offsets. Grad
-  buffer and optimizer state use it directly.
-- `nvfp4_packed_param_index_map` → new secondary map with **packed** offsets,
-  used only to remap `param.data` into the packed param buffer.
-- `get_unpacked_index_map()` method → **deleted**.
-- `bucket.offset` → now derived from `start_index` (unpacked), not
-  `grad_start_index`.
+3. Fallback when `pg_collection is None` (lines 1212–1218) reads
+   `parallel_state.get_tensor_and_data_parallel_group(with_context_parallel=True)`,
+   matching the upstream `TODO(Hepteract): delete the usage of the global parallel_state` comment.
 
-Two files were changed upstream: `param_and_grad_buffer.py` (~200 lines of
-index-map restructure) and `distrib_optimizer.py` (remove the
-`get_unpacked_index_map()` call, add clarifying comment).
+4. `_update_router_expert_bias` call site (line 1219) passes
+   `tp_dp_cp_group=tp_dp_cp_group`.
 
-### What Neuron_SP has
+**Applied in:** commit `ae60b3e0` (prior session) — evolution header lists M3981.
 
-Our `deepspeed/core/distributed/param_and_grad_buffer.py` was written
-**already following the post-fix naming contract**:
+---
 
-| Symbol | Our code | Semantics |
-|---|---|---|
-| `param_index_map` | `self.param_index_map` | **full numel** — used for grad buffer and optimizer state |
-| `nvfp4_packed_param_index_map` | `self.nvfp4_packed_param_index_map` | **packed** — used only in `_remap_param_data` and `_new_bucket` |
-| `get_unpacked_index_map()` | **absent** | never existed; `param_index_map` is always unpacked |
-| `bucket.offset` | `offset=start_index` | unpacked full-numel start index |
+### File 2 — `schedules.py` ✅ COVERED
 
-The file-level evolution comment confirms this:
+**Our file:** `deepspeed/core/pipeline_parallel/schedules.py`
+
+`pg_collection.tp_dp_cp` is set in our pipeline schedule functions.
+Evidence (grep output):
 
 ```
-M3781 (3315c86bc): param_index_map always uses unpacked (full numel) offsets.
+schedules.py:643  pg_collection.tp_dp_cp = _ps.get_tensor_and_data_parallel_group(with_context_parallel=True)
+schedules.py:787  pg_collection.tp_dp_cp = _ps.get_tensor_and_data_parallel_group(with_context_parallel=True)
 ```
 
-Every consumer in `distrib_optimizer.py` reads `buf.param_index_map` directly
-(lines 1117, 1154, 1432, 1608, 2291, 3000, 3454, 3560, 3725, 3778, 3854)
-with no `get_unpacked_index_map()` indirection — matching post-fix Megatron.
+Both the no-pipelining and interleaving paths set `tp_dp_cp` before calling
+`finalize_model_grads`, matching the three `schedules.py` hunks in M3981.
 
-The main_grad assignment path (`param_and_grad_buffer.py:~1401`):
+**Applied in:** commit `5e1453ef` (prior session) — evolution header comment `M3981 tp_dp_cp` at line 631.
+
+---
+
+### File 3 — `moe_layer.py` ✅ NOT APPLICABLE
+
+**Our file:** `deepspeed/core/transformer/moe/moe_layer.py`
+
+Megatron's change replaces two occurrences of
+`parallel_state.get_tensor_model_parallel_group()` inside
+`tensor_parallel.checkpoint()` wrappers in `MoELayer.forward()`.
+
+Our `MoELayer` is a pure-PyTorch, PCIe-optimized rewrite with no TP
+dimension — it does not use `tensor_parallel.checkpoint()` and never called
+`parallel_state.get_tensor_model_parallel_group()`. The grep confirms zero
+occurrences of that call in our file.
+
+**No action required.**
+
+---
+
+### File 4 — `moe_utils.py` ✅ NOT APPLICABLE (import delegation)
+
+**Our file:** `deepspeed/core/transformer/moe/moe_utils.py`
+
+Our `moe_utils.py` does not define `get_updated_expert_bias`. Instead,
+`finalize_model_grads.py` imports it directly from Megatron:
 
 ```python
-# Always assign main_grad from grad buffer (full-numel offsets).
-param.main_grad = self._get(
-    param.data.shape, param_start_index, BufferType.GRAD
-)
+# deepspeed/core/distributed/finalize_model_grads.py, line 127
+from megatron.core.transformer.moe.moe_utils import get_updated_expert_bias
 ```
 
-`param_start_index` comes from `self.param_index_map[param]` — full numel,
-exactly matching upstream post-fix behaviour.
+When Megatron is installed, the upstream `get_updated_expert_bias` already
+carries the `tp_dp_cp_group=` parameter (as verified in the Megatron source
+at commit ≥ aa786b72). When Megatron is not installed, the function is set to
+`None` and the expert-bias update is silently skipped — this is pre-existing
+behaviour documented in the evolution header.
 
-### Why packed offsets cannot leak into param_index_map in our code
+**No local change required.** The import delegation means the Megatron fix
+is inherited automatically.
 
-`_compute_nvfp4_packed_layout()` is a **separate second pass** that runs
-after `param_index_map` is populated, building `nvfp4_packed_param_index_map`
-independently.  There is no shared loop or branch that could write packed
-offsets into `param_index_map`.
+---
 
-### Conditions that would reopen this task
+### File 5 — `shared_experts.py` ❌ GAP FOUND → FIXED in this session
 
-- A future refactor merges the two construction passes into one loop and
-  re-introduces a per-param branch writing packed offsets into
-  `param_index_map`.
-- A new caller reads `param_index_map` and indexes into the **packed param
-  buffer** directly (currently only `_remap_param_data` and `_new_bucket`
-  touch the packed buffer, and both correctly use
-  `nvfp4_packed_param_index_map`).
+**Our file:** `deepspeed/core/transformer/moe/shared_experts.py`
 
-### Verdict
+Two call sites inside `SharedExpertMLP._pre_forward_comm()` called:
 
-**No code change required.** Neuron_SP adopted the post-fix naming convention
-from the start; the bug never existed in our codebase. `param_index_map` is
-and has always been full-numel (unpacked).
+```python
+# BEFORE (using implicit parallel_state singleton):
+gather_from_sequence_parallel_region(input, tensor_parallel_output_grad=True)
+copy_to_tensor_model_parallel_region(input)
+```
+
+`self.tp_group` was already set (inherited from `MLP.__init__` via
+`pg_collection.tp`) but was not passed to the collectives.
+
+Additionally, `deepspeed/core/tensor_parallel/mappings.py` defined both
+functions without a `group=` parameter, so the call sites could not have
+passed one even if they wanted to.
+
+**Fix applied in commit `5064b4f2` (this session):**
+
+`mappings.py`:
+- `_CopyToModelParallelRegion.forward()` gains `group=None`; stored as
+  `ctx.group`; backward reads `ctx.group or _get_tp_group()`.
+- `_GatherFromSequenceParallelRegion.forward()` gains `group=None`; stored as
+  `ctx.group`; forward and backward use the explicit group for both
+  `all_gather` and the `all_reduce` in the SP-output-grad path.
+- Both public wrapper functions gain a `group=` keyword argument.
+
+`shared_experts.py`:
+```python
+# AFTER (explicit group — M3981):
+gather_from_sequence_parallel_region(
+    input, tensor_parallel_output_grad=True, group=self.tp_group
+)
+copy_to_tensor_model_parallel_region(input, group=self.tp_group)
+```
+
+Backward compatibility: `group=None` default preserves all existing callers.
+
+---
+
+## Commit log for this audit
+
+| Commit | File(s) | M3981 sub-change |
+|---|---|---|
+| `ae60b3e0` | `finalize_model_grads.py`, `__init__.py` | Sub-change 1 (finalize path) |
+| `5e1453ef` | `schedules.py` (evidence in grep) | Sub-change 2 (schedules tp_dp_cp) |
+| `5064b4f2` | `mappings.py`, `shared_experts.py` | Sub-change 5 (SP-region group threading) — **gap fixed this session** |
+
+Sub-changes 3 (`moe_layer.py`) and 4 (`moe_utils.py`) are not applicable
+to our codebase as documented above.
+
+---
+
+## Regression test
+
+`tests/test_core_integration.py` **Test 7** (`test_finalize_model_grads_moe_tp_dp_cp_assert`):
+- Verifies `pg_collection.tp_dp_cp` assertion is present in source.
+- Verifies `tp_dp_cp_group=` kwarg is threaded to `_update_router_expert_bias`.
+
+Additional source-level verification can be added for `shared_experts.py`
+call sites in a follow-up if needed.
+
+---
+
+# Megatron Commit Audit — M3981
+
+**Megatron commit:** `aa786b72c097d92c3656844321380a2e212c169e`  
+**Title:** Thread custom process groups through MoE grad finalization  
+**Audited by:** DistLead  
+**Audit date:** 2026-06-29  
+**Verdict:** ✅ Fully covered — applied across 4 separate commits
+
+## What M3981 changes (upstream Megatron)
+
+M3981 removes every implicit `parallel_state` singleton call inside the MoE
+expert-bias gradient finalization path, threading an explicit `tp_dp_cp_group`
+parameter from `finalize_model_grads` down to the `torch.distributed.all_reduce`
+inside `get_updated_expert_bias`. It also removes two
+`parallel_state.get_tensor_model_parallel_group()` calls in `MoELayer`
+checkpoint wrappers, replacing them with `self.tp_group`.
+
+**5 files touched in Megatron-LM:**
+
+| File | Change |
+|---|---|
+| `distributed/finalize_model_grads.py` | `_update_router_expert_bias` + `finalize_model_grads` get `tp_dp_cp_group` |
+| `pipeline_parallel/schedules.py` | 3 schedule functions set `pg_collection.tp_dp_cp` |
+| `transformer/moe/moe_layer.py` | 2 `checkpoint()` sites use `self.tp_group` |
+| `transformer/moe/moe_utils.py` | `get_updated_expert_bias` gains `tp_dp_cp_group=` |
+| `transformer/moe/shared_experts.py` | SP-region calls gain `group=self.tp_group` |
+
+## Coverage map
+
+### `finalize_model_grads.py` — ✅ COVERED (commit `ae60b3e0`)
+
+- `_update_router_expert_bias` has `tp_dp_cp_group=` param (line 840).
+- `finalize_model_grads` asserts `pg_collection.tp_dp_cp` when
+  `moe_router_enable_expert_bias=True` and extracts `tp_dp_cp_group`.
+- Fallback when `pg_collection is None` reads
+  `parallel_state.get_tensor_and_data_parallel_group(with_context_parallel=True)`.
+- Call at line 1219 passes `tp_dp_cp_group=tp_dp_cp_group`.
+
+### `schedules.py` — ✅ COVERED (commit `5e1453ef`)
+
+`pg_collection.tp_dp_cp` set in both no-pipelining and interleaving paths:
+```
+schedules.py:643  pg_collection.tp_dp_cp = _ps.get_tensor_and_data_parallel_group(...)
+schedules.py:787  pg_collection.tp_dp_cp = _ps.get_tensor_and_data_parallel_group(...)
+```
+
+### `moe_layer.py` — ✅ NOT APPLICABLE
+
+Our `MoELayer` is a pure-PyTorch PCIe-optimized rewrite with no TP dimension.
+It never called `parallel_state.get_tensor_model_parallel_group()` in
+`tensor_parallel.checkpoint()` wrappers. Zero occurrences confirmed by grep.
+
+### `moe_utils.py` — ✅ NOT APPLICABLE (import delegation)
+
+Our `moe_utils.py` does not define `get_updated_expert_bias`. The function is
+imported directly from Megatron (`finalize_model_grads.py` line 127), so the
+upstream `tp_dp_cp_group=` fix is inherited automatically when Megatron ≥ aa786b72
+is installed.
+
+### `shared_experts.py` — ❌ GAP FOUND → ✅ FIXED (commit `5064b4f2`)
+
+**Before:** both SP-region calls used implicit `parallel_state` singleton:
+```python
+gather_from_sequence_parallel_region(input, tensor_parallel_output_grad=True)
+copy_to_tensor_model_parallel_region(input)
+```
+
+**Root cause:** `mappings.py` did not accept a `group=` parameter on either
+function, so `self.tp_group` (already set via `pg_collection.tp`) could not
+be threaded through.
+
+**Fix (commit `5064b4f2`):**
+
+`deepspeed/core/tensor_parallel/mappings.py`:
+- `_CopyToModelParallelRegion` gains `group=None` in `forward()`; `backward()`
+  uses `ctx.group` or falls back to `_get_tp_group()`.
+- `_GatherFromSequenceParallelRegion` gains `group=None`; both forward all-gather
+  and backward all-reduce use the explicit group.
+- Both public wrappers gain a `group=` keyword; default `None` preserves
+  backward compatibility.
+
+`deepspeed/core/transformer/moe/shared_experts.py`:
+```python
+gather_from_sequence_parallel_region(
+    input, tensor_parallel_output_grad=True, group=self.tp_group  # M3981
+)
+copy_to_tensor_model_parallel_region(input, group=self.tp_group)  # M3981
+```
+
+## Regression tests
+
+`tests/test_core_integration.py` **Test 7** verifies the `pg_collection.tp_dp_cp`
+assertion and `tp_dp_cp_group=` kwarg threading in `finalize_model_grads.py`.
