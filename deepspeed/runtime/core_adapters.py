@@ -11,6 +11,7 @@ Usage in desloc_engine.py:
         build_hybrid_cp_schedule,
         maybe_enable_activation_offload,
         build_moe_adapter,
+        build_mla_adapter,   # Multi-Latent Attention adapter (Phase 4d)
     )
 """
 from __future__ import annotations
