@@ -9,6 +9,7 @@ Usage in desloc_engine.py:
         get_pipeline_forward_backward,
         build_dist_checkpoint_saver,
         build_hybrid_cp_schedule,
+        maybe_enable_activation_offload,
     )
 """
 from __future__ import annotations
@@ -386,6 +387,109 @@ def build_hybrid_cp_schedule(
     except Exception as exc:
         logger.warning(
             "core_adapter: hybrid_cp_schedule failed (%s), fallback to default microbatch loop",
+            exc,
+        )
+        return None
+
+
+# ---------------------------------------------------------------------------
+# 6. Fine-grained activation offload adapter (DES-LOC tier-aware)
+# ---------------------------------------------------------------------------
+
+def maybe_enable_activation_offload(
+    config: Any,
+    tier_type: Any = None,
+) -> Optional[Any]:
+    """Conditionally initialise fine-grained activation offloading.
+
+    Decision logic (DES-LOC spec)
+    ──────────────────────────────
+    * ``config.use_activation_offload`` must be True (opt-in flag).
+    * ``tier_type`` drives the tier check:
+        - PROFESSIONAL / CONSUMER  (≤ ~49 GB VRAM, e.g. A6000, RTX 4090)
+          → offload **enabled** – GPU memory is scarce.
+        - DATACENTER (H100, A100, ≥ 80 GB VRAM)
+          → offload **skipped** – ample VRAM, adding PCIe traffic hurts MFU.
+      When *tier_type* is None the adapter falls back to interrogating
+      ``torch.cuda.get_device_properties`` directly.
+
+    Returns
+    ────────
+    ``FineGrainedActivationOffloadingInterface`` singleton if offload is
+    active, otherwise ``None``.  The caller (desloc_engine) can store the
+    return value and use it as a context manager around each transformer layer::
+
+        _offload = maybe_enable_activation_offload(cfg, tier_type)
+        if _offload is not None:
+            _offload.init_chunk_handler(vp_size, vp_stage, min_tensor_size)
+        …
+        with _offload or nullcontext():
+            y = transformer_layer(x)
+
+    Config keys recognised (all optional with sensible defaults):
+        use_activation_offload      bool   – master on/off switch (default False)
+        activation_offload_min_size int    – minimum tensor elements to offload
+                                             (default 1 048 576 = 1 M elements)
+        activation_offload_max_inflight int – max pending D2H per group name
+                                              (default None = unlimited)
+        virtual_pipeline_model_parallel_size int – VPP size (default None = 1)
+    """
+    if not getattr(config, "use_activation_offload", False):
+        return None
+
+    try:
+        from deepspeed.core.pipeline_parallel.fine_grained_activation_offload import (
+            FineGrainedActivationOffloadingInterface,
+            PipelineOffloadManager,
+            offload_required_for_tier,
+        )
+
+        # --- Tier check: skip on high-VRAM GPUs ---
+        if not offload_required_for_tier(tier_type):
+            logger.info(
+                "core_adapter: activation offload SKIPPED "
+                "(tier=%s indicates sufficient VRAM; disable use_activation_offload "
+                "or set tier_type=PROFESSIONAL to force)",
+                tier_type,
+            )
+            return None
+
+        # --- Read config knobs ---
+        min_size: int = getattr(
+            config, "activation_offload_min_size", 1024 * 1024
+        )
+        max_inflight: Optional[int] = getattr(
+            config, "activation_offload_max_inflight", None
+        )
+        vp_size: Optional[int] = getattr(
+            config, "virtual_pipeline_model_parallel_size", None
+        )
+
+        # Ensure singleton is fresh
+        PipelineOffloadManager.reset_instance()
+
+        # Pre-initialise the first chunk handler for vp_stage 0 so that
+        # callers that do not call init_chunk_handler explicitly still work.
+        FineGrainedActivationOffloadingInterface.init_chunk_handler(
+            vp_size=vp_size,
+            vp_stage=0,
+            min_offloaded_tensor_size=min_size,
+            max_inflight_offloads=max_inflight,
+        )
+
+        logger.info(
+            "core_adapter: fine-grained activation offload ACTIVE "
+            "(tier=%s, min_size=%d, max_inflight=%s, vp_size=%s)",
+            tier_type,
+            min_size,
+            max_inflight,
+            vp_size,
+        )
+        return FineGrainedActivationOffloadingInterface
+
+    except Exception as exc:
+        logger.warning(
+            "core_adapter: activation offload failed (%s), skipping",
             exc,
         )
         return None
