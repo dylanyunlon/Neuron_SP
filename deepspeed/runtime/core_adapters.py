@@ -750,3 +750,255 @@ def build_moe_adapter(
             "build_moe_adapter: failed (%s); MoE disabled for this run.", exc
         )
         return None
+
+
+# ---------------------------------------------------------------------------
+# 7. Multi-Latent Attention (MLA) adapter
+# ---------------------------------------------------------------------------
+
+class _LightweightMLA(object):
+    """Pure-PyTorch MLA drop-in for MiniTransformer's CausalSelfAttention.
+
+    Implements the DeepSeek-style low-rank KV compression without requiring
+    Megatron-LM or any external RoPE library.  This is the *training path*
+    that always works; for inference or tensor-parallel workloads the caller
+    can swap in ``MLASelfAttention`` from deepspeed.core.transformer.
+
+    Architecture summary
+    --------------------
+    Queries      : x → W_q_down (hidden → q_lora_rank) → W_q_up (→ n_heads * head_dim)
+    Keys/Values  : x → W_kv_down (hidden → kv_lora_rank) →
+                       W_k_up  (→ n_heads * head_dim)
+                       W_v_up  (→ n_heads * v_head_dim)
+    Output       : concat(head_outputs) → W_proj (n_heads * v_head_dim → hidden)
+
+    RoPE is *not* applied here; the MiniTransformer does not use positional
+    embeddings in its smoke-test configuration.  Add a rotary layer before
+    W_q_up / W_k_up when porting to a production model.
+    """
+
+    def __new__(
+        cls,
+        hidden: int,
+        n_heads: int,
+        q_lora_rank: int,
+        kv_lora_rank: int,
+        head_dim: int,
+        v_head_dim: int,
+    ):
+        """Return an ``nn.Module`` (not a plain Python object)."""
+        import torch
+        import torch.nn as nn
+        import torch.nn.functional as F
+
+        class _MLA(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.n_heads   = n_heads
+                self.head_dim  = head_dim
+                self.v_head_dim = v_head_dim
+
+                # Q low-rank path: hidden → q_lora_rank → n_heads * head_dim
+                self.w_q_down = nn.Linear(hidden, q_lora_rank, bias=False)
+                self.w_q_up   = nn.Linear(q_lora_rank, n_heads * head_dim, bias=False)
+
+                # KV shared down-projection: hidden → kv_lora_rank (the "latent")
+                self.w_kv_down = nn.Linear(hidden, kv_lora_rank, bias=False)
+                # K up-projection from latent
+                self.w_k_up   = nn.Linear(kv_lora_rank, n_heads * head_dim, bias=False)
+                # V up-projection from latent
+                self.w_v_up   = nn.Linear(kv_lora_rank, n_heads * v_head_dim, bias=False)
+                # Output projection: concat of all V heads → hidden
+                self.proj      = nn.Linear(n_heads * v_head_dim, hidden, bias=False)
+
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                B, T, _ = x.shape
+                h, d, vd = self.n_heads, self.head_dim, self.v_head_dim
+
+                q = self.w_q_up(self.w_q_down(x))          # (B, T, h*d)
+                latent = self.w_kv_down(x)                  # (B, T, kv_lora_rank)
+                k = self.w_k_up(latent)                     # (B, T, h*d)
+                v = self.w_v_up(latent)                     # (B, T, h*vd)
+
+                # Reshape to (B, h, T, dim_per_head)
+                q = q.view(B, T, h, d).transpose(1, 2)
+                k = k.view(B, T, h, d).transpose(1, 2)
+                v = v.view(B, T, h, vd).transpose(1, 2)
+
+                out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+                out = out.transpose(1, 2).contiguous().view(B, T, h * vd)
+                return self.proj(out)
+
+        return _MLA()
+
+
+class MLAAdapter:
+    """Patches a MiniTransformer/TransformerBlock model to use MLA attention.
+
+    Responsibilities
+    ----------------
+    * **patch_model** — replace the ``CausalSelfAttention`` (``.attn``) in
+      every TransformerBlock with a :class:`_LightweightMLA` module.
+      Only every ``mla_layer_freq``-th block is converted (default: every
+      block when freq=1).
+
+    * **log_info** — emit a one-line summary of the conversion.
+
+    Config keys recognised in ``TrainingConfig`` (all optional):
+        use_mla             bool  – master on/off switch (default False)
+        mla_q_lora_rank     int   – Q bottleneck rank (default hidden // 4)
+        mla_kv_lora_rank    int   – KV shared latent rank (default hidden // 8)
+        mla_head_dim        int   – per-head QK dimension (default hidden // n_heads)
+        mla_v_head_dim      int   – per-head V dimension  (default hidden // n_heads)
+        mla_layer_freq      int   – convert every N-th block (default 1)
+    """
+
+    def __init__(self, config: Any) -> None:
+        self.config = config
+        self._mla_layers: list = []  # populated by patch_model()
+
+    def _resolve_dims(self, hidden: int, n_heads: int):
+        """Return (q_lora_rank, kv_lora_rank, head_dim, v_head_dim) from config."""
+        cfg = self.config
+        head_dim    = getattr(cfg, "mla_head_dim",    hidden // n_heads)
+        v_head_dim  = getattr(cfg, "mla_v_head_dim",  hidden // n_heads)
+        q_lora_rank = getattr(cfg, "mla_q_lora_rank",  hidden // 4)
+        kv_lora_rank = getattr(cfg, "mla_kv_lora_rank", hidden // 8)
+        return q_lora_rank, kv_lora_rank, head_dim, v_head_dim
+
+    def patch_model(self, model: Any) -> int:
+        """Replace CausalSelfAttention with _LightweightMLA in eligible blocks.
+
+        Args:
+            model: The ``nn.Module`` to patch (typically ``DesLocEngine.model``).
+
+        Returns:
+            Number of blocks that were converted to MLA.
+        """
+        cfg  = self.config
+        freq: int = getattr(cfg, "mla_layer_freq", 1)
+
+        block_list = getattr(model, "blocks", None) or getattr(model, "layers", None)
+        if block_list is None:
+            logger.warning(
+                "MLAAdapter.patch_model: model has no .blocks/.layers; "
+                "MLA patching skipped."
+            )
+            return 0
+
+        converted = 0
+        for layer_idx, block in enumerate(block_list):
+            if freq > 1 and layer_idx % freq != 0:
+                continue
+
+            if not hasattr(block, "attn"):
+                logger.debug(
+                    "MLAAdapter: layer %d has no .attn — cannot convert", layer_idx
+                )
+                continue
+
+            # Infer hidden / n_heads from the existing attention module.
+            existing_attn = block.attn
+            # CausalSelfAttention stores .qkv: Linear(hidden, 3*hidden)
+            if hasattr(existing_attn, "qkv"):
+                hidden   = existing_attn.qkv.in_features
+                n_heads  = existing_attn.n_heads
+            elif hasattr(existing_attn, "proj"):
+                hidden  = existing_attn.proj.out_features
+                n_heads = getattr(existing_attn, "n_heads", 1)
+            else:
+                logger.debug(
+                    "MLAAdapter: layer %d .attn has unknown shape — skipping",
+                    layer_idx,
+                )
+                continue
+
+            q_lora_rank, kv_lora_rank, head_dim, v_head_dim = self._resolve_dims(
+                hidden, n_heads
+            )
+
+            mla_layer = _LightweightMLA(
+                hidden=hidden,
+                n_heads=n_heads,
+                q_lora_rank=q_lora_rank,
+                kv_lora_rank=kv_lora_rank,
+                head_dim=head_dim,
+                v_head_dim=v_head_dim,
+            )
+            # Move to same device/dtype as the existing module.
+            param0 = next(existing_attn.parameters(), None)
+            if param0 is not None:
+                mla_layer = mla_layer.to(dtype=param0.dtype, device=param0.device)
+
+            block.attn = mla_layer
+            self._mla_layers.append(mla_layer)
+            converted += 1
+            logger.debug(
+                "MLAAdapter: layer %d .attn replaced with _LightweightMLA "
+                "(q_lora=%d, kv_lora=%d, heads=%d, head_dim=%d, v_head_dim=%d)",
+                layer_idx, q_lora_rank, kv_lora_rank, n_heads, head_dim, v_head_dim,
+            )
+
+        logger.info(
+            "MLAAdapter.patch_model: %d/%d blocks converted to MLA "
+            "(q_lora_rank=%d, kv_lora_rank=%d, freq=%d)",
+            converted,
+            len(block_list),
+            getattr(cfg, "mla_q_lora_rank",  getattr(cfg, "hidden_size", 0) // 4),
+            getattr(cfg, "mla_kv_lora_rank", getattr(cfg, "hidden_size", 0) // 8),
+            freq,
+        )
+        return converted
+
+    def param_count(self) -> int:
+        """Return total parameter count across all patched MLA layers."""
+        return sum(p.numel() for layer in self._mla_layers for p in layer.parameters())
+
+
+def build_mla_adapter(
+    config: Any,
+    model: Any,
+) -> "Optional[MLAAdapter]":
+    """Build and apply an MLAAdapter if ``config.use_mla`` is True.
+
+    Gate flag
+    ---------
+    ``config.use_mla: bool`` — master on/off switch.  When False (default),
+    this function is a no-op and returns ``None`` so the rest of the engine
+    is completely unaffected.
+
+    On success, ``MLAAdapter.patch_model(model)`` is called immediately so
+    the caller receives a model already populated with MLA attention layers.
+
+    Args:
+        config: ``TrainingConfig`` (or any object with ``use_mla`` attr).
+        model:  The ``nn.Module`` to patch in-place.
+
+    Returns:
+        Populated :class:`MLAAdapter` instance, or ``None`` when MLA is
+        disabled or the patch step fails.
+    """
+    if not getattr(config, "use_mla", False):
+        return None
+
+    try:
+        adapter = MLAAdapter(config=config)
+        n_converted = adapter.patch_model(model)
+        if n_converted == 0:
+            logger.warning(
+                "build_mla_adapter: use_mla=True but no blocks were converted; "
+                "check model architecture and mla_layer_freq setting."
+            )
+        logger.info(
+            "build_mla_adapter: MLAAdapter active (%d MLA layers, "
+            "q_lora_rank=%d, kv_lora_rank=%d)",
+            n_converted,
+            getattr(config, "mla_q_lora_rank",  getattr(config, "hidden_size", 0) // 4),
+            getattr(config, "mla_kv_lora_rank", getattr(config, "hidden_size", 0) // 8),
+        )
+        return adapter
+    except Exception as exc:
+        logger.warning(
+            "build_mla_adapter: failed (%s); MLA disabled for this run.", exc
+        )
+        return None
