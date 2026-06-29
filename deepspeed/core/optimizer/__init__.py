@@ -56,6 +56,20 @@ from deepspeed.core.optimizer.distrib_optimizer import (
     get_canonical_lr_for_logging,
 )
 
+# Megatron optimizer wrappers ported to deepspeed.core (optimizer.py)
+from deepspeed.core.optimizer.optimizer import (
+    Float16OptimizerWithFloat16Params,
+    FP32Optimizer,
+    ChainedOptimizer,
+    ProxyDict,
+    clip_grad_by_total_norm_fp32,
+    count_zeros_fp32,
+    param_is_not_shared,
+    param_group_identifier_keys,
+    _zero_grad_group_helper,
+    _multi_tensor_copy_this_to_that,
+)
+
 
 def build_optimizer(params, config: OptimizerConfig):
     """Construct an optimizer from *config*.
@@ -117,4 +131,15 @@ __all__ = [
     "get_canonical_lr_for_logging",
     # From Megatron M3543: Lion optimizer factory
     "build_optimizer",
+    # From optimizer.py port
+    "Float16OptimizerWithFloat16Params",
+    "FP32Optimizer",
+    "ChainedOptimizer",
+    "ProxyDict",
+    "clip_grad_by_total_norm_fp32",
+    "count_zeros_fp32",
+    "param_is_not_shared",
+    "param_group_identifier_keys",
+    "_zero_grad_group_helper",
+    "_multi_tensor_copy_this_to_that",
 ]

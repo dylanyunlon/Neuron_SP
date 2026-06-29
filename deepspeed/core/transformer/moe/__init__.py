@@ -2,6 +2,12 @@
 
 Adapted from Megatron megatron/core/transformer/moe/.
 """
+from deepspeed.core.transformer.moe.experts import (
+    GroupedMLPSubmodules,
+    TEGroupedMLP,
+    InferenceGroupedMLP,
+    SequentialMLP,
+)
 from deepspeed.core.transformer.moe.moe_layer import ExpertMLP, MoELayer
 from deepspeed.core.transformer.moe.shared_experts import SharedExpertMLP, SharedExpertState
 from deepspeed.core.transformer.moe.moe_utils import (
@@ -21,6 +27,12 @@ from deepspeed.core.transformer.moe.token_dispatcher import (
 )
 
 __all__ = [
+    # Grouped / sequential expert implementations (ported from Megatron experts.py)
+    "GroupedMLPSubmodules",
+    "TEGroupedMLP",
+    "InferenceGroupedMLP",
+    "SequentialMLP",
+    # Legacy simple expert + MoE layer
     "MoELayer",
     "TopKRouter",
     "ExpertMLP",
