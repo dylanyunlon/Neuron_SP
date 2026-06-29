@@ -20,11 +20,11 @@ Guaranteed import paths
     from deepspeed.core.optimizer import clip_grad_norm
     from deepspeed.core.optimizer import Range
 
-    from deepspeed.core.optimizer.optimizer_config import OptimizerConfig
+    from deepspeed.core.optimizer.optimizer_config import OptimizerConfig, ParamKey
     from deepspeed.core.optimizer.distrib_optimizer import DistributedOptimizer
 """
 
-from deepspeed.core.optimizer.optimizer_config import OptimizerConfig
+from deepspeed.core.optimizer.optimizer_config import OptimizerConfig, ParamKey
 from deepspeed.core.optimizer.distrib_optimizer import (
     # Core optimizer hierarchy
     MegatronOptimizer,

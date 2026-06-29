@@ -8,9 +8,45 @@ Mirrors Megatron's OptimizerConfig with DES-LOC moment-sync extensions.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Type, Union
 
 import torch
+
+
+@dataclass(unsafe_hash=True)
+class ParamKey:
+    """Identifies a parameter subset for per-param optimizer config overrides.
+
+    From Megatron M2654: enables different lr/wd/etc. for different param groups
+    without requiring separate optimizer instances.
+
+    A parameter matches if EITHER its name contains a substring in ``name``
+    OR it has a truthy attribute named by ``attr``.
+
+    Examples::
+
+        # Lower lr for all embedding parameters
+        ParamKey(name='embedding')
+
+        # Separate config for expert-parallel params
+        ParamKey(attr='is_expert_parallel')
+    """
+    name: Union[str, List[str]] = ""
+    """Param name substring(s). Empty string skips name matching."""
+    attr: Union[str, List[str]] = ""
+    """Param attribute name(s) to check for truthiness. Empty skips."""
+
+    def matches(self, param: "torch.nn.Parameter", param_name: str) -> bool:
+        """Return True if param matches this key by name or attribute."""
+        names = [self.name] if isinstance(self.name, str) else list(self.name)
+        for n in names:
+            if n and n in param_name:
+                return True
+        attrs = [self.attr] if isinstance(self.attr, str) else list(self.attr)
+        for a in attrs:
+            if a and getattr(param, a, False):
+                return True
+        return False
 
 
 @dataclass
@@ -155,6 +191,29 @@ class OptimizerConfig:
     def is_kx_step(self, step: int) -> bool:
         """Return True if *step* is a parameter sync step (Kx)."""
         return (step % self.kx) == 0
+
+    def override_for_param(
+        self,
+        param: "torch.nn.Parameter",
+        param_name: str,
+        config_overrides: "Optional[Dict[ParamKey, OptimizerConfig]]" = None,
+    ) -> "OptimizerConfig":
+        """Return effective OptimizerConfig for a given parameter.
+
+        From Megatron M2654: first matching ParamKey wins; returns self
+        if no override matches or config_overrides is None/empty.
+
+        Args:
+            param:            Parameter tensor.
+            param_name:       Name of parameter in the model state dict.
+            config_overrides: Dict[ParamKey -> OptimizerConfig] overrides.
+        """
+        if not config_overrides:
+            return self
+        for key, override in config_overrides.items():
+            if key.matches(param, param_name):
+                return override
+        return self
 
     # -----------------------------------------------------------------------
     # Insight I6: PCIe-aware overlap (Megatron aa-3.5)
