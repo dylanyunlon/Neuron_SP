@@ -42,6 +42,14 @@ from deepspeed.core.transformer.attention import (
 )
 from deepspeed.core.transformer.mlp import MLP
 from deepspeed.core.transformer.module import MegatronModule
+from deepspeed.core.transformer.multi_latent_attention import (
+    MultiLatentAttention,
+    MLASelfAttention,
+    FusedMLASelfAttention,
+    MLASelfAttentionSubmodules,
+    ModuleSpec,
+    build_module,
+)
 from deepspeed.core.transformer.multi_token_prediction import (
     MultiTokenPredictionLayer,
     MultiTokenPredictionLayerSubmodules,
@@ -75,6 +83,13 @@ __all__ = [
     "MLP",
     # Base
     "MegatronModule",
+    # Multi-Latent Attention (MLA / DeepSeek)
+    "MultiLatentAttention",
+    "MLASelfAttention",
+    "FusedMLASelfAttention",
+    "MLASelfAttentionSubmodules",
+    "ModuleSpec",
+    "build_module",
     # Multi-Token Prediction (MTP)
     "MultiTokenPredictionLayer",
     "MultiTokenPredictionLayerSubmodules",
