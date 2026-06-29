@@ -211,6 +211,14 @@ class OptimizerParamScheduler:
     # Checkpoint helpers
     # ------------------------------------------------------------------
 
+    def get_last_lr(self) -> list:
+        """Return last computed LR for each param group.
+
+        Compatibility shim: desloc_engine calls scheduler.get_last_lr()[0]
+        which is a torch LambdaLR method. We emulate it here.
+        """
+        return [group.get('lr', self.max_lr) for group in self.optimizer.param_groups]
+
     def state_dict(self) -> dict:
         """Return a dict containing all scheduler state needed for checkpointing."""
         return {

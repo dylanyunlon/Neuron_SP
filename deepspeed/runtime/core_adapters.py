@@ -121,16 +121,16 @@ def maybe_build_dist_checkpoint_saver(
         return None
 
     try:
-        from deepspeed.core.dist_checkpointing import core as dc_core
+        from deepspeed.core.dist_checkpointing import save as dc_save, load as dc_load
 
         class DistCheckpointAdapter:
             """Thin wrapper around dist_checkpointing.save/load."""
 
             def save(self, state_dict: dict, path) -> None:
-                dc_core.save(state_dict, str(path))
+                dc_save(state_dict, str(path))
 
             def load(self, path) -> dict:
-                return dc_core.load(str(path))
+                return dc_load(str(path))
 
         logger.info("core_adapter: dist_checkpointing active")
         return DistCheckpointAdapter()

@@ -2328,6 +2328,10 @@ class DesLocEngine:
         )
         _shard_sync_pending: bool = False
 
+        # --- Core pipeline schedule adapter (gated by config.use_pipeline_schedule) ---
+        from deepspeed.runtime.core_adapters import maybe_get_pipeline_forward_backward
+        _pipeline_fb_func = maybe_get_pipeline_forward_backward(cfg, default_fn=None)
+
         for step in range(self.global_step, cfg.total_steps):
             # DistributedOptimizer.zero_grad() zeroes its grad_data buffers +
             # shard param grads.  Plain AdamW zero_grad() on the non-ZeRO-3 path.
@@ -2804,6 +2808,10 @@ class DesLocEngine:
 
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
+
+        # --- Core dist_checkpointing adapter (gated by config.use_dist_checkpointing) ---
+        from deepspeed.runtime.core_adapters import maybe_build_dist_checkpoint_saver
+        _dc_saver = maybe_build_dist_checkpoint_saver(self.config)
 
         payload = {
             "global_step":       self.global_step,
