@@ -483,7 +483,10 @@ def _background_checkpoint_worker(save_fn, *args, **kwargs):
     On PCIe clusters (no NVLink) this is especially important since storage
     and GPU interconnect share bandwidth.
     """
-    _os.nice(19)  # lowest CPU priority
+    try:
+        _os.nice(19)
+    except OSError:
+        pass
     try:
         import subprocess as _sp
         _sp.run(['ionice', '-c', '3', '-p', str(_os.getpid())],
