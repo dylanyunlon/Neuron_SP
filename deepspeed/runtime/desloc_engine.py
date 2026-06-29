@@ -264,6 +264,21 @@ class TrainingConfig:
     wandb_project: Optional[str] = None
     tensorboard_dir: Optional[str] = None
 
+    # From Megatron M2492: cpu-offloading-num-layers interface.
+    # Setting cpu_offloading_num_layers > 0 enables layer-level CPU offloading
+    # (moves activations/weights of that many Transformer layers to host RAM).
+    # On DES-LOC A6000×2 (48 GB each, PCIe, no NVLink) this is the primary knob
+    # for fitting larger models: offload the bottom N layers to the 1.5 TB DDR5
+    # pool when VRAM is exhausted.  Setting this also forces cpu_offloading=True.
+    cpu_offloading_num_layers: int = 0
+    """Number of Transformer layers to offload to CPU. 0 = disabled.
+    When > 0, cpu_offloading is automatically enabled (Megatron M2492)."""
+
+    @property
+    def cpu_offloading(self) -> bool:
+        """Derived flag: True when any layers are scheduled for CPU offload."""
+        return self.cpu_offloading_num_layers > 0
+
     # Insight I8: default flight_recorder for PCIe (Megatron M3499)
     # Megatron M3499 introduced flight_recorder_dump_on_timeout to capture NCCL
     # collective traces when a hang is detected.  In PCIe topologies (our cluster:
