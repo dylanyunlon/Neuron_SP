@@ -501,6 +501,9 @@ class MegatronOptimizer(ABC):
           - must not be a TP replica.
 
         # From Megatron M4171: extracted so get_grads_for_grad_norm can reuse it.
+        # M4171 followup (ParamRegistry): shared flag is resolved via
+        # _GLOBAL_PARAM_REGISTRY first; getattr fallback supports params that
+        # pre-date the registry (e.g. registered before optimizer construction).
         """
         grads: List[torch.Tensor] = []
         for param in params:
