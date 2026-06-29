@@ -158,7 +158,9 @@ class DistributedDataParallelConfig:
 
     megatron_fsdp_grad_comm_dtype: Optional[torch.dtype] = None
     """Data type for gradient gather/scatter communication in Megatron-FSDP.
-    If None, uses main_grads_dtype. Setting to BF16 can reduce comm latency."""
+    If None, uses main_grads_dtype. Setting to BF16 can reduce comm latency.
+    # PCIe-opt: set to torch.bfloat16 on DES-LOC A6000+H100+Blackwell to halve grad comm bandwidth.
+    """
 
     # DES-LOC: allow skipping grad sync on non-Kx steps.
     allow_skip_grad_sync: bool = True

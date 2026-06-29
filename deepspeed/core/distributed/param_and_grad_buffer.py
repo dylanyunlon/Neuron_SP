@@ -822,6 +822,10 @@ class ParamAndGradBucketGroup:
             else self.data_parallel_group
         )
 
+        # From Megatron M3574: cast to grad_comm_dtype for PCIe bandwidth reduction (50% for BF16).
+        # DES-LOC clusters (A6000+H100+Blackwell, no NVLink): set megatron_fsdp_grad_comm_dtype=bfloat16.
+        _grad_comm_dtype = getattr(getattr(self, 'ddp_config', None), 'megatron_fsdp_grad_comm_dtype', None)
+
         # Coalesce all buckets in this group into a single NCCL call.
         grad_reduce_handle = None
         with stream_context, _coalescing_manager(communication_group, async_ops=async_op) as cm:
@@ -835,22 +839,48 @@ class ParamAndGradBucketGroup:
                     local_view = self.cached_grad_buffer_shard_list[idx][
                         self.intra_distributed_optimizer_instance_rank
                     ]
-                    grad_reduce_handle = dist_reduce_scatter_func(
-                        local_view,
-                        bucket.grad_data,
-                        op=reduce_op,
-                        group=communication_group,
-                        async_op=async_op,
-                    )
+                    # M3574: cast grad_data to comm dtype (e.g. BF16) to halve PCIe bandwidth.
+                    if _grad_comm_dtype is not None and bucket.grad_data.dtype != _grad_comm_dtype:
+                        _orig_dtype = bucket.grad_data.dtype
+                        _cast_data = bucket.grad_data.to(_grad_comm_dtype)
+                        _cast_local = local_view.to(_grad_comm_dtype)
+                        grad_reduce_handle = dist_reduce_scatter_func(
+                            _cast_local,
+                            _cast_data,
+                            op=reduce_op,
+                            group=communication_group,
+                            async_op=async_op,
+                        )
+                        bucket.grad_data.copy_(_cast_data.to(_orig_dtype))
+                    else:
+                        grad_reduce_handle = dist_reduce_scatter_func(
+                            local_view,
+                            bucket.grad_data,
+                            op=reduce_op,
+                            group=communication_group,
+                            async_op=async_op,
+                        )
                 else:
                     if torch.distributed.get_rank() == 0 and force_all_reduce:
                         logger.info("Performing all_reduce (force_all_reduce=%s)", force_all_reduce)
-                    torch.distributed.all_reduce(
-                        bucket.grad_data,
-                        op=reduce_op,
-                        group=communication_group,
-                        async_op=async_op,
-                    )
+                    # M3574: cast grad_data to comm dtype (e.g. BF16) to halve PCIe bandwidth.
+                    if _grad_comm_dtype is not None and bucket.grad_data.dtype != _grad_comm_dtype:
+                        _orig_dtype = bucket.grad_data.dtype
+                        _cast_data = bucket.grad_data.to(_grad_comm_dtype)
+                        torch.distributed.all_reduce(
+                            _cast_data,
+                            op=reduce_op,
+                            group=communication_group,
+                            async_op=async_op,
+                        )
+                        bucket.grad_data.copy_(_cast_data.to(_orig_dtype))
+                    else:
+                        torch.distributed.all_reduce(
+                            bucket.grad_data,
+                            op=reduce_op,
+                            group=communication_group,
+                            async_op=async_op,
+                        )
 
         # Inter-instance all-reduce for multiple DistOpt instances (M3561).
         if use_dist_opt and num_instances > 1:
