@@ -134,7 +134,12 @@ def build_dist_checkpoint_saver(
                 dc_save(state_dict, str(path))
 
             def load(self, path) -> dict:
-                return dc_load(str(path))
+                # Phase-1: payload is still a flat dict (no ShardedTensors yet).
+                # Pass an empty sharded_state_dict so dc_load reconstructs the
+                # full payload from common.pt + shard_*.pt without needing a
+                # target shard map.  Phase 2 (_build_sharded_payload) will
+                # replace this with a proper sharded descriptor.
+                return dc_load({}, str(path))
 
         logger.info("core_adapter: dist_checkpointing active")
         return DistCheckpointAdapter()

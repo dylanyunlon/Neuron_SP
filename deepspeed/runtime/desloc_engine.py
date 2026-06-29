@@ -3430,21 +3430,42 @@ class DesLocEngine:
                 )
 
         # ------------------------------------------------------------------
-        # Stage 3: Legacy / synchronous fallback — torch.load of a .pt file.
+        # Stage 3: dist_checkpointing directory or legacy torch.load fallback.
         # ------------------------------------------------------------------
-        pt_file = path if path.suffix == ".pt" else path
-        payload = torch.load(
-            pt_file,
-            map_location=f"cuda:{torch.cuda.current_device()}"
-            if torch.cuda.is_available() else "cpu",
-        )
-        self._apply_loaded_state(payload, cfg)
-        logger.info(
-            "Checkpoint loaded (legacy): %s (step %d, %.2fM tokens seen)",
-            path,
-            self.global_step,
-            self.tokens_seen / 1e6,
-        )
+        # Build the adapter here (mirrors save_checkpoint).  Returns None when
+        # use_dist_checkpointing=False (default) so legacy behaviour is unchanged.
+        from deepspeed.runtime.core_adapters import build_dist_checkpoint_saver  # noqa: PLC0415
+        _dc_saver = build_dist_checkpoint_saver(self.config)
+
+        from deepspeed.core.dist_checkpointing import check_is_distributed_checkpoint  # noqa: PLC0415
+        if _dc_saver is not None and path.is_dir() and check_is_distributed_checkpoint(str(path)):
+            # Phase-1 wire-up (PROPOSAL_checkpoint_migration.md §3 Step 1):
+            # checkpoint was written by dist_checkpointing.save(); use the
+            # adapter to load so common.pt + shard_*.pt are handled correctly.
+            logger.info(
+                "dist_checkpoint load: %s", path,
+            )
+            payload = _dc_saver.load(path)
+            self._apply_loaded_state(payload, cfg)
+            logger.info(
+                "dist_checkpoint loaded: %s (step %d, %.2fM tokens seen)",
+                path, self.global_step, self.tokens_seen / 1e6,
+            )
+        else:
+            # Legacy / synchronous fallback — torch.load of a .pt file.
+            pt_file = path if path.suffix == ".pt" else path
+            payload = torch.load(
+                pt_file,
+                map_location=f"cuda:{torch.cuda.current_device()}"
+                if torch.cuda.is_available() else "cpu",
+            )
+            self._apply_loaded_state(payload, cfg)
+            logger.info(
+                "Checkpoint loaded (legacy): %s (step %d, %.2fM tokens seen)",
+                path,
+                self.global_step,
+                self.tokens_seen / 1e6,
+            )
 
     def _apply_loaded_state(
         self,
