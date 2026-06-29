@@ -10,6 +10,7 @@ Usage in desloc_engine.py:
         build_dist_checkpoint_saver,
         build_hybrid_cp_schedule,
         maybe_enable_activation_offload,
+        build_moe_adapter,
     )
 """
 from __future__ import annotations
@@ -491,5 +492,261 @@ def maybe_enable_activation_offload(
         logger.warning(
             "core_adapter: activation offload failed (%s), skipping",
             exc,
+        )
+        return None
+
+
+# ---------------------------------------------------------------------------
+# 7. MoE adapter — wire deepspeed/core/transformer/moe/ into the engine
+# ---------------------------------------------------------------------------
+
+class MoEAdapter:
+    """Manages MoE layers inside a model built with MiniTransformer/TransformerBlock.
+
+    Responsibilities
+    ----------------
+    * **patch_model** — replace the dense ``MLP`` sub-module in every
+      TransformerBlock with an ``MoELayer`` according to the engine config.
+      Only every ``moe_layer_freq``-th block gets MoE (default: every block
+      when freq=1).  Layers owned by H100 (high-VRAM) tiers always get MoE;
+      A6000 layers only get MoE when ``moe_on_all_tiers=True``.
+
+    * **collect_aux_loss** — walk all ``MoELayer`` instances in the model and
+      sum their router auxiliary losses into a single scalar.  Called once per
+      micro-batch backward so the aux loss participates in the gradient graph.
+
+    * **log_utilization** — emit per-expert token-count statistics at the
+      requested logging cadence (gated by ``moe_log_every``).
+
+    Config keys recognised in ``TrainingConfig`` (all optional):
+        num_moe_experts         int   – number of experts per MoE layer (default 8)
+        moe_router_topk         int   – tokens routed to top-k experts (default 2)
+        moe_aux_loss_coeff      float – load-balancing aux loss weight (default 0.01)
+        moe_z_loss_coeff        float – z-loss weight for router stability (default 0.0)
+        moe_token_capacity_factor float – optional expert capacity factor (default None)
+        moe_layer_freq          int   – replace every N-th block with MoE (default 1)
+        moe_on_all_tiers        bool  – enable MoE on A6000 tiers too (default True)
+        moe_num_shared_experts  int   – shared (dense) expert count per layer (default 0)
+        ffn_hidden_size         int   – expert intermediate size (default hidden*4)
+        activation_func_type    str   – 'swiglu' or 'gelu' (default 'swiglu')
+    """
+
+    def __init__(self, config: Any, tiers: Any = None) -> None:
+        self.config = config
+        self.tiers = tiers or []
+        self._moe_layers: list = []   # populated by patch_model()
+
+    # ------------------------------------------------------------------
+    # Internal: build a synthetic config object the MoELayer / TopKRouter
+    # constructors understand.  They only need attribute access, so a
+    # simple namespace is enough — no dataclass or TypedDict required.
+    # ------------------------------------------------------------------
+    def _make_moe_config(self) -> Any:
+        """Return an attribute namespace with all fields MoELayer expects."""
+        import types
+        cfg = self.config
+        ns = types.SimpleNamespace(
+            hidden_size=cfg.hidden_size,
+            ffn_hidden_size=getattr(cfg, "ffn_hidden_size", cfg.hidden_size * 4),
+            num_moe_experts=getattr(cfg, "num_moe_experts", 8),
+            moe_router_topk=getattr(cfg, "moe_router_topk", 2),
+            moe_aux_loss_coeff=getattr(cfg, "moe_aux_loss_coeff", 0.01),
+            moe_z_loss_coeff=getattr(cfg, "moe_z_loss_coeff", 0.0),
+            moe_token_capacity_factor=getattr(cfg, "moe_token_capacity_factor", None),
+            moe_num_shared_experts=getattr(cfg, "moe_num_shared_experts", 0),
+            activation_func_type=getattr(cfg, "activation_func_type", "swiglu"),
+        )
+        return ns
+
+    def patch_model(self, model: Any) -> int:
+        """Replace dense MLP sub-modules with MoELayer in eligible blocks.
+
+        Args:
+            model: The nn.Module to patch (typically ``DesLocEngine.model``).
+
+        Returns:
+            Number of blocks that were converted to MoE.
+        """
+        try:
+            from deepspeed.core.transformer.moe.moe_layer import MoELayer
+        except Exception as exc:  # pragma: no cover
+            logger.warning("MoEAdapter.patch_model: cannot import MoELayer (%s)", exc)
+            return 0
+
+        cfg = self.config
+        moe_config = self._make_moe_config()
+        freq: int = getattr(cfg, "moe_layer_freq", 1)
+        on_all_tiers: bool = getattr(cfg, "moe_on_all_tiers", True)
+
+        # Build device-index → TierClass lookup from discovered tiers so we
+        # can skip MoE on memory-constrained A6000 tiers when requested.
+        tier_values: dict = {}
+        for spec in self.tiers:
+            tier_val = getattr(getattr(spec, "tier", None), "value", "UNKNOWN")
+            tier_values[spec.device_index] = tier_val
+
+        # Support both MiniTransformer (.blocks) and models with .layers.
+        block_list = getattr(model, "blocks", None) or getattr(model, "layers", None)
+        if block_list is None:
+            logger.warning(
+                "MoEAdapter.patch_model: model has no .blocks/.layers; "
+                "MoE patching skipped."
+            )
+            return 0
+
+        converted = 0
+        for layer_idx, block in enumerate(block_list):
+            # Frequency gate: only replace every freq-th layer.
+            if freq > 1 and layer_idx % freq != 0:
+                continue
+
+            # Tier gate: when moe_on_all_tiers=False, skip A6000 layers.
+            if not on_all_tiers:
+                dev_idx = getattr(block, "_device_idx", -1)
+                tier_name = tier_values.get(dev_idx, "UNKNOWN")
+                if "A6000" in tier_name:
+                    logger.debug(
+                        "MoEAdapter: layer %d on A6000 — skipped (moe_on_all_tiers=False)",
+                        layer_idx,
+                    )
+                    continue
+
+            # Replace .mlp sub-module if present; fall back to .ffn.
+            target_attr = None
+            if hasattr(block, "mlp"):
+                target_attr = "mlp"
+            elif hasattr(block, "ffn"):
+                target_attr = "ffn"
+            else:
+                logger.debug(
+                    "MoEAdapter: layer %d has no .mlp/.ffn — cannot convert",
+                    layer_idx,
+                )
+                continue
+
+            moe_layer = MoELayer(moe_config, layer_number=layer_idx)
+            setattr(block, target_attr, moe_layer)
+            self._moe_layers.append(moe_layer)
+            converted += 1
+            logger.debug(
+                "MoEAdapter: layer %d .%s replaced with MoELayer "
+                "(%d experts, top-%d)",
+                layer_idx, target_attr,
+                moe_config.num_moe_experts, moe_config.moe_router_topk,
+            )
+
+        logger.info(
+            "MoEAdapter.patch_model: %d/%d blocks converted to MoE "
+            "(experts=%d, topk=%d, freq=%d)",
+            converted, len(block_list),
+            moe_config.num_moe_experts, moe_config.moe_router_topk, freq,
+        )
+        return converted
+
+    def collect_aux_loss(self) -> Any:
+        """Sum router auxiliary losses from all live MoELayer instances.
+
+        Returns a zero-dimensional scalar tensor on the same device as the
+        router weights, or Python float 0.0 when there are no MoE layers.
+        The returned value can be added directly to the main loss so that
+        aux-loss gradients flow through the router gate weights.
+        """
+        import torch
+
+        total = None
+        for moe_layer in self._moe_layers:
+            layer_aux = getattr(moe_layer, "get_aux_loss", lambda: None)()
+            if layer_aux is None:
+                continue
+            if not isinstance(layer_aux, torch.Tensor):
+                continue
+            if total is None:
+                total = layer_aux
+            else:
+                total = total + layer_aux
+
+        if total is None:
+            return 0.0
+        return total
+
+    def log_utilization(self, step: int, moe_log_every: int = 100) -> None:
+        """Log per-expert token-count statistics at the requested cadence.
+
+        Args:
+            step: Current global training step.
+            moe_log_every: Emit utilisation logs every this many steps.
+        """
+        if step % moe_log_every != 0:
+            return
+
+        for i, moe_layer in enumerate(self._moe_layers):
+            router = getattr(moe_layer, "router", None)
+            if router is None:
+                continue
+            aux = getattr(router, "aux_loss", None)
+            if aux is None:
+                continue
+            try:
+                aux_val = float(aux.item()) if hasattr(aux, "item") else float(aux)
+            except Exception:
+                aux_val = float("nan")
+            logger.info(
+                "[MoE] step=%d layer=%d aux_loss=%.6f experts=%d topk=%d",
+                step, i, aux_val,
+                getattr(moe_layer, "num_experts", -1),
+                getattr(moe_layer, "topk", -1),
+            )
+
+
+def build_moe_adapter(
+    config: Any,
+    model: Any,
+    tiers: Any = None,
+) -> Optional["MoEAdapter"]:
+    """Build and apply a MoEAdapter if ``config.use_moe`` is True.
+
+    Gate flag
+    ---------
+    ``config.use_moe: bool`` — master on/off switch.  When False (default),
+    this function is a no-op and returns ``None`` so the rest of the engine
+    is completely unaffected.
+
+    On success, ``MoEAdapter.patch_model(model)`` is called immediately so
+    the caller receives a model already populated with MoE layers.
+
+    Args:
+        config: ``TrainingConfig`` (or any object with ``use_moe`` attr).
+        model:  The ``nn.Module`` to patch in-place.
+        tiers:  Optional list of ``TierSpec`` objects (from ``TierDiscovery``).
+                Used to apply tier-aware MoE placement (skip A6000 when
+                ``moe_on_all_tiers=False``).
+
+    Returns:
+        Populated :class:`MoEAdapter` instance, or ``None`` when MoE is
+        disabled or the import chain fails.
+    """
+    if not getattr(config, "use_moe", False):
+        return None
+
+    try:
+        adapter = MoEAdapter(config=config, tiers=tiers or [])
+        n_converted = adapter.patch_model(model)
+        if n_converted == 0:
+            logger.warning(
+                "build_moe_adapter: use_moe=True but no blocks were converted; "
+                "check model architecture and moe_layer_freq setting."
+            )
+        logger.info(
+            "build_moe_adapter: MoEAdapter active (%d MoE layers, "
+            "experts=%d, topk=%d, aux_coeff=%.4f)",
+            n_converted,
+            getattr(config, "num_moe_experts", 8),
+            getattr(config, "moe_router_topk", 2),
+            getattr(config, "moe_aux_loss_coeff", 0.01),
+        )
+        return adapter
+    except Exception as exc:
+        logger.warning(
+            "build_moe_adapter: failed (%s); MoE disabled for this run.", exc
         )
         return None
