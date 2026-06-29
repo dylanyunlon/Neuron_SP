@@ -1719,12 +1719,85 @@ class TransformerConfig(ModelParallelConfig):
                 f"got {self.desloc_default_tier!r}."
             )
 
+        # --- Feature-combination validation (M2309/M2354/M2368/M2444) ----
+        self._validate_overlap_combinations()
+
         # --- DES-LOC tier resolution (per-layer GPU assignment) -----------
         self._resolve_desloc_tiers()
 
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
+
+    def _validate_overlap_combinations(self) -> None:
+        """Validate that overlap feature combinations are supported.
+        From Megatron M2309/M2354/M2368/M2444: feature interaction bugs are
+        the #1 correctness hazard in distributed training config.
+        # From Megatron M2309/M2354/M2368/M2444: feature combination guard.
+        """
+        import warnings
+
+        # M2309: overlap_grad_reduce + delay_wgrad_compute requires TE >= 2.8
+        if (getattr(self, 'overlap_grad_reduce', False)
+                and getattr(self, 'delay_wgrad_compute', False)):
+            warnings.warn(
+                "overlap_grad_reduce=True with delay_wgrad_compute=True requires "
+                "TransformerEngine >= 2.8. Below that version this combination "
+                "silently produces wrong gradients. From Megatron M2309.",
+                UserWarning, stacklevel=4,
+            )
+
+        # M2444: moe_shared_expert_overlap requires shared experts to be configured
+        if (getattr(self, 'moe_shared_expert_overlap', False)
+                and getattr(self, 'moe_shared_expert_intermediate_size', None) is None):
+            raise ValueError(
+                "moe_shared_expert_overlap=True requires moe_shared_expert_intermediate_size "
+                "to be set. From Megatron M2444: overlap only applies when shared experts exist."
+            )
+
+        # M2444: these two overlap modes conflict
+        if (getattr(self, 'moe_shared_expert_overlap', False)
+                and getattr(self, 'overlap_moe_expert_parallel_comm', False)):
+            raise ValueError(
+                "moe_shared_expert_overlap and overlap_moe_expert_parallel_comm cannot "
+                "both be True. From Megatron M2444: conflicting execution order assumptions."
+            )
+
+    def validate_for_desloc_topology(self) -> None:
+        """Validate config for DES-LOC heterogeneous PCIe topology.
+        Call this after constructing TransformerConfig in your training script.
+        # From Megatron batch_aa analysis: PCIe topology invalidates NVLink assumptions.
+        """
+        import warnings
+        tp = getattr(self, 'tensor_model_parallel_size', 1)
+        ep = getattr(self, 'expert_model_parallel_size', 1)
+        dispatcher = getattr(self, 'moe_token_dispatcher_type', 'allgather')
+
+        if getattr(self, 'sequence_parallel', False) and tp > 1:
+            warnings.warn(
+                f"sequence_parallel=True with tensor_model_parallel_size={tp}: "
+                "requires high TP bandwidth. On PCIe topology (no NVLink) this "
+                "may bottleneck. Consider reducing TP degree or disabling SP.",
+                UserWarning, stacklevel=2,
+            )
+
+        if dispatcher == 'allgather' and ep > 1:
+            warnings.warn(
+                "moe_token_dispatcher_type='allgather' with expert_model_parallel_size>1 "
+                "broadcasts ALL tokens across EP ranks. On PCIe topology use 'alltoall' "
+                "dispatcher to reduce bandwidth. From Megatron batch_aa MoE analysis.",
+                UserWarning, stacklevel=2,
+            )
+
+        pp = getattr(self, 'pipeline_model_parallel_size', 1)
+        vpp = getattr(self, 'virtual_pipeline_model_parallel_size', None)
+        num_layers = getattr(self, 'num_layers', None)
+        if pp > 1 and vpp is not None and num_layers is not None:
+            assert num_layers % (pp * vpp) == 0, (
+                f"num_layers={num_layers} must be divisible by "
+                f"pipeline_model_parallel_size={pp} * virtual_pipeline_model_parallel_size={vpp}={pp*vpp}. "
+                "From Megatron M2350: VPP layer divisibility requirement."
+            )
 
     def _resolve_desloc_tiers(self) -> None:
         """Populate desloc_h100_layers / desloc_a6000_layers / desloc_tier_map.
