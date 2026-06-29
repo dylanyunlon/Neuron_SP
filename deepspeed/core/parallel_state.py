@@ -2401,3 +2401,90 @@ def dump_process_groups(rank: Optional[int] = None) -> str:
         lines.append(f"  {'TIER groups':<20}: [not initialized]")
     return "\n".join(lines)
     # From Megatron M2638: debug repr for process groups (DES-LOC adaptation)
+
+
+# ---------------------------------------------------------------------------
+# Safe rank / world-size accessors with SLURM fallback (M4022)
+# ---------------------------------------------------------------------------
+# From Megatron M4022 (Various training utils, PR #4872):
+# Megatron added safe_get_rank / safe_get_world_size that fall back to
+# SLURM environment variables when torch.distributed is not yet initialized.
+# This is important for our heterogeneous SLURM cluster where some logging /
+# checkpointing code may run before dist.init_process_group().
+
+def _resolve_slurm_rank() -> Optional[int]:
+    """Return global rank from SLURM env, or None if not in a SLURM job."""
+    if "SLURM_NTASKS" not in os.environ:
+        return None
+    procid = os.environ.get("SLURM_PROCID")
+    return int(procid) if procid is not None else None
+
+
+def _resolve_slurm_world_size() -> Optional[int]:
+    """Return world size from SLURM env, or None if not in a SLURM job."""
+    ntasks = os.environ.get("SLURM_NTASKS")
+    return int(ntasks) if ntasks is not None else None
+
+
+def safe_get_rank() -> int:
+    """Get distributed rank safely, even before torch.distributed is initialized.
+
+    Fallback order:
+    1. torch.distributed.get_rank()  — if initialized
+    2. RANK env var                  — torchrun / torchelastic
+    3. SLURM_PROCID env var          — SLURM launcher
+    4. 0 with a warning              — single-process / unknown
+
+    From Megatron M4022 (PR #4872).
+    """
+    if torch.distributed.is_initialized():
+        return torch.distributed.get_rank()
+
+    if "RANK" in os.environ:
+        try:
+            return int(os.environ["RANK"])
+        except (ValueError, TypeError):
+            pass
+
+    slurm_rank = _resolve_slurm_rank()
+    if slurm_rank is not None:
+        return slurm_rank
+
+    warnings.warn(
+        "safe_get_rank: could not determine rank from torch.distributed, "
+        "RANK, or SLURM_PROCID — defaulting to 0.",
+        stacklevel=2,
+    )
+    return 0
+
+
+def safe_get_world_size() -> int:
+    """Get distributed world size safely, even before torch.distributed is initialized.
+
+    Fallback order:
+    1. torch.distributed.get_world_size()  — if initialized
+    2. WORLD_SIZE env var                  — torchrun / torchelastic
+    3. SLURM_NTASKS env var               — SLURM launcher
+    4. 1 with a warning                    — single-process / unknown
+
+    From Megatron M4022 (PR #4872).
+    """
+    if torch.distributed.is_initialized():
+        return torch.distributed.get_world_size()
+
+    if "WORLD_SIZE" in os.environ:
+        try:
+            return int(os.environ["WORLD_SIZE"])
+        except (ValueError, TypeError):
+            pass
+
+    slurm_ws = _resolve_slurm_world_size()
+    if slurm_ws is not None:
+        return slurm_ws
+
+    warnings.warn(
+        "safe_get_world_size: could not determine world size from torch.distributed, "
+        "WORLD_SIZE, or SLURM_NTASKS — defaulting to 1.",
+        stacklevel=2,
+    )
+    return 1

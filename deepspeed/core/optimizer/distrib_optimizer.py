@@ -2093,8 +2093,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             dp_rank = param_and_grad_buffer.data_parallel_group.rank()
             dp_world = param_and_grad_buffer.data_parallel_group.size()
         else:
-            dp_rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-            dp_world = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+            # From Megatron M4022: use safe_get_rank/safe_get_world_size which
+            # also fall back to SLURM env vars before defaulting to 0/1.
+            dp_rank = parallel_state.safe_get_rank()
+            dp_world = parallel_state.safe_get_world_size()
 
         gbuf_size = param_and_grad_buffer.grad_data.numel()
         # Equal-slice shard boundaries (het-sizing not applicable here since
