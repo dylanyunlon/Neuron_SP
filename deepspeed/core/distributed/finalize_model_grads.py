@@ -61,6 +61,7 @@ import deepspeed.core.parallel_state as parallel_state
 from deepspeed.core.model_parallel_config import ModelParallelConfig
 from deepspeed.core.desloc_config import DesLocConfig
 from deepspeed.core.distributed.distributed_data_parallel import DistributedDataParallel
+from deepspeed.core.optimizer.distrib_optimizer import get_effective_grad
 
 logger = logging.getLogger(__name__)
 
@@ -199,7 +200,8 @@ def _allreduce_conditional_embedding_grads(
     for model_chunk in model:
         for name, param in _named_parameters(model_chunk):
             if param.requires_grad and getattr(param, 'pipeline_parallel', False):
-                grad = param.main_grad
+                # DES-LOC M4145 followup: unified grad access via get_effective_grad.
+                grad = get_effective_grad(param)
                 if name in grads_dict:
                     grads_dict[name][0].add_(grad)
                     grads_dict[name].append(grad)
@@ -423,7 +425,8 @@ def _allreduce_router_grads(
     for model_chunk in model:
         for name, param in _named_parameters(model_chunk):
             if param.requires_grad and getattr(param, 'flextron_router_pp_sync', False):
-                grad = param.main_grad
+                # DES-LOC M4145 followup: unified grad access via get_effective_grad.
+                grad = get_effective_grad(param)
                 if name in grads_dict:
                     grads_dict[name][0].add_(grad)
                     grads_dict[name].append(grad)

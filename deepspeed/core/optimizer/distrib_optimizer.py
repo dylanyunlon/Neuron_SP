@@ -208,6 +208,61 @@ _GLOBAL_PARAM_REGISTRY: ParamRegistry = ParamRegistry()
 # ---------------------------------------------------------------------------
 
 
+def get_effective_grad(
+    param: torch.nn.Parameter,
+    use_decoupled_grad: bool = False,
+) -> Optional[torch.Tensor]:
+    """统一梯度访问接口。优先级: main_grad > decoupled_grad/grad > None。
+
+    对 FSDP 参数（__fsdp_param__=True）自动 unwrap DTensor local shard。
+
+    Priority order (first non-None wins):
+      1. param.main_grad       — Megatron BF16 bucket path
+      2. param.decoupled_grad  — FSDP DTensor path (only when use_decoupled_grad=True)
+      3. param.grad            — standard PyTorch
+
+    For FSDP-marked params (``__fsdp_param__ == True``) the chosen tensor is
+    further unwrapped via ``._local_tensor`` when that attribute exists.
+
+    # From Megatron M4145: fix zero counter with decoupled grads.
+    # DES-LOC extension: handles all gradient storage formats uniformly.
+    """
+    is_fsdp = getattr(param, "__fsdp_param__", False)
+
+    grad: Optional[torch.Tensor] = None
+    attr_name: str = "none"
+
+    # Priority 1: main_grad
+    _main_grad = getattr(param, "main_grad", None)
+    if _main_grad is not None:
+        grad = _main_grad
+        attr_name = "main_grad"
+    else:
+        # Priority 2: decoupled_grad (only when requested)
+        if use_decoupled_grad:
+            _decoupled_grad = getattr(param, "decoupled_grad", None)
+            if _decoupled_grad is not None:
+                grad = _decoupled_grad
+                attr_name = "decoupled_grad"
+
+        # Priority 3: standard .grad
+        if grad is None:
+            grad = param.grad
+            if grad is not None:
+                attr_name = "grad"
+
+    # FSDP unwrap: extract local shard from DTensor
+    if grad is not None and is_fsdp:
+        if hasattr(grad, "_local_tensor"):
+            print(
+                f"[get_effective_grad] FSDP param {id(param)}: "
+                f"using {attr_name}._local_tensor, shape={grad.shape}"
+            )
+            grad = grad._local_tensor
+
+    return grad
+
+
 # From Megatron M2813: prefer param.main_param over param.data.float() for norm.
 # In bf16 training avoids extra fp32 temp — critical on A6000 48GB VRAM.
 def clip_grad_norm(
@@ -241,16 +296,8 @@ def clip_grad_norm(
     for p in parameters:
         if not isinstance(p, torch.Tensor):
             continue
-        # M4145: choose grad attribute based on use_decoupled_grad flag.
-        grad_attr = "decoupled_grad" if use_decoupled_grad else "grad"
-        grad = getattr(p, "main_grad", None)
-        if grad is None:
-            grad = getattr(p, grad_attr, None)
-        # M4145: for FSDP params, the gradient is a sharded DTensor;
-        # use the local shard for norm computation.
-        if grad is not None and getattr(p, "__fsdp_param__", False):
-            if hasattr(grad, '_local_tensor'):
-                grad = grad._local_tensor
+        # DES-LOC M4145 followup: unified grad access via get_effective_grad.
+        grad = get_effective_grad(p, use_decoupled_grad=use_decoupled_grad)
         if grad is not None:
             grads.append(grad.detach())
 
@@ -509,7 +556,8 @@ class MegatronOptimizer(ABC):
         for param in params:
             if param_filter is not None and not param_filter(param):
                 continue
-            grad = getattr(param, 'main_grad', param.grad)
+            # DES-LOC M4145 followup: unified grad access via get_effective_grad.
+            grad = get_effective_grad(param)
             if grad is None:
                 continue
             # M4171 followup: prefer registry for shared flag; fall back to
