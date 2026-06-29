@@ -2562,6 +2562,13 @@ class DesLocEngine:
                         _act_key = f"fwd_act:iter={iteration}"
                         _engine_cache.put(_act_key, loss.detach())
                         if not forward_only:
+                            # --- MoE auxiliary loss (MIMO path) ---
+                            if self.moe_adapter is not None:
+                                _aux = self.moe_adapter.collect_aux_loss()
+                                if not isinstance(_aux, float):
+                                    scaled_loss = scaled_loss + _aux / max(_num_mb, 1)
+                                elif _aux != 0.0:
+                                    scaled_loss = scaled_loss + _aux / max(_num_mb, 1)
                             scaled_loss.backward()
                         return [loss]
 
@@ -2600,6 +2607,18 @@ class DesLocEngine:
                         loss, scaled_loss = self.forward(
                             input_ids, labels, num_microbatches=num_microbatches,
                         )
+                        # --- MoE auxiliary loss (router load balancing) ---
+                        # Collect and add aux loss BEFORE backward so that
+                        # router gate gradients flow through the combined loss.
+                        # When moe_adapter is None this is a cheap float-0.0 no-op.
+                        if self.moe_adapter is not None:
+                            _aux = self.moe_adapter.collect_aux_loss()
+                            if isinstance(_aux, float):
+                                scaled_loss = scaled_loss + _aux / num_microbatches
+                            else:
+                                # Tensor: divide by num_microbatches to match
+                                # the main-loss scale convention.
+                                scaled_loss = scaled_loss + _aux / max(num_microbatches, 1)
                         scaled_loss.backward()
                         # --- HeteroFP32GradAccumManager: accumulate (standard path) ---
                         # Promote BF16 param.grad into FP32 main_grad accumulators
@@ -2801,6 +2820,14 @@ class DesLocEngine:
 
                 loss_accum = 0.0
                 t0 = time.time()
+
+                # --- MoE expert utilisation logging ---
+                # Gated by moe_log_every; no-op when MoE is disabled.
+                if self.moe_adapter is not None:
+                    self.moe_adapter.log_utilization(
+                        step=self.global_step,
+                        moe_log_every=getattr(cfg, "moe_log_every", 100),
+                    )
 
             # Checkpointing
             if self.global_step % cfg.save_every == 0:
