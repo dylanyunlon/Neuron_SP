@@ -148,3 +148,97 @@ sole optimizer in the chain).
 and significantly extended with DES-LOC heterogeneous-hardware logic in
 `hetero_grad_norm_skip.py`.  The `clip_grads.py` whitespace-only changes
 from upstream are intentionally not ported.
+
+---
+
+## M3781 — Make param_index_map always use unpacked (full numel) offsets
+**Upstream commit:** `f34be599` (Megatron PR #4328, internal ref `3315c86bc`)
+**Audit date:** 2026-06-29
+**Status:** ✅ SKIP — fully ported; Neuron_SP adopted the post-fix naming contract before the NVFP4 work landed
+
+### What the upstream bug was
+
+Before this fix, Megatron's `_ParamAndGradBuffer` maintained **two** separate
+index maps for NVFP4 buffers:
+
+| Map | Offsets | Used for |
+|---|---|---|
+| `param_index_map` | **packed** (numel // 2 for NVFP4 params) | param buffer (`param_data`) |
+| `nvfp4_unpacked_param_index_map` | **full numel** | grad buffer (`grad_data`) and optimizer state |
+
+The distributed optimizer called `param_and_grad_buffer.get_unpacked_index_map()`
+to retrieve full-numel offsets for shard boundary computation.  Any caller
+that read `param_index_map` directly would get packed offsets and
+miscalculate which rank owns which slice of the optimizer state — a silent
+2× offset error for NVFP4 params.
+
+The fix **inverts the naming contract**:
+
+- `param_index_map` → always stores **full numel (unpacked)** offsets. Grad
+  buffer and optimizer state use it directly.
+- `nvfp4_packed_param_index_map` → new secondary map with **packed** offsets,
+  used only to remap `param.data` into the packed param buffer.
+- `get_unpacked_index_map()` method → **deleted**.
+- `bucket.offset` → now derived from `start_index` (unpacked), not
+  `grad_start_index`.
+
+Two files were changed upstream: `param_and_grad_buffer.py` (~200 lines of
+index-map restructure) and `distrib_optimizer.py` (remove the
+`get_unpacked_index_map()` call, add clarifying comment).
+
+### What Neuron_SP has
+
+Our `deepspeed/core/distributed/param_and_grad_buffer.py` was written
+**already following the post-fix naming contract**:
+
+| Symbol | Our code | Semantics |
+|---|---|---|
+| `param_index_map` | `self.param_index_map` | **full numel** — used for grad buffer and optimizer state |
+| `nvfp4_packed_param_index_map` | `self.nvfp4_packed_param_index_map` | **packed** — used only in `_remap_param_data` and `_new_bucket` |
+| `get_unpacked_index_map()` | **absent** | never existed; `param_index_map` is always unpacked |
+| `bucket.offset` | `offset=start_index` | unpacked full-numel start index |
+
+The file-level evolution comment confirms this:
+
+```
+M3781 (3315c86bc): param_index_map always uses unpacked (full numel) offsets.
+```
+
+Every consumer in `distrib_optimizer.py` reads `buf.param_index_map` directly
+(lines 1117, 1154, 1432, 1608, 2291, 3000, 3454, 3560, 3725, 3778, 3854)
+with no `get_unpacked_index_map()` indirection — matching post-fix Megatron.
+
+The main_grad assignment path (`param_and_grad_buffer.py:~1401`):
+
+```python
+# Always assign main_grad from grad buffer (full-numel offsets).
+param.main_grad = self._get(
+    param.data.shape, param_start_index, BufferType.GRAD
+)
+```
+
+`param_start_index` comes from `self.param_index_map[param]` — full numel,
+exactly matching upstream post-fix behaviour.
+
+### Why packed offsets cannot leak into param_index_map in our code
+
+`_compute_nvfp4_packed_layout()` is a **separate second pass** that runs
+after `param_index_map` is populated, building `nvfp4_packed_param_index_map`
+independently.  There is no shared loop or branch that could write packed
+offsets into `param_index_map`.
+
+### Conditions that would reopen this task
+
+- A future refactor merges the two construction passes into one loop and
+  re-introduces a per-param branch writing packed offsets into
+  `param_index_map`.
+- A new caller reads `param_index_map` and indexes into the **packed param
+  buffer** directly (currently only `_remap_param_data` and `_new_bucket`
+  touch the packed buffer, and both correctly use
+  `nvfp4_packed_param_index_map`).
+
+### Verdict
+
+**No code change required.** Neuron_SP adopted the post-fix naming convention
+from the start; the bug never existed in our codebase. `param_index_map` is
+and has always been full-numel (unpacked).
