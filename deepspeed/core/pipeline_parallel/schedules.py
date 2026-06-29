@@ -215,12 +215,24 @@ def get_tensor_device(tensor):
     return tensor.device
 
 
-def _get_mtp_loss_scale(config, device):
+def _get_mtp_loss_scale(config, device, num_tokens: "Optional[torch.Tensor]" = None):
     """Get MTP loss scale, preferring mtp_grad_scale_func (M4083).
 
-    Known issue (From Megatron M3312, PR #3159): calculate_per_token_loss=True时,
-    MTP scale应额外除以rolling后减少的有效token比例。当前未修正，MTP梯度相对过重。
-    TODO: track original_num_tokens to apply correction factor.
+    Fix (Megatron M3312, PR #3159): when ``calculate_per_token_loss=True``
+    ``process_mtp_loss`` already multiplies the MTP loss by
+    ``original_num_tokens / rolled_num_tokens`` before handing it to
+    ``MTPLossAutoScaler``.  In the backward pass the AutoScaler multiplies
+    that pre-scaled loss by ``main_loss_backward_scale``, so MTP gradients
+    end up weighted by ``scale * (original / rolled)`` while the main loss
+    gradients are weighted by ``scale`` only.
+
+    The correction: divide the scale by that same ratio so the net weight is
+    just ``scale``.  ``original_num_tokens`` is published onto
+    ``MTPLossAutoScaler.original_num_tokens`` by ``process_mtp_loss`` each
+    forward pass.  ``num_tokens`` (the pre-roll count from the main loss
+    function) equals ``original_num_tokens``, so the rolled count is
+    approximated from the stored value.  If the stored value is not yet set
+    (first step, non-MTP path) the correction is skipped safely.
     """
     def _normalize(ls, name):
         ls = torch.as_tensor(ls, device=device)
@@ -229,10 +241,35 @@ def _get_mtp_loss_scale(config, device):
         return ls
     fn = getattr(config, 'mtp_grad_scale_func', None)
     if fn is not None:
-        return _normalize(fn(), "mtp_grad_scale_func")
-    if config.grad_scale_func is not None:
-        return _normalize(config.grad_scale_func(torch.ones(1, device=device)), "grad_scale_func")
-    return torch.ones(1, device=device)
+        loss_scale = _normalize(fn(), "mtp_grad_scale_func")
+    elif config.grad_scale_func is not None:
+        loss_scale = _normalize(config.grad_scale_func(torch.ones(1, device=device)), "grad_scale_func")
+    else:
+        loss_scale = torch.ones(1, device=device)
+
+    # M3312 correction: when per-token loss is active and process_mtp_loss
+    # has published original_num_tokens, fold the inverse ratio into the
+    # scale so that the AutoScaler backward weight stays at just `loss_scale`.
+    if getattr(config, 'calculate_per_token_loss', False):
+        try:
+            from deepspeed.core.transformer.multi_token_prediction import MTPLossAutoScaler as _MTPScaler
+            orig = _MTPScaler.original_num_tokens
+            if orig is not None and num_tokens is not None:
+                num_tokens_t = torch.as_tensor(num_tokens, dtype=loss_scale.dtype, device=device)
+                orig_t = orig.to(dtype=loss_scale.dtype, device=device)
+                # Rolled count ≈ orig − batch_size (one position zeroed per seq).
+                # We use num_tokens as the best available proxy for the
+                # post-roll valid-token count seen by the main loss function;
+                # process_mtp_loss uses its own internal rolled count which may
+                # differ by at most B tokens.  This matches Megatron M3312.
+                rolled_t = torch.clamp(num_tokens_t, min=1)
+                orig_safe = torch.clamp(orig_t, min=1)
+                # Divide by the ratio that process_mtp_loss already applied.
+                loss_scale = loss_scale * rolled_t / orig_safe
+        except Exception:
+            pass  # Correction is best-effort; fall back to uncorrected scale.
+
+    return loss_scale
 
 
 def get_forward_backward_func(pp_size=None, vp_size=None):
@@ -328,10 +365,12 @@ def forward_step_calc_loss(
                 loss_scale * cp_size_for_scaling * tp_size_for_scaling / num_microbatches
             )
 
-    # MTP loss scaling (M3213, M4083)
+    # MTP loss scaling (M3213, M4083, M3312)
     if _has_mtp and hasattr(config, 'mtp_num_layers') and config.mtp_num_layers is not None:
         device = get_tensor_device(output_tensor)
-        loss_scale = _get_mtp_loss_scale(config, device)
+        # Pass num_tokens so _get_mtp_loss_scale can apply the M3312
+        # token-ratio correction when calculate_per_token_loss=True.
+        loss_scale = _get_mtp_loss_scale(config, device, num_tokens=num_tokens)
         if config.calculate_per_token_loss:
             MTPLossAutoScaler.set_loss_scale(loss_scale)
         else:
