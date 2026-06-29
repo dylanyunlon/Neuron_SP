@@ -2742,6 +2742,18 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         not mapped to model params.  In Neuron_SP we write directly to the
         model param tensors via ``_copy_main_params_to_model_params``, so
         this method is a no-op (retained for API parity).
+
+        From Megatron M3116: IMPORTANT — any future caller of this method
+        must guard the call with a check that forward_pre_hook is registered:
+          forward_pre_hook_enabled = (
+              hasattr(model, 'remove_forward_pre_hook_handles') and
+              len(model.remove_forward_pre_hook_handles) > 0
+          )
+          if forward_pre_hook_enabled:
+              self._copy_main_params_to_param_buffer()
+        Without this guard, calling on the first iteration (before the hook
+        is registered) will pollute main_grads with main_params values since
+        finish_param_sync() hasn't been called yet to zero the grad buffer.
         """
         # No-op: MXFP8 path not in scope.
         pass

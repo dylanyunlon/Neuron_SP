@@ -163,6 +163,13 @@ class DistributedDataParallelConfig:
     # DES-LOC: allow skipping grad sync on non-Kx steps.
     allow_skip_grad_sync: bool = True
 
+    # From Megatron M3194: when True, offload_grad_buffers() is suppressed.
+    # CUDA graphs capture tensor storage addresses at graph-capture time; freeing
+    # grad buffer storage (offload) invalidates those addresses and causes silent
+    # corruption or crashes on graph replay. Set to True whenever RL training
+    # cudagraphs are active to prevent this.
+    training_cuda_graphs_enabled: bool = False
+
 
 # ---------------------------------------------------------------------------
 # DistributedDataParallel
@@ -798,10 +805,22 @@ class DistributedDataParallel(nn.Module):
         All bucket.grad_data and param.main_grad views remain live (but
         accessing them during offload is undefined behavior).
 
+        From Megatron M3194: when training_cuda_graphs_enabled=True, this
+        method is a no-op with a warning. CUDA graphs capture storage addresses
+        at graph-capture time; freeing and reallocating grad buffers would
+        invalidate those addresses, causing silent corruption on replay.
+
         Args:
             synchronize: Call torch.cuda.synchronize() before freeing.
             empty_cache: Call torch.cuda.empty_cache() after freeing.
         """
+        # From Megatron M3194: do not offload when training cudagraphs are active
+        if getattr(self.config, 'training_cuda_graphs_enabled', False):
+            logging.warning(
+                "offload_grad_buffers() called but training_cuda_graphs_enabled=True — "
+                "skipping offload to prevent CUDA graph address invalidation (M3194)."
+            )
+            return
         if synchronize:
             torch.cuda.synchronize()
         for buf in self.buffers + self.expert_parallel_buffers:

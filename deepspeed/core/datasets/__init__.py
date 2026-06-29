@@ -72,6 +72,12 @@ class GPTDatasetConfig:
     eod_token_id: int = 0
     pad_token_id: int = 0
 
+    # From Megatron M3031: CP size needed for sequence packing padding alignment.
+    # When set, packed sequences must be padded to a multiple of this value so that
+    # context-parallel ring-attention can split the sequence evenly across CP ranks.
+    # Without this, unequal CP splits cause the ring-attention all-to-all to hang.
+    context_parallel_size: Optional[int] = None
+
 
 # ---------------------------------------------------------------------------
 # Internal helpers

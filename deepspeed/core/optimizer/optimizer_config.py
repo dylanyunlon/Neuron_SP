@@ -61,6 +61,12 @@ class OptimizerConfig:
     # Regularisation
     weight_decay: float = 0.01
 
+    # From Megatron M3042: when True, q_layernorm/k_layernorm params ARE subject to weight
+    # decay even though they are 1-D (standard rule would exempt them as bias-like params).
+    # Required for Qwen3-Next / models that have explicit QK LayerNorm and want WD on them
+    # for training stability. When False (default), all 1-D params and .bias are WD-exempt.
+    apply_wd_to_qk_layernorm: bool = False
+
     # From Megatron M2356: Add setting to support using either Adam or AdamW.
     # If True (default), weight decay is decoupled from the gradient update (AdamW behavior).
     # If False, original Adam update rule is used (weight decay applied via L2 gradient).
