@@ -311,6 +311,7 @@ class OptimizerConfig:
     h100_bf16_tflops: float = 989.0
     a6000_bf16_tflops: float = 309.7
     blackwell_bf16_tflops: float = 300.0  # RTX PRO 6000 Blackwell (estimated)
+    consumer_bf16_tflops: float = 82.6   # RTX 4090 BF16 TFLOPS (dense)
 
     # VRAM-aware shard sizing (preferred over pure TFLOPS when enabled).
     # When ``shard_by_available_vram`` is True, _compute_hetero_shard_boundaries
@@ -321,6 +322,7 @@ class OptimizerConfig:
     h100_total_vram_gb: float = 96.0
     a6000_total_vram_gb: float = 49.0
     blackwell_total_vram_gb: float = 98.0
+    consumer_total_vram_gb: float = 24.0  # RTX 4090 / 3090 (24 GB class)
     activation_reserve_gb: float = 4.0   # per-GPU reserved for activation peaks
 
     # -----------------------------------------------------------------------

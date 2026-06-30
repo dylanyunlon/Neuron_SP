@@ -938,7 +938,9 @@ def _compute_hetero_shard_boundaries(
                 return getattr(config, 'h100_total_vram_gb', 96.0)
             elif tier == TierType.BLACKWELL:
                 return getattr(config, 'blackwell_total_vram_gb', 98.0)
-            else:
+            elif tier == TierType.CONSUMER:
+                return getattr(config, 'consumer_total_vram_gb', 24.0)
+            else:  # PROFESSIONAL (A6000) or unknown
                 return getattr(config, 'a6000_total_vram_gb', 49.0)
 
         rank_available = []
@@ -956,7 +958,9 @@ def _compute_hetero_shard_boundaries(
                 return h100_tflops
             elif tier == TierType.BLACKWELL:
                 return getattr(config, 'blackwell_bf16_tflops', 300.0)
-            else:
+            elif tier == TierType.CONSUMER:
+                return getattr(config, 'consumer_bf16_tflops', 82.6)
+            else:  # PROFESSIONAL (A6000) or unknown
                 return a6000_tflops
         rank_weights = [_tier_tflops(t) for t in tier_assignments]
         total_weight = sum(rank_weights)
