@@ -1909,6 +1909,20 @@ class DesLocEngine:
         _ckpt_master_on = bool(config.activation_checkpointing)
         _ckpt_granularity = str(config.checkpoint_activations_granularity).lower()
 
+        # --- A6000 safety guard (PipeDream-style per-stage recompute override) ---
+        # PipeDream runtime.py disables recompute on the last stage to save compute;
+        # we do the inverse: force it ON for memory-constrained stages (A6000, 48 GB)
+        # even when the caller has not set the flag.  Mirrors HetSeq controller.py
+        # line 282 OOM recovery — pre-emptive rather than crash-and-retry.
+        _has_a6000_tier = any(spec.tier == TierClass.A6000 for spec in self.tiers)
+        if _has_a6000_tier and not _ckpt_master_on:
+            logger.warning(
+                "[ActCkpt] A6000 tier detected with activation_checkpointing=False. "
+                "Forcing ON to prevent OOM at seq_len>=4096 (48 GB VRAM). "
+                "Set activation_checkpointing=True explicitly to suppress this warning."
+            )
+            _ckpt_master_on = True
+
         _local_rank = (
             parallel_state.get_data_parallel_rank()
             if parallel_state.is_initialized()
