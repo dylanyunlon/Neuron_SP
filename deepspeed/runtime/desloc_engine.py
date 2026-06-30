@@ -1136,6 +1136,10 @@ class DesLocEngine:
                 "[zero3] Optimizer on param_shard: %d FP32 elements on %s",
                 _shard.numel(), _shard.device,
             )
+            # BF16 model must be on GPU for torch.compile (AutoSP) to trace.
+            # ZeRO-3 FP32 master shard is separate; this just places the
+            # forward/backward compute graph on the correct device.
+            self.model = self.model.to(_local_device)
         else:
             self.model = self.model.to(_local_device)
             self.optimizer = AdamW(
