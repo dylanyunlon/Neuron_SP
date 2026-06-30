@@ -1068,14 +1068,23 @@ def build_neuron_sp_config(
     h100_index: int = 2,
     recompute_threshold_gb: float = 0.5,
     loc_max_cpu_gb: float = 32.0,
+    a6000_granularity: str = "full",
 ) -> HeteroRecomputeConfig:
     """
     Construct a :class:`HeteroRecomputeConfig` for the Neuron_SP target cluster:
     2× A6000-48GB (SM86) + 1× H100-NVL-96GB (SM90).
 
-    A6000 nodes have constrained HBM (48 GB each); they benefit from
-    recomputing norm_out.  The H100 has 96 GB HBM and is configured conservatively
-    (no norm_out recompute by default).
+    A6000 nodes have constrained HBM (48 GB each).  When *a6000_granularity* is
+    ``"full"`` (default), :meth:`HeteroRecomputeConfig.should_recompute_norm_out`
+    returns ``False`` for A6000 devices because the outer
+    ``torch.utils.checkpoint`` block (applied per-layer in DesLocEngine.__init__)
+    already recomputes the entire forward, making the finer-grained
+    ``CheckpointWithoutOutput`` path redundant.  The H100 has 96 GB HBM and is
+    configured conservatively (no norm_out recompute — enough headroom exists).
+
+    Megatron M4141 (ff5264c33): selective norm_out recompute is only profitable
+    when VRAM headroom exists to store surrounding activations.  A6000 has no
+    such headroom at seq_len=4096, so full granularity is the correct default.
 
     Parameters
     ----------
@@ -1088,6 +1097,11 @@ def build_neuron_sp_config(
         than recomputed on the GPU.
     loc_max_cpu_gb : float
         Maximum LOC budget in GiB.
+    a6000_granularity : str
+        Recompute granularity for A6000 devices: ``"full"`` (default, every
+        layer recomputed by outer torch.utils.checkpoint) or ``"selective"``
+        (norm_out only via CheckpointWithoutOutput).  Use ``"selective"`` only
+        when seq_len ≤ 2048 and VRAM budget is confirmed sufficient.
 
     Returns
     -------
@@ -1106,7 +1120,7 @@ def build_neuron_sp_config(
         prefetch_depth=2,
     )
     return HeteroRecomputeConfig(
-        granularity="selective",
+        granularity=a6000_granularity,
         modules_per_device={
             DeviceClass.A6000: {"gdn_norm_out"},
             DeviceClass.H100_NVL: set(),

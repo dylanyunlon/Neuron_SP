@@ -1864,10 +1864,31 @@ class DesLocEngine:
             self.load_checkpoint(config.resume_from)
 
         # --- Phase 7: Neuron_SP heterogeneous recompute config ---
-        self.neuron_sp_config: HeteroRecomputeConfig = build_neuron_sp_config()
+        # Build device-class lists from the discovered tier specs so that
+        # build_neuron_sp_config() receives the real device indices rather than
+        # relying on the hardcoded (0,1) / 2 defaults.
+        _a6000_indices = [
+            spec.device_index for spec in self.tiers if spec.tier == TierClass.A6000
+        ]
+        _h100_indices = [
+            spec.device_index for spec in self.tiers if spec.tier == TierClass.H100
+        ]
+        _h100_idx = _h100_indices[0] if _h100_indices else 2
+        # A6000 (48 GB): use "full" recompute granularity inside GDN layers so
+        # the outer torch.utils.checkpoint block absorbs the entire layer forward.
+        # H100 (96 GB): keep "selective" — norm_out-only recompute costs less.
+        # This aligns with Megatron M4141 (ff5264c33): selective norm_out recompute
+        # is only profitable when VRAM headroom exists to store other activations.
+        _a6000_granularity = "full" if _a6000_indices else "selective"
+        self.neuron_sp_config: HeteroRecomputeConfig = build_neuron_sp_config(
+            a6000_indices=tuple(_a6000_indices) if _a6000_indices else (0, 1),
+            h100_index=_h100_idx,
+            a6000_granularity=_a6000_granularity,
+        )
         logger.info(
-            "Neuron_SP recompute config built (granularity=%s, attention=%s).",
+            "Neuron_SP recompute config built (granularity=%s, a6000_gran=%s, attention=%s).",
             self.neuron_sp_config.granularity,
+            _a6000_granularity,
             self.neuron_sp_config.attention_variant,
         )
 
@@ -2462,7 +2483,13 @@ class DesLocEngine:
         # The per-layer torch.utils.checkpoint wrapping is applied in __init__,
         # but we keep the live config attached to the model for downstream
         # modules (e.g. HeteroGDNNormOutRecompute) that query it at runtime.
-        recompute_config = build_neuron_sp_config()
+        _rc_a6000_idx = [s.device_index for s in self.tiers if s.tier == TierClass.A6000]
+        _rc_h100_idx  = [s.device_index for s in self.tiers if s.tier == TierClass.H100]
+        recompute_config = build_neuron_sp_config(
+            a6000_indices=tuple(_rc_a6000_idx) if _rc_a6000_idx else (0, 1),
+            h100_index=_rc_h100_idx[0] if _rc_h100_idx else 2,
+            a6000_granularity="full" if _rc_a6000_idx else "selective",
+        )
         self.neuron_sp_config = recompute_config
         try:
             self.model.neuron_sp_recompute_config = recompute_config  # type: ignore[attr-defined]
