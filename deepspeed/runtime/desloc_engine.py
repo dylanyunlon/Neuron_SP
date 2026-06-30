@@ -130,10 +130,10 @@ from deepspeed.runtime.desloc_config import (  # noqa: E402
     PartitionStrategy,
     TierClass,
     TierSpec,
-    MicrobatchAllocation,
     PartitionPlan,
     TrainingConfig,
 )
+from deepspeed.runtime.hetero_step_batch_scheduler import MicrobatchAllocation  # noqa: E402
 
 class HeteroRegistry:
     """
