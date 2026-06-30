@@ -1094,6 +1094,58 @@ def run_desloc(args: argparse.Namespace) -> None:
         tensorboard_dir = getattr(args, "tensorboard_desloc_dir", None),
     )
 
+    # ── Merge YAML desloc config into TrainingConfig ──
+    # Keys from configs/7b_5gpu.yaml → desloc: section are set as attributes
+    # on TrainingConfig so that DesLocEngine can read them via getattr().
+    _yaml_cfg = getattr(args, "yaml_cfg", {})
+    _desloc_yaml = _yaml_cfg.get("desloc", {})
+    _yaml_remap = {
+        "Kx": "desloc_Kx",
+        "Ku": "desloc_Ku",
+        "Kv": "desloc_Kv",
+        "zero_stage": "zero_stage",
+        "loc_cache_numa0_gb": "loc_cache_numa0_gb",
+        "loc_cache_numa1_gb": "loc_cache_numa1_gb",
+        "shard_by_available_vram": "shard_by_available_vram",
+        "activation_reserve_gb": "activation_reserve_gb",
+    }
+    for yaml_key, attr_name in _yaml_remap.items():
+        if yaml_key in _desloc_yaml:
+            setattr(tc, attr_name, _desloc_yaml[yaml_key])
+    # Parallelism section
+    _par_yaml = _yaml_cfg.get("parallelism", {})
+    if "pipeline_parallel" in _par_yaml:
+        tc.pipeline_parallel_size = _par_yaml["pipeline_parallel"]
+    if "tensor_parallel" in _par_yaml:
+        setattr(tc, "tensor_parallel_size", _par_yaml["tensor_parallel"])
+    _pp_split = _par_yaml.get("pp_layer_split") or _desloc_yaml.get("pp_layer_split")
+    if _pp_split:
+        tc.pipeline_layer_split = _pp_split
+    # Training section overrides
+    _train_yaml = _yaml_cfg.get("training", {})
+    if "micro_batch_size_per_gpu" in _train_yaml:
+        tc.micro_batch_size_per_gpu = _train_yaml["micro_batch_size_per_gpu"]
+    if "global_batch_size" in _train_yaml:
+        tc.global_batch_size = _train_yaml["global_batch_size"]
+    if "grad_accum_steps" in _train_yaml:
+        tc.grad_accum_steps = _train_yaml["grad_accum_steps"]
+    if "activation_checkpointing" in _train_yaml:
+        tc.activation_checkpointing = _train_yaml["activation_checkpointing"]
+    if "checkpoint_activations_granularity" in _train_yaml:
+        tc.checkpoint_activations_granularity = _train_yaml["checkpoint_activations_granularity"]
+    # Stage overrides (Blackwell Kx/Ku/Kv)
+    if "stage_overrides" in _desloc_yaml:
+        setattr(tc, "desloc_stage_overrides", _desloc_yaml["stage_overrides"])
+    logger.info(
+        "YAML→TrainingConfig merged: Kx=%s Ku=%s Kv=%s PP=%s zero=%s mbs_per_gpu=%s",
+        getattr(tc, 'desloc_Kx', 'default'),
+        getattr(tc, 'desloc_Ku', 'default'),
+        getattr(tc, 'desloc_Kv', 'default'),
+        getattr(tc, 'pipeline_parallel_size', 1),
+        getattr(tc, 'zero_stage', 'default'),
+        getattr(tc, 'micro_batch_size_per_gpu', 'default'),
+    )
+
     # Build the LlamaModel and pass it in (DesLocEngine wraps it)
     # Model stays on CPU here — DesLocEngine/FSDP handles device placement.
     # Moving to GPU first then FSDP flatten causes OOM on A6000 (47GB).
