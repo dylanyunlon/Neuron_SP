@@ -1108,6 +1108,8 @@ def run_desloc(args: argparse.Namespace) -> None:
         "loc_cache_numa1_gb": "loc_cache_numa1_gb",
         "shard_by_available_vram": "shard_by_available_vram",
         "activation_reserve_gb": "activation_reserve_gb",
+        "use_pipeline_schedule": "use_pipeline_schedule",
+        "enabled": "desloc_enabled",
     }
     for yaml_key, attr_name in _yaml_remap.items():
         if yaml_key in _desloc_yaml:
