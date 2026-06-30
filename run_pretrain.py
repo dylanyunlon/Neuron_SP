@@ -386,10 +386,7 @@ class LlamaModel(nn.Module):
             pos = torch.arange(T, device=input_ids.device).unsqueeze(0)
             x = self.embedding(input_ids) + self.pos_embedding(pos)
             for layer in self.layers:
-                if getattr(self, "_grad_ckpt", False) and self.training:
-                    x = torch.utils.checkpoint.checkpoint(layer, x, use_reentrant=False)
-                else:
-                    x = layer(x)
+                x = layer(x)
             return self.lm_head(self.norm(x))
 
     @property
