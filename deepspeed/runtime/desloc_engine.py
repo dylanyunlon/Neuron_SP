@@ -1887,10 +1887,11 @@ class DesLocEngine:
                     _cg_impl = getattr(_cg_impl, 'cuda_graph_impl', 'none') if _cg_impl else 'none'
                     _ddp_cfg = CoreDDPConfig(
                         grad_reduce_in_fp32=False,
-                        overlap_grad_reduce=False,
-                        use_distributed_optimizer=False,
+                        overlap_grad_reduce=True,  # ISSUE2: overlap grad-reduce with backward compute
+                        use_distributed_optimizer=bool(getattr(config, 'zero_stage', 0) >= 2),
                         allow_skip_grad_sync=True,  # DES-LOC Kx gating
                         megatron_fsdp_grad_comm_dtype=torch.bfloat16,  # M3574: PCIe BW reduction
+                        use_pcie_aware_overlap=True,  # PCIe-only topology: adapt bucket sizes
                         cuda_graph_mode=(_cg_impl == 'full_iteration'),  # M4041
                     )
                     # From Megatron M2928: wrap DDP init in a dedicated side-stream

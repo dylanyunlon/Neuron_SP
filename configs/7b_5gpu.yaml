@@ -47,17 +47,17 @@ training:
 
   # --- Batch sizes ---
   # global_batch_size = sum(micro_batch_size_per_gpu) * grad_accum_steps
-  # Here: (2+8+16+2+8) * 2 = 36 * 2 = 72
+  # Here: (2+8+24+2+8) * 16 = 44 * 16 = 704
   global_batch_size: 704
   grad_accum_steps: 16          # was 2; bubble 67%→20% (see PP_BUBBLE_ANALYSIS)
 
   # Per-GPU micro-batch sizes, scaled by TFLOPS (not just VRAM):
   #   GPU0  A6000        38.7 TFLOPS →  2  (baseline)
   #   GPU1  Blackwell    ~300 TFLOPS →  8  (est. 4× base; update after benchmarking)
-  #   GPU2  H100 NVL      835 TFLOPS → 16  (8× base; conservative vs 21:1 true ratio)
+  #   GPU2  H100 NVL      835 TFLOPS → 24  (12× base; exploiting 26% compute headroom)
   #   GPU3  A6000        38.7 TFLOPS →  2  (mirror GPU0)
   #   GPU4  Blackwell    ~300 TFLOPS →  8  (mirror GPU1)
-  # Ratio H100:Blackwell:A6000 = 16:8:2 = 8:4:1
+  # Ratio H100:Blackwell:A6000 = 24:8:2 = 12:4:1
   # vs Megatron M93504931 target 6:1 (H100:A6000) — we go more aggressive.
   # vs true TFLOPS ratio 21:1 — conservative safety margin retained.
   # global_batch_size = (2+8+16+2+8) × grad_accum_steps = 36 × 2 = 72
