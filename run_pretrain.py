@@ -204,9 +204,10 @@ try:
     logger.info("DesLocEngine / TrainingConfig imported (apex-free path)")
     _HAS_DESLOC = True
 except Exception as _desloc_import_err:
-    logger.warning(
-        "Could not import DesLocEngine (%s); falling back to standalone training loop.",
-        _desloc_import_err,
+    import traceback as _tb
+    logger.error(
+        "DesLocEngine import FAILED — will fall back to standalone (DDP). Fix this!\n%s",
+        _tb.format_exc(),
     )
     _HAS_DESLOC = False
 
