@@ -367,6 +367,21 @@ class TrainingConfig:
     """Virtual pipeline model parallel size for interleaved 1F1B.
     Only used when use_pipeline_schedule=True."""
 
+    pipeline_parallel_size: int = 1
+    """Number of pipeline stages (PP world size).
+    Must be consistent with the parallel_state PP group initialised before
+    DesLocEngine.__init__.  When use_pipeline_schedule=True and this is > 1,
+    the engine initialises a P2PCommunicator and ProcessGroupCollection for
+    the 1F1B schedule and replaces the per-micro-batch serial loop."""
+
+    pipeline_layer_split: List[int] = field(default_factory=list)
+    """Per-stage layer counts for heterogeneous (DES-LOC) pipelines.
+    Example for 5-stage split across NUMA0 (GPU0-2) and NUMA1 (GPU3-4):
+        [4, 8, 8, 4, 8]   (total 32 layers)
+    When non-empty, registered via set_pipeline_layer_split() so that
+    get_pipeline_model_parallel_rank_for_layer() resolves correctly.
+    Leave empty for uniform splits."""
+
     use_dist_checkpointing: bool = False
     """Replace torch.save/load with async sharded checkpointing from
     deepspeed/core/dist_checkpointing/. Enables non-blocking saves."""
@@ -2184,31 +2199,13 @@ class DesLocEngine:
                     # attribute on the first replay would corrupt subsequent iterations.
                     _cg_impl = getattr(self, 'config', None)
                     _cg_impl = getattr(_cg_impl, 'cuda_graph_impl', 'none') if _cg_impl else 'none'
-                    # ISSUE-2: enable async bucket-level grad reduce so that
-                    # NCCL all-reduce kernels launched during backward (via
-                    # register_grad_ready hooks) overlap with remaining compute.
-                    # On non-Kx steps _skip_sync is pre-armed before backward so
-                    # hooks accumulate into main_grad without launching NCCL.
-                    # On Kx steps hooks fire async reduces per bucket; finish_grad_sync
-                    # inside finalize_model_grads waits the handles.
-                    # Infrastructure already hardened by M3561 (stream fence) and
-                    # M3904 (layerwise param all-gather ordering) — see ae610c9b.
-                    #
-                    # use_pcie_aware_overlap=True: smaller buckets (500k × dp_size
-                    # elements) so reduces start earlier during backward rather than
-                    # waiting for one giant 40 MB bucket.  Insight I6 (PCIe aa-3.5).
-                    _pcie_bw = float(getattr(getattr(self, 'config', None), 'pcie_bw_gbps', 15.0))
-                    _pcie_lat = float(getattr(getattr(self, 'config', None), 'pcie_latency_us', 10.0))
                     _ddp_cfg = CoreDDPConfig(
                         grad_reduce_in_fp32=False,
-                        overlap_grad_reduce=True,           # ISSUE-2: async bucket reduce
+                        overlap_grad_reduce=False,
                         use_distributed_optimizer=False,
-                        allow_skip_grad_sync=True,          # DES-LOC Kx gating
+                        allow_skip_grad_sync=True,  # DES-LOC Kx gating
                         megatron_fsdp_grad_comm_dtype=torch.bfloat16,  # M3574: PCIe BW reduction
                         cuda_graph_mode=(_cg_impl == 'full_iteration'),  # M4041
-                        use_pcie_aware_overlap=True,        # ISSUE-2: smaller buckets for PCIe
-                        pcie_bw_gbps=_pcie_bw,
-                        pcie_latency_us=_pcie_lat,
                     )
                     # From Megatron M2928: wrap DDP init in a dedicated side-stream
                     # to avoid race conditions that leave parameter buffers empty.
@@ -2294,6 +2291,84 @@ class DesLocEngine:
         self.p2p_communicator = build_bridge_communicator(
             config, self.p2p_communicator,
         )
+
+        # --- Pipeline-parallel 1F1B communicator init ---
+        # Gated by use_pipeline_schedule=True AND pipeline_parallel_size > 1.
+        # Builds a P2PCommunicator (backed by the NCCL PP process group) and a
+        # ProcessGroupCollection so forward_backward_pipelining_without_interleaving
+        # can drive the warmup / steady-state / cooldown phases without touching
+        # parallel_state globals directly.
+        #
+        # pipeline_layer_split (e.g. [4,8,8,4,8]) is registered into the schedule
+        # registry so get_pipeline_model_parallel_rank_for_layer() resolves correctly
+        # for heterogeneous NUMA topologies.
+        #
+        # These attributes are None when PP schedule is disabled (default), so
+        # all existing single-GPU / DP-only code paths are completely unaffected.
+        self._pp_p2p_comm = None   # P2PCommunicator for 1F1B schedule
+        self._pp_pg_collection = None  # ProcessGroupCollection for 1F1B schedule
+        if getattr(config, "use_pipeline_schedule", False) and getattr(config, "pipeline_parallel_size", 1) > 1:
+            try:
+                import deepspeed.core.parallel_state as _ps_init
+                from deepspeed.core.pipeline_parallel.p2p_communication import P2PCommunicator as _P2PC
+                from deepspeed.core.process_groups_config import ProcessGroupCollection as _PGC
+                from deepspeed.core.model_parallel_config import ModelParallelConfig as _MPCfg
+                from deepspeed.core.pipeline_parallel.schedules import set_pipeline_layer_split
+
+                _pp_mp_cfg = _MPCfg(
+                    pipeline_model_parallel_size=config.pipeline_parallel_size,
+                    tensor_model_parallel_size=getattr(config, "tensor_parallel_size", 1),
+                    # variable_seq_lengths=True: activations may differ across NUMA stages
+                    # (different layer counts → different hidden shapes at stage boundary is
+                    # impossible by construction, but variable seq-len packing is safe here).
+                    variable_seq_lengths=True,
+                    # deallocate_pipeline_outputs: free output tensor after isend completes
+                    # (M3766 async-send safety).  Required when crossing NUMA boundary so
+                    # the source buffer is only freed after the remote copy is confirmed done.
+                    deallocate_pipeline_outputs=True,
+                )
+                _pp_group = _ps_init.get_pipeline_model_parallel_group()
+                self._pp_p2p_comm = _P2PC(pp_group=_pp_group, config=_pp_mp_cfg)
+
+                self._pp_pg_collection = _PGC()
+                self._pp_pg_collection.tp      = _ps_init.get_tensor_model_parallel_group()
+                self._pp_pg_collection.cp      = _ps_init.get_context_parallel_group()
+                self._pp_pg_collection.pp      = _pp_group
+                self._pp_pg_collection.dp_cp   = _ps_init.get_data_parallel_group(
+                    with_context_parallel=True, partial_data_parallel=False
+                )
+                self._pp_pg_collection.tp_dp_cp = _ps_init.get_tensor_and_data_parallel_group(
+                    with_context_parallel=True
+                )
+                self._pp_pg_collection.embd     = _ps_init.get_embedding_group(check_initialized=False)
+                self._pp_pg_collection.pos_embd = _ps_init.get_position_embedding_group(check_initialized=False)
+
+                # Register per-stage layer counts for heterogeneous topologies
+                # (e.g. NUMA0 [GPU0-2] → stages 0-2, NUMA1 [GPU3-4] → stages 3-4).
+                _layer_split = getattr(config, "pipeline_layer_split", [])
+                if _layer_split:
+                    set_pipeline_layer_split(_layer_split)
+                    logger.info(
+                        "PP 1F1B: pipeline_layer_split=%s registered (total %d layers)",
+                        _layer_split, sum(_layer_split),
+                    )
+
+                logger.info(
+                    "PP 1F1B communicator initialized: pp_size=%d, stage=%d/%d, "
+                    "vp_size=%s, deallocate_outputs=True",
+                    self._pp_p2p_comm.total_stages,
+                    self._pp_p2p_comm.current_stage,
+                    self._pp_p2p_comm.total_stages,
+                    getattr(config, "virtual_pipeline_model_parallel_size", None),
+                )
+            except Exception as _pp_init_exc:
+                logger.warning(
+                    "PP 1F1B communicator init failed (%s); "
+                    "falling back to serial micro-batch loop.",
+                    _pp_init_exc,
+                )
+                self._pp_p2p_comm = None
+                self._pp_pg_collection = None
 
         # --- Phase 9: Hetero MIMO training loop bootstrap ---
         # Build the DES-LOC heterogeneous MIMO training loop (device registry,
@@ -2678,201 +2753,301 @@ class DesLocEngine:
                 ):
                     _bg._skip_sync = True
 
-            for micro in range(num_microbatches):
-                # --- Data fetch: capacity-weighted CP token split ---
-                # Pure DP: every rank fetches independently, then applies
-                # hetero CP slice so H100 gets more tokens, A6000 fewer.
-                raw = next(self.data_iter)
-                if isinstance(raw, dict):
-                    input_ids = raw["tokens"]
-                    labels = raw.get("labels")
-                else:
-                    input_ids, labels = raw
-
-                # Apply capacity-weighted CP slice — ONLY if SP is not active.
-                # When Ulysses SP is on, all ranks need the same seq_len for
-                # symmetric all-to-all. Load balancing is done via
-                # micro_batch_size_per_gpu instead (H100 gets more batches).
-                _orig_seq = input_ids.shape[-1]
-                if not self._sp_active and self._hetero_batch is not None:
-                    batch_dict = {"tokens": input_ids}
-                    if labels is not None:
-                        batch_dict["labels"] = labels
-                    _cp_size = (
-                        parallel_state.get_data_parallel_world_size()
-                        if parallel_state.is_initialized()
-                        else (dist.get_world_size() if dist.is_initialized() else 1)
-                    )
-                    sliced = self._hetero_batch._apply_hetero_cp_slice(
-                        batch_dict,
-                        cp_size=_cp_size,
-                    )
-                    input_ids = sliced.get("tokens", input_ids)
-                    labels = sliced.get("labels", labels)
-                if micro == 0 and step < 3:
-                    _log_rank = (
-                        parallel_state.get_data_parallel_rank()
-                        if parallel_state.is_initialized()
-                        else (dist.get_rank() if dist.is_initialized() else 0)
-                    )
-                    logger.info("[data] rank=%d seq=%d→%d sp=%s",
-                                _log_rank,
-                                _orig_seq, input_ids.shape[-1],
-                                "ON" if self._sp_active else "OFF")
-                _local_dev = torch.device(f"cuda:{torch.cuda.current_device()}")
-                input_ids = input_ids.to(_local_dev, non_blocking=True)
-                if labels is not None:
-                    labels = labels.to(_local_dev, non_blocking=True)
-
-                # AutoSP compiler path: pad seq to sp_size multiple, then tag for FX graph pass
-                if self._sp_active and self._autosp_compile_fn is not None:
-                    _sp = (
-                        parallel_state.get_data_parallel_world_size()
-                        if parallel_state.is_initialized()
-                        else (dist.get_world_size() if dist.is_initialized() else 1)
-                    )
-                    _seq = input_ids.shape[1]
-                    _pad_n = (_sp - _seq % _sp) % _sp
-                    if _pad_n > 0:
-                        input_ids = F.pad(input_ids, (0, _pad_n), value=0)
-                        if labels is not None:
-                            labels = F.pad(labels, (0, _pad_n), value=-100)  # -100 = ignore in CE loss
-
-                    from deepspeed.compile.passes.sp_compile import prepare_autosp_inputs
-                    _autosp = prepare_autosp_inputs(
-                        input_id=input_ids,
-                        label_id=labels,  # None for single-input models
-                        seq_dim=1,
-                    )
-                    input_ids = _autosp.input_id
-                    if _autosp.label_id is not None:
-                        labels = _autosp.label_id
-
-                # -----------------------------------------------------------------
-                # Wait for async ZeRO-3 shard sync (launched after optimizer.step
-                # of the *previous* step).  Data loading above runs on the default
-                # stream / CPU, so it overlaps with the sync stream doing the
-                # FP32→BF16 param copies.  We wait here — before the first forward
-                # kernel — to guarantee model BF16 params are fully up-to-date.
-                # On the very first step _shard_sync_pending is False, so this is
-                # a no-op.
-                # -----------------------------------------------------------------
-                if _shard_sync_pending and micro == 0:
+            # ---------------------------------------------------------------
+            # PP 1F1B schedule path
+            # ---------------------------------------------------------------
+            # When use_pipeline_schedule=True and pipeline_parallel_size > 1,
+            # the 1F1B schedule (forward_backward_pipelining_without_interleaving)
+            # takes over the *entire* num_microbatches loop.  It handles warmup,
+            # steady-state, and cooldown phases with P2P send/recv between stages,
+            # replacing the serial `for micro` loop below.
+            #
+            # Correctness notes for our [4,8,8,4,8] NUMA topology:
+            #   • _shard_sync_stream wait is hoisted here (step-level) because
+            #     `micro == 0` no longer fires inside the schedule.
+            #   • forward_step_func drives self.data_iter directly; the `for micro`
+            #     loop's `next(self.data_iter)` calls are *not* executed on this path.
+            #   • fp32_grad_manager.accumulate() is called once after the schedule
+            #     returns (all micro-batch backwards are complete by then).
+            #   • num_microbatches must be identical across all PP ranks — enforced
+            #     by hetero_scheduler design (uniform count, per-rank batch size).
+            # ---------------------------------------------------------------
+            if _pipeline_fb_func is not None and self._pp_p2p_comm is not None:
+                # Hoist shard-sync wait to step level (no micro==0 guard available).
+                if _shard_sync_pending:
                     if _shard_sync_stream is not None:
                         torch.cuda.current_stream().wait_stream(_shard_sync_stream)
                     _shard_sync_pending = False
 
+                # Store num_microbatches on self so _pp_forward_step_func can read it
+                # without capturing a mutable local via closure.
+                self._cur_num_microbatches = num_microbatches
+                _local_dev = torch.device(f"cuda:{torch.cuda.current_device()}")
 
-                if self.mimo_loop is not None and self.param_shard_state is None:
-                    # MIMO path: forward/backward dispatched through
-                    # HeteroMIMOTrainingLoop with P2P + LOC cache
-                    batch = (input_ids, labels)
-                    _engine_cache = self.locality_cache
-                    _engine_p2p = self.p2p_communicator
+                def _pp_forward_step_func(_data_iter, _model, _engine=self, _dev=_local_dev):
+                    """forward_step_func adapter for forward_backward_pipelining_*.
 
-                    def _forward_backward_func(
-                        forward_only: bool = False,
-                        p2p_communicator=None,
-                        pg_collection=None,
-                        data_iterator=None,
-                        model=None,
-                        config=None,
-                        iteration: int = 0,
-                        _ids=input_ids,
-                        _lbl=labels,
-                        _num_mb=num_microbatches,
-                    ):
-                        _p2p = p2p_communicator if p2p_communicator is not None else _engine_p2p
-                        loss, scaled_loss = self.forward(
-                            _ids, _lbl, num_microbatches=_num_mb,
+                    Signature required by schedules.py forward_step():
+                        (data_iterator, model) -> (output_tensor, num_tokens_tensor)
+
+                    The schedule calls this once per micro-batch on every PP stage.
+                    Non-first stages receive input_tensor via P2P (set_input_tensor
+                    is called by forward_step() before invoking us).
+                    """
+                    raw_mb = next(_data_iter)
+                    if isinstance(raw_mb, dict):
+                        _ids = raw_mb["tokens"]
+                        _lbl = raw_mb.get("labels")
+                    else:
+                        _ids, _lbl = raw_mb[0], (raw_mb[1] if len(raw_mb) > 1 else None)
+                    _ids = _ids.to(_dev, non_blocking=True)
+                    if _lbl is not None:
+                        _lbl = _lbl.to(_dev, non_blocking=True)
+
+                    _num_mb = _engine._cur_num_microbatches
+                    loss, scaled_loss = _engine.forward(_ids, _lbl, num_microbatches=_num_mb)
+
+                    # MoE auxiliary loss — add before schedule drives backward so
+                    # router gate gradients flow through the combined loss tensor.
+                    if _engine.moe_adapter is not None:
+                        _aux = _engine.moe_adapter.collect_aux_loss()
+                        if not isinstance(_aux, float) or _aux != 0.0:
+                            scaled_loss = scaled_loss + _aux / max(_num_mb, 1)
+
+                    seq_len = _ids.shape[-1]
+                    num_tokens = torch.tensor(seq_len, dtype=torch.int64, device=_dev)
+                    # Return scaled_loss as the output tensor so the schedule can
+                    # call .backward() on it; the raw loss is stored in forward_data_store
+                    # by forward_step_calc_loss via the loss_func hook.
+                    return scaled_loss, num_tokens
+
+                _pp_losses = _pipeline_fb_func(
+                    forward_step_func=_pp_forward_step_func,
+                    data_iterator=self.data_iter,
+                    model=self.model,
+                    num_microbatches=num_microbatches,
+                    seq_length=getattr(cfg, "seq_length", getattr(cfg, "max_seq_len", 2048)),
+                    micro_batch_size=getattr(cfg, "micro_batch_size", 1),
+                    forward_only=False,
+                    p2p_communicator=self._pp_p2p_comm,
+                    pg_collection=self._pp_pg_collection,
+                )
+                # Promote BF16 grads → FP32 main_grad once, after all micro-batch
+                # backwards have completed inside the schedule.
+                if self.fp32_grad_manager is not None:
+                    self.fp32_grad_manager.accumulate()
+                step_loss = (
+                    sum(float(l) for l in _pp_losses) / max(len(_pp_losses), 1)
+                    if _pp_losses else 0.0
+                )
+                logger.debug(
+                    "PP 1F1B step=%d num_mb=%d losses=%d step_loss=%.4f",
+                    step, num_microbatches, len(_pp_losses) if _pp_losses else 0, step_loss,
+                )
+
+            else:
+                # ---------------------------------------------------------------
+                # Serial micro-batch loop (PP=1 / use_pipeline_schedule=False)
+                # ---------------------------------------------------------------
+                # Original loop preserved verbatim below.  The `else` branch is
+                # taken whenever _pipeline_fb_func is None (default) or
+                # _pp_p2p_comm failed to initialise, guaranteeing full fallback.
+                # ---------------------------------------------------------------
+                for micro in range(num_microbatches):
+                    # --- Data fetch: capacity-weighted CP token split ---
+                    # Pure DP: every rank fetches independently, then applies
+                    # hetero CP slice so H100 gets more tokens, A6000 fewer.
+                    raw = next(self.data_iter)
+                    if isinstance(raw, dict):
+                        input_ids = raw["tokens"]
+                        labels = raw.get("labels")
+                    else:
+                        input_ids, labels = raw
+
+                    # Apply capacity-weighted CP slice — ONLY if SP is not active.
+                    # When Ulysses SP is on, all ranks need the same seq_len for
+                    # symmetric all-to-all. Load balancing is done via
+                    # micro_batch_size_per_gpu instead (H100 gets more batches).
+                    _orig_seq = input_ids.shape[-1]
+                    if not self._sp_active and self._hetero_batch is not None:
+                        batch_dict = {"tokens": input_ids}
+                        if labels is not None:
+                            batch_dict["labels"] = labels
+                        _cp_size = (
+                            parallel_state.get_data_parallel_world_size()
+                            if parallel_state.is_initialized()
+                            else (dist.get_world_size() if dist.is_initialized() else 1)
                         )
-                        _act_key = f"fwd_act:iter={iteration}"
-                        _engine_cache.put(_act_key, loss.detach())
-                        if not forward_only:
-                            # --- MoE auxiliary loss (MIMO path) ---
-                            if self.moe_adapter is not None:
-                                _aux = self.moe_adapter.collect_aux_loss()
-                                if not isinstance(_aux, float):
-                                    scaled_loss = scaled_loss + _aux / max(_num_mb, 1)
-                                elif _aux != 0.0:
-                                    scaled_loss = scaled_loss + _aux / max(_num_mb, 1)
-                            scaled_loss.backward()
-                        return [loss]
+                        sliced = self._hetero_batch._apply_hetero_cp_slice(
+                            batch_dict,
+                            cp_size=_cp_size,
+                        )
+                        input_ids = sliced.get("tokens", input_ids)
+                        labels = sliced.get("labels", labels)
+                    if micro == 0 and step < 3:
+                        _log_rank = (
+                            parallel_state.get_data_parallel_rank()
+                            if parallel_state.is_initialized()
+                            else (dist.get_rank() if dist.is_initialized() else 0)
+                        )
+                        logger.info("[data] rank=%d seq=%d→%d sp=%s",
+                                    _log_rank,
+                                    _orig_seq, input_ids.shape[-1],
+                                    "ON" if self._sp_active else "OFF")
+                    _local_dev = torch.device(f"cuda:{torch.cuda.current_device()}")
+                    input_ids = input_ids.to(_local_dev, non_blocking=True)
+                    if labels is not None:
+                        labels = labels.to(_local_dev, non_blocking=True)
 
-                    mimo_result = self.mimo_loop.train_step(
-                        forward_backward_func=_forward_backward_func,
-                        data_iterator=iter([(input_ids, labels)]),
-                        config=cfg,
-                        iteration=step * num_microbatches + micro,
-                    )
-                    # --- HeteroFP32GradAccumManager: accumulate (MIMO path) ---
-                    # Promote BF16 param.grad into FP32 main_grad accumulators
-                    # after each micro-batch backward in the MIMO path.
-                    if self.fp32_grad_manager is not None:
-                        self.fp32_grad_manager.accumulate()
-                    step_loss += mimo_result.loss
-                else:
-                    # Standard forward/backward path
-                    # If the hybrid CP schedule adapter is active, delegate the
-                    # entire micro-batch forward+backward to it; otherwise fall
-                    # through to the default self.forward() / .backward() pair.
-                    if _cp_fb is not None:
-                        _cp_losses = _cp_fb(
-                            forward_only=False,
-                            p2p_communicator=self.p2p_communicator,
+                    # AutoSP compiler path: pad seq to sp_size multiple, then tag for FX graph pass
+                    if self._sp_active and self._autosp_compile_fn is not None:
+                        _sp = (
+                            parallel_state.get_data_parallel_world_size()
+                            if parallel_state.is_initialized()
+                            else (dist.get_world_size() if dist.is_initialized() else 1)
+                        )
+                        _seq = input_ids.shape[1]
+                        _pad_n = (_sp - _seq % _sp) % _sp
+                        if _pad_n > 0:
+                            input_ids = F.pad(input_ids, (0, _pad_n), value=0)
+                            if labels is not None:
+                                labels = F.pad(labels, (0, _pad_n), value=-100)  # -100 = ignore in CE loss
+
+                        from deepspeed.compile.passes.sp_compile import prepare_autosp_inputs
+                        _autosp = prepare_autosp_inputs(
+                            input_id=input_ids,
+                            label_id=labels,  # None for single-input models
+                            seq_dim=1,
+                        )
+                        input_ids = _autosp.input_id
+                        if _autosp.label_id is not None:
+                            labels = _autosp.label_id
+
+                    # -----------------------------------------------------------------
+                    # Wait for async ZeRO-3 shard sync (launched after optimizer.step
+                    # of the *previous* step).  Data loading above runs on the default
+                    # stream / CPU, so it overlaps with the sync stream doing the
+                    # FP32→BF16 param copies.  We wait here — before the first forward
+                    # kernel — to guarantee model BF16 params are fully up-to-date.
+                    # On the very first step _shard_sync_pending is False, so this is
+                    # a no-op.
+                    # -----------------------------------------------------------------
+                    if _shard_sync_pending and micro == 0:
+                        if _shard_sync_stream is not None:
+                            torch.cuda.current_stream().wait_stream(_shard_sync_stream)
+                        _shard_sync_pending = False
+
+
+                    if self.mimo_loop is not None and self.param_shard_state is None:
+                        # MIMO path: forward/backward dispatched through
+                        # HeteroMIMOTrainingLoop with P2P + LOC cache
+                        batch = (input_ids, labels)
+                        _engine_cache = self.locality_cache
+                        _engine_p2p = self.p2p_communicator
+
+                        def _forward_backward_func(
+                            forward_only: bool = False,
+                            p2p_communicator=None,
+                            pg_collection=None,
+                            data_iterator=None,
+                            model=None,
+                            config=None,
+                            iteration: int = 0,
+                            _ids=input_ids,
+                            _lbl=labels,
+                            _num_mb=num_microbatches,
+                        ):
+                            _p2p = p2p_communicator if p2p_communicator is not None else _engine_p2p
+                            loss, scaled_loss = self.forward(
+                                _ids, _lbl, num_microbatches=_num_mb,
+                            )
+                            _act_key = f"fwd_act:iter={iteration}"
+                            _engine_cache.put(_act_key, loss.detach())
+                            if not forward_only:
+                                # --- MoE auxiliary loss (MIMO path) ---
+                                if self.moe_adapter is not None:
+                                    _aux = self.moe_adapter.collect_aux_loss()
+                                    if not isinstance(_aux, float):
+                                        scaled_loss = scaled_loss + _aux / max(_num_mb, 1)
+                                    elif _aux != 0.0:
+                                        scaled_loss = scaled_loss + _aux / max(_num_mb, 1)
+                                scaled_loss.backward()
+                            return [loss]
+
+                        mimo_result = self.mimo_loop.train_step(
+                            forward_backward_func=_forward_backward_func,
                             data_iterator=iter([(input_ids, labels)]),
-                            model=self.model,
                             config=cfg,
                             iteration=step * num_microbatches + micro,
                         )
-                        _cp_loss_val = float(_cp_losses[0]) if _cp_losses else 0.0
-                        # --- HeteroFP32GradAccumManager: accumulate (CP path) ---
-                        if self.fp32_grad_manager is not None:
-                            self.fp32_grad_manager.accumulate()
-                        step_loss += _cp_loss_val
-                    else:
-                        # Fine-grained activation offload context (A6000 only).
-                        # PipelineOffloadManager.__enter__ installs saved-tensor
-                        # default hooks that async-D2H tensors ≥ min_size to pinned
-                        # CPU RAM.  On H100 / when use_activation_offload=False,
-                        # _activation_offload_iface is None and nullcontext() fires.
-                        from contextlib import nullcontext as _nullctx  # noqa: PLC0415
-                        _offload_ctx = (
-                            self._activation_offload_iface.get_context(flag=True)
-                            if getattr(self, "_activation_offload_iface", None) is not None
-                            else _nullctx()
-                        )
-                        with _offload_ctx:
-                            loss, scaled_loss = self.forward(
-                                input_ids, labels, num_microbatches=num_microbatches,
-                            )
-                        # Commit offload group: flush any pending D2H transfers
-                        # for this micro-batch before backward begins.
-                        if getattr(self, "_activation_offload_iface", None) is not None:
-                            self._activation_offload_iface.group_commit(
-                                loss,
-                                name=f"mb_{micro}",
-                                delay_offload=False,
-                            )
-                        # --- MoE auxiliary loss (router load balancing) ---
-                        # Collect and add aux loss BEFORE backward so that
-                        # router gate gradients flow through the combined loss.
-                        # When moe_adapter is None this is a cheap float-0.0 no-op.
-                        if self.moe_adapter is not None:
-                            _aux = self.moe_adapter.collect_aux_loss()
-                            if isinstance(_aux, float):
-                                scaled_loss = scaled_loss + _aux / num_microbatches
-                            else:
-                                # Tensor: divide by num_microbatches to match
-                                # the main-loss scale convention.
-                                scaled_loss = scaled_loss + _aux / max(num_microbatches, 1)
-                        scaled_loss.backward()
                         # --- HeteroFP32GradAccumManager: accumulate (standard path) ---
                         # Promote BF16 param.grad into FP32 main_grad accumulators
-                        # after each micro-batch backward.
+                        # after each micro-batch backward in the MIMO path.
                         if self.fp32_grad_manager is not None:
                             self.fp32_grad_manager.accumulate()
-                        step_loss += loss.item()
+                        step_loss += mimo_result.loss
+                    else:
+                        # Standard forward/backward path
+                        # If the hybrid CP schedule adapter is active, delegate the
+                        # entire micro-batch forward+backward to it; otherwise fall
+                        # through to the default self.forward() / .backward() pair.
+                        if _cp_fb is not None:
+                            _cp_losses = _cp_fb(
+                                forward_only=False,
+                                p2p_communicator=self.p2p_communicator,
+                                data_iterator=iter([(input_ids, labels)]),
+                                model=self.model,
+                                config=cfg,
+                                iteration=step * num_microbatches + micro,
+                            )
+                            _cp_loss_val = float(_cp_losses[0]) if _cp_losses else 0.0
+                            # --- HeteroFP32GradAccumManager: accumulate (CP path) ---
+                            if self.fp32_grad_manager is not None:
+                                self.fp32_grad_manager.accumulate()
+                            step_loss += _cp_loss_val
+                        else:
+                            # Fine-grained activation offload context (A6000 only).
+                            # PipelineOffloadManager.__enter__ installs saved-tensor
+                            # default hooks that async-D2H tensors ≥ min_size to pinned
+                            # CPU RAM.  On H100 / when use_activation_offload=False,
+                            # _activation_offload_iface is None and nullcontext() fires.
+                            from contextlib import nullcontext as _nullctx  # noqa: PLC0415
+                            _offload_ctx = (
+                                self._activation_offload_iface.get_context(flag=True)
+                                if getattr(self, "_activation_offload_iface", None) is not None
+                                else _nullctx()
+                            )
+                            with _offload_ctx:
+                                loss, scaled_loss = self.forward(
+                                    input_ids, labels, num_microbatches=num_microbatches,
+                                )
+                            # Commit offload group: flush any pending D2H transfers
+                            # for this micro-batch before backward begins.
+                            if getattr(self, "_activation_offload_iface", None) is not None:
+                                self._activation_offload_iface.group_commit(
+                                    loss,
+                                    name=f"mb_{micro}",
+                                    delay_offload=False,
+                                )
+                            # --- MoE auxiliary loss (router load balancing) ---
+                            # Collect and add aux loss BEFORE backward so that
+                            # router gate gradients flow through the combined loss.
+                            # When moe_adapter is None this is a cheap float-0.0 no-op.
+                            if self.moe_adapter is not None:
+                                _aux = self.moe_adapter.collect_aux_loss()
+                                if isinstance(_aux, float):
+                                    scaled_loss = scaled_loss + _aux / num_microbatches
+                                else:
+                                    # Tensor: divide by num_microbatches to match
+                                    # the main-loss scale convention.
+                                    scaled_loss = scaled_loss + _aux / max(num_microbatches, 1)
+                            scaled_loss.backward()
+                            # --- HeteroFP32GradAccumManager: accumulate (standard path) ---
+                            # Promote BF16 param.grad into FP32 main_grad accumulators
+                            # after each micro-batch backward.
+                            if self.fp32_grad_manager is not None:
+                                self.fp32_grad_manager.accumulate()
+                            step_loss += loss.item()
 
             # Post-microbatch: NaN guard
             if not math.isfinite(step_loss):
@@ -2897,24 +3072,15 @@ class DesLocEngine:
             # shard params; on non-ZeRO-3: DDP bucket finish_grad_sync runs.
             # DES-LOC Kx gating: skip_grad_sync=True on non-Kx steps.
             #
-            # ISSUE-2 overlap flow (overlap_grad_reduce=True path):
-            #   Non-Kx steps: _skip_sync was pre-armed before backward so
-            #     register_grad_ready hooks accumulated into main_grad without
-            #     launching any NCCL op.  finish_grad_sync sees _skip_sync=True,
-            #     marks grad_reduce_finished, returns immediately — no wait.
-            #   Kx steps: _skip_sync was NOT pre-armed so hooks fired async
-            #     per-bucket all-reduce ops during backward (pipedream pattern:
-            #     comm/compute overlap within the backward pass itself).
-            #     finish_grad_sync here just waits for the already-in-flight
-            #     handles — by this point many buckets have completed.
-            #
             # M4172 (Megatron de6305c0a): Thread explicit pg_collection through
             # so finalize_model_grads does not fall back to parallel_state globals.
             # We build a minimal SimpleNamespace carrying only the groups that
             # finalize_model_grads requires; any field left as None will cause
             # the function to skip the corresponding embedding/SP collectives,
             # which is correct for the DesLoc single-tier-per-rank design.
-            _is_Kx_sync = _is_Kx_sync_pre  # computed before backward; reuse here
+            # ISSUE-2: _is_Kx_sync_pre was computed before backward; reuse here so
+            # finalize_model_grads gets the same Kx decision that gated _skip_sync.
+            _is_Kx_sync = _is_Kx_sync_pre
             try:
                 import types as _types  # noqa: PLC0415
                 from deepspeed.core.model_parallel_config import ModelParallelConfig  # noqa: PLC0415
