@@ -279,7 +279,9 @@ def _validate_sdpa_nodes(gm, sp_sz, rank):
     sdpa_nodes = get_sdpa_nodes(gm)
     n_sdpa = len(sdpa_nodes)
     if n_sdpa == 0:
-        return 0
+        raise RuntimeError(
+            "[AutoSP] No SDPA nodes in graph. Model must use "
+            "F.scaled_dot_product_attention (set _attn_implementation='sdpa').")
     if rank == 0:
         first_sdpa = sdpa_nodes[0]
         for arg_idx, arg_name in [(0, "Q"), (1, "K"), (2, "V")]:
@@ -351,16 +353,6 @@ def apply_autosp(gm: GraphModule,
     passes = passes or AUTOSP_PASSES
     rank = dist.get_rank()
     n_sdpa = _validate_sdpa_nodes(gm, sp_size, rank)
-    if n_sdpa == 0:
-        # No SDPA nodes found — PyTorch may have decomposed them.
-        # Skip AutoSP passes; training proceeds without SP.
-        if rank == 0:
-            logger.warning(
-                "[AutoSP] No SDPA nodes in FX graph (PyTorch %s may decompose "
-                "F.scaled_dot_product_attention). Skipping SP passes.",
-                torch.__version__,
-            )
-        return gm.forward
 
     for p in passes:
         if debug and rank == 0:
