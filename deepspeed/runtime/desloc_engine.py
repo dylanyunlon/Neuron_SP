@@ -2263,6 +2263,12 @@ class DesLocEngine:
 
             from deepspeed.compile.passes.sp_compile import apply_autosp
             def _autosp_backend(gm, real_inputs):
+                # DEBUG: dump all FX graph nodes so we can see what dynamo captured
+                rank = dist.get_rank() if dist.is_initialized() else 0
+                if rank == 0:
+                    logger.info("[AutoSP-DEBUG] FX graph has %d nodes:", len(list(gm.graph.nodes)))
+                    for node in gm.graph.nodes:
+                        logger.info("  %s  op=%s  target=%s", node.name, node.op, node.target)
                 apply_autosp(gm, real_inputs, debug=False, sp_size=sp_size, dp_size=dp_size)
                 return gm.forward  # eager fallback (no inductor on cu118)
 
