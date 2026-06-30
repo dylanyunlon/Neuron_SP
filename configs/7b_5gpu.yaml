@@ -132,6 +132,14 @@ desloc:
   Kv: 16                        # token split factor for H100/Blackwell value cache
   zero_stage: 3
 
+  # Optimizer shard sizing: use available VRAM (not total) to prevent A6000 OOM.
+  # Available = total_vram - model_params - grads - activation_reserve.
+  shard_by_available_vram: true
+  activation_reserve_gb: 4.0
+
+  # Pipeline schedule: 1F1B enabled by default for PP>1.
+  use_pipeline_schedule: true
+
   # Per-stage overrides for Blackwell GPUs (SM12.0).
   # Blackwell has a different async-copy engine; tune independently.
   # Requires PyTorch cu126+ to avoid PTX fallback on SM12.0.
