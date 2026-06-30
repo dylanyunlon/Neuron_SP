@@ -228,8 +228,11 @@ def cleanup_sp_groups():
     for gid, group in list(_PROCESS_GROUPS.items()):
         dist.destroy_process_group(group)
 
-    from .hetero_mesh import reset_hetero_plan
-    reset_hetero_plan()
+    try:
+        from .hetero_mesh import reset_hetero_plan
+        reset_hetero_plan()
+    except ImportError:
+        pass
 
     _PROCESS_GROUPS.clear()
     _PENDING_A2A_HANDLES.clear()

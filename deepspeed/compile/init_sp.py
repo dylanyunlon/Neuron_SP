@@ -133,10 +133,13 @@ def init_autosp(config):
             sp_size, dp_size,
             loc_peer_ranks=loc_cfg['peer_ranks'] or None)
     elif hetero_cfg['strategy'] != 'contiguous':
-        from .custom_ops.hetero_mesh import populate_hetero_registry
-        populate_hetero_registry(sp_size, dp_size, strategy=hetero_cfg['strategy'])
-        from .custom_ops.sp_dp_registry import mark_heterogeneous
-        mark_heterogeneous(True)
+        try:
+            from .custom_ops.hetero_mesh import populate_hetero_registry
+            populate_hetero_registry(sp_size, dp_size, strategy=hetero_cfg['strategy'])
+            from .custom_ops.sp_dp_registry import mark_heterogeneous
+            mark_heterogeneous(True)
+        except ImportError:
+            pass
 
     if histogram_cfg['enabled']:
         from .custom_ops.sp_histogram import get_histogram_kernel

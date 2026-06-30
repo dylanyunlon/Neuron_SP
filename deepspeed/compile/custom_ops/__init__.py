@@ -5,7 +5,6 @@ __all__ = [
     "all_to_all",
     "sp_dp_registry",
     "sp_compat",
-    "hetero_mesh",
     "bloombee_bridge",
     "sp_histogram",
     "double_buffer_a2a",

@@ -69,7 +69,10 @@ from deepspeed.runtime.constants import \
     PLD_THETA, PLD_GAMMA, BFLOAT16, FP16, AMP, GRADIENT_ACCUMULATION_STEPS, \
     DATA_PARALLEL_GROUP, GLOBAL_RANK, DDP_BFLOAT16
 from deepspeed.runtime.zero.config import ZeroStageEnum
-from deepspeed.runtime.hetero_registry import HeteroRegistry
+try:
+    from deepspeed.runtime.hetero_registry import HeteroRegistry
+except ImportError:
+    HeteroRegistry = None
 from deepspeed.compression import compression_scheduler
 from deepspeed.compression.constants import \
     WEIGHT_QUANTIZE_IN_FORWARD_ENABLED, \

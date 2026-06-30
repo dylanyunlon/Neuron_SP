@@ -39,10 +39,14 @@ from deepspeed.accelerator import get_accelerator
 from deepspeed.runtime.zero.muon.original_muon import muon_update
 from deepspeed.runtime.zero.muon.muon_optimizer import MuonWithAuxAdam
 # DES-LOC M776: Gemini-inspired asymmetric GPU/CPU memory management
-from deepspeed.runtime.zero.hetero_memory_manager import (
-    HeteroMemoryManager,
-    HeteroMemoryConfig,
-)
+try:
+    from deepspeed.runtime.zero.hetero_memory_manager import (
+        HeteroMemoryManager,
+        HeteroMemoryConfig,
+    )
+except ImportError:
+    HeteroMemoryManager = None
+    HeteroMemoryConfig = None
 
 # Toggle this to true to enable correctness test
 # with gradient partitioning and without

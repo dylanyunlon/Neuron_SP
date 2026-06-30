@@ -10,10 +10,13 @@ if is_torch_elastic_compatible():
     from .elastic_agent import DSElasticAgent
 
 # M4188: Flextron hetero-GPU subnet selection (mirrors Megatron 2d862fe0c)
-from .hetero_flextron_config import (
-    HeteroFlextronConfig,
-    build_hetero_flextron_config,
-)
+try:
+    from .hetero_flextron_config import (
+        HeteroFlextronConfig,
+        build_hetero_flextron_config,
+    )
+except ImportError:
+    pass
 from .flextron_budget import (
     DeslocMemoryProfile,
     count_subnet_params,
