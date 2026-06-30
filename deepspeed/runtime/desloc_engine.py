@@ -2038,6 +2038,43 @@ class DesLocEngine:
                 "activation-checkpoint wrapping skipped."
             )
 
+        # --- Phase 7b: Fine-grained activation offload (A6000 only) ---
+        # Wires PipelineOffloadManager so that large saved tensors (embeddings,
+        # residuals ≥ activation_offload_min_size elements) are D2H-copied
+        # asynchronously during forward and H2D-restored lazily during backward.
+        # On A6000 PCIe (32 GB/s), attention score tensors are cheaper to recompute
+        # than to offload; the min_size threshold filters those out automatically.
+        # On H100 (DATACENTER tier), offload_required_for_tier() returns False
+        # and maybe_enable_activation_offload() is a cheap no-op.
+        #
+        # HetSeq uses a simpler "catch OOM, skip batch" strategy; we prefer the
+        # PipeDream memory-planning approach: know the budget in advance and
+        # configure the runtime to stay within it.
+        from deepspeed.runtime.core_adapters import maybe_enable_activation_offload  # noqa: PLC0415
+        try:
+            from deepspeed.core.desloc_config import TierType as _TierType  # noqa: PLC0415
+            _local_tier_class = _dev_tier.get(
+                list(self.plan.tier_layer_map.keys())[0] if self.plan.tier_layer_map else primary_idx,
+                TierClass.UNKNOWN,
+            )
+            _tier_type_for_offload = {
+                TierClass.A6000:           _TierType.PROFESSIONAL,
+                TierClass.RTX_PRO_6000_BW: _TierType.PROFESSIONAL,
+                TierClass.H100:            _TierType.DATACENTER,
+                TierClass.UNKNOWN:         None,
+            }.get(_local_tier_class, None)
+        except Exception:  # noqa: BLE001
+            _tier_type_for_offload = None
+        self._activation_offload_iface = maybe_enable_activation_offload(
+            config, tier_type=_tier_type_for_offload
+        )
+        logger.info(
+            "[FineGrainedOffload] iface=%s  local_tier=%s  use_activation_offload=%s",
+            "ACTIVE" if self._activation_offload_iface is not None else "SKIPPED",
+            _dev_tier.get(primary_idx, TierClass.UNKNOWN).value,
+            getattr(config, "use_activation_offload", False),
+        )
+
         # --- Phase 8: HeteroFP32GradAccumManager ---
         # Build a default config: H100 (Tier-0) always accumulates in FP32;
         # A6000s (Tier-1) follow the LayerNorm/embedding patterns; CPU is FP32.
@@ -2794,9 +2831,29 @@ class DesLocEngine:
                             self.fp32_grad_manager.accumulate()
                         step_loss += _cp_loss_val
                     else:
-                        loss, scaled_loss = self.forward(
-                            input_ids, labels, num_microbatches=num_microbatches,
+                        # Fine-grained activation offload context (A6000 only).
+                        # PipelineOffloadManager.__enter__ installs saved-tensor
+                        # default hooks that async-D2H tensors ≥ min_size to pinned
+                        # CPU RAM.  On H100 / when use_activation_offload=False,
+                        # _activation_offload_iface is None and nullcontext() fires.
+                        from contextlib import nullcontext as _nullctx  # noqa: PLC0415
+                        _offload_ctx = (
+                            self._activation_offload_iface.get_context(flag=True)
+                            if getattr(self, "_activation_offload_iface", None) is not None
+                            else _nullctx()
                         )
+                        with _offload_ctx:
+                            loss, scaled_loss = self.forward(
+                                input_ids, labels, num_microbatches=num_microbatches,
+                            )
+                        # Commit offload group: flush any pending D2H transfers
+                        # for this micro-batch before backward begins.
+                        if getattr(self, "_activation_offload_iface", None) is not None:
+                            self._activation_offload_iface.group_commit(
+                                loss,
+                                name=f"mb_{micro}",
+                                delay_offload=False,
+                            )
                         # --- MoE auxiliary loss (router load balancing) ---
                         # Collect and add aux loss BEFORE backward so that
                         # router gate gradients flow through the combined loss.
