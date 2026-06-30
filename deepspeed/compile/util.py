@@ -541,10 +541,30 @@ def create_shard_offsets(gm: GraphModule, s0_node: Node) -> Tuple[Node, Node]:
 
 
 def get_sdpa_nodes(gm: GraphModule) -> List[Node]:
-    return list(gm.graph.find_nodes(
+    # High-level F.scaled_dot_product_attention (pre-decomposition)
+    nodes = list(gm.graph.find_nodes(
         op="call_function",
         target=F.scaled_dot_product_attention,
     ))
+    if nodes:
+        return nodes
+    # PyTorch 2.7+ dynamo may decompose SDPA into aten ops — search those too
+    _aten_sdpa_targets = []
+    for name in (
+        "_scaled_dot_product_flash_attention",
+        "_scaled_dot_product_efficient_attention",
+        "_scaled_dot_product_attention_math",
+        "_scaled_dot_product_cudnn_attention",
+    ):
+        op = getattr(torch.ops.aten, name, None)
+        if op is not None:
+            # Handle both .default and the op itself
+            _aten_sdpa_targets.append(getattr(op, "default", op))
+            _aten_sdpa_targets.append(op)
+    for node in gm.graph.nodes:
+        if node.op == "call_function" and node.target in _aten_sdpa_targets:
+            nodes.append(node)
+    return nodes
 
 
 def get_input_id_node(gm: GraphModule) -> Node:
