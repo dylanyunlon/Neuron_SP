@@ -3,9 +3,9 @@
 #
 # Blackwell RTX PRO 6000 (SM120) excluded: PyTorch 2.7.1+cu118 only supports up to SM90.
 # Upgrade to PyTorch cu126+ to enable Blackwell. Until then, train on 3 GPUs:
-#   GPU0: A6000   (47GB, SM8.6) — secondary  (NUMA0)
-#   GPU2: H100 NVL (93GB, SM9.0) — primary compute (NUMA0)
-#   GPU3: A6000   (47GB, SM8.6) — secondary  (NUMA1)
+#   GPU2: H100 NVL (93GB, SM9.0) — primary compute
+#   GPU3: A6000   (47GB, SM8.6) — secondary
+#   GPU4: A6000   (47GB, SM8.6) — secondary
 #
 # To enable all 5 GPUs with Blackwell:
 #   pip install torch --index-url https://download.pytorch.org/whl/cu126
@@ -19,9 +19,7 @@ TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 LOG="logs/7b_pretrain_3gpu_${TIMESTAMP}.log"
 
 # Only H100 + 2×A6000 (skip Blackwell SM120)
-# GPU layout: 0=A6000(NUMA0), 1=Blackwell(NUMA0), 2=H100(NUMA0), 3=A6000(NUMA1), 4=Blackwell(NUMA1)
-# Select: GPU0(A6000) + GPU2(H100) + GPU3(A6000) — all non-Blackwell
-export CUDA_VISIBLE_DEVICES=0,2,3
+export CUDA_VISIBLE_DEVICES=2,3,4
 export NCCL_P2P_DISABLE=1
 export NCCL_IB_DISABLE=1
 export NCCL_SOCKET_IFNAME=lo
@@ -35,7 +33,7 @@ EXTRA_ARGS=("$@")
 
 if [[ " ${EXTRA_ARGS[*]:-} " == *" --dry-run "* ]]; then
     echo "=== DRY RUN (3-GPU: H100 + 2×A6000) ==="
-    nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader -i 0,2,3 2>/dev/null
+    nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader -i 2,3,4 2>/dev/null
     EXTRA_ARGS=("${EXTRA_ARGS[@]/--dry-run/}" --steps 3 --log-every 1 --save-every 0)
 fi
 
