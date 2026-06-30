@@ -48,7 +48,7 @@ training:
   # --- Batch sizes ---
   # global_batch_size = sum(micro_batch_size_per_gpu) * grad_accum_steps
   # Here: (2+8+16+2+8) * 2 = 36 * 2 = 72
-  global_batch_size: 640
+  global_batch_size: 704
   grad_accum_steps: 16          # was 2; bubble 67%→20% (see PP_BUBBLE_ANALYSIS)
 
   # Per-GPU micro-batch sizes, scaled by TFLOPS (not just VRAM):
@@ -61,7 +61,7 @@ training:
   # vs Megatron M93504931 target 6:1 (H100:A6000) — we go more aggressive.
   # vs true TFLOPS ratio 21:1 — conservative safety margin retained.
   # global_batch_size = (2+8+16+2+8) × grad_accum_steps = 36 × 2 = 72
-  micro_batch_size_per_gpu: [2, 8, 20, 2, 8]
+  micro_batch_size_per_gpu: [2, 8, 24, 2, 8]
 
   # Kept for backwards-compat with single-value consumers; set to the minimum
   # stage value so nothing OOMs on the A6000 stages.
