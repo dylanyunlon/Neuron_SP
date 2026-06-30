@@ -2040,13 +2040,31 @@ class DesLocEngine:
                     # attribute on the first replay would corrupt subsequent iterations.
                     _cg_impl = getattr(self, 'config', None)
                     _cg_impl = getattr(_cg_impl, 'cuda_graph_impl', 'none') if _cg_impl else 'none'
+                    # ISSUE-2: enable async bucket-level grad reduce so that
+                    # NCCL all-reduce kernels launched during backward (via
+                    # register_grad_ready hooks) overlap with remaining compute.
+                    # On non-Kx steps _skip_sync is pre-armed before backward so
+                    # hooks accumulate into main_grad without launching NCCL.
+                    # On Kx steps hooks fire async reduces per bucket; finish_grad_sync
+                    # inside finalize_model_grads waits the handles.
+                    # Infrastructure already hardened by M3561 (stream fence) and
+                    # M3904 (layerwise param all-gather ordering) — see ae610c9b.
+                    #
+                    # use_pcie_aware_overlap=True: smaller buckets (500k × dp_size
+                    # elements) so reduces start earlier during backward rather than
+                    # waiting for one giant 40 MB bucket.  Insight I6 (PCIe aa-3.5).
+                    _pcie_bw = float(getattr(getattr(self, 'config', None), 'pcie_bw_gbps', 15.0))
+                    _pcie_lat = float(getattr(getattr(self, 'config', None), 'pcie_latency_us', 10.0))
                     _ddp_cfg = CoreDDPConfig(
                         grad_reduce_in_fp32=False,
-                        overlap_grad_reduce=False,
+                        overlap_grad_reduce=True,           # ISSUE-2: async bucket reduce
                         use_distributed_optimizer=False,
-                        allow_skip_grad_sync=True,  # DES-LOC Kx gating
+                        allow_skip_grad_sync=True,          # DES-LOC Kx gating
                         megatron_fsdp_grad_comm_dtype=torch.bfloat16,  # M3574: PCIe BW reduction
                         cuda_graph_mode=(_cg_impl == 'full_iteration'),  # M4041
+                        use_pcie_aware_overlap=True,        # ISSUE-2: smaller buckets for PCIe
+                        pcie_bw_gbps=_pcie_bw,
+                        pcie_latency_us=_pcie_lat,
                     )
                     # From Megatron M2928: wrap DDP init in a dedicated side-stream
                     # to avoid race conditions that leave parameter buffers empty.
@@ -2490,6 +2508,26 @@ class DesLocEngine:
             if self.fp32_grad_manager is not None:
                 self.fp32_grad_manager.before_backward()
 
+            # ISSUE-2: Pre-arm _skip_sync on every DDP bucket group BEFORE the
+            # backward pass so that register_grad_ready hooks know whether to
+            # launch NCCL immediately (Kx step) or accumulate only (non-Kx step).
+            #
+            # Upstream pattern: hetseq controller.py `maybe_no_sync()` wraps the
+            # backward in `model.no_sync()` for all-but-last microbatch, gating
+            # the reduce at the hook level.  We extend this to the Kx dimension:
+            # non-Kx steps behave identically to a never-syncing no_sync() pass.
+            #
+            # Must execute AFTER zero_grad_buffer() (which calls bg.reset(),
+            # clearing _skip_sync from the previous step) and BEFORE the first
+            # backward kernel fires.
+            _is_Kx_sync_pre = (step + 1) % self.desloc_Kx == 0
+            if self._core_ddp is not None and not _is_Kx_sync_pre:
+                for _bg in (
+                    self._core_ddp.bucket_groups
+                    + self._core_ddp.expert_parallel_bucket_groups
+                ):
+                    _bg._skip_sync = True
+
             for micro in range(num_microbatches):
                 # --- Data fetch: capacity-weighted CP token split ---
                 # Pure DP: every rank fetches independently, then applies
@@ -2689,13 +2727,24 @@ class DesLocEngine:
             # shard params; on non-ZeRO-3: DDP bucket finish_grad_sync runs.
             # DES-LOC Kx gating: skip_grad_sync=True on non-Kx steps.
             #
+            # ISSUE-2 overlap flow (overlap_grad_reduce=True path):
+            #   Non-Kx steps: _skip_sync was pre-armed before backward so
+            #     register_grad_ready hooks accumulated into main_grad without
+            #     launching any NCCL op.  finish_grad_sync sees _skip_sync=True,
+            #     marks grad_reduce_finished, returns immediately — no wait.
+            #   Kx steps: _skip_sync was NOT pre-armed so hooks fired async
+            #     per-bucket all-reduce ops during backward (pipedream pattern:
+            #     comm/compute overlap within the backward pass itself).
+            #     finish_grad_sync here just waits for the already-in-flight
+            #     handles — by this point many buckets have completed.
+            #
             # M4172 (Megatron de6305c0a): Thread explicit pg_collection through
             # so finalize_model_grads does not fall back to parallel_state globals.
             # We build a minimal SimpleNamespace carrying only the groups that
             # finalize_model_grads requires; any field left as None will cause
             # the function to skip the corresponding embedding/SP collectives,
             # which is correct for the DesLoc single-tier-per-rank design.
-            _is_Kx_sync = (step + 1) % self.desloc_Kx == 0
+            _is_Kx_sync = _is_Kx_sync_pre  # computed before backward; reuse here
             try:
                 import types as _types  # noqa: PLC0415
                 from deepspeed.core.model_parallel_config import ModelParallelConfig  # noqa: PLC0415
