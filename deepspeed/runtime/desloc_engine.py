@@ -1059,22 +1059,14 @@ class DesLocEngine:
         else:
             logger.info("MLA disabled (use_mla=False); standard attention kept.")
 
-        # --- Phase 4b + 5: ZeRO-3 via core.optimizer.DistributedOptimizer ---
-        # Replaces the hand-written zero3_hetero_shard.ShardState + manual AdamW.
-        # DistributedOptimizer owns:
-        #   • FLOPS-proportional heterogeneous FP32 shard boundaries
-        #   • reduce-scatter of BF16 grads → FP32 shard grads (prepare_grads)
-        #   • local Adam step on FP32 shards
-        #   • DES-LOC Ku/Kv moment sync via sync_moments()
-        #   • all-gather FP32 shards → BF16 model (shard_to_model_broadcast)
-        #
-        # self.param_shard_state is kept as a not-None sentinel so all
-        # downstream `if self.param_shard_state is not None:` guards work
-        # without change.  self._dist_optimizer holds the actual instance.
-        self._dist_optimizer = None        # core.optimizer.DistributedOptimizer
-        self.param_shard_state = None      # sentinel: not-None ↔ ZeRO-3 active
-        self.param_shard = None            # compat alias → _dist_optimizer._fp32_shards[0]
-        self.param_offsets = None          # compat alias → synthetic param_index_map
+        # --- Phase 4b: ZeRO-3 heterogeneous parameter sharding ---
+        # Uses the original zero3_hetero_shard.ShardState which was working
+        # at baseline 3faf8420. Each rank keeps a VRAM-proportional FP32
+        # slice; full BF16 params gathered on-demand during forward/backward.
+        self.param_shard_state = None
+        self.param_shard = None
+        self.param_offsets = None
+        self._dist_optimizer = None
 
         _ws = (
             parallel_state.get_data_parallel_world_size()
@@ -1089,133 +1081,62 @@ class DesLocEngine:
 
         if _ws > 1:
             try:
-                from deepspeed.core.optimizer import DistributedOptimizer as _DistOpt  # noqa: PLC0415
-                from deepspeed.core.optimizer import OptimizerConfig as _OptCfg  # noqa: PLC0415
-                from deepspeed.core.desloc_config import TierType as _TierType  # noqa: PLC0415
-                from deepspeed.core.model_parallel_config import ModelParallelConfig as _MPCfg  # noqa: PLC0415
-
-                # Build per-rank tier_assignments for FLOPS-proportional shard sizing.
-                _tier_assignments = None
-                if getattr(self, "tiers", None):
-                    try:
-                        _ta: List = []
-                        for _t in self.tiers:
-                            _name = getattr(getattr(_t, "tier", None), "value", "")
-                            _ta.append(
-                                _TierType.DATACENTER if "H100" in _name else _TierType.EDGE
-                            )
-                        if len(_ta) == _ws:
-                            _tier_assignments = _ta
-                    except Exception:
-                        _tier_assignments = None
-
-                # OptimizerConfig mirrors TrainingConfig LR/Adam params + DES-LOC periods.
-                _opt_cfg = _OptCfg(
-                    lr=config.max_lr,
-                    min_lr=config.min_lr,
-                    weight_decay=config.weight_decay,
-                    adam_beta1=config.beta1,
-                    adam_beta2=config.beta2,
-                    adam_eps=config.eps,
-                    clip_grad=config.grad_clip,
-                    bf16=True,
-                    use_distributed_optimizer=True,
-                    desloc_enabled=True,
-                    ku=getattr(config, "desloc_Ku", 96),
-                    kv=getattr(config, "desloc_Kv", 192),
-                    kx=getattr(config, "desloc_Kx", 32),
-                    heterogeneous_shard_sizing=(_tier_assignments is not None),
+                from deepspeed.runtime.zero3_hetero_shard import (
+                    ShardState as _ShardState,
+                    vram_weights_from_tiers as _vram_weights_from_tiers,
                 )
-
-                # Build a synthetic ParamAndGradBuffer shim over the flat model layout.
-                _param_order = [
-                    (n, p) for n, p in self.model.named_parameters() if p.requires_grad
-                ]
-                if not _param_order:
-                    raise RuntimeError("No trainable parameters for DistributedOptimizer")
-
-                _total_numel = sum(p.numel() for _, p in _param_order)
-                _grad_data = torch.zeros(_total_numel, dtype=torch.float32, device=_local_device)
-
-                _param_index_map: Dict[Any, Any] = {}
-                _cursor = 0
-                for _n, _p in _param_order:
-                    _end = _cursor + _p.numel()
-                    _param_index_map[_p] = (_cursor, _end, None)
-                    _cursor = _end
-
-                class _SynBuf:
-                    """Minimal ParamAndGradBuffer shim for DistributedOptimizer."""
-                    def __init__(self, gd, pim):
-                        self.grad_data = gd
-                        self.param_index_map = pim
-
-                _syn_buf = _SynBuf(_grad_data, _param_index_map)
-
-                # DP process group — use parallel_state when available.
-                _dp_grp = (
-                    parallel_state.get_data_parallel_group()
-                    if parallel_state.is_initialized()
-                    else (dist.group.WORLD if dist.is_initialized() else None)
+                _weights = _vram_weights_from_tiers(self.tiers) if getattr(
+                    self, "tiers", None
+                ) else None
+                if _weights and len(_weights) != _ws:
+                    _weights = None
+                self.param_shard_state = _ShardState.build(
+                    model=self.model,
+                    rank=_rk,
+                    world_size=_ws,
+                    device=_local_device,
+                    vram_weights=_weights,
                 )
-
-                # Inner AdamW; DistributedOptimizer rewires param_groups in _build_shards.
-                _est_shard = _total_numel // _ws
-                _inner_adam = AdamW(
-                    [],
-                    lr=config.max_lr,
-                    betas=(config.beta1, config.beta2),
-                    eps=config.eps,
-                    weight_decay=config.weight_decay,
-                    foreach=(_est_shard <= 2 ** 31 - 1),
-                )
-
-                self._dist_optimizer = _DistOpt(
-                    config=_opt_cfg,
-                    optimizer=_inner_adam,
-                    params=[p for _, p in _param_order],
-                    model_parallel_config=_MPCfg(),
-                    param_and_grad_buffers=[_syn_buf],
-                    data_parallel_group=_dp_grp,
-                    data_parallel_group_gloo=None,
-                    tier_assignments=_tier_assignments,
-                )
-
-                # Populate compat aliases.
-                self.param_shard_state = self._dist_optimizer   # sentinel (not None)
-                self.param_shard = self._dist_optimizer._fp32_shards[0]
-                self.param_offsets = _param_index_map
-
-                _local_numel = sum(s.numel() for s in self._dist_optimizer._fp32_shards)
-                logger.info(
-                    "[zero3] core.optimizer.DistributedOptimizer active: "
-                    "%d ranks, local_shard=%d, total=%d, hetero=%s",
-                    _ws, _local_numel, _total_numel,
-                    _opt_cfg.heterogeneous_shard_sizing,
-                )
-
+                if self.param_shard_state is not None:
+                    self.param_shard = self.param_shard_state.param_shard
+                    self.param_offsets = self.param_shard_state.param_offsets
+                    _orig_total = sum(p.numel() for p in self.model.parameters())
+                    _shard_total = sum(self.param_shard_state.shard_sizes)
+                    assert _shard_total >= _orig_total, (
+                        f"shard total {_shard_total} < orig {_orig_total}"
+                    )
+                    logger.info(
+                        "[zero3] Sharding active: %d ranks, local=%d, "
+                        "total=%d (orig=%d, pad=%d)",
+                        _ws, self.param_shard.numel(),
+                        _shard_total, _orig_total,
+                        self.param_shard_state.pad,
+                    )
             except Exception as _shard_exc:  # noqa: BLE001
                 logger.warning(
-                    "[zero3] DistributedOptimizer init failed (%s); "
-                    "continuing with full-replica parameters.", _shard_exc,
+                    "[zero3] Sharding init failed (%s); continuing with "
+                    "full-replica parameters.", _shard_exc,
                 )
-                self._dist_optimizer = None
                 self.param_shard_state = None
 
-        # --- Phase 5: Optimizer ---
-        # When DistributedOptimizer is active it IS self.optimizer; its step()
-        # drives: reduce-scatter → Adam → Ku/Kv sync_moments → broadcast.
-        # For the non-ZeRO-3 path we fall through to plain AdamW.
-        if self._dist_optimizer is not None:
-            self.optimizer = self._dist_optimizer
+        # --- Phase 5: Optimizer & Scheduler ---
+        if self.param_shard_state is not None:
+            _shard = self.param_shard_state.param_shard
+            _shard.requires_grad_(True)
+            _use_foreach = _shard.numel() <= 2**31 - 1
+            self.optimizer = AdamW(
+                [_shard],
+                lr=config.max_lr,
+                betas=(config.beta1, config.beta2),
+                eps=config.eps,
+                weight_decay=config.weight_decay,
+                foreach=_use_foreach,
+            )
             logger.info(
-                "[zero3] self.optimizer = DistributedOptimizer "
-                "(shard=%d elems on %s)",
-                sum(s.numel() for s in self._dist_optimizer._fp32_shards),
-                _local_device,
+                "[zero3] Optimizer on param_shard: %d FP32 elements on %s",
+                _shard.numel(), _shard.device,
             )
         else:
-            # ZeRO-3 not active → full-replica model must live on GPU
             self.model = self.model.to(_local_device)
             self.optimizer = AdamW(
                 self.model.parameters(),
