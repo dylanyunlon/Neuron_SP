@@ -65,7 +65,6 @@ torchrun --nproc_per_node=3 --master_port=29500 \
     --batch-size 1 \
     --seq-len 2048 \
     --use-desloc \
-    --fsdp \
     --gradient-checkpointing \
     --log-every 10 \
     --save-every 500 \
