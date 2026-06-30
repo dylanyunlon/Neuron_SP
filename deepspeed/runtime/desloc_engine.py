@@ -260,13 +260,31 @@ class TrainingConfig:
     batch_schedule_seq_length: Optional[int] = None
 
     # Activation checkpointing config.
-    # activation_checkpointing: master on/off switch (default OFF for backward compat).
+    # activation_checkpointing: master on/off switch.
+    #   Defaults True — required for seq_len≥4096 on A6000 (48 GB VRAM).
+    #   Set False explicitly only on H100-only clusters where VRAM is plentiful.
     # checkpoint_activations_granularity: "full" (every layer) or "selective" (every other layer).
-    # Per-tier defaults applied in DesLocEngine.__init__:
-    #   A6000 (48 GB) → "full"       (checkpoint every TransformerBlock)
-    #   H100  (96 GB) → "selective"  (checkpoint every other TransformerBlock)
-    activation_checkpointing: bool = False
+    # Per-tier policy applied in DesLocEngine.__init__ (overrides granularity):
+    #   A6000 (48 GB, SM 8.6)  → FULL checkpoint   (wrap every TransformerBlock)
+    #   H100  (96 GB, SM 9.x)  → SELECTIVE ckpt    (wrap every other TransformerBlock)
+    #   RTX_PRO_6000_BW (96 GB)→ SELECTIVE ckpt    (same as H100)
+    # References: PipeDream runtime.py enable_recompute per-stage flag;
+    #             HetSeq controller.py OOM guard at line 282.
+    activation_checkpointing: bool = True
     checkpoint_activations_granularity: str = "full"  # "full" | "selective"
+
+    # Fine-grained CPU activation offload (A6000 only).
+    # Wired via core_adapters.maybe_enable_activation_offload() → PipelineOffloadManager.
+    # On A6000 PCIe (32 GB/s BW) offload is only worth it for cheap-to-transfer
+    # tensors (embeddings, small residuals); attention scores are faster to recompute.
+    # use_activation_offload: opt-in master switch (default False; safe on H100 clusters).
+    # activation_offload_min_size: minimum tensor element count to offload to pinned CPU.
+    #   Default 1 M elements ≈ 4 MB at fp32 / 2 MB at bf16 — skips small weight-grad tensors.
+    # activation_offload_max_inflight: max concurrent D2H transfers per group name.
+    #   None = unlimited; 4 is a safe cap for A6000 PCIe to avoid BW saturation.
+    use_activation_offload: bool = False
+    activation_offload_min_size: int = 1_048_576   # 1 M elements
+    activation_offload_max_inflight: Optional[int] = 4
 
     # Logging backends (rank 0 only)
     # wandb_project: W&B project name; None = disabled.  Requires wandb installed.
