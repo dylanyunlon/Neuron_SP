@@ -1215,6 +1215,8 @@ class DesLocEngine:
                 _local_device,
             )
         else:
+            # ZeRO-3 not active → full-replica model must live on GPU
+            self.model = self.model.to(_local_device)
             self.optimizer = AdamW(
                 self.model.parameters(),
                 lr=config.max_lr,
