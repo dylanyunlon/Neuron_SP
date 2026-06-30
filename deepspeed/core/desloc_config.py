@@ -14,7 +14,8 @@ import torch
 class TierType(Enum):
     """GPU tier classification based on compute capability."""
     DATACENTER = auto()   # H100, A100, etc.
-    PROFESSIONAL = auto() # RTX PRO 6000 Blackwell, RTX A6000, etc.
+    PROFESSIONAL = auto() # RTX A6000, etc.
+    BLACKWELL = auto()    # RTX PRO 6000 Blackwell (SM12.0)
     CONSUMER = auto()     # RTX 4090, 3090, etc.
 
 

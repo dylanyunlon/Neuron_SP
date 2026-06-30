@@ -86,7 +86,8 @@ class ParamMeta:
 _TIER_TYPE_TO_STR: Dict[TierType, str] = {
     TierType.DATACENTER:   'h100',
     TierType.PROFESSIONAL: 'a6000',
-    TierType.CONSUMER:     'blackwell',
+    TierType.BLACKWELL:    'blackwell',
+    TierType.CONSUMER:     'consumer',
 }
 
 
@@ -910,17 +911,58 @@ def _compute_hetero_shard_boundaries(
         return boundaries
 
     # -----------------------------------------------------------------------
-    # Heterogeneous partitioning: assign sizes proportional to FLOPS.
+    # Heterogeneous partitioning: assign sizes proportional to available VRAM
+    # (preferred) or FLOPS (fallback).
+    #
+    # "Available VRAM" = total_vram - model_params_bytes - grad_bytes - reserve
+    # This prevents A6000 OOM: a 49 GB card with ~30 GB fixed overhead has only
+    # ~15 GB free for optimizer state, while a 96 GB H100 with the same overhead
+    # has ~62 GB free — the ratio is ~4:1, not the 2:1 that total-VRAM would
+    # give, nor the 2.5:1 from TFLOPS.
     # -----------------------------------------------------------------------
     h100_tflops = config.h100_bf16_tflops
     a6000_tflops = config.a6000_bf16_tflops
 
-    # Tflops weight for each rank
-    rank_tflops = [h100_tflops if t == TierType.DATACENTER else a6000_tflops for t in tier_assignments]
-    total_tflops = sum(rank_tflops)
+    if getattr(config, 'shard_by_available_vram', False):
+        # Estimate per-rank fixed overhead: model params (bf16) + grads (bf16)
+        # Each param is 2 bytes (bf16) for the model copy and 2 bytes for grad.
+        param_and_grad_bytes = total_numel * 4  # shared across all ranks in ZeRO-3
+        # In ZeRO-3, each rank holds 1/dp_world_size of params+grads, but the
+        # all-gather temporarily doubles memory. Conservatively use full size.
+        per_rank_fixed_gb = (param_and_grad_bytes / dp_world_size) / (1024**3)
 
-    # Raw (unaligned) shard sizes proportional to FLOPS
-    raw_sizes = [int(total_numel * w / total_tflops) for w in rank_tflops]
+        activation_reserve = getattr(config, 'activation_reserve_gb', 4.0)
+
+        def _tier_vram(tier):
+            if tier == TierType.DATACENTER:
+                return getattr(config, 'h100_total_vram_gb', 96.0)
+            elif tier == TierType.BLACKWELL:
+                return getattr(config, 'blackwell_total_vram_gb', 98.0)
+            else:
+                return getattr(config, 'a6000_total_vram_gb', 49.0)
+
+        rank_available = []
+        for t in tier_assignments:
+            total_gb = _tier_vram(t)
+            available = max(total_gb - per_rank_fixed_gb - activation_reserve, 1.0)
+            rank_available.append(available)
+        total_available = sum(rank_available)
+        rank_weights = rank_available
+        total_weight = total_available
+    else:
+        # Fallback: shard proportional to FLOPS
+        def _tier_tflops(tier):
+            if tier == TierType.DATACENTER:
+                return h100_tflops
+            elif tier == TierType.BLACKWELL:
+                return getattr(config, 'blackwell_bf16_tflops', 300.0)
+            else:
+                return a6000_tflops
+        rank_weights = [_tier_tflops(t) for t in tier_assignments]
+        total_weight = sum(rank_weights)
+
+    # Raw (unaligned) shard sizes proportional to weight (VRAM or FLOPS)
+    raw_sizes = [int(total_numel * w / total_weight) for w in rank_weights]
 
     # Align each shard to ALIGN; distribute rounding error to first rank
     aligned_sizes = [_round_up(s, ALIGN) for s in raw_sizes]

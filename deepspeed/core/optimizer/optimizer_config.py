@@ -310,6 +310,18 @@ class OptimizerConfig:
     #   A6000 Ada ≈ 309.7 BF16 TFLOPS (dense, not sparse)
     h100_bf16_tflops: float = 989.0
     a6000_bf16_tflops: float = 309.7
+    blackwell_bf16_tflops: float = 300.0  # RTX PRO 6000 Blackwell (estimated)
+
+    # VRAM-aware shard sizing (preferred over pure TFLOPS when enabled).
+    # When ``shard_by_available_vram`` is True, _compute_hetero_shard_boundaries
+    # allocates optimizer-state shards proportional to each rank's *available*
+    # VRAM = total_vram - model_param_bytes - grad_bytes - activation_reserve,
+    # preventing A6000 OOM while still scaling to H100 capacity.
+    shard_by_available_vram: bool = True
+    h100_total_vram_gb: float = 96.0
+    a6000_total_vram_gb: float = 49.0
+    blackwell_total_vram_gb: float = 98.0
+    activation_reserve_gb: float = 4.0   # per-GPU reserved for activation peaks
 
     # -----------------------------------------------------------------------
     # Helpers
