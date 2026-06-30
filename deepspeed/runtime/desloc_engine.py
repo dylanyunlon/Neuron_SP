@@ -212,6 +212,14 @@ class TrainingConfig:
     total_steps: int = 100_000
     global_batch_size: int = 64
     micro_batch_size: int = 2
+    # Per-GPU micro-batch sizes for heterogeneous clusters.
+    # Indexed by CUDA device order matching `tiers` discovery order.
+    # When set, _plan_zero3() and the Phase-7 DeviceProfile builder use these
+    # values directly instead of computing from multipliers.  The fallback
+    # `micro_batch_size` (above) is still used as the base for any device
+    # not listed here and for consistency_check arithmetic.
+    # Example (5-GPU ags1): [2, 8, 16, 2, 8]  → A6000:2, BW:8, H100:16, A6000:2, BW:8
+    micro_batch_size_per_gpu: Optional[List[int]] = None
     grad_accum_steps: int = 8
     max_lr: float = 3e-4
     min_lr: float = 3e-5
@@ -728,7 +736,26 @@ class PartitionSolver:
         Upstream Megatron pattern — num_microbatches is a single global value
         identical on all ranks. Heterogeneous throughput comes from per-rank
         micro_batch_size (H100 takes larger batches, A6000 takes smaller).
+
+        MBS assignment priority (highest wins):
+        1. cfg.micro_batch_size_per_gpu[device_index]  — explicit yaml override
+        2. TFLOPS-aware tier multiplier                — hardware-proportional default
+
+        Tier multipliers (conservative, ~⅓ of true TFLOPS ratio to leave headroom):
+            H100 NVL      835 TFLOPS  → 8× base   (true ratio ~21:1)
+            RTX PRO 6000 Blackwell    → 4× base   (estimated ~300 TFLOPS)
+            A6000          38.7 TFLOPS → 1× base
         """
+        # TFLOPS-aware multipliers: conservative fractions of the true ratio.
+        # The former `min(base*4, 4)` hard-cap is removed; VRAM is the real limit
+        # and is already accounted for in the per-gpu yaml values.
+        _TIER_MULTIPLIER: Dict[TierClass, int] = {
+            TierClass.H100:            8,
+            TierClass.RTX_PRO_6000_BW: 4,
+            TierClass.A6000:           1,
+            TierClass.UNKNOWN:         1,
+        }
+
         cfg = self.config
         tier_layer_map: Dict[int, List[int]] = {}
         grad_accum: Dict[int, int] = {}
@@ -738,22 +765,35 @@ class PartitionSolver:
         for spec in self.tiers:
             tier_layer_map[spec.device_index] = all_layers[:]
             grad_accum[spec.device_index] = cfg.grad_accum_steps
-            if spec.tier == TierClass.H100:
-                micro_bs[spec.device_index] = min(cfg.micro_batch_size * 4, 4)
+
+            # Priority 1: explicit per-gpu override from yaml
+            if (cfg.micro_batch_size_per_gpu is not None
+                    and spec.device_index < len(cfg.micro_batch_size_per_gpu)):
+                micro_bs[spec.device_index] = cfg.micro_batch_size_per_gpu[spec.device_index]
             else:
-                micro_bs[spec.device_index] = cfg.micro_batch_size
+                # Priority 2: TFLOPS-aware multiplier
+                multiplier = _TIER_MULTIPLIER.get(spec.tier, 1)
+                micro_bs[spec.device_index] = cfg.micro_batch_size * multiplier
 
         throughput = self._estimate_zero3_throughput(micro_bs, grad_accum)
 
+        # Build a human-readable summary grouped by tier
+        mbs_by_tier = {
+            t.name: micro_bs[s.device_index]
+            for s in self.tiers
+            for t in [s.tier]
+        }
         return PartitionPlan(
             strategy=PartitionStrategy.ZERO3_HETERO,
             tier_layer_map=tier_layer_map,
             grad_accum_steps=grad_accum,
             micro_batch_sizes=micro_bs,
             estimated_throughput=throughput,
-            notes=f"ZeRO-3: uniform grad_accum={cfg.grad_accum_steps}, "
-                  f"per-tier micro_bs (H100={min(cfg.micro_batch_size * 4, 4)}, "
-                  f"A6000={cfg.micro_batch_size})",
+            notes=(
+                f"ZeRO-3 hetero: grad_accum={cfg.grad_accum_steps}, "
+                f"per-device micro_bs={dict(sorted(micro_bs.items()))} "
+                f"(source={'yaml' if cfg.micro_batch_size_per_gpu else 'tflops_multiplier'})"
+            ),
         )
 
     # ------------------------------------------------------------------
@@ -1614,16 +1654,30 @@ class DesLocEngine:
         # --- Phase 7: HeteroStepBatchScheduler ---
         # Upstream Megatron pattern: all ranks run the same num_microbatches.
         # Heterogeneous throughput via per-rank micro_batch_size, not forward count.
-        # capacity_weight is uniform (1.0) so the allocator gives each device
-        # the same microbatch count.
+        # capacity_weight is now TFLOPS-proportional so the allocator assigns
+        # more microbatches to H100/Blackwell and fewer to A6000.
+        #
+        # Multipliers (conservative, ~1/3 of true TFLOPS ratio):
+        #   H100 NVL 835 TFLOPS → weight 8.0
+        #   Blackwell ~300 TFLOPS (est.) → weight 4.0
+        #   A6000 38.7 TFLOPS → weight 1.0
+        _TIER_WEIGHT: Dict[TierClass, float] = {
+            TierClass.H100:            8.0,
+            TierClass.RTX_PRO_6000_BW: 4.0,
+            TierClass.A6000:           1.0,
+            TierClass.UNKNOWN:         1.0,
+        }
         if self.tiers:
             device_profiles = []
             for spec in self.tiers:
-                weight = 1.0  # uniform — all ranks same forward count
-                if spec.total_mem_gb >= 80:
-                    max_mbs = min(config.micro_batch_size * 4, 4)
+                weight = _TIER_WEIGHT.get(spec.tier, 1.0)
+                # max_micro_batch_size: use explicit per-gpu yaml value if available,
+                # otherwise derive from weight (H100→16, Blackwell→8, A6000→2)
+                if (config.micro_batch_size_per_gpu is not None
+                        and spec.device_index < len(config.micro_batch_size_per_gpu)):
+                    max_mbs = config.micro_batch_size_per_gpu[spec.device_index]
                 else:
-                    max_mbs = config.micro_batch_size
+                    max_mbs = max(1, int(config.micro_batch_size * weight))
                 device_profiles.append(DeviceProfile(
                     device_id=spec.device_index,
                     sm_arch=spec.sm_major * 10 + spec.sm_minor,

@@ -192,18 +192,39 @@ class DeviceProfile:
         return self.vram_gb >= 80 or self.sm_arch >= 90
 
 
-# DES-LOC 默认集群配置: 2x A6000 48GB SM86 + 1x H100 NVL 96GB SM90
-# capacity_weight 按目标微批比例设置：H100 跑 6 个微批，A6000 各跑 1 个。
-# 这样 HeteroMicrobatchAllocator 会按 1:1:6 的权重分配，消除 H100 等待 A6000 的
-# 同步瓶颈，将 MFU 从 ~8% 提升到接近 H100 峰值利用率。
+# DES-LOC 默认集群配置: ags1 5-GPU 异构节点
+#   GPU0: A6000 SM8.6  49 GB   38.7 TFLOPS BF16   capacity_weight=1.0
+#   GPU1: Blackwell SM12.0  98 GB  ~300 TFLOPS BF16 (est.)  capacity_weight=4.0
+#   GPU2: H100 NVL SM9.0  96 GB  835 TFLOPS BF16   capacity_weight=8.0
+#   GPU3: A6000 SM8.6  49 GB   38.7 TFLOPS BF16   capacity_weight=1.0
+#   GPU4: Blackwell SM12.0  98 GB  ~300 TFLOPS BF16 (est.)  capacity_weight=4.0
+#
+# capacity_weight 基于保守 TFLOPS 比（真实比约为 21:8:1，取 8:4:1 留安全余量）。
+# 这使 HeteroMicrobatchAllocator 将约 8/18 的微批分给 H100、4/18 分给每个 Blackwell、
+# 1/18 分给每个 A6000，接近 Megatron M93504931 的 6:1 目标并进一步向 21:1 逼近。
+#
+# max_micro_batch_size 对应 yaml micro_batch_size_per_gpu=[2,8,16,2,8]。
+# Blackwell 的 capacity_weight=4.0 在实测 TFLOPS 后应按比例调整。
 DEFAULT_DES_LOC_DEVICE_PROFILES: List[DeviceProfile] = [
-    DeviceProfile(device_id=0, sm_arch=86, vram_gb=48.0, capacity_weight=1.0,
-                  max_micro_batch_size=1, loc_cache_size_mb=2048),
-    DeviceProfile(device_id=1, sm_arch=86, vram_gb=48.0, capacity_weight=1.0,
-                  max_micro_batch_size=1, loc_cache_size_mb=2048),
-    DeviceProfile(device_id=2, sm_arch=90, vram_gb=96.0, capacity_weight=1.0,
-                  max_micro_batch_size=4, loc_cache_size_mb=8192),
+    DeviceProfile(device_id=0, sm_arch=86,  vram_gb=49.0,
+                  capacity_weight=1.0, max_micro_batch_size=2,
+                  loc_cache_size_mb=2048),
+    DeviceProfile(device_id=1, sm_arch=120, vram_gb=98.0,
+                  capacity_weight=4.0, max_micro_batch_size=8,
+                  loc_cache_size_mb=8192),
+    DeviceProfile(device_id=2, sm_arch=90,  vram_gb=96.0,
+                  capacity_weight=8.0, max_micro_batch_size=16,
+                  loc_cache_size_mb=8192),
+    DeviceProfile(device_id=3, sm_arch=86,  vram_gb=49.0,
+                  capacity_weight=1.0, max_micro_batch_size=2,
+                  loc_cache_size_mb=2048),
+    DeviceProfile(device_id=4, sm_arch=120, vram_gb=98.0,
+                  capacity_weight=4.0, max_micro_batch_size=8,
+                  loc_cache_size_mb=8192),
 ]
+# 总权重 = 1+4+8+1+4 = 18
+# 分配比例: GPU0(1/18) GPU1(4/18) GPU2(8/18) GPU3(1/18) GPU4(4/18)
+# H100:Blackwell:A6000 ≈ 8:4:1  (对应 micro_batch_size_per_gpu: [2,8,16,2,8])
 
 
 @dataclass

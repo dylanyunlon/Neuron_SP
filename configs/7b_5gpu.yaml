@@ -47,19 +47,21 @@ training:
 
   # --- Batch sizes ---
   # global_batch_size = sum(micro_batch_size_per_gpu) * grad_accum_steps
-  # Here: (2+4+4+2+4) * 4 = 16 * 4 = 64  → matches the 3-GPU baseline
-  global_batch_size: 64
-  grad_accum_steps: 4           # reduced from 8; more GPUs offset accumulation
+  # Here: (2+8+16+2+8) * 2 = 36 * 2 = 72
+  global_batch_size: 72
+  grad_accum_steps: 2           # reduced from 4; larger per-step MBS offset accumulation
 
-  # Per-GPU micro-batch sizes, scaled by available VRAM:
-  #   GPU0 A6000        49 GB → 2  (same as baseline; 49 GB is the tightest stage)
-  #   GPU1 Blackwell    98 GB → 4  (2× VRAM vs A6000)
-  #   GPU2 H100 NVL     96 GB → 4  (large VRAM, high BW — take bigger slice)
-  #   GPU3 A6000        49 GB → 2  (mirror of GPU0)
-  #   GPU4 Blackwell    98 GB → 4  (mirror of GPU1)
-  # NOTE: these values are used by the DesLocEngine per-stage micro-batch
-  #   scheduler; the key name must match what run_pretrain.py expects.
-  micro_batch_size_per_gpu: [2, 4, 4, 2, 4]
+  # Per-GPU micro-batch sizes, scaled by TFLOPS (not just VRAM):
+  #   GPU0  A6000        38.7 TFLOPS →  2  (baseline)
+  #   GPU1  Blackwell    ~300 TFLOPS →  8  (est. 4× base; update after benchmarking)
+  #   GPU2  H100 NVL      835 TFLOPS → 16  (8× base; conservative vs 21:1 true ratio)
+  #   GPU3  A6000        38.7 TFLOPS →  2  (mirror GPU0)
+  #   GPU4  Blackwell    ~300 TFLOPS →  8  (mirror GPU1)
+  # Ratio H100:Blackwell:A6000 = 16:8:2 = 8:4:1
+  # vs Megatron M93504931 target 6:1 (H100:A6000) — we go more aggressive.
+  # vs true TFLOPS ratio 21:1 — conservative safety margin retained.
+  # global_batch_size = (2+8+16+2+8) × grad_accum_steps = 36 × 2 = 72
+  micro_batch_size_per_gpu: [2, 8, 16, 2, 8]
 
   # Kept for backwards-compat with single-value consumers; set to the minimum
   # stage value so nothing OOMs on the A6000 stages.
