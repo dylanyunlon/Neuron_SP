@@ -3147,6 +3147,41 @@ class DesLocEngine:
                     logger.warning("[eval] step=%d eval hook failed: %s", self.global_step, _eval_exc)
                 finally:
                     self.model.train()
+                    # --- M3490 (b8e23d587): reset activation offload manager after eval ---
+                    # PipeDream runtime.py train() resets all tensor/gradient state when
+                    # re-entering training from eval mode (tensors=[], gradients={},
+                    # forward_minibatch_id=0).  We do the same for PipelineOffloadManager:
+                    # eval runs no backward pass, so the backward-chunk deque accumulates
+                    # stale ChunkOffloadHandler entries that are never drained.  If left
+                    # in place, the next training step's H2D restores (on_get_saved_tensor)
+                    # will pop from the wrong backward chunk and corrupt activations.
+                    #
+                    # HetSeq controller.py train_step() calls self.model.train() at entry
+                    # and self.zero_grad(); we mirror that with a manager-level reset so
+                    # all chunk-handler state is consistent with a fresh micro-batch window.
+                    if getattr(self, "_activation_offload_iface", None) is not None:
+                        try:
+                            self._activation_offload_iface.reset_instance()
+                            self._activation_offload_iface.init_chunk_handler(
+                                vp_size=getattr(cfg, "virtual_pipeline_model_parallel_size", None),
+                                vp_stage=0,
+                                min_offloaded_tensor_size=getattr(
+                                    cfg, "activation_offload_min_size", 1_048_576
+                                ),
+                                max_inflight_offloads=getattr(
+                                    cfg, "activation_offload_max_inflight", None
+                                ),
+                            )
+                            logger.info(
+                                "[eval] step=%d PipelineOffloadManager reset+reinit "
+                                "(M3490 parity — stale backward chunks cleared)",
+                                self.global_step,
+                            )
+                        except Exception as _reset_exc:  # noqa: BLE001
+                            logger.warning(
+                                "[eval] step=%d offload manager reset failed: %s",
+                                self.global_step, _reset_exc,
+                            )
         total_time = time.time() - train_start
         # Drain any outstanding async shard sync from the final step so that
         # checkpointing / evaluation that follows reads consistent BF16 params.
