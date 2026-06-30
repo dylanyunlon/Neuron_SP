@@ -279,10 +279,11 @@ class TrainingConfig:
     """Per-tier LR scaling factor when use_core_scheduler=True.
     A6000 tiers should use ~0.8, H100 tiers use 1.0."""
 
-    use_pipeline_schedule: bool = False
+    use_pipeline_schedule: bool = True
     """Replace inline forward_backward_func closure with Megatron-style
     pipeline schedule from deepspeed/core/pipeline_parallel/schedules.py.
-    Enables combined_1f1b, interleaved 1F1B, A2A overlap."""
+    Enables combined_1f1b, interleaved 1F1B, A2A overlap.
+    Enabled by default; set False only for debugging single-GPU runs."""
 
     virtual_pipeline_model_parallel_size: Optional[int] = None
     """Virtual pipeline model parallel size for interleaved 1F1B.
