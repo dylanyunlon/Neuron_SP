@@ -440,98 +440,95 @@ class DesLocEngine:
                 )
                 self.param_shard_state = None
 
-        # --- Phase 5: Optimizer & Scheduler ---
-        # Ref: DeepSpeed #4527 (GPU memory higher than estimated)
-        #      DeepSpeed #3313 (optimizer state inits on GPU then offloads)
-        #      Megatron PR #2811 (optimizer state + master weight offloading)
-        #      ColossalAI HybridAdam (adaptive GPU/CPU placement)
+        # --- Phase 5: Optimizer & Scheduler (hetero_bridge) ---
+        # Replaces the ad-hoc AdamW / DeepSpeedCPUAdam setup with the single
+        # hetero_bridge entrypoint that:
+        #   1. Discovers GPU tiers (TierMap.discover)
+        #   2. Plans VRAM-proportional fp32 shards (HeteroShardPlanner.plan)
+        #   3. Builds per-rank optimizer — CPUAdam on A6000, fused AdamW on H100/Blackwell
+        #      (DistOptAdapter.build)
+        #   4. Attaches adapter to self.optimizer / self._dist_optimizer
         #
-        # On low-VRAM tiers (A6000 ≤47GB), PyTorch Adam's _init_group
-        # allocates exp_avg + exp_avg_sq on GPU via torch.zeros_like,
-        # causing OOM.  Fix: move param_shard to CPU before optimizer
-        # init so states are allocated in CPU RAM, then use
-        # DeepSpeedCPUAdam for efficient CPU-side updates.
-        _local_vram_gb = torch.cuda.get_device_properties(
-            _local_device
-        ).total_memory / (1 << 30)
-        self._cpu_offload_optim = _local_vram_gb < 50.0
+        # Graceful fallback: if install() raises for any reason we fall back to
+        # the original AdamW path so training is never blocked by a bridge bug.
+        try:
+            from deepspeed.core.hetero_bridge import engine_integration as _hb_ei
+            _hb_ei.install(
+                self,
+                lr=config.max_lr,
+                betas=(config.beta1, config.beta2),
+                weight_decay=config.weight_decay,
+            )
+            logger.info("[hetero_bridge] Phase 5: install() succeeded — "
+                        "optimizer=%s, _cpu_offload=%s",
+                        type(self.optimizer).__name__, self._cpu_offload_optim)
+        except Exception as _hb_exc:  # noqa: BLE001
+            logger.warning(
+                "[hetero_bridge] install() failed (%s); "
+                "falling back to plain AdamW.", _hb_exc,
+            )
+            # ── Legacy fallback path (original Phase 5 behaviour) ─────────
+            _local_vram_gb = torch.cuda.get_device_properties(
+                _local_device
+            ).total_memory / (1 << 30)
+            self._cpu_offload_optim = _local_vram_gb < 50.0
 
-        if self.param_shard_state is not None:
-            _shard = self.param_shard_state.param_shard
-            _shard.requires_grad_(True)
+            if self.param_shard_state is not None:
+                _shard = self.param_shard_state.param_shard
+                _shard.requires_grad_(True)
 
-            if self._cpu_offload_optim:
-                # --- A6000 path: CPU optimizer (Ref: DeepSpeed cpu_adam.py) ---
-                # Move shard to CPU so Adam states (exp_avg, exp_avg_sq)
-                # are allocated in pinned host memory, not GPU VRAM.
-                _gpu_device = _shard.device
-                _shard_cpu = _shard.detach().to("cpu", non_blocking=False)
-                _shard_cpu.requires_grad_(True)
-                # Replace in-place so param_shard_state still references it
-                self.param_shard_state.param_shard = _shard_cpu
-                self.param_shard = _shard_cpu
-
-                try:
-                    from deepspeed.ops.adam import DeepSpeedCPUAdam
-                    self.optimizer = DeepSpeedCPUAdam(
-                        [_shard_cpu],
-                        lr=config.max_lr,
-                        betas=(config.beta1, config.beta2),
-                        eps=config.eps,
-                        weight_decay=config.weight_decay,
-                        adamw_mode=True,
-                        fp32_optimizer_states=True,
-                    )
-                    self._optim_type = "DeepSpeedCPUAdam"
-                except ImportError:
-                    # Fallback: plain AdamW on CPU (slower but no OOM)
+                if self._cpu_offload_optim:
+                    _gpu_device = _shard.device
+                    _shard_cpu = _shard.detach().to("cpu", non_blocking=False)
+                    _shard_cpu.requires_grad_(True)
+                    self.param_shard_state.param_shard = _shard_cpu
+                    self.param_shard = _shard_cpu
+                    try:
+                        from deepspeed.ops.adam import DeepSpeedCPUAdam
+                        self.optimizer = DeepSpeedCPUAdam(
+                            [_shard_cpu],
+                            lr=config.max_lr,
+                            betas=(config.beta1, config.beta2),
+                            eps=config.eps,
+                            weight_decay=config.weight_decay,
+                            adamw_mode=True,
+                            fp32_optimizer_states=True,
+                        )
+                        self._optim_type = "DeepSpeedCPUAdam"
+                    except ImportError:
+                        self.optimizer = AdamW(
+                            [_shard_cpu],
+                            lr=config.max_lr,
+                            betas=(config.beta1, config.beta2),
+                            eps=config.eps,
+                            weight_decay=config.weight_decay,
+                        )
+                        self._optim_type = "AdamW(cpu)"
+                    self._optim_gpu_device = _gpu_device
+                else:
+                    _use_foreach = _shard.numel() <= 2**31 - 1
                     self.optimizer = AdamW(
-                        [_shard_cpu],
+                        [_shard],
                         lr=config.max_lr,
                         betas=(config.beta1, config.beta2),
                         eps=config.eps,
                         weight_decay=config.weight_decay,
+                        foreach=_use_foreach,
                     )
-                    self._optim_type = "AdamW(cpu)"
-
-                self._optim_gpu_device = _gpu_device
-                logger.info(
-                    "[zero3] CPU offload optimizer (%s) on param_shard: "
-                    "%d FP32 elements, VRAM=%.1fGB < 50GB threshold. "
-                    "Ref: DeepSpeed #4527, Megatron PR #2811",
-                    self._optim_type, _shard_cpu.numel(), _local_vram_gb,
-                )
+                    self._optim_type = "AdamW(gpu)"
+                self.model = self.model.to(_local_device)
             else:
-                # --- H100/Blackwell path: fused GPU AdamW ---
-                _use_foreach = _shard.numel() <= 2**31 - 1
+                self.model = self.model.to(_local_device)
                 self.optimizer = AdamW(
-                    [_shard],
+                    self.model.parameters(),
                     lr=config.max_lr,
                     betas=(config.beta1, config.beta2),
                     eps=config.eps,
                     weight_decay=config.weight_decay,
-                    foreach=_use_foreach,
+                    fused=self._fused_adam_available(),
                 )
-                self._optim_type = "AdamW(gpu)"
-                logger.info(
-                    "[zero3] GPU optimizer on param_shard: %d FP32 elements "
-                    "on %s, VRAM=%.1fGB",
-                    _shard.numel(), _shard.device, _local_vram_gb,
-                )
-
-            self.model = self.model.to(_local_device)
-        else:
-            self.model = self.model.to(_local_device)
-            self.optimizer = AdamW(
-                self.model.parameters(),
-                lr=config.max_lr,
-                betas=(config.beta1, config.beta2),
-                eps=config.eps,
-                weight_decay=config.weight_decay,
-                fused=self._fused_adam_available(),
-            )
-            self._optim_type = "AdamW(full-replica)"
-            self._cpu_offload_optim = False
+                self._optim_type = "AdamW(full-replica)"
+                self._cpu_offload_optim = False
         self.scheduler = build_warmup_cosine_scheduler(
             self.optimizer,
             warmup_steps=config.warmup_steps,

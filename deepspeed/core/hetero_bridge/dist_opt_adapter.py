@@ -470,6 +470,18 @@ class DistOptAdapter:
             return self._opt
 
     # ------------------------------------------------------------------
+    # .defaults — pass-through so engine.optimizer.defaults.get() works
+    # (desloc_engine line ~1820 checks optimizer.defaults.get("foreach", False))
+    # ------------------------------------------------------------------
+
+    @property
+    def defaults(self) -> dict:
+        """Return the inner optimizer's defaults dict (or an empty dict)."""
+        if self._opt is not None and hasattr(self._opt, "defaults"):
+            return self._opt.defaults
+        return {}
+
+    # ------------------------------------------------------------------
     # step / zero_grad  — frozen public API
     # ------------------------------------------------------------------
 
