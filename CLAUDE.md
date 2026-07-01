@@ -25,6 +25,18 @@
 - Comments should explain **why**, not **what**. Describe the purpose and reasoning, not the mechanics that the code already shows.
 - New features must include corresponding tests and documentation updates.
 
+## Execution discipline (CRITICAL)
+
+- **NO commentary.** Do not narrate what you are about to do, what you just did, or why. Execute silently.
+- **NO progress reports.** Do not tell the user "I'm now going to...", "Let me first...", "Step 1:", "Here's my plan:". Just do it.
+- **NO asking for confirmation.** If the task is clear, execute. Do not ask "shall I proceed?" or "would you like me to...".
+- **NO summarizing your own output.** After running a command or writing code, do not restate what the output says. The user can read.
+- **NO hedging.** Do not say "I think", "it seems like", "this might". State facts or act.
+- **Maximize code, minimize prose.** A response with 200 lines of code and 0 lines of explanation is better than 20 lines of code and 50 lines of explanation.
+- **Full files, not fragments.** When modifying code, output the complete modified file via artifacts or write it directly. Do not output partial diffs with "..." elisions.
+- **Loop until done.** If a task requires multiple steps, execute all of them in one turn. Do not stop after one step and wait for the user to say "continue".
+- **No new branches, no v2/v3 suffixes.** All work goes on main. All files keep their original names.
+
 ## Tool Caveats
 
 ### Edit tool auto-formatter
