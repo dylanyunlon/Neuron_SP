@@ -15,6 +15,14 @@ The file has been adapted from two fairscale files:
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
 
+# Defer annotation evaluation so that `dist.ProcessGroup` (deepspeed.comm) used
+# as a type hint at class-definition time does not require deepspeed.comm to be
+# fully initialized. Without this, importing sharded_moe while deepspeed.comm is
+# still initializing (circular import via ops.transformer.inference.moe_inference)
+# raises: AttributeError: partially initialized module 'deepspeed.comm' has no
+# attribute 'ProcessGroup'.
+from __future__ import annotations
+
 from deepspeed.utils.timer import SynchronizedWallClockTimer
 from deepspeed.utils import logger
 from deepspeed.utils.bwc import bwc_tensor_model_parallel_world_size
