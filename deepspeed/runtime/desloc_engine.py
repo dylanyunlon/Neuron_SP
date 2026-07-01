@@ -1120,25 +1120,84 @@ class DesLocEngine:
                 self.param_shard_state = None
 
         # --- Phase 5: Optimizer & Scheduler ---
+        # Ref: DeepSpeed #4527 (GPU memory higher than estimated)
+        #      DeepSpeed #3313 (optimizer state inits on GPU then offloads)
+        #      Megatron PR #2811 (optimizer state + master weight offloading)
+        #      ColossalAI HybridAdam (adaptive GPU/CPU placement)
+        #
+        # On low-VRAM tiers (A6000 ≤47GB), PyTorch Adam's _init_group
+        # allocates exp_avg + exp_avg_sq on GPU via torch.zeros_like,
+        # causing OOM.  Fix: move param_shard to CPU before optimizer
+        # init so states are allocated in CPU RAM, then use
+        # DeepSpeedCPUAdam for efficient CPU-side updates.
+        _local_vram_gb = torch.cuda.get_device_properties(
+            _local_device
+        ).total_memory / (1 << 30)
+        self._cpu_offload_optim = _local_vram_gb < 50.0
+
         if self.param_shard_state is not None:
             _shard = self.param_shard_state.param_shard
             _shard.requires_grad_(True)
-            _use_foreach = _shard.numel() <= 2**31 - 1
-            self.optimizer = AdamW(
-                [_shard],
-                lr=config.max_lr,
-                betas=(config.beta1, config.beta2),
-                eps=config.eps,
-                weight_decay=config.weight_decay,
-                foreach=_use_foreach,
-            )
-            logger.info(
-                "[zero3] Optimizer on param_shard: %d FP32 elements on %s",
-                _shard.numel(), _shard.device,
-            )
-            # BF16 model must be on GPU for torch.compile (AutoSP) to trace.
-            # ZeRO-3 FP32 master shard is separate; this just places the
-            # forward/backward compute graph on the correct device.
+
+            if self._cpu_offload_optim:
+                # --- A6000 path: CPU optimizer (Ref: DeepSpeed cpu_adam.py) ---
+                # Move shard to CPU so Adam states (exp_avg, exp_avg_sq)
+                # are allocated in pinned host memory, not GPU VRAM.
+                _gpu_device = _shard.device
+                _shard_cpu = _shard.detach().to("cpu", non_blocking=False)
+                _shard_cpu.requires_grad_(True)
+                # Replace in-place so param_shard_state still references it
+                self.param_shard_state.param_shard = _shard_cpu
+                self.param_shard = _shard_cpu
+
+                try:
+                    from deepspeed.ops.adam import DeepSpeedCPUAdam
+                    self.optimizer = DeepSpeedCPUAdam(
+                        [_shard_cpu],
+                        lr=config.max_lr,
+                        betas=(config.beta1, config.beta2),
+                        eps=config.eps,
+                        weight_decay=config.weight_decay,
+                        adamw_mode=True,
+                        fp32_optimizer_states=True,
+                    )
+                    self._optim_type = "DeepSpeedCPUAdam"
+                except ImportError:
+                    # Fallback: plain AdamW on CPU (slower but no OOM)
+                    self.optimizer = AdamW(
+                        [_shard_cpu],
+                        lr=config.max_lr,
+                        betas=(config.beta1, config.beta2),
+                        eps=config.eps,
+                        weight_decay=config.weight_decay,
+                    )
+                    self._optim_type = "AdamW(cpu)"
+
+                self._optim_gpu_device = _gpu_device
+                logger.info(
+                    "[zero3] CPU offload optimizer (%s) on param_shard: "
+                    "%d FP32 elements, VRAM=%.1fGB < 50GB threshold. "
+                    "Ref: DeepSpeed #4527, Megatron PR #2811",
+                    self._optim_type, _shard_cpu.numel(), _local_vram_gb,
+                )
+            else:
+                # --- H100/Blackwell path: fused GPU AdamW ---
+                _use_foreach = _shard.numel() <= 2**31 - 1
+                self.optimizer = AdamW(
+                    [_shard],
+                    lr=config.max_lr,
+                    betas=(config.beta1, config.beta2),
+                    eps=config.eps,
+                    weight_decay=config.weight_decay,
+                    foreach=_use_foreach,
+                )
+                self._optim_type = "AdamW(gpu)"
+                logger.info(
+                    "[zero3] GPU optimizer on param_shard: %d FP32 elements "
+                    "on %s, VRAM=%.1fGB",
+                    _shard.numel(), _shard.device, _local_vram_gb,
+                )
+
             self.model = self.model.to(_local_device)
         else:
             self.model = self.model.to(_local_device)
@@ -1150,6 +1209,8 @@ class DesLocEngine:
                 weight_decay=config.weight_decay,
                 fused=self._fused_adam_available(),
             )
+            self._optim_type = "AdamW(full-replica)"
+            self._cpu_offload_optim = False
         self.scheduler = build_warmup_cosine_scheduler(
             self.optimizer,
             warmup_steps=config.warmup_steps,
@@ -2077,9 +2138,29 @@ class DesLocEngine:
         return loss, scaled_loss
 
     def step(self) -> None:
-        """Optimizer step — used by hetero_grad_norm_skip monkey-patch."""
+        """Optimizer step — used by hetero_grad_norm_skip monkey-patch.
+
+        On CPU-offload ranks (A6000, VRAM<50GB), the param_shard lives
+        on CPU during optimizer.step().  After the CPU Adam update, we
+        copy the updated FP32 shard back to GPU for the next forward pass.
+        Ref: Megatron PR #2811 (optimizer state offloading).
+        """
         if self.optimizer is not None:
-            self.optimizer.step()
+            if getattr(self, '_cpu_offload_optim', False):
+                # CPU offload path: grad must be on CPU for CPUAdam
+                _shard = self.param_shard_state.param_shard
+                if _shard.grad is not None and _shard.grad.device.type != 'cpu':
+                    _shard.grad = _shard.grad.to('cpu', non_blocking=True)
+                    torch.cuda.current_stream().synchronize()
+                self.optimizer.step()
+                # Copy updated params back to GPU for next forward
+                _gpu = getattr(self, '_optim_gpu_device', None)
+                if _gpu is not None and self.param_shard is not None:
+                    self.param_shard.data.copy_(
+                        _shard.data, non_blocking=True
+                    )
+            else:
+                self.optimizer.step()
 
     def train(self) -> None:
         """
