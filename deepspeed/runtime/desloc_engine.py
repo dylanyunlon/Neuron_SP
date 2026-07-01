@@ -2246,17 +2246,83 @@ class DesLocEngine:
             register_long_context_checkpointing()
 
             from deepspeed.compile.passes.sp_compile import apply_autosp
-            from deepspeed.compile.custom_ops.all_to_all import all_to_all as _sp_all_to_all
             from deepspeed.compile.custom_ops import sp_dp_registry
 
-            # ── Direct SP injection (bypass torch.compile) ──────────────
-            # torch.compile + dynamo on PyTorch 2.7.1+cu118 decomposes SDPA
-            # regardless of custom_op / allow_in_graph. Instead of fighting
-            # dynamo, inject all-to-all calls directly into the model's
-            # attention forward method, like 360-LLaMA-Factory's Ulysses.
-            _orig_attn_forward = self.model.layers[0].attn.forward.__func__ if hasattr(self.model.layers[0].attn.forward, '__func__') else None
-
             _sp_size = sp_size
+
+            def _raw_a2a(tensor, scatter_idx, gather_idx, group):
+                """Low-level A2A without autograd. Handles padding internally."""
+                B, dim1, dim2, H = tensor.shape
+                P = _sp_size
+
+                if scatter_idx == 1:
+                    pad_n = (P - dim1 % P) % P
+                    if pad_n > 0:
+                        tensor = F.pad(tensor, (0, 0, 0, 0, 0, pad_n))
+                        dim1 += pad_n
+                else:
+                    pad_n = (P - dim2 % P) % P
+                    if pad_n > 0:
+                        tensor = F.pad(tensor, (0, 0, 0, pad_n))
+                        dim2 += pad_n
+
+                if scatter_idx == 1:
+                    # scatter heads, gather seq
+                    t = tensor.reshape(B, P, dim1 // P, dim2, H).permute(1, 0, 2, 3, 4).contiguous()
+                    out = torch.empty_like(t)
+                    dist.all_to_all_single(out, t, group=group)
+                    out = out.permute(1, 2, 0, 3, 4).contiguous()
+                    return out.reshape(B, dim1 // P, P * dim2, H)
+                else:
+                    # scatter seq, gather heads
+                    t = tensor.reshape(B, dim1, P, dim2 // P, H).permute(2, 0, 1, 3, 4).contiguous()
+                    out = torch.empty_like(t)
+                    dist.all_to_all_single(out, t, group=group)
+                    out = out.permute(1, 0, 2, 3, 4).contiguous()
+                    return out.reshape(B, P * dim1, dim2 // P, H)
+
+            class _SPAttentionFn(torch.autograd.Function):
+                @staticmethod
+                def forward(ctx, q, k, v, group, n_heads, T):
+                    # q,k,v: [B, n_heads, T, head_dim]
+                    # Forward A2A: scatter seq, gather heads
+                    q2 = _raw_a2a(q, scatter_idx=2, gather_idx=1, group=group)
+                    k2 = _raw_a2a(k, scatter_idx=2, gather_idx=1, group=group)
+                    v2 = _raw_a2a(v, scatter_idx=2, gather_idx=1, group=group)
+                    # SDPA
+                    out2 = F.scaled_dot_product_attention(q2, k2, v2, is_causal=True)
+                    # Reverse A2A: scatter heads, gather seq
+                    out3 = _raw_a2a(out2, scatter_idx=1, gather_idx=2, group=group)
+                    # Trim to original shape
+                    out3 = out3[:, :n_heads, :T, :]
+
+                    ctx.save_for_backward(q, k, v)
+                    ctx.group = group
+                    ctx.n_heads = n_heads
+                    ctx.T = T
+                    return out3
+
+                @staticmethod
+                def backward(ctx, grad_output):
+                    q, k, v = ctx.saved_tensors
+                    group = ctx.group
+                    n_heads = ctx.n_heads
+                    T = ctx.T
+
+                    # Re-compute forward (checkpointing-style) to get SDPA grads
+                    with torch.enable_grad():
+                        q2 = _raw_a2a(q.detach().requires_grad_(True), 2, 1, group)
+                        k2 = _raw_a2a(k.detach().requires_grad_(True), 2, 1, group)
+                        v2 = _raw_a2a(v.detach().requires_grad_(True), 2, 1, group)
+                        out2 = F.scaled_dot_product_attention(q2, k2, v2, is_causal=True)
+                        out3 = _raw_a2a(out2, 1, 2, group)
+                        out3 = out3[:, :n_heads, :T, :]
+                        out3.backward(grad_output)
+
+                    return q2.grad if q2.grad is not None else torch.zeros_like(q), \
+                           k2.grad if k2.grad is not None else torch.zeros_like(k), \
+                           v2.grad if v2.grad is not None else torch.zeros_like(v), \
+                           None, None, None
 
             def _sp_attn_forward(self_attn, x):
                 B, T, C = x.shape
@@ -2265,30 +2331,17 @@ class DesLocEngine:
 
                 qkv = self_attn.qkv(x).reshape(B, T, 3, n_heads, head_dim)
                 q, k, v = qkv.unbind(2)
-                # q,k,v: [B, T, n_heads, head_dim] → [B, n_heads, T, head_dim]
                 q = q.transpose(1, 2)
                 k = k.transpose(1, 2)
                 v = v.transpose(1, 2)
 
-                # SP: scatter seq (dim2), gather heads (dim1)
-                # Input: [B, n_heads, T, head_dim]
-                # After A2A: [B, n_heads*sp, T/sp, head_dim]
                 if _sp_size > 1 and dist.is_initialized() and dist.get_world_size() > 1:
-                    q = _sp_all_to_all(q, scatter_idx=2, gather_idx=1, name="q")
-                    k = _sp_all_to_all(k, scatter_idx=2, gather_idx=1, name="k")
-                    v = _sp_all_to_all(v, scatter_idx=2, gather_idx=1, name="v")
-
-                out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
-
-                if _sp_size > 1 and dist.is_initialized() and dist.get_world_size() > 1:
-                    # Reverse: scatter heads (dim1), gather seq (dim2)
-                    out = _sp_all_to_all(out, scatter_idx=1, gather_idx=2, name="o")
-                    # Trim padded heads (32 heads, sp=3 → padded to 33 → trim back)
-                    if out.shape[1] > n_heads:
-                        out = out[:, :n_heads, :, :]
-                    # Trim padded seq (2048, sp=3 → padded to 2049 → trim back)
-                    if out.shape[2] > T:
-                        out = out[:, :, :T, :]
+                    _rank = dist.get_rank()
+                    _gid = _rank // _sp_size
+                    _group = sp_dp_registry.get_group(_gid)
+                    out = _SPAttentionFn.apply(q, k, v, _group, n_heads, T)
+                else:
+                    out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
 
                 return self_attn.proj(out.transpose(1, 2).contiguous().reshape(B, T, C))
 
