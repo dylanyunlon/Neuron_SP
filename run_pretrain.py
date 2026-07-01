@@ -1468,12 +1468,24 @@ def main() -> None:
 
     if args.use_desloc and _HAS_DESLOC:
         run_desloc(args)
+    elif args.use_desloc and not _HAS_DESLOC:
+        # DO NOT fall back to standalone DDP — this silently loses ZeRO-3
+        # heterogeneous sharding, causing A6000 OOM on full-model DDP.
+        # Ref: DeepSpeed #4807 (DDP loads whole model → OOM),
+        #      DeepSpeed #5575 (ZeRO-3 init bypass loads full model),
+        #      HexiScale/FlashFlex (heterogeneous GPU training),
+        #      Cephalo (arxiv:2411.01075, decoupled state allocation)
+        logger.error(
+            "--use-desloc requested but DesLocEngine failed to import. "
+            "REFUSING to fall back to standalone DDP — full-model replication "
+            "will OOM on A6000 (47GB) with 7B model. Fix the import error above."
+        )
+        raise RuntimeError(
+            f"DesLocEngine import failed: {_desloc_import_err}\n"
+            "Cannot fall back to DDP: 7B model requires ZeRO-3 heterogeneous "
+            "sharding for A6000 (47GB). Fix the import error and retry."
+        )
     else:
-        if args.use_desloc and not _HAS_DESLOC:
-            logger.warning(
-                "--use-desloc requested but DesLocEngine unavailable; "
-                "using standalone loop."
-            )
         run_standalone(args)
 
 
