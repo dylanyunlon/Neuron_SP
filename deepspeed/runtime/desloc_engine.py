@@ -540,10 +540,14 @@ class DesLocEngine:
                 self._optim_type = "AdamW(full-replica)"
                 self._cpu_offload_optim = False
         # LRScheduler requires a torch.optim.Optimizer instance.
-        # DistOptAdapter wraps the real optimizer; unwrap it for the scheduler.
+        # Unwrap chain: DistOptAdapter._opt → DistributedOptimizer.optimizer → AdamW
         _sched_opt = self.optimizer
+        # Level 1: DistOptAdapter → DistributedOptimizer
         if hasattr(_sched_opt, '_opt') and _sched_opt._opt is not None:
             _sched_opt = _sched_opt._opt
+        # Level 2: DistributedOptimizer → torch.optim.AdamW
+        if hasattr(_sched_opt, 'optimizer') and hasattr(_sched_opt.optimizer, 'param_groups'):
+            _sched_opt = _sched_opt.optimizer
         self.scheduler = build_warmup_cosine_scheduler(
             _sched_opt,
             warmup_steps=config.warmup_steps,
