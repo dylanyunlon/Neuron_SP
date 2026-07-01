@@ -101,6 +101,12 @@ try:
     if d.get('type')=='content_block_delta':
         t=d.get('delta',{}).get('text','')
         if t: print(t,end='',flush=True)
+    elif d.get('type')=='content_block_start':
+        cb=d.get('content_block',{})
+        if cb.get('type')=='tool_use':
+            print(f\"\\n[tool:{cb.get('name','')}]\",end='',flush=True)
+    elif d.get('type')=='message_stop':
+        pass
 except: pass
 " 2>/dev/null | tee -a "$OUTPUT_FILE"
     fi
