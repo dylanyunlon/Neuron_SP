@@ -2285,44 +2285,57 @@ class DesLocEngine:
                 @staticmethod
                 def forward(ctx, q, k, v, group, n_heads, T):
                     # q,k,v: [B, n_heads, T, head_dim]
-                    # Forward A2A: scatter seq, gather heads
                     q2 = _raw_a2a(q, scatter_idx=2, gather_idx=1, group=group)
                     k2 = _raw_a2a(k, scatter_idx=2, gather_idx=1, group=group)
                     v2 = _raw_a2a(v, scatter_idx=2, gather_idx=1, group=group)
-                    # SDPA
                     out2 = F.scaled_dot_product_attention(q2, k2, v2, is_causal=True)
-                    # Reverse A2A: scatter heads, gather seq
                     out3 = _raw_a2a(out2, scatter_idx=1, gather_idx=2, group=group)
-                    # Trim to original shape
                     out3 = out3[:, :n_heads, :T, :]
 
-                    ctx.save_for_backward(q, k, v)
+                    # Save A2A'd tensors for backward (not original q,k,v — saves memory)
+                    ctx.save_for_backward(q2, k2, v2, out2)
                     ctx.group = group
                     ctx.n_heads = n_heads
                     ctx.T = T
+                    ctx.out3_shape_before_trim = (_raw_a2a(out2, 1, 2, group)).shape
                     return out3
 
                 @staticmethod
                 def backward(ctx, grad_output):
-                    q, k, v = ctx.saved_tensors
+                    q2, k2, v2, out2 = ctx.saved_tensors
                     group = ctx.group
                     n_heads = ctx.n_heads
                     T = ctx.T
+                    full_shape = ctx.out3_shape_before_trim
 
-                    # Re-compute forward (checkpointing-style) to get SDPA grads
+                    # 1. Un-trim grad_output → pad back to pre-trim shape
+                    d_out3 = torch.zeros(full_shape, dtype=grad_output.dtype, device=grad_output.device)
+                    d_out3[:, :n_heads, :T, :] = grad_output
+
+                    # 2. Reverse A2A gradient: out3 = A2A(out2, scatter=1, gather=2)
+                    #    gradient of "scatter heads, gather seq" = "scatter seq, gather heads"
+                    d_out2 = _raw_a2a(d_out3, scatter_idx=2, gather_idx=1, group=group)
+
+                    # 3. SDPA backward via autograd.grad
                     with torch.enable_grad():
-                        q2 = _raw_a2a(q.detach().requires_grad_(True), 2, 1, group)
-                        k2 = _raw_a2a(k.detach().requires_grad_(True), 2, 1, group)
-                        v2 = _raw_a2a(v.detach().requires_grad_(True), 2, 1, group)
-                        out2 = F.scaled_dot_product_attention(q2, k2, v2, is_causal=True)
-                        out3 = _raw_a2a(out2, 1, 2, group)
-                        out3 = out3[:, :n_heads, :T, :]
-                        out3.backward(grad_output)
+                        q2g = q2.detach().requires_grad_(True)
+                        k2g = k2.detach().requires_grad_(True)
+                        v2g = v2.detach().requires_grad_(True)
+                        o2g = F.scaled_dot_product_attention(q2g, k2g, v2g, is_causal=True)
+                        dq2, dk2, dv2 = torch.autograd.grad(o2g, (q2g, k2g, v2g), d_out2)
 
-                    return q2.grad if q2.grad is not None else torch.zeros_like(q), \
-                           k2.grad if k2.grad is not None else torch.zeros_like(k), \
-                           v2.grad if v2.grad is not None else torch.zeros_like(v), \
-                           None, None, None
+                    # 4. Forward A2A gradient: q2 = A2A(q, scatter=2, gather=1)
+                    #    gradient of "scatter seq, gather heads" = "scatter heads, gather seq"
+                    dq = _raw_a2a(dq2, scatter_idx=1, gather_idx=2, group=group)
+                    dk = _raw_a2a(dk2, scatter_idx=1, gather_idx=2, group=group)
+                    dv = _raw_a2a(dv2, scatter_idx=1, gather_idx=2, group=group)
+
+                    # 5. Trim to original input shape [B, n_heads, T, head_dim]
+                    dq = dq[:, :n_heads, :T, :]
+                    dk = dk[:, :n_heads, :T, :]
+                    dv = dv[:, :n_heads, :T, :]
+
+                    return dq, dk, dv, None, None, None
 
             def _sp_attn_forward(self_attn, x):
                 B, T, C = x.shape
