@@ -205,6 +205,7 @@ try:
     _HAS_DESLOC = True
 except Exception as _desloc_import_err:
     import traceback as _tb
+    _desloc_import_err_saved = _desloc_import_err
     logger.error(
         "DesLocEngine import FAILED — will fall back to standalone (DDP). Fix this!\n%s",
         _tb.format_exc(),
@@ -1481,7 +1482,7 @@ def main() -> None:
             "will OOM on A6000 (47GB) with 7B model. Fix the import error above."
         )
         raise RuntimeError(
-            f"DesLocEngine import failed: {_desloc_import_err}\n"
+            f"DesLocEngine import failed: {_desloc_import_err_saved}\n"
             "Cannot fall back to DDP: 7B model requires ZeRO-3 heterogeneous "
             "sharding for A6000 (47GB). Fix the import error and retry."
         )
