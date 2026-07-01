@@ -1358,32 +1358,58 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
             else:
                 # -------------------------------------------------------
-                # Slow path: heterogeneous shards → chunked reduce + local copy
-                # Uses all_reduce on the full buffer then extracts our slice.
-                # This is bandwidth-equivalent to reduce_scatter + re-broadcast
-                # for small worlds; for large worlds a proper variable-chunk
-                # reduce_scatter would be more efficient.
+                # Slow path: heterogeneous (unequal) shards.
+                #
+                # A naive all_reduce on the full grad buffer duplicates the
+                # entire 12+ GB buffer on GPU — this OOMs the A6000 (only a few
+                # GB free after model shard + activations). Instead, reduce in
+                # bounded CHUNKS through a small fixed-size CUDA staging buffer,
+                # so peak extra memory is one chunk (default 256 MB), not the
+                # whole buffer. Each rank keeps only its own reduced shard.
+                #
+                # NCCL requires CUDA tensors; when grads are CPU-offloaded the
+                # staging buffer lives on the local CUDA device and the reduced
+                # result is copied back to the (possibly CPU) fp32 shard.
                 # -------------------------------------------------------
-                # NCCL requires CUDA tensors. When the optimizer states are
-                # CPU-offloaded (A6000 low-VRAM tier), buf.grad_data may live on
-                # CPU while data_parallel_group is an NCCL group — all_reduce then
-                # raises "No backend type associated with device type cpu".
-                # Reduce on the current CUDA device, then copy the result back to
-                # the (possibly CPU-resident) fp32 shard.
                 _comm_device = self._reduce_comm_device(buf.grad_data)
-                grad_work = buf.grad_data.to(_comm_device, copy=True)
-                # Insight I6: PCIe-aware overlap (Megatron aa-3.5)
-                handle = torch.distributed.all_reduce(
-                    grad_work,
-                    op=torch.distributed.ReduceOp.SUM,
-                    group=self.data_parallel_group,
-                    async_op=_async_op,
+                grad_src = buf.grad_data          # may be CPU or CUDA
+                # Chunk size in elements (256 MB of the grad dtype).
+                _bytes_per_elem = grad_src.element_size()
+                _chunk_elems = max(1, (256 * 1024 * 1024) // _bytes_per_elem)
+
+                # Only our shard [shard_start, shard_end) is needed locally, but
+                # every rank must participate in the collective over the full
+                # range so sums are correct. Reduce chunk-by-chunk over the whole
+                # buffer; copy out only the part that overlaps our shard.
+                _stage = torch.empty(
+                    min(_chunk_elems, grad_src.numel()),
+                    dtype=grad_src.dtype,
+                    device=_comm_device,
                 )
-                if _async_op and handle is not None:
-                    handle.wait()
-                fp32_grad_shard.copy_(
-                    grad_work[shard_start:shard_end].float().div_(dp_world)
-                )
+                pos = 0
+                total = grad_src.numel()
+                while pos < total:
+                    cur = min(_chunk_elems, total - pos)
+                    stage = _stage[:cur]
+                    stage.copy_(grad_src[pos:pos + cur])   # H2D (or D2D) of one chunk
+                    torch.distributed.all_reduce(
+                        stage,
+                        op=torch.distributed.ReduceOp.SUM,
+                        group=self.data_parallel_group,
+                    )
+                    # Does this chunk overlap our shard [shard_start, shard_end)?
+                    ov_start = max(pos, shard_start)
+                    ov_end = min(pos + cur, shard_end)
+                    if ov_start < ov_end:
+                        dst_lo = ov_start - shard_start
+                        dst_hi = ov_end - shard_start
+                        src_lo = ov_start - pos
+                        src_hi = ov_end - pos
+                        fp32_grad_shard[dst_lo:dst_hi].copy_(
+                            stage[src_lo:src_hi].float().div_(dp_world)
+                        )
+                    pos += cur
+                del _stage
 
         # Attach grad shards to shard params for the Adam step
         for shard_param, fp32_grad_shard in zip(self._shard_params, self._fp32_grad_shards):
