@@ -2299,9 +2299,12 @@ class DesLocEngine:
                 if _sp_size > 1 and dist.is_initialized() and dist.get_world_size() > 1:
                     # Reverse: scatter heads (dim1), gather seq (dim2)
                     out = _sp_all_to_all(out, scatter_idx=1, gather_idx=2, name="o")
-                    # Trim padded heads if needed (32 heads, sp=3 → padded to 33)
+                    # Trim padded heads (32 heads, sp=3 → padded to 33 → trim back)
                     if out.shape[1] > n_heads:
                         out = out[:, :n_heads, :, :]
+                    # Trim padded seq (2048, sp=3 → padded to 2049 → trim back)
+                    if out.shape[2] > T:
+                        out = out[:, :, :T, :]
 
                 return self_attn.proj(out.transpose(1, 2).contiguous().reshape(B, T, C))
 
