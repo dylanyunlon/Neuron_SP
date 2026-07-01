@@ -12,7 +12,7 @@ import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
 
-from deepspeed.runtime.desloc_types import TrainingConfig
+from deepspeed.runtime.desloc_config import TrainingConfig
 
 
 class RMSNorm(nn.Module):

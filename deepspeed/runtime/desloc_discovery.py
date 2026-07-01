@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Tuple
 
 import torch
 
-from deepspeed.runtime.desloc_types import TierClass, TierSpec
+from deepspeed.runtime.desloc_config import TierClass, TierSpec
 
 logger = logging.getLogger(__name__)
 

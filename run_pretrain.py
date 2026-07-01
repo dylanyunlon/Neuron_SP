@@ -808,13 +808,41 @@ def run_standalone(args: argparse.Namespace) -> None:
     # For DDP: use model.module to reach the underlying nn.Module.
     # For single-GPU: model IS the raw module.
     raw_model = model.module if (is_dist and not use_fsdp) else model
-    optimizer = AdamW(
-        model.parameters() if use_fsdp else raw_model.parameters(),
-        lr           = 3e-4,
-        betas        = (0.9, 0.95),
-        eps          = 1e-8,
-        weight_decay = 0.1,
-    )
+
+    # VRAM-adaptive optimizer: CPUAdam for A6000 (≤47GB), GPU AdamW for H100.
+    # Ref: DeepSpeed #4527, Megatron PR #2811, Issue #3.
+    _local_vram_gb = torch.cuda.get_device_properties(device).total_memory / (1 << 30)
+    _optim_params = model.parameters() if use_fsdp else raw_model.parameters()
+
+    if _local_vram_gb < 50.0 and not use_fsdp:
+        # A6000 path: move params to CPU, use DeepSpeedCPUAdam
+        try:
+            from deepspeed.ops.adam import DeepSpeedCPUAdam
+            _cpu_params = []
+            for p in _optim_params:
+                cp = p.detach().cpu().requires_grad_(True)
+                cp.grad = None
+                _cpu_params.append(cp)
+            optimizer = DeepSpeedCPUAdam(
+                _cpu_params, lr=3e-4, betas=(0.9, 0.95),
+                eps=1e-8, weight_decay=0.1, adamw_mode=True,
+            )
+            logger.info("Standalone optimizer: DeepSpeedCPUAdam (VRAM=%.1fGB < 50GB)", _local_vram_gb)
+        except ImportError:
+            # Fallback: gradient checkpointing should have freed enough memory
+            optimizer = AdamW(
+                model.parameters() if use_fsdp else raw_model.parameters(),
+                lr=3e-4, betas=(0.9, 0.95), eps=1e-8, weight_decay=0.1,
+            )
+            logger.warning("DeepSpeedCPUAdam unavailable, using GPU AdamW (may OOM on A6000)")
+    else:
+        optimizer = AdamW(
+            _optim_params,
+            lr           = 3e-4,
+            betas        = (0.9, 0.95),
+            eps          = 1e-8,
+            weight_decay = 0.1,
+        )
     scheduler = build_cosine_schedule(optimizer, warmup_steps=10, total_steps=args.steps)
 
     # ------------------------------------------------------------------ data

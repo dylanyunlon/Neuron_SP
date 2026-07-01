@@ -7,7 +7,7 @@ from __future__ import annotations
 import logging
 from typing import Dict, List
 
-from deepspeed.runtime.desloc_types import (
+from deepspeed.runtime.desloc_config import (
     PartitionPlan,
     PartitionStrategy,
     TierClass,
