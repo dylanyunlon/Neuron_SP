@@ -13,6 +13,15 @@ from torch.optim import Optimizer
 from torch.optim.lr_scheduler import _LRScheduler
 from packaging import version as pkg_version
 
+# Define HAS_TRITON as a module attribute IMMEDIATELY, before any submodule
+# import below can re-enter this package and read `deepspeed.HAS_TRITON` at
+# their own module-load time (e.g. ops/transformer/inference/triton/matmul_ext,
+# model_implementations/.../ds_transformer). Without this, importing a
+# deepspeed submodule directly (the run_pretrain apex-free path) while this
+# __init__ is still executing raises AttributeError: module 'deepspeed' has no
+# attribute 'HAS_TRITON'. The real value is (re)computed just below.
+HAS_TRITON = False
+
 # Skip Triton import for AMD due to pytorch-triton-rocm module breaking device API in DeepSpeed
 if not (hasattr(torch.version, 'hip') and torch.version.hip is not None):
     try:

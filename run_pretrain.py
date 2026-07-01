@@ -221,11 +221,35 @@ try:
     logger.info("deepspeed.core.models.GPTModel imported (wiring Task C)")
     _HAS_CORE_MODELS = True
 except Exception as _core_err:
-    logger.warning("deepspeed.core.models unavailable (%s); using fallback LlamaModel.", _core_err)
-    GPTModel = None           # type: ignore[assignment,misc]
-    TransformerConfig = None  # type: ignore[assignment,misc]
-    TransformerLayer = None   # type: ignore[assignment,misc]
-    _HAS_CORE_MODELS = False
+    import traceback as _core_tb
+    # NO SILENT FALLBACK. The fallback LlamaModel uses absolute position
+    # embeddings + hand-written blocks — a DIFFERENT architecture than the real
+    # GPTModel (RoPE, RMSNorm, TP components). Training on it silently produces
+    # a model that does not match the intended design. Fail loudly so the real
+    # import bug gets fixed. Set NEURON_SP_ALLOW_FALLBACK_MODEL=1 only for an
+    # explicit, deliberate debug run.
+    if os.environ.get("NEURON_SP_ALLOW_FALLBACK_MODEL") == "1":
+        logger.warning(
+            "deepspeed.core.models unavailable (%s); FALLBACK EXPLICITLY ALLOWED "
+            "via NEURON_SP_ALLOW_FALLBACK_MODEL=1. This trains a DIFFERENT "
+            "architecture (absolute pos-emb, not RoPE).", _core_err,
+        )
+        GPTModel = None           # type: ignore[assignment,misc]
+        TransformerConfig = None  # type: ignore[assignment,misc]
+        TransformerLayer = None   # type: ignore[assignment,misc]
+        _HAS_CORE_MODELS = False
+    else:
+        logger.error(
+            "deepspeed.core.models import FAILED — refusing to fall back to the "
+            "hand-written LlamaModel (different architecture). Fix the import "
+            "below. To force the fallback for a debug run only, set "
+            "NEURON_SP_ALLOW_FALLBACK_MODEL=1.\n%s",
+            _core_tb.format_exc(),
+        )
+        raise RuntimeError(
+            f"deepspeed.core.models unavailable ({_core_err}); fallback disabled. "
+            "Fix the import or set NEURON_SP_ALLOW_FALLBACK_MODEL=1 to override."
+        ) from _core_err
 
 # ---------------------------------------------------------------------------
 # Model size presets (Llama-style)

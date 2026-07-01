@@ -469,7 +469,7 @@ class Fp16Matmul(TritonMatmul):
 
 # -----------------------------------------------------------------------------
 # mapping
-if deepspeed.HAS_TRITON:
+if getattr(deepspeed, "HAS_TRITON", False):
     fp16_matmul = Fp16Matmul()
     matmul = MatmulExt.forward
     matmul_4d = fp16_matmul._matmul_4d
@@ -485,5 +485,5 @@ else:
 
 @atexit.register
 def matmul_ext_update_autotune_table():
-    if deepspeed.HAS_TRITON:
+    if getattr(deepspeed, "HAS_TRITON", False):
         fp16_matmul._update_autotune_table()
