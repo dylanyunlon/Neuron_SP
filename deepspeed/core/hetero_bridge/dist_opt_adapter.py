@@ -481,6 +481,22 @@ class DistOptAdapter:
             return self._opt.defaults
         return {}
 
+    @property
+    def param_groups(self) -> list:
+        """Proxy param_groups to the inner optimizer.
+
+        Required by torch.optim.lr_scheduler.LambdaLR and other schedulers
+        that call ``len(optimizer.param_groups)``.
+        """
+        if self._opt is not None and hasattr(self._opt, "param_groups"):
+            return self._opt.param_groups
+        return [{"lr": self.lr}]
+
+    @param_groups.setter
+    def param_groups(self, value):
+        if self._opt is not None and hasattr(self._opt, "param_groups"):
+            self._opt.param_groups = value
+
     # ------------------------------------------------------------------
     # step / zero_grad  — frozen public API
     # ------------------------------------------------------------------
