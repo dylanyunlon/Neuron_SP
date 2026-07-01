@@ -759,6 +759,21 @@ def run_standalone(args: argparse.Namespace) -> None:
         )
 
     # ------------------------------------------------------------------ model
+    # Seed CUDA RNG tracker before model creation (same fix as run_desloc).
+    _seed = getattr(args, "seed", 42)
+    if torch.cuda.is_available():
+        try:
+            from deepspeed.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+            model_parallel_cuda_manual_seed(_seed)
+        except Exception:
+            try:
+                from deepspeed.runtime.activation_checkpointing.checkpointing import (
+                    _CUDA_RNG_STATE_TRACKER, _MODEL_PARALLEL_RNG_TRACKER_NAME,
+                )
+                _CUDA_RNG_STATE_TRACKER.add(_MODEL_PARALLEL_RNG_TRACKER_NAME, _seed)
+            except Exception:
+                pass
+
     model = LlamaModel(
         vocab_size  = cfg["vocab_size"],
         hidden_size = cfg["hidden_size"],
@@ -1237,6 +1252,30 @@ def run_desloc(args: argparse.Namespace) -> None:
         getattr(tc, 'micro_batch_size_per_gpu', 'default'),
     )
 
+    # Seed CUDA RNG tracker BEFORE model creation.
+    # GPTModel.__init__ (via TransformerLayer) calls CudaRNGStatesTracker.fork()
+    # which requires 'model-parallel-rng' to be registered. Without this,
+    # multi-GPU runs crash: "cuda rng state model-parallel-rng is not added".
+    # Ref: microsoft/DeepSpeed#3583, NVIDIA/Megatron-LM QuickStart.md,
+    #      NVIDIA/Megatron-LM PR#2640 (Fix CUDA RNG Tracker).
+    _seed = getattr(args, "seed", 42)
+    try:
+        from deepspeed.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+        model_parallel_cuda_manual_seed(_seed)
+        logger.info("model_parallel_cuda_manual_seed(%d) — RNG tracker initialized", _seed)
+    except Exception as _rng_err:
+        # Fallback: directly register with the activation checkpointing tracker
+        # (DeepSpeed's own RNG tracker, used when core.tensor_parallel is unavailable)
+        try:
+            from deepspeed.runtime.activation_checkpointing.checkpointing import (
+                _CUDA_RNG_STATE_TRACKER,
+                _MODEL_PARALLEL_RNG_TRACKER_NAME,
+            )
+            _CUDA_RNG_STATE_TRACKER.add(_MODEL_PARALLEL_RNG_TRACKER_NAME, _seed)
+            logger.info("Fallback RNG tracker: registered model-parallel-rng (seed=%d)", _seed)
+        except Exception as _rng_err2:
+            logger.warning("RNG tracker init failed (both paths): %s / %s", _rng_err, _rng_err2)
+
     # Build the LlamaModel and pass it in (DesLocEngine wraps it)
     # Model stays on CPU here — DesLocEngine/FSDP handles device placement.
     # Moving to GPU first then FSDP flatten causes OOM on A6000 (47GB).
@@ -1440,6 +1479,12 @@ def parse_args() -> argparse.Namespace:
             "YAML config's data.sources field and calls "
             "data.blend_datasets.build_blended_dataloader()."
         ),
+    )
+    p.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Base random seed for CUDA RNG tracker and data shuffling.",
     )
     return p.parse_args()
 
