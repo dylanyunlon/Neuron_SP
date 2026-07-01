@@ -2262,18 +2262,56 @@ class DesLocEngine:
             register_long_context_checkpointing()
 
             from deepspeed.compile.passes.sp_compile import apply_autosp
+            from deepspeed.compile.custom_ops.all_to_all import all_to_all as _sp_all_to_all
+            from deepspeed.compile.custom_ops import sp_dp_registry
 
-            def _autosp_backend(gm, real_inputs):
-                rank = dist.get_rank() if dist.is_initialized() else 0
-                apply_autosp(gm, real_inputs, debug=False, sp_size=sp_size, dp_size=dp_size)
-                if rank == 0:
-                    logger.info("[AutoSP] SP pass applied successfully")
-                return gm.forward  # eager fallback (no inductor on cu118)
+            # ── Direct SP injection (bypass torch.compile) ──────────────
+            # torch.compile + dynamo on PyTorch 2.7.1+cu118 decomposes SDPA
+            # regardless of custom_op / allow_in_graph. Instead of fighting
+            # dynamo, inject all-to-all calls directly into the model's
+            # attention forward method, like 360-LLaMA-Factory's Ulysses.
+            _orig_attn_forward = self.model.layers[0].attn.forward.__func__ if hasattr(self.model.layers[0].attn.forward, '__func__') else None
 
-            self._autosp_compile_fn = _autosp_backend
-            self.model = torch.compile(self.model, backend=_autosp_backend, fullgraph=True, dynamic=True)
+            _sp_size = sp_size
+
+            def _sp_attn_forward(self_attn, x):
+                B, T, C = x.shape
+                n_heads = self_attn.n_heads
+                head_dim = self_attn.head_dim
+
+                qkv = self_attn.qkv(x).reshape(B, T, 3, n_heads, head_dim)
+                q, k, v = qkv.unbind(2)
+                # q,k,v: [B, T, n_heads, head_dim] → [B, n_heads, T, head_dim]
+                q = q.transpose(1, 2)
+                k = k.transpose(1, 2)
+                v = v.transpose(1, 2)
+
+                # SP: scatter seq (dim2), gather heads (dim1)
+                # Input: [B, n_heads, T, head_dim]
+                # After A2A: [B, n_heads*sp, T/sp, head_dim]
+                if _sp_size > 1 and dist.is_initialized() and dist.get_world_size() > 1:
+                    q = _sp_all_to_all(q, scatter_idx=2, gather_idx=1, name="q")
+                    k = _sp_all_to_all(k, scatter_idx=2, gather_idx=1, name="k")
+                    v = _sp_all_to_all(v, scatter_idx=2, gather_idx=1, name="v")
+
+                out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+
+                if _sp_size > 1 and dist.is_initialized() and dist.get_world_size() > 1:
+                    # Reverse: scatter heads (dim1), gather seq (dim2)
+                    out = _sp_all_to_all(out, scatter_idx=1, gather_idx=2, name="o")
+                    # Trim padded heads if needed (32 heads, sp=3 → padded to 33)
+                    if out.shape[1] > n_heads:
+                        out = out[:, :n_heads, :, :]
+
+                return self_attn.proj(out.transpose(1, 2).contiguous().reshape(B, T, C))
+
+            # Monkey-patch all attention layers
+            for layer in self.model.layers:
+                import types
+                layer.attn.forward = types.MethodType(_sp_attn_forward, layer.attn)
+
             self._sp_active = True
-            logger.info("AutoSP: compiler-based SP enabled (sp_size=%d)", sp_size)
+            logger.info("AutoSP: direct SP injection (sp_size=%d, monkey-patch, no torch.compile)", sp_size)
 
         # Wire HeteroGradNormSkipController into this engine via
         # integrate_with_deepspeed_engine(). That function monkey-patches
