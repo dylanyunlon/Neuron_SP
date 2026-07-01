@@ -948,10 +948,8 @@ class DesLocEngine:
             for li in layer_indices:
                 layer_device_map[li] = dev_idx
 
-        # Support both MiniTransformer (.blocks) and standard Transformer (.layers).
-        block_list = getattr(self.model, "blocks", None) or getattr(
-            self.model, "layers", None
-        )
+        # Support multiple model backends via unified layer probe.
+        block_list = self._get_model_layers()
 
         _ckpt_master_on = bool(config.activation_checkpointing)
         _ckpt_granularity = str(config.checkpoint_activations_granularity).lower()
@@ -1424,6 +1422,38 @@ class DesLocEngine:
         self._checkpoint_thread = None  # From M3407: track async checkpoint Thread
 
     # ------------------------------------------------------------------
+    # Layer access helper (multi-backend)
+    # ------------------------------------------------------------------
+    def _get_model_layers(self) -> Optional[nn.ModuleList]:
+        """Probe model structure and return the transformer layer ModuleList.
+
+        Supports multiple backends:
+          - Hand-written LlamaModel: model.layers
+          - MiniTransformer: model.blocks
+          - GPTModel backend: model._gpt.decoder.layers
+          - HuggingFace LlamaForCausalLM: model.model.layers
+          - Bare TransformerBlock wrapper: model.decoder.layers
+
+        Ref: RightNow-AI/TIDE UniversalAdapter multi-path probe,
+             DeepSpeed PR#4313 (HuggingFace Llama policy).
+        """
+        m = self.model
+        for path in [
+            lambda: m.layers,                        # hand-written LlamaModel
+            lambda: m.blocks,                        # MiniTransformer
+            lambda: m._gpt.decoder.layers,           # GPTModel backend
+            lambda: m.model.layers,                   # HuggingFace double-wrap
+            lambda: m.decoder.layers,                 # bare TransformerBlock
+        ]:
+            try:
+                candidate = path()
+                if isinstance(candidate, nn.ModuleList):
+                    return candidate
+            except (AttributeError, TypeError):
+                continue
+        return None
+
+    # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
     def forward(
@@ -1778,9 +1808,18 @@ class DesLocEngine:
                 return self_attn.proj(out.transpose(1, 2).contiguous().reshape(B, T, C))
 
             # Monkey-patch all attention layers
-            for layer in self.model.layers:
-                import types
-                layer.attn.forward = types.MethodType(_sp_attn_forward, layer.attn)
+            _sp_layers = self._get_model_layers()
+            if _sp_layers is None:
+                logger.warning(
+                    "AutoSP: cannot find model layers — probed model.layers, "
+                    "model.blocks, model._gpt.decoder.layers, model.model.layers, "
+                    "model.decoder.layers. SP injection skipped."
+                )
+            else:
+                for layer in _sp_layers:
+                    if hasattr(layer, "attn"):
+                        import types
+                        layer.attn.forward = types.MethodType(_sp_attn_forward, layer.attn)
 
             self._sp_active = True
             logger.info("AutoSP: direct SP injection (sp_size=%d, monkey-patch, no torch.compile)", sp_size)
