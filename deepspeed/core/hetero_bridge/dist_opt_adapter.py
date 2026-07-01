@@ -429,6 +429,22 @@ class DistOptAdapter:
 
             model_parallel_config = ModelParallelConfig()
 
+            # On this hetero PCIe cluster (SP=world, DP=1) Megatron's
+            # parallel_state data-parallel group is often not initialized
+            # (see "data parallel group is not initialized" warnings). The
+            # gradient reduction runs across ALL ranks, so pass the WORLD
+            # NCCL group explicitly rather than relying on parallel_state.
+            import torch
+            _dp_group = None
+            try:
+                import deepspeed.core.parallel_state as _ps
+                if _ps.is_initialized():
+                    _dp_group = _ps.get_data_parallel_group()
+            except Exception:
+                _dp_group = None
+            if _dp_group is None and torch.distributed.is_initialized():
+                _dp_group = torch.distributed.GroupMember.WORLD
+
             if opt_config is not None:
                 dist_opt = DistributedOptimizer(
                     config=opt_config,
@@ -436,7 +452,7 @@ class DistOptAdapter:
                     params=params,
                     model_parallel_config=model_parallel_config,
                     param_and_grad_buffers=param_and_grad_buffers,
-                    data_parallel_group=None,       # resolved from parallel_state
+                    data_parallel_group=_dp_group,   # explicit WORLD NCCL group
                     data_parallel_group_gloo=None,
                     tier_assignments=tier_assignments,
                 )

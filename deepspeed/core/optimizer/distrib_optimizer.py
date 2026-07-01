@@ -1248,6 +1248,29 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
     # Grad preparation
     # ------------------------------------------------------------------
 
+    def _reduce_comm_device(self, ref_tensor: torch.Tensor) -> torch.device:
+        """Pick the device to run the gradient collective on.
+
+        NCCL process groups only support CUDA tensors.  When optimizer states
+        are CPU-offloaded (A6000 low-VRAM tier), grad buffers may be on CPU;
+        running the collective on such a tensor raises
+        "No backend type associated with device type cpu".  If the group is
+        NCCL-backed (or the reference tensor is on CPU while CUDA is available),
+        route the collective through the local CUDA device.  For a genuine
+        gloo/CPU group we keep the tensor on CPU.
+        """
+        if ref_tensor.is_cuda:
+            return ref_tensor.device
+        # ref tensor is on CPU — decide by group backend.
+        try:
+            backend = torch.distributed.get_backend(self.data_parallel_group)
+        except Exception:
+            backend = "nccl" if torch.cuda.is_available() else "gloo"
+        if backend == "gloo":
+            return ref_tensor.device  # CPU collective is valid for gloo
+        # NCCL (or unknown) group: must use CUDA.
+        return torch.device("cuda", torch.cuda.current_device())
+
     @torch.no_grad()
     def _reduce_scatter_grads(self) -> None:
         """Reduce-scatter BF16 grads; store averaged FP32 result in grad shards.
@@ -1301,21 +1324,24 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 # -------------------------------------------------------
                 # Fast path: equal shards → use reduce_scatter_tensor
                 # -------------------------------------------------------
+                # NCCL requires CUDA tensors; when grads are CPU-offloaded the
+                # collective must still run on the CUDA device (see hetero path).
+                _comm_device = self._reduce_comm_device(buf.grad_data)
                 padded_numel = max_shard_size * dp_world
                 if padded_numel > total_numel:
                     grad_padded = torch.zeros(
                         padded_numel,
                         dtype=buf.grad_data.dtype,
-                        device=buf.grad_data.device,
+                        device=_comm_device,
                     )
                     grad_padded[:total_numel].copy_(buf.grad_data)
                 else:
-                    grad_padded = buf.grad_data
+                    grad_padded = buf.grad_data.to(_comm_device, copy=False)
 
                 output_shard = torch.zeros(
                     max_shard_size,
                     dtype=grad_padded.dtype,
-                    device=grad_padded.device,
+                    device=_comm_device,
                 )
                 # Insight I6: PCIe-aware overlap (Megatron aa-3.5)
                 # async_op=True only for buffers above the PCIe latency threshold.
@@ -1338,7 +1364,14 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 # for small worlds; for large worlds a proper variable-chunk
                 # reduce_scatter would be more efficient.
                 # -------------------------------------------------------
-                grad_work = buf.grad_data.clone()
+                # NCCL requires CUDA tensors. When the optimizer states are
+                # CPU-offloaded (A6000 low-VRAM tier), buf.grad_data may live on
+                # CPU while data_parallel_group is an NCCL group — all_reduce then
+                # raises "No backend type associated with device type cpu".
+                # Reduce on the current CUDA device, then copy the result back to
+                # the (possibly CPU-resident) fp32 shard.
+                _comm_device = self._reduce_comm_device(buf.grad_data)
+                grad_work = buf.grad_data.to(_comm_device, copy=True)
                 # Insight I6: PCIe-aware overlap (Megatron aa-3.5)
                 handle = torch.distributed.all_reduce(
                     grad_work,
@@ -1348,7 +1381,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 )
                 if _async_op and handle is not None:
                     handle.wait()
-                fp32_grad_shard.copy_(grad_work[shard_start:shard_end].float().div_(dp_world))
+                fp32_grad_shard.copy_(
+                    grad_work[shard_start:shard_end].float().div_(dp_world)
+                )
 
         # Attach grad shards to shard params for the Adam step
         for shard_param, fp32_grad_shard in zip(self._shard_params, self._fp32_grad_shards):

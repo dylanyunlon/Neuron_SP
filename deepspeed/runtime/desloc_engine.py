@@ -1584,10 +1584,11 @@ class DesLocEngine:
                         self.world_size = world_size
                         self.param_shard = torch.empty(0, device=device)
 
+                _hook_device = torch.device(f"cuda:{torch.cuda.current_device()}")
                 _adapter = _ShardAdapter(
                     rank=self._dist_optimizer.data_parallel_rank,
                     world_size=self._dist_optimizer.data_parallel_world_size,
-                    device=_local_device,
+                    device=_hook_device,
                 )
                 self._zero3_forward_hook = _Z3Hook(self.model, _adapter)
                 self._zero3_forward_hook.register()
