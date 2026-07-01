@@ -548,6 +548,14 @@ def get_sdpa_nodes(gm: GraphModule) -> List[Node]:
     ))
     if nodes:
         return nodes
+    # Custom op neuronsp::sdpa (registered via torch.library.custom_op)
+    _custom_sdpa = getattr(torch.ops, "neuronsp", None)
+    if _custom_sdpa is not None:
+        _sdpa_default = getattr(getattr(_custom_sdpa, "sdpa", None), "default", None)
+        if _sdpa_default is not None:
+            nodes = list(gm.graph.find_nodes(op="call_function", target=_sdpa_default))
+            if nodes:
+                return nodes
     # Check for allow_in_graph wrappers (e.g. _sdpa_keep_in_graph)
     for node in gm.graph.nodes:
         if node.op == "call_function":

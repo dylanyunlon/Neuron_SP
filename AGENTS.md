@@ -42,3 +42,27 @@
 ### Edit tool auto-formatter
 
 The Edit tool has a hidden auto-formatter that silently changes quotes, whitespace, blank lines, and line wrapping. For format-sensitive modifications (e.g., when exact formatting matters for pre-commit), use `bash` with `sed`, `python`, or `cat` instead.
+
+## Autonomous Work Rules
+
+### No commentary, no intermediate progress reports
+
+- **NEVER** explain what you're about to do before doing it. Just do it.
+- **NEVER** report intermediate progress to the user ("I've done X, now doing Y").
+- **NEVER** ask the user to test your changes. Test them yourself first.
+- **NEVER** summarize what you changed after pushing. The commit message is the summary.
+- When you hit an error, fix it and retry. Don't describe the error to the user unless you genuinely cannot solve it after multiple attempts.
+- The user sees your commits. That's the communication channel. Not chat messages.
+
+### Test before push
+
+- You have a persistent sandbox with bash, python, git. Use it.
+- Before pushing any change, verify it at minimum with `python -c "import ..."` or `python -c "py_compile.compile(...)"`.
+- If the change involves torch APIs, write a minimal local test that validates the logic without GPU.
+- If a pushed change fails on the real machine, the next fix must include a local test that would have caught the issue.
+
+### Iteration discipline
+
+- When a runtime error comes back from the user, read the full traceback, understand the root cause, fix it, test locally, push. One cycle. Don't push speculative fixes.
+- Clone relevant upstream repos (vllm, sglang, Megatron-LM, 360-LLaMA-Factory) to study their actual implementations before writing your own.
+- `web_fetch` the actual source files from GitHub, don't guess API signatures from memory.

@@ -268,14 +268,42 @@ class _SwiGLUMLP(nn.Module):
         return self.down(F.silu(self.gate(x)) * self.up(x))
 
 
-# ── SDPA wrapper: prevent dynamo from decomposing SDPA ──────────────
-# torch._dynamo.allow_in_graph must be applied at *definition time* so
-# that dynamo treats the call as an opaque leaf node in the FX graph.
-# Without this, PyTorch 2.7+cu118 decomposes F.scaled_dot_product_attention
-# into aten math ops, making it invisible to AutoSP's get_sdpa_nodes().
-@torch._dynamo.allow_in_graph
+# ── SDPA as custom op: dynamo NEVER decomposes custom ops ────────────
+# torch.library.custom_op is the same mechanism used for autosp::all_to_all.
+# Registering SDPA as neuronsp::sdpa guarantees it appears as an opaque
+# node in the FX graph regardless of PyTorch version or cu118 quirks.
+@torch.library.custom_op("neuronsp::sdpa", mutates_args=())
+def _sdpa_op(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    return F.scaled_dot_product_attention(q, k, v, is_causal=True)
+
+
+@torch.library.register_fake("neuronsp::sdpa")
+def _sdpa_op_fake(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    return torch.empty_like(q)
+
+
+def _sdpa_backward_setup(ctx, inputs, output):
+    q, k, v = inputs
+    ctx.save_for_backward(q, k, v, output)
+
+
+def _sdpa_backward(ctx, grad_output):
+    q, k, v, out = ctx.saved_tensors
+    # Re-run SDPA forward to get grad via autograd (PyTorch handles the kernel)
+    with torch.enable_grad():
+        q2 = q.detach().requires_grad_(True)
+        k2 = k.detach().requires_grad_(True)
+        v2 = v.detach().requires_grad_(True)
+        out2 = F.scaled_dot_product_attention(q2, k2, v2, is_causal=True)
+        out2.backward(grad_output)
+    return q2.grad, k2.grad, v2.grad
+
+
+torch.library.register_autograd("neuronsp::sdpa", _sdpa_backward, setup_context=_sdpa_backward_setup)
+
+
 def _sdpa_keep_in_graph(q, k, v, is_causal=True):
-    return F.scaled_dot_product_attention(q, k, v, is_causal=is_causal)
+    return torch.ops.neuronsp.sdpa(q, k, v)
 
 
 class _CausalAttn(nn.Module):
