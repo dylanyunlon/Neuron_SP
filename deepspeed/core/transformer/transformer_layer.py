@@ -163,7 +163,7 @@ class TransformerLayer(MegatronModule):
         self.input_layernorm = _build_norm(config)
 
         # --- Self-attention -----------------------------------------------
-        self.self_attention = SelfAttention(config, layer_number)
+        self.self_attention = SelfAttention(config, layer_number=layer_number)
 
         # --- Hidden-state dropout after attention -------------------------
         self.attn_dropout = nn.Dropout(p=self.hidden_dropout)
@@ -179,7 +179,7 @@ class TransformerLayer(MegatronModule):
             # A full cross-attention implementation would subclass differently;
             # here we expose the hook so the block layer can route context.
             self.cross_attention: Optional[nn.Module] = SelfAttention(
-                config, layer_number
+                config, layer_number=layer_number
             )
             self.cross_attn_dropout = nn.Dropout(p=self.hidden_dropout)
         else:
