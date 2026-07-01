@@ -1216,13 +1216,34 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 # Shard with no overlapping model param: register defaults + tier.
                 _GLOBAL_PARAM_REGISTRY.register(sp, tier=_tier_str)
             shard_params.append(sp)
-        self.optimizer.param_groups = [{
+        # Preserve the inner optimizer's existing param_group defaults
+        # (amsgrad, maximize, foreach, capturable, differentiable, fused,
+        # decoupled_weight_decay, …). torch.optim.AdamW.step() reads several of
+        # these keys directly (e.g. group["amsgrad"]); rebuilding the group from
+        # scratch with only lr/betas/eps/weight_decay drops them → KeyError.
+        # Start from the current group's keys and override only what we retune.
+        if self.optimizer.param_groups:
+            _base_group = dict(self.optimizer.param_groups[0])
+        else:
+            _base_group = {}
+        _base_group.pop("params", None)
+        _new_group = {
+            **_base_group,
             "params": shard_params,
             "lr": self.config.lr or 1e-4,
             "betas": (self.config.adam_beta1, self.config.adam_beta2),
             "eps": self.config.adam_eps,
             "weight_decay": self.config.weight_decay,
-        }]
+        }
+        # Backstop: ensure AdamW-required keys exist even if the inner optimizer
+        # never populated defaults (e.g. a bare Optimizer subclass).
+        _new_group.setdefault("amsgrad", False)
+        _new_group.setdefault("maximize", False)
+        _new_group.setdefault("foreach", None)
+        _new_group.setdefault("capturable", False)
+        _new_group.setdefault("differentiable", False)
+        _new_group.setdefault("fused", None)
+        self.optimizer.param_groups = [_new_group]
         self._shard_params = shard_params
 
         logger.debug(
