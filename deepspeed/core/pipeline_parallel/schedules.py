@@ -555,18 +555,6 @@ def finish_embedding_wgrad_compute(config, embedding_module, is_last_stage, tp_g
         drain_embedding_wgrad_compute(config, ea_buf, go_buf, weight, tp_group)
 
 
-def get_tensor_shapes(*, seq_length, micro_batch_size, decoder_seq_length, config,
-                       tp_group=None, cp_group=None):
-    """Compute pipeline tensor shapes. Returns [()] for variable_seq_lengths."""
-    if config.variable_seq_lengths:
-        return [()]
-    effective = decoder_seq_length if decoder_seq_length is not None else seq_length
-    effective = effective // cp_group.size()
-    if config.sequence_parallel:
-        effective = effective // tp_group.size()
-    return [(effective, micro_batch_size, config.hidden_size)]
-
-
 def get_pp_rank_microbatches(num_microbatches, num_model_chunks, microbatch_group_size_per_vp_stage,
                               forward_only=False, overlap_moe_expert_parallel_comm=False,
                               p2p_communicator=None):
@@ -1867,7 +1855,7 @@ def forward_backward_pipelining_with_interleaving(
             force_all_reduce=force_all_reduce,
         )
 
-    if getattr(config, 'fine_grained_activation_offloading', False):
+    if _HAS_FGAO and getattr(config, 'fine_grained_activation_offloading', False):
         off_interface.reset()
     # Restore config.grad_sync_func and config.param_sync_func.
     if forward_only:
@@ -2275,7 +2263,7 @@ def forward_backward_pipelining_without_interleaving(
             force_all_reduce=force_all_reduce,
         )
 
-    if getattr(config, 'fine_grained_activation_offloading', False):
+    if _HAS_FGAO and getattr(config, 'fine_grained_activation_offloading', False):
         off_interface.reset()
 
     if config.timers is not None:
