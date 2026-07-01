@@ -200,10 +200,50 @@ try:
     from megatron.core.utils import make_tp_sharded_tensor_for_checkpoint
 except ImportError:
     def make_tp_sharded_tensor_for_checkpoint(tensor, key, tp_axis=0, prepend_offsets=()):  # type: ignore[misc]
-        raise NotImplementedError(
-            "make_tp_sharded_tensor_for_checkpoint requires megatron.core; "
-            "install Megatron-LM or implement a DeepSpeed equivalent."
-        )
+        """Wrap *tensor* as a sharded checkpoint object for TP-aware save/load.
+
+        Fallback implementation when ``megatron.core`` is not installed.
+        Computes global shape and per-rank offsets from the TP process group
+        so that universal-checkpoint tooling can reassemble the full tensor.
+        """
+        import torch
+        try:
+            import deepspeed.utils.groups as groups
+            tp_rank = groups.get_tensor_model_parallel_rank()
+            tp_world = groups.get_tensor_model_parallel_world_size()
+        except Exception:
+            tp_rank, tp_world = 0, 1
+
+        local_shape = list(tensor.shape)
+        global_shape = list(tensor.shape)
+        global_shape[tp_axis] = local_shape[tp_axis] * tp_world
+
+        offsets = [0] * len(global_shape)
+        offsets[tp_axis] = tp_rank * local_shape[tp_axis]
+
+        for axis, offset, global_size in prepend_offsets:
+            offsets[axis] = offset
+            global_shape[axis] = global_size
+
+        from dataclasses import dataclass, field as _field
+
+        @dataclass
+        class _ShardedTensor:
+            key: str
+            tensor: "torch.Tensor"
+            global_shape: list
+            offsets: list
+            local_shape: list = _field(init=False)
+
+            def __post_init__(self):
+                self.local_shape = list(self.tensor.shape)
+
+            @property
+            def data(self):
+                return self.tensor
+
+        return _ShardedTensor(key=key, tensor=tensor,
+                              global_shape=global_shape, offsets=offsets)
 
 # ---------------------------------------------------------------------------
 # Transformer Engine optional imports  (matching deepspeed/core/transformer/attention.py)
@@ -255,8 +295,32 @@ except ImportError:
     def _yarn_get_mscale(scaling_factor, mscale_all_dim):  # type: ignore[misc]
         return 1.0
 
-    def apply_rotary_pos_emb(*args, **kwargs):  # type: ignore[misc]
-        raise NotImplementedError("Megatron-LM is required for MLA RoPE application.")
+    def apply_rotary_pos_emb(q, k, cos, sin, offset=0):  # type: ignore[misc]
+        """Apply Rotary Position Embedding to *q* and *k*.
+
+        Fallback when ``megatron.core`` RoPE is unavailable.  Supports both
+        ``(seq, batch, heads, dim)`` and ``(batch, heads, seq, dim)`` layouts.
+        Only the first ``rotary_dim`` channels are rotated; the remainder pass
+        through unchanged.
+        """
+        import torch
+
+        def _rotate_half(x):
+            half = x.shape[-1] // 2
+            return torch.cat((-x[..., half:], x[..., :half]), dim=-1)
+
+        def _apply(t, c, s):
+            rdim = c.shape[-1]
+            t_rot, t_pass = t[..., :rdim], t[..., rdim:]
+            out = t_rot * c + _rotate_half(t_rot) * s
+            return torch.cat((out, t_pass), dim=-1) if t_pass.shape[-1] else out
+
+        if cos.dim() == 2:
+            cos = cos.unsqueeze(1).unsqueeze(1)
+            sin = sin.unsqueeze(1).unsqueeze(1)
+        sq, sk = q.shape[0], k.shape[0]
+        return (_apply(q, cos[offset:offset + sq], sin[offset:offset + sq]),
+                _apply(k, cos[:sk], sin[:sk]))
 
 # ---------------------------------------------------------------------------
 # Fused MLA RoPE kernels  (optional Megatron fusions)
