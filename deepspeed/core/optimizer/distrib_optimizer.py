@@ -1,3 +1,5 @@
+import logging
+logger = logging.getLogger(__name__)
 # SPDX-License-Identifier: Apache-2.0
 # DeepSpeed Team
 """Distributed optimizer — ZeRO-3 style param/grad/state sharding.
@@ -128,10 +130,9 @@ class ParamRegistry:
         pid = id(param)
         meta = ParamMeta(**kwargs)
         self._table[pid] = meta
-        print(
-            f"[ParamRegistry] register id={pid} "
-            f"tier={meta.tier!r} group={meta.grad_norm_group!r} "
-            f"shared={meta.shared} fsdp={meta.is_fsdp_param}"
+        logger.debug(
+            "[ParamRegistry] register id=%s tier=%r group=%r shared=%s fsdp=%s",
+            pid, meta.tier, meta.grad_norm_group, meta.shared, meta.is_fsdp_param,
         )
 
     def get(self, param: torch.Tensor) -> ParamMeta:
@@ -160,9 +161,9 @@ class ParamRegistry:
             is_fsdp_param=src_meta.is_fsdp_param,
         )
         self._table[id(dst)] = dst_meta
-        print(
-            f"[ParamRegistry] copy_from_param src_id={id(src)} -> dst_id={id(dst)} "
-            f"tier={dst_meta.tier!r} group={dst_meta.grad_norm_group!r}"
+        logger.debug(
+            "[ParamRegistry] copy_from_param src_id=%s -> dst_id=%s tier=%r group=%r",
+            id(src), id(dst), dst_meta.tier, dst_meta.grad_norm_group,
         )
 
     # ------------------------------------------------------------------
