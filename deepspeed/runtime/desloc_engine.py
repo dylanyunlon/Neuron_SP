@@ -2262,26 +2262,22 @@ class DesLocEngine:
             register_long_context_checkpointing()
 
             from deepspeed.compile.passes.sp_compile import apply_autosp
+
+            # Prevent dynamo from decomposing F.scaled_dot_product_attention
+            # into lower-level aten ops before the AutoSP backend can see it.
+            # Without this, PyTorch 2.7+ (especially cu118 without flash_attn)
+            # decomposes SDPA into _attention_math, making it invisible to AutoSP.
+            torch._dynamo.allow_in_graph(F.scaled_dot_product_attention)
+
             def _autosp_backend(gm, real_inputs):
                 rank = dist.get_rank() if dist.is_initialized() else 0
-                try:
-                    apply_autosp(gm, real_inputs, debug=False, sp_size=sp_size, dp_size=dp_size)
-                    if rank == 0:
-                        logger.info("[AutoSP] SP pass applied successfully")
-                except RuntimeError as e:
-                    if "No SDPA nodes" in str(e):
-                        if rank == 0:
-                            logger.warning(
-                                "[AutoSP] SDPA nodes not found in traced graph — "
-                                "falling back to eager execution (no SP). "
-                                "This can happen with PyTorch >= 2.7 + cu118 where SDPA "
-                                "is decomposed before the backend sees it.")
-                    else:
-                        raise
+                apply_autosp(gm, real_inputs, debug=False, sp_size=sp_size, dp_size=dp_size)
+                if rank == 0:
+                    logger.info("[AutoSP] SP pass applied successfully")
                 return gm.forward  # eager fallback (no inductor on cu118)
 
             self._autosp_compile_fn = _autosp_backend
-            self.model = torch.compile(self.model, backend=_autosp_backend, fullgraph=False, dynamic=True)
+            self.model = torch.compile(self.model, backend=_autosp_backend, fullgraph=True, dynamic=True)
             self._sp_active = True
             logger.info("AutoSP: compiler-based SP enabled (sp_size=%d)", sp_size)
 
