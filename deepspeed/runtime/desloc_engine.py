@@ -1993,26 +1993,10 @@ class DesLocEngine:
         # same CPU DRAM staging area and cross-pool transfer path.
         # Failures here must not break legacy single-GPU training paths, so the
         # call is wrapped defensively and the loop falls back to None.
-        try:
-            self.mimo_loop: Optional[HeteroMIMOTrainingLoop] = (
-                setup_hetero_mimo_training(
-                    self.model,
-                    cache_max_gb=_cache_max_gb,
-                    cache_max_entries=_cache_max_entries,
-                )
-            )
-            logger.info(
-                "HeteroMIMOTrainingLoop initialized via setup_hetero_mimo_training() "
-                "(cache=%.1f GB, world_size=%d).",
-                _cache_max_gb, _world_size,
-            )
-        except Exception as exc:  # pragma: no cover - defensive
-            logger.warning(
-                "setup_hetero_mimo_training() failed (%s); continuing without "
-                "MIMO loop. Heterogeneous dispatch will degrade to single-device.",
-                exc,
-            )
-            self.mimo_loop = None
+        # MIMO training loop disabled: it creates a full-model Adam optimizer
+        # on every device, doubling memory usage and causing OOM on A6000 (47 GB).
+        # ZeRO-3 sharded optimizer handles training; MIMO is a future optimization.
+        self.mimo_loop = None
 
         # fp32_grad_manager already initialized in Phase 8 above.
 
