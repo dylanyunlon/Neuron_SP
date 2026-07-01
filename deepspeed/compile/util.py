@@ -548,6 +548,14 @@ def get_sdpa_nodes(gm: GraphModule) -> List[Node]:
     ))
     if nodes:
         return nodes
+    # Check for allow_in_graph wrappers (e.g. _sdpa_keep_in_graph)
+    for node in gm.graph.nodes:
+        if node.op == "call_function":
+            target_name = getattr(node.target, "__name__", "")
+            if "sdpa" in target_name or "scaled_dot_product_attention" in target_name:
+                nodes.append(node)
+    if nodes:
+        return nodes
     # PyTorch 2.7+ dynamo may decompose SDPA into aten ops — search those too
     _aten_sdpa_targets = []
     for name in (
@@ -558,7 +566,6 @@ def get_sdpa_nodes(gm: GraphModule) -> List[Node]:
     ):
         op = getattr(torch.ops.aten, name, None)
         if op is not None:
-            # Handle both .default and the op itself
             _aten_sdpa_targets.append(getattr(op, "default", op))
             _aten_sdpa_targets.append(op)
     for node in gm.graph.nodes:

@@ -268,6 +268,16 @@ class _SwiGLUMLP(nn.Module):
         return self.down(F.silu(self.gate(x)) * self.up(x))
 
 
+# ── SDPA wrapper: prevent dynamo from decomposing SDPA ──────────────
+# torch._dynamo.allow_in_graph must be applied at *definition time* so
+# that dynamo treats the call as an opaque leaf node in the FX graph.
+# Without this, PyTorch 2.7+cu118 decomposes F.scaled_dot_product_attention
+# into aten math ops, making it invisible to AutoSP's get_sdpa_nodes().
+@torch._dynamo.allow_in_graph
+def _sdpa_keep_in_graph(q, k, v, is_causal=True):
+    return F.scaled_dot_product_attention(q, k, v, is_causal=is_causal)
+
+
 class _CausalAttn(nn.Module):
     """Multi-head causal self-attention (sdpa / FlashAttention path)."""
 
@@ -286,7 +296,7 @@ class _CausalAttn(nn.Module):
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
-        out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        out = _sdpa_keep_in_graph(q, k, v, is_causal=True)
         return self.proj(out.transpose(1, 2).contiguous().reshape(B, T, C))
 
 

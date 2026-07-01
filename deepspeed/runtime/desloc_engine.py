@@ -2263,12 +2263,6 @@ class DesLocEngine:
 
             from deepspeed.compile.passes.sp_compile import apply_autosp
 
-            # Prevent dynamo from decomposing F.scaled_dot_product_attention
-            # into lower-level aten ops before the AutoSP backend can see it.
-            # Without this, PyTorch 2.7+ (especially cu118 without flash_attn)
-            # decomposes SDPA into _attention_math, making it invisible to AutoSP.
-            torch._dynamo.allow_in_graph(F.scaled_dot_product_attention)
-
             def _autosp_backend(gm, real_inputs):
                 rank = dist.get_rank() if dist.is_initialized() else 0
                 apply_autosp(gm, real_inputs, debug=False, sp_size=sp_size, dp_size=dp_size)
