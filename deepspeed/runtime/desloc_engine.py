@@ -142,6 +142,7 @@ from deepspeed.runtime.desloc_discovery import TierDiscovery
 from deepspeed.runtime.desloc_solver import PartitionSolver
 from deepspeed.models.mini_transformer import (
     RMSNorm, CausalSelfAttention, MLP, TransformerBlock, MiniTransformer,
+    build_warmup_cosine_scheduler,
 )
 
 # ---------------------------------------------------------------------------
@@ -495,7 +496,16 @@ class DesLocEngine:
                             fp32_optimizer_states=True,
                         )
                         self._optim_type = "DeepSpeedCPUAdam"
-                    except ImportError:
+                    except Exception as _cpu_adam_err:
+                        # CUDAMismatchException when system CUDA != torch CUDA,
+                        # ImportError when deepspeed ops not installed.
+                        # Fallback: plain PyTorch AdamW on CPU (slower, no JIT).
+                        logger.warning(
+                            "[zero3] DeepSpeedCPUAdam failed (%s); using torch AdamW on CPU. "
+                            "Fix: install torch matching system CUDA (pip install torch --index-url "
+                            "https://download.pytorch.org/whl/cu130)",
+                            _cpu_adam_err,
+                        )
                         self.optimizer = AdamW(
                             [_shard_cpu],
                             lr=config.max_lr,

@@ -113,7 +113,7 @@ def _build_inner_optimizer(
                 rank, vram_gb, _CPU_OFFLOAD_VRAM_THRESHOLD_GB,
             )
             return opt
-        except ImportError:
+        except Exception as _e:  # CUDAMismatchException, ImportError, etc.
             logger.warning(
                 "[rank %d] DeepSpeedCPUAdam not available (DS not compiled with "
                 "DS_BUILD_CPU_ADAM=1); falling back to AdamW on CPU. "
@@ -194,7 +194,7 @@ def _make_param_grad_buffer(model: "nn.Module") -> "object":
         # If already wrapped, return directly.
         if hasattr(model, "_param_and_grad_buffers"):
             return model._param_and_grad_buffers
-    except ImportError:
+    except Exception as _e:  # CUDAMismatchException, ImportError, etc.
         ParamAndGradBuffer = None
 
     # Build a lightweight namespace that satisfies DistributedOptimizer._build_shards.
@@ -499,7 +499,7 @@ class DistOptAdapter:
             if isinstance(self._opt, DistributedOptimizer):
                 self._opt.step_with_ready_grads()
                 return
-        except ImportError:
+        except Exception as _e:  # CUDAMismatchException, ImportError, etc.
             pass
         self._opt.step()
 
@@ -545,7 +545,7 @@ class DistOptAdapter:
                 # use_pcie_aware_overlap=False ensures synchronous execution.
                 self._opt._reduce_scatter_grads()
                 return
-        except ImportError:
+        except Exception as _e:  # CUDAMismatchException, ImportError, etc.
             pass
 
         # Fallback path: manual all-reduce + local copy when the full
@@ -581,7 +581,7 @@ class DistOptAdapter:
                 # force_sync=True: blocking all-gather (PCIe — no async benefit)
                 self._opt.start_param_sync(force_sync=True)
                 return
-        except ImportError:
+        except Exception as _e:  # CUDAMismatchException, ImportError, etc.
             pass
 
         # Fallback: no-op for single-rank / test environments where params are
