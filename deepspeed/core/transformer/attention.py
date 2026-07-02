@@ -1216,10 +1216,14 @@ class Attention(MegatronModule, ABC):
                     )
             except ImportError:
                 # Fallback to built-in rotary if megatron not available.
-                # Pass the original rotary_pos_emb [2, s, 1, dim] so
-                # _apply_rotary_emb can unpack both cos and sin.
-                if rotary_pos_emb is not None:
-                    query, key = self._apply_rotary_emb(query, key, rotary_pos_emb)
+                # q_pos_emb = cos [s, 1, dim], k_pos_emb = sin [s, 1, dim]
+                # (unpacked from rotary_pos_emb at line 1194 above).
+                # If rotary_pos_emb was a stacked [2, s, 1, dim] tensor,
+                # re-stack so _apply_rotary_emb can unpack dim-0.
+                # If it was a tuple, torch.stack materialises it.
+                if q_pos_emb is not None and k_pos_emb is not None:
+                    stacked = torch.stack([q_pos_emb, k_pos_emb], dim=0)
+                    query, key = self._apply_rotary_emb(query, key, stacked)
 
         # ------------------------------------------------------------------
         # Core attention computation
@@ -1448,6 +1452,10 @@ class Attention(MegatronModule, ABC):
             # Packed [2, seq, ...dim] format from _RotaryEmbedding
             cos_emb = rotary_pos_emb[0]  # [seq, 1, dim]
             sin_emb = rotary_pos_emb[1]  # [seq, 1, dim]
+            # Ensure 4D [s, 1, 1, dim] for broadcasting with q [s, b, nh, dim]
+            while cos_emb.dim() < q.dim():
+                cos_emb = cos_emb.unsqueeze(-2)
+                sin_emb = sin_emb.unsqueeze(-2)
         else:
             # rotary_pos_emb is [seq, 1, 1, dim] with cos/sin interleaved
             # (old GPT-NeoX style: first half = cos values, second half = sin)
