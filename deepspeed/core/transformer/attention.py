@@ -1215,15 +1215,22 @@ class Attention(MegatronModule, ABC):
                         mla_rotary_interleaved=mla_rotary_interleaved,
                     )
             except ImportError:
-                # Fallback to built-in rotary if megatron not available.
+                # Fallback: apply RoPE inline without megatron.
                 # q_pos_emb = cos [s, 1, dim], k_pos_emb = sin [s, 1, dim]
-                # (unpacked from rotary_pos_emb at line 1194 above).
-                # If rotary_pos_emb was a stacked [2, s, 1, dim] tensor,
-                # re-stack so _apply_rotary_emb can unpack dim-0.
-                # If it was a tuple, torch.stack materialises it.
+                # (from unpack of [2, s, 1, dim] at line 1194).
+                # q/k: [s, b, nh, head_dim].  head_dim == dim.
                 if q_pos_emb is not None and k_pos_emb is not None:
-                    stacked = torch.stack([q_pos_emb, k_pos_emb], dim=0)
-                    query, key = self._apply_rotary_emb(query, key, stacked)
+                    cos_emb = q_pos_emb  # [s, 1, dim]
+                    sin_emb = k_pos_emb  # [s, 1, dim]
+                    # Add head dim for broadcast: [s, 1, dim] → [s, 1, 1, dim]
+                    if cos_emb.dim() == 3:
+                        cos_emb = cos_emb.unsqueeze(1)  # [s, 1, 1, dim]
+                        sin_emb = sin_emb.unsqueeze(1)  # [s, 1, 1, dim]
+                    hd = query.shape[-1] // 2
+                    def _rotate(x: torch.Tensor) -> torch.Tensor:
+                        return torch.cat((-x[..., hd:], x[..., :hd]), dim=-1)
+                    query = query * cos_emb + _rotate(query) * sin_emb
+                    key = key * cos_emb[:key.shape[0]] + _rotate(key) * sin_emb[:key.shape[0]]
 
         # ------------------------------------------------------------------
         # Core attention computation
