@@ -450,24 +450,20 @@ class DesLocEngine:
         #      (DistOptAdapter.build)
         #   4. Attaches adapter to self.optimizer / self._dist_optimizer
         #
-        # Graceful fallback: if install() raises for any reason we fall back to
-        # the original AdamW path so training is never blocked by a bridge bug.
-        try:
-            from deepspeed.core.hetero_bridge import engine_integration as _hb_ei
-            _hb_ei.install(
-                self,
-                lr=config.max_lr,
-                betas=(config.beta1, config.beta2),
-                weight_decay=config.weight_decay,
-            )
-            logger.info("[hetero_bridge] Phase 5: install() succeeded — "
-                        "optimizer=%s, _cpu_offload=%s",
-                        type(self.optimizer).__name__, self._cpu_offload_optim)
-        except Exception as _hb_exc:  # noqa: BLE001
-            logger.warning(
-                "[hetero_bridge] install() failed (%s); "
-                "falling back to plain AdamW.", _hb_exc,
-            )
+        # NO FALLBACK: hetero_bridge is the production path.  If it fails,
+        # we crash — silent degradation to plain AdamW caused weeks of
+        # wasted training with wrong convergence (issue #13, no-fallback policy).
+        from deepspeed.core.hetero_bridge import engine_integration as _hb_ei
+        _hb_ei.install(
+            self,
+            lr=config.max_lr,
+            betas=(config.beta1, config.beta2),
+            weight_decay=config.weight_decay,
+        )
+        logger.info("[hetero_bridge] Phase 5: install() succeeded — "
+                    "optimizer=%s, _cpu_offload=%s",
+                    type(self.optimizer).__name__, self._cpu_offload_optim)
+        if False:  # dead code — fallback removed per no-fallback policy
             # ── Legacy fallback path (original Phase 5 behaviour) ─────────
             _local_vram_gb = torch.cuda.get_device_properties(
                 _local_device
@@ -484,28 +480,20 @@ class DesLocEngine:
                     _shard_cpu.requires_grad_(True)
                     self.param_shard_state.param_shard = _shard_cpu
                     self.param_shard = _shard_cpu
-                    try:
-                        from deepspeed.ops.adam import DeepSpeedCPUAdam
-                        self.optimizer = DeepSpeedCPUAdam(
-                            [_shard_cpu],
-                            lr=config.max_lr,
-                            betas=(config.beta1, config.beta2),
-                            eps=config.eps,
-                            weight_decay=config.weight_decay,
-                            adamw_mode=True,
-                            fp32_optimizer_states=True,
-                        )
-                        self._optim_type = "DeepSpeedCPUAdam"
-                    except Exception as _cpu_adam_err:
-                        # CUDAMismatchException when system CUDA != torch CUDA,
-                        # ImportError when deepspeed ops not installed.
-                        # Fallback: plain PyTorch AdamW on CPU (slower, no JIT).
-                        logger.warning(
-                            "[zero3] DeepSpeedCPUAdam failed (%s); using torch AdamW on CPU. "
-                            "Fix: install torch matching system CUDA (pip install torch --index-url "
-                            "https://download.pytorch.org/whl/cu130)",
-                            _cpu_adam_err,
-                        )
+                    # NO FALLBACK (issue #12): DeepSpeedCPUAdam is mandatory
+                    # for A6000 (49 GB VRAM).  Compile with DS_BUILD_CPU_ADAM=1.
+                    from deepspeed.ops.adam import DeepSpeedCPUAdam
+                    self.optimizer = DeepSpeedCPUAdam(
+                        [_shard_cpu],
+                        lr=config.max_lr,
+                        betas=(config.beta1, config.beta2),
+                        eps=config.eps,
+                        weight_decay=config.weight_decay,
+                        adamw_mode=True,
+                        fp32_optimizer_states=True,
+                    )
+                    self._optim_type = "DeepSpeedCPUAdam"
+                    if False:  # dead code — fallback removed per no-fallback policy
                         self.optimizer = AdamW(
                             [_shard_cpu],
                             lr=config.max_lr,

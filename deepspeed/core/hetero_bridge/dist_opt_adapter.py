@@ -65,6 +65,8 @@ def _build_inner_optimizer(
     weight_decay: float,
     vram_bytes: int,
     rank: int,
+    *,
+    wrapped_by_dist_opt: bool = False,
 ) -> "torch.optim.Optimizer":
     """Construct the per-rank inner optimizer based on available VRAM.
 
@@ -74,6 +76,13 @@ def _build_inner_optimizer(
       - VRAM ≥ 90 GB  → AdamW(fused=True) (H100 / Blackwell; GPU-fused kernel)
       - 50–89 GB      → AdamW(fused=False) (conservative GPU path)
 
+    **Weight decay handling** (fix for issue #13):
+    When ``wrapped_by_dist_opt=True``, weight_decay is set to 0 in the inner
+    optimizer because DistributedOptimizer applies weight decay externally via
+    ``param_group['wd_mult']``.  Setting it in both places causes double
+    application (Megatron convention: inner optimizer weight_decay=0, outer
+    DistributedOptimizer manages wd_mult per param group).
+
     Args:
         params:       Parameters or param-groups for the optimizer.
         lr:           Learning rate.
@@ -81,10 +90,15 @@ def _build_inner_optimizer(
         weight_decay: L2 / AdamW weight-decay coefficient.
         vram_bytes:   Total VRAM on this rank's GPU (bytes).
         rank:         Global distributed rank (for logging only).
+        wrapped_by_dist_opt: If True, set inner weight_decay=0 to avoid double
+                             application with DistributedOptimizer's wd_mult.
 
     Returns:
         A :class:`torch.optim.Optimizer` instance.
     """
+    # Fix #13: when DistributedOptimizer wraps us, it handles weight decay
+    # via wd_mult in param_groups.  Inner optimizer must NOT also apply it.
+    inner_wd = 0.0 if wrapped_by_dist_opt else weight_decay
     import torch
     vram_gb = vram_bytes / _BYTES_PER_GB
 
@@ -95,36 +109,27 @@ def _build_inner_optimizer(
     # GPU→CPU grad transfer and CPU→GPU param update implicitly.
     # ------------------------------------------------------------------
     if vram_gb < _CPU_OFFLOAD_VRAM_THRESHOLD_GB:
-        try:
-            from deepspeed.ops.adam import DeepSpeedCPUAdam
-            opt = DeepSpeedCPUAdam(
-                params,
-                lr=lr,
-                betas=betas,
-                eps=1e-8,
-                weight_decay=weight_decay,
-                adamw_mode=True,
-                fp32_optimizer_states=True,
-            )
-            logger.info(
-                "[rank %d] DistOptAdapter: VRAM=%.1f GB < %.0f GB "
-                "→ DeepSpeedCPUAdam (CPU offload, fp32 states). "
-                "Ref: a52efee1, DeepSpeed #4527",
-                rank, vram_gb, _CPU_OFFLOAD_VRAM_THRESHOLD_GB,
-            )
-            return opt
-        except Exception as _e:  # CUDAMismatchException, ImportError, etc.
-            logger.warning(
-                "[rank %d] DeepSpeedCPUAdam not available (DS not compiled with "
-                "DS_BUILD_CPU_ADAM=1); falling back to AdamW on CPU. "
-                "This may cause OOM on A6000 (%.1f GB VRAM).",
-                rank, vram_gb,
-            )
-            # Fallback: plain AdamW — slower but avoids hard failure in CI.
-            return torch.optim.AdamW(
-                params, lr=lr, betas=betas, eps=1e-8, weight_decay=weight_decay,
-                fused=False,
-            )
+        # NO FALLBACK (policy: issue #12).  DeepSpeedCPUAdam is required for
+        # A6000 (49 GB VRAM).  Without CPU-offloaded optimizer states the
+        # A6000 will OOM on any model > 3B params.  If this import fails,
+        # the operator must compile with DS_BUILD_CPU_ADAM=1.
+        from deepspeed.ops.adam import DeepSpeedCPUAdam
+        opt = DeepSpeedCPUAdam(
+            params,
+            lr=lr,
+            betas=betas,
+            eps=1e-8,
+            weight_decay=inner_wd,
+            adamw_mode=True,
+            fp32_optimizer_states=True,
+        )
+        logger.info(
+            "[rank %d] DistOptAdapter: VRAM=%.1f GB < %.0f GB "
+            "→ DeepSpeedCPUAdam (CPU offload, fp32 states). "
+            "Ref: a52efee1, DeepSpeed #4527",
+            rank, vram_gb, _CPU_OFFLOAD_VRAM_THRESHOLD_GB,
+        )
+        return opt
 
     # ------------------------------------------------------------------
     # H100 / Blackwell / high-VRAM path: fused AdamW on GPU.
@@ -141,7 +146,7 @@ def _build_inner_optimizer(
             pass
 
         opt = torch.optim.AdamW(
-            params, lr=lr, betas=betas, eps=1e-8, weight_decay=weight_decay,
+            params, lr=lr, betas=betas, eps=1e-8, weight_decay=inner_wd,
             fused=fused_available,
         )
         logger.info(
@@ -155,7 +160,7 @@ def _build_inner_optimizer(
     # Mid-VRAM path (50–89 GB): standard AdamW, no fused kernel.
     # ------------------------------------------------------------------
     opt = torch.optim.AdamW(
-        params, lr=lr, betas=betas, eps=1e-8, weight_decay=weight_decay,
+        params, lr=lr, betas=betas, eps=1e-8, weight_decay=inner_wd,
         fused=False,
     )
     logger.info(
@@ -391,6 +396,7 @@ class DistOptAdapter:
             weight_decay=self.weight_decay,
             vram_bytes=vram_bytes,
             rank=rank,
+            wrapped_by_dist_opt=True,  # Fix #13: DistOpt handles WD via wd_mult
         )
 
         # ---- 3. Build OptimizerConfig ----------------------------------
