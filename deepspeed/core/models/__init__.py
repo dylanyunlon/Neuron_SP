@@ -500,7 +500,12 @@ class _EmbeddingLayer(nn.Module):
 
 
 class _RotaryEmbedding(nn.Module):
-    """Rotary Position Embedding (RoPE) — precomputes cos/sin tables."""
+    """Rotary Position Embedding (RoPE) — precomputes raw frequency table.
+
+    Returns raw freqs (not cos/sin) so that downstream rope_utils functions
+    (_apply_rotary_pos_emb_bshd) can call torch.cos/sin themselves, matching
+    the Megatron-LM convention.  Shape returned: [s, 1, 1, dim].
+    """
 
     def __init__(
         self,
@@ -513,8 +518,7 @@ class _RotaryEmbedding(nn.Module):
         self.base = rotary_base
         self.rotary_interleaved = rotary_interleaved
         self._seq_len_cached: int = 0
-        self._cos_cached: Optional[torch.Tensor] = None
-        self._sin_cached: Optional[torch.Tensor] = None
+        self._freqs_cached: Optional[torch.Tensor] = None
 
     def _build_cache(self, seq_len: int, device: torch.device, dtype: torch.dtype) -> None:
         if seq_len <= self._seq_len_cached:
@@ -525,21 +529,21 @@ class _RotaryEmbedding(nn.Module):
         )
         t = torch.arange(seq_len, device=device, dtype=torch.float32)
         freqs = torch.outer(t, theta)  # [s, dim/2]
-        emb = torch.cat([freqs, freqs], dim=-1)  # [s, dim]
-        self._cos_cached = emb.cos().to(dtype)
-        self._sin_cached = emb.sin().to(dtype)
+        emb = torch.cat([freqs, freqs], dim=-1)  # [s, dim] — doubled so rot_dim == head_dim
+        self._freqs_cached = emb  # store raw freqs, NOT cos/sin
 
     def forward(self, seq_len: int, device: Optional[torch.device] = None) -> torch.Tensor:
-        """Return RoPE embedding of shape [seq_len, 1, 1, dim]."""
+        """Return raw RoPE frequencies of shape [s, 1, 1, dim].
+
+        Downstream code (rope_utils._apply_rotary_pos_emb_bshd) applies
+        torch.cos / torch.sin itself, so we must NOT pre-compute them here.
+        """
         if device is None:
             device = torch.device("cpu")
         self._build_cache(seq_len, device, torch.float32)
-        assert self._cos_cached is not None
-        # Return (cos, sin) stacked so callers can unpack easily.
-        cos = self._cos_cached[:seq_len]  # [s, dim]
-        sin = self._sin_cached[:seq_len]  # [s, dim]
-        # Package as [s, 1, 1, dim] for broadcasting in attention.
-        return torch.stack([cos, sin], dim=0).unsqueeze(2)  # [2, s, 1, dim]
+        assert self._freqs_cached is not None
+        freqs = self._freqs_cached[:seq_len]  # [s, dim]
+        return freqs.unsqueeze(1).unsqueeze(1)  # [s, 1, 1, dim]
 
 
 # ===========================================================================

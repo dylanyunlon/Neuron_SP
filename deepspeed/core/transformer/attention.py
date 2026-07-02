@@ -547,17 +547,8 @@ class Attention(MegatronModule, ABC):
         packed_seq_params=None,
     ) -> Tensor:
         """Forward method with selective activation checkpointing."""
-        try:
-            from megatron.core import tensor_parallel as _tp
-            _checkpoint = _tp.checkpoint
-        except ImportError:
-            # Fallback: run without checkpointing
-            return self._run_core_attention(
-                query, key, value, attention_mask,
-                attn_mask_type=attn_mask_type,
-                attention_bias=attention_bias,
-                packed_seq_params=packed_seq_params,
-            )
+        from deepspeed.core import tensor_parallel as _tp
+        _checkpoint = _tp.checkpoint
 
         def custom_forward(*inputs):
             _q, _k, _v, _mask = inputs[0], inputs[1], inputs[2], inputs[3]
@@ -634,14 +625,13 @@ class Attention(MegatronModule, ABC):
         """
         if self._pp_layer_offset is not None:
             return self._pp_layer_offset
-        # Uniform distribution fallback
-        try:
-            from megatron.core.transformer.transformer_layer import get_transformer_layer_offset
-            from megatron.core.parallel_state import get_pipeline_model_parallel_rank
-            return get_transformer_layer_offset(self.config, vp_stage=None,
-                                                pp_rank=get_pipeline_model_parallel_rank())
-        except Exception:
-            return 0
+        # Uniform distribution: use local parallel_state (no megatron fallback)
+        from deepspeed.core.parallel_state import get_pipeline_model_parallel_rank
+        pp_rank = get_pipeline_model_parallel_rank()
+        num_layers_per_stage = self.config.num_layers // max(
+            getattr(self.config, "pipeline_model_parallel_size", 1), 1
+        )
+        return pp_rank * num_layers_per_stage
 
     # ------------------------------------------------------------------
     # Inference KV-cache management (M2680)
@@ -1116,9 +1106,11 @@ class Attention(MegatronModule, ABC):
         else:
             rotary_pos_cos = rotary_pos_sin = None
 
-        # Normalise rotary_pos_emb to tuple
+        # Normalise rotary_pos_emb to (q_emb, k_emb) tuple.
+        # _RotaryEmbedding.forward() now returns raw freqs [s, 1, 1, dim].
+        # We share the same freqs tensor for both Q and K.
         if rotary_pos_emb is not None and not isinstance(rotary_pos_emb, tuple):
-            rotary_pos_emb = (rotary_pos_emb,) * 2
+            rotary_pos_emb = (rotary_pos_emb, rotary_pos_emb)
 
         # ------------------------------------------------------------------
         # AutoSP A2A scatter: seq/sp → seq, hidden → hidden/sp
@@ -1205,9 +1197,10 @@ class Attention(MegatronModule, ABC):
             q_pos_emb, k_pos_emb = rotary_pos_emb
             from deepspeed.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
 
-            # --- Fix #42: slice cos/sin by SP rank after all-to-all scatter ---
-            # After SP scatter, query/key seq dim = full_seq / sp_size,
-            # but rotary_pos_emb is still full_seq. Slice to matching segment.
+            # Slice raw freqs by SP rank after all-to-all scatter.
+            # _RotaryEmbedding returns [s, 1, 1, dim] raw freqs (not cos/sin).
+            # After SP scatter query/key have seq = full_seq / sp_size,
+            # so we slice freqs dim-0 to the local segment for this SP rank.
             if use_sp:
                 sp_rank = torch.distributed.get_rank(sp_group)
                 sp_world = torch.distributed.get_world_size(sp_group)
@@ -1401,84 +1394,27 @@ class Attention(MegatronModule, ABC):
 
     @staticmethod
     def _apply_rotary_emb(
-        q: torch.Tensor, k: torch.Tensor, rotary_pos_emb: torch.Tensor
+        q: torch.Tensor, k: torch.Tensor, freqs: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Apply rotary position embeddings to Q and K (built-in fallback).
 
         Args:
             q: ``[seq, batch, num_heads, head_dim]``
             k: ``[seq, batch, num_kv_heads, head_dim]``
-            rotary_pos_emb: ``[seq, 1, 1, head_dim]``
+            freqs: raw RoPE frequencies ``[seq, 1, 1, head_dim]``
+                   as returned by ``_RotaryEmbedding.forward()``.
+                   cos/sin are computed here, not pre-computed.
 
         Returns:
             Rotated q and k tensors with the same shapes.
         """
-        # rotary_pos_emb: [seq, 1, 1, head_dim] — cos and sin are packed as
-        # full head_dim via cat([freqs, freqs]) in _RotaryEmbedding._build_cache.
-        # The GPT-NeoX style: cos/sin have the same dim as q's last axis.
-        dim = q.shape[-1]
-        half = dim // 2
+        # freqs: [seq, 1, 1, head_dim] — raw position frequencies (NOT cos/sin).
+        # _RotaryEmbedding._build_cache stores: emb = cat([freqs, freqs], dim=-1)
+        # so head_dim == 2 * (dim/2) and rot_half naturally covers the full head.
+        half = q.shape[-1] // 2
 
-        # Split cos/sin from the stacked rotary_pos_emb.
-        # _RotaryEmbedding.forward() returns [2, seq, 1, dim] with [0]=cos, [1]=sin.
-        # But by the time we reach here, the caller already unpacked dim-0 into
-        # q_pos_emb and k_pos_emb, each [seq, 1, 1, dim].  So rotary_pos_emb
-        # here is already cos-only [seq, 1, 1, dim].  We need to reconstruct sin.
-        #
-        # Actually, looking at the call-site (line ~1220):
-        #   q_pos_emb, k_pos_emb = rotary_pos_emb   # unpack dim-0 of [2, s, 1, dim]
-        #   query, key = self._apply_rotary_emb(query, key, q_pos_emb)
-        # So q_pos_emb = cos part [s, 1, dim].  We don't have sin here!
-        #
-        # The fix: the _RotaryEmbedding should return (cos, sin) tuple, or we
-        # need to pass both.  For now, reconstruct from the fact that
-        # _build_cache does cat([freqs, freqs]) for cos, and same for sin.
-        # The emb has the structure: cos = [cos(θ₀)..cos(θ_{d/2-1}), cos(θ₀)..cos(θ_{d/2-1})]
-        # So the first half equals the second half.
-        #
-        # But wait — the real issue is simpler: rotary_pos_emb here IS already
-        # [seq, 1, 1, dim] where dim=head_dim.  cos/sin must be this full dim.
-        # The _build_cache does: emb = cat([freqs, freqs], dim=-1) → [s, dim]
-        # Then cos = emb.cos(), sin = emb.sin().
-        # forward() returns stack([cos, sin], dim=0) → [2, s, 1, dim].
-        # Caller unpacks: q_pos_emb, k_pos_emb = rotary_pos_emb → each [s, 1, dim]
-        #
-        # So q_pos_emb IS cos of shape [s, 1, dim] and k_pos_emb IS sin.
-        # The caller passes: self._apply_rotary_emb(query, key, q_pos_emb)
-        # But q_pos_emb is cos only!  We need BOTH cos and sin.
-        #
-        # Fix the call site to pass both, or fix here to derive sin from cos.
-        # Since cos² + sin² = 1 and the freqs are duplicated (cat), we can
-        # derive sin = sqrt(1 - cos²).  But that's numerically fragile.
-        #
-        # Proper fix: pass both cos and sin.  But to minimize changes, use the
-        # structure: cos_emb = rotary_pos_emb (full dim), and since
-        # _build_cache makes emb = cat([freqs, freqs]), we know
-        # cos[:half] == cos[half:] and sin can be derived from asin.
-        #
-        # Simplest correct approach: recompute sin from the angle.
-        # Actually even simpler — just use torch SDPA rotary which handles it.
-        #
-        # SIMPLEST FIX: rotary_pos_emb is cos; sin = sqrt(1-cos²) with sign
-        # correction.  But this is fragile.
-        #
-        # REAL FIX: Change forward() to pass (cos, sin) tuple through.
-        # For now, use the fact that we stored both in the [2,...] tensor.
-        # Let's handle it: if rotary_pos_emb has a first dim of 2, unpack;
-        # otherwise fall back to the old half-split logic.
-        if rotary_pos_emb.shape[0] == 2 and rotary_pos_emb.dim() >= 3:
-            # Packed [2, seq, ...dim] format from _RotaryEmbedding
-            cos_emb = rotary_pos_emb[0]  # [seq, 1, dim]
-            sin_emb = rotary_pos_emb[1]  # [seq, 1, dim]
-            # Ensure 4D [s, 1, 1, dim] for broadcasting with q [s, b, nh, dim]
-            while cos_emb.dim() < q.dim():
-                cos_emb = cos_emb.unsqueeze(-2)
-                sin_emb = sin_emb.unsqueeze(-2)
-        else:
-            # rotary_pos_emb is [seq, 1, 1, dim] with cos/sin interleaved
-            # (old GPT-NeoX style: first half = cos values, second half = sin)
-            cos_emb = rotary_pos_emb[..., :half]
-            sin_emb = rotary_pos_emb[..., half:]
+        cos_emb = torch.cos(freqs).to(q.dtype)  # [seq, 1, 1, head_dim]
+        sin_emb = torch.sin(freqs).to(q.dtype)  # [seq, 1, 1, head_dim]
 
         def rotate_half(x: torch.Tensor) -> torch.Tensor:
             x1, x2 = x[..., :half], x[..., half:]
