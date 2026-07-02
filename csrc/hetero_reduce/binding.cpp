@@ -227,13 +227,238 @@ void fused_swiglu_ln_py(at::Tensor output,
 }
 
 // ---------------------------------------------------------------------------
+// fused_rope_hetero bindings
+// ---------------------------------------------------------------------------
+
+void rope_cache_py(at::Tensor cos_cache,
+                   at::Tensor sin_cache,
+                   int seq_len,
+                   int head_dim,
+                   float base,
+                   int pos_offset)
+{
+    check_fp32(cos_cache, "cos_cache");
+    check_fp32(sin_cache, "sin_cache");
+    TORCH_CHECK(cos_cache.is_contiguous(), "cos_cache must be contiguous");
+    TORCH_CHECK(sin_cache.is_contiguous(), "sin_cache must be contiguous");
+    const int half_dim = head_dim / 2;
+    TORCH_CHECK(cos_cache.numel() == (int64_t)seq_len * half_dim,
+                "cos_cache size mismatch");
+    TORCH_CHECK(sin_cache.numel() == (int64_t)seq_len * half_dim,
+                "sin_cache size mismatch");
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    launch_rope_cache(cos_cache.data_ptr<float>(),
+                      sin_cache.data_ptr<float>(),
+                      seq_len, head_dim, base, pos_offset, stream);
+}
+
+void fused_rope_hetero_py(at::Tensor output,
+                           at::Tensor input,
+                           at::Tensor cos_cache,
+                           at::Tensor sin_cache,
+                           bool neox_style,
+                           int sm_version)
+{
+    check_bf16(output,    "output");
+    check_bf16(input,     "input");
+    check_fp32(cos_cache, "cos_cache");
+    check_fp32(sin_cache, "sin_cache");
+
+    TORCH_CHECK(input.dim() == 4,  "input must be 4-D [B, S, H, D]");
+    TORCH_CHECK(output.dim() == 4, "output must be 4-D [B, S, H, D]");
+    TORCH_CHECK(output.sizes() == input.sizes(), "output/input shape mismatch");
+
+    const int batch     = (int)input.size(0);
+    const int seq_len   = (int)input.size(1);
+    const int num_heads = (int)input.size(2);
+    const int head_dim  = (int)input.size(3);
+
+    TORCH_CHECK(head_dim % 2 == 0, "head_dim must be even, got ", head_dim);
+
+    const int half_dim = head_dim / 2;
+    TORCH_CHECK(cos_cache.numel() == (int64_t)seq_len * half_dim,
+                "cos_cache numel mismatch");
+    TORCH_CHECK(sin_cache.numel() == (int64_t)seq_len * half_dim,
+                "sin_cache numel mismatch");
+
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    launch_fused_rope_hetero(
+        reinterpret_cast<__nv_bfloat16*>(output.data_ptr<at::BFloat16>()),
+        reinterpret_cast<const __nv_bfloat16*>(input.data_ptr<at::BFloat16>()),
+        cos_cache.data_ptr<float>(),
+        sin_cache.data_ptr<float>(),
+        batch, seq_len, num_heads, head_dim,
+        neox_style, sm_version, stream);
+}
+
+// ---------------------------------------------------------------------------
+// pcie_adaptive_allreduce bindings
+// ---------------------------------------------------------------------------
+
+at::Tensor pcie_ring_reduce_py(at::Tensor dst,
+                                at::Tensor src,
+                                int sm_version)
+{
+    check_bf16(dst, "dst");
+    check_bf16(src, "src");
+    TORCH_CHECK(dst.numel() == src.numel(), "dst/src numel mismatch");
+    TORCH_CHECK(dst.numel() % 8 == 0, "numel must be divisible by 8");
+
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    launch_pcie_ring_reduce(
+        reinterpret_cast<__nv_bfloat16*>(dst.data_ptr<at::BFloat16>()),
+        reinterpret_cast<const __nv_bfloat16*>(src.data_ptr<at::BFloat16>()),
+        (size_t)dst.numel(), sm_version, stream);
+    return dst;
+}
+
+void pcie_allreduce_finalise_py(at::Tensor out,
+                                 at::Tensor src,
+                                 int world_size,
+                                 int sm_version)
+{
+    check_bf16(out, "out");
+    check_bf16(src, "src");
+    TORCH_CHECK(out.numel() == src.numel(), "out/src numel mismatch");
+    TORCH_CHECK(out.numel() % 8 == 0, "numel must be divisible by 8");
+    TORCH_CHECK(world_size > 0, "world_size must be > 0");
+
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    launch_pcie_allreduce_finalise(
+        reinterpret_cast<__nv_bfloat16*>(out.data_ptr<at::BFloat16>()),
+        reinterpret_cast<const __nv_bfloat16*>(src.data_ptr<at::BFloat16>()),
+        (size_t)out.numel(), world_size, sm_version, stream);
+}
+
+int64_t pcie_bucket_size_py(float pcie_bw_gbps)
+{
+    return (int64_t)compute_pcie_bucket_size(pcie_bw_gbps);
+}
+
+// ---------------------------------------------------------------------------
+// tier_activation_offload bindings
+// ---------------------------------------------------------------------------
+
+void activation_pack_py(at::Tensor output,
+                         std::vector<at::Tensor> inputs,
+                         int sm_version)
+{
+    check_bf16(output, "output");
+    TORCH_CHECK(!inputs.empty(), "inputs must not be empty");
+    const size_t tensor_elems = (size_t)inputs[0].numel();
+    TORCH_CHECK(tensor_elems % 8 == 0, "tensor_elems must be divisible by 8");
+    TORCH_CHECK((size_t)output.numel() == inputs.size() * tensor_elems,
+                "output size mismatch");
+
+    std::vector<const __nv_bfloat16*> ptrs;
+    ptrs.reserve(inputs.size());
+    for (size_t i = 0; i < inputs.size(); i++) {
+        check_bf16(inputs[i], ("inputs[" + std::to_string(i) + "]").c_str());
+        TORCH_CHECK((size_t)inputs[i].numel() == tensor_elems,
+                    "inputs[", i, "] numel mismatch");
+        ptrs.push_back(reinterpret_cast<const __nv_bfloat16*>(
+            inputs[i].data_ptr<at::BFloat16>()));
+    }
+
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    launch_activation_pack(
+        reinterpret_cast<__nv_bfloat16*>(output.data_ptr<at::BFloat16>()),
+        ptrs.data(), (int)ptrs.size(), tensor_elems, sm_version, stream);
+}
+
+void activation_unpack_py(std::vector<at::Tensor> outputs,
+                           at::Tensor flat,
+                           int sm_version)
+{
+    check_bf16(flat, "flat");
+    TORCH_CHECK(!outputs.empty(), "outputs must not be empty");
+    const size_t tensor_elems = (size_t)outputs[0].numel();
+    TORCH_CHECK(tensor_elems % 8 == 0, "tensor_elems must be divisible by 8");
+    TORCH_CHECK((size_t)flat.numel() == outputs.size() * tensor_elems,
+                "flat size mismatch");
+
+    std::vector<__nv_bfloat16*> ptrs;
+    ptrs.reserve(outputs.size());
+    for (size_t i = 0; i < outputs.size(); i++) {
+        check_bf16(outputs[i], ("outputs[" + std::to_string(i) + "]").c_str());
+        TORCH_CHECK((size_t)outputs[i].numel() == tensor_elems,
+                    "outputs[", i, "] numel mismatch");
+        ptrs.push_back(reinterpret_cast<__nv_bfloat16*>(
+            outputs[i].data_ptr<at::BFloat16>()));
+    }
+
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    launch_activation_unpack(
+        ptrs.data(),
+        reinterpret_cast<const __nv_bfloat16*>(flat.data_ptr<at::BFloat16>()),
+        (int)ptrs.size(), tensor_elems, sm_version, stream);
+}
+
+void quantise_bf16_to_int8_py(at::Tensor output,
+                                at::Tensor scales,
+                                at::Tensor input)
+{
+    TORCH_CHECK(output.scalar_type() == at::ScalarType::Char,
+                "output must be Int8");
+    TORCH_CHECK(output.is_cuda() && output.is_contiguous());
+    check_fp32(scales, "scales");
+    check_bf16(input,  "input");
+    TORCH_CHECK(output.numel() == input.numel(), "output/input numel mismatch");
+
+    const size_t n_elems = (size_t)input.numel();
+    const size_t n_tiles = (n_elems + 127) / 128;
+    TORCH_CHECK((size_t)scales.numel() >= n_tiles,
+                "scales buffer too small: need ", n_tiles, " got ", scales.numel());
+
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    launch_quantise_fp16_to_int8(
+        reinterpret_cast<int8_t*>(output.data_ptr<int8_t>()),
+        scales.data_ptr<float>(),
+        reinterpret_cast<const __nv_bfloat16*>(input.data_ptr<at::BFloat16>()),
+        n_elems, stream);
+}
+
+void dequantise_int8_to_bf16_py(at::Tensor output,
+                                  at::Tensor input,
+                                  at::Tensor scales)
+{
+    check_bf16(output, "output");
+    TORCH_CHECK(input.scalar_type() == at::ScalarType::Char,
+                "input must be Int8");
+    TORCH_CHECK(input.is_cuda() && input.is_contiguous());
+    check_fp32(scales, "scales");
+    TORCH_CHECK(output.numel() == input.numel(), "output/input numel mismatch");
+
+    const size_t n_elems = (size_t)input.numel();
+    const size_t n_tiles = (n_elems + 127) / 128;
+    TORCH_CHECK((size_t)scales.numel() >= n_tiles,
+                "scales buffer too small");
+
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    launch_dequantise_int8_to_fp16(
+        reinterpret_cast<__nv_bfloat16*>(output.data_ptr<at::BFloat16>()),
+        reinterpret_cast<const int8_t*>(input.data_ptr<int8_t>()),
+        scales.data_ptr<float>(),
+        n_elems, stream);
+}
+
+int64_t compute_offload_budget_py(int64_t total_act_bytes,
+                                   int64_t vram_free_bytes,
+                                   float   headroom_frac)
+{
+    return (int64_t)compute_offload_budget(
+        (size_t)total_act_bytes, (size_t)vram_free_bytes, headroom_frac);
+}
+
+// ---------------------------------------------------------------------------
 // PYBIND11_MODULE
 // ---------------------------------------------------------------------------
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
-    m.doc() = "DeepSpeed hetero_reduce: fused BF16 reduce-scatter + SwiGLU-LN "
-              "kernels for heterogeneous GPU clusters (SM 8.6 / 9.0 / 12.0).";
+    m.doc() = "DeepSpeed hetero_reduce: fused BF16 reduce-scatter + SwiGLU-LN + "
+              "RoPE + PCIe allreduce + tier activation offload kernels "
+              "for heterogeneous GPU clusters (SM 8.6 / 9.0 / 12.0).";
 
     m.def("fused_bf16_reduce",
           &fused_bf16_reduce_py,
@@ -289,4 +514,136 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("ln_weight"),
           py::arg("eps") = 1e-6f,
           py::arg("sm_version") = 86);
+
+    // -----------------------------------------------------------------------
+    // fused_rope_hetero
+    // -----------------------------------------------------------------------
+    m.def("rope_cache",
+          &rope_cache_py,
+          "Precompute RoPE cos/sin cache on device.\n"
+          "Args:\n"
+          "  cos_cache  (Tensor FP32 [S, D/2]): output cosine table\n"
+          "  sin_cache  (Tensor FP32 [S, D/2]): output sine table\n"
+          "  seq_len    (int): sequence length\n"
+          "  head_dim   (int): full head dimension\n"
+          "  base       (float): RoPE base, default 10000.0\n"
+          "  pos_offset (int): global position offset for packed seqs",
+          py::arg("cos_cache"),
+          py::arg("sin_cache"),
+          py::arg("seq_len"),
+          py::arg("head_dim"),
+          py::arg("base") = 10000.f,
+          py::arg("pos_offset") = 0);
+
+    m.def("fused_rope_hetero",
+          &fused_rope_hetero_py,
+          "Fused RoPE for heterogeneous head counts.\n"
+          "Args:\n"
+          "  output     (Tensor BF16 [B, S, H, D]): output (may alias input)\n"
+          "  input      (Tensor BF16 [B, S, H, D]): query or key tensor\n"
+          "  cos_cache  (Tensor FP32 [S, D/2])    : precomputed cosines\n"
+          "  sin_cache  (Tensor FP32 [S, D/2])    : precomputed sines\n"
+          "  neox_style (bool): True=Llama/NeoX, False=GPT-J interleaved\n"
+          "  sm_version (int): 86, 90, or 120",
+          py::arg("output"),
+          py::arg("input"),
+          py::arg("cos_cache"),
+          py::arg("sin_cache"),
+          py::arg("neox_style") = true,
+          py::arg("sm_version") = 86);
+
+    // -----------------------------------------------------------------------
+    // pcie_adaptive_allreduce
+    // -----------------------------------------------------------------------
+    m.def("pcie_ring_reduce",
+          &pcie_ring_reduce_py,
+          "PCIe ring-allreduce reduce phase: dst += src (BF16, in-place).\n"
+          "Args:\n"
+          "  dst        (Tensor BF16): local accumulator (modified in-place)\n"
+          "  src        (Tensor BF16): incoming peer gradient bucket\n"
+          "  sm_version (int): 86, 90, or 120",
+          py::arg("dst"),
+          py::arg("src"),
+          py::arg("sm_version") = 86);
+
+    m.def("pcie_allreduce_finalise",
+          &pcie_allreduce_finalise_py,
+          "Divide allreduce sum by world_size and write BF16 output.\n"
+          "Args:\n"
+          "  out        (Tensor BF16): output buffer\n"
+          "  src        (Tensor BF16): sum buffer\n"
+          "  world_size (int): number of participating GPUs\n"
+          "  sm_version (int): 86, 90, or 120",
+          py::arg("out"),
+          py::arg("src"),
+          py::arg("world_size"),
+          py::arg("sm_version") = 86);
+
+    m.def("pcie_bucket_size",
+          &pcie_bucket_size_py,
+          "Compute recommended PCIe gradient bucket size in bytes.\n"
+          "Args:\n"
+          "  pcie_bw_gbps (float): measured or estimated PCIe bandwidth in GB/s\n"
+          "Returns: int (bucket size in bytes)",
+          py::arg("pcie_bw_gbps") = 32.f);
+
+    // -----------------------------------------------------------------------
+    // tier_activation_offload
+    // -----------------------------------------------------------------------
+    m.def("activation_pack",
+          &activation_pack_py,
+          "Pack activation tensors into a flat BF16 offload buffer.\n"
+          "Args:\n"
+          "  output     (Tensor BF16 [N * tensor_elems]): flat output buffer\n"
+          "  inputs     (List[Tensor BF16]): activation tensors to pack\n"
+          "  sm_version (int): 86, 90, or 120",
+          py::arg("output"),
+          py::arg("inputs"),
+          py::arg("sm_version") = 86);
+
+    m.def("activation_unpack",
+          &activation_unpack_py,
+          "Unpack a flat BF16 buffer back to individual activation tensors.\n"
+          "Args:\n"
+          "  outputs    (List[Tensor BF16]): destination activation tensors\n"
+          "  flat       (Tensor BF16 [N * tensor_elems]): flat source buffer\n"
+          "  sm_version (int): 86, 90, or 120",
+          py::arg("outputs"),
+          py::arg("flat"),
+          py::arg("sm_version") = 86);
+
+    m.def("quantise_bf16_to_int8",
+          &quantise_bf16_to_int8_py,
+          "Block-wise INT8 quantisation of BF16 activation buffer.\n"
+          "Tile size = 128 elements, scale = absmax / 127 per tile.\n"
+          "Args:\n"
+          "  output (Tensor Int8  [N]): quantised output\n"
+          "  scales (Tensor FP32  [ceil(N/128)]): per-tile scales\n"
+          "  input  (Tensor BF16  [N]): input activations",
+          py::arg("output"),
+          py::arg("scales"),
+          py::arg("input"));
+
+    m.def("dequantise_int8_to_bf16",
+          &dequantise_int8_to_bf16_py,
+          "Block-wise INT8 dequantisation to BF16.\n"
+          "Args:\n"
+          "  output (Tensor BF16  [N]): dequantised output\n"
+          "  input  (Tensor Int8  [N]): quantised input\n"
+          "  scales (Tensor FP32  [ceil(N/128)]): per-tile scales",
+          py::arg("output"),
+          py::arg("input"),
+          py::arg("scales"));
+
+    m.def("compute_offload_budget",
+          &compute_offload_budget_py,
+          "Compute activation offload budget for a GPU tier.\n"
+          "Args:\n"
+          "  total_act_bytes  (int): total activation bytes required\n"
+          "  vram_free_bytes  (int): current free VRAM on this device\n"
+          "  headroom_frac    (float): fraction of free VRAM to keep unused\n"
+          "Returns: int (bytes to offload, 0 if activations fit in VRAM)",
+          py::arg("total_act_bytes"),
+          py::arg("vram_free_bytes"),
+          py::arg("headroom_frac") = 0.1f);
 }
