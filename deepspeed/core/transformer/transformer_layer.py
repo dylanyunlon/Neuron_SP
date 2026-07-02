@@ -269,7 +269,7 @@ class TransformerLayer(MegatronModule):
 
         if self.apply_residual_post_layernorm:
             # Post-norm: run attention on raw hidden states, norm after residual
-            attn_out = self.self_attention(
+            attn_out_raw = self.self_attention(
                 hidden_states,
                 attention_mask=attention_mask,
                 rotary_pos_emb=rotary_pos_emb,
@@ -280,13 +280,15 @@ class TransformerLayer(MegatronModule):
                 packed_seq_params=packed_seq_params,
                 sequence_len_offset=sequence_len_offset,
             )
+            # Attention returns (output, bias) tuple; extract tensor
+            attn_out = attn_out_raw[0] if isinstance(attn_out_raw, (tuple, list)) else attn_out_raw
             hidden_states = self.input_layernorm(
                 self._apply_residual(residual, attn_out, self.attn_dropout, None)
             )
         else:
             # Pre-norm: norm first, then attention, then residual
             normed = self.input_layernorm(hidden_states)
-            attn_out = self.self_attention(
+            attn_out_raw = self.self_attention(
                 normed,
                 attention_mask=attention_mask,
                 rotary_pos_emb=rotary_pos_emb,
@@ -297,6 +299,8 @@ class TransformerLayer(MegatronModule):
                 packed_seq_params=packed_seq_params,
                 sequence_len_offset=sequence_len_offset,
             )
+            # Attention returns (output, bias) tuple; extract tensor
+            attn_out = attn_out_raw[0] if isinstance(attn_out_raw, (tuple, list)) else attn_out_raw
             hidden_states = self._apply_residual(
                 residual, attn_out, self.attn_dropout, None
             )
@@ -309,21 +313,23 @@ class TransformerLayer(MegatronModule):
                 residual = hidden_states
 
             if self.apply_residual_post_layernorm:
-                cross_out = self.cross_attention(
+                cross_out_raw = self.cross_attention(
                     hidden_states,
                     attention_mask=context_mask,
                     inference_context=inference_context,
                 )
+                cross_out = cross_out_raw[0] if isinstance(cross_out_raw, (tuple, list)) else cross_out_raw
                 hidden_states = self.pre_cross_attn_layernorm(
                     self._apply_residual(residual, cross_out, self.cross_attn_dropout, None)
                 )
             else:
                 normed = self.pre_cross_attn_layernorm(hidden_states)
-                cross_out = self.cross_attention(
+                cross_out_raw = self.cross_attention(
                     normed,
                     attention_mask=context_mask,
                     inference_context=inference_context,
                 )
+                cross_out = cross_out_raw[0] if isinstance(cross_out_raw, (tuple, list)) else cross_out_raw
                 hidden_states = self._apply_residual(
                     residual, cross_out, self.cross_attn_dropout, None
                 )
@@ -347,13 +353,17 @@ class TransformerLayer(MegatronModule):
             residual = hidden_states
 
         if self.apply_residual_post_layernorm:
-            mlp_out = self.mlp(hidden_states)
+            mlp_out_raw = self.mlp(hidden_states)
+            # MLP returns (output, bias) tuple; extract tensor
+            mlp_out = mlp_out_raw[0] if isinstance(mlp_out_raw, (tuple, list)) else mlp_out_raw
             hidden_states = self.pre_mlp_layernorm(
                 self._apply_residual(residual, mlp_out, self.mlp_dropout, None)
             )
         else:
             normed = self.pre_mlp_layernorm(hidden_states)
-            mlp_out = self.mlp(normed)
+            mlp_out_raw = self.mlp(normed)
+            # MLP returns (output, bias) tuple; extract tensor
+            mlp_out = mlp_out_raw[0] if isinstance(mlp_out_raw, (tuple, list)) else mlp_out_raw
             hidden_states = self._apply_residual(
                 residual, mlp_out, self.mlp_dropout, None
             )
