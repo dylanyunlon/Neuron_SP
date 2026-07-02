@@ -281,8 +281,10 @@ def apply_rotary_pos_emb(
     global fused_apply_rotary_pos_emb, fused_apply_rotary_pos_emb_thd
 
     # Keep for backward compatibility. Will deprecate in the future.
+    # DES-LOC skips Megatron parallel init, so _CONTEXT_PARALLEL_GROUP may be None.
+    # When CP is not initialized (cp_size=1), treat as no context parallelism.
     if cp_group is None:
-        cp_group = parallel_state.get_context_parallel_group()
+        cp_group = parallel_state.get_context_parallel_group(check_initialized=False)
 
     if config.apply_rope_fusion:
         if cu_seqlens is None:
@@ -316,8 +318,8 @@ def apply_rotary_pos_emb(
                 t,
                 cu_seqlens,
                 freqs,
-                cp_size=cp_group.size(),
-                cp_rank=cp_group.rank(),
+                cp_size=cp_group.size() if cp_group is not None else 1,
+                cp_rank=cp_group.rank() if cp_group is not None else 0,
                 interleaved=config.rotary_interleaved,
             )
     # use unfused implementation
