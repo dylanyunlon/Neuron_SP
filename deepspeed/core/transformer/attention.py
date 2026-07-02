@@ -185,14 +185,33 @@ except ImportError:
     set_save_original_input = None  # type: ignore[assignment]
     _te_get_workspace = None    # type: ignore[assignment]
 
-# YaRN mscale helper
-try:
-    from megatron.core.models.common.embeddings.yarn_rotary_pos_embedding import (
-        _yarn_get_concentration_factor_from_config,
+# YaRN mscale helpers — ported from Megatron-LM yarn_rotary_pos_embedding.py
+# No fallback: this is the real implementation.
+import math
+
+def _yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
+    if scale <= 1:
+        return 1.0
+    return 0.1 * mscale * math.log(scale) + 1.0
+
+def _yarn_get_concentration_factor(
+    scaling_factor: float, mscale: float | None, mscale_all_dim: float | None,
+) -> float:
+    if mscale is None or mscale_all_dim is None:
+        return _yarn_get_mscale(scaling_factor)
+    return float(
+        _yarn_get_mscale(scaling_factor, mscale)
+        / _yarn_get_mscale(scaling_factor, mscale_all_dim)
     )
-except ImportError:
-    def _yarn_get_concentration_factor_from_config(config) -> float | None:  # type: ignore[misc]
-        return None
+
+def _yarn_get_concentration_factor_from_config(config) -> float:
+    if hasattr(config, "yarn_rotary_scaling_factor"):
+        return _yarn_get_concentration_factor(
+            config.yarn_rotary_scaling_factor,
+            getattr(config, "yarn_mscale", None),
+            getattr(config, "yarn_mscale_all_dim", None),
+        )
+    return 1.0
 
 
 # ---------------------------------------------------------------------------
