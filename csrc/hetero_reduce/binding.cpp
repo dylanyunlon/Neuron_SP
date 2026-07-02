@@ -15,6 +15,20 @@
  *       inputs : List[torch.Tensor]  BF16 device tensors, each shape [N]
  *       sm_version : int  e.g. 86, 90, 120
  *
+ *   hetero_reduce.hetero_reduce_scatter(output, inputs, shard_offset,
+ *                                        shard_count, sm_version) -> None
+ *       output       : torch.Tensor BF16, device tensor [shard_count]
+ *       inputs       : List[torch.Tensor] BF16 device tensors [N]
+ *       shard_offset : int  starting element index in the full tensor
+ *       shard_count  : int  number of elements this device writes
+ *       sm_version   : int  e.g. 86, 90, 120
+ *
+ *   hetero_reduce.compute_shard_ranges(sm_versions, total_elems)
+ *                                        -> List[Tuple[int, int]]
+ *       sm_versions : List[int]  per-tier SM versions
+ *       total_elems : int        total BF16 elements
+ *       Returns list of (offset, count) tuples, one per tier.
+ *
  *   hetero_reduce.fused_swiglu_ln(output, gate_proj, up_proj, ln_weight,
  *                                  eps, sm_version) -> None
  *       output     : torch.Tensor  BF16  [batch, hidden]
@@ -90,6 +104,84 @@ void fused_bf16_reduce_py(at::Tensor output,
 }
 
 // ---------------------------------------------------------------------------
+// hetero_reduce_scatter binding
+// ---------------------------------------------------------------------------
+
+void hetero_reduce_scatter_py(at::Tensor output,
+                               std::vector<at::Tensor> inputs,
+                               int64_t shard_offset,
+                               int64_t shard_count,
+                               int sm_version)
+{
+    check_bf16(output, "output");
+    TORCH_CHECK(!inputs.empty(), "inputs list must not be empty");
+    TORCH_CHECK(inputs.size() <= 32,
+                "supports at most 32 input tensors, got ", inputs.size());
+
+    TORCH_CHECK(shard_offset >= 0, "shard_offset must be >= 0");
+    TORCH_CHECK(shard_count > 0,   "shard_count must be > 0");
+    TORCH_CHECK(shard_count % 8 == 0,
+                "shard_count must be divisible by 8, got ", shard_count);
+    TORCH_CHECK(static_cast<size_t>(output.numel()) >= static_cast<size_t>(shard_count),
+                "output numel must be >= shard_count");
+
+    std::vector<const __nv_bfloat16*> ptrs;
+    ptrs.reserve(inputs.size());
+    for (size_t i = 0; i < inputs.size(); i++) {
+        check_bf16(inputs[i], ("inputs[" + std::to_string(i) + "]").c_str());
+        TORCH_CHECK(static_cast<size_t>(inputs[i].numel()) >=
+                    static_cast<size_t>(shard_offset + shard_count),
+                    "inputs[", i, "] numel too small for shard range");
+        ptrs.push_back(reinterpret_cast<const __nv_bfloat16*>(inputs[i].data_ptr<at::BFloat16>()));
+    }
+
+    __nv_bfloat16* out_ptr =
+        reinterpret_cast<__nv_bfloat16*>(output.data_ptr<at::BFloat16>());
+
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    launch_hetero_reduce_scatter(out_ptr, ptrs.data(),
+                                  static_cast<int>(ptrs.size()),
+                                  static_cast<size_t>(shard_offset),
+                                  static_cast<size_t>(shard_count),
+                                  sm_version, stream);
+}
+
+// ---------------------------------------------------------------------------
+// compute_shard_ranges binding
+// ---------------------------------------------------------------------------
+
+std::vector<std::tuple<int64_t, int64_t>>
+compute_shard_ranges_py(std::vector<int> sm_versions, int64_t total_elems)
+{
+    TORCH_CHECK(!sm_versions.empty(), "sm_versions must not be empty");
+    TORCH_CHECK(total_elems > 0, "total_elems must be > 0");
+    TORCH_CHECK(total_elems % 8 == 0,
+                "total_elems must be divisible by 8, got ", total_elems);
+
+    const int num_tiers = static_cast<int>(sm_versions.size());
+    std::vector<HeteroTierDesc> tiers(num_tiers);
+    for (int i = 0; i < num_tiers; i++) {
+        tiers[i].device_id   = i;
+        tiers[i].sm_version  = sm_versions[i];
+        tiers[i].bucket_size = 0;
+    }
+
+    std::vector<size_t> offsets(num_tiers);
+    std::vector<size_t> counts(num_tiers);
+    compute_hetero_shard_ranges(tiers.data(), num_tiers,
+                                 static_cast<size_t>(total_elems),
+                                 offsets.data(), counts.data());
+
+    std::vector<std::tuple<int64_t, int64_t>> result;
+    result.reserve(num_tiers);
+    for (int i = 0; i < num_tiers; i++) {
+        result.emplace_back(static_cast<int64_t>(offsets[i]),
+                            static_cast<int64_t>(counts[i]));
+    }
+    return result;
+}
+
+// ---------------------------------------------------------------------------
 // fused_swiglu_ln binding
 // ---------------------------------------------------------------------------
 
@@ -153,6 +245,33 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("output"),
           py::arg("inputs"),
           py::arg("sm_version") = 86);
+
+    m.def("hetero_reduce_scatter",
+          &hetero_reduce_scatter_py,
+          "Heterogeneous reduce-scatter: reduces all inputs but writes only the\n"
+          "local shard [shard_offset, shard_offset + shard_count) to output.\n"
+          "Args:\n"
+          "  output       (Tensor BF16): shard output buffer [shard_count]\n"
+          "  inputs       (List[Tensor BF16]): full-length input gradient tensors\n"
+          "  shard_offset (int): starting element index in full tensor\n"
+          "  shard_count  (int): number of elements to reduce and write\n"
+          "  sm_version   (int): SM version of active device",
+          py::arg("output"),
+          py::arg("inputs"),
+          py::arg("shard_offset"),
+          py::arg("shard_count"),
+          py::arg("sm_version") = 86);
+
+    m.def("compute_shard_ranges",
+          &compute_shard_ranges_py,
+          "Compute non-uniform shard ranges for heterogeneous GPU tiers.\n"
+          "Returns List[Tuple[offset, count]] with one entry per tier.\n"
+          "Weight: SM12.0=4, SM9.0=3, SM8.6=1.\n"
+          "Args:\n"
+          "  sm_versions (List[int]): per-tier SM versions\n"
+          "  total_elems (int): total BF16 elements in gradient tensor",
+          py::arg("sm_versions"),
+          py::arg("total_elems"));
 
     m.def("fused_swiglu_ln",
           &fused_swiglu_ln_py,
