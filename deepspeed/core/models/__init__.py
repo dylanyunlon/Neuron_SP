@@ -338,14 +338,44 @@ class GPTModel(LanguageModule):
         else:
             # Intermediate or last PP stage: activations were received from the
             # previous stage via set_input_tensor().  Pass them directly.
-            hidden_states = getattr(self.decoder, "_input_tensor", None)
+            # NOTE: TransformerBlock stores to self.input_tensor (no underscore).
+            hidden_states = getattr(self.decoder, "input_tensor", None)
+            if hidden_states is None:
+                hidden_states = getattr(self.decoder, "_input_tensor", None)
 
         # ---- 2. Rotary positional embeddings ----------------------------- #
+        # Always generate rotary embeddings for the FULL sequence length, not
+        # the local SP/PP partition.  Downstream code (attention.py) handles
+        # slicing by SP rank after the all-to-all scatter.
+        #
+        # Fix for RuntimeError: t(2048) vs cos_(2) — when input_ids is None
+        # (PP middle stage) and hidden_states has seq-first shape [s, b, h],
+        # hidden_states.size(0) is the local sequence length.  But with SP,
+        # we need the FULL sequence length for correct positional encoding.
+        #
+        # References:
+        #   - Megatron-LM #560: CP RoPE slice mismatch
+        #   - Megatron-LM #1418: max_position_embeddings dual meaning
+        #   - verl #2603: SP cos/sin shape mismatch
+        #   - TE #552: apply_rotary_pos_emb shape handling
         rotary_pos_emb: Optional[torch.Tensor] = None
         if self._rotary_pos_emb is not None:
-            seq_len = input_ids.size(1) if input_ids is not None else (
-                hidden_states.size(0) if hidden_states is not None else 0
-            )
+            if input_ids is not None:
+                # First PP stage: input_ids is [batch, seq_len]
+                seq_len = input_ids.size(1)
+            elif hidden_states is not None:
+                # Middle/last PP stage: hidden_states is [seq, batch, hidden]
+                seq_len = hidden_states.size(0)
+            else:
+                seq_len = 0
+
+            # For SP: always use the FULL sequence length.  The attention
+            # module slices freqs by SP rank after all-to-all scatter.
+            # config.max_position_embeddings is the canonical full seq length.
+            max_pos = getattr(self.config, "max_position_embeddings", None)
+            if max_pos is not None and seq_len > 0:
+                seq_len = max(seq_len, max_pos)
+
             rotary_pos_emb = self._rotary_pos_emb(seq_len)
 
         # ---- 3. Transformer block ---------------------------------------- #

@@ -133,6 +133,21 @@ def _apply_rotary_pos_emb_bshd(
     cos_ = (torch.cos(freqs) * mscale).to(t.dtype)
     sin_ = (torch.sin(freqs) * mscale).to(t.dtype)
 
+    # Guard: freqs seq dim must match or broadcast with t seq dim.
+    # If freqs has fewer entries than t, the caller forgot to generate
+    # rotary embeddings for the full sequence length (common in SP/PP).
+    if cos_.shape[0] != 1 and t.shape[0] != cos_.shape[0]:
+        raise RuntimeError(
+            f"RoPE shape mismatch: input seq_dim={t.shape[0]} but "
+            f"freqs seq_dim={cos_.shape[0]}. Full shapes: t={tuple(t.shape)}, "
+            f"freqs={tuple(freqs.shape)}. This usually means rotary_pos_emb "
+            f"was generated with the wrong seq_len (e.g. batch_size instead "
+            f"of seq_len, or local SP partition instead of full sequence). "
+            f"Fix: ensure _RotaryEmbedding receives the FULL sequence length "
+            f"and let attention.py slice by SP rank after all-to-all scatter. "
+            f"Refs: Megatron-LM #560, #1418; verl #2603; TE #552."
+        )
+
     t = (t * cos_) + (_rotate_half(t, rotary_interleaved) * sin_)
     return torch.cat((t, t_pass), dim=-1)
 
