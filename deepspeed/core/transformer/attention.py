@@ -1215,20 +1215,38 @@ class Attention(MegatronModule, ABC):
                         mla_rotary_interleaved=mla_rotary_interleaved,
                     )
             except ImportError:
-                # Fallback: apply RoPE inline without megatron.
-                # q_pos_emb is the FULL [2, s, 1, dim] tensor (cos/sin stacked
-                # on dim-0), because line ~1109 wraps the tensor as
-                # (tensor, tensor) tuple and line 1194 unpacks it back.
-                # We need to index dim-0 to get cos and sin separately.
+                # Fallback: unfused RoPE — matches Megatron rope_utils._apply_rotary_pos_emb_bshd
+                # without the megatron import.  See also:
+                #   HF transformers #32312 (cos/sin CPU vs query CUDA mismatch)
+                #   HF transformers #45482 (Gemma4 cross-device RoPE)
+                #   Megatron-LM #1606 (TE v2.3 import path change)
+                #
+                # q_pos_emb shape: [2, s, 1, dim] (cos/sin stacked on dim-0)
+                # or [s, 1, 1, dim] when freqs already split.
                 if q_pos_emb is not None:
-                    emb = q_pos_emb  # [2, s, 1, dim]
-                    cos_emb = emb[0].unsqueeze(1)  # [s, 1, dim] → [s, 1, 1, dim]
-                    sin_emb = emb[1].unsqueeze(1)  # [s, 1, dim] → [s, 1, 1, dim]
-                    hd = query.shape[-1] // 2
-                    def _rotate(x: torch.Tensor) -> torch.Tensor:
-                        return torch.cat((-x[..., hd:], x[..., :hd]), dim=-1)
-                    query = query * cos_emb + _rotate(query) * sin_emb
-                    key = key * cos_emb[:key.shape[0]] + _rotate(key) * sin_emb[:key.shape[0]]
+                    emb = q_pos_emb
+                    if emb.dim() == 4 and emb.shape[0] == 2:
+                        cos_ = emb[0].unsqueeze(1)  # [s, 1, dim] → [s, 1, 1, dim]
+                        sin_ = emb[1].unsqueeze(1)
+                    else:
+                        # freqs tensor: compute cos/sin like Megatron
+                        cos_ = torch.cos(emb)
+                        sin_ = torch.sin(emb)
+                    # Device + dtype alignment (HF #32312 fix)
+                    cos_ = cos_.to(device=query.device, dtype=query.dtype)
+                    sin_ = sin_.to(device=query.device, dtype=query.dtype)
+                    rot_dim = cos_.shape[-1]
+                    q_rot, q_pass = query[..., :rot_dim], query[..., rot_dim:]
+                    k_rot, k_pass = key[..., :rot_dim], key[..., rot_dim:]
+                    # _rotate_half: [-x2, x1] (non-interleaved, Megatron default)
+                    q1, q2 = q_rot.chunk(2, dim=-1)
+                    k1, k2 = k_rot.chunk(2, dim=-1)
+                    q_rot = q_rot * cos_ + torch.cat((-q2, q1), dim=-1) * sin_
+                    cos_k = cos_[:k_rot.shape[0]]
+                    sin_k = sin_[:k_rot.shape[0]]
+                    k_rot = k_rot * cos_k + torch.cat((-k2, k1), dim=-1) * sin_k
+                    query = torch.cat((q_rot, q_pass), dim=-1)
+                    key = torch.cat((k_rot, k_pass), dim=-1)
 
         # ------------------------------------------------------------------
         # Core attention computation
