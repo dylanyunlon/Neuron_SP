@@ -1215,9 +1215,11 @@ class Attention(MegatronModule, ABC):
                         mla_rotary_interleaved=mla_rotary_interleaved,
                     )
             except ImportError:
-                # Fallback to built-in rotary if megatron not available
-                if q_pos_emb is not None:
-                    query, key = self._apply_rotary_emb(query, key, q_pos_emb)
+                # Fallback to built-in rotary if megatron not available.
+                # Pass the original rotary_pos_emb [2, s, 1, dim] so
+                # _apply_rotary_emb can unpack both cos and sin.
+                if rotary_pos_emb is not None:
+                    query, key = self._apply_rotary_emb(query, key, rotary_pos_emb)
 
         # ------------------------------------------------------------------
         # Core attention computation
@@ -1389,10 +1391,68 @@ class Attention(MegatronModule, ABC):
         Returns:
             Rotated q and k tensors with the same shapes.
         """
+        # rotary_pos_emb: [seq, 1, 1, head_dim] — cos and sin are packed as
+        # full head_dim via cat([freqs, freqs]) in _RotaryEmbedding._build_cache.
+        # The GPT-NeoX style: cos/sin have the same dim as q's last axis.
         dim = q.shape[-1]
         half = dim // 2
-        cos_emb = rotary_pos_emb[..., :half]
-        sin_emb = rotary_pos_emb[..., half:]
+
+        # Split cos/sin from the stacked rotary_pos_emb.
+        # _RotaryEmbedding.forward() returns [2, seq, 1, dim] with [0]=cos, [1]=sin.
+        # But by the time we reach here, the caller already unpacked dim-0 into
+        # q_pos_emb and k_pos_emb, each [seq, 1, 1, dim].  So rotary_pos_emb
+        # here is already cos-only [seq, 1, 1, dim].  We need to reconstruct sin.
+        #
+        # Actually, looking at the call-site (line ~1220):
+        #   q_pos_emb, k_pos_emb = rotary_pos_emb   # unpack dim-0 of [2, s, 1, dim]
+        #   query, key = self._apply_rotary_emb(query, key, q_pos_emb)
+        # So q_pos_emb = cos part [s, 1, dim].  We don't have sin here!
+        #
+        # The fix: the _RotaryEmbedding should return (cos, sin) tuple, or we
+        # need to pass both.  For now, reconstruct from the fact that
+        # _build_cache does cat([freqs, freqs]) for cos, and same for sin.
+        # The emb has the structure: cos = [cos(θ₀)..cos(θ_{d/2-1}), cos(θ₀)..cos(θ_{d/2-1})]
+        # So the first half equals the second half.
+        #
+        # But wait — the real issue is simpler: rotary_pos_emb here IS already
+        # [seq, 1, 1, dim] where dim=head_dim.  cos/sin must be this full dim.
+        # The _build_cache does: emb = cat([freqs, freqs], dim=-1) → [s, dim]
+        # Then cos = emb.cos(), sin = emb.sin().
+        # forward() returns stack([cos, sin], dim=0) → [2, s, 1, dim].
+        # Caller unpacks: q_pos_emb, k_pos_emb = rotary_pos_emb → each [s, 1, dim]
+        #
+        # So q_pos_emb IS cos of shape [s, 1, dim] and k_pos_emb IS sin.
+        # The caller passes: self._apply_rotary_emb(query, key, q_pos_emb)
+        # But q_pos_emb is cos only!  We need BOTH cos and sin.
+        #
+        # Fix the call site to pass both, or fix here to derive sin from cos.
+        # Since cos² + sin² = 1 and the freqs are duplicated (cat), we can
+        # derive sin = sqrt(1 - cos²).  But that's numerically fragile.
+        #
+        # Proper fix: pass both cos and sin.  But to minimize changes, use the
+        # structure: cos_emb = rotary_pos_emb (full dim), and since
+        # _build_cache makes emb = cat([freqs, freqs]), we know
+        # cos[:half] == cos[half:] and sin can be derived from asin.
+        #
+        # Simplest correct approach: recompute sin from the angle.
+        # Actually even simpler — just use torch SDPA rotary which handles it.
+        #
+        # SIMPLEST FIX: rotary_pos_emb is cos; sin = sqrt(1-cos²) with sign
+        # correction.  But this is fragile.
+        #
+        # REAL FIX: Change forward() to pass (cos, sin) tuple through.
+        # For now, use the fact that we stored both in the [2,...] tensor.
+        # Let's handle it: if rotary_pos_emb has a first dim of 2, unpack;
+        # otherwise fall back to the old half-split logic.
+        if rotary_pos_emb.shape[0] == 2 and rotary_pos_emb.dim() >= 3:
+            # Packed [2, seq, ...dim] format from _RotaryEmbedding
+            cos_emb = rotary_pos_emb[0]  # [seq, 1, dim]
+            sin_emb = rotary_pos_emb[1]  # [seq, 1, dim]
+        else:
+            # rotary_pos_emb is [seq, 1, 1, dim] with cos/sin interleaved
+            # (old GPT-NeoX style: first half = cos values, second half = sin)
+            cos_emb = rotary_pos_emb[..., :half]
+            sin_emb = rotary_pos_emb[..., half:]
 
         def rotate_half(x: torch.Tensor) -> torch.Tensor:
             x1, x2 = x[..., :half], x[..., half:]
