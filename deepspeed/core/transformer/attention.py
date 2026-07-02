@@ -1204,6 +1204,24 @@ class Attention(MegatronModule, ABC):
         ):
             q_pos_emb, k_pos_emb = rotary_pos_emb
             from deepspeed.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
+
+            # --- Fix #42: slice cos/sin by SP rank after all-to-all scatter ---
+            # After SP scatter, query/key seq dim = full_seq / sp_size,
+            # but rotary_pos_emb is still full_seq. Slice to matching segment.
+            if use_sp:
+                sp_rank = torch.distributed.get_rank(sp_group)
+                sp_world = torch.distributed.get_world_size(sp_group)
+                if q_pos_emb is not None and q_pos_emb.shape[0] > query.shape[0]:
+                    full_seq = q_pos_emb.shape[0]
+                    local_seq = full_seq // sp_world
+                    start = sp_rank * local_seq
+                    q_pos_emb = q_pos_emb[start : start + local_seq]
+                if k_pos_emb is not None and k_pos_emb.shape[0] > key.shape[0]:
+                    full_seq = k_pos_emb.shape[0]
+                    local_seq = full_seq // sp_world
+                    start = sp_rank * local_seq
+                    k_pos_emb = k_pos_emb[start : start + local_seq]
+
             mscale = _yarn_get_concentration_factor_from_config(self.config)
             # M4090: multi_latent_attention (old kwarg name) is now
             # mla_rotary_interleaved in rope_utils.apply_rotary_pos_emb.
