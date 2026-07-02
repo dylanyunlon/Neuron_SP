@@ -707,25 +707,17 @@ class Attention(MegatronModule, ABC):
                 rotary_pos_sin_k = rotary_pos_sin_q
 
             if rotary_pos_sin_k is not None:
-                # From Megatron M2020 (5b7374a8d): Fix RoPE backward compatibility —
-                # apply_rotary_pos_emb_with_cos_sin may not exist in older TE/Megatron
-                # versions; graceful fallback prevents crashes on A6000 nodes with older
-                # CUDA environments.  The try/except preserves the pre-M2020 behaviour
-                # so PCIe-only clusters running mixed software versions stay stable.
-                try:
-                    from megatron.core.models.common.embeddings.rope_utils import (
-                        apply_rotary_pos_emb_with_cos_sin,
-                    )
-                    key = apply_rotary_pos_emb_with_cos_sin(
-                        key, rotary_pos_cos_k, rotary_pos_sin_k,
-                        rotary_interleaved=getattr(self.config, "rotary_interleaved", False),
-                    )
-                    query = apply_rotary_pos_emb_with_cos_sin(
-                        query, rotary_pos_cos_q, rotary_pos_sin_q,
-                        rotary_interleaved=getattr(self.config, "rotary_interleaved", False),
-                    )
-                except ImportError:
-                    pass
+                from deepspeed.core.models.common.embeddings.rope_utils import (
+                    apply_rotary_pos_emb_with_cos_sin,
+                )
+                key = apply_rotary_pos_emb_with_cos_sin(
+                    key, rotary_pos_cos_k, rotary_pos_sin_k,
+                    rotary_interleaved=getattr(self.config, "rotary_interleaved", False),
+                )
+                query = apply_rotary_pos_emb_with_cos_sin(
+                    query, rotary_pos_cos_q, rotary_pos_sin_q,
+                    rotary_interleaved=getattr(self.config, "rotary_interleaved", False),
+                )
         else:
             rotary_pos_cos_q = rotary_pos_sin_q = None
 
@@ -1192,61 +1184,27 @@ class Attention(MegatronModule, ABC):
             getattr(self.config, "flash_decode", False) and inference_context is not None
         ):
             q_pos_emb, k_pos_emb = rotary_pos_emb
-            try:
-                from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
-                mscale = _yarn_get_concentration_factor_from_config(self.config)
-                # M4090: multi_latent_attention (old kwarg name) is now
-                # mla_rotary_interleaved in rope_utils.apply_rotary_pos_emb.
-                # Pass it explicitly so DSA/MLA layers get correct interleaving
-                # even after the upstream Megatron removed the old kwarg.
-                mla_rotary_interleaved = bool(
-                    getattr(self.config, "multi_latent_attention", False)
+            from deepspeed.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
+            mscale = _yarn_get_concentration_factor_from_config(self.config)
+            # M4090: multi_latent_attention (old kwarg name) is now
+            # mla_rotary_interleaved in rope_utils.apply_rotary_pos_emb.
+            # Pass it explicitly so DSA/MLA layers get correct interleaving
+            # even after the upstream Megatron removed the old kwarg.
+            mla_rotary_interleaved = bool(
+                getattr(self.config, "multi_latent_attention", False)
+            )
+            if q_pos_emb is not None:
+                query = apply_rotary_pos_emb(
+                    query, q_pos_emb, config=self.config,
+                    mscale=mscale,
+                    mla_rotary_interleaved=mla_rotary_interleaved,
                 )
-                if q_pos_emb is not None:
-                    query = apply_rotary_pos_emb(
-                        query, q_pos_emb, config=self.config,
-                        mscale=mscale,
-                        mla_rotary_interleaved=mla_rotary_interleaved,
-                    )
-                if k_pos_emb is not None:
-                    key = apply_rotary_pos_emb(
-                        key, k_pos_emb, config=self.config,
-                        mscale=mscale,
-                        mla_rotary_interleaved=mla_rotary_interleaved,
-                    )
-            except ImportError:
-                # Fallback: unfused RoPE — matches Megatron rope_utils._apply_rotary_pos_emb_bshd
-                # without the megatron import.  See also:
-                #   HF transformers #32312 (cos/sin CPU vs query CUDA mismatch)
-                #   HF transformers #45482 (Gemma4 cross-device RoPE)
-                #   Megatron-LM #1606 (TE v2.3 import path change)
-                #
-                # q_pos_emb shape: [2, s, 1, dim] (cos/sin stacked on dim-0)
-                # or [s, 1, 1, dim] when freqs already split.
-                if q_pos_emb is not None:
-                    emb = q_pos_emb
-                    if emb.dim() == 4 and emb.shape[0] == 2:
-                        cos_ = emb[0].unsqueeze(1)  # [s, 1, dim] → [s, 1, 1, dim]
-                        sin_ = emb[1].unsqueeze(1)
-                    else:
-                        # freqs tensor: compute cos/sin like Megatron
-                        cos_ = torch.cos(emb)
-                        sin_ = torch.sin(emb)
-                    # Device + dtype alignment (HF #32312 fix)
-                    cos_ = cos_.to(device=query.device, dtype=query.dtype)
-                    sin_ = sin_.to(device=query.device, dtype=query.dtype)
-                    rot_dim = cos_.shape[-1]
-                    q_rot, q_pass = query[..., :rot_dim], query[..., rot_dim:]
-                    k_rot, k_pass = key[..., :rot_dim], key[..., rot_dim:]
-                    # _rotate_half: [-x2, x1] (non-interleaved, Megatron default)
-                    q1, q2 = q_rot.chunk(2, dim=-1)
-                    k1, k2 = k_rot.chunk(2, dim=-1)
-                    q_rot = q_rot * cos_ + torch.cat((-q2, q1), dim=-1) * sin_
-                    cos_k = cos_[:k_rot.shape[0]]
-                    sin_k = sin_[:k_rot.shape[0]]
-                    k_rot = k_rot * cos_k + torch.cat((-k2, k1), dim=-1) * sin_k
-                    query = torch.cat((q_rot, q_pass), dim=-1)
-                    key = torch.cat((k_rot, k_pass), dim=-1)
+            if k_pos_emb is not None:
+                key = apply_rotary_pos_emb(
+                    key, k_pos_emb, config=self.config,
+                    mscale=mscale,
+                    mla_rotary_interleaved=mla_rotary_interleaved,
+                )
 
         # ------------------------------------------------------------------
         # Core attention computation
