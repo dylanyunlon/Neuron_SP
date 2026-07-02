@@ -1216,16 +1216,14 @@ class Attention(MegatronModule, ABC):
                     )
             except ImportError:
                 # Fallback: apply RoPE inline without megatron.
-                # q_pos_emb = cos [s, 1, dim], k_pos_emb = sin [s, 1, dim]
-                # (from unpack of [2, s, 1, dim] at line 1194).
-                # q/k: [s, b, nh, head_dim].  head_dim == dim.
-                if q_pos_emb is not None and k_pos_emb is not None:
-                    cos_emb = q_pos_emb  # [s, 1, dim]
-                    sin_emb = k_pos_emb  # [s, 1, dim]
-                    # Add head dim for broadcast: [s, 1, dim] → [s, 1, 1, dim]
-                    if cos_emb.dim() == 3:
-                        cos_emb = cos_emb.unsqueeze(1)  # [s, 1, 1, dim]
-                        sin_emb = sin_emb.unsqueeze(1)  # [s, 1, 1, dim]
+                # q_pos_emb is the FULL [2, s, 1, dim] tensor (cos/sin stacked
+                # on dim-0), because line ~1109 wraps the tensor as
+                # (tensor, tensor) tuple and line 1194 unpacks it back.
+                # We need to index dim-0 to get cos and sin separately.
+                if q_pos_emb is not None:
+                    emb = q_pos_emb  # [2, s, 1, dim]
+                    cos_emb = emb[0].unsqueeze(1)  # [s, 1, dim] → [s, 1, 1, dim]
+                    sin_emb = emb[1].unsqueeze(1)  # [s, 1, dim] → [s, 1, 1, dim]
                     hd = query.shape[-1] // 2
                     def _rotate(x: torch.Tensor) -> torch.Tensor:
                         return torch.cat((-x[..., hd:], x[..., :hd]), dim=-1)
