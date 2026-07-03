@@ -87,6 +87,116 @@ class ModelParallelConfig:
     flight_recorder_extra_dump_on_exec: bool = False
     """Extra dump on exec in flight recorder (TORCH_NCCL_EXTRA_DUMP_ON_EXEC)."""
 
+    # ---------------------------------------------------------------------------
+    # Pipeline-parallel communication fields (required by pipeline_parallel/)
+    # ---------------------------------------------------------------------------
+
+    # Dtype used for pipeline activation tensors (None → use params_dtype)
+    pipeline_dtype: Optional[torch.dtype] = None
+
+    # Model hidden dimension (needed by get_tensor_shapes)
+    hidden_size: int = 4096
+
+    # Enable/disable batched P2P (NCCL batch_isend_irecv) vs sequential
+    batch_p2p_comm: bool = True
+    batch_p2p_sync: bool = True
+
+    # Ring-exchange P2P (alternative to batch_isend_irecv for some backends)
+    use_ring_exchange_p2p: bool = False
+
+    # Variable sequence lengths — enables dynamic shape negotiation in P2P
+    variable_seq_lengths: bool = False
+
+    # Overlap P2P comm with compute in VPP schedule
+    overlap_p2p_comm: bool = False
+    overlap_p2p_comm_warmup_flush: bool = False
+
+    # Deallocate pipeline output tensors after sending (save activation memory)
+    deallocate_pipeline_outputs: bool = False
+
+    # Defer embedding weight-gradient compute to after pipeline cooldown
+    defer_embedding_wgrad_compute: bool = False
+
+    # MoE expert-parallel A2A overlap with compute
+    overlap_moe_expert_parallel_comm: bool = False
+
+    # Number of microbatches with partial activation checkpointing
+    num_microbatches_with_partial_activation_checkpoints: Optional[int] = None
+
+    # Microbatch group size per virtual pipeline stage (VPP tunable schedule)
+    microbatch_group_size_per_vp_stage: int = 1
+
+    # Per-token loss normalisation (instead of dividing by num_microbatches)
+    calculate_per_token_loss: bool = False
+
+    # MoE experts (used to gate MoE aux-loss scaling)
+    num_moe_experts: Optional[int] = None
+
+    # Multi-token prediction layers (MTP)
+    mtp_num_layers: Optional[int] = None
+
+    # MTP standalone mode — shape negotiation on standalone MTP stage (M3009)
+    mtp_standalone: bool = False
+
+    # CUDA graph implementation ("local" | None)
+    cuda_graph_impl: Optional[str] = None
+
+    # Autocast settings
+    enable_autocast: bool = False
+    autocast_dtype: Optional[torch.dtype] = None
+
+    # Barrier before timing L1 timers
+    barrier_with_L1_time: bool = True
+
+    # Paged activation stashing for MoE (M4012)
+    moe_paged_stash: bool = False
+
+    # Hybrid context parallel
+    hybrid_context_parallel: bool = False
+
+    # Grad/MoE/MTP scale functions (set by training loop)
+    moe_grad_scale_func: Optional[Callable] = None
+    mtp_grad_scale_func: Optional[Callable] = None
+
+    # Experimental attention variant (e.g. 'dsa')
+    experimental_attention_variant: Optional[str] = None
+
+    # Fine-grained activation offloading (M3018)
+    fine_grained_activation_offloading: bool = False
+
+    # ---------------------------------------------------------------------------
+    # Heterogeneous pipeline (DES-LOC PP=5) — per-stage micro_batch_size
+    # ---------------------------------------------------------------------------
+    # When set, each pipeline stage i uses hetero_micro_batch_sizes[i] instead
+    # of the global micro_batch_size.  This allows fast stages (H100) to process
+    # larger micro-batches while slow stages (A6000) use smaller ones, reducing
+    # the pipeline bubble imposed by the slowest stage.
+    #
+    # Example for PP=5 with H100 at stages 0,2,4 and A6000 at stages 1,3:
+    #   hetero_micro_batch_sizes = [4, 2, 4, 2, 4]
+    #
+    # The P2P communicator handles the shape mismatch by enabling
+    # variable_seq_lengths when this list is non-empty.
+    hetero_micro_batch_sizes: Optional[List[int]] = None
+
     @property
     def desloc_enabled(self) -> bool:
         return self.desloc is not None and self.desloc.enabled
+
+    @property
+    def effective_pipeline_dtype(self) -> torch.dtype:
+        """Return the dtype to use for pipeline activation tensors."""
+        if self.pipeline_dtype is not None:
+            return self.pipeline_dtype
+        return self.params_dtype
+
+    def get_stage_micro_batch_size(self, stage: int, default: int) -> int:
+        """Return micro_batch_size for a given pipeline stage.
+
+        Used by the 1F1B schedule to support heterogeneous pipelines (PP=5)
+        where different stages run different micro-batch sizes.
+        """
+        if self.hetero_micro_batch_sizes is not None:
+            if stage < len(self.hetero_micro_batch_sizes):
+                return self.hetero_micro_batch_sizes[stage]
+        return default

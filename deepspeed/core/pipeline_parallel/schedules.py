@@ -1878,13 +1878,38 @@ def get_tensor_shapes(
     config,
     tp_group: Optional[torch.distributed.ProcessGroup] = None,
     cp_group: Optional[torch.distributed.ProcessGroup] = None,
+    stage: Optional[int] = None,
 ):
     """Determine tensor shapes for pipeline communication.
 
     Returns [()] for variable_seq_lengths mode (shapes exchanged dynamically),
     or computed shapes for fixed sequence length mode.
+
+    DES-LOC heterogeneous PP=5 extension:
+        When ``config.hetero_micro_batch_sizes`` is set and ``stage`` is
+        provided, the micro-batch size for *that* stage is used instead of
+        the global ``micro_batch_size``.  This allows fast stages (H100) to
+        process larger micro-batches while slow stages (A6000) use smaller
+        ones, reducing pipeline bubbles imposed by the slowest stage.
+
+        When stages use different micro-batch sizes, ``config.variable_seq_lengths``
+        is automatically treated as True for P2P shape negotiation so that the
+        receiver allocates a buffer matching the sender's actual tensor size.
     """
     tensor_shapes = []
+
+    # Heterogeneous micro-batch size: if per-stage sizes are configured and
+    # differ from the global default, force variable-shape communication so
+    # adjacent stages can negotiate the correct tensor dimensions at runtime.
+    hetero_mbs = getattr(config, 'hetero_micro_batch_sizes', None)
+    if hetero_mbs is not None and stage is not None:
+        effective_mbs = config.get_stage_micro_batch_size(stage, micro_batch_size)
+        # If any stage differs in micro-batch size, shapes must be negotiated
+        # dynamically — fall through to variable_seq_lengths path.
+        if effective_mbs != micro_batch_size or len(set(hetero_mbs)) > 1:
+            tensor_shapes.append(())
+            return tensor_shapes
+        micro_batch_size = effective_mbs
 
     if config.variable_seq_lengths:
         # Shapes exchanged dynamically during P2P communication
@@ -1893,9 +1918,10 @@ def get_tensor_shapes(
 
     # Fixed sequence lengths - compute shape
     effective_seq_length = decoder_seq_length if decoder_seq_length is not None else seq_length
-    effective_seq_length = effective_seq_length // cp_group.size()
+    if cp_group is not None:
+        effective_seq_length = effective_seq_length // cp_group.size()
 
-    if config.sequence_parallel:
+    if config.sequence_parallel and tp_group is not None:
         effective_seq_length = effective_seq_length // tp_group.size()
 
     tensor_shapes.append((effective_seq_length, micro_batch_size, config.hidden_size))
@@ -2064,6 +2090,9 @@ def forward_backward_pipelining_without_interleaving(
     else:
         backward_func = backward_step
 
+    # DES-LOC: current PP stage index for heterogeneous micro-batch sizing
+    _current_pp_stage = p2p_communicator.current_stage
+
     recv_tensor_shapes = get_tensor_shapes(
         seq_length=seq_length,
         micro_batch_size=micro_batch_size,
@@ -2071,6 +2100,7 @@ def forward_backward_pipelining_without_interleaving(
         config=config,
         tp_group=tp_group,
         cp_group=cp_group,
+        stage=_current_pp_stage,
     )
     send_tensor_shapes = get_tensor_shapes(
         seq_length=seq_length,
@@ -2079,6 +2109,7 @@ def forward_backward_pipelining_without_interleaving(
         config=config,
         tp_group=tp_group,
         cp_group=cp_group,
+        stage=_current_pp_stage,
     )
     if adjust_tensor_shapes_fn is not None:
         recv_tensor_shapes, send_tensor_shapes = adjust_tensor_shapes_fn(
