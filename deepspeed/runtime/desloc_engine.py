@@ -2197,10 +2197,17 @@ class DesLocEngine:
                                 if getattr(self, "_activation_offload_iface", None) is not None
                                 else _nullctx()
                             )
+                            _dbg_rank = dist.get_rank() if dist.is_initialized() else 0
+                            logger.info("rank=%d: before forward (step=%d micro=%d)", _dbg_rank, step, micro)
+                            if dist.is_initialized():
+                                dist.barrier()
                             with _offload_ctx:
                                 loss, scaled_loss = self.forward(
                                     input_ids, labels, num_microbatches=num_microbatches,
                                 )
+                            if dist.is_initialized():
+                                dist.barrier()
+                            logger.info("rank=%d: after forward (step=%d micro=%d)", _dbg_rank, step, micro)
                             # Commit offload group: flush any pending D2H transfers
                             # for this micro-batch before backward begins.
                             if getattr(self, "_activation_offload_iface", None) is not None:
@@ -2221,7 +2228,13 @@ class DesLocEngine:
                                     # Tensor: divide by num_microbatches to match
                                     # the main-loss scale convention.
                                     scaled_loss = scaled_loss + _aux / max(num_microbatches, 1)
+                            logger.info("rank=%d: before backward (step=%d micro=%d)", _dbg_rank, step, micro)
+                            if dist.is_initialized():
+                                dist.barrier()
                             scaled_loss.backward()
+                            if dist.is_initialized():
+                                dist.barrier()
+                            logger.info("rank=%d: after backward (step=%d micro=%d)", _dbg_rank, step, micro)
                             # --- HeteroFP32GradAccumManager: accumulate (standard path) ---
                             # Promote BF16 param.grad into FP32 main_grad accumulators
                             # after each micro-batch backward.
