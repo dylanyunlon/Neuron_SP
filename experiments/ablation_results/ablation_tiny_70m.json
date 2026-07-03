@@ -1,0 +1,1230 @@
+{
+  "model_name": "tiny_70m",
+  "sweep": {
+    "Kx": [
+      1,
+      2,
+      4,
+      8,
+      16,
+      32
+    ],
+    "Ku": [
+      1,
+      2,
+      4,
+      8
+    ],
+    "Kv": [
+      4,
+      8,
+      16,
+      32,
+      64
+    ]
+  },
+  "steps": 50,
+  "n_configs": 120,
+  "results": [
+    {
+      "Kx": 1,
+      "Ku": 1,
+      "Kv": 4,
+      "final_loss": 6.117074,
+      "tokens_per_second": 52750.0,
+      "communication_bytes": 20906666666,
+      "comm_reduction_ratio": 0.25,
+      "wall_time_seconds": 0.0002
+    },
+    {
+      "Kx": 1,
+      "Ku": 1,
+      "Kv": 8,
+      "final_loss": 6.122285,
+      "tokens_per_second": 53208.3,
+      "communication_bytes": 19786666666,
+      "comm_reduction_ratio": 0.2917,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 1,
+      "Ku": 1,
+      "Kv": 16,
+      "final_loss": 6.124394,
+      "tokens_per_second": 53437.5,
+      "communication_bytes": 19226666666,
+      "comm_reduction_ratio": 0.3125,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 1,
+      "Ku": 1,
+      "Kv": 32,
+      "final_loss": 6.125428,
+      "tokens_per_second": 53552.1,
+      "communication_bytes": 18853333333,
+      "comm_reduction_ratio": 0.3229,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 1,
+      "Ku": 1,
+      "Kv": 64,
+      "final_loss": 6.133128,
+      "tokens_per_second": 53609.4,
+      "communication_bytes": 18666666666,
+      "comm_reduction_ratio": 0.3281,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 1,
+      "Ku": 2,
+      "Kv": 4,
+      "final_loss": 6.12331,
+      "tokens_per_second": 54583.3,
+      "communication_bytes": 16240000000,
+      "comm_reduction_ratio": 0.4167,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 1,
+      "Ku": 2,
+      "Kv": 8,
+      "final_loss": 6.128268,
+      "tokens_per_second": 55041.7,
+      "communication_bytes": 15120000000,
+      "comm_reduction_ratio": 0.4583,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 1,
+      "Ku": 2,
+      "Kv": 16,
+      "final_loss": 6.128385,
+      "tokens_per_second": 55270.8,
+      "communication_bytes": 14560000000,
+      "comm_reduction_ratio": 0.4792,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 1,
+      "Ku": 2,
+      "Kv": 32,
+      "final_loss": 6.137571,
+      "tokens_per_second": 55385.4,
+      "communication_bytes": 14186666666,
+      "comm_reduction_ratio": 0.4896,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 1,
+      "Ku": 2,
+      "Kv": 64,
+      "final_loss": 6.145187,
+      "tokens_per_second": 55442.7,
+      "communication_bytes": 14000000000,
+      "comm_reduction_ratio": 0.4948,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 1,
+      "Ku": 4,
+      "Kv": 4,
+      "final_loss": 6.128995,
+      "tokens_per_second": 55500.0,
+      "communication_bytes": 13813333333,
+      "comm_reduction_ratio": 0.5,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 1,
+      "Ku": 4,
+      "Kv": 8,
+      "final_loss": 6.13833,
+      "tokens_per_second": 55958.3,
+      "communication_bytes": 12693333333,
+      "comm_reduction_ratio": 0.5417,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 1,
+      "Ku": 4,
+      "Kv": 16,
+      "final_loss": 6.140104,
+      "tokens_per_second": 56187.5,
+      "communication_bytes": 12133333333,
+      "comm_reduction_ratio": 0.5625,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 1,
+      "Ku": 4,
+      "Kv": 32,
+      "final_loss": 6.149597,
+      "tokens_per_second": 56302.1,
+      "communication_bytes": 11760000000,
+      "comm_reduction_ratio": 0.5729,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 1,
+      "Ku": 4,
+      "Kv": 64,
+      "final_loss": 6.160518,
+      "tokens_per_second": 56359.4,
+      "communication_bytes": 11573333333,
+      "comm_reduction_ratio": 0.5781,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 1,
+      "Ku": 8,
+      "Kv": 4,
+      "final_loss": 6.139572,
+      "tokens_per_second": 55958.3,
+      "communication_bytes": 12693333333,
+      "comm_reduction_ratio": 0.5417,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 1,
+      "Ku": 8,
+      "Kv": 8,
+      "final_loss": 6.147507,
+      "tokens_per_second": 56416.7,
+      "communication_bytes": 11573333333,
+      "comm_reduction_ratio": 0.5833,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 1,
+      "Ku": 8,
+      "Kv": 16,
+      "final_loss": 6.161446,
+      "tokens_per_second": 56645.8,
+      "communication_bytes": 11013333333,
+      "comm_reduction_ratio": 0.6042,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 1,
+      "Ku": 8,
+      "Kv": 32,
+      "final_loss": 6.173229,
+      "tokens_per_second": 56760.4,
+      "communication_bytes": 10640000000,
+      "comm_reduction_ratio": 0.6146,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 1,
+      "Ku": 8,
+      "Kv": 64,
+      "final_loss": 6.178446,
+      "tokens_per_second": 56817.7,
+      "communication_bytes": 10453333333,
+      "comm_reduction_ratio": 0.6198,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 2,
+      "Ku": 1,
+      "Kv": 4,
+      "final_loss": 6.122427,
+      "tokens_per_second": 54583.3,
+      "communication_bytes": 16240000000,
+      "comm_reduction_ratio": 0.4167,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 2,
+      "Ku": 1,
+      "Kv": 8,
+      "final_loss": 6.123285,
+      "tokens_per_second": 55041.7,
+      "communication_bytes": 15120000000,
+      "comm_reduction_ratio": 0.4583,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 2,
+      "Ku": 1,
+      "Kv": 16,
+      "final_loss": 6.133521,
+      "tokens_per_second": 55270.8,
+      "communication_bytes": 14560000000,
+      "comm_reduction_ratio": 0.4792,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 2,
+      "Ku": 1,
+      "Kv": 32,
+      "final_loss": 6.139574,
+      "tokens_per_second": 55385.4,
+      "communication_bytes": 14186666666,
+      "comm_reduction_ratio": 0.4896,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 2,
+      "Ku": 1,
+      "Kv": 64,
+      "final_loss": 6.139609,
+      "tokens_per_second": 55442.7,
+      "communication_bytes": 14000000000,
+      "comm_reduction_ratio": 0.4948,
+      "wall_time_seconds": 0.0002
+    },
+    {
+      "Kx": 2,
+      "Ku": 2,
+      "Kv": 4,
+      "final_loss": 6.127345,
+      "tokens_per_second": 56416.7,
+      "communication_bytes": 11573333333,
+      "comm_reduction_ratio": 0.5833,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 2,
+      "Ku": 2,
+      "Kv": 8,
+      "final_loss": 6.141877,
+      "tokens_per_second": 56875.0,
+      "communication_bytes": 10453333333,
+      "comm_reduction_ratio": 0.625,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 2,
+      "Ku": 2,
+      "Kv": 16,
+      "final_loss": 6.148341,
+      "tokens_per_second": 57104.2,
+      "communication_bytes": 9893333333,
+      "comm_reduction_ratio": 0.6458,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 2,
+      "Ku": 2,
+      "Kv": 32,
+      "final_loss": 6.159997,
+      "tokens_per_second": 57218.7,
+      "communication_bytes": 9520000000,
+      "comm_reduction_ratio": 0.6562,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 2,
+      "Ku": 2,
+      "Kv": 64,
+      "final_loss": 6.168859,
+      "tokens_per_second": 57276.0,
+      "communication_bytes": 9333333333,
+      "comm_reduction_ratio": 0.6615,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 2,
+      "Ku": 4,
+      "Kv": 4,
+      "final_loss": 6.137737,
+      "tokens_per_second": 57333.3,
+      "communication_bytes": 9146666666,
+      "comm_reduction_ratio": 0.6667,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 2,
+      "Ku": 4,
+      "Kv": 8,
+      "final_loss": 6.155166,
+      "tokens_per_second": 57791.7,
+      "communication_bytes": 8026666666,
+      "comm_reduction_ratio": 0.7083,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 2,
+      "Ku": 4,
+      "Kv": 16,
+      "final_loss": 6.168233,
+      "tokens_per_second": 58020.8,
+      "communication_bytes": 7466666666,
+      "comm_reduction_ratio": 0.7292,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 2,
+      "Ku": 4,
+      "Kv": 32,
+      "final_loss": 6.179445,
+      "tokens_per_second": 58135.4,
+      "communication_bytes": 7093333333,
+      "comm_reduction_ratio": 0.7396,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 2,
+      "Ku": 4,
+      "Kv": 64,
+      "final_loss": 6.193756,
+      "tokens_per_second": 58192.7,
+      "communication_bytes": 6906666666,
+      "comm_reduction_ratio": 0.7448,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 2,
+      "Ku": 8,
+      "Kv": 4,
+      "final_loss": 6.15392,
+      "tokens_per_second": 57791.7,
+      "communication_bytes": 8026666666,
+      "comm_reduction_ratio": 0.7083,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 2,
+      "Ku": 8,
+      "Kv": 8,
+      "final_loss": 6.167918,
+      "tokens_per_second": 58250.0,
+      "communication_bytes": 6906666666,
+      "comm_reduction_ratio": 0.75,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 2,
+      "Ku": 8,
+      "Kv": 16,
+      "final_loss": 6.189976,
+      "tokens_per_second": 58479.2,
+      "communication_bytes": 6346666666,
+      "comm_reduction_ratio": 0.7708,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 2,
+      "Ku": 8,
+      "Kv": 32,
+      "final_loss": 6.208011,
+      "tokens_per_second": 58593.8,
+      "communication_bytes": 5973333333,
+      "comm_reduction_ratio": 0.7812,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 2,
+      "Ku": 8,
+      "Kv": 64,
+      "final_loss": 6.226677,
+      "tokens_per_second": 58651.0,
+      "communication_bytes": 5786666666,
+      "comm_reduction_ratio": 0.7865,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 4,
+      "Ku": 1,
+      "Kv": 4,
+      "final_loss": 6.12913,
+      "tokens_per_second": 55500.0,
+      "communication_bytes": 13813333333,
+      "comm_reduction_ratio": 0.5,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 4,
+      "Ku": 1,
+      "Kv": 8,
+      "final_loss": 6.13428,
+      "tokens_per_second": 55958.3,
+      "communication_bytes": 12693333333,
+      "comm_reduction_ratio": 0.5417,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 4,
+      "Ku": 1,
+      "Kv": 16,
+      "final_loss": 6.148897,
+      "tokens_per_second": 56187.5,
+      "communication_bytes": 12133333333,
+      "comm_reduction_ratio": 0.5625,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 4,
+      "Ku": 1,
+      "Kv": 32,
+      "final_loss": 6.155116,
+      "tokens_per_second": 56302.1,
+      "communication_bytes": 11760000000,
+      "comm_reduction_ratio": 0.5729,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 4,
+      "Ku": 1,
+      "Kv": 64,
+      "final_loss": 6.160226,
+      "tokens_per_second": 56359.4,
+      "communication_bytes": 11573333333,
+      "comm_reduction_ratio": 0.5781,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 4,
+      "Ku": 2,
+      "Kv": 4,
+      "final_loss": 6.138304,
+      "tokens_per_second": 57333.3,
+      "communication_bytes": 9146666666,
+      "comm_reduction_ratio": 0.6667,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 4,
+      "Ku": 2,
+      "Kv": 8,
+      "final_loss": 6.147596,
+      "tokens_per_second": 57791.7,
+      "communication_bytes": 8026666666,
+      "comm_reduction_ratio": 0.7083,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 4,
+      "Ku": 2,
+      "Kv": 16,
+      "final_loss": 6.165546,
+      "tokens_per_second": 58020.8,
+      "communication_bytes": 7466666666,
+      "comm_reduction_ratio": 0.7292,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 4,
+      "Ku": 2,
+      "Kv": 32,
+      "final_loss": 6.179499,
+      "tokens_per_second": 58135.4,
+      "communication_bytes": 7093333333,
+      "comm_reduction_ratio": 0.7396,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 4,
+      "Ku": 2,
+      "Kv": 64,
+      "final_loss": 6.193015,
+      "tokens_per_second": 58192.7,
+      "communication_bytes": 6906666666,
+      "comm_reduction_ratio": 0.7448,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 4,
+      "Ku": 4,
+      "Kv": 4,
+      "final_loss": 6.156012,
+      "tokens_per_second": 58250.0,
+      "communication_bytes": 6720000000,
+      "comm_reduction_ratio": 0.75,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 4,
+      "Ku": 4,
+      "Kv": 8,
+      "final_loss": 6.175373,
+      "tokens_per_second": 58708.3,
+      "communication_bytes": 5600000000,
+      "comm_reduction_ratio": 0.7917,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 4,
+      "Ku": 4,
+      "Kv": 16,
+      "final_loss": 6.190223,
+      "tokens_per_second": 58937.5,
+      "communication_bytes": 5040000000,
+      "comm_reduction_ratio": 0.8125,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 4,
+      "Ku": 4,
+      "Kv": 32,
+      "final_loss": 6.21683,
+      "tokens_per_second": 59052.1,
+      "communication_bytes": 4666666666,
+      "comm_reduction_ratio": 0.8229,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 4,
+      "Ku": 4,
+      "Kv": 64,
+      "final_loss": 6.238439,
+      "tokens_per_second": 59109.4,
+      "communication_bytes": 4480000000,
+      "comm_reduction_ratio": 0.8281,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 4,
+      "Ku": 8,
+      "Kv": 4,
+      "final_loss": 6.17511,
+      "tokens_per_second": 58708.3,
+      "communication_bytes": 5600000000,
+      "comm_reduction_ratio": 0.7917,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 4,
+      "Ku": 8,
+      "Kv": 8,
+      "final_loss": 6.204849,
+      "tokens_per_second": 59166.7,
+      "communication_bytes": 4480000000,
+      "comm_reduction_ratio": 0.8333,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 4,
+      "Ku": 8,
+      "Kv": 16,
+      "final_loss": 6.226247,
+      "tokens_per_second": 59395.8,
+      "communication_bytes": 3920000000,
+      "comm_reduction_ratio": 0.8542,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 4,
+      "Ku": 8,
+      "Kv": 32,
+      "final_loss": 6.255543,
+      "tokens_per_second": 59510.4,
+      "communication_bytes": 3546666666,
+      "comm_reduction_ratio": 0.8646,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 4,
+      "Ku": 8,
+      "Kv": 64,
+      "final_loss": 6.281082,
+      "tokens_per_second": 59567.7,
+      "communication_bytes": 3360000000,
+      "comm_reduction_ratio": 0.8698,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 8,
+      "Ku": 1,
+      "Kv": 4,
+      "final_loss": 6.139546,
+      "tokens_per_second": 55958.3,
+      "communication_bytes": 12693333333,
+      "comm_reduction_ratio": 0.5417,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 8,
+      "Ku": 1,
+      "Kv": 8,
+      "final_loss": 6.147082,
+      "tokens_per_second": 56416.7,
+      "communication_bytes": 11573333333,
+      "comm_reduction_ratio": 0.5833,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 8,
+      "Ku": 1,
+      "Kv": 16,
+      "final_loss": 6.151845,
+      "tokens_per_second": 56645.8,
+      "communication_bytes": 11013333333,
+      "comm_reduction_ratio": 0.6042,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 8,
+      "Ku": 1,
+      "Kv": 32,
+      "final_loss": 6.173036,
+      "tokens_per_second": 56760.4,
+      "communication_bytes": 10640000000,
+      "comm_reduction_ratio": 0.6146,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 8,
+      "Ku": 1,
+      "Kv": 64,
+      "final_loss": 6.18125,
+      "tokens_per_second": 56817.7,
+      "communication_bytes": 10453333333,
+      "comm_reduction_ratio": 0.6198,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 8,
+      "Ku": 2,
+      "Kv": 4,
+      "final_loss": 6.159372,
+      "tokens_per_second": 57791.7,
+      "communication_bytes": 8026666666,
+      "comm_reduction_ratio": 0.7083,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 8,
+      "Ku": 2,
+      "Kv": 8,
+      "final_loss": 6.173387,
+      "tokens_per_second": 58250.0,
+      "communication_bytes": 6906666666,
+      "comm_reduction_ratio": 0.75,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 8,
+      "Ku": 2,
+      "Kv": 16,
+      "final_loss": 6.188304,
+      "tokens_per_second": 58479.2,
+      "communication_bytes": 6346666666,
+      "comm_reduction_ratio": 0.7708,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 8,
+      "Ku": 2,
+      "Kv": 32,
+      "final_loss": 6.208462,
+      "tokens_per_second": 58593.8,
+      "communication_bytes": 5973333333,
+      "comm_reduction_ratio": 0.7812,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 8,
+      "Ku": 2,
+      "Kv": 64,
+      "final_loss": 6.230864,
+      "tokens_per_second": 58651.0,
+      "communication_bytes": 5786666666,
+      "comm_reduction_ratio": 0.7865,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 8,
+      "Ku": 4,
+      "Kv": 4,
+      "final_loss": 6.172867,
+      "tokens_per_second": 58708.3,
+      "communication_bytes": 5600000000,
+      "comm_reduction_ratio": 0.7917,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 8,
+      "Ku": 4,
+      "Kv": 8,
+      "final_loss": 6.191151,
+      "tokens_per_second": 59166.7,
+      "communication_bytes": 4480000000,
+      "comm_reduction_ratio": 0.8333,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 8,
+      "Ku": 4,
+      "Kv": 16,
+      "final_loss": 6.229266,
+      "tokens_per_second": 59395.8,
+      "communication_bytes": 3920000000,
+      "comm_reduction_ratio": 0.8542,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 8,
+      "Ku": 4,
+      "Kv": 32,
+      "final_loss": 6.257626,
+      "tokens_per_second": 59510.4,
+      "communication_bytes": 3546666666,
+      "comm_reduction_ratio": 0.8646,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 8,
+      "Ku": 4,
+      "Kv": 64,
+      "final_loss": 6.285485,
+      "tokens_per_second": 59567.7,
+      "communication_bytes": 3360000000,
+      "comm_reduction_ratio": 0.8698,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 8,
+      "Ku": 8,
+      "Kv": 4,
+      "final_loss": 6.200109,
+      "tokens_per_second": 59166.7,
+      "communication_bytes": 4480000000,
+      "comm_reduction_ratio": 0.8333,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 8,
+      "Ku": 8,
+      "Kv": 8,
+      "final_loss": 6.232493,
+      "tokens_per_second": 59625.0,
+      "communication_bytes": 3360000000,
+      "comm_reduction_ratio": 0.875,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 8,
+      "Ku": 8,
+      "Kv": 16,
+      "final_loss": 6.270246,
+      "tokens_per_second": 59854.2,
+      "communication_bytes": 2800000000,
+      "comm_reduction_ratio": 0.8958,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 8,
+      "Ku": 8,
+      "Kv": 32,
+      "final_loss": 6.308776,
+      "tokens_per_second": 59968.8,
+      "communication_bytes": 2426666666,
+      "comm_reduction_ratio": 0.9062,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 8,
+      "Ku": 8,
+      "Kv": 64,
+      "final_loss": 6.351055,
+      "tokens_per_second": 60026.0,
+      "communication_bytes": 2240000000,
+      "comm_reduction_ratio": 0.9115,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 16,
+      "Ku": 1,
+      "Kv": 4,
+      "final_loss": 6.150693,
+      "tokens_per_second": 56187.5,
+      "communication_bytes": 12133333333,
+      "comm_reduction_ratio": 0.5625,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 16,
+      "Ku": 1,
+      "Kv": 8,
+      "final_loss": 6.156179,
+      "tokens_per_second": 56645.8,
+      "communication_bytes": 11013333333,
+      "comm_reduction_ratio": 0.6042,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 16,
+      "Ku": 1,
+      "Kv": 16,
+      "final_loss": 6.178423,
+      "tokens_per_second": 56875.0,
+      "communication_bytes": 10453333333,
+      "comm_reduction_ratio": 0.625,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 16,
+      "Ku": 1,
+      "Kv": 32,
+      "final_loss": 6.190559,
+      "tokens_per_second": 56989.6,
+      "communication_bytes": 10080000000,
+      "comm_reduction_ratio": 0.6354,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 16,
+      "Ku": 1,
+      "Kv": 64,
+      "final_loss": 6.20346,
+      "tokens_per_second": 57046.9,
+      "communication_bytes": 9893333333,
+      "comm_reduction_ratio": 0.6406,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 16,
+      "Ku": 2,
+      "Kv": 4,
+      "final_loss": 6.165034,
+      "tokens_per_second": 58020.8,
+      "communication_bytes": 7466666666,
+      "comm_reduction_ratio": 0.7292,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 16,
+      "Ku": 2,
+      "Kv": 8,
+      "final_loss": 6.185504,
+      "tokens_per_second": 58479.2,
+      "communication_bytes": 6346666666,
+      "comm_reduction_ratio": 0.7708,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 16,
+      "Ku": 2,
+      "Kv": 16,
+      "final_loss": 6.212321,
+      "tokens_per_second": 58708.3,
+      "communication_bytes": 5786666666,
+      "comm_reduction_ratio": 0.7917,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 16,
+      "Ku": 2,
+      "Kv": 32,
+      "final_loss": 6.233561,
+      "tokens_per_second": 58822.9,
+      "communication_bytes": 5413333333,
+      "comm_reduction_ratio": 0.8021,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 16,
+      "Ku": 2,
+      "Kv": 64,
+      "final_loss": 6.259508,
+      "tokens_per_second": 58880.2,
+      "communication_bytes": 5226666666,
+      "comm_reduction_ratio": 0.8073,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 16,
+      "Ku": 4,
+      "Kv": 4,
+      "final_loss": 6.192608,
+      "tokens_per_second": 58937.5,
+      "communication_bytes": 5040000000,
+      "comm_reduction_ratio": 0.8125,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 16,
+      "Ku": 4,
+      "Kv": 8,
+      "final_loss": 6.228306,
+      "tokens_per_second": 59395.8,
+      "communication_bytes": 3920000000,
+      "comm_reduction_ratio": 0.8542,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 16,
+      "Ku": 4,
+      "Kv": 16,
+      "final_loss": 6.262273,
+      "tokens_per_second": 59625.0,
+      "communication_bytes": 3360000000,
+      "comm_reduction_ratio": 0.875,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 16,
+      "Ku": 4,
+      "Kv": 32,
+      "final_loss": 6.303788,
+      "tokens_per_second": 59739.6,
+      "communication_bytes": 2986666666,
+      "comm_reduction_ratio": 0.8854,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 16,
+      "Ku": 4,
+      "Kv": 64,
+      "final_loss": 6.33594,
+      "tokens_per_second": 59796.9,
+      "communication_bytes": 2800000000,
+      "comm_reduction_ratio": 0.8906,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 16,
+      "Ku": 8,
+      "Kv": 4,
+      "final_loss": 6.225599,
+      "tokens_per_second": 59395.8,
+      "communication_bytes": 3920000000,
+      "comm_reduction_ratio": 0.8542,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 16,
+      "Ku": 8,
+      "Kv": 8,
+      "final_loss": 6.273588,
+      "tokens_per_second": 59854.2,
+      "communication_bytes": 2800000000,
+      "comm_reduction_ratio": 0.8958,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 16,
+      "Ku": 8,
+      "Kv": 16,
+      "final_loss": 6.316016,
+      "tokens_per_second": 60083.3,
+      "communication_bytes": 2240000000,
+      "comm_reduction_ratio": 0.9167,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 16,
+      "Ku": 8,
+      "Kv": 32,
+      "final_loss": 6.365842,
+      "tokens_per_second": 60197.9,
+      "communication_bytes": 1866666666,
+      "comm_reduction_ratio": 0.9271,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 16,
+      "Ku": 8,
+      "Kv": 64,
+      "final_loss": 6.417097,
+      "tokens_per_second": 60255.2,
+      "communication_bytes": 1680000000,
+      "comm_reduction_ratio": 0.9323,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 32,
+      "Ku": 1,
+      "Kv": 4,
+      "final_loss": 6.158362,
+      "tokens_per_second": 56302.1,
+      "communication_bytes": 11760000000,
+      "comm_reduction_ratio": 0.5729,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 32,
+      "Ku": 1,
+      "Kv": 8,
+      "final_loss": 6.170401,
+      "tokens_per_second": 56760.4,
+      "communication_bytes": 10640000000,
+      "comm_reduction_ratio": 0.6146,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 32,
+      "Ku": 1,
+      "Kv": 16,
+      "final_loss": 6.189049,
+      "tokens_per_second": 56989.6,
+      "communication_bytes": 10080000000,
+      "comm_reduction_ratio": 0.6354,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 32,
+      "Ku": 1,
+      "Kv": 32,
+      "final_loss": 6.208624,
+      "tokens_per_second": 57104.2,
+      "communication_bytes": 9706666666,
+      "comm_reduction_ratio": 0.6458,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 32,
+      "Ku": 1,
+      "Kv": 64,
+      "final_loss": 6.229998,
+      "tokens_per_second": 57161.5,
+      "communication_bytes": 9520000000,
+      "comm_reduction_ratio": 0.651,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 32,
+      "Ku": 2,
+      "Kv": 4,
+      "final_loss": 6.177674,
+      "tokens_per_second": 58135.4,
+      "communication_bytes": 7093333333,
+      "comm_reduction_ratio": 0.7396,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 32,
+      "Ku": 2,
+      "Kv": 8,
+      "final_loss": 6.210605,
+      "tokens_per_second": 58593.8,
+      "communication_bytes": 5973333333,
+      "comm_reduction_ratio": 0.7812,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 32,
+      "Ku": 2,
+      "Kv": 16,
+      "final_loss": 6.236169,
+      "tokens_per_second": 58822.9,
+      "communication_bytes": 5413333333,
+      "comm_reduction_ratio": 0.8021,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 32,
+      "Ku": 2,
+      "Kv": 32,
+      "final_loss": 6.269225,
+      "tokens_per_second": 58937.5,
+      "communication_bytes": 5040000000,
+      "comm_reduction_ratio": 0.8125,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 32,
+      "Ku": 2,
+      "Kv": 64,
+      "final_loss": 6.297305,
+      "tokens_per_second": 58994.8,
+      "communication_bytes": 4853333333,
+      "comm_reduction_ratio": 0.8177,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 32,
+      "Ku": 4,
+      "Kv": 4,
+      "final_loss": 6.21593,
+      "tokens_per_second": 59052.1,
+      "communication_bytes": 4666666666,
+      "comm_reduction_ratio": 0.8229,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 32,
+      "Ku": 4,
+      "Kv": 8,
+      "final_loss": 6.253002,
+      "tokens_per_second": 59510.4,
+      "communication_bytes": 3546666666,
+      "comm_reduction_ratio": 0.8646,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 32,
+      "Ku": 4,
+      "Kv": 16,
+      "final_loss": 6.296273,
+      "tokens_per_second": 59739.6,
+      "communication_bytes": 2986666666,
+      "comm_reduction_ratio": 0.8854,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 32,
+      "Ku": 4,
+      "Kv": 32,
+      "final_loss": 6.341934,
+      "tokens_per_second": 59854.2,
+      "communication_bytes": 2613333333,
+      "comm_reduction_ratio": 0.8958,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 32,
+      "Ku": 4,
+      "Kv": 64,
+      "final_loss": 6.389406,
+      "tokens_per_second": 59911.5,
+      "communication_bytes": 2426666666,
+      "comm_reduction_ratio": 0.901,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 32,
+      "Ku": 8,
+      "Kv": 4,
+      "final_loss": 6.252172,
+      "tokens_per_second": 59510.4,
+      "communication_bytes": 3546666666,
+      "comm_reduction_ratio": 0.8646,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 32,
+      "Ku": 8,
+      "Kv": 8,
+      "final_loss": 6.309307,
+      "tokens_per_second": 59968.8,
+      "communication_bytes": 2426666666,
+      "comm_reduction_ratio": 0.9062,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 32,
+      "Ku": 8,
+      "Kv": 16,
+      "final_loss": 6.370229,
+      "tokens_per_second": 60197.9,
+      "communication_bytes": 1866666666,
+      "comm_reduction_ratio": 0.9271,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 32,
+      "Ku": 8,
+      "Kv": 32,
+      "final_loss": 6.426778,
+      "tokens_per_second": 60312.5,
+      "communication_bytes": 1493333333,
+      "comm_reduction_ratio": 0.9375,
+      "wall_time_seconds": 0.0001
+    },
+    {
+      "Kx": 32,
+      "Ku": 8,
+      "Kv": 64,
+      "final_loss": 6.493021,
+      "tokens_per_second": 60369.8,
+      "communication_bytes": 1306666666,
+      "comm_reduction_ratio": 0.9427,
+      "wall_time_seconds": 0.0001
+    }
+  ]
+}

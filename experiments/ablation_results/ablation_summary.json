@@ -1,0 +1,41 @@
+{
+  "total_configs": 120,
+  "steps_per_config": 50,
+  "mode": "simulate",
+  "models": [
+    "tiny_70m"
+  ],
+  "sweep": {
+    "Kx": [
+      1,
+      2,
+      4,
+      8,
+      16,
+      32
+    ],
+    "Ku": [
+      1,
+      2,
+      4,
+      8
+    ],
+    "Kv": [
+      4,
+      8,
+      16,
+      32,
+      64
+    ]
+  },
+  "best_per_model": {
+    "tiny_70m": {
+      "Kx": 1,
+      "Ku": 1,
+      "Kv": 4,
+      "final_loss": 6.117074,
+      "tokens_per_second": 52750.0,
+      "comm_reduction_ratio": 0.25
+    }
+  }
+}

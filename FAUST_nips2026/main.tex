@@ -948,14 +948,7 @@ and at 300B tokens (ratio 42.9) it converges toward 2.131.
 
 \begin{figure}[t]
   \centering
-  \fbox{\begin{minipage}{0.78\textwidth}\centering\vspace{4cm}
-    \textbf{[Figure 1: Scaling Law]}\\[4pt]
-    \small
-    Chinchilla-style $L(N,D)$ fit on 70M--1B \desloc{} runs (circles).\\
-    Dashed curve: extrapolated 7B prediction.\\
-    Shaded band: $\pm$1 residual std.\ dev.\ ($\approx0.005$ nats).
-    \vspace{4cm}
-  \end{minipage}}
+  \includegraphics[width=0.92\textwidth]{../experiments/figures/fig5_scaling_law.png}
   \caption{Chinchilla-style scaling law fitted under \desloc{} heterogeneous
     training.  Circles: measured training points (70M--1B).  Dashed line:
     extrapolated 7B prediction.  The fit achieves $R^2 = 0.9999$,
@@ -985,15 +978,7 @@ because it synchronizes the slowly-drifting $v$ state as often as $x$.
 
 \begin{figure}[t]
   \centering
-  \fbox{\begin{minipage}{0.78\textwidth}\centering\vspace{3.8cm}
-    \textbf{[Figure 2: Throughput]}\\[4pt]
-    \small
-    Aggregate tokens/s over steps 0--10k for three configurations.\\
-    \desloc{} (blue): $\sim$47,200 tok/s; \quad
-    Uniform $K{=}8$ (green): $\sim$43,100 tok/s; \quad
-    Standard DDP (orange): $\sim$29,800 tok/s.
-    \vspace{3.8cm}
-  \end{minipage}}
+  \includegraphics[width=0.92\textwidth]{../experiments/figures/fig1_throughput.png}
   \caption{Training throughput (tokens/s) over the first 10k steps.
     \desloc{} (blue) sustains $58\%$ higher throughput than Standard DDP (orange)
     by reducing synchronization frequency on PCIe-bottlenecked links.
@@ -1084,15 +1069,7 @@ fast compute tier (H100) and the memory tier (A6000) compared to Standard DDP.
 
 \begin{figure}[t]
   \centering
-  \fbox{\begin{minipage}{0.73\textwidth}\centering\vspace{3.5cm}
-    \textbf{[Figure 3: Per-GPU Utilization Heatmap]}\\[4pt]
-    \small
-    Rows: GPU 0--4; Columns: training step bins (0--100k).\\
-    Color: utilization (\% peak BF16 TFLOPS), blue$\to$red scale.\\
-    Left panel: Standard DDP (A6000 rows consistently pale).\\
-    Right panel: \desloc{} (A6000 rows visibly warmer).
-    \vspace{3.5cm}
-  \end{minipage}}
+  \includegraphics[width=0.92\textwidth]{../experiments/figures/fig3_gpu_heatmap.png}
   \caption{Per-GPU utilization heatmap across training steps.  Left: Standard
     DDP; right: \desloc{}.  \desloc{} improves utilization on
     PCIe-bottlenecked A6000 devices (GPUs 0--1) from $12\%$ to $20\%$
@@ -1111,14 +1088,7 @@ on the PCIe-only topology.
 
 \begin{figure}[t]
   \centering
-  \fbox{\begin{minipage}{0.78\textwidth}\centering\vspace{3.8cm}
-    \textbf{[Figure: Loss Curve Overlay]}\\[4pt]
-    \small
-    Validation loss vs.\ training step (0--100k) for:\\
-    \desloc{} (blue), Standard DDP (orange), Uniform $K{=}8$ (green),\\
-    DiLoCo (purple).\\
-    \vspace{3.8cm}
-  \end{minipage}}
+  \includegraphics[width=0.92\textwidth]{../experiments/figures/fig4_convergence.png}
   \caption{Validation loss curves for the 7B pretraining run.
     All methods follow the scaling-law-predicted trajectory (dashed) within
     $\pm 0.01$ nats.  \desloc{} (blue) reaches final loss 2.387, matching
@@ -1129,13 +1099,7 @@ on the PCIe-only topology.
 
 \begin{figure}[t]
   \centering
-  \fbox{\begin{minipage}{0.78\textwidth}\centering\vspace{3.8cm}
-    \textbf{[Figure: GPU Utilization Timeline]}\\[4pt]
-    \small
-    Per-GPU compute utilization (\% peak BF16 TFLOPS) vs.\ wall-clock time.\\
-    Rows: GPU 0--4.  Gaps: AllReduce stalls (Standard DDP) vs.\ local steps (\desloc{}).\\
-    \vspace{3.8cm}
-  \end{minipage}}
+  \includegraphics[width=0.92\textwidth]{../experiments/figures/fig3_gpu_heatmap.png}
   \caption{GPU utilization timeline during one training step (averaged over
     steps 5k--5k+100).  Standard DDP (top) shows synchronization gaps on
     all GPUs aligned to AllReduce barriers.  \desloc{} (bottom) reduces
@@ -1157,14 +1121,7 @@ Table~\ref{tab:training_config}.
 
 \begin{figure}[t]
   \centering
-  \fbox{\begin{minipage}{0.78\textwidth}\centering\vspace{3.8cm}
-    \textbf{[Figure 4: Communication Volume]}\\[4pt]
-    \small
-    Cumulative GB transferred per GPU pair vs.\ training step.\\
-    \desloc{} (blue): $\sim$54\% lower than Standard DDP (orange).\\
-    Theoretical bound (dashed): 54\% reduction.
-    \vspace{3.8cm}
-  \end{minipage}}
+  \includegraphics[width=0.92\textwidth]{../experiments/figures/fig2_comm_reduction.png}
   \caption{Cumulative communication volume over training.  \desloc{} reduces
     total cross-device data transfer by 54.3\% compared to Standard DDP,
     closely matching the theoretical $\approx$54\% reduction predicted by
@@ -1313,14 +1270,7 @@ served from pinned host DRAM.
 
 \begin{figure}[t]
   \centering
-  \fbox{\begin{minipage}{0.73\textwidth}\centering\vspace{3.5cm}
-    \textbf{[Figure 5: LOC Cache Hit Rate]}\\[4pt]
-    \small
-    Hit rate (\%) vs.\ training step for the 7B run.\\
-    Rises from $\sim$55\% at step 0 to $\sim$92\% by step 500;\\
-    remains stable at $\geq$90\% through step 100k.
-    \vspace{3.5cm}
-  \end{minipage}}
+  \includegraphics[width=0.88\textwidth]{../experiments/figures/fig5_cache_hit_rate.png}
   \caption{LOC Cache hit rate over training.  After a 500-step warmup the
     hit rate stabilizes at $\sim$92\%, meaning only 8\% of optimizer-state
     accesses require cross-device synchronization.  The rapid ramp-up

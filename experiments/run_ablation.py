@@ -34,6 +34,7 @@ import math
 import os
 import pathlib
 import random
+import textwrap
 import time
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
@@ -317,6 +318,7 @@ def run_ablation(
     model_filter: Optional[str] = None,
     steps: int = DEFAULT_STEPS,
     matrix_path: Optional[pathlib.Path] = None,
+    quiet: bool = False,
 ) -> List[AblationResult]:
     """Run the full ablation sweep and persist results."""
     path = str(matrix_path) if matrix_path is not None else str(_MATRIX_PATH)
@@ -332,7 +334,8 @@ def run_ablation(
     results: List[AblationResult] = []
     for i, cfg in enumerate(configs, 1):
         tag = f'{cfg.model_name}_Kx{cfg.Kx}_Ku{cfg.Ku}_Kv{cfg.Kv}'
-        print(f'  [{i}/{len(configs)}] {tag} ...', end=' ', flush=True)
+        if not quiet:
+            print(f'  [{i}/{len(configs)}] {tag} ...', end=' ', flush=True)
 
         if mode == 'simulate':
             result = simulate_run(cfg, scaling_fit)
@@ -340,8 +343,9 @@ def run_ablation(
             result = live_run(cfg)
 
         results.append(result)
-        print(f'loss={result.final_loss:.4f}  tps={result.tokens_per_second:.0f}  '
-              f'comm={result.communication_bytes / 1e9:.2f}GB')
+        if not quiet:
+            print(f'loss={result.final_loss:.4f}  tps={result.tokens_per_second:.0f}  '
+                  f'comm={result.communication_bytes / 1e9:.2f}GB')
 
     # Write per-model summary files
     model_groups: Dict[str, List[AblationResult]] = {}
@@ -404,11 +408,102 @@ def _result_to_dict(r: AblationResult) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Pretty-print summary table
+# ---------------------------------------------------------------------------
+def print_summary(results: List['AblationResult']) -> None:
+    """Print a concise Markdown-style summary table of best configs."""
+    from itertools import groupby
+
+    sorted_results = sorted(results, key=lambda r: r.config['model_name'])
+    print('\n' + '=' * 72)
+    print(f'{"Model":<18} {"Kx":>4} {"Ku":>4} {"Kv":>4} '
+          f'{"Loss":>8} {"Tput (tok/s)":>14} {"CommRed%":>9}')
+    print('-' * 72)
+    for model_name, group in groupby(sorted_results,
+                                     key=lambda r: r.config['model_name']):
+        group_list = list(group)
+        best = min(group_list, key=lambda r: r.final_loss)
+        print(
+            f'{model_name:<18} {best.config["Kx"]:>4} {best.config["Ku"]:>4} '
+            f'{best.config["Kv"]:>4} {best.final_loss:>8.4f} '
+            f'{best.tokens_per_second:>14,.0f} '
+            f'{best.comm_reduction_ratio * 100:>8.1f}%'
+        )
+    print('=' * 72)
+    print('(Best configuration per model = lowest final validation loss)\n')
+
+
+# ---------------------------------------------------------------------------
+# Optional: generate ablation heatmap after run
+# ---------------------------------------------------------------------------
+def plot_ablation_heatmap(results: List['AblationResult'],
+                          model_name: Optional[str] = None) -> None:
+    """Plot Kx vs Ku heatmap of final loss (Kv fixed at median)."""
+    try:
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+        import numpy as np
+    except ImportError:
+        print('[ablation] matplotlib not available — skipping heatmap')
+        return
+
+    model_filter = model_name or (results[0].config['model_name'] if results else None)
+    subset = [r for r in results if r.config['model_name'] == model_filter]
+    if not subset:
+        return
+
+    kx_vals = sorted(set(r.config['Kx'] for r in subset))
+    ku_vals = sorted(set(r.config['Ku'] for r in subset))
+    # Pick median Kv
+    kv_vals = sorted(set(r.config['Kv'] for r in subset))
+    kv_med  = kv_vals[len(kv_vals) // 2]
+
+    data = np.full((len(ku_vals), len(kx_vals)), np.nan)
+    for r in subset:
+        if r.config['Kv'] != kv_med:
+            continue
+        xi = kx_vals.index(r.config['Kx'])
+        yi = ku_vals.index(r.config['Ku'])
+        cur = data[yi, xi]
+        data[yi, xi] = r.final_loss if np.isnan(cur) else min(cur, r.final_loss)
+
+    fig, ax = plt.subplots(figsize=(5.5, 3.2))
+    im = ax.imshow(data, cmap='RdYlGn_r', aspect='auto')
+    ax.set_xticks(range(len(kx_vals))); ax.set_xticklabels(kx_vals)
+    ax.set_yticks(range(len(ku_vals))); ax.set_yticklabels(ku_vals)
+    ax.set_xlabel(r'$K_x$ (parameter sync period)')
+    ax.set_ylabel(r'$K_u$ (first-moment sync period)')
+    ax.set_title(f'Ablation: final loss — {model_filter} (Kv={kv_med})')
+    for yi in range(len(ku_vals)):
+        for xi in range(len(kx_vals)):
+            v = data[yi, xi]
+            if not np.isnan(v):
+                ax.text(xi, yi, f'{v:.3f}', ha='center', va='center',
+                        fontsize=7, color='k' if v < np.nanmax(data) * 0.85 else 'w')
+    fig.colorbar(im, ax=ax, label='Final loss', shrink=0.85)
+    fig.tight_layout()
+    out = _RESULTS_DIR / f'ablation_heatmap_{model_filter}.png'
+    fig.savefig(out, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print(f'[ablation] Heatmap saved {out}')
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description='DES-LOC ablation sweep over Kx / Ku / Kv sync periods')
+        description='DES-LOC ablation sweep over Kx / Ku / Kv sync periods',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=textwrap.dedent("""\
+        Examples:
+          python experiments/run_ablation.py                          # simulate all
+          python experiments/run_ablation.py --mode live --steps 500  # real GPUs
+          python experiments/run_ablation.py --model tiny_70m         # single model
+          python experiments/run_ablation.py --plot                   # + heatmaps
+        """),
+    )
     parser.add_argument(
         '--mode', choices=['simulate', 'live'], default='simulate',
         help='simulate = deterministic synthetic run; live = real GPU training')
@@ -421,11 +516,28 @@ def main() -> None:
     parser.add_argument(
         '--matrix', default=str(_MATRIX_PATH),
         help='Path to experiment_matrix.yaml')
+    parser.add_argument(
+        '--plot', action='store_true',
+        help='Generate Kx×Ku heatmap figures after the sweep')
+    parser.add_argument(
+        '--quiet', action='store_true',
+        help='Suppress per-config progress output')
     args = parser.parse_args()
 
     matrix_path = pathlib.Path(args.matrix)
-    run_ablation(mode=args.mode, model_filter=args.model, steps=args.steps,
-                 matrix_path=matrix_path)
+    results = run_ablation(
+        mode=args.mode,
+        model_filter=args.model,
+        steps=args.steps,
+        matrix_path=matrix_path,
+        quiet=args.quiet,
+    )
+    print_summary(results)
+
+    if args.plot:
+        model_names = sorted(set(r.config['model_name'] for r in results))
+        for mn in model_names:
+            plot_ablation_heatmap(results, model_name=mn)
 
 
 if __name__ == '__main__':
