@@ -1121,7 +1121,14 @@ def finalize_model_grads(
         try:
             dp_cp_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
         except Exception:
-            dp_cp_group = parallel_state.get_data_parallel_group()
+            try:
+                dp_cp_group = parallel_state.get_data_parallel_group()
+            except Exception:
+                dp_cp_group = (
+                    torch.distributed.group.WORLD
+                    if torch.distributed.is_initialized()
+                    else None
+                )
 
     # ------------------------------------------------------------------
     # DES-LOC: resolve Kx/Ku/Kv flags.
