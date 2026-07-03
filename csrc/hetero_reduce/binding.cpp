@@ -295,6 +295,62 @@ void fused_rope_hetero_py(at::Tensor output,
 // pcie_adaptive_allreduce bindings
 // ---------------------------------------------------------------------------
 
+/**
+ * pcie_gradient_pack_py
+ *
+ * Gathers non-contiguous gradient slices from multiple BF16 tensors into a
+ * flat contiguous BF16 bucket (device-side gather kernel).
+ *
+ * Each chunk is described by (tensor, byte_offset, length_in_elements).
+ * Python-side interface uses a list of (Tensor, int, int) tuples.
+ *
+ * @param bucket      BF16 output bucket [bucket_elems]
+ * @param chunks_in   List of (Tensor, offset_elems, length_elems) tuples
+ * @param sm_version  SM version of the active device
+ */
+void pcie_gradient_pack_py(at::Tensor bucket,
+                            std::vector<std::tuple<at::Tensor, int64_t, int64_t>> chunks_in,
+                            int sm_version)
+{
+    check_bf16(bucket, "bucket");
+    TORCH_CHECK(!chunks_in.empty(), "chunks must not be empty");
+
+    // Build C-side PcieGradChunk array from Python tuples.
+    std::vector<PcieGradChunk> chunks;
+    chunks.reserve(chunks_in.size());
+    size_t total_elems = 0;
+    for (size_t i = 0; i < chunks_in.size(); i++) {
+        at::Tensor& t = std::get<0>(chunks_in[i]);
+        int64_t offset = std::get<1>(chunks_in[i]);
+        int64_t length = std::get<2>(chunks_in[i]);
+        check_bf16(t, ("chunks[" + std::to_string(i) + "].tensor").c_str());
+        TORCH_CHECK(offset >= 0, "chunk offset must be >= 0");
+        TORCH_CHECK(length > 0,  "chunk length must be > 0");
+        TORCH_CHECK(length % 8 == 0,
+                    "chunk length must be divisible by 8, got ", length);
+        TORCH_CHECK(offset + length <= t.numel(),
+                    "chunk[", i, "] offset+length exceeds tensor numel");
+        PcieGradChunk c;
+        c.src    = reinterpret_cast<const __nv_bfloat16*>(t.data_ptr<at::BFloat16>());
+        c.offset = static_cast<size_t>(offset);
+        c.length = static_cast<size_t>(length);
+        chunks.push_back(c);
+        total_elems += static_cast<size_t>(length);
+    }
+
+    TORCH_CHECK(static_cast<size_t>(bucket.numel()) >= total_elems,
+                "bucket numel (", bucket.numel(), ") < sum of chunk lengths (", total_elems, ")");
+
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    launch_pcie_gradient_pack(
+        reinterpret_cast<__nv_bfloat16*>(bucket.data_ptr<at::BFloat16>()),
+        chunks.data(),
+        static_cast<int>(chunks.size()),
+        total_elems,
+        sm_version,
+        stream);
+}
+
 at::Tensor pcie_ring_reduce_py(at::Tensor dst,
                                 at::Tensor src,
                                 int sm_version)
@@ -555,6 +611,17 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     // -----------------------------------------------------------------------
     // pcie_adaptive_allreduce
     // -----------------------------------------------------------------------
+    m.def("pcie_gradient_pack",
+          &pcie_gradient_pack_py,
+          "Gather non-contiguous gradient shards into a flat BF16 bucket.\n"
+          "Args:\n"
+          "  bucket     (Tensor BF16 [bucket_elems]): flat output bucket\n"
+          "  chunks     (List[Tuple[Tensor, int, int]]): (tensor, offset, length) per shard\n"
+          "  sm_version (int): 86, 90, or 120",
+          py::arg("bucket"),
+          py::arg("chunks"),
+          py::arg("sm_version") = 86);
+
     m.def("pcie_ring_reduce",
           &pcie_ring_reduce_py,
           "PCIe ring-allreduce reduce phase: dst += src (BF16, in-place).\n"

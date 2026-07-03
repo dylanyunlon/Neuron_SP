@@ -9,20 +9,42 @@ from .builder import CUDAOpBuilder
 
 class HeteroReduceBuilder(CUDAOpBuilder):
     """
-    Builds the hetero_reduce CUDA extension:
+    Builds the hetero_reduce CUDA extension for heterogeneous GPU clusters.
 
-      * csrc/hetero_reduce/hetero_reduce.cu   — BF16→FP32 reduce-scatter + cast
-      * csrc/hetero_reduce/fused_swiglu_ln.cu — fused SwiGLU + RMSNorm
-      * csrc/hetero_reduce/binding.cpp         — pybind11 glue
+    Source files
+    ------------
+    * csrc/hetero_reduce/hetero_reduce.cu          — BF16→FP32 fused reduce-scatter
+    * csrc/hetero_reduce/fused_rope_hetero.cu      — RoPE with heterogeneous head counts
+    * csrc/hetero_reduce/pcie_adaptive_allreduce.cu — PCIe-aware bucketed allreduce
+    * csrc/hetero_reduce/fused_swiglu_ln.cu        — fused SwiGLU + RMSNorm
+    * csrc/hetero_reduce/tier_activation_offload.cu — activation checkpoint pack/unpack
+    * csrc/hetero_reduce/binding.cpp               — pybind11 / PyTorch extension glue
 
     Heterogeneous targets (all PCIe, no NVLink):
-      SM 8.6  — RTX A6000
-      SM 9.0  — H100
-      SM 12.0 — Blackwell (requires CUDA ≥ 12.8 toolchain)
+      SM 8.6  — RTX A6000  (48 GB VRAM)
+      SM 9.0  — H100       (80 GB VRAM)
+      SM 12.0 — Blackwell  (192 GB VRAM NVL72, requires CUDA ≥ 12.8)
 
-    The sm_version argument passed to launch_fused_bf16_reduce /
-    launch_fused_swiglu_ln at *runtime* (not build time) selects the
-    occupancy-tuned kernel variant for the active device.
+    The sm_version argument passed to each launch_* function at *runtime*
+    (not build time) selects the occupancy-tuned kernel variant for the
+    active device.  This lets a single binary serve all three tiers.
+
+    Exposed Python API (after import deepspeed; op = deepspeed.ops.op_builder.HeteroReduceBuilder().load())
+    ----------------------------------------
+    op.fused_bf16_reduce(output, inputs, sm_version)
+    op.hetero_reduce_scatter(output, inputs, shard_offset, shard_count, sm_version)
+    op.compute_shard_ranges(sm_versions, total_elems) -> List[Tuple[int,int]]
+    op.fused_swiglu_ln(output, gate_proj, up_proj, ln_weight, eps, sm_version)
+    op.rope_cache(cos_cache, sin_cache, seq_len, head_dim, base, pos_offset)
+    op.fused_rope_hetero(output, input, cos_cache, sin_cache, neox_style, sm_version)
+    op.pcie_ring_reduce(dst, src, sm_version)
+    op.pcie_allreduce_finalise(out, src, world_size, sm_version)
+    op.pcie_bucket_size(pcie_bw_gbps) -> int
+    op.activation_pack(output, inputs, sm_version)
+    op.activation_unpack(outputs, flat, sm_version)
+    op.quantise_bf16_to_int8(output, scales, input)
+    op.dequantise_int8_to_bf16(output, input, scales)
+    op.compute_offload_budget(total_act_bytes, vram_free_bytes, headroom_frac) -> int
     """
 
     BUILD_VAR = "DS_BUILD_HETERO_REDUCE"
@@ -37,49 +59,89 @@ class HeteroReduceBuilder(CUDAOpBuilder):
 
     def sources(self):
         return [
+            # C++ pybind11 glue — compiled by the host CXX compiler.
             "csrc/hetero_reduce/binding.cpp",
+            # CUDA kernels — compiled by nvcc.
             "csrc/hetero_reduce/hetero_reduce.cu",
+            "csrc/hetero_reduce/fused_rope_hetero.cu",
+            "csrc/hetero_reduce/pcie_adaptive_allreduce.cu",
             "csrc/hetero_reduce/fused_swiglu_ln.cu",
+            "csrc/hetero_reduce/tier_activation_offload.cu",
         ]
 
     def include_paths(self):
         return [
+            # DeepSpeed shared headers: DS_D_INLINE, hw_warp_size, …
             "csrc/includes",
+            # hetero_reduce.h (HeteroTierDesc, PcieGradChunk, launch_* declarations)
             "csrc/hetero_reduce",
         ]
 
     def cxx_args(self):
+        # Inherit base CXX flags (C++17, position-independent, etc.) and add
+        # version-dependent macros (-DBF16_AVAILABLE, -DVERSION_GE_1_1, …).
         args = super().cxx_args()
         return args + self.version_dependent_macros()
 
     def nvcc_args(self):
-        nvcc_flags = ["-O3"] + self.version_dependent_macros()
+        # Start with optimisation level and version macros.
+        nvcc_flags = ["-O3", "--expt-relaxed-constexpr"] + self.version_dependent_macros()
+
         if not self.is_rocm_pytorch():
             base_flags = [
+                # Debug line info for nsight / cuda-gdb profiling.
                 "-lineinfo",
+                # Fused sincos, fast division, etc.
                 "--use_fast_math",
-                # SM 8.6 — RTX A6000
+                # Allow C++ 17 in device code (required for if-constexpr in templates).
+                "-std=c++17",
+                # ----------------------------------------------------------------
+                # Code generation targets — one per supported SM generation.
+                # ----------------------------------------------------------------
+                # SM 8.6 — RTX A6000 (Ampere)
                 "-gencode", "arch=compute_86,code=sm_86",
-                # SM 9.0 — H100
+                # SM 9.0 — H100 (Hopper)
                 "-gencode", "arch=compute_90,code=sm_90",
-                # Forward-compatible PTX for unknown SM ≥ 9.0 (covers SM 12.0
-                # when compiled with CUDA < 12.8 that lacks sm_120 target).
+                # Forward-compatible PTX: covers SM 9.x variants and any future
+                # architecture that the CUDA toolchain doesn't yet know about,
+                # including SM 12.0 when built with CUDA < 12.8.
                 "-gencode", "arch=compute_90,code=compute_90",
             ]
-            # SM 12.0 (Blackwell) needs CUDA ≥ 12.8 for native SASS codegen.
+
+            # SM 12.0 (Blackwell) requires CUDA ≥ 12.8 for native SASS.
+            # When available, add the native target for maximum performance;
+            # the PTX fallback above still works with older toolchains.
             try:
                 cuda_major, cuda_minor = self.installed_cuda_version()
                 if cuda_major > 12 or (cuda_major == 12 and cuda_minor >= 8):
                     base_flags += ["-gencode", "arch=compute_120,code=sm_120"]
             except Exception:
-                pass  # toolchain absent; skip sm_120
+                pass  # nvcc absent or version query failed; PTX fallback suffices.
 
             if sys.platform == "win32":
                 base_flags = ["-allow-unsupported-compiler"] + base_flags
 
             nvcc_flags.extend(base_flags)
+            # Remove any accidental empty strings that confuse nvcc.
             nvcc_flags = [f for f in nvcc_flags if f]
+
         return nvcc_flags
 
     def extra_ldflags(self):
+        # No extra libraries beyond what PyTorch already links (libcuda, libcudart).
         return []
+
+    def is_compatible(self, verbose=True):
+        """hetero_reduce requires CUDA 11.0+ for BF16 and cooperative groups."""
+        try:
+            cuda_major, cuda_minor = self.installed_cuda_version()
+            if cuda_major < 11:
+                if verbose:
+                    self.warning(
+                        f"{self.NAME}: CUDA {cuda_major}.{cuda_minor} < 11.0; "
+                        "BF16 and cooperative groups require CUDA ≥ 11.0."
+                    )
+                return False
+        except Exception:
+            pass  # Let the parent class handle the absence of nvcc.
+        return super().is_compatible(verbose)

@@ -200,9 +200,12 @@ fused_bf16_reduce_kernel_sm86(
     const size_t tid    = static_cast<size_t>(blockIdx.x) * kBlockSize + threadIdx.x;
     const size_t stride = static_cast<size_t>(gridDim.x) * kBlockSize;
 
-    // Use cooperative groups thread_block for block-level synchronisation
-    // hints — the compiler can optimise barrier placement.
+    // thread_block is used here to provide a forward-compatible hint for
+    // the compiler's barrier placement optimiser on SM 8.6.
+    // The (void) cast suppresses unused-variable warnings when the compiler
+    // elides the object in optimised builds.
     cg::thread_block blk = cg::this_thread_block();
+    (void)blk;
 
     for (size_t t = tid; t < n_elems / kVecWidth; t += stride) {
         const size_t base = t * kVecWidth;
@@ -229,7 +232,9 @@ fused_bf16_reduce_kernel_sm120(
     const size_t tid    = static_cast<size_t>(blockIdx.x) * kBlockSize + threadIdx.x;
     const size_t stride = static_cast<size_t>(gridDim.x) * kBlockSize;
 
+    // Same thread_block hint as the SM 8.6 variant — see comment above.
     cg::thread_block blk = cg::this_thread_block();
+    (void)blk;
 
     for (size_t t = tid; t < n_elems / kVecWidth; t += stride) {
         const size_t base = t * kVecWidth;
