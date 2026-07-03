@@ -66,3 +66,24 @@ The Edit tool has a hidden auto-formatter that silently changes quotes, whitespa
 - When a runtime error comes back from the user, read the full traceback, understand the root cause, fix it, test locally, push. One cycle. Don't push speculative fixes.
 - Clone relevant upstream repos (vllm, sglang, Megatron-LM, 360-LLaMA-Factory) to study their actual implementations before writing your own.
 - `web_fetch` the actual source files from GitHub, don't guess API signatures from memory.
+
+## Management Protocol (Manager ↔ Sub-Claude ↔ User)
+
+### No intermediate status reports
+
+- **The Manager Claude does NOT report intermediate status to the user.** No "Worker-3 has started", no "5 of 10 dispatched", no progress tables. The user sees commits landing in the repo — that is the only status channel.
+- **Sub-Claudes do NOT report intermediate status to the Manager.** They work autonomously in their containers, push when done. The Manager reviews commits, not chat messages.
+- **When something goes wrong**, create a GitHub issue in the project board (https://github.com/users/dylanyunlon/projects/2) with the problem and proposed fix. Do not describe problems in chat unless the user explicitly asks.
+
+### Manager role
+
+- The Manager defines tasks, dispatches sub-Claudes, and reviews their commits.
+- The Manager does NOT write code itself — that wastes context window on implementation details instead of coordination.
+- The Manager does NOT act as a terminal for sub-Claudes. Sub-Claudes have their own code execution environments (repl_v0 → bash_tool).
+- 429 rate limits are normal. Wait and retry. Do not report rate limits to the user.
+
+### Sub-Claude role
+
+- Each sub-Claude owns a module end-to-end: clone → read history → design → implement → test → push.
+- Sub-Claudes iterate in their own containers until `python -c "import ..."` succeeds.
+- Sub-Claudes push directly to main. No branches, no v2/v3 suffixes.
