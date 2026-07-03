@@ -29,6 +29,22 @@ export OMP_NUM_THREADS=8
 export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,max_split_size_mb:256
 
+# ── AutoSP kill-switch ────────────────────────────────────────────────────────
+# PCIe-only topology (H100 + 2×A6000, no NVLink): Ulysses SP=3 all-to-all
+# collectives deadlock inside model.forward() at step 0.  Force DP-only mode
+# until the all-to-all / process-group wiring is fixed for heterogeneous PCIe.
+#
+# To re-enable SP once the deadlock is resolved, either:
+#   export NEURON_SP_DISABLE_AUTOSP=0   (before calling this script), or
+#   remove / comment-out the line below.
+export NEURON_SP_DISABLE_AUTOSP=${NEURON_SP_DISABLE_AUTOSP:-1}
+
+# ── Optional per-layer forward logging ───────────────────────────────────────
+# Set NEURON_SP_LAYER_LOG=1 to emit a log line before/after every transformer
+# layer during forward.  Useful for pinpointing the exact layer that hangs
+# when SP is re-enabled.  Off by default (adds barrier overhead).
+export NEURON_SP_LAYER_LOG=${NEURON_SP_LAYER_LOG:-0}
+
 EXTRA_ARGS=("$@")
 
 if [[ " ${EXTRA_ARGS[*]:-} " == *" --dry-run "* ]]; then

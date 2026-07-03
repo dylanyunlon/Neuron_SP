@@ -1494,7 +1494,54 @@ class DesLocEngine:
             _model_dev = self.model_device
             input_ids = input_ids.to(_model_dev, non_blocking=True)
             labels = labels.to(_model_dev, non_blocking=True)
-            logits: torch.Tensor = self.model(input_ids)
+
+            # --- Per-layer forward instrumentation ---
+            # Enabled when NEURON_SP_LAYER_LOG=1 (or always on step 0 micro 0).
+            # Logs before/after each transformer block so we can pinpoint exactly
+            # which layer hangs (e.g., due to a stray all-to-all collective that
+            # was injected by AutoSP but not fully disabled).
+            _layer_log = os.environ.get("NEURON_SP_LAYER_LOG", "0").strip() == "1"
+            _fw_rank = dist.get_rank() if dist.is_initialized() else 0
+            _model_layers = self._get_model_layers()
+            if _layer_log and _model_layers is not None:
+                # Run the embedding/pre-block portion manually if the model
+                # exposes a standard MiniTransformer structure; otherwise fall
+                # through to the monolithic call below.
+                _has_structured_fwd = (
+                    hasattr(self.model, 'embedding')
+                    and hasattr(self.model, 'blocks')
+                    and hasattr(self.model, 'norm')
+                    and hasattr(self.model, 'lm_head')
+                )
+                if _has_structured_fwd:
+                    import torch as _torch  # already imported, just alias for clarity
+                    B_l, T_l = input_ids.shape
+                    _pos = _torch.arange(T_l, device=input_ids.device).unsqueeze(0)
+                    _x = self.model.embedding(input_ids) + self.model.pos_embedding(_pos)
+                    logger.info("[layer_log] rank=%d embedding done, shape=%s", _fw_rank, tuple(_x.shape))
+                    for _li, _blk in enumerate(self.model.blocks):
+                        logger.info("[layer_log] rank=%d → layer %d START", _fw_rank, _li)
+                        if dist.is_initialized():
+                            dist.barrier()
+                        _x = _blk(_x)
+                        if dist.is_initialized():
+                            dist.barrier()
+                        logger.info("[layer_log] rank=%d ← layer %d END", _fw_rank, _li)
+                    _x = self.model.norm(_x)
+                    logits = self.model.lm_head(_x)
+                    logger.info("[layer_log] rank=%d lm_head done, logits=%s", _fw_rank, tuple(logits.shape))
+                else:
+                    # Structured forward not available; fall back to opaque call
+                    logger.warning(
+                        "[layer_log] rank=%d model does not have MiniTransformer structure "
+                        "(embedding/blocks/norm/lm_head); falling back to self.model(input_ids). "
+                        "Set NEURON_SP_LAYER_LOG=0 to suppress this warning.",
+                        _fw_rank,
+                    )
+                    logits = self.model(input_ids)
+            else:
+                logits = self.model(input_ids)
+
             B, T, V = logits.shape
             shift_logits = logits[:, :-1, :].contiguous().reshape(-1, V)
             shift_labels = labels[:, :T - 1].contiguous().reshape(-1)
@@ -1679,6 +1726,20 @@ class DesLocEngine:
             if parallel_state.is_initialized()
             else (dist.get_world_size() if dist.is_initialized() else 1)
         )
+        # Kill-switch: NEURON_SP_DISABLE_AUTOSP=1 forces DP-only mode.
+        # Use this on PCIe-only heterogeneous topologies where SP all-to-all
+        # collectives (Ulysses scatter/gather) deadlock due to bandwidth
+        # asymmetry between NVLink and PCIe links.
+        # Set this in launch_7b_3gpu.sh (or any PCIe-only launch script) to
+        # bypass SP and let training proceed in pure DP mode until the
+        # all-to-all deadlock is resolved at the collective-comm layer.
+        _env_disable_autosp = os.environ.get("NEURON_SP_DISABLE_AUTOSP", "0").strip() == "1"
+        if _env_disable_autosp:
+            _sp_world_size = 1
+            logger.info(
+                "AutoSP disabled via NEURON_SP_DISABLE_AUTOSP=1 env var "
+                "(DP-only mode; SP all-to-all skipped to avoid PCIe deadlock)."
+            )
         # FIX: Disable AutoSP on PCIe-only topology (no NVLink).
         # SP all-to-all collectives deadlock on heterogeneous PCIe meshes
         # because the bandwidth asymmetry causes timeout on slower links.
