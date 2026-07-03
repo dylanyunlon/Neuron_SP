@@ -38,6 +38,13 @@ DES-LOC extensions:
   - broadcast_params(): called every Kx step to fix ZeRO-3 shard inconsistency.
   - no_sync(): context manager for gradient accumulation (multi-microbatch).
   - offload_grad_buffers() / restore_grad_buffers(): RL optimizer offload support.
+  - Tier-aware gradient bucketing: when a TierMap is available from parallel_state,
+    the auto-computed bucket_size is adjusted per GPU hardware tier (A6000 / H100 /
+    Blackwell) via compute_tier_bucket_sizes(), then synchronised across the DP group
+    with an all-reduce MIN so all ranks use consistent bucket boundaries.
+    Tier multipliers: A6000 → 0.5× (PCIe), H100 → 1.5× (NVLink), Blackwell → 2.0×.
+    Respects explicit bucket_size overrides — tier adjustment is skipped when
+    ddp_config.bucket_size is set by the caller.
 
 Provides:
   DistributedDataParallelConfig, DistributedDataParallel
@@ -60,6 +67,7 @@ from deepspeed.core.distributed.param_and_grad_buffer import (
     ParamAndGradBucketGroup,
     group_params_for_buffers,
     partition_buckets,
+    compute_tier_bucket_sizes,
 )
 
 logger = logging.getLogger(__name__)
@@ -268,6 +276,20 @@ class DistributedDataParallel(nn.Module):
         # Bucket size (M2974: scale with dp_size).
         # Insight I6: PCIe-aware overlap (Megatron aa-3.5)
         # ------------------------------------------------------------------
+        # ------------------------------------------------------------------
+        # Tier-aware bucket sizing (DES-LOC heterogeneous GPU extension).
+        # Applied BEFORE the PCIe-aware / NVLink-default selection so that
+        # the per-tier multiplier is computed on top of the chosen baseline.
+        # After computing the baseline below, compute_tier_bucket_sizes() will
+        # be called to apply the multiplier and sync across the DP group.
+        # (See deepspeed/core/distributed/param_and_grad_buffer.py for the
+        # full rationale and multiplier table.)
+        # ------------------------------------------------------------------
+        _apply_tier_bucketing = (
+            ddp_config.bucket_size is None  # only auto-tune; respect explicit override
+            and parallel_state.is_initialized()
+        )
+
         if ddp_config.bucket_size is None:
             if getattr(ddp_config, 'use_pcie_aware_overlap', False):
                 # PCIe-aware bucket sizing.
@@ -314,6 +336,20 @@ class DistributedDataParallel(nn.Module):
             else:
                 # Original NVLink-tuned default (Megatron M2974).
                 ddp_config.bucket_size = max(40_000_000, 1_000_000 * dp_group.size())
+
+        # ------------------------------------------------------------------
+        # Apply tier-aware bucket sizing (DES-LOC heterogeneous GPU clusters).
+        # compute_tier_bucket_sizes() queries the TierMap for the local GPU's
+        # hardware tier (A6000 / H100 / Blackwell) and applies a per-tier
+        # multiplier, then synchronises the result across the DP group via an
+        # all-reduce MIN so all ranks use consistent bucket boundaries.
+        # Only applied when bucket_size was auto-computed (not overridden).
+        # ------------------------------------------------------------------
+        if _apply_tier_bucketing and ddp_config.bucket_size is not None:
+            ddp_config.bucket_size = compute_tier_bucket_sizes(
+                ddp_config.bucket_size, dp_group=dp_group
+            )
+
         if not ddp_config.overlap_grad_reduce:
             ddp_config.bucket_size = None
 

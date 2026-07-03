@@ -48,13 +48,19 @@ DES-LOC extensions:
   - start_grad_sync(skip_sync): skip collective on non-Kx steps.
   - force_all_reduce param propagated from finalize_model_grads.
   - grad_reduce_finished idempotency for predecessor-draining pattern.
+  - get_tier_bucket_size / compute_tier_bucket_sizes: tier-aware gradient
+    bucketing for heterogeneous GPU clusters (A6000 / H100 / Blackwell).
+    Each GPU tier gets a different bucket size (multiplier on base_bucket_size)
+    to match its PCIe vs NVLink bandwidth; an all-reduce MIN across the DP
+    group ensures consistent bucket boundaries across all ranks.
 
 Provides:
   BufferType, shard_buffer,
   ParamAndGradBucket, LayerwiseAllGatherHandle,
   ParamAndGradBucketGroup, ParamAndGradBuffer,
   group_params_for_buffers, partition_buckets,
-  _compute_default_per_buffer_param_layout
+  _compute_default_per_buffer_param_layout,
+  get_tier_bucket_size, compute_tier_bucket_sizes
 """
 
 from __future__ import annotations
@@ -1786,6 +1792,170 @@ def partition_buckets(
                 )
             )
     return groups
+
+
+# ---------------------------------------------------------------------------
+# Tier-aware gradient bucketing (DES-LOC heterogeneous GPU support)
+# ---------------------------------------------------------------------------
+
+# Tier bucket-size multipliers relative to the base bucket_size.
+# Faster GPU tiers can sustain larger in-flight buckets because they saturate
+# their NVLink / PCIe bandwidth quicker — smaller collectives on slow tiers
+# and larger on fast tiers maximises overlap utility per tier.
+#
+# Rationale for multipliers:
+#   A6000 (PCIe-only, no NVLink):        0.5×  — PCIe-limited; smaller buckets
+#                                                  reduce time-to-first-byte and
+#                                                  expose more backward overlap.
+#   H100 NVLink:                          1.5×  — high BW, can absorb bigger
+#                                                  buckets without latency harm.
+#   Blackwell (B200 / GB200, NVLink 5.0): 2.0×  — peak BW; very large buckets
+#                                                  stay bandwidth-bound.
+#   Unknown / generic:                    1.0×  — default (no-op).
+#
+# These are conservative defaults; operators should tune per cluster.
+_TIER_BUCKET_MULTIPLIERS: Dict[str, float] = {
+    "a6000":     0.5,
+    "h100":      1.5,
+    "blackwell": 2.0,
+    "unknown":   1.0,
+}
+
+
+def get_tier_bucket_size(base_bucket_size: Optional[int]) -> Optional[int]:
+    """Return a tier-adjusted bucket size for the local GPU.
+
+    Queries ``parallel_state.get_tier_map()`` to identify the hardware tier
+    of the current rank's GPU, then applies the corresponding multiplier from
+    ``_TIER_BUCKET_MULTIPLIERS``.
+
+    Falls back to ``base_bucket_size`` unmodified when:
+    - ``base_bucket_size`` is None (single-bucket mode, e.g. no overlap).
+    - parallel_state is not initialized.
+    - No TierMap is available (non-heterogeneous cluster).
+    - The current rank's tier cannot be determined.
+
+    This function is called once per DDP wrapper construction (inside
+    ``DistributedDataParallel.__init__``) and the result is cached in the
+    DDP instance's ``bucket_size`` attribute.
+
+    Args:
+        base_bucket_size: The NVLink-tuned default bucket size in elements,
+            or None to keep a single bucket per buffer.
+
+    Returns:
+        Tier-adjusted bucket size (int) or None.
+    """
+    if base_bucket_size is None:
+        return None
+
+    if not parallel_state.is_initialized():
+        return base_bucket_size
+
+    # Try to get the TierMap from parallel_state.
+    tier_map = None
+    try:
+        tier_map = parallel_state.get_tier_map()
+    except Exception:
+        pass
+
+    if tier_map is None:
+        return base_bucket_size
+
+    # Determine the tier name for the current rank.
+    try:
+        from deepspeed.core.hetero_bridge.tier_map import GPUTier
+        world_rank = torch.distributed.get_rank()
+        local_tier: Optional[str] = None
+        for gpu_tier in GPUTier:
+            tier_ranks = tier_map.ranks_of_tier(gpu_tier)
+            if world_rank in tier_ranks:
+                local_tier = gpu_tier.value  # e.g. 'a6000', 'h100', 'blackwell', 'unknown'
+                break
+    except Exception:
+        return base_bucket_size
+
+    if local_tier is None:
+        return base_bucket_size
+
+    multiplier = _TIER_BUCKET_MULTIPLIERS.get(local_tier, 1.0)
+    adjusted = max(1, int(base_bucket_size * multiplier))
+
+    if adjusted != base_bucket_size:
+        _log_single_rank(
+            logger,
+            logging.INFO,
+            f"[DES-LOC tier-aware bucketing] tier={local_tier!r} "
+            f"multiplier={multiplier:.2f} "
+            f"bucket_size: {base_bucket_size} → {adjusted} elements",
+        )
+
+    return adjusted
+
+
+def compute_tier_bucket_sizes(
+    base_bucket_size: Optional[int],
+    dp_group: Optional[torch.distributed.ProcessGroup] = None,
+) -> Optional[int]:
+    """Synchronise per-rank tier bucket size across the DP group.
+
+    Each rank independently computes its tier-adjusted bucket size.  On
+    heterogeneous clusters the values may differ across ranks.  This function
+    returns the **minimum** across all DP ranks so that every rank uses the
+    same bucket boundaries (required for correct gradient bucketing when
+    overlap_grad_reduce is True — all ranks must issue collectives for the
+    same set of parameters at the same time).
+
+    Rationale: using the minimum is conservative (slower ranks dictate the
+    pace) but correct.  A future optimisation could use per-tier sub-groups to
+    let each tier run its own bucket schedule, but that requires larger
+    architectural changes.
+
+    Args:
+        base_bucket_size: NVLink-tuned base bucket size.
+        dp_group: Data-parallel process group for the all-reduce min.
+            If None, falls back to the world group.
+
+    Returns:
+        Globally agreed tier-adjusted bucket size (min across DP ranks), or
+        None if base_bucket_size is None.
+    """
+    if base_bucket_size is None:
+        return None
+
+    local_size = get_tier_bucket_size(base_bucket_size)
+    if local_size is None:
+        return None
+
+    if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+        return local_size
+
+    # All-reduce MIN across DP ranks.
+    try:
+        size_tensor = torch.tensor(
+            [local_size], dtype=torch.int64, device=torch.cuda.current_device()
+        )
+        torch.distributed.all_reduce(
+            size_tensor,
+            op=torch.distributed.ReduceOp.MIN,
+            group=dp_group,
+        )
+        agreed_size = int(size_tensor.item())
+        if agreed_size != local_size:
+            _log_single_rank(
+                logger,
+                logging.INFO,
+                f"[DES-LOC tier-aware bucketing] local_bucket_size={local_size} "
+                f"→ agreed_min={agreed_size} (all-reduce MIN across DP group)",
+            )
+        return agreed_size
+    except Exception as exc:
+        logger.warning(
+            "[DES-LOC tier-aware bucketing] all-reduce MIN failed (%s); "
+            "using local tier size %d",
+            exc, local_size,
+        )
+        return local_size
 
 
 # ---------------------------------------------------------------------------

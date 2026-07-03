@@ -14,6 +14,8 @@ from deepspeed.core.distributed.param_and_grad_buffer import (
     ParamAndGradBucket,
     ParamAndGradBucketGroup,
     ParamAndGradBuffer,
+    get_tier_bucket_size,
+    compute_tier_bucket_sizes,
 )
 
 from deepspeed.core.distributed.distributed_data_parallel import (
@@ -44,6 +46,8 @@ __all__ = [
     "ParamAndGradBucket",
     "ParamAndGradBucketGroup",
     "ParamAndGradBuffer",
+    "get_tier_bucket_size",
+    "compute_tier_bucket_sizes",
     # distributed_data_parallel
     "DistributedDataParallelConfig",
     "DistributedDataParallel",
