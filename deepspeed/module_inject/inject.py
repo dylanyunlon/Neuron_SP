@@ -1,8 +1,9 @@
+import logging
 # Copyright (c) Microsoft Corporation.
 # SPDX-License-Identifier: Apache-2.0
 
 # DeepSpeed Team
-print('[M187]')
+logging.debug('[M187]')
 
 import copy
 import torch

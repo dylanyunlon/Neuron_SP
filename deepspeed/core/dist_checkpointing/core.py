@@ -186,4 +186,4 @@ def save_config(config: CheckpointingConfig, checkpoint_dir: str):
     config_path = Path(checkpoint_dir, CONFIG_FNAME)
     with config_path.open('w') as f:
         json.dump(asdict(config), f)
-print('[M1437]')
+logging.debug('[M1437]')

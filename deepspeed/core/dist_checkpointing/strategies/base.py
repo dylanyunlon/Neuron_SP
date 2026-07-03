@@ -1,3 +1,4 @@
+import logging
 # Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
 
 from abc import ABC, abstractmethod
@@ -217,4 +218,4 @@ class SaveShardedStrategy(SaveStrategyBase):
         _torch.distributed.barrier()
 
 
-print('[M1437]')
+logging.debug('[M1437]')

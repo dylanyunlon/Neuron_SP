@@ -1,3 +1,4 @@
+import logging
 # Copyright (c) Microsoft Corporation.
 # SPDX-License-Identifier: Apache-2.0
 
@@ -62,7 +63,7 @@
 #
 # 20% adaptation: deepspeed/compile/ targets the DS runtime; imports from
 # megatron.core.* are preserved so this file is usable with the Megatron-Core
-# backend bundled inside Neuron_SP.  Adds print('[M1312]') marker.
+# backend bundled inside Neuron_SP.  Adds  logging.debug('[M1312]') marker.
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
@@ -79,11 +80,11 @@
 # 20% adaptation (鲁迅式迁移):
 #   鲁迅云：「横眉冷对千夫指，俯首甘为孺子牛。」
 #   位置编码本无涯，上下文并行划其境，各rank守一隅，合则知全序。
-#   Adds print('[M1870]') diagnostic markers at key code paths.
+#   Adds  logging.debug('[M1870]') diagnostic markers at key code paths.
 # ---------------------------------------------------------------------------
 
-print('[M1312]')
-print('[M1870] GPT model context parallelism: get_pos_emb_on_this_cp_rank loaded')
+logging.debug('[M1312]')
+logging.debug('[M1870] GPT model context parallelism: get_pos_emb_on_this_cp_rank loaded')
 
 import torch
 from torch import Tensor
@@ -151,7 +152,7 @@ class GPTModel(MegatronModule):
         self._encoder_key = 'encoder'
 
         self.initialize_word_embeddings()
-        print('[M1312] GPTModel.__init__ complete')
+        logging.debug('[M1312] GPTModel.__init__ complete')
 
     def set_input_tensor(self, input_tensor):
         """See megatron.model.transformer.set_input_tensor()"""
@@ -179,7 +180,8 @@ class GPTModel(MegatronModule):
         )
         pos_emb = pos_emb.index_select(seq_dim, cp_idx)
         pos_emb = pos_emb.view(*pos_emb.shape[:seq_dim], -1, *pos_emb.shape[(seq_dim + 2):])
-        print('[M1870] get_pos_emb_on_this_cp_rank: cp_rank=%d cp_size=%d out_shape=%s'
+        
+        logging.debug('[M1870] get_pos_emb_on_this_cp_rank: cp_rank=%d cp_size=%d out_shape=%s'
               % (cp_rank, cp_size, list(pos_emb.shape)))
         return pos_emb
 
@@ -215,7 +217,8 @@ class GPTModel(MegatronModule):
             # Slice rotary_pos_emb along sequence dim and select the partition
             # of the current CP rank (M1870).
             if self.config.context_parallel_size > 1:
-                print('[M1870] forward: slicing rotary_pos_emb for cp_size=%d'
+                
+                logging.debug('[M1870] forward: slicing rotary_pos_emb for cp_size=%d'
                       % self.config.context_parallel_size)
                 rotary_pos_emb = self.get_pos_emb_on_this_cp_rank(rotary_pos_emb, 0)
 

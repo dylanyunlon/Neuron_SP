@@ -1,3 +1,4 @@
+import logging
 # coding=utf-8
 # Copyright (c) 2020, NVIDIA CORPORATION.  All rights reserved.
 #
@@ -28,11 +29,11 @@ from .communication import (
 from .forward_step import ForwardStep
 from .sampling import sample
 
-print('[M1055]')
-print('[M1166]')
-print('[M1215]')
-print('[M1230]')
-print('[M1278]')
+logging.debug('[M1055]')
+logging.debug('[M1166]')
+logging.debug('[M1215]')
+logging.debug('[M1230]')
+logging.debug('[M1278]')
 
 def score_and_return_on_first_stage(model, tokens, lengths):
     """Function for just scoring.

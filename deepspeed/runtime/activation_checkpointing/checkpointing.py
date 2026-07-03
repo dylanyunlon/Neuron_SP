@@ -1,3 +1,4 @@
+import logging
 # Copyright (c) Microsoft Corporation.
 # SPDX-License-Identifier: Apache-2.0
 
@@ -55,7 +56,7 @@ import weakref
 # 20% adaptation: init_checkpointed_activations_memory_buffer and
 # reset_checkpointed_activations_memory_buffer are removed (dead code);
 # DISTRIBUTE_CHECKPOINTED_ACTIVATIONS boolean (already in file) drives the
-# split/gather path; adds print('[M762]') marker.
+# split/gather path; adds  logging.debug('[M762]') marker.
 # ---------------------------------------------------------------------------
 
 import mmap
@@ -266,7 +267,7 @@ class CudaRNGStatesTracker:
         # can branch on is_inference_rng_tracker without isinstance checks.
         # 鲁迅: 推理时的随机数，是不需要被训练驯服的；给它一个身份证，才能放行。
         self.is_inference_rng_tracker = is_inference_rng_tracker
-        print(f'[M2080-RNG] CudaRNGStatesTracker.__init__ is_inference_rng_tracker={is_inference_rng_tracker}')
+        logging.debug(f'[M2080-RNG] CudaRNGStatesTracker.__init__ is_inference_rng_tracker={is_inference_rng_tracker}')
 
     def reset(self):
         # DES-LOC M158: tracked
@@ -1168,7 +1169,7 @@ def checkpoint(function, *args):
     """Checkpoint a model or part of the model.
     This has been directly copied from torch.utils.checkpoint. """
 
-    print('[M762]')
+    logging.debug('[M762]')
     # M762: contiguous buffer removed; no reset needed before checkpointed forward.
     all_outputs = []
     CheckpointFunction.apply(function, all_outputs, *args)

@@ -1,3 +1,4 @@
+import logging
 # Copyright (c) Microsoft Corporation.
 # SPDX-License-Identifier: Apache-2.0
 
@@ -22,10 +23,10 @@
 #
 # 20% adaptation: deepspeed uses ds_config.fp16.enabled rather than
 # argparse args.fp16; _GLOBAL_ARGS singleton pattern used for get_args();
-# adds print('[M343]') marker.
+# adds  logging.debug('[M343]') marker.
 # ---------------------------------------------------------------------------
 
-print('[M343]')
+logging.debug('[M343]')
 
 import torch
 
@@ -49,7 +50,7 @@ def set_args(args):
     """
     global _GLOBAL_ARGS
     _GLOBAL_ARGS = args
-    print(f'[M343] set_args: params_dtype={getattr(args, "params_dtype", None)}')
+    logging.debug(f'[M343] set_args: params_dtype={getattr(args, "params_dtype", None)}')
 
 
 def set_params_dtype(args):
@@ -70,7 +71,7 @@ def set_params_dtype(args):
     rank = getattr(args, 'rank', 0)
     if rank == 0:
         print('using {} for parameters ...'.format(args.params_dtype), flush=True)
-    print(f'[M343] set_params_dtype: params_dtype={args.params_dtype}')
+    logging.debug(f'[M343] set_params_dtype: params_dtype={args.params_dtype}')
     return args
 
 
@@ -93,7 +94,7 @@ def set_params_dtype(args):
 # so it can be called from engine init after pipeline size is resolved.
 # ---------------------------------------------------------------------------
 
-print('[M409]')
+logging.debug('[M409]')
 
 
 def validate_pipeline_mp_ring_exchange(args):
@@ -113,7 +114,8 @@ def validate_pipeline_mp_ring_exchange(args):
             raise Exception(
                 'PyTorch with torch.distributed.ring_exchange needed '
                 'to run pipeline MP!')
-    print('[M409] validate_pipeline_mp_ring_exchange: '
+    
+    logging.debug('[M409] validate_pipeline_mp_ring_exchange: '
           f'pipeline_mp_size={pipeline_mp_size}, '
           f'ring_exchange_available={"ring_exchange" in dir(torch.distributed)}')
 
@@ -143,7 +145,7 @@ def validate_pipeline_mp_ring_exchange(args):
 # add_deprecated_args(parser) helpers callable from compile/initialize.
 # ---------------------------------------------------------------------------
 
-print('[M451]')
+logging.debug('[M451]')
 
 
 def validate_deprecated_args(args):
@@ -179,7 +181,7 @@ def validate_deprecated_args(args):
             '--model-parallel-size is no longer valid, use --tensor-model-parallel-size instead'
         del args.model_parallel_size
 
-    print('[M451] validate_deprecated_args: deprecated args validated and removed')
+    logging.debug('[M451] validate_deprecated_args: deprecated args validated and removed')
 
 
 def add_deprecated_args(parser):
@@ -216,7 +218,7 @@ def add_deprecated_args(parser):
     group.add_argument('--model-parallel-size', type=int, default=None,
                        help='Old model parallel argument, do not use. Use '
                        '--tensor-model-parallel-size instead.')
-    print('[M451] add_deprecated_args: deprecated argument stubs registered')
+    logging.debug('[M451] add_deprecated_args: deprecated argument stubs registered')
     return parser
 
 # ---------------------------------------------------------------------------
@@ -243,7 +245,7 @@ def add_deprecated_args(parser):
 # DeepSpeed adaptation: exposed as helper functions callable from compile/init.
 # ---------------------------------------------------------------------------
 
-print('[M512]')
+logging.debug('[M512]')
 
 
 def patch_checkpointing_args(parser):
@@ -258,7 +260,7 @@ def patch_checkpointing_args(parser):
                        help='Do not load optimizer when loading checkpoint.')
     group.add_argument('--no-load-rng', action='store_true', default=None,
                        help='Do not load rng state when loading checkpoint.')
-    print('[M512] patch_checkpointing_args: no-load-optim/rng with default=None')
+    logging.debug('[M512] patch_checkpointing_args: no-load-optim/rng with default=None')
     return parser
 
 
@@ -271,7 +273,7 @@ def patch_distributed_args(parser):
     group = parser.add_argument_group(title='M512 distributed patches')
     group.add_argument('--use-cpu-initialization', type=bool, required=False,
                        help='If set, affine parallel weights initialization uses CPU')
-    print('[M512] patch_distributed_args: use-cpu-initialization as type=bool')
+    logging.debug('[M512] patch_distributed_args: use-cpu-initialization as type=bool')
     return parser
 
 
@@ -290,10 +292,10 @@ def patch_distributed_args(parser):
 #
 # 20% adaptation: added as a standalone patch_virtual_pipeline_args() helper
 # that callers invoke alongside other distributed arg patches; uses the same
-# add_argument_group pattern as existing M512 helpers; adds print('[M556]').
+# add_argument_group pattern as existing M512 helpers; adds  logging.debug('[M556]').
 # ---------------------------------------------------------------------------
 
-print('[M556]')
+logging.debug('[M556]')
 
 
 def patch_virtual_pipeline_args(parser):
@@ -308,7 +310,7 @@ def patch_virtual_pipeline_args(parser):
     group.add_argument('--virtual-pipeline-model-parallel-size', type=int,
                        default=None,
                        help='Number of virtual pipeline stages in physical stage.')
-    print('[M556] patch_virtual_pipeline_args: --virtual-pipeline-model-parallel-size registered')
+    logging.debug('[M556] patch_virtual_pipeline_args: --virtual-pipeline-model-parallel-size registered')
     return parser
 
 
@@ -332,7 +334,7 @@ def set_input_defaults_early(args, defaults):
                        flush=True)
         else:
             setattr(args, key, defaults[key])
-    print(f'[M512] set_input_defaults_early: applied {len(defaults)} default(s)')
+    logging.debug(f'[M512] set_input_defaults_early: applied {len(defaults)} default(s)')
     return args
 
 # ---------------------------------------------------------------------------
@@ -357,7 +359,7 @@ def set_input_defaults_early(args, defaults):
 # callable from compile/initialize to register biencoder CLI arguments.
 # ---------------------------------------------------------------------------
 
-print('[M544]')
+logging.debug('[M544]')
 
 
 def add_biencoder_args(parser):
@@ -415,7 +417,7 @@ def add_biencoder_args(parser):
                        help='After how many batches should the indexer '
                        'report progress')
 
-    print('[M544] add_biencoder_args: biencoder arguments registered')
+    logging.debug('[M544] add_biencoder_args: biencoder arguments registered')
     return parser
 # M559: Megatron e3e5ea892 — Compute tensor chunk size more cleanly, and add
 #       assertion for global batch size
@@ -444,7 +446,7 @@ def add_biencoder_args(parser):
 #     tensor_chunk_shape code path.
 # ---------------------------------------------------------------------------
 
-print('[M559]')
+logging.debug('[M559]')
 
 
 def validate_global_batch_size_interleaved(args):
@@ -473,7 +475,9 @@ def validate_global_batch_size_interleaved(args):
             'global batch size is not divisible by pipeline parallel size when ' \
             'using interleaved schedule'
 
-    print(f'[M559] validate_global_batch_size_interleaved: '
+    
+
+    logging.debug(f'[M559] validate_global_batch_size_interleaved: '
           f'global_batch_size={global_batch_size}, '
           f'pipeline_model_parallel_size={pp_size}, '
           f'virtual_pipeline_model_parallel_size={virtual_pp_size}')
@@ -504,7 +508,7 @@ def validate_global_batch_size_interleaved(args):
 # add_virtual_pipeline_arg(parser) helpers callable from compile/initialize.
 # ---------------------------------------------------------------------------
 
-print('[M565]')
+logging.debug('[M565]')
 
 
 def resolve_virtual_pipeline_size(args):
@@ -541,7 +545,8 @@ def resolve_virtual_pipeline_size(args):
             'using interleaved schedule'
     else:
         args.virtual_pipeline_model_parallel_size = None
-    print('[M565] resolve_virtual_pipeline_size: '
+    
+    logging.debug('[M565] resolve_virtual_pipeline_size: '
           f'virtual_pipeline_model_parallel_size='
           f'{args.virtual_pipeline_model_parallel_size}')
     return args
@@ -561,7 +566,7 @@ def add_virtual_pipeline_arg(parser):
     group = parser.add_argument_group(title='M565 virtual pipeline arguments')
     group.add_argument('--num-layers-per-virtual-pipeline-stage', type=int, default=None,
                        help='Number of layers per virtual pipeline stage')
-    print('[M565] add_virtual_pipeline_arg: --num-layers-per-virtual-pipeline-stage registered')
+    logging.debug('[M565] add_virtual_pipeline_arg: --num-layers-per-virtual-pipeline-stage registered')
     return parser
 
 # ---------------------------------------------------------------------------
@@ -595,7 +600,7 @@ def add_virtual_pipeline_arg(parser):
 #   (args → DeepSpeed config) uses the correct canonical name.
 # ---------------------------------------------------------------------------
 
-print('[M598]')
+logging.debug('[M598]')
 
 # ---------------------------------------------------------------------------
 # M610: Megatron 0d5188c15 — refactored the fused kernels build
@@ -619,10 +624,10 @@ print('[M598]')
 #     by _compile_dependencies() inside megatron_initialize.py, mirroring
 #     the upstream move from arguments.py → initialize.py.
 #   - No new helpers needed here; this file documents the removal.
-#   - Adds print('[M610]') marker.
+#   - Adds  logging.debug('[M610]') marker.
 # ---------------------------------------------------------------------------
 
-print('[M610]')
+logging.debug('[M610]')
 
 # ---------------------------------------------------------------------------
 # M611: Megatron 43c9137b9 — Fixed based on review recommendation
@@ -700,11 +705,11 @@ def add_tasks_retriever_args(parser):
     group.add_argument('--faiss-topk-retrievals', type=int, default=100,
                        help='Number of blocks to use as top-k during retrieval')
 
-    print('[M611] add_tasks_retriever_args: qa-data + faiss args registered')
+    logging.debug('[M611] add_tasks_retriever_args: qa-data + faiss args registered')
     return parser
 
 
-print('[M611]')
+logging.debug('[M611]')
 
 # ---------------------------------------------------------------------------
 # M616: Megatron 182841f7d — Make sure pipeline-model-parallel size is
@@ -729,7 +734,7 @@ print('[M611]')
 # divisibility assertion but not the pp-size > 2 guard).
 # ---------------------------------------------------------------------------
 
-print('[M616]')
+logging.debug('[M616]')
 
 
 def validate_pipeline_mp_size_interleaved(args):
@@ -751,7 +756,8 @@ def validate_pipeline_mp_size_interleaved(args):
         assert pipeline_mp_size > 2, \
             'pipeline-model-parallel size should be greater than 2 with ' \
             'interleaved schedule'
-    print('[M616] validate_pipeline_mp_size_interleaved: '
+    
+    logging.debug('[M616] validate_pipeline_mp_size_interleaved: '
           f'num_layers_per_virtual_pipeline_stage={num_layers_per_stage}, '
           f'pipeline_model_parallel_size={getattr(args, "pipeline_model_parallel_size", 1)}')
 
@@ -808,7 +814,7 @@ def validate_pipeline_mp_size_interleaved(args):
 #     documented here for traceability.
 # ---------------------------------------------------------------------------
 
-print('[M612]')
+logging.debug('[M612]')
 
 
 # ---------------------------------------------------------------------------
@@ -849,7 +855,7 @@ def add_dialog_ctrl_args(parser):
     return parser
 
 
-print('[M702]')
+logging.debug('[M702]')
 
 
 # ---------------------------------------------------------------------------
@@ -903,11 +909,11 @@ def add_empty_unused_memory_arg(parser):
              '(training and eval), to reduce fragmentation. '
              '0=off, 1=moderate, 2=aggressive.',
     )
-    print('[M749] add_empty_unused_memory_arg: --empty-unused-memory-each-iter registered')
+    logging.debug('[M749] add_empty_unused_memory_arg: --empty-unused-memory-each-iter registered')
     return parser
 
 
-print('[M749]')
+logging.debug('[M749]')
 
 # ---------------------------------------------------------------------------
 # M771: Megatron cb5e611d7 — tested
@@ -929,7 +935,7 @@ print('[M749]')
 # callable after pipeline and activation-checkpoint args are resolved.
 # ---------------------------------------------------------------------------
 
-print('[M771]')
+logging.debug('[M771]')
 
 
 def validate_distributed_checkpointing(args):
@@ -956,7 +962,7 @@ def validate_distributed_checkpointing(args):
     assert getattr(args, 'num_layers_per_virtual_pipeline_stage', None) is None, \
         'currently distrobuted checkpoint activations only supported for ' \
         'nointerleaved pipeline parallelism'
-    print('[M771] validate_distributed_checkpointing: passed')
+    logging.debug('[M771] validate_distributed_checkpointing: passed')
 
 # ---------------------------------------------------------------------------
 # M1005: Megatron b93bef00d — comments, cleanup.
@@ -1045,7 +1051,7 @@ def validate_distributed_checkpointing(args):
 # No code changes required in this repo. Marker added for log continuity.
 # ---------------------------------------------------------------------------
 
-print('[M1005]')
+logging.debug('[M1005]')
 
 # ---------------------------------------------------------------------------
 # M1038: Megatron 1cd3650dc — more minor fixes
@@ -1077,7 +1083,7 @@ print('[M1005]')
 #   callable from compile/initialize, matching the existing patch_* / add_* convention.
 # ---------------------------------------------------------------------------
 
-print('[M1038]')
+logging.debug('[M1038]')
 
 
 def set_standalone_embedding_args(args):
@@ -1112,7 +1118,8 @@ def set_standalone_embedding_args(args):
             args.virtual_pipeline_model_parallel_size = (
                 (num_layers // t_pp_size) // num_layers_per_stage
             )
-    print('[M1038] set_standalone_embedding_args: '
+    
+    logging.debug('[M1038] set_standalone_embedding_args: '
           f'pipeline_model_parallel_size={pp_size}, '
           f'standalone_embedding_stage={standalone}, '
           f'transformer_pipeline_model_parallel_size='
@@ -1141,7 +1148,7 @@ def add_standalone_embedding_arg(parser):
              'stage, without any transformer layers. (For T5, this flag '
              'currently only affects the encoder embedding.)',
     )
-    print('[M1038] add_standalone_embedding_arg: --standalone-embedding-stage registered')
+    logging.debug('[M1038] add_standalone_embedding_arg: --standalone-embedding-stage registered')
     return parser
 
 # ---------------------------------------------------------------------------
@@ -1178,7 +1185,7 @@ def add_standalone_embedding_arg(parser):
 # is ported, the else-branch above must NOT be included.
 # ---------------------------------------------------------------------------
 
-print('[M1245]')
+logging.debug('[M1245]')
 
 # ---------------------------------------------------------------------------
 # M1278: Megatron d48d95ab8 — Open sourcing lm detoxification code
@@ -1217,10 +1224,10 @@ def add_max_tokens_to_oom_arg(parser):
              'tokens here is # in prompt + # to generate. '
              'Allows us to throw an error before OOM crashes server.',
     )
-    print('[M1278] add_max_tokens_to_oom_arg: --max-tokens-to-oom registered')
+    logging.debug('[M1278] add_max_tokens_to_oom_arg: --max-tokens-to-oom registered')
     return parser
 
-print('[M1278]')
+logging.debug('[M1278]')
 
 # ---------------------------------------------------------------------------
 # M1333: Megatron 1e0e555c4 — merging rope to main
@@ -1277,11 +1284,11 @@ def add_rotary_position_args(parser):
         dest='add_position_embedding',
         help='Disable position embedding.',
     )
-    print('[M1333] add_rotary_position_args: RoPE args registered')
+    logging.debug('[M1333] add_rotary_position_args: RoPE args registered')
     return parser
 
 
-print('[M1333]')
+logging.debug('[M1333]')
 
 # ---------------------------------------------------------------------------
 # M1359: Megatron 05b808ef7 — Expand on apply-layernorm-1p description a bit.
@@ -1308,7 +1315,7 @@ print('[M1333]')
 # the existing add_* convention in this file.
 # ---------------------------------------------------------------------------
 
-print('[M1359]')
+logging.debug('[M1359]')
 
 
 def add_network_size_args_1p(parser):
@@ -1330,7 +1337,7 @@ def add_network_size_args_1p(parser):
         help='Adjust LayerNorm weights such that they are centered '
              'around zero. This improves numerical stability.',
     )
-    print('[M1359] add_network_size_args_1p: --apply-layernorm-1p registered')
+    logging.debug('[M1359] add_network_size_args_1p: --apply-layernorm-1p registered')
     return parser
 # M1379: Megatron 3e71ad9c6 — Exit on usage of --checkpoint-activations
 #        because it defaults to full recomputation which is slow.
@@ -1397,9 +1404,9 @@ def validate_checkpoint_activations_arg(args):
             )
         exit()
     del args.checkpoint_activations
-    print('[M1379]')
+    logging.debug('[M1379]')
 
-print('[M1379]')
+logging.debug('[M1379]')
 
 # ---------------------------------------------------------------------------
 # M1420: Megatron 397d0b2eb — Split TransformerConfig into BaseConfig and
@@ -1424,7 +1431,7 @@ print('[M1379]')
 # with deepspeed/compile/__init__.py.
 #
 # 10% adaptation: TransformerConfig imported from local module; adds
-# print('[M1420]') marker at call time.
+#  logging.debug('[M1420]') marker at call time.
 # ---------------------------------------------------------------------------
 
 
@@ -1456,12 +1463,13 @@ def core_config_from_args(args):
     # on out-of-order.  Derived here to keep both config flags consistent with
     # the CLI flag rather than letting each call-site compute the negation.
     kw_args['batch_p2p_comm'] = not getattr(args, 'overlap_p2p_comm', False)
-    print('[M1420]')
-    print('[M1506] core_config_from_args: batch_p2p_comm=%s (overlap_p2p_comm=%s)' % (
+    logging.debug('[M1420]')
+    
+    logging.debug('[M1506] core_config_from_args: batch_p2p_comm=%s (overlap_p2p_comm=%s)' % (
         kw_args['batch_p2p_comm'], getattr(args, 'overlap_p2p_comm', False)))
     return TransformerConfig(**kw_args)
 
-print('[M1420]')
+logging.debug('[M1420]')
 
 # ---------------------------------------------------------------------------
 # M1501: Megatron f9283c5a8 — Add option to overlap p2p communication
@@ -1476,7 +1484,7 @@ print('[M1420]')
 #
 # 20% adaptation: surfaced as a standalone patch_overlap_p2p_args() helper
 # matching the existing pattern (patch_virtual_pipeline_args, etc.); adds
-# print('[M1501]') marker at registration and call time.
+#  logging.debug('[M1501]') marker at registration and call time.
 # ---------------------------------------------------------------------------
 
 
@@ -1500,11 +1508,12 @@ def patch_overlap_p2p_args(parser):
         help='overlap pipeline parallel communication with forward and backward chunks',
         dest='overlap_p2p_comm',
     )
-    print('[M1501] patch_overlap_p2p_args: --overlap-p2p-communication registered, '
+    
+    logging.debug('[M1501] patch_overlap_p2p_args: --overlap-p2p-communication registered, '
           'sets args.overlap_p2p_comm=True when present')
 
 
-print('[M1501]')
+logging.debug('[M1501]')
 
 # ---------------------------------------------------------------------------
 # M1503: Megatron 2c13d1f95 — Consistent arg names
@@ -1549,11 +1558,12 @@ def verify_p2p_arg_names(args):
             f'Use overlap_p2p_comm / batch_p2p_comm (Megatron 2c13d1f95).')
     overlap = getattr(args, 'overlap_p2p_comm', False)
     batch = getattr(args, 'batch_p2p_comm', not overlap)
-    print(f'[M1503] verify_p2p_arg_names: overlap_p2p_comm={overlap} '
+    
+    logging.debug(f'[M1503] verify_p2p_arg_names: overlap_p2p_comm={overlap} '
           f'batch_p2p_comm={batch} — names consistent with Megatron 2c13d1f95')
 
 
-print('[M1503]')
+logging.debug('[M1503]')
 
 # ---------------------------------------------------------------------------
 # M1506: Megatron 4ef31451d — Fixes/cleanup from overlap p2p merge
@@ -1594,7 +1604,7 @@ print('[M1503]')
 #     targeted by the upstream diff do not exist here
 # ---------------------------------------------------------------------------
 
-print('[M1506]')
+logging.debug('[M1506]')
 
 
 # ---------------------------------------------------------------------------
@@ -1616,7 +1626,7 @@ print('[M1506]')
 #             梯度与通信之重叠，永不得启。」
 #   - patch_tp_comm_rs_dgrad_args(parser) 函数封装新参数，
 #     与既有 M1501/M1503/M1506 风格保持一致。
-#   - print('[M1960]') diagnostic added.
+#   -  logging.debug('[M1960]') diagnostic added.
 # ---------------------------------------------------------------------------
 
 
@@ -1638,11 +1648,12 @@ def patch_tp_comm_rs_dgrad_args(parser):
              'Requires --tp-comm-overlap and TransformerEngine > 1.6.0.dev0.',
         dest='tp_comm_overlap_rs_dgrad',
     )
-    print('[M1960] patch_tp_comm_rs_dgrad_args: --tp-comm-overlap-rs-dgrad registered, '
+    
+    logging.debug('[M1960] patch_tp_comm_rs_dgrad_args: --tp-comm-overlap-rs-dgrad registered, '
           'sets args.tp_comm_overlap_rs_dgrad=True when present')
 
 
-print('[M1960]')
+logging.debug('[M1960]')
 
 # ---------------------------------------------------------------------------
 # M2030: Megatron f76b465e0 — Add TP communication bootstrap backend interface
@@ -1664,7 +1675,7 @@ print('[M1960]')
 #             用者自取，方为真正的接口开放。」
 #   - patch_tp_comm_bootstrap_backend_args(parser) 封装新参数，
 #     与既有 M1960 风格保持一致。
-#   - print('[M2030]') diagnostic added.
+#   -  logging.debug('[M2030]') diagnostic added.
 # ---------------------------------------------------------------------------
 
 
@@ -1687,8 +1698,9 @@ def patch_tp_comm_bootstrap_backend_args(parser):
              'Requires --tp-comm-overlap. For TE < 1.9.0 only mpi is supported.',
         dest='tp_comm_bootstrap_backend',
     )
-    print('[M2030] patch_tp_comm_bootstrap_backend_args: --tp-comm-bootstrap-backend registered, '
+    
+    logging.debug('[M2030] patch_tp_comm_bootstrap_backend_args: --tp-comm-bootstrap-backend registered, '
           'default=nccl, choices=[nccl, mpi, gloo]')
 
 
-print('[M2030]')
+logging.debug('[M2030]')

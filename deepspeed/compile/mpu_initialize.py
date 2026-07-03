@@ -1,3 +1,4 @@
+import logging
 # Copyright (c) Microsoft Corporation.
 # SPDX-License-Identifier: Apache-2.0
 
@@ -45,7 +46,7 @@
 
 import deepspeed.comm as dist
 
-print('[M345]')
+logging.debug('[M345]')
 
 # These values enable us to change the mpu sizes on the fly.
 _MPU_WORLD_SIZE = None
@@ -61,7 +62,7 @@ def set_model_parallel_world_size(world_size):
     """
     global _MPU_WORLD_SIZE
     _MPU_WORLD_SIZE = world_size
-    print(f'[M54-MPU] set_model_parallel_world_size({world_size})')
+    logging.debug(f'[M54-MPU] set_model_parallel_world_size({world_size})')
 
 
 def get_model_parallel_world_size():
@@ -86,7 +87,7 @@ def set_model_parallel_rank(rank):
     """
     global _MPU_RANK
     _MPU_RANK = rank
-    print(f'[M54-MPU] set_model_parallel_rank({rank})')
+    logging.debug(f'[M54-MPU] set_model_parallel_rank({rank})')
 
 
 def get_model_parallel_rank():
@@ -146,7 +147,7 @@ def get_model_parallel_rank():
 #   in the wider DeepSpeed codebase that have not yet been updated.
 # ===========================================================================
 
-print('[M447]')
+logging.debug('[M447]')
 
 _PIPELINE_GLOBAL_RANKS = None
 
@@ -184,10 +185,10 @@ _PIPELINE_GLOBAL_RANKS = None
 # virtual rank management is standalone (no NCCL group construction).
 # is_pipeline_first/last_stage stubs refer to the same physical-rank checks
 # already present via get_pipeline_model_parallel_rank() / world_size.
-# Adds print('[M556]').
+# Adds  logging.debug('[M556]').
 # ===========================================================================
 
-print('[M556]')
+logging.debug('[M556]')
 
 _VIRTUAL_PIPELINE_MODEL_PARALLEL_RANK = None
 _VIRTUAL_PIPELINE_MODEL_PARALLEL_WORLD_SIZE = None
@@ -204,7 +205,8 @@ def init_virtual_pipeline_model_parallel(virtual_pipeline_model_parallel_size):
     global _VIRTUAL_PIPELINE_MODEL_PARALLEL_WORLD_SIZE
     _VIRTUAL_PIPELINE_MODEL_PARALLEL_RANK = 0
     _VIRTUAL_PIPELINE_MODEL_PARALLEL_WORLD_SIZE = virtual_pipeline_model_parallel_size
-    print(f'[M556] init_virtual_pipeline_model_parallel: '
+    
+    logging.debug(f'[M556] init_virtual_pipeline_model_parallel: '
           f'world_size={virtual_pipeline_model_parallel_size}')
 
 
@@ -284,7 +286,7 @@ def set_pipeline_global_ranks(ranks):
     """
     global _PIPELINE_GLOBAL_RANKS
     _PIPELINE_GLOBAL_RANKS = list(ranks)
-    print(f'[M447] set_pipeline_global_ranks: ranks={_PIPELINE_GLOBAL_RANKS}')
+    logging.debug(f'[M447] set_pipeline_global_ranks: ranks={_PIPELINE_GLOBAL_RANKS}')
 
 
 def get_pipeline_model_parallel_first_rank():
@@ -356,7 +358,7 @@ def get_pipeline_model_parallel_src_rank():
 # since this file is the DS equivalent of the mpu package namespace.
 # ---------------------------------------------------------------------------
 
-print('[M1003]')
+logging.debug('[M1003]')
 
 # ---------------------------------------------------------------------------
 # M1038: Megatron 1cd3650dc — more minor fixes
@@ -464,7 +466,7 @@ print('[M1003]')
 #     (DS text generation path differs); see megatron_generation.py comment.
 #   • static/index.html, README, prep_resp_gen.sh: no-op.
 # ---------------------------------------------------------------------------
-print('[M1038]')
+logging.debug('[M1038]')
 
 
 def assert_viewless_tensor(tensor, extra_msg=None):

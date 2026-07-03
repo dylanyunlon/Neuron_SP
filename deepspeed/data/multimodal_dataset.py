@@ -1,3 +1,4 @@
+import logging
 # coding=utf-8
 # Copyright (c) 2020, NVIDIA CORPORATION.  All rights reserved.
 #
@@ -22,7 +23,7 @@ import time
 import numpy as np
 import torch
 
-print('[M1392]')
+logging.debug('[M1392]')
 
 from megatron import print_rank_0
 from megatron.core import mpu

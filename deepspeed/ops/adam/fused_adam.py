@@ -1061,5 +1061,5 @@ class DeslocGradAccumulator:
 # corresponding deepspeed/optimizer/distributed_fused_adam.py does not exist
 # in Neuron_SP, so no file deletion is required. Marker placed here as the
 # nearest fused-adam counterpart.
-print('[M1078]')
+logging.debug('[M1078]')
 # --- End M1078 ---

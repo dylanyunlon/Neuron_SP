@@ -1,3 +1,4 @@
+import logging
 # SPDX-License-Identifier: Apache-2.0
 # DeepSpeed Team
 
@@ -29,10 +30,10 @@
 # 20% adaptation: exposed as a standalone guard function
 # assert_no_decoder_with_untied_embeddings() so that DeepSpeed model-init
 # code can call it directly without instantiating TransformerLanguageModel.
-# Adds print('[M1344]') marker.
+# Adds  logging.debug('[M1344]') marker.
 # ---------------------------------------------------------------------------
 
-print('[M1344]')
+logging.debug('[M1344]')
 
 
 def assert_no_decoder_with_untied_embeddings(args, add_decoder):
@@ -65,5 +66,6 @@ def assert_no_decoder_with_untied_embeddings(args, add_decoder):
             "add_decoder=True (T5).  Tied embeddings are required for the "
             "cross-stage embedding synchronisation used by the T5 decoder."
         )
-    print(f'[M1344] assert_no_decoder_with_untied_embeddings: '
+    
+    logging.debug(f'[M1344] assert_no_decoder_with_untied_embeddings: '
           f'untie={untie} add_decoder={add_decoder} — OK')

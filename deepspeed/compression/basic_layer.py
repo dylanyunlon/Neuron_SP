@@ -1,3 +1,4 @@
+import logging
 # Copyright (c) Microsoft Corporation.
 # SPDX-License-Identifier: Apache-2.0
 
@@ -13,7 +14,7 @@ from deepspeed.utils import logger
 
 g_mpu = None
 
-print('[M340]')
+logging.debug('[M340]')
 
 
 class QuantAct(nn.Module):

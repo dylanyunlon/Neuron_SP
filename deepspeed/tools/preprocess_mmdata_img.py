@@ -1,3 +1,4 @@
+import logging
 # coding=utf-8
 # Copyright (c) 2020, NVIDIA CORPORATION.  All rights reserved.
 #
@@ -38,7 +39,7 @@ from megatron.tokenizer import build_tokenizer
 from megatron.data import indexed_dataset
 from megatron.data.indexed_dataset import MMapIndexedDatasetBuilder
 
-print('[M1392]')
+logging.debug('[M1392]')
 
 
 def get_args():

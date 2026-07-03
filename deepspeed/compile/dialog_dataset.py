@@ -1,3 +1,4 @@
+import logging
 # SPDX-License-Identifier: Apache-2.0
 # DeepSpeed Team
 
@@ -31,19 +32,19 @@ import os
 import numpy as np
 import torch
 
-print('[M702]')
+logging.debug('[M702]')
 # M895: Megatron b3eea9d8b — Delete commands.sh
 # tasks/knwl_dialo/scripts/commands.sh did not exist in Neuron_SP; deletion is a no-op here.
-print('[M895]')
+logging.debug('[M895]')
 # M936: Megatron 7122b878e — delete interactive file
 # tools/control_dialog_interactive.py did not exist in Neuron_SP; deletion is a no-op here.
-print('[M936]')
+logging.debug('[M936]')
 # M967: Megatron 3b29f0e79 — minor fixes
 # megatron/data/data_samplers.py MegatronPretrainingRandomSampler: `dataset` -> `self.dataset`
 # megatron/data/vit_dataset.py ClassificationTransform: hardcode mean/std instead of `*self.mean_std`
 # megatron/model/vision/classification.py: remove unused mit_backbone and trunc_normal_ imports
 # None of these three files exist in Neuron_SP/deepspeed; no-op here.
-print('[M967]')
+logging.debug('[M967]')
 # M1004: Megatron 3f1a728af — more minor fixes
 # megatron/data/vit_dataset.py DinoTransform.__init__: args.local_crops_number -> args.dino_local_crops_number,
 #   args.local_img_size -> args.dino_local_img_size; DinoTransform.__call__: remove street_data crop branch;
@@ -56,7 +57,7 @@ print('[M967]')
 # pretrain_vision_dino.py: add ModelType import, fix contrastive->dino import, pass ModelType.encoder_or_decoder.
 # pretrain_vision_inpaint.py: add ModelType import, pass ModelType.encoder_or_decoder to pretrain().
 # None of these files exist in Neuron_SP/deepspeed; no-op here.
-print('[M1004]')
+logging.debug('[M1004]')
 
 # M1038: Megatron 1cd3650dc — more minor fixes
 # This commit bundles the same vision-file changes as 3f1a728af (already handled
@@ -132,7 +133,7 @@ print('[M1004]')
 # README.md: prose improvements; "pre-training of" typo fix; TP/PP column note.
 # examples/msdp/prep_resp_gen.sh: --knowledge_gen_file → --knwl_gen_file.
 #   Both are documentation-only; no-op here.
-print('[M1038]')
+logging.debug('[M1038]')
 
 from deepspeed.compile.megatron_initialize import get_tokenizer
 
@@ -277,4 +278,4 @@ def build_train_valid_test_datasets(data_folder, dataset_name, train_module, max
 # pretrain_vision_dino.py: import get_feature_bank from knn_monitor; use get_feature_bank()
 #   instead of args.knn_features; remove print_rank_0("building VIT model ...").
 # None of these files exist in Neuron_SP/deepspeed; no-op here.
-print('[M1039]')
+logging.debug('[M1039]')

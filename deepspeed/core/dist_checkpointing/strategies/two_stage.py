@@ -1,3 +1,4 @@
+import logging
 # Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
 
 """ 2-stage checkpoint loading. """
@@ -177,7 +178,7 @@ class TwoStageDataParallelLoadShardedStrategy(LoadShardedStrategy):
     def _exchange_loaded_tensors(self, ten_metas: List[_ShardedTensorMetadata], sharded_state_dict, checkpoint_dir):
         # M1980: 铁屋中的 rank，各自负重，唯计时方知谁轻谁重。
         logger.debug(f'_exchange_loaded_tensors, num ten_metas: {len(ten_metas)}')
-        print(f'[M1980] _exchange_loaded_tensors start: {len(ten_metas)} tensors, rank={self.global_rank}')
+        logging.debug(f'[M1980] _exchange_loaded_tensors start: {len(ten_metas)} tensors, rank={self.global_rank}')
         load_time_total = 0.0
         broadcast_time_total = 0.0
         for ten_meta in ten_metas:
@@ -213,7 +214,7 @@ class TwoStageDataParallelLoadShardedStrategy(LoadShardedStrategy):
         logger.debug(f'load_tensor_from_storage total took {load_time_total:.4f}s')
         logger.debug(f'broadcast total took {broadcast_time_total:.4f}s')
         logger.debug(f'cuda.synchronize took {_sync_took:.4f}s')
-        print(f'[M1980] _exchange_loaded_tensors done: load={load_time_total:.4f}s bcast={broadcast_time_total:.4f}s sync={_sync_took:.4f}s')
+        logging.debug(f'[M1980] _exchange_loaded_tensors done: load={load_time_total:.4f}s bcast={broadcast_time_total:.4f}s sync={_sync_took:.4f}s')
 
     @timed(verbose=False)
     def _distribute_data_to_state_dict(self, ten_meta: _ShardedTensorMetadata, loaded_ten: torch.Tensor, sharded_state_dict: ShardedStateDict):
@@ -233,4 +234,4 @@ class TwoStageDataParallelLoadShardedStrategy(LoadShardedStrategy):
             return sharded_tensor.data
 
         dict_list_map_inplace(_fill_in_data, sharded_state_dict)
-print('[M1437]')
+logging.debug('[M1437]')

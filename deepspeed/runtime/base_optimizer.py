@@ -1,3 +1,4 @@
+import logging
 # Copyright (c) Microsoft Corporation.
 # SPDX-License-Identifier: Apache-2.0
 
@@ -20,7 +21,7 @@ class DeepSpeedOptimizer(object):
         # M487: Megatron 160ba6800 — base no-op; fp16 subclasses override.
         # Called after loading a pretrained checkpoint for finetuning to sync
         # fp32 master params with the freshly loaded model weights.
-        print('[M487]')
+        logging.debug('[M487]')
         pass
 
 

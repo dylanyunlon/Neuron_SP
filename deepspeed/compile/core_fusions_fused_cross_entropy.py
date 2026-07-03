@@ -1,3 +1,4 @@
+import logging
 # Copyright (c) Microsoft Corporation.
 # SPDX-License-Identifier: Apache-2.0
 
@@ -36,10 +37,10 @@
 #   - @jit_fuser → @torch.jit.script（项目映射）。
 #   - 所有 megatron.core.* 导入替换为 deepspeed.compile.* 等价模块。
 #   - VocabParallelCrossEntropy 来自本项目的 core_tensor_parallel_cross_entropy。
-#   - 加 print('[M1990]') 诊断标记。
+#   - 加  logging.debug('[M1990]') 诊断标记。
 # ---------------------------------------------------------------------------
 
-print('[M1990] core_fusions_fused_cross_entropy: jit.script cross-entropy fusion loaded')
+logging.debug('[M1990] core_fusions_fused_cross_entropy: jit.script cross-entropy fusion loaded')
 
 from typing import Tuple
 
@@ -149,7 +150,7 @@ class _VocabParallelCrossEntropy(torch.autograd.Function):
         rank = get_tensor_model_parallel_rank()
         world_size = get_tensor_model_parallel_world_size()
         vocab_start_index, vocab_end_index = get_vocab_range(partition_vocab_size, rank, world_size)
-        print(f'[M1990] fused _VocabParallelCrossEntropy.forward vocab_start={vocab_start_index} vocab_end={vocab_end_index} partition_vocab_size={partition_vocab_size}')
+        logging.debug(f'[M1990] fused _VocabParallelCrossEntropy.forward vocab_start={vocab_start_index} vocab_end={vocab_end_index} partition_vocab_size={partition_vocab_size}')
 
         (
             target_mask,

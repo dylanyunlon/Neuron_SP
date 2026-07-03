@@ -1,3 +1,4 @@
+import logging
 # Copyright (c) Microsoft Corporation.
 # SPDX-License-Identifier: Apache-2.0
 
@@ -21,10 +22,10 @@
 # DeepSpeed adaptation:
 #   - megatron.model.enums.AttnMaskType replaced with a local enum stub so this
 #     file is self-contained (no Megatron dependency at import time).
-#   - adds print('[M774]') marker per project convention.
+#   - adds  logging.debug('[M774]') marker per project convention.
 # ---------------------------------------------------------------------------
 
-print('[M774]')
+logging.debug('[M774]')
 
 import torch
 import torch.nn as nn

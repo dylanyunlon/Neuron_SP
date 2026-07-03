@@ -1,5 +1,6 @@
-print('[M302]')
-print('[M314]')  # Megatron a14f1442f — remove ict_dataset.py (InverseClozeDataset lives here in realm_dataset.py)
+import logging
+logging.debug('[M302]')
+logging.debug('[M314]')  # Megatron a14f1442f — remove ict_dataset.py (InverseClozeDataset lives here in realm_dataset.py)
 import itertools
 import os
 import random
@@ -306,7 +307,7 @@ class InverseClozeDataset(Dataset):
             start_time = time.time()
             print_rank_0(' > building samples index mapping for {} ...'.format(
                 self.name))
-            print('[M562]')
+            logging.debug('[M562]')
             from megatron.data import helpers
             samples_mapping = helpers.build_blocks_mapping(
                 self.block_dataset.doc_idx,

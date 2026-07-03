@@ -1,3 +1,4 @@
+import logging
 # SPDX-License-Identifier: Apache-2.0
 # DeepSpeed Team
 
@@ -39,7 +40,7 @@
 #   - _cpp_extention_load_helper passes verbose=(args.rank == 0) as upstream.
 #   - Extra cuda flags for softmax include -U__CUDA_NO_HALF_OPERATORS__ etc.
 #   - Layer norm extra flags: ['-maxrregcount=50'] (no half-op flags needed).
-#   - Adds print('[M610]') marker.
+#   - Adds  logging.debug('[M610]') marker.
 # ---------------------------------------------------------------------------
 
 import os
@@ -116,7 +117,7 @@ def load(args):
                srcpath / 'layer_norm_cuda_kernel.cu']
     fused_mix_prec_layer_norm_cuda = _cpp_extention_load_helper(
         "fused_mix_prec_layer_norm_cuda", sources, extra_cuda_flags)
-    print('[M612] load: fused_mix_prec_layer_norm_cuda loaded unconditionally (bfloat support)')
+    logging.debug('[M612] load: fused_mix_prec_layer_norm_cuda loaded unconditionally (bfloat support)')
 
 
 def _get_cuda_bare_metal_version(cuda_dir):
@@ -139,4 +140,4 @@ def _create_build_dir(buildpath):
             print(f"Creation of the build directory {buildpath} failed")
 
 
-print('[M610]')
+logging.debug('[M610]')

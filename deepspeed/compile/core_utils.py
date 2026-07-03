@@ -1,3 +1,4 @@
+import logging
 # Copyright (c) Microsoft Corporation.
 # SPDX-License-Identifier: Apache-2.0
 
@@ -21,10 +22,10 @@
 #
 # 20% adaptation: imports core_parallel_state from deepspeed.compile rather
 # than megatron.core.parallel_state; uses torch.distributed._all_gather_base
-# matching upstream; adds print('[M1233]') marker.
+# matching upstream; adds  logging.debug('[M1233]') marker.
 # ---------------------------------------------------------------------------
 
-print('[M1233]')
+logging.debug('[M1233]')
 
 """Utility functions used through Megatron core"""
 import torch
@@ -96,7 +97,7 @@ def gather_split_1d_tensor(tensor):
 #   改用 parallel_state API，方为正途。
 #   get_args() 与 mpu 之依赖尽除，换 parallel_state.get_context_parallel_*，
 #   使 mcore 模块自洽，不必仰赖 training 层之鼻息。
-#   print('[M2050]') 诊断印记，见证此次搬迁。
+#      logging.debug('[M2050]') 诊断印记，见证此次搬迁。
 # ---------------------------------------------------------------------------
 
 
@@ -120,10 +121,10 @@ def get_batch_on_this_cp_rank(batch):
     # and chunk_3 are assigned to GPU0, chunk_1 and chunk_2 are assigned to GPU1, so
     # that we can get balanced workload among GPUs in a context parallel group.
     cp_size = parallel_state.get_context_parallel_world_size()
-    print('[M2050] get_batch_on_this_cp_rank: cp_size=%d keys=%s' % (cp_size, list(batch.keys())))
+    logging.debug('[M2050] get_batch_on_this_cp_rank: cp_size=%d keys=%s' % (cp_size, list(batch.keys())))
     if cp_size > 1:
         cp_rank = parallel_state.get_context_parallel_rank()
-        print('[M2050] get_batch_on_this_cp_rank: cp_rank=%d, slicing sequence dim' % cp_rank)
+        logging.debug('[M2050] get_batch_on_this_cp_rank: cp_rank=%d, slicing sequence dim' % cp_rank)
         for key, val in batch.items():
             if val is not None:
                 seq_dim = 1 if key != 'attention_mask' else 2

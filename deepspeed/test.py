@@ -1,7 +1,8 @@
+import logging
 import os
 import torch
 
-print('[M1250]')
+logging.debug('[M1250]')
 
 def main():
     rank = torch.cuda.current_device()

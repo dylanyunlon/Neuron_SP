@@ -1,3 +1,4 @@
+import logging
 # Copyright (c) Microsoft Corporation.
 # SPDX-License-Identifier: Apache-2.0
 
@@ -253,7 +254,7 @@ class TrainingSampleBuilder:
         if self._doc_idx is not None:
             return self._doc_idx, self._sample_idx, self._shuffle_idx
 
-        print(f"[M459-BUILDER] Building index mappings for {self.num_samples} samples...")
+        logging.debug(f"[M459-BUILDER] Building index mappings for {self.num_samples} samples...")
         self._doc_idx = self._build_doc_idx()
         self._sample_idx = self._build_sample_idx(self._doc_idx)
         self._shuffle_idx = self._build_shuffle_idx()

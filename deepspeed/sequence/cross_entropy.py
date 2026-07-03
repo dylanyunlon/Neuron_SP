@@ -1,3 +1,4 @@
+import logging
 # Copyright (c) Microsoft Corporation.
 # SPDX-License-Identifier: Apache-2.0
 
@@ -8,7 +9,7 @@ import torch
 import deepspeed.comm as dist
 
 
-print('[M55]')
+logging.debug('[M55]')
 
 
 class _VocabSequenceParallelCrossEntropy(torch.autograd.Function):

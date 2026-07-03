@@ -1,4 +1,5 @@
-print('[M1241]')
+import logging
+logging.debug('[M1241]')
 from setuptools import setup, find_packages
 
 setup(

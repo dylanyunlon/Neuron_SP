@@ -1,3 +1,4 @@
+import logging
 # coding=utf-8
 # Copyright (c) 2020, NVIDIA CORPORATION.  All rights reserved.
 #
@@ -29,7 +30,7 @@ from megatron.initialize import initialize_megatron
 from tasks.knwl_dialo.utils import get_token_stream
 # from megatron.text_generation import generate_and_post_process
 
-print('[M925]')
+logging.debug('[M925]')
 
 
 def call_model_api(inputs):

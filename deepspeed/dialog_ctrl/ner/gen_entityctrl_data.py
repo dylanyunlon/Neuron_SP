@@ -1,6 +1,7 @@
+import logging
 # SPDX-License-Identifier: Apache-2.0
 # DeepSpeed Team
-print('[M701]')
+logging.debug('[M701]')
 
 from src.config import get_params
 from transformers import AutoTokenizer

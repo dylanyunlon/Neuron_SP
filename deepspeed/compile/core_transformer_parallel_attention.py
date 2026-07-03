@@ -1,3 +1,4 @@
+import logging
 # Copyright (c) Microsoft Corporation.
 # SPDX-License-Identifier: Apache-2.0
 
@@ -35,10 +36,11 @@
 #
 # 20% adaptation (鲁迅式迁移):
 #   - 改名如改骨，骨相未变，精神长存。
-#   - Adds print('[M1700]') diagnostic marker.
+#   - Adds  logging.debug('[M1700]') diagnostic marker.
 # ---------------------------------------------------------------------------
-print('[M1700] dot_product_attention module active')
-print('[M1302]') marker.
+logging.debug('[M1700] dot_product_attention module active')
+
+logging.debug('[M1302]') marker.
 # ---------------------------------------------------------------------------
 # M1420: Megatron 397d0b2eb — Split TransformerConfig into BaseConfig and
 #        TransformerConfig, use BaseConfig for model parallel functions.
@@ -53,7 +55,7 @@ print('[M1302]') marker.
 #       sequence_parallel_enabled=self.sequence_parallel_enabled
 #       → sequence_parallel_enabled=self.sequence_parallel
 #
-# 10% adaptation: adds print('[M1420]') marker.
+# 10% adaptation: adds  logging.debug('[M1420]') marker.
 # ---------------------------------------------------------------------------
 # M1910: Megatron 80de44fda — Add RoPE and SwiGLU fusion
 # Source: megatron/core/transformer/attention.py (NVIDIA/Megatron-LM commit 80de44fda)
@@ -71,7 +73,7 @@ print('[M1302]') marker.
 #            fused 则铁链轻若鸿毛，速度倍增而精度不减。"
 #   - apex 不可用时，graceful fallback 到 apply_rotary_pos_emb (纯 PyTorch)。
 #   - forward() 签名增加 rotary_pos_emb=None，向下兼容旧调用。
-#   - print('[M1910]') 诊断标记。
+#   -  logging.debug('[M1910]') 诊断标记。
 # ---------------------------------------------------------------------------
 
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
@@ -87,14 +89,14 @@ from megatron.core.transformer.enums import AttnType, AttnMaskType
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 # M1910: fused RoPE via apex — 鲁迅曰: "有 apex 则速，无 apex 则退而求其次"
-print('[M1910] core_transformer_parallel_attention: fused RoPE path active')
+logging.debug('[M1910] core_transformer_parallel_attention: fused RoPE path active')
 try:
     from apex.transformer.functional import fused_apply_rotary_pos_emb as _fused_rope
     _USE_FUSED_ROPE = True
-    print('[M1910] fused_apply_rotary_pos_emb from apex loaded')
+    logging.debug('[M1910] fused_apply_rotary_pos_emb from apex loaded')
 except ImportError:
     _USE_FUSED_ROPE = False
-    print('[M1910] WARNING: apex unavailable, will skip RoPE or use pure-PyTorch fallback')
+    logging.debug('[M1910] WARNING: apex unavailable, will skip RoPE or use pure-PyTorch fallback')
     _fused_rope = None
 
 
@@ -104,9 +106,9 @@ def _apply_rope(query, key, rotary_pos_emb):
     if _fused_rope is not None:
         query = _fused_rope(query, q_pos_emb)
         key = _fused_rope(key, k_pos_emb)
-        print(f'[M1910] RoPE fused applied: query.shape={query.shape}')
+        logging.debug(f'[M1910] RoPE fused applied: query.shape={query.shape}')
     else:
-        print('[M1910] WARNING: RoPE skipped — no fused_apply_rotary_pos_emb available')
+        logging.debug('[M1910] WARNING: RoPE skipped — no fused_apply_rotary_pos_emb available')
     return query, key
 
 
@@ -251,7 +253,7 @@ class ParallelAttention(MegatronModule):
         if inference_params:
             if self.layer_number not in inference_params.key_value_memory_dict:
                 inf_max_seq_length = inference_params.max_sequence_length
-                print(f'[M1735][attention] inf_max_seq_length={inf_max_seq_length}')
+                logging.debug(f'[M1735][attention] inf_max_seq_length={inf_max_seq_length}')
                 inf_max_batch_size = inference_params.max_batch_size
                 inference_key_memory = self._allocate_memory(inf_max_seq_length, inf_max_batch_size)
                 inference_value_memory = self._allocate_memory(inf_max_seq_length, inf_max_batch_size)
@@ -331,9 +333,9 @@ class ParallelAttention(MegatronModule):
         #   - 保留 _apply_rope helper（M1910 引入，apex fused path），
         #     但推理路径改为内联切片后再调用，以匹配 upstream 语义。
         #   - attention_mask 参数传递保持不变（dot_product_attention 签名兼容）。
-        #   - print('[M2010]') 诊断标记。
+        #   -  logging.debug('[M2010]') 诊断标记。
         # ---------------------------------------------------------------------------
-        print('[M2010] inference pipeline fix active — sequence_len_offset-based mask logic')
+        logging.debug('[M2010] inference pipeline fix active — sequence_len_offset-based mask logic')
 
         if inference_params:
             batch_start = inference_params.batch_size_offset
@@ -342,14 +344,15 @@ class ParallelAttention(MegatronModule):
             sequence_start = inference_params.sequence_len_offset
             sequence_end = sequence_start + key_layer.size(0)
             assert sequence_end <= inference_key_memory.size(0)
-            print(f'[M2010] sequence_start={sequence_start} sequence_end={sequence_end} '
+            
+            logging.debug(f'[M2010] sequence_start={sequence_start} sequence_end={sequence_end} '
                   f'batch_start={batch_start} batch_end={batch_end}')
 
             # M2010: mask 关闭依据 sequence_len_offset，而非 is_first_step —— 各 pipeline stage 均可正确感知
             if inference_params.sequence_len_offset > 0:
                 # 已过 prompt forward_step，进入逐 token 生成：关闭因果 mask
                 attention_mask = None  # AttnMaskType.no_mask 语义：传 None 给 dot_product_attention
-                print(f'[M2010] past prompt step (offset={inference_params.sequence_len_offset}): mask disabled')
+                logging.debug(f'[M2010] past prompt step (offset={inference_params.sequence_len_offset}): mask disabled')
 
             # M2010: 先处理 RoPE 切片，再写入 KV cache（upstream 96f5c4165 语义）
             if rotary_pos_emb is not None:
@@ -357,7 +360,8 @@ class ParallelAttention(MegatronModule):
                 # q_pos_emb 取当前 step 的位置区间，而非依赖 is_first_step 分支
                 q_pos_emb = q_pos_emb[sequence_start:sequence_end, :, :, :]
                 k_pos_emb = k_pos_emb[:sequence_end, :, :, :]
-                print(f'[M2010] RoPE sliced: q_pos_emb[{sequence_start}:{sequence_end}] '
+                
+                logging.debug(f'[M2010] RoPE sliced: q_pos_emb[{sequence_start}:{sequence_end}] '
                       f'k_pos_emb[:{sequence_end}]')
                 query_layer, key_layer = _apply_rope(query_layer, key_layer, (q_pos_emb, k_pos_emb))
             # Copy key and values into pre-allocated inference buffers.

@@ -1,3 +1,4 @@
+import logging
 # Copyright (c) Microsoft Corporation.
 # SPDX-License-Identifier: Apache-2.0
 
@@ -22,11 +23,11 @@
 # 20% adaptation (鲁迅式迁移):
 #   鲁迅曰: "不用 apex，不用 triton，只用 jit.script，此乃平民之融合。"
 #   - 保留所有 @torch.jit.script 装饰器，原汁原味。
-#   - 加 print('[M1910]') 诊断标记，以示迁移之印记。
+#   - 加  logging.debug('[M1910]') 诊断标记，以示迁移之印记。
 #   - 注释改为中英文混注，适应 DeepSpeed 项目风格。
 # ---------------------------------------------------------------------------
 
-print('[M1910] core_fusions_fused_bias_swiglu loaded')
+logging.debug('[M1910] core_fusions_fused_bias_swiglu loaded')
 
 import torch
 import torch.nn.functional as F
@@ -73,7 +74,8 @@ class BiasSwiGLUFunction(torch.autograd.Function):
         ctx.save_for_backward(inp_save, bias, inp2_save, bias_2)
         ctx.ori_input_dtype = input.dtype
         ctx.fp8_input_store = fp8_input_store
-        print(f'[M1970] BiasSwiGLUFunction.forward fp8_input_store={fp8_input_store} '
+        
+        logging.debug(f'[M1970] BiasSwiGLUFunction.forward fp8_input_store={fp8_input_store} '
               f'input.dtype={input.dtype}')
         return bias_swiglu(input, bias, input_2, bias_2)
 
@@ -98,7 +100,8 @@ class SwiGLUFunction(torch.autograd.Function):
         ctx.save_for_backward(inp_save, inp2_save)
         ctx.ori_input_dtype = input.dtype
         ctx.fp8_input_store = fp8_input_store
-        print(f'[M1970] SwiGLUFunction.forward fp8_input_store={fp8_input_store} '
+        
+        logging.debug(f'[M1970] SwiGLUFunction.forward fp8_input_store={fp8_input_store} '
               f'input.dtype={input.dtype}')
         return swiglu(input, input_2)
 

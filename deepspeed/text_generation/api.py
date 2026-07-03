@@ -1,3 +1,4 @@
+import logging
 # coding=utf-8
 # Copyright (c) 2020, NVIDIA CORPORATION.  All rights reserved.
 #
@@ -28,8 +29,8 @@ from .tokenization import (
     tokenize_prompts,
     detokenize_generations)
 
-print('[M1055]')
-print('[M1166]')
+logging.debug('[M1055]')
+logging.debug('[M1166]')
 
 def generate_and_post_process(model,
                               prompts=None,

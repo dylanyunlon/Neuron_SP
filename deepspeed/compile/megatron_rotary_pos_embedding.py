@@ -1,3 +1,4 @@
+import logging
 # Copyright (c) Microsoft Corporation.
 # SPDX-License-Identifier: Apache-2.0
 
@@ -102,12 +103,15 @@ class RotaryEmbedding(nn.Module):
         if importlib.util.find_spec('einops') is None:
             raise RuntimeError("einops is required for Rotary Embedding")
 
-        print(f"[M1850-RotaryEmbedding-INIT] kv_channels={kv_channels} "
+        
+
+        logging.debug(f"[M1850-RotaryEmbedding-INIT] kv_channels={kv_channels} "
               f"rotary_percent={rotary_percent} effective_dim={dim} "
               f"seq_len_interpolation_factor={seq_len_interpolation_factor} "
               f"(Megatron 7314fe221: dim computation moved into __init__)")
         # M1900: rotary_base diagnostic — confirms non-default base (e.g. 1000000 for Code Llama).
-        print(f"[M1900-RotaryEmbedding-INIT] rotary_base={rotary_base} "
+        
+        logging.debug(f"[M1900-RotaryEmbedding-INIT] rotary_base={rotary_base} "
               f"(Megatron d931ba8a4: expose rotary_base; Code Llama uses 1000000)")
 
     def forward(self, max_seq_len, offset=0):
@@ -140,7 +144,8 @@ class RotaryEmbedding(nn.Module):
         """
         if inference_params is not None:
             rotary_seq_len = inference_params.max_sequence_length
-            print(f"[M1850-get_rotary_seq_len] path=inference_params "
+            
+            logging.debug(f"[M1850-get_rotary_seq_len] path=inference_params "
                   f"rotary_seq_len={rotary_seq_len} "
                   f"(Megatron 7314fe221: seq-len from inference_params.max_sequence_length)")
         else:
@@ -154,7 +159,9 @@ class RotaryEmbedding(nn.Module):
             if transformer_config.sequence_parallel:
                 rotary_seq_len *= transformer_config.tensor_model_parallel_size
 
-            print(f"[M1850-get_rotary_seq_len] path={_path} "
+            
+
+            logging.debug(f"[M1850-get_rotary_seq_len] path={_path} "
                   f"rotary_seq_len={rotary_seq_len} "
                   f"sequence_parallel={transformer_config.sequence_parallel} "
                   f"(Megatron 7314fe221: seq-len from {_path})")
@@ -196,6 +203,6 @@ def apply_rotary_pos_emb(t, freqs):
     return torch.cat((t, t_pass), dim=-1)
 
 
-print('[M1333]')
-print('[M1850]')
-print('[M1900]')
+logging.debug('[M1333]')
+logging.debug('[M1850]')
+logging.debug('[M1900]')

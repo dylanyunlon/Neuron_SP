@@ -1,3 +1,4 @@
+import logging
 # BSD 3-Clause License
 #
 # Copyright (c) Soumith Chintala 2016, 
@@ -206,4 +207,4 @@ class Cityscapes(VisionDataset):
         return len(self.images)
 
 
-print('[M1172]')
+logging.debug('[M1172]')

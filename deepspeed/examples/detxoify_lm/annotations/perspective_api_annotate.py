@@ -1,3 +1,4 @@
+import logging
 import json
 import time
 from typing import Dict, Optional, List
@@ -181,4 +182,4 @@ if __name__ == '__main__':
     main()
 
 
-print('[M1278]')
+logging.debug('[M1278]')

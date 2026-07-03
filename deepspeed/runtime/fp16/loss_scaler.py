@@ -1,3 +1,4 @@
+import logging
 # Copyright (c) Microsoft Corporation.
 # SPDX-License-Identifier: Apache-2.0
 
@@ -187,7 +188,7 @@ class LossScalerBase(DeepSpeedConfigObject):
 
     def scale_gradient(self, module, grad_in, grad_out):
         # M158: Megatron 99410264a — multi_tensor_applier replaces scalar loop
-        print('[M158]')
+        logging.debug('[M158]')
         _overflow_buf = torch.cuda.IntTensor([0])
         _apply_multi_tensor_scale(_overflow_buf,
                                   [list(grad_in), list(grad_in)],

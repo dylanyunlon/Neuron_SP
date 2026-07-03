@@ -1,3 +1,4 @@
+import logging
 # Copyright (c) Microsoft Corporation.
 # SPDX-License-Identifier: Apache-2.0
 
@@ -27,10 +28,10 @@
 #
 # 20% adaptation: exposed as a standalone guard function rather than an
 # inline conditional; callable from merge_mp_partitions and engine init.
-# Adds print('[M512]') marker.
+# Adds  logging.debug('[M512]') marker.
 # ---------------------------------------------------------------------------
 
-print('[M512]')
+logging.debug('[M512]')
 
 
 def should_skip_word_embedding_init(args):
@@ -55,6 +56,7 @@ def should_skip_word_embedding_init(args):
     """
     pipeline_size = getattr(args, 'pipeline_model_parallel_size', 1)
     skip = (pipeline_size == 1)
-    print(f'[M512] should_skip_word_embedding_init: '
+    
+    logging.debug(f'[M512] should_skip_word_embedding_init: '
           f'pipeline_size={pipeline_size} skip={skip}')
     return skip

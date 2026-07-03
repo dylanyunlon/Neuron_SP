@@ -1,4 +1,5 @@
-print('[M127]')
+import logging
+logging.debug('[M127]')
 """
 Takes a corpora of files (specified by `--input_files`) with json data separated
 by newlines (loose json). Splits data into train.json, val.json, test.json files

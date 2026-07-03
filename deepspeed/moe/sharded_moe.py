@@ -1,3 +1,4 @@
+import logging
 # Copyright (c) Microsoft Corporation.
 # SPDX-License-Identifier: Apache-2.0
 
@@ -365,7 +366,7 @@ def top2gating(logits: Tensor,
         l_aux = torch.mean(me * ce) * num_experts * num_experts
     else:
         l_aux = torch.tensor(0.0, device=logits.device, dtype=logits.dtype)
-        print(f"[M2090-DIAG] top2gating: grad_enabled=False, l_aux zeroed")
+        logging.debug(f"[M2090-DIAG] top2gating: grad_enabled=False, l_aux zeroed")
     exp_counts = torch.sum(mask1 + mask2, dim=0).detach().to(logits.device)
 
     if drop_tokens:
@@ -457,10 +458,10 @@ def topkgating(
     ce = torch.mean(mask.float(), dim=0)
     if torch.is_grad_enabled():
         l_aux = torch.mean(me * ce) * num_experts * num_experts / k
-        print(f"[M2090-DIAG] topkgating(k={k}): grad_enabled=True, l_aux={l_aux.item():.6f}")
+        logging.debug(f"[M2090-DIAG] topkgating(k={k}): grad_enabled=True, l_aux={l_aux.item():.6f}")
     else:
         l_aux = torch.tensor(0.0, device=logits.device, dtype=logits.dtype)
-        print(f"[M2090-DIAG] topkgating(k={k}): grad_enabled=False, l_aux zeroed")
+        logging.debug(f"[M2090-DIAG] topkgating(k={k}): grad_enabled=False, l_aux zeroed")
     if drop_tokens:
         # Calculate configured capacity and remove locations outside capacity from mask
         capacity = _capacity(gates, torch.tensor(capacity_factor * k), torch.tensor(min_capacity))

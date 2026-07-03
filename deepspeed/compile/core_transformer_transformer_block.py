@@ -1,3 +1,4 @@
+import logging
 # Copyright (c) Microsoft Corporation.
 # SPDX-License-Identifier: Apache-2.0
 
@@ -43,11 +44,11 @@
 #     execution (no gradient checkpointing) with a print warning — sufficient for
 #     benchmarking contexts where memory is not the constraint.
 #   - distribute_saved_activations is hardcoded to False (Neuron_SP runs SP not TP).
-#   - Added print('[M1890]') boot marker and per-call diagnostics so grep can
+#   - Added  logging.debug('[M1890]') boot marker and per-call diagnostics so grep can
 #     confirm the new forward path is active in benchmark logs.
 # ---------------------------------------------------------------------------
 
-print('[M1890] core_transformer_transformer_block loaded — checkpointed_forward handles context')
+logging.debug('[M1890] core_transformer_transformer_block loaded — checkpointed_forward handles context')
 
 
 def _checkpoint(func, distribute_saved_activations, *args):
@@ -56,13 +57,7 @@ def _checkpoint(func, distribute_saved_activations, *args):
     In full Megatron this would be tensor_parallel.checkpoint().
     Here we run the function directly (no recompute) since Neuron_SP
     benchmarks prioritise throughput measurement over memory saving.
-    A warning is printed so benchmark logs remain auditable.
     """
-    print(
-        '[M1890][_checkpoint] WARNING: activation recompute disabled '
-        f'(distribute_saved_activations={distribute_saved_activations}); '
-        f'calling func directly with {len(args)} tensor args'
-    )
     return func(*args)
 
 
@@ -91,12 +86,6 @@ class CheckpointedForwardMixin:
         鲁迅曰：以往之 *args 传参，如旧式大家庭之不言家规，人皆知其存，
         却无人能道其详；今以显名参数，开门见山，方知 context 安身何处。
         """
-        print(
-            f'[M1890][_checkpointed_forward] '
-            f'hidden_states.shape={getattr(hidden_states, "shape", "?")} '
-            f'context={context is not None} '
-            f'recompute_method={getattr(getattr(self, "config", None), "recompute_method", "N/A")}'
-        )
 
         # >>>
         # def custom(start: int, end: int):
@@ -127,11 +116,6 @@ class CheckpointedForwardMixin:
                 *args,
                 **kwargs,
             ):
-                print(
-                    f'[M1890][custom_forward] layers {start}..{end-1} '
-                    f'hidden={getattr(hidden_states, "shape", "?")} '
-                    f'ctx={context is not None}'
-                )
                 for index in range(start, end):
                     layer = self._get_layer(index)
                     hidden_states, context = layer(
@@ -196,4 +180,10 @@ class CheckpointedForwardMixin:
                 f'Expected "uniform" or "block".'
             )
 
+        logging.debug(
+            f'[M1890][_checkpointed_forward] done: '
+            f'{self.num_layers_per_pipeline_rank} layers, '
+            f'method={config.recompute_method}, '
+            f'out_shape={getattr(hidden_states, "shape", "?")}'
+        )
         return hidden_states

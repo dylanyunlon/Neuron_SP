@@ -1,3 +1,4 @@
+import logging
 # SPDX-License-Identifier: Apache-2.0
 # DeepSpeed Team
 
@@ -57,7 +58,7 @@ import urllib.request  # Python-3 equivalent of Python-2 urllib2
 # M835: import generate_and_post_process (replaces legacy generate)
 from deepspeed.compile.inference_api import generate_and_post_process
 
-print('[M835]')
+logging.debug('[M835]')
 
 
 class PutRequest(urllib.request.Request):

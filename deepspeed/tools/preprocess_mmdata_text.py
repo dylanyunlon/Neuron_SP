@@ -1,3 +1,4 @@
+import logging
 # coding=utf-8
 # Copyright (c) 2020, NVIDIA CORPORATION.  All rights reserved.
 #
@@ -35,7 +36,7 @@ except ImportError:
 from megatron.tokenizer import build_tokenizer
 from megatron.data import indexed_dataset
 
-print('[M1392]')
+logging.debug('[M1392]')
 
 
 # https://stackoverflow.com/questions/33139531/preserve-empty-lines-with-nltks-punkt-tokenizer

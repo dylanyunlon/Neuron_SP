@@ -1,3 +1,4 @@
+import logging
 # Copyright (c) Microsoft Corporation.
 # SPDX-License-Identifier: Apache-2.0
 
@@ -36,7 +37,7 @@ class Backend(object):
         # DES-LOC: communication volume tracking (Algorithm 1 tier awareness)
         self.desloc_bytes_sent = 0   # cumulative bytes across all_reduce / reduce_scatter calls
         self.desloc_ops_count = 0    # cumulative collective operation count
-        print('[M176]')
+        logging.debug('[M176]')
 
     def is_initialized(self):
         return self.initialized

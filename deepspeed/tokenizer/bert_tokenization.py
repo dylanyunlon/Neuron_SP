@@ -1,3 +1,4 @@
+import logging
 # coding=utf-8
 # Copyright 2018 The Google AI Language Team Authors.
 #
@@ -26,7 +27,7 @@
 #  module under deepspeed/tokenizer/ mirroring the Megatron package structure)
 # ---------------------------------------------------------------------------
 
-print('[M76]')
+logging.debug('[M76]')
 
 """Tokenization classes."""
 

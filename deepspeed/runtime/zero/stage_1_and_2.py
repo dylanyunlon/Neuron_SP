@@ -1,3 +1,4 @@
+import logging
 # Copyright (c) Microsoft Corporation.
 # SPDX-License-Identifier: Apache-2.0
 
@@ -672,7 +673,8 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         # save_parameter_state / load_parameter_state.  We create it lazily
         # the first time it is needed to avoid blocking all runs.
         self._desloc_dp_group_gloo = None
-        print(f"[M1461][DESLOC] __init__: local_param_group_map built, "
+        
+        logging.debug(f"[M1461][DESLOC] __init__: local_param_group_map built, "
               f"{len(self._desloc_local_param_group_map)} params tracked across "
               f"{len(self.optimizer.param_groups)} groups")
 
@@ -695,7 +697,8 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
             torch_dist.all_gather(all_global_ranks, rank_tensor, group=self.dp_process_group)
             dp_global_ranks = [int(r.item()) for r in all_global_ranks]
             self._desloc_dp_group_gloo = torch_dist.new_group(dp_global_ranks, backend="gloo")
-            print(f"[M1461][DESLOC] _get_desloc_dp_group_gloo: created gloo group for "
+            
+            logging.debug(f"[M1461][DESLOC] _get_desloc_dp_group_gloo: created gloo group for "
                   f"DP ranks {dp_global_ranks} (dp_rank={dp_rank})")
         return self._desloc_dp_group_gloo
 
@@ -2866,7 +2869,9 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         # Determine global rank of dp_rank=0 for gather destination
         global_rank_of_dp0 = torch_dist.get_rank() - dp_rank  # approximation; works when DP is contiguous
 
-        print(f"[M1461][DESLOC] save_parameter_state: dp_rank={dp_rank}/{dp_world_size}, "
+        
+
+        logging.debug(f"[M1461][DESLOC] save_parameter_state: dp_rank={dp_rank}/{dp_world_size}, "
               f"filename={filename}")
 
         state = {}
@@ -2896,7 +2901,8 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                 torch_dist.gather(send_tensor, recv_list, dst=0, group=dp_group_gloo)
                 if dp_rank == 0:
                     world_shards[key] = torch.cat(recv_list)
-                    print(f"[M1461][DESLOC] save_parameter_state: group={group_idx} key={key} "
+                    
+                    logging.debug(f"[M1461][DESLOC] save_parameter_state: group={group_idx} key={key} "
                           f"world_numel={world_shards[key].numel()}")
 
             if dp_rank == 0:
@@ -2909,7 +2915,8 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                 'desloc_checkpoint_version': 'M1461',
             }
             torch.save({'param_state': state, 'meta': meta}, filename)
-            print(f"[M1461][DESLOC] save_parameter_state: saved world state to {filename} "
+            
+            logging.debug(f"[M1461][DESLOC] save_parameter_state: saved world state to {filename} "
                   f"(dp_world_size={dp_world_size}, groups={len(state)})")
 
     def load_parameter_state(self, filename):
@@ -2930,7 +2937,9 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         dp_rank = dist.get_rank(group=self.dp_process_group)
         dp_group_gloo = self._get_desloc_dp_group_gloo()
 
-        print(f"[M1461][DESLOC] load_parameter_state: dp_rank={dp_rank}/{dp_world_size}, "
+        
+
+        logging.debug(f"[M1461][DESLOC] load_parameter_state: dp_rank={dp_rank}/{dp_world_size}, "
               f"filename={filename}")
 
         # DP rank 0 loads the world state
@@ -2939,10 +2948,12 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
             world_state = saved.get('param_state', saved)  # backward-compat
             meta = saved.get('meta', {})
             saved_dp_size = meta.get('desloc_dp_world_size', None)
-            print(f"[M1461][DESLOC] load_parameter_state: loaded {filename}, "
+            
+            logging.debug(f"[M1461][DESLOC] load_parameter_state: loaded {filename}, "
                   f"saved_dp_size={saved_dp_size}, current_dp_size={dp_world_size}")
             if saved_dp_size is not None and saved_dp_size != dp_world_size:
-                print(f"[M1461][DESLOC] WARNING: DP world size changed "
+                
+                logging.debug(f"[M1461][DESLOC] WARNING: DP world size changed "
                       f"{saved_dp_size}→{dp_world_size}; scatter will reshape shards")
         else:
             world_state = None
@@ -2981,7 +2992,8 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                     shard_numel = world_numel // dp_world_size
                     send_list = [world_tensor[i * shard_numel:(i + 1) * shard_numel]
                                  .contiguous() for i in range(dp_world_size)]
-                    print(f"[M1461][DESLOC] load_parameter_state: group={group_idx} key={key} "
+                    
+                    logging.debug(f"[M1461][DESLOC] load_parameter_state: group={group_idx} key={key} "
                           f"world_numel={world_numel} shard_numel={shard_numel}")
                 else:
                     send_list = None
@@ -3004,7 +3016,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                         self.optimizer.state.setdefault(fp32_partition, {})[key] = \
                             recv_tensor[:local_numel].to(fp32_partition.device)
 
-        print(f"[M1461][DESLOC] load_parameter_state: completed scatter for dp_rank={dp_rank}")
+        logging.debug(f"[M1461][DESLOC] load_parameter_state: completed scatter for dp_rank={dp_rank}")
 
     def state_dict(self):
         # DES-LOC M153: tracked
@@ -3059,7 +3071,8 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         # M1461: tag this checkpoint so load_state_dict can distinguish new vs old format
         state_dict['_desloc_dp_independent'] = True
         dp_rank = dist.get_rank(group=self.dp_process_group)
-        print(f"[M1461][DESLOC] state_dict: dp_rank={dp_rank}, "
+        
+        logging.debug(f"[M1461][DESLOC] state_dict: dp_rank={dp_rank}, "
               f"elastic={self.elastic_checkpoint}, "
               f"param tensors deferred to save_parameter_state()")
 
@@ -3208,7 +3221,8 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
 
             is_dp_independent = first_sd is not None and first_sd.get('_desloc_dp_independent', False)
             dp_rank = dist.get_rank(group=self.dp_process_group)
-            print(f"[M1461][DESLOC] load_state_dict: dp_rank={dp_rank}, "
+            
+            logging.debug(f"[M1461][DESLOC] load_state_dict: dp_rank={dp_rank}, "
                   f"dp_independent_fmt={is_dp_independent}, "
                   f"load_optimizer_states={load_optimizer_states}")
 

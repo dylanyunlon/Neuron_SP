@@ -1,3 +1,4 @@
+import logging
 # coding=utf-8
 # Copyright (c) 2020, NVIDIA CORPORATION.  All rights reserved.
 #
@@ -17,7 +18,7 @@
 # Megatron commit d6c4248b7b22c68f0a3d475b1c6dbf0e7bc7225b
 # M358: added splitting checkpointed activations
 
-print('[M358]')
+logging.debug('[M358]')
 
 import torch
 

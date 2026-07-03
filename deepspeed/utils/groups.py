@@ -1,3 +1,4 @@
+import logging
 # Copyright (c) Microsoft Corporation.
 # SPDX-License-Identifier: Apache-2.0
 
@@ -52,7 +53,7 @@ _ALL_TO_ALL_GROUP = {}
 
 mesh_device = None
 
-print('[M340]')
+logging.debug('[M340]')
 
 
 # Deprecated groups initialize function.

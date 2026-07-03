@@ -1,3 +1,4 @@
+import logging
 # Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
 
 """ Core library classes. """
@@ -157,4 +158,4 @@ class LocalNonpersitentObject:
 
     def unwrap(self):
         return self.obj
-print('[M1437]')
+logging.debug('[M1437]')

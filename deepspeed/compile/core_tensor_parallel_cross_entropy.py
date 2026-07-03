@@ -1,3 +1,4 @@
+import logging
 # Copyright (c) Microsoft Corporation.
 # SPDX-License-Identifier: Apache-2.0
 
@@ -40,12 +41,12 @@
 #   5. prepare_gradient_calculation_operands signature: trailing comma added to params.
 #
 # 20% adaptation: imports from deepspeed.compile.core_parallel_state and
-# deepspeed.compile.core_tensor_parallel_utils (our mappings); adds print('[M1233]')
-# and print('[M1990]') diagnostics.
+# deepspeed.compile.core_tensor_parallel_utils (our mappings); adds  logging.debug('[M1233]')
+# and  logging.debug('[M1990]') diagnostics.
 # ---------------------------------------------------------------------------
 
-print('[M1233]')
-print('[M1990] core_tensor_parallel_cross_entropy: jit.script-compatible vocab-range refactor loaded')
+logging.debug('[M1233]')
+logging.debug('[M1990] core_tensor_parallel_cross_entropy: jit.script-compatible vocab-range refactor loaded')
 
 from typing import Tuple
 
@@ -184,7 +185,7 @@ class _VocabParallelCrossEntropy(torch.autograd.Function):
         rank = get_tensor_model_parallel_rank()
         world_size = get_tensor_model_parallel_world_size()
         vocab_start_index, vocab_end_index = get_vocab_range(partition_vocab_size, rank, world_size)
-        print(f'[M1990] _VocabParallelCrossEntropy.forward vocab_start={vocab_start_index} vocab_end={vocab_end_index}')
+        logging.debug(f'[M1990] _VocabParallelCrossEntropy.forward vocab_start={vocab_start_index} vocab_end={vocab_end_index}')
 
         (
             target_mask,

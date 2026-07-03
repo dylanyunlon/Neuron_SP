@@ -1,3 +1,4 @@
+import logging
 # Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
 
 """ Strategies using Zarr as an underlying format. """
@@ -198,4 +199,4 @@ def pad_to_expected_shape(x: torch.Tensor, expected_sharded_ten: ShardedTensor):
 
 # default_strategies[StrategyAction.LOAD_SHARDED.value][('zarr', 1)] = ZarrLoadShardedStrategy()
 default_strategies[StrategyAction.SAVE_SHARDED.value][('zarr', 1)] = ZarrSaveShardedStrategy('zarr', 1)
-print('[M1437]')
+logging.debug('[M1437]')

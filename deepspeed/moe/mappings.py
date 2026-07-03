@@ -1,3 +1,4 @@
+import logging
 # Copyright (c) Microsoft Corporation.
 # SPDX-License-Identifier: Apache-2.0
 
@@ -33,7 +34,7 @@ def _gather_tokens(input_, dim=0):
     # Original Megatron bug: all_gather called with undefined `group` variable;
     # fix replaced it with get_model_parallel_group().  DeepSpeed equivalent
     # already uses bwc_tensor_model_parallel_group(mpu) — confirmed correct.
-    print('[M374]')
+    logging.debug('[M374]')
     mpu = deepspeed.utils.groups.mpu
 
     input_ = input_.contiguous()

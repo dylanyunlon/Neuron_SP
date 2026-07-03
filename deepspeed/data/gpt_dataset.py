@@ -86,7 +86,7 @@ def build_train_valid_test_datasets(data_prefix, data_impl,
         print_rank_0("Separate data paths provided for train, valid & test. Split string will be ignored.")
 
         train_dataset, valid_dataset, test_dataset = None, None, None
-        print('[M1266]')
+        logging.debug('[M1266]')
         # Single dataset.
         if train_data_prefix is not None:
             train_dataset = build_dataset("train", train_data_prefix, data_impl,

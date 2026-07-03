@@ -1,3 +1,4 @@
+import logging
 # coding=utf-8
 # Copyright (c) 2020, NVIDIA CORPORATION.  All rights reserved.
 
@@ -195,7 +196,7 @@ def main():
 
 
 
-print("[M1278]")
+logging.debug("[M1278]")
 if __name__ == "__main__":
 
     main()

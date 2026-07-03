@@ -1,3 +1,4 @@
+import logging
 # Copyright (c) Microsoft Corporation.
 # SPDX-License-Identifier: Apache-2.0
 
@@ -23,7 +24,7 @@
 #     helpers with safe fallbacks.
 #   • mpu.* resolved via deepspeed.compile.mpu_initialize.
 #   • p2p_communication imports resolve to megatron_p2p_communication.
-#   • Adds print('[M556]') marker.
+#   • Adds  logging.debug('[M556]') marker.
 # ---------------------------------------------------------------------------
 # M735: Megatron e727de99d — Use timers kwargs correctly to prevent bug with
 #         new p2p_communication API
@@ -93,12 +94,12 @@
 # callers that don't yet pass a PipelineConfig; print diagnostic on call.
 # ---------------------------------------------------------------------------
 
-print('[M556]')
-print('[M735]')
-print('[M971]')
-print('[M972]')
-print('[M1003]')
-print('[M1860]')
+logging.debug('[M556]')
+logging.debug('[M735]')
+logging.debug('[M971]')
+logging.debug('[M972]')
+logging.debug('[M1003]')
+logging.debug('[M1860]')
 
 import torch
 
@@ -113,7 +114,7 @@ def deallocate_output_tensor(out):
     M971: Megatron c1e4526bb — renamed from free_output_tensor.
     New simpler signature: single tensor (not list), no flag argument.
     '''
-    print('[M971]')
+    logging.debug('[M971]')
     assert isinstance(out, torch.Tensor), \
         "expected Tensor, found %s." % type(out).__name__
     assert out._base is None, \
@@ -256,7 +257,7 @@ def forward_backward_no_pipelining(forward_step_func, data_iterator, model,
 
     # M1860: Only finalize grads when config.finalize_model_grads_func is set.
     if config is not None and config.finalize_model_grads_func is not None and not forward_only:
-        print('[M1860] forward_backward_no_pipelining: calling finalize_model_grads_func')
+        logging.debug('[M1860] forward_backward_no_pipelining: calling finalize_model_grads_func')
         config.finalize_model_grads_func([model])
 
     return losses_reduced
@@ -433,7 +434,7 @@ def forward_backward_pipelining_with_interleaving(
 
     # M1860: Only finalize grads when config.finalize_model_grads_func is set.
     if config is not None and config.finalize_model_grads_func is not None and not forward_only:
-        print('[M1860] forward_backward_pipelining_with_interleaving: calling finalize_model_grads_func')
+        logging.debug('[M1860] forward_backward_pipelining_with_interleaving: calling finalize_model_grads_func')
         config.finalize_model_grads_func(model)
 
     return losses_reduced
@@ -510,7 +511,7 @@ def forward_backward_pipelining(forward_step_func, data_iterator, model,
 
     # M1860: Only finalize grads when config.finalize_model_grads_func is set.
     if config is not None and config.finalize_model_grads_func is not None and not forward_only:
-        print('[M1860] forward_backward_pipelining: calling finalize_model_grads_func')
+        logging.debug('[M1860] forward_backward_pipelining: calling finalize_model_grads_func')
         config.finalize_model_grads_func([model])
 
     return losses_reduced

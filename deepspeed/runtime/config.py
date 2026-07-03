@@ -1,3 +1,4 @@
+import logging
 # Copyright (c) Microsoft Corporation.
 # SPDX-License-Identifier: Apache-2.0
 
@@ -1027,7 +1028,7 @@ class DeepSpeedConfig(object):
         # (arguments.py → deepspeed/runtime/config.py)
         # VOCABULARY_SIZE_DEFAULT is already None in constants.py; the guard below
         # is a no-op when None, which is correct: None means "infer from tokenizer".
-        print('[M54]')
+        logging.debug('[M54]')
         vocabulary_size = self._param_dict.get(VOCABULARY_SIZE, VOCABULARY_SIZE_DEFAULT)
         if vocabulary_size and vocabulary_size % TENSOR_CORE_ALIGN_SIZE != 0:
             logger.warning(

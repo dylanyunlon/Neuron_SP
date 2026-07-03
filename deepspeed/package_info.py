@@ -1,3 +1,4 @@
+import logging
 # SPDX-License-Identifier: Apache-2.0
 # DeepSpeed Team
 
@@ -16,4 +17,4 @@ __description__ = 'Megatron-LM: Training Multi-Billion Parameter Language Models
 __license__ = 'See https://github.com/NVIDIA/Megatron-LM/blob/master/LICENSE'
 __keywords__ = 'deep learning, Megatron, gpu, NLP, nvidia, pytorch, torch, language'
 
-print('[M357]')
+logging.debug('[M357]')

@@ -1,3 +1,4 @@
+import logging
 # Copyright (c) Microsoft Corporation.
 # SPDX-License-Identifier: Apache-2.0
 
@@ -78,9 +79,9 @@
 # 20% adaptation: logic placed at end of ddp_init() after dist is confirmed
 # initialised; import torch kept local to match surrounding style.
 # ---------------------------------------------------------------------------
-print('[M519]')
-print('[M373]')
-print('[M345]')
+logging.debug('[M519]')
+logging.debug('[M373]')
+logging.debug('[M345]')
 # M556: Megatron dd8890626 — Interleaved pipeline execution and code refactoring
 # Source: megatron/initialize.py (NVIDIA/Megatron-LM commit dd8890626)
 # Author: Deepak Narayanan <dnarayanan@nvidia.com>  Date: 2020-12-12
@@ -95,8 +96,8 @@ print('[M345]')
 #      from mpu_initialize when set.
 #
 # 20% adaptation: uses deepspeed.comm / mpu_initialize; lazy_mpu_init path
-# left unchanged; adds print('[M556]').
-print('[M556]')
+# left unchanged; adds  logging.debug('[M556]').
+logging.debug('[M556]')
 
 import deepspeed.comm as dist
 from deepspeed.compile.mpu_initialize import (
@@ -192,7 +193,8 @@ def initialize_megatron(extra_args_provider=None,
                 from deepspeed.compile.mpu_initialize import (
                     init_virtual_pipeline_model_parallel)
                 init_virtual_pipeline_model_parallel(virtual_pipeline_size)
-                print(f'[M556] ddp_init: virtual_pipeline_model_parallel_size='
+                
+                logging.debug(f'[M556] ddp_init: virtual_pipeline_model_parallel_size='
                       f'{virtual_pipeline_size}')
 
         # M519: call makefile every run so we recompile if the code has changed.
@@ -202,12 +204,15 @@ def initialize_megatron(extra_args_provider=None,
             compile_helper()
         # Simple barrier
         torch.distributed.barrier()
-        print('[M519]')
+        logging.debug('[M519]')
 
-        print('[M373] ddp_init: model parallel init guard applied, '
+        
+
+        logging.debug('[M373] ddp_init: model parallel init guard applied, '
               f'world_size={get_model_parallel_world_size()}, '
               f'rank={get_model_parallel_rank()}')
-        print('[M345] ddp_init: distributed initialised, '
+        
+        logging.debug('[M345] ddp_init: distributed initialised, '
               f'world_size={get_model_parallel_world_size()}, '
               f'rank={get_model_parallel_rank()}')
 
@@ -256,10 +261,10 @@ def initialize_megatron(extra_args_provider=None,
 #   - dist.get_rank() used in place of torch.distributed.get_rank().
 #   - torch.distributed.barrier() preserved for fused-kernel sync (upstream uses it).
 #   - get_args() sourced from deepspeed.compile.megatron_arguments.
-#   - Adds print('[M610]') marker.
+#   - Adds  logging.debug('[M610]') marker.
 # ---------------------------------------------------------------------------
 
-print('[M610]')
+logging.debug('[M610]')
 
 import time
 import torch
@@ -287,7 +292,7 @@ def _compile_dependencies():
         args = None
 
     if args is None:
-        print('[M610] _compile_dependencies: args not available, skipping.')
+        logging.debug('[M610] _compile_dependencies: args not available, skipping.')
         return
 
     # =========================
@@ -332,7 +337,7 @@ def _compile_dependencies():
                   ' back to unfused kernel invocations.', flush=True)
 
     if _fused_kernels is None:
-        print('[M610] _compile_dependencies: fused_kernels not available, skipping kernel load.')
+        logging.debug('[M610] _compile_dependencies: fused_kernels not available, skipping kernel load.')
         return
 
     # Always build on rank zero first.
@@ -354,7 +359,7 @@ def _compile_dependencies():
               'Compilation time: {:.3f} seconds'.format(
                   time.time() - start_time), flush=True)
 
-    print('[M610] _compile_dependencies: done.')
+    logging.debug('[M610] _compile_dependencies: done.')
 
 
 # ---------------------------------------------------------------------------
@@ -376,10 +381,10 @@ def _compile_dependencies():
 #
 # 20% adaptation: calls core_initialize_model_parallel() (our mapping of
 # core.initialize_model_parallel) from deepspeed.compile.core_parallel_state;
-# prints use the same format as upstream; adds print('[M1233]') marker.
+# prints use the same format as upstream; adds  logging.debug('[M1233]') marker.
 # ---------------------------------------------------------------------------
 
-print('[M1233]')
+logging.debug('[M1233]')
 
 
 def core_initialize_model_parallel(tensor_model_parallel_size,
@@ -407,7 +412,7 @@ def core_initialize_model_parallel(tensor_model_parallel_size,
           f'{get_tensor_model_parallel_world_size()}')
     print(f'> initialized pipeline model parallel with size '
           f'{get_pipeline_model_parallel_world_size()}')
-    print('[M1233] core_initialize_model_parallel: done.')
+    logging.debug('[M1233] core_initialize_model_parallel: done.')
 
 # ---------------------------------------------------------------------------
 # M2030: Megatron f76b465e0 — Add TP communication bootstrap backend interface
@@ -433,8 +438,8 @@ def core_initialize_model_parallel(tensor_model_parallel_size,
 #             但至少警告用者：此路仅此一条，莫强求。」
 #   - initialize_tp_communicators_m2030() 函数封装新逻辑，
 #     与既有 M1233 风格一致。
-#   - print('[M2030]') diagnostic added at module level.
-#   - print('[M2030-TP-INIT] ...') diagnostic added inside the function.
+#   -  logging.debug('[M2030]') diagnostic added at module level.
+#   -  logging.debug('[M2030-TP-INIT] ...') diagnostic added inside the function.
 # ---------------------------------------------------------------------------
 
 
@@ -463,12 +468,14 @@ def initialize_tp_communicators_m2030(te_module, args, ub_cfgs):
     ]
     backend = getattr(args, 'tp_comm_bootstrap_backend', 'nccl')
 
-    print(f'[M2030-TP-INIT] initialize_tp_communicators: backend={backend} '
+    
+
+    logging.debug(f'[M2030-TP-INIT] initialize_tp_communicators: backend={backend} '
           f'input_shape={input_shape} tp_size={args.tensor_model_parallel_size}')
 
     if _have_te_version_utils and is_te_min_version("1.9.0"):
         # TE >= 1.9.0: process group is created inside TE; pass backend kwarg.
-        print(f'[M2030-TP-INIT] TE >= 1.9.0 path: passing bootstrap_backend={backend} to initialize_ub')
+        logging.debug(f'[M2030-TP-INIT] TE >= 1.9.0 path: passing bootstrap_backend={backend} to initialize_ub')
         te_module.base.initialize_ub(
             shape=input_shape,
             tp_size=args.tensor_model_parallel_size,
@@ -485,7 +492,7 @@ def initialize_tp_communicators_m2030(te_module, args, ub_cfgs):
                 f'[M2030] Transformer Engine v{te_ver} supports only MPI bootstrap backend. '
                 f'Requested backend={backend!r} ignored; falling back to mpi.'
             )
-        print(f'[M2030-TP-INIT] TE < 1.9.0 path: creating MPI process group, bootstrap_backend forced to mpi')
+        logging.debug(f'[M2030-TP-INIT] TE < 1.9.0 path: creating MPI process group, bootstrap_backend forced to mpi')
         # Create a MPI process group to help with TP communication overlap bootstrap.
         import torch
         torch.distributed.new_group(backend='mpi')
@@ -496,7 +503,7 @@ def initialize_tp_communicators_m2030(te_module, args, ub_cfgs):
             ub_cfgs=ub_cfgs,
         )
 
-    print(f'[M2030-TP-INIT] initialize_tp_communicators done.')
+    logging.debug(f'[M2030-TP-INIT] initialize_tp_communicators done.')
 
 
-print('[M2030]')
+logging.debug('[M2030]')

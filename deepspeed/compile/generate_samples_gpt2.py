@@ -1,3 +1,4 @@
+import logging
 # SPDX-License-Identifier: Apache-2.0
 # DeepSpeed Team
 
@@ -34,7 +35,7 @@
 #   model classes are ported.
 # ===========================================================================
 
-print('[M447]')
+logging.debug('[M447]')
 
 
 def select_pipeline_stage_model(mpu, model_classes, num_tokentypes=0):

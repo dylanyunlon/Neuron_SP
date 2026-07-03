@@ -1,3 +1,4 @@
+import logging
 # Copyright (c) Microsoft Corporation.
 # SPDX-License-Identifier: Apache-2.0
 
@@ -91,7 +92,7 @@ class DeepSpeedSelfAttention(nn.Module):
         # M837: Megatron b10ca2115 — ParallelAttention inference cache init: add key_memory, drop current_sequence_len
         self.inference_key_memory = None
         self.inference_value_memory = None
-        print('[M837]')
+        logging.debug('[M837]')
 
     def compute_attention(self, qkv_out, input_mask, layer_past, alibi, is_prompt, token_idx, position_ids):
         if isinstance(qkv_out, list) or isinstance(qkv_out, tuple):

@@ -1,3 +1,4 @@
+import logging
 # Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
 
 """ Utilities for operating with dicts and lists. """
@@ -192,4 +193,4 @@ def map_reduce(xs: Iterable, key_fn: Callable = lambda x: x,
     for k in res:
         res[k] = reduce_fn(res[k])
     return dict(res)
-print('[M1437]')
+logging.debug('[M1437]')

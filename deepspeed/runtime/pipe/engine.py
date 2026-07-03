@@ -1,3 +1,4 @@
+import logging
 # Copyright (c) Microsoft Corporation.
 # SPDX-License-Identifier: Apache-2.0
 
@@ -1692,7 +1693,7 @@ def m592_forward_backward_pipelining_without_interleaving(
     """Non-interleaved 1F1B schedule with pipeline-stall measurement guarded
     by measure_pipeline_stall so we never deadlock when the number of
     microbatches is smaller than the pipeline-parallel world size."""
-    print('[M592]')
+    logging.debug('[M592]')
     import torch
     from megatron import get_num_microbatches, get_timers, mpu, p2p_communication
     timers = get_timers()
@@ -1774,7 +1775,7 @@ def m592_forward_backward_pipelining_without_interleaving(
 
     # M1860: Only finalize grads when config.finalize_model_grads_func is set.
     if config is not None and config.finalize_model_grads_func is not None and not forward_only:
-        print('[M1860] m592_forward_backward_pipelining_without_interleaving: calling finalize_model_grads_func')
+        logging.debug('[M1860] m592_forward_backward_pipelining_without_interleaving: calling finalize_model_grads_func')
         config.finalize_model_grads_func([model])
 
     return losses_reduced

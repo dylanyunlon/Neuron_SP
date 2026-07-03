@@ -1,3 +1,4 @@
+import logging
 # Copyright (c) Microsoft Corporation.
 # SPDX-License-Identifier: Apache-2.0
 
@@ -173,7 +174,7 @@ def get_available_dataset_impl():
 
 
 def infer_dataset_impl(path):
-    print('[M120]')
+    logging.debug('[M120]')
     if IndexedDataset.exists(path):
         with open(index_file_path(path), 'rb') as f:
             magic = f.read(8)
@@ -423,7 +424,7 @@ class IndexedDatasetBuilder(object):
         self.doc_idx.append(len(self.sizes))
 
     def merge_file_(self, another_file):
-        print('[M1171]')
+        logging.debug('[M1171]')
         index = IndexedDataset(another_file)
         assert index.dtype == self.dtype
 
@@ -752,7 +753,7 @@ class MMapIndexedDatasetBuilder(object):
         self._sizes.append(np_array.size)
 
     def add_batched_item(self, np_array):
-        print('[M1392]')
+        logging.debug('[M1392]')
         self._data_file.write(np_array.tobytes(order='C'))
         cur_doc_sizes = len(self._sizes)
         self._doc_idx.extend([i for i in range(cur_doc_sizes + 1,
@@ -766,7 +767,7 @@ class MMapIndexedDatasetBuilder(object):
         self._doc_idx.append(np.int64(len(self._sizes)))
 
     def merge_file_(self, another_file):
-        print('[M1171]')
+        logging.debug('[M1171]')
         # Concatenate index
         index = MMapIndexedDataset.Index(index_file_path(another_file))
         assert index.dtype == self._dtype
@@ -801,7 +802,7 @@ class MMapIndexedDatasetBuilder(object):
         # only rank-0 consolidates shards while others free their state.
         self._sizes = []
         self._doc_idx = [0]
-        print('[M202]')
+        logging.debug('[M202]')
 
     def create_block_data_index(self, block_data):
         """M227: Megatron 3f122ce98 — Write MIPS tests in HashedIndex.
@@ -814,7 +815,7 @@ class MMapIndexedDatasetBuilder(object):
         index = faiss.IndexFlatL2(block_embeds.shape[1])
         index.add(block_embeds)
         print('Total blocks in index: ', index.ntotal)
-        print('[M227]')
+        logging.debug('[M227]')
         return index
 
     def exact_mips_equals(self, block_data, hash_matrix, query_embeds):
@@ -867,4 +868,4 @@ class MMapIndexedDatasetBuilder(object):
 
         equal_arr = self.exact_mips_equals(block_data, hash_matrix, query_embeds)
         print("Num correct: ", sum(equal_arr), " Fraction correct: ", sum(equal_arr) / equal_arr.size)
-        print('[M227]')
+        logging.debug('[M227]')

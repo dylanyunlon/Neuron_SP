@@ -1,3 +1,4 @@
+import logging
 # Copyright (c) Microsoft Corporation.
 # SPDX-License-Identifier: Apache-2.0
 
@@ -20,7 +21,7 @@
 #   3. __post_init__: add validation block — if recompute_granularity is not None,
 #      raise ValueError unless value is 'full' or 'selective'.
 #
-# 10% adaptation: imports unchanged; adds print('[M1302]') marker in __post_init__.
+# 10% adaptation: imports unchanged; adds  logging.debug('[M1302]') marker in __post_init__.
 # ---------------------------------------------------------------------------
 # M1420: Megatron 397d0b2eb — Split TransformerConfig into BaseConfig and
 #        TransformerConfig, use BaseConfig for model parallel functions.
@@ -47,7 +48,7 @@
 #      backward compat with Neuron_SP code that still reads it directly.
 #
 # 10% adaptation: BaseConfig imported from local core_base_config module;
-# adds print('[M1420]') marker.
+# adds  logging.debug('[M1420]') marker.
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
@@ -82,7 +83,7 @@
 #            本项目另辟蹊径，bias_activation_fusion + not gelu 为凭，殊途同归。」
 #   - 校验逻辑改用本地 SwiGLU 判据，无需引入 gated_linear_unit 字段。
 #   - print 诊断在 __post_init__ 中输出 fp8_input_store 值，实验可见。
-# Adds print('[M1544]') diagnostic marker.
+# Adds  logging.debug('[M1544]') diagnostic marker.
 # ---------------------------------------------------------------------------
 # M1910: Megatron 80de44fda — Add RoPE and SwiGLU fusion
 # Source: megatron/core/transformer/transformer_config.py (NVIDIA/Megatron-LM commit 80de44fda)
@@ -99,12 +100,12 @@
 #   鲁迅曰: "TODO 存活多年，终成历史文物；改名一刻，万古长存。"
 #   - bias_gelu_fusion 字段彻底消除，bias_activation_fusion 取而代之。
 #   - __post_init__ 中的 bias_gelu_fusion 校验改为 bias_activation_fusion。
-#   - print('[M1910]') 诊断标记。
+#   -  logging.debug('[M1910]') 诊断标记。
 # ---------------------------------------------------------------------------
-print('[M1302]')
-print('[M1420]')
-print('[M1544]')
-print('[M1910] core_transformer_transformer_config: bias_activation_fusion field active')
+logging.debug('[M1302]')
+logging.debug('[M1420]')
+logging.debug('[M1544]')
+logging.debug('[M1910] core_transformer_transformer_config: bias_activation_fusion field active')
 # ---------------------------------------------------------------------------
 # M1940: Megatron 1a3e1c522 — Add transpose cache feature
 # Source: megatron/core/transformer/transformer_config.py
@@ -115,9 +116,9 @@ print('[M1910] core_transformer_transformer_config: bias_activation_fusion field
 #
 # 20% adaptation (鲁迅式迁移):
 #   鲁迅曰：「转置之缓存，犹如旧俗——废之则纯净，留之则高效。」
-#   - print('[M1940]') diagnostic marker.
+#   -  logging.debug('[M1940]') diagnostic marker.
 # ---------------------------------------------------------------------------
-print('[M1940] core_transformer_transformer_config: disable_parameter_transpose_cache field active')
+logging.debug('[M1940] core_transformer_transformer_config: disable_parameter_transpose_cache field active')
 
 from dataclasses import dataclass
 from typing import Callable
@@ -299,7 +300,7 @@ class TransformerConfig(BaseConfig):
                     "When bias_activation_fusion is True and activation function is gelu, "
                     "add_bias_linear must also be True."
                 )
-        print('[M1910] __post_init__: bias_activation_fusion validated')
+        logging.debug('[M1910] __post_init__: bias_activation_fusion validated')
 
         # M1970: fp8 activation input store — only valid for SwiGLU path
         # 鲁迅曰：「fp8 压缩只护 SwiGLU 一族；gelu 若来，概不接待。」
@@ -314,5 +315,6 @@ class TransformerConfig(BaseConfig):
                     "activation_func_fp8_input_store=True is only supported for the SwiGLU "
                     "path (bias_activation_fusion=True and activation_func != gelu)."
                 )
-        print(f'[M1970] __post_init__: activation_func_fp8_input_store='
+        
+        logging.debug(f'[M1970] __post_init__: activation_func_fp8_input_store='
               f'{self.activation_func_fp8_input_store}')

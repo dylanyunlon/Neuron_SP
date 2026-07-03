@@ -1,3 +1,4 @@
+import logging
 # Copyright (c) Microsoft Corporation.
 # SPDX-License-Identifier: Apache-2.0
 
@@ -914,7 +915,7 @@ class AnnealingLR(object):
     """
 
     DECAY_STYLES = ('linear', 'cosine', 'exponential', 'constant')
-    print('[M434]')
+    logging.debug('[M434]')
 
     def __init__(self,
                  optimizer,
@@ -955,7 +956,7 @@ class AnnealingLR(object):
         # Initialise step counter then snap LR to the formula (Megatron pattern).
         self.step(step_num=self.num_steps)
 
-        print('[M431]')
+        logging.debug('[M431]')
         print(
             f'[AnnealingLR] init: decay_style={self.decay_style} '
             f'max_lr={max_lr} warmup_steps={warmup_steps} decay_steps={decay_steps} '
@@ -999,7 +1000,7 @@ class AnnealingLR(object):
             coeff = 0.5 * (math.cos(math.pi * decay_ratio) + 1)
         elif self.decay_style == 'exponential':
             # exp(-0.693) ≈ 1/2 — halves every decay_steps steps
-            print('[M49]')
+            logging.debug('[M49]')
             coeff = math.exp(-0.693 * decay_ratio)
         else:
             coeff = 1.0
@@ -1463,7 +1464,7 @@ def _m642_annealing_lr_check_and_set_error_msg(name: str, cls_value, sd_value) -
         f'AnnealingLR: class input value {cls_value!r} and checkpoint '
         f'value {sd_value!r} for {name} do not match'
     )
-    print(f'[M642] lr_check_and_set mismatch detected — {msg}')
+    logging.debug(f'[M642] lr_check_and_set mismatch detected — {msg}')
     return msg
 
 

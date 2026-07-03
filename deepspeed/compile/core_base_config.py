@@ -1,3 +1,4 @@
+import logging
 # Copyright (c) Microsoft Corporation.
 # SPDX-License-Identifier: Apache-2.0
 
@@ -43,10 +44,10 @@
 # Note: upstream typo `__post__init__` (double underscore) retained as-is.
 #
 # 10% adaptation: import path unchanged (torch/dataclasses/Callable are
-# stdlib); adds print('[M1420]') marker.
+# stdlib); adds  logging.debug('[M1420]') marker.
 # ---------------------------------------------------------------------------
 
-print('[M1420]')
+logging.debug('[M1420]')
 
 # ---------------------------------------------------------------------------
 # M1506: Megatron 4ef31451d — Fixes/cleanup from overlap p2p merge
@@ -70,7 +71,7 @@ print('[M1420]')
 # __post__init__ with ValueError; print diagnostic added.
 # ---------------------------------------------------------------------------
 
-print('[M1506]')\n# ---------------------------------------------------------------------------\n# M1870: Megatron 7a70c5401 — GPT model level change for context parallelism\n# Source: megatron/core/model_parallel_config.py\n#\n# Mapping: megatron/core/model_parallel_config.py ModelParallelConfig\n#        → deepspeed/compile/core_base_config.py BaseConfig\n#\n# Changes ported:\n#   1. Docstring: add context_parallel_size description\n#   2. Field: context_parallel_size: int = 1  (after tensor_model_parallel_size)\n#\n# 20% adaptation (鲁迅式迁移):\n#   鲁迅云：「不在沉默中爆发，就在沉默中灭亡。」\n#   序列维度被切分，各rank各得其所，上下文并行从config始。\n#   print('[M1870]') diagnostic added.\n# ---------------------------------------------------------------------------\nprint('[M1870] context_parallel_size field added to BaseConfig')
+logging.debug('[M1506]')\n# ---------------------------------------------------------------------------\n# M1870: Megatron 7a70c5401 — GPT model level change for context parallelism\n# Source: megatron/core/model_parallel_config.py\n#\n# Mapping: megatron/core/model_parallel_config.py ModelParallelConfig\n#        → deepspeed/compile/core_base_config.py BaseConfig\n#\n# Changes ported:\n#   1. Docstring: add context_parallel_size description\n#   2. Field: context_parallel_size: int = 1  (after tensor_model_parallel_size)\n#\n# 20% adaptation (鲁迅式迁移):\n#   鲁迅云：「不在沉默中爆发，就在沉默中灭亡。」\n#   序列维度被切分，各rank各得其所，上下文并行从config始。\n#      logging.debug('[M1870]') diagnostic added.\n# ---------------------------------------------------------------------------\nlogging.debug('[M1870] context_parallel_size field added to BaseConfig')
 # ---------------------------------------------------------------------------
 # M1960: Megatron c3079ce98 — Enable DGRAD RS overlap
 # Source: megatron/core/model_parallel_config.py
@@ -88,9 +89,9 @@ print('[M1506]')\n# ------------------------------------------------------------
 #             旧代码却令其相互等待，犹如官僚衙门，拖沓误事。」
 #   tp_comm_overlap_rs_dgrad=True 时，DGRAD GEMM 与 Reduce-Scatter 流水线重叠，
 #   通信掩于计算之下，吞吐量从此不再干等。
-#   - print('[M1960]') diagnostic added.
+#   -  logging.debug('[M1960]') diagnostic added.
 # ---------------------------------------------------------------------------
-print('[M1960] core_base_config: tp_comm_overlap_rs_dgrad field added to BaseConfig')
+logging.debug('[M1960] core_base_config: tp_comm_overlap_rs_dgrad field added to BaseConfig')
 from typing import Callable
 
 import torch
@@ -307,7 +308,8 @@ class BaseConfig:
                 'set batch_p2p_comm=False when overlap_p2p_comm=True '
                 '(Megatron 4ef31451d / Neuron_SP M1506).'
             )
-        print('[M1506] BaseConfig.__post__init__: overlap_p2p_comm=%s '
+        
+        logging.debug('[M1506] BaseConfig.__post__init__: overlap_p2p_comm=%s '
               'batch_p2p_comm=%s batch_p2p_sync=%s' % (
                   self.overlap_p2p_comm, self.batch_p2p_comm, self.batch_p2p_sync))
 
@@ -327,6 +329,6 @@ class BaseConfig:
 #             旧代码硬写 mpi，不知变通，犹如守旧官僚，误人不浅。
 #             今以 tp_comm_bootstrap_backend 开接口，让调用者自择其路。」
 #   - tp_comm_bootstrap_backend 字段加入 BaseConfig
-#   - print('[M2030]') diagnostic added.
+#   -  logging.debug('[M2030]') diagnostic added.
 # ---------------------------------------------------------------------------
-print('[M2030] core_base_config: tp_comm_bootstrap_backend field added to BaseConfig (default=nccl)')
+logging.debug('[M2030] core_base_config: tp_comm_bootstrap_backend field added to BaseConfig (default=nccl)')

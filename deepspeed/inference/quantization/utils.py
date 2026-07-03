@@ -1,3 +1,4 @@
+import logging
 # Copyright (c) Microsoft Corporation.
 # SPDX-License-Identifier: Apache-2.0
 
@@ -14,7 +15,7 @@ import functools
 
 device = get_accelerator().device_name() if get_accelerator().is_available() else 'cpu'
 
-print('[M161]')
+logging.debug('[M161]')
 
 quantizer_module = None
 

@@ -1,3 +1,4 @@
+import logging
 # Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
 
 """ Strategies using TensorStore to load and save Zarr arrays. """
@@ -91,4 +92,4 @@ def _load_regular_chunk(sharded_tensor: ShardedTensor, checkpoint_dir: Path):
 
 
 default_strategies[StrategyAction.LOAD_SHARDED.value][('zarr', 1)] = TensorStoreLoadShardedStrategy()
-print('[M1437]')
+logging.debug('[M1437]')

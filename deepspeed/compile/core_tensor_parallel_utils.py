@@ -1,3 +1,4 @@
+import logging
 # Copyright (c) Microsoft Corporation.
 # SPDX-License-Identifier: Apache-2.0
 
@@ -22,10 +23,10 @@
 #   7. Style: reformat multi-line function calls.
 #
 # 20% adaptation: imports divide from deepspeed.compile.core_utils (our mapping
-# of megatron.core.utils); adds print('[M1233]') marker.
+# of megatron.core.utils); adds  logging.debug('[M1233]') marker.
 # ---------------------------------------------------------------------------
 
-print('[M1233]')
+logging.debug('[M1233]')
 
 import torch
 from typing import List, Sequence

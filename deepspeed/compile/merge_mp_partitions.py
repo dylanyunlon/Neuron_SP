@@ -1,3 +1,4 @@
+import logging
 # Copyright (c) Microsoft Corporation.
 # SPDX-License-Identifier: Apache-2.0
 
@@ -23,7 +24,7 @@
 #
 # 20% adaptation: imports use deepspeed.compile.mpu_initialize instead of
 # the original megatron.mpu.initialize; model/checkpoint helpers reference
-# deepspeed utilities; adds print('[M54]') marker.
+# deepspeed utilities; adds  logging.debug('[M54]') marker.
 #
 # M180: Megatron 2e0b3fca7 — Fixed minor inconsistencies in scripts, added
 # distributed comment.
@@ -55,8 +56,8 @@ from .mpu_initialize import (
     get_model_parallel_world_size,
 )
 
-print('[M54]')
-print('[M180]')
+logging.debug('[M54]')
+logging.debug('[M180]')
 
 # ---------------------------------------------------------------------------
 # M180: Corrected evaluation defaults (Megatron 2e0b3fca7)
@@ -183,7 +184,7 @@ def test_split_merge():
 
     Megatron 57c2060fe merge_mp_partitions.py::test_split_merge.
     """
-    print('[M54] testing split and merge ...')
+    logging.debug('[M54] testing split and merge ...')
 
     # [QKV.ROW-COL] — 3 heads × 4 rows × 5 cols
     tensor = torch.FloatTensor([
@@ -211,7 +212,7 @@ def test_split_merge():
     merge_partitions(merged, partitions, partition_dim, stride)
 
     max_error = (merged - tensor).abs().max()
-    print(f'[M54]   > max error (should be zero): {max_error}')
+    logging.debug(f'[M54]   > max error (should be zero): {max_error}')
 
 
 # ---------------------------------------------------------------------------
@@ -264,7 +265,7 @@ def merge_model_parallel_checkpoints(
         get_checkpoint_name: callable(path, iteration) → str.
         ensure_directory_exists: callable(filename) — creates parent dirs.
     """
-    print('[M54] merging model parallel partitions ...')
+    logging.debug('[M54] merging model parallel partitions ...')
     print(f' > number of partitions: {model_parallel_size}')
     print(f' > checkpoint path: {load_path}')
 
@@ -281,7 +282,7 @@ def merge_model_parallel_checkpoints(
         set_model_parallel_rank(rank)
         checkpoint_name, iteration = get_parallel_checkpoint_name(
             load_path, get_checkpoint_tracker_filename, get_checkpoint_name)
-        print(f'[M54] > loading {checkpoint_name} ...')
+        logging.debug(f'[M54] > loading {checkpoint_name} ...')
         model_ = get_model_fn()
         sd = torch.load(checkpoint_name, map_location='cpu')
         model_.load_state_dict(sd['model'])
@@ -293,7 +294,7 @@ def merge_model_parallel_checkpoints(
     while True:
         try:
             name, merged_param = next(merged_params_gen)
-            print(f'[M54] > working on {name} ...')
+            logging.debug(f'[M54] > working on {name} ...')
             print(f'     merged         type: {merged_param.dtype}, '
                   f'size: {list(merged_param.size())}')
             partitions_param = []
@@ -314,7 +315,7 @@ def merge_model_parallel_checkpoints(
                 stride = merged_param.partition_stride
                 print(f'     parallel parameter merge with stride {stride} along '
                       f'dimention {dim}')
-                print('[M512]')
+                logging.debug('[M512]')
                 merge_partitions(merged_param,
                                  partitions_param,
                                  dim,
@@ -330,6 +331,6 @@ def merge_model_parallel_checkpoints(
     merged_path = os.path.join(load_path, 'merged')
     checkpoint_name = get_checkpoint_name(merged_path, iteration)
     ensure_directory_exists(checkpoint_name)
-    print(f'[M54] > saving merged model to {checkpoint_name}')
+    logging.debug(f'[M54] > saving merged model to {checkpoint_name}')
     torch.save(sd, checkpoint_name)
-    print('[M54] done :-)')
+    logging.debug('[M54] done :-)')

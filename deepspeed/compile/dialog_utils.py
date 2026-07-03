@@ -1,3 +1,4 @@
+import logging
 # SPDX-License-Identifier: Apache-2.0
 # DeepSpeed Team
 
@@ -23,7 +24,7 @@
 
 import torch
 
-print('[M702]')
+logging.debug('[M702]')
 
 
 def get_ltor_attention_masks_and_position_ids(data, eod_token_id):

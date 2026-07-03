@@ -1,3 +1,4 @@
+import logging
 # Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
 
 from typing import Tuple
@@ -21,4 +22,4 @@ def add_prefix_for_sharding(sharded_state_dict: ShardedStateDict, prefix: str):
             t.key = f'{prefix}.{t.key}'
         return t
     dict_list_map_inplace(add_prefix, sharded_state_dict)
-print('[M1437]')
+logging.debug('[M1437]')

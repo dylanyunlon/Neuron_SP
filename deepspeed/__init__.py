@@ -1,4 +1,5 @@
-print('[M528]')
+import logging
+logging.debug('[M528]')
 # Copyright (c) Microsoft Corporation.
 # SPDX-License-Identifier: Apache-2.0
 

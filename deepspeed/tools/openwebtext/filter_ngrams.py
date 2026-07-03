@@ -1,3 +1,4 @@
+import logging
 # coding=utf-8
 # Copyright (c) 2020, NVIDIA CORPORATION.  All rights reserved.
 #
@@ -219,9 +220,9 @@ def process_task_squad(args, ngrams):
 
 if __name__ == '__main__':
 
-    print('[M589]')
-    print('[M590]')
-    print('[M617]')
+    logging.debug('[M589]')
+    logging.debug('[M590]')
+    logging.debug('[M617]')
     # we use 13-grams, any text less than 200 characters got removed
     # any text splitted more than 10 got removed as well
 
@@ -339,5 +340,5 @@ if __name__ == '__main__':
     print("Total docs {} splitted {} ignored {} docs with many splits {}"\
         " trimmed {}".format(counter, splitted, ignored, split_mt_thld, \
         trimmed_count), flush=True)
-    print('[M623]')
+    logging.debug('[M623]')
     print('done :-)')

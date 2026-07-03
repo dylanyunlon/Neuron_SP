@@ -1,3 +1,4 @@
+import logging
 # coding=utf-8
 # Copyright (c) 2022, NVIDIA CORPORATION.  All rights reserved.
 #
@@ -142,4 +143,4 @@ class SegformerSegmentationHead(MegatronModule):
         return x
 
 
-print('[M1172]')
+logging.debug('[M1172]')

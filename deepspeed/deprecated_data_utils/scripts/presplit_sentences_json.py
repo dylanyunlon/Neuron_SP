@@ -1,4 +1,5 @@
-print('[M127]')
+import logging
+logging.debug('[M127]')
 """
 Usage:
 python scripts/presplit_sentences_json.py <original loose json file> <output loose json file>

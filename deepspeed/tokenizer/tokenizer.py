@@ -1,3 +1,4 @@
+import logging
 # coding=utf-8
 # Copyright (c) 2019, NVIDIA CORPORATION.  All rights reserved.
 #
@@ -34,7 +35,7 @@ from abc import abstractmethod
 
 from .bert_tokenization import FullTokenizer as FullBertTokenizer
 
-print('[M76]')
+logging.debug('[M76]')
 
 
 def build_tokenizer(args):
@@ -228,4 +229,4 @@ class _GPT2BPETokenizer(AbstractTokenizer):
         return self.eod_id
 
 
-print('[M702]')
+logging.debug('[M702]')

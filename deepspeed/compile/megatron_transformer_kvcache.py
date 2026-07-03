@@ -1,3 +1,4 @@
+import logging
 # Copyright (c) Microsoft Corporation.
 # SPDX-License-Identifier: Apache-2.0
 
@@ -61,7 +62,7 @@
 #   future ParallelAttention ports can import it directly.
 # ===========================================================================
 
-print('[M831]')
+logging.debug('[M831]')
 
 """ParallelAttention kv-cache helpers — M831 port of Megatron a7539b0f8."""
 
@@ -92,7 +93,7 @@ def allocate_kvcache(inference_params, allocate_memory_fn):
     if inference_params is None or not inference_params.allocate_key_value_memory:
         return None, None
     inf_max_seq_length = inference_params.max_sequence_length
-    print(f'[M1735][kvcache] inf_max_seq_length={inf_max_seq_length}')
+    logging.debug(f'[M1735][kvcache] inf_max_seq_length={inf_max_seq_length}')
     inf_max_batch_size = inference_params.max_batch_size
     key_memory = allocate_memory_fn(inf_max_seq_length, inf_max_batch_size)
     value_memory = allocate_memory_fn(inf_max_seq_length, inf_max_batch_size)

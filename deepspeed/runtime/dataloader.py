@@ -1,3 +1,4 @@
+import logging
 # Copyright (c) Microsoft Corporation.
 # SPDX-License-Identifier: Apache-2.0
 
@@ -281,7 +282,7 @@ def desloc_tp_report(alloc, profiles, sl, ms):
 #      whereas numpy's is exclusive.
 # ---------------------------------------------------------------------------
 
-print('[M36] dataloader: padding_mask_np / loss_mask_np rename + dataset helper refactor ported from Megatron f6a6811fd')
+logging.debug('[M36] dataloader: padding_mask_np / loss_mask_np rename + dataset helper refactor ported from Megatron f6a6811fd')
 
 
 def _m36_pad_and_convert_to_numpy(tokens, tokentypes, masked_positions,
@@ -439,7 +440,7 @@ def _m36_get_samples_mapping(indexed_dataset, data_prefix, num_epochs,
 # upstream deletion.
 # ---------------------------------------------------------------------------
 
-print('[M40] dataloader: split_dataset removed (mirrors Megatron 8179ebd31 — SplitDataset/split_ds/get_train_valid_test_split deleted upstream)')
+logging.debug('[M40] dataloader: split_dataset removed (mirrors Megatron 8179ebd31 — SplitDataset/split_ds/get_train_valid_test_split deleted upstream)')
 
 
 # ---------------------------------------------------------------------------
@@ -472,7 +473,7 @@ print('[M40] dataloader: split_dataset removed (mirrors Megatron 8179ebd31 — S
 #      ("> " → "    ") recorded in comment only.
 # ---------------------------------------------------------------------------
 
-print('[M37]')
+logging.debug('[M37]')
 
 
 def _m37_get_train_valid_test_split(splits_string, size):
@@ -617,7 +618,7 @@ def _m37_get_samples_mapping(indexed_dataset, data_prefix, num_epochs,
 #      behaviour (train_data / val_data / test_data would be unbound).
 # ---------------------------------------------------------------------------
 
-print('[M47]')
+logging.debug('[M47]')
 
 
 def _m47_get_train_val_test_data_loader_type(data_loader_type):
@@ -667,7 +668,7 @@ def _m47_get_train_val_test_data_loader_type(data_loader_type):
 #      the existing valid_ds / valid_data pattern used in ALBERT data loading.
 # ---------------------------------------------------------------------------
 
-print('[M56]')
+logging.debug('[M56]')
 
 
 def _m56_make_data_loader(dataset, global_batch_size, data_parallel_rank,
@@ -776,7 +777,7 @@ def _m56_forward_step_sop(lm_logits, sop_logits, lm_labels, loss_mask, sentence_
 #      it had no effect on model behaviour.
 # ---------------------------------------------------------------------------
 
-print('[M59]')
+logging.debug('[M59]')
 
 
 def _m59_json_dataset_init(path, tokenizer, preprocess_fn,
@@ -848,7 +849,7 @@ def _m59_bert_sentencepair_get_target_seq_length(rng, max_seq_len, short_seq_pro
 #      path (distinct from the ALBERT/SOP path in M56).
 # ---------------------------------------------------------------------------
 
-print('[M63]')
+logging.debug('[M63]')
 
 
 def _m63_make_data_loader_shuffle(dataset, batch_size, args, random_sampler_cls,
@@ -1001,7 +1002,7 @@ def _m63_ict_forward_step(lm_logits, nsp_logits, lm_labels, loss_mask, next_sent
 #      (matching the names used in the refactored return path).
 # ---------------------------------------------------------------------------
 
-print('[M62]')
+logging.debug('[M62]')
 
 
 def _m62_getitem_inverse_cloze(ict_dataset, idx):
@@ -1146,7 +1147,7 @@ def _m62_concat_and_pad_tokens(tokens, token_types, max_seq_len, enc_id, sep_id,
 #   simplifications inform _m70_build_bert_datasets_kwargs().
 # ---------------------------------------------------------------------------
 
-print('[M70]')
+logging.debug('[M70]')
 
 
 def _m70_bert_data_args_spec():
@@ -1276,7 +1277,7 @@ def _m70_build_bert_datasets_kwargs(args):
 #      (similarity index 100% — no logic change, only new location)
 # ---------------------------------------------------------------------------
 
-print('[M76]')
+logging.debug('[M76]')
 
 
 def _m76_get_full_bert_tokenizer():
@@ -1320,7 +1321,7 @@ def _m76_get_build_tokenizer():
 #   the data_utils package as deprecated in favour of the newer data pipeline.
 # ---------------------------------------------------------------------------
 
-print('[M93]')
+logging.debug('[M93]')
 # --- End M93 dataloader ---
 
 
@@ -1348,7 +1349,7 @@ print('[M93]')
 #   should use this helper when choosing the input sentence index from a document.
 # ---------------------------------------------------------------------------
 
-print('[M97]')
+logging.debug('[M97]')
 
 
 def _m97_select_input_sentence_idx(rng, num_sentences):
@@ -1414,7 +1415,7 @@ def _m102_valid_data_path(args_valid_data):
     return args_valid_data[0]
 
 
-print('[M102]')
+logging.debug('[M102]')
 # --- End M102 dataloader ---
 
 # ---------------------------------------------------------------------------
@@ -1479,7 +1480,7 @@ class _M120Encoder(object):
 
         if getattr(self.args, 'split_sentences', False):
             if not _nltk_available:
-                print('[M120] NLTK is not available to split sentences.')
+                logging.debug('[M120] NLTK is not available to split sentences.')
                 raise RuntimeError('NLTK required for sentence splitting')
             splitter = _nltk.load('tokenizers/punkt/english.pickle')
             if getattr(self.args, 'keep_newlines', False):
@@ -1519,14 +1520,14 @@ def m120_preprocess_data(args):
     args must expose: input, json_keys, output_prefix, dataset_impl,
     workers, log_interval, vocab_size (optional), build_tokenizer (optional).
     """
-    print('[M120]')
+    logging.debug('[M120]')
     from deepspeed.runtime.data_pipeline.data_sampling.indexed_dataset import (
         make_builder as _make_builder,
     )
     import torch as _torch
 
     startup_start = time.time()
-    print('[M120] Opening', args.input)
+    logging.debug('[M120] Opening', args.input)
     fin = open(args.input, 'r', encoding='utf-8')
 
     if _nltk_available and getattr(args, 'split_sentences', False):
@@ -1538,7 +1539,7 @@ def m120_preprocess_data(args):
     encoded_docs = pool.imap(encoder.encode, fin, 25)
 
     vocab_size = getattr(args, 'vocab_size', None)
-    print(f'[M120] Output prefix: {args.output_prefix}')
+    logging.debug(f'[M120] Output prefix: {args.output_prefix}')
     output_bin_files = {}
     output_idx_files = {}
     builders = {}
@@ -1552,10 +1553,10 @@ def m120_preprocess_data(args):
     startup_end = time.time()
     proc_start = time.time()
     total_bytes_processed = 0
-    print('[M120] Time to startup:', startup_end - startup_start)
+    logging.debug('[M120] Time to startup:', startup_end - startup_start)
 
     log_interval = getattr(args, 'log_interval', 100)
-    print('[M539]')
+    logging.debug('[M539]')
     for i, (doc, bytes_processed) in enumerate(encoded_docs, start=1):
         total_bytes_processed += bytes_processed
         for key, sentences in doc.items():
@@ -1568,14 +1569,15 @@ def m120_preprocess_data(args):
             current = time.time()
             elapsed = current - proc_start
             mbs = total_bytes_processed / elapsed / 1024 / 1024
-            print(f'[M120] Processed {i} documents '
+            
+            logging.debug(f'[M120] Processed {i} documents '
                   f'({i/elapsed:.2f} docs/s, {mbs:.2f} MB/s).',
                   file=sys.stderr)
 
     for key in args.json_keys:
         builders[key].finalize(output_idx_files[key])
 
-    print('[M120] Preprocessing complete.')
+    logging.debug('[M120] Preprocessing complete.')
 
 
 # --- End M120 dataloader ---
@@ -1622,7 +1624,7 @@ def m120_preprocess_data(args):
 #   functions following the same _mNNN_ naming convention.
 # ---------------------------------------------------------------------------
 
-print('[M119]')
+logging.debug('[M119]')
 
 
 def _m119_build_sample_idx_py(sizes, doc_idx, seq_length, num_epochs,
@@ -2013,7 +2015,7 @@ def _m119_build_train_valid_test_datasets(data_prefix, data_impl, splits_string,
 #   old dict key names are superseded by the _m189_* versions.
 # ---------------------------------------------------------------------------
 
-print('[M189]')
+logging.debug('[M189]')
 
 
 def _m189_ict_dataset_init_params():
@@ -2370,7 +2372,7 @@ def _m189_get_batch_keys():
 #     train_valid_test_datasets_provider() with dataset_type='realm'.
 # ---------------------------------------------------------------------------
 
-print('[M212]')
+logging.debug('[M212]')
 
 
 def _m212_dataset_types():
@@ -2502,7 +2504,7 @@ def _m212_pretrain_realm_dataset_provider(args):
 #      - train_valid_test_datasets_provider() passes dataset_type='realm'.
 # ---------------------------------------------------------------------------
 
-print('[M214]')
+logging.debug('[M214]')
 
 
 def _m214_pretrain_realm_model_provider():
@@ -2636,7 +2638,7 @@ def _m214_pretrain_realm_dataset_provider():
 #        sequence (true seq length is 2x but none predicted with LM outside first half).
 # ---------------------------------------------------------------------------
 
-print('[M211]')
+logging.debug('[M211]')
 
 
 def _m211_build_sample_fn_attr():
@@ -2814,7 +2816,7 @@ class _M211RealmDataset:
 #      deepspeed/runtime/dataloader.py (see M62, M189 blocks above).  No file
 #      deletion is needed here; the import source is simply updated.
 #
-#   print('[M232]') added to deepspeed/hashed_index.py at module load time.
+#      logging.debug('[M232]') added to deepspeed/hashed_index.py at module load time.
 # --- End M232 dataloader ---
 
 # M236: Megatron 16a64c41b — Move get_train_val... to dataset_utils
@@ -2865,7 +2867,7 @@ class _M211RealmDataset:
 #     import from megatron.data.dataset_utils, not megatron.data.bert_dataset.
 # ---------------------------------------------------------------------------
 
-print('[M236]')
+logging.debug('[M236]')
 
 
 def _m236_bert_dataset_removed_imports():
@@ -3009,7 +3011,7 @@ def _m236_pretrain_scripts_import_update():
 #   documents the upstream fix for traceability.
 # ---------------------------------------------------------------------------
 
-print('[M328]')
+logging.debug('[M328]')
 
 
 def _m328_gpt2_get_train_valid_test_split_import_source():
@@ -3064,7 +3066,7 @@ def _m328_gpt2_get_train_valid_test_split_import_source():
 #   size for dataset sizing purposes (e.g. train_val_test_num_samples).
 # ---------------------------------------------------------------------------
 
-print('[M408]')
+logging.debug('[M408]')
 
 
 def _m408_build_train_valid_test_data_iterators_global_batch_size(args,
@@ -3131,7 +3133,7 @@ def _m408_build_train_valid_test_data_iterators_global_batch_size(args,
 #   callers can invoke it after dataloader construction.
 #
 
-print('[M463]')
+logging.debug('[M463]')
 
 
 def _m463_apply_sample_multiplier_to_batch_sizes(args, train_dataset):
@@ -3242,7 +3244,9 @@ def _m642_pipeline_eval_loop_batch(
         actual_batch_size *= ds.sample_multiplier
     args.batch_size = actual_batch_size
 
-    print(
+    
+
+    logging.debug(
         f'[M642] eval batch: actual_batch_size={actual_batch_size} '
         f'sample_multiplier={getattr(ds, "sample_multiplier", 1)} '
         f'first_stage={is_pipeline_first_stage_fn()} '
@@ -3291,7 +3295,8 @@ def _m642_finetune_eval_only_mode(args):
     training loop to spin with no data.  Setting it to 0 exits immediately.
     """
     if getattr(args, 'train_iters', None) is not None:
-        print(f'[M642] eval-only mode: overriding train_iters '
+        
+        logging.debug(f'[M642] eval-only mode: overriding train_iters '
               f'{args.train_iters} → 0')
         args.train_iters = 0
 

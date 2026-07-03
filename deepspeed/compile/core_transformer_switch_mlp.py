@@ -1,3 +1,4 @@
+import logging
 # Copyright (c) Microsoft Corporation.
 # SPDX-License-Identifier: Apache-2.0
 
@@ -112,7 +113,7 @@
 # 犹如无病强投虎狼之药，身体虽壮，必受其害。
 # ---------------------------------------------------------------------------
 
-print('[M1880] core_transformer_switch_mlp: guard gather/scatter with SP/EP condition; fix globa_indices typo')
+logging.debug('[M1880] core_transformer_switch_mlp: guard gather/scatter with SP/EP condition; fix globa_indices typo')
 
 
 def _switch_mlp_forward_no_sp_ep_path(hidden_states, max_ind, sequence_parallel, expert_parallel_size):
@@ -122,7 +123,8 @@ def _switch_mlp_forward_no_sp_ep_path(hidden_states, max_ind, sequence_parallel,
 
     Returns (global_hidden_states, global_indices) for the no-SP/no-EP path.
     """
-    print(
+    
+    logging.debug(
         f'[M1880][SwitchMLP.forward] sequence_parallel={sequence_parallel}, '
         f'expert_parallel_size={expert_parallel_size} -> '
         f'{"SP/EP path: gather/scatter" if (sequence_parallel or expert_parallel_size > 1) else "direct path: no gather/scatter"}'
@@ -164,7 +166,7 @@ def _switch_mlp_forward_no_sp_ep_path(hidden_states, max_ind, sequence_parallel,
 #         # No SP, no EP: hidden_states is already the complete shard; skip gather
 #         global_hidden_states = hidden_states
 #         global_indices = max_ind  # upstream had typo 'globa_indices'; fixed
-#         print('[M1880][SwitchMLP] no SP/EP: skipping gather_from_sequence_parallel_region_to_moe')
+#                  logging.debug('[M1880][SwitchMLP] no SP/EP: skipping gather_from_sequence_parallel_region_to_moe')
 #
 #     output_total = torch.zeros_like(global_hidden_states)
 #     if self.add_bias:
@@ -196,7 +198,7 @@ def _switch_mlp_forward_no_sp_ep_path(hidden_states, max_ind, sequence_parallel,
 #                 output_bias_total / parallel_state.get_tensor_model_parallel_world_size()
 #             )
 #     else:
-#         print('[M1880][SwitchMLP] no SP/EP: skipping reduce_scatter_to_sequence_parallel_region_from_moe')
+#                  logging.debug('[M1880][SwitchMLP] no SP/EP: skipping reduce_scatter_to_sequence_parallel_region_from_moe')
 #
 #     output_total = output_total * max_prob
 #     output_total = output_total.view(hidden_shape)

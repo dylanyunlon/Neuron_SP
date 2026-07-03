@@ -1,4 +1,5 @@
-print('[M301]')
+import logging
+logging.debug('[M301]')
 from collections import defaultdict
 import os
 import pickle

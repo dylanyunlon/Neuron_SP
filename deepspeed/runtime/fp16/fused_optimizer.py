@@ -1,3 +1,4 @@
+import logging
 # Copyright (c) Microsoft Corporation.
 # SPDX-License-Identifier: Apache-2.0
 
@@ -127,7 +128,7 @@ def model_grads_to_master_grads_flat(fp16_group_flat, fp32_master_flat, fp16_gro
     contribute a zero-tensor to the flat buffer (no copy_), and non-null leaves
     are cast-and-appended once before the single _flatten call.
     """
-    print('[M163]')
+    logging.debug('[M163]')
     null_grad_count = 0
     grad_tensors = []
     for p in fp16_group:
@@ -145,7 +146,7 @@ def model_grads_to_master_grads_flat(fp16_group_flat, fp32_master_flat, fp16_gro
     fp32_master_flat.grad = _fdt(grad_tensors)
     # M158: Megatron 99410264a (fp16util) — use multi_tensor_applier to copy
     # model grads -> master grads at scale 1.0, matching Megatron fp16util change
-    print('[M158]')
+    logging.debug('[M158]')
     model_grads = [p.grad for p in fp16_group if p.grad is not None]
     master_grads = [p.grad for p in [fp32_master_flat] if p.grad is not None]
     if model_grads and master_grads:
@@ -303,7 +304,7 @@ class FP16_Optimizer(DeepSpeedOptimizer):
         # param_groups and delegates to clip_grad_norm_.
         # Uses fp16_groups (live model params whose grads are populated at
         # clip time) rather than the flat fp32 master buffer.
-        print('[M472]')
+        logging.debug('[M472]')
         params = []
         for group in self.fp16_groups:
             for param in group:
@@ -565,7 +566,7 @@ class FP16_Optimizer(DeepSpeedOptimizer):
 
         if apply_scale:
             # M158: Megatron 99410264a — multi_tensor_applier replaces per-grad mul_
-            print('[M158]')
+            logging.debug('[M158]')
             _overflow_buf = torch.cuda.IntTensor([0])
             _apply_multi_tensor_scale(
                                  _overflow_buf,
@@ -670,7 +671,7 @@ class FP16_Optimizer(DeepSpeedOptimizer):
     def _get_fp16_model_and_master_params_data(self):
         # M487: Megatron 160ba6800 — _get_model_and_master_params_data_fp16 equivalent
         # Extract paired (fp16 model, fp32 master) flat tensors for multi_tensor ops.
-        print('[M487]')
+        logging.debug('[M487]')
         model_data = []
         master_data = []
         for fp16_flat, fp32_flat in zip(self.fp16_groups_flat, self.fp32_groups_flat):

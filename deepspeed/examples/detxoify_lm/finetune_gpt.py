@@ -1,3 +1,4 @@
+import logging
 # coding=utf-8
 # Copyright (c) 2020, NVIDIA CORPORATION.  All rights reserved.
 
@@ -137,7 +138,7 @@ def add_validation_args(parser):
 
 
 
-print("[M1278]")
+logging.debug("[M1278]")
 if __name__ == "__main__":
 
     pretrain(train_valid_test_datasets_provider, model_provider,

@@ -1,8 +1,9 @@
-print('[M685]')
-print('[M661]')
-print('[M550]')
-print('[M311]')
-print('[M301]')
+import logging
+logging.debug('[M685]')
+logging.debug('[M661]')
+logging.debug('[M550]')
+logging.debug('[M311]')
+logging.debug('[M301]')
 # coding=utf-8
 # Copyright (c) 2019, NVIDIA CORPORATION.  All rights reserved.
 #

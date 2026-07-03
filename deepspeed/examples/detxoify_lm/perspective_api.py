@@ -1,3 +1,4 @@
+import logging
 import json
 import time
 from typing import Dict, Optional, List
@@ -169,4 +170,4 @@ def main():
 
 main()
 
-print('[M1278]')
+logging.debug('[M1278]')

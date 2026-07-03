@@ -1,3 +1,4 @@
+import logging
 # Copyright (c) Microsoft Corporation.
 # SPDX-License-Identifier: Apache-2.0
 
@@ -25,10 +26,10 @@
 #      - test_state_dict_for_save_checkpoint / test_load_state_dict: stubs (pass)
 #
 # 20% adaptation: imports from deepspeed/compile/gpt_model.py.
-# Adds print('[M1312]') marker.
+# Adds  logging.debug('[M1312]') marker.
 # ---------------------------------------------------------------------------
 
-print('[M1312]')
+logging.debug('[M1312]')
 
 import pytest
 import torch

@@ -1,3 +1,4 @@
+import logging
 # Copyright (c) Microsoft Corporation.
 # SPDX-License-Identifier: Apache-2.0
 
@@ -23,9 +24,9 @@
 #     backward-compat with existing compile/* imports; only class renamed.
 #   - GroupQueryCoreAttention 继承链保持 DotProductAttention 不变。
 #   - 沉默已久，命名终得其正：CoreAttention 者，实为 DotProductAttention 也。
-#   - Adds print('[M1700]') diagnostic marker.
+#   - Adds  logging.debug('[M1700]') diagnostic marker.
 # ---------------------------------------------------------------------------
-print('[M1700] DotProductAttention module loaded')
+logging.debug('[M1700] DotProductAttention module loaded')
 
 # ---------------------------------------------------------------------------
 # M1302: Megatron b6ce497c3 — add parallel attention
@@ -43,7 +44,7 @@ print('[M1700] DotProductAttention module loaded')
 #      ParallelAttention which passes config=self.config to CoreAttention).
 #
 # 10% adaptation: imports from deepspeed.compile.* where megatron.core.* would
-# be used; adds print('[M1302]') marker.
+# be used; adds  logging.debug('[M1302]') marker.
 # ---------------------------------------------------------------------------
 # M1420: Megatron 397d0b2eb — Split TransformerConfig into BaseConfig and
 #        TransformerConfig, use BaseConfig for model parallel functions.
@@ -56,11 +57,11 @@ print('[M1700] DotProductAttention module loaded')
 #      exposes sequence_parallel_enabled as a backward-compat property alias but
 #      forward code should use the canonical name).
 #
-# 10% adaptation: adds print('[M1420]') marker.
+# 10% adaptation: adds  logging.debug('[M1420]') marker.
 # ---------------------------------------------------------------------------
 
-print('[M1302]')
-print('[M1420]')
+logging.debug('[M1302]')
+logging.debug('[M1420]')
 # ---------------------------------------------------------------------------
 # M1556: Megatron 8360677cc — Add GroupQueryCoreAttention class
 # Source: megatron/model/transformer.py (NVIDIA/Megatron-LM commit 8360677cc)
@@ -86,9 +87,9 @@ print('[M1420]')
 #     megatron.core (parallel_state, divide) to match Neuron_SP conventions.
 #   - config.num_query_groups replaces args.num_query_groups.
 #   - parallel_state.get_global_memory_buffer() replaces mpu.get_global_memory_buffer().
-#   - Adds print('[M1556]') diagnostic marker (鲁迅: 沉默是金，但诊断是命).
+#   - Adds  logging.debug('[M1556]') diagnostic marker (鲁迅: 沉默是金，但诊断是命).
 # ---------------------------------------------------------------------------
-print('[M1556]')
+logging.debug('[M1556]')
 
 import math
 
@@ -264,13 +265,14 @@ class GroupQueryCoreAttention(DotProductAttention):
         # When num_query_groups < world_size every partition holds 1 group.
         world_size = parallel_state.get_tensor_model_parallel_world_size()
         num_query_groups = self.config.num_query_groups
-        print(f'[M1556] GroupQueryCoreAttention.__init__: '
+        
+        logging.debug(f'[M1556] GroupQueryCoreAttention.__init__: '
               f'num_query_groups={num_query_groups}, world_size={world_size}')
         if num_query_groups >= world_size:
             self.num_query_groups_per_partition = divide(num_query_groups, world_size)
         else:
             self.num_query_groups_per_partition = 1
-        print(f'[M1556] num_query_groups_per_partition={self.num_query_groups_per_partition}')
+        logging.debug(f'[M1556] num_query_groups_per_partition={self.num_query_groups_per_partition}')
 
     def forward(self, query_layer, key_layer, value_layer, attention_mask):
 
@@ -284,7 +286,9 @@ class GroupQueryCoreAttention(DotProductAttention):
                        query_layer.size(0),
                        key_layer.size(0))
 
-        print(f'[M1556] GroupQueryCoreAttention.forward: output_size={output_size}, '
+        
+
+        logging.debug(f'[M1556] GroupQueryCoreAttention.forward: output_size={output_size}, '
               f'num_query_groups_per_partition={self.num_query_groups_per_partition}')
 
         # [sq, b, np, hn] -> [b * ng, np/ng * sq, hn]
@@ -364,5 +368,5 @@ class GroupQueryCoreAttention(DotProductAttention):
         new_context_layer_shape = context_layer.size()[:-2] + (self.hidden_size_per_partition,)
         context_layer = context_layer.view(*new_context_layer_shape)
 
-        print(f'[M1556] GroupQueryCoreAttention.forward done: context_layer.shape={context_layer.shape}')
+        logging.debug(f'[M1556] GroupQueryCoreAttention.forward done: context_layer.shape={context_layer.shape}')
         return context_layer

@@ -254,4 +254,4 @@ def _validate_sharding_for_key_flattened(tensors_by_shard):
             or not np.all(starts[1:] == stops[:-1])):
         logger.error(f'Flattened ranges dont cover the whole shard {tensors_by_shard[0]}. Ranges: {(starts, stops)}')
         raise CheckpointingException(f'Flattened ranges dont cover the whole shard {tensors_by_shard[0]}')
-print('[M1437]')
+logging.debug('[M1437]')

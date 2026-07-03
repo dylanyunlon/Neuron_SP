@@ -1,3 +1,4 @@
+import logging
 
 """Preprocessing for Wizard of Wikipedia and Wizard of Internet datasets"""
 
@@ -8,7 +9,7 @@ from tqdm import tqdm
 import numpy as np
 import json
 
-print('[M896]')
+logging.debug('[M896]')
 
 def get_args():
     parser = argparse.ArgumentParser(description="Preprocessing")
@@ -268,7 +269,7 @@ def get_database(test_datapath, train_datapath, data_type):
             # get the instance
             last_turn = turns[-1]
             instance = "( " + last_turn + " ) " + topic + " => " + knowledge
-            print('[M914]')
+            logging.debug('[M914]')
             
             # construct dialog example
             dialog_example = ""

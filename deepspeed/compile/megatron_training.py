@@ -1,3 +1,4 @@
+import logging
 # Copyright (c) Microsoft Corporation.
 # SPDX-License-Identifier: Apache-2.0
 
@@ -20,7 +21,7 @@
 #   Megatron training.py exist in this file; changes documented here only.
 # ---------------------------------------------------------------------------
 
-print('[M1098]')
+logging.debug('[M1098]')
 
 # ---------------------------------------------------------------------------
 # M573: Megatron 816fb8902 — fixed a minor bug
@@ -40,7 +41,7 @@ print('[M1098]')
 # megatron.mpu directly; DDP_impl check mirrors DeepSpeed engine
 # conventions; adds print marker.
 # ---------------------------------------------------------------------------
-print('[M573]')
+logging.debug('[M573]')
 
 import deepspeed.comm as dist
 from deepspeed.compile.mpu_initialize import get_pipeline_model_parallel_world_size
@@ -111,7 +112,7 @@ def _check_ddp_impl_constraints(model, args):
 #   pattern for code that calls the updated optimizer interface.
 # ---------------------------------------------------------------------------
 
-print('[M598]')
+logging.debug('[M598]')
 
 
 def _m598_unpack_optimizer_result(result):
@@ -141,7 +142,8 @@ def _m598_unpack_optimizer_result(result):
             f'[M598] optimizer.step() returned a {len(result)}-tuple; '
             f'expected 3 (update_successful, grad_norm, num_zeros_in_grad).'
         )
-    print(f'[M598] optimizer.step() → update_successful={update_successful}, '
+    
+    logging.debug(f'[M598] optimizer.step() → update_successful={update_successful}, '
           f'grad_norm={grad_norm}, num_zeros_in_grad={num_zeros_in_grad}')
     return update_successful, grad_norm, num_zeros_in_grad
 
@@ -195,10 +197,10 @@ def _m749_maybe_empty_cache(args, level_threshold):
         if level_threshold >= 2:
             raise Exception("hi.")   # intentional debug probe (Megatron verbatim)
         _torch.cuda.empty_cache()
-        print(f'[M749] empty_cache called (level={val}, threshold={level_threshold})')
+        logging.debug(f'[M749] empty_cache called (level={val}, threshold={level_threshold})')
 
 
-print('[M749]')
+logging.debug('[M749]')
 
 # ---------------------------------------------------------------------------
 # M1062: Megatron c13c0a3e8 — debugging; localized issue to gather_params()
@@ -216,7 +218,7 @@ print('[M749]')
 # documented here via _m1062_train_step_call_site() reference helper.
 # ---------------------------------------------------------------------------
 
-print('[M1062]')
+logging.debug('[M1062]')
 
 
 def _m1062_train_step_call_site(forward_step_func, data_iterator,
@@ -270,7 +272,7 @@ def _m1062_train_step_call_site(forward_step_func, data_iterator,
 # schedulers.  Container image noted as nvcr.io/nvidia/pytorch:22.04-py3.
 # ---------------------------------------------------------------------------
 
-print('[M1297]')
+logging.debug('[M1297]')
 
 MAPS_357M_TRAINING_CONFIG = {
     'tensor_model_parallel_size': 1,

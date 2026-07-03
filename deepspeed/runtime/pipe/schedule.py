@@ -1,3 +1,4 @@
+import logging
 # Copyright (c) Microsoft Corporation.
 # SPDX-License-Identifier: Apache-2.0
 
@@ -351,7 +352,7 @@ class InterleavedTrainSchedule(PipeSchedule):
         # to have every worker in a warmup and steady state phase.
         self.measure_pipeline_stall = self.micro_batches >= self.stages
 
-        print('[M592]')
+        logging.debug('[M592]')
         print(
             f"[InterleavedTrainSchedule] stage={stage_id}/{stages} "
             f"chunks={num_model_chunks} mb_total={num_mb_total} "

@@ -1,10 +1,11 @@
+import logging
 import os
 import torch
 import megatron.core.parallel_state as ps
 from datetime import timedelta
 import pytest
 
-print('[M1250]')
+logging.debug('[M1250]')
 
 #TODO: Maybe get these values frome environment variables 
 rank = torch.cuda.current_device()

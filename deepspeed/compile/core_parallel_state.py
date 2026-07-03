@@ -1,3 +1,4 @@
+import logging
 # Copyright (c) Microsoft Corporation.
 # SPDX-License-Identifier: Apache-2.0
 
@@ -46,10 +47,10 @@
 #
 # 20% adaptation: imports from deepspeed.compile.mpu_initialize for group helpers
 # already present (get_tensor_model_parallel_group, etc.); uses deepspeed.comm
-# where torch.distributed would be used; adds print('[M1233]') marker.
+# where torch.distributed would be used; adds  logging.debug('[M1233]') marker.
 # ---------------------------------------------------------------------------
 
-print('[M1345]')
+logging.debug('[M1345]')
 
 import torch
 from typing import Optional
@@ -314,7 +315,7 @@ def set_pipeline_model_parallel_world_size(world_size):
 
 def set_virtual_pipeline_model_parallel_world_size(world_size):
     """Set the virtual pipeline model parallel size"""
-    print('[M1317]')
+    logging.debug('[M1317]')
     global _VIRTUAL_PIPELINE_MODEL_PARALLEL_WORLD_SIZE
     _VIRTUAL_PIPELINE_MODEL_PARALLEL_WORLD_SIZE = world_size
 
@@ -556,11 +557,11 @@ def destroy_model_parallel():
 
 def get_context_parallel_world_size():
     """Return context parallel world size; defaults to 1 (no CP)."""
-    print('[M2050] get_context_parallel_world_size: returning 1 (stub)')
+    logging.debug('[M2050] get_context_parallel_world_size: returning 1 (stub)')
     return 1
 
 
 def get_context_parallel_rank():
     """Return context parallel rank; defaults to 0 (no CP)."""
-    print('[M2050] get_context_parallel_rank: returning 0 (stub)')
+    logging.debug('[M2050] get_context_parallel_rank: returning 0 (stub)')
     return 0

@@ -35,7 +35,7 @@ from deepspeed.module_inject.policy import transpose
 torch_memory_reserved = get_accelerator().memory_reserved
 torch_max_memory_reserved = get_accelerator().max_memory_reserved
 
-print('[M425]')
+logging.debug('[M425]')
 
 
 class DummyOptim():
@@ -587,7 +587,7 @@ def clip_grad_norm_(parameters, max_norm, norm_type=2, mpu=None):
     #   - grad should not be None
     #   - parameter should not be shared (avoids double-counting tied embeddings)
     #   - should not be a TP-duplicate (only count rank-0 non-parallel params)
-    print('[M472]')
+    logging.debug('[M472]')
     filtered_parameters = []
     for param in parameters:
         grad_not_none = param.grad is not None
@@ -609,7 +609,7 @@ def clip_grad_norm_(parameters, max_norm, norm_type=2, mpu=None):
             dist.all_reduce(total_norm, op=dist.ReduceOp.MAX, group=mpu.get_model_parallel_group())
     else:
         total_norm = 0
-        print('[M201]')
+        logging.debug('[M201]')
         mp_rank_is_zero = (mpu.get_model_parallel_rank() == 0) if mpu is not None else True
         for p in parameters:
             if mpu is not None:
@@ -628,7 +628,7 @@ def clip_grad_norm_(parameters, max_norm, norm_type=2, mpu=None):
         # >>>
         # dist.all_reduce(total_norm, op=dist.ReduceOp.SUM, group=mpu.get_model_parallel_group())
         # +++
-        print('[M1066]')
+        logging.debug('[M1066]')
         if mpu is not None:
             dist.all_reduce(total_norm, op=dist.ReduceOp.SUM)
         # <<<
@@ -730,7 +730,7 @@ def get_grad_zeros(parameters, mpu=None):
     Returns:
         Total number of params with zero values (viewed as a single vector).
     """
-    print('[M597]')
+    logging.debug('[M597]')
     if isinstance(parameters, torch.Tensor):
         parameters = [parameters]
     parameters = list(filter(lambda p: p.grad is not None, parameters))
@@ -1837,7 +1837,7 @@ def desloc_clip_grad_per_tier(params, max_norm, tier='x',
     M200: fixed bug — separate parameters_with_grads (for clipping) from
     parameters_for_norm (model-parallel aware, for norm calculation),
     matching Megatron fb5b2b362 l2_grad_clipper fix."""
-    print('[M200]')
+    logging.debug('[M200]')
     # Make sure we have an iterable.
     if isinstance(params, torch.Tensor):
         params = [params]
@@ -3060,7 +3060,7 @@ def desloc_per_bucket_grad_norm_fp32(buckets, norm_type=2.0, dp_group=None):
 # Original in megatron/utils.py lines 275-281.
 # ---------------------------------------------------------------------------
 
-print('[M43]')
+logging.debug('[M43]')
 
 
 def _m43_vocab_size_with_padding(num_tokens, make_vocab_size_divisible_by,
@@ -3089,7 +3089,7 @@ def _m43_vocab_size_with_padding(num_tokens, make_vocab_size_divisible_by,
 # --- End M43 utils ---
 
 # --- M83: Megatron 46379244a — added gpt2 tokenizer ---
-print('[M83]')
+logging.debug('[M83]')
 
 # coding=utf-8
 # Copyright 2018 The Open AI Team Authors and The HuggingFace Inc. team.
@@ -3434,7 +3434,7 @@ def _m102_get_detokenizer(path, detokenizers_map):
     return lambda x: x
 
 
-print('[M102]')
+logging.debug('[M102]')
 # --- End M102 utils ---
 
 
@@ -3470,7 +3470,7 @@ def merge_hash_shards(dir_name, output_path, data_parallel_rank=0):
         data_parallel_rank (int): Caller's data-parallel rank; only rank 0
             writes the consolidated file.  Defaults to 0 (single-process use).
     """
-    print('[M193]')
+    logging.debug('[M193]')
     if data_parallel_rank != 0:
         return
 
@@ -3557,5 +3557,5 @@ def get_block_dataset_kwargs(block_dataset, title_dataset, data_prefix,
 # was commented out, forcing norm_type==2 through the generic per-param loop.
 # Applied here: commented out the norm_type==2.0 fast path in
 # desloc_per_bucket_grad_norm_fp32 so all norm types follow the unified path.
-print('[M203]')
+logging.debug('[M203]')
 # --- End M203 ---

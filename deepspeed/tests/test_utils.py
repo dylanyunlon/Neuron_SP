@@ -1,9 +1,10 @@
+import logging
 import pytest
 import torch
 import megatron.core.utils as util
 import numpy as np
 
-print('[M1250]')
+logging.debug('[M1250]')
 
 def test_divide_properly():
     assert util.divide(4,2) == 2

@@ -1,3 +1,4 @@
+import logging
 # Copyright (c) Microsoft Corporation.
 # SPDX-License-Identifier: Apache-2.0
 
@@ -52,7 +53,8 @@ def get_distributed_optimizer_checkpoint_name(model_checkpoint_name):
     Adapted for DES-LOC: the three-level sync (Kx/Ku/Kv) means the optimizer state
     must be reconstructable regardless of DP width at resume time.
     """
-    print(f"[M1461][DESLOC] get_distributed_optimizer_checkpoint_name: "
+    
+    logging.debug(f"[M1461][DESLOC] get_distributed_optimizer_checkpoint_name: "
           f"base={model_checkpoint_name}, optim_file={DISTRIB_OPTIM_STATE_FILE}")
     return os.path.join(os.path.dirname(model_checkpoint_name), DISTRIB_OPTIM_STATE_FILE)
 
@@ -364,10 +366,10 @@ class DeepSpeedCheckpoint(object):
         """
         # M1461: use DP-independent naming so checkpoint survives DP resize
         if checkpoint_name is None:
-            print("[M1461][DESLOC] desloc_save: no checkpoint_name provided, skipping distrib optim save")
+            logging.debug("[M1461][DESLOC] desloc_save: no checkpoint_name provided, skipping distrib optim save")
             return None
         optim_path = get_distributed_optimizer_checkpoint_name(checkpoint_name)
-        print(f"[M1461][DESLOC] desloc_save: Kx/Ku/Kv state → {optim_path} (DP-independent)")
+        logging.debug(f"[M1461][DESLOC] desloc_save: Kx/Ku/Kv state → {optim_path} (DP-independent)")
         return optim_path
 
 
@@ -380,12 +382,12 @@ class DeepSpeedCheckpoint(object):
         Returns the path if the file exists, None otherwise.
         """
         if checkpoint_name is None:
-            print("[M1461][DESLOC] desloc_load: no checkpoint_name provided, skipping distrib optim load")
+            logging.debug("[M1461][DESLOC] desloc_load: no checkpoint_name provided, skipping distrib optim load")
             return None
         optim_path = get_distributed_optimizer_checkpoint_name(checkpoint_name)
         if os.path.isfile(optim_path):
-            print(f"[M1461][DESLOC] desloc_load: loading Kx/Ku/Kv state from {optim_path} (DP-independent)")
+            logging.debug(f"[M1461][DESLOC] desloc_load: loading Kx/Ku/Kv state from {optim_path} (DP-independent)")
             return optim_path
-        print(f"[M1461][DESLOC] desloc_load: distrib optim file not found at {optim_path}, cold-start assumed")
+        logging.debug(f"[M1461][DESLOC] desloc_load: distrib optim file not found at {optim_path}, cold-start assumed")
         return None
 

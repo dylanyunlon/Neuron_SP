@@ -1,3 +1,4 @@
+import logging
 # Copyright (c) Microsoft Corporation.
 # SPDX-License-Identifier: Apache-2.0
 
@@ -34,7 +35,7 @@
 #   string constant so future ports can import it directly.
 # ---------------------------------------------------------------------------
 
-print('[M1003]')
+logging.debug('[M1003]')
 
 # Corrected docstring for NoopTransformerLayer (bea16fa33 fix).
 # Upstream changed standalone_embedding_stage → standalone_embed_stage.
@@ -118,7 +119,7 @@ FAST_LAYER_NORM_VIEW_BUG_NOTE = (
 #   four changes above.
 # ---------------------------------------------------------------------------
 
-print('[M1082]')
+logging.debug('[M1082]')
 
 # Change 1 — ParallelAttention.__init__ pseudo-code reminder:
 # After:
@@ -243,7 +244,7 @@ print('[M1082]')
 # previous serial-expert-per-rank bottleneck.
 # ---------------------------------------------------------------------------
 
-print('[M1157]')
+logging.debug('[M1157]')
 
 # Change 1 reference — ParallelMLP.__init__ delta:
 #
@@ -411,7 +412,7 @@ print('[M1157]')
 # megatron.core refactor.
 # ---------------------------------------------------------------------------
 
-print('[M1313]')
+logging.debug('[M1313]')
 
 # Change 2 reference — layer_number assignment delta:
 #
@@ -647,7 +648,7 @@ print('[M1313]')
 #
 # ---------------------------------------------------------------------------
 
-print('[M1333]')
+logging.debug('[M1333]')
 
 # ---------------------------------------------------------------------------
 # M1443: Megatron 5428592c3 — Add retro attr to ParallelTransformer
@@ -678,7 +679,7 @@ print('[M1333]')
 # that checks self.retro_add_retriever rather than re-reading args.
 # ---------------------------------------------------------------------------
 
-print('[M1443]')
+logging.debug('[M1443]')
 # Changes ported from upstream (transformer.py):
 #
 # ParallelTransformer.forward() — forward_kwargs dict [line ~1598]:
@@ -720,7 +721,7 @@ print('[M1443]')
 #
 # ---------------------------------------------------------------------------
 
-print('[M1444]')
+logging.debug('[M1444]')
 
 # ---------------------------------------------------------------------------
 # M1730: Megatron b3fac674f — Fix expert parallelism issues from merge
@@ -795,8 +796,8 @@ print('[M1444]')
 # 诊断: 旧码无偏置时仍强行scatter，有如无米之炊，徒费柴火。
 # ---------------------------------------------------------------------------
 
-print('[M1730] expert parallelism fix: direct tensor_parallel import, guard output_bias=None')
-print('[M1730] SwitchMLP: gather/scatter no longer dispatched via mpu, bias=None handled cleanly')
+logging.debug('[M1730] expert parallelism fix: direct tensor_parallel import, guard output_bias=None')
+logging.debug('[M1730] SwitchMLP: gather/scatter no longer dispatched via mpu, bias=None handled cleanly')
 
 # ---------------------------------------------------------------------------
 # M1880: Megatron 063edede9 — Bug fix for no sequence and expert parallel case
@@ -864,7 +865,7 @@ print('[M1730] SwitchMLP: gather/scatter no longer dispatched via mpu, bias=None
 # 徒增耗损，贻误百姓。
 # ---------------------------------------------------------------------------
 
-print('[M1880] megatron_transformer: SwitchMLP.forward guard SP/EP for gather/scatter; fix globa_indices typo')
+logging.debug('[M1880] megatron_transformer: SwitchMLP.forward guard SP/EP for gather/scatter; fix globa_indices typo')
 
 # ---------------------------------------------------------------------------
 # M1900: Megatron d931ba8a4 — Expose rotary base for Code Llama support
@@ -910,6 +911,8 @@ if self.position_embedding_type == 'rope':
     )
 """
 
-print('[M1900] megatron_transformer: GPTModel.rotary_base param template recorded; '
+
+
+logging.debug('[M1900] megatron_transformer: GPTModel.rotary_base param template recorded; '
       'see megatron_rotary_pos_embedding.py for live RotaryEmbedding change')
 

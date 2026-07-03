@@ -1,3 +1,4 @@
+import logging
 # Copyright (c) Microsoft Corporation.
 # SPDX-License-Identifier: Apache-2.0
 
@@ -37,10 +38,10 @@
 #
 # 20% adaptation: standalone module with simplified state; uses Python
 # logging-compatible print_rank_0; does not depend on full Megatron global
-# state machinery (get_args / mpu).  Adds print('[M512]') marker.
+# state machinery (get_args / mpu).  Adds  logging.debug('[M512]') marker.
 # ---------------------------------------------------------------------------
 
-print('[M512]')
+logging.debug('[M512]')
 
 import torch
 
@@ -71,7 +72,7 @@ def set_checkpoint_version(value):
         assert _CHECKPOINT_VERSION == value, \
             f'checkpoint versions do not match: {_CHECKPOINT_VERSION} vs {value}'
     _CHECKPOINT_VERSION = value
-    print(f'[M512] set_checkpoint_version: version={value}')
+    logging.debug(f'[M512] set_checkpoint_version: version={value}')
 
 
 def get_checkpoint_version():
@@ -165,7 +166,7 @@ def load_checkpoint_safe(load_path, checkpoint_name,
     try:
         state_dict = torch.load(checkpoint_name, map_location='cpu')
     except Exception as e:
-        print(f'[M512] load_checkpoint_safe: failed to load {checkpoint_name}: {e}')
+        logging.debug(f'[M512] load_checkpoint_safe: failed to load {checkpoint_name}: {e}')
         raise
 
     # Set checkpoint version.
@@ -207,10 +208,10 @@ def load_checkpoint_safe(load_path, checkpoint_name,
 # virtual-pipeline logic is factored into two new helpers —
 # build_virtual_pipeline_state_dict() and load_virtual_pipeline_state_dict()
 # — that callers invoke as part of their state_dict_fn / model_load_fn.
-# Adds print('[M556]').
+# Adds  logging.debug('[M556]').
 # ===========================================================================
 
-print('[M556]')
+logging.debug('[M556]')
 
 
 def build_virtual_pipeline_state_dict(model_list):
@@ -239,7 +240,7 @@ def build_virtual_pipeline_state_dict(model_list):
         for i, model_module in enumerate(model_list):
             set_virtual_pipeline_model_parallel_rank(i)
             result['model%d' % i] = model_module.state_dict_for_save_checkpoint()
-    print(f'[M556] build_virtual_pipeline_state_dict: {len(model_list)} stage(s)')
+    logging.debug(f'[M556] build_virtual_pipeline_state_dict: {len(model_list)} stage(s)')
     return result
 
 
@@ -266,7 +267,7 @@ def load_virtual_pipeline_state_dict(model_list, state_dict, strict=True):
         for i, model_module in enumerate(model_list):
             set_virtual_pipeline_model_parallel_rank(i)
             model_module.load_state_dict(state_dict['model%d' % i], strict=strict)
-    print(f'[M556] load_virtual_pipeline_state_dict: {len(model_list)} stage(s)')
+    logging.debug(f'[M556] load_virtual_pipeline_state_dict: {len(model_list)} stage(s)')
 
 
 
@@ -314,10 +315,10 @@ def load_virtual_pipeline_state_dict(model_list, state_dict, strict=True):
 #
 # 20% adaptation: mpu calls are forwarded to deepspeed.compile.mpu_initialize
 # equivalents; function is self-contained and usable independently of the
-# Megatron global state machinery.  Adds print('[M1203]').
+# Megatron global state machinery.  Adds  logging.debug('[M1203]').
 # ===========================================================================
 
-print('[M1203]')
+logging.debug('[M1203]')
 
 
 def get_checkpoint_names(checkpoints_path, iteration,
@@ -432,7 +433,7 @@ def get_checkpoint_names(checkpoints_path, iteration,
     else:
         model_name = optim_name = unified_name
 
-    print('[M1377]')
+    logging.debug('[M1377]')
     return model_name, optim_name
 
 # M1204: Megatron b178e6fc5 — error fixes & tested
@@ -470,10 +471,10 @@ def get_checkpoint_names(checkpoints_path, iteration,
 # 20% adaptation: the split-save logic is expressed in
 # save_checkpoint_distributed_optimizer() below, which extends the existing
 # save_checkpoint_safe() callback pattern rather than modifying it in-place.
-# Adds print('[M1204]').
+# Adds  logging.debug('[M1204]').
 # ===========================================================================
 
-print('[M1204]')
+logging.debug('[M1204]')
 
 
 def save_checkpoint_distributed_optimizer(
@@ -611,7 +612,7 @@ def _load_checkpoint_finetune_notes():
     """
     pass  # documentation-only function
 
-print('[M1278]')
+logging.debug('[M1278]')
 
 
 def load_optimizer_state_safe(optimizer, state_dict, checkpoint_name):
@@ -638,14 +639,14 @@ def load_optimizer_state_safe(optimizer, state_dict, checkpoint_name):
     """
     try:
         optimizer.load_state_dict(state_dict)
-        print(f'[M2000] load_optimizer_state_safe: optimizer loaded from {checkpoint_name}')
+        logging.debug(f'[M2000] load_optimizer_state_safe: optimizer loaded from {checkpoint_name}')
     except KeyError as e:
         print_rank_0(
             f'[M2000] Unable to load optimizer from checkpoint {checkpoint_name}. '
             'Specify --no-load-optim or --finetune to prevent attempting to load '
             'the optimizer state.'
         )
-        print(f'[M2000] KeyError detail: {e!r}')
+        logging.debug(f'[M2000] KeyError detail: {e!r}')
         raise e
 
 # ---------------------------------------------------------------------------
@@ -721,10 +722,10 @@ def load_optimizer_state_safe(optimizer, state_dict, checkpoint_name):
 #
 # 20% adaptation: get_checkpoint_names() below updated in-place with the
 # no_load_optim param and file-existence branching; helpers that take
-# no_load_optim are updated accordingly. Adds print('[M1377]').
+# no_load_optim are updated accordingly. Adds  logging.debug('[M1377]').
 # ---------------------------------------------------------------------------
 
-print('[M1377]')
+logging.debug('[M1377]')
 
 # M1378: Megatron 268cb0c87 — consolidated conditions.
 # Source: megatron/checkpointing.py (NVIDIA/Megatron-LM commit 268cb0c87)
@@ -782,10 +783,10 @@ print('[M1377]')
 # 20% adaptation: exposed as get_checkpoint_names_v2() to sit alongside the
 # existing get_checkpoint_names() (M1203) without breaking callers.  The
 # no_load_optim parameter is added as required by the new first branch.
-# Adds print('[M1378]').
+# Adds  logging.debug('[M1378]').
 # ---------------------------------------------------------------------------
 
-print('[M1378]')
+logging.debug('[M1378]')
 
 
 def get_checkpoint_names_v2(checkpoints_path, iteration,
@@ -897,5 +898,5 @@ def get_checkpoint_names_v2(checkpoints_path, iteration,
                 os.path.exists(distrib_model_name),
                 use_distributed_optimizer))
 
-    print(f'[M1378] get_checkpoint_names_v2: model={model_name}')
+    logging.debug(f'[M1378] get_checkpoint_names_v2: model={model_name}')
     return model_name, optim_name

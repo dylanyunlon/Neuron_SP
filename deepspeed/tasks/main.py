@@ -1,3 +1,4 @@
+import logging
 # coding=utf-8
 # Copyright (c) 2020, NVIDIA CORPORATION.  All rights reserved.
 #
@@ -23,7 +24,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__),
 from megatron import get_args
 from megatron.initialize import initialize_megatron
 
-print('[M911]')
+logging.debug('[M911]')
 
 def get_tasks_args(parser):
     """Provide extra arguments required for tasks."""
@@ -113,7 +114,7 @@ def get_tasks_args(parser):
                        help='setup model api for prompting')
     group.add_argument('--megatron-api-url', type=str, default=None,
                        help='url of the megatron api')
-    print('[M928]')
+    logging.debug('[M928]')
 
     return parser
 

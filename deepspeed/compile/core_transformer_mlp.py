@@ -1,3 +1,4 @@
+import logging
 # Copyright (c) Microsoft Corporation.
 # SPDX-License-Identifier: Apache-2.0
 
@@ -18,7 +19,7 @@
 #      so that the config object is accessible on the instance for downstream use.
 #
 # 10% adaptation: imports from megatron.core.* (upstream convention retained
-# for reference); adds print('[M1302]') marker.
+# for reference); adds  logging.debug('[M1302]') marker.
 # ---------------------------------------------------------------------------
 # M1420: Megatron 397d0b2eb — Split TransformerConfig into BaseConfig and
 #        TransformerConfig, use BaseConfig for model parallel functions.
@@ -34,7 +35,7 @@
 #       → sequence_parallel_enabled=self.sequence_parallel  (kwarg name unchanged in
 #         mpu_layers; only the config attribute was renamed)
 #
-# 10% adaptation: adds print('[M1420]') marker.
+# 10% adaptation: adds  logging.debug('[M1420]') marker.
 # ---------------------------------------------------------------------------
 # M1910: Megatron 80de44fda — Add RoPE and SwiGLU fusion
 # Source: megatron/core/transformer/mlp.py (NVIDIA/Megatron-LM commit 80de44fda)
@@ -54,7 +55,7 @@
 #            bias_activation_fusion 当立，方能容纳 SwiGLU 之新秀。"
 #   - bias_gelu_fusion → bias_activation_fusion 字段名跟随上游。
 #   - 增加 try/except 保护 SwiGLU import，防止无 apex 环境崩溃。
-#   - print('[M1910]') 诊断标记。
+#   -  logging.debug('[M1910]') 诊断标记。
 # ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
 # M1970: Megatron 21648b5ab — Store SwiGLU inputs in fp8 to save activation memory
@@ -71,9 +72,9 @@
 #   - 双 print 诊断：SwiGLU path + fp8_store 值，方便实验中快速确认。
 # ---------------------------------------------------------------------------
 
-print('[M1302]')
-print('[M1420]')
-print('[M1910] core_transformer_mlp: SwiGLU bias_activation_fusion active')
+logging.debug('[M1302]')
+logging.debug('[M1420]')
+logging.debug('[M1910] core_transformer_mlp: SwiGLU bias_activation_fusion active')
 
 import torch
 import torch.nn.functional as F
@@ -86,9 +87,9 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 # M1910: SwiGLU fused impl — 鲁迅曰: "融合之道，在乎一 chunk，分而治之。"
 try:
     from .core_fusions_fused_bias_swiglu import bias_swiglu_impl, swiglu_impl
-    print('[M1910] bias_swiglu_impl and swiglu_impl imported successfully')
+    logging.debug('[M1910] bias_swiglu_impl and swiglu_impl imported successfully')
 except ImportError as _e:
-    print(f'[M1910] WARNING: SwiGLU fusion unavailable: {_e}')
+    logging.debug(f'[M1910] WARNING: SwiGLU fusion unavailable: {_e}')
     bias_swiglu_impl = None
     swiglu_impl = None
 
@@ -177,8 +178,8 @@ class ParallelMLP(MegatronModule):
                 # M1970: pass fp8_input_store flag for activation memory saving
                 x = torch.chunk(intermediate_parallel, 2, dim=-1)
                 fp8_store = getattr(self.config, 'activation_func_fp8_input_store', False)
-                print(f'[M1910] SwiGLU fusion path: x[0].shape={x[0].shape}')
-                print(f'[M1970] SwiGLU fp8_input_store={fp8_store}')
+                logging.debug(f'[M1910] SwiGLU fusion path: x[0].shape={x[0].shape}')
+                logging.debug(f'[M1970] SwiGLU fp8_input_store={fp8_store}')
                 if bias_parallel is not None:
                     bias = torch.chunk(bias_parallel, 2, dim=-1)
                     intermediate_parallel = bias_swiglu_impl(x[0], bias[0], x[1], bias[1],

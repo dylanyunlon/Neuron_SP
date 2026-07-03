@@ -1,3 +1,4 @@
+import logging
 # SPDX-License-Identifier: Apache-2.0
 # DeepSpeed Team
 
@@ -16,7 +17,7 @@
 #   - Key step walkthrough (fp16 grad path, 4-element per-rank example)
 #
 # No Python changes in upstream commit; print marker placed in this file per project convention.
-print('[M1173]')
+logging.debug('[M1173]')
 
 # ---------------------------------------------------------------------------
 # M1377: Megatron a5c60087b — made compatible.
@@ -43,10 +44,10 @@ print('[M1173]')
 #   from grad_buffer storage directly (uses a different shard-based approach).
 #   The compatibility logic is provided as get_storage_untyped() below for use
 #   by any future code that needs cross-version storage access.
-#   Adds print('[M1377]').
+#   Adds  logging.debug('[M1377]').
 # ---------------------------------------------------------------------------
 
-print('[M1377]')
+logging.debug('[M1377]')
 
 # ---------------------------------------------------------------------------
 # M1148: Megatron be8de1b36 — fixed shared weight attribute for fp32.
@@ -85,7 +86,7 @@ print('[M1377]')
 #   this file from prior migrations.)
 # ---------------------------------------------------------------------------
 
-print('[M1141]')
+logging.debug('[M1141]')
 
 # ---------------------------------------------------------------------------
 # M1111: Megatron 2c1660e76 — cleaned distrib_optimizer.py.
@@ -114,7 +115,7 @@ print('[M1141]')
 #   stub raise-Exception methods replaced with real state_dict/load_state_dict.)
 # ---------------------------------------------------------------------------
 
-print('[M1111]')
+logging.debug('[M1111]')
 
 # ---------------------------------------------------------------------------
 # M1098: Megatron 862d70fce — small fixes.
@@ -150,7 +151,7 @@ print('[M1111]')
 #   model/distributed.py has no equivalent; skipped.
 # ---------------------------------------------------------------------------
 
-print('[M1098]')
+logging.debug('[M1098]')
 
 # ---------------------------------------------------------------------------
 # M1062: Megatron c13c0a3e8 — debugging; localized issue to gather_params()
@@ -186,7 +187,7 @@ print('[M1098]')
 # to the analogous Float16OptimizerWithFloat16Params class herein.
 # ---------------------------------------------------------------------------
 
-print('[M1062]')
+logging.debug('[M1062]')
 
 # ---------------------------------------------------------------------------
 # M1110: Megatron efa3cbcf0 — partially cleaned optimizer.py.
@@ -221,7 +222,7 @@ print('[M1062]')
 #      step(self, args, timers); removed ITERATION from clip_grad_norm call.
 # ---------------------------------------------------------------------------
 
-print('[M1110]')
+logging.debug('[M1110]')
 
 # ---------------------------------------------------------------------------
 # M1013: Megatron 7dc8c4759 — feb 9 alpha
@@ -273,8 +274,8 @@ print('[M1110]')
 #      (>>> / <<< markers).
 # ---------------------------------------------------------------------------
 
-print('[M1013]')
-print('[M1061]')
+logging.debug('[M1013]')
+logging.debug('[M1061]')
 
 
 from abc import ABC
@@ -301,7 +302,7 @@ except ImportError:
         from torch.optim import Adam as _TorchAdam  # noqa: F401
         HAVE_APEX_OR_TE = False
 
-print(f'[M2000] HAVE_APEX_OR_TE={HAVE_APEX_OR_TE}')
+logging.debug(f'[M2000] HAVE_APEX_OR_TE={HAVE_APEX_OR_TE}')
 
 # apex / amp_C are optional NVIDIA packages (fused CUDA kernels).
 # Provide a pure-Python fallback so the module loads on CPU/CI environments.
@@ -659,7 +660,7 @@ class Float16OptimizerWithFloat16Params(MegatronOptimizer):
                         # M1148 (Megatron be8de1b36): fp32 param is used directly
                         # (not sharded/copied), so 'shared' attribute is already
                         # present on param — no propagation needed.
-                        print('[M1148]')
+                        logging.debug('[M1148]')
 
                     else:
                         raise TypeError('Wrapped parameters must be one of '
@@ -1054,7 +1055,8 @@ class Float16DistributedOptimizer(BaseFloat16Optimizer):
 
         # M1820: 公共属性时代已来，私有前缀如旧社会辫子，剪去方为新人。
         # Megatron 4feb2b0d: _grad_buffer_param_index_map → grad_buffer_param_index_map
-        print(f"[M1820-DIST-OPT] get_model_gbuf_param_shard_map: dtype={dtype}, "
+        
+        logging.debug(f"[M1820-DIST-OPT] get_model_gbuf_param_shard_map: dtype={dtype}, "
               f"model={type(model).__name__}, "
               f"has grad_buffer_param_index_map={hasattr(model, 'grad_buffer_param_index_map')}")
         param_world_index_map = model.grad_buffer_param_index_map[dtype]
@@ -1092,7 +1094,8 @@ class Float16DistributedOptimizer(BaseFloat16Optimizer):
 
         # M1820: _grad_buffers 已成历史尘埃，grad_buffers 方为正道。
         # Megatron 4feb2b0d: _grad_buffers → grad_buffers (public rename)
-        print(f"[M1820-DIST-OPT] get_model_gbuf_shard: dtype={dtype}, "
+        
+        logging.debug(f"[M1820-DIST-OPT] get_model_gbuf_shard: dtype={dtype}, "
               f"has grad_buffers={hasattr(model, 'grad_buffers')}")
         # Grad buffer shard.
         grad_buffer = model.grad_buffers[dtype]
@@ -1246,7 +1249,8 @@ class Float16DistributedOptimizer(BaseFloat16Optimizer):
     def state_dict(self):
         # M2000: cache state_dict once; avoids calling self.optimizer.state_dict() twice.
         inner_state_dict = self.optimizer.state_dict()
-        print(f'[M2000] Float16DistributedOptimizer.state_dict: '
+        
+        logging.debug(f'[M2000] Float16DistributedOptimizer.state_dict: '
               f'HAVE_APEX_OR_TE={HAVE_APEX_OR_TE}, '
               f'num_param_groups={len(inner_state_dict.get("param_groups", []))}')
         state_dict = {}
@@ -1258,7 +1262,7 @@ class Float16DistributedOptimizer(BaseFloat16Optimizer):
             steps = list(set([s['step'].item() for s in inner_state_dict['state'].values()]))
             assert len(steps) == 1, f'[M2000] expected uniform step; got {steps}'
             step = steps[0]
-            print(f'[M2000] state_dict: extracted step={step}')
+            logging.debug(f'[M2000] state_dict: extracted step={step}')
 
         state_dict['optimizer'] = {k: v for k, v in inner_state_dict.items() if k != 'state'}
         if self.grad_scaler:
@@ -1268,7 +1272,7 @@ class Float16DistributedOptimizer(BaseFloat16Optimizer):
             if not HAVE_APEX_OR_TE:
                 # Native PyTorch Adam param_group must carry step for checkpoint round-trip.
                 param_group['step'] = step
-                print(f'[M2000] state_dict: injecting step={step} into param_group')
+                logging.debug(f'[M2000] state_dict: injecting step={step} into param_group')
 
         state_dict['groups'] = [g['params'] for g in self.optimizer.param_groups]
         return state_dict
@@ -1279,7 +1283,8 @@ class Float16DistributedOptimizer(BaseFloat16Optimizer):
             optimizer_key = 'optimizer_state_dict'
             print_rank_0('***WARNING*** loading optimizer from '
                          'an old checkpoint ...')
-        print(f'[M2000] Float16DistributedOptimizer.load_state_dict: '
+        
+        logging.debug(f'[M2000] Float16DistributedOptimizer.load_state_dict: '
               f'HAVE_APEX_OR_TE={HAVE_APEX_OR_TE}')
         self.optimizer.load_state_dict(state_dict[optimizer_key])
 
@@ -1291,7 +1296,7 @@ class Float16DistributedOptimizer(BaseFloat16Optimizer):
             step = torch.tensor(steps[0], dtype=torch.float)
             for s in self.optimizer.state.values():
                 s['step'] = step
-            print(f'[M2000] load_state_dict: reinjected step={step.item()} into optimizer state')
+            logging.debug(f'[M2000] load_state_dict: reinjected step={step.item()} into optimizer state')
 
         # Grad scaler.
         if 'grad_scaler' not in state_dict:
@@ -1496,7 +1501,7 @@ class Float16DistributedOptimizer(BaseFloat16Optimizer):
 #   to reverse index (index=numel, index-=numel, iterate params reversed).
 #   This ensures DeslocDistributedOptimizerShardManager.build_shard_ranges()
 #   in deepspeed/runtime/engine.py reads consistent [start,end) coords.
-#   Adds print('[M1835]') in engine.py inside DesLocGradBuffer.__init__().
+#   Adds  logging.debug('[M1835]') in engine.py inside DesLocGradBuffer.__init__().
 # ---------------------------------------------------------------------------
 
-print('[M1835]')
+logging.debug('[M1835]')

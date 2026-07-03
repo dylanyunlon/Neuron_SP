@@ -1,3 +1,4 @@
+import logging
 # SPDX-License-Identifier: Apache-2.0
 # DeepSpeed Team
 
@@ -15,7 +16,7 @@
 #      param_groups[0] and param_groups[1]) bounded by >>> / <<< markers.
 # ---------------------------------------------------------------------------
 
-print('[M1013]')
+logging.debug('[M1013]')
 
 try:
     from apex.optimizers import FusedAdam as Adam

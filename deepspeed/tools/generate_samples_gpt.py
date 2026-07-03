@@ -1,3 +1,4 @@
+import logging
 # coding=utf-8
 # Copyright (c) 2020, NVIDIA CORPORATION.  All rights reserved.
 #
@@ -15,7 +16,7 @@
 
 """Sample Generate GPT"""
 
-print('[M869]')
+logging.debug('[M869]')
 
 import os
 import sys

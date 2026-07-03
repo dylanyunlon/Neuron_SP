@@ -1,3 +1,4 @@
+import logging
 # Copyright (c) Microsoft Corporation.
 # SPDX-License-Identifier: Apache-2.0
 
@@ -55,7 +56,7 @@
 #     Megatron dependencies.
 # ===========================================================================
 
-print('[M831]')
+logging.debug('[M831]')
 
 """Forward step utilities — M831 port of Megatron a7539b0f8."""
 
@@ -89,7 +90,7 @@ class InferenceParams:
         assert max_sequence_length > 0
         assert max_batch_size > 0
         self.max_sequence_length = max_sequence_length
-        print(f'[M1735][InferenceParams] max_sequence_length={max_sequence_length}')
+        logging.debug(f'[M1735][InferenceParams] max_sequence_length={max_sequence_length}')
         self.max_batch_size = max_batch_size
         self.sequence_len_offset = 0
         self.batch_size_offset = 0

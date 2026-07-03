@@ -1,3 +1,4 @@
+import logging
 # Copyright (c) Microsoft Corporation.
 # SPDX-License-Identifier: Apache-2.0
 
@@ -31,7 +32,7 @@
 #     back gracefully when no global args are set.
 #   • mpu.get_pipeline_model_parallel_*_rank() / is_pipeline_*_stage()
 #     resolved via deepspeed.compile.mpu_initialize.
-#   • Adds print('[M556]') marker.
+#   • Adds  logging.debug('[M556]') marker.
 # ---------------------------------------------------------------------------
 # M734: Megatron 1dccefd89 — Make it possible to pass in tensor shapes to
 #       communication methods in p2p_communication.py
@@ -91,13 +92,13 @@
 # 20% adaptation:
 #   • _batched_p2p_ops/_p2p_ops use DS-local _prev_rank()/_next_rank() and
 #     pass group=None (pipeline group; DS simplified form).
-#   • Adds print('[M1501]') markers at module load and in each changed site.
+#   • Adds  logging.debug('[M1501]') markers at module load and in each changed site.
 # ---------------------------------------------------------------------------
 
-print('[M556]')
-print('[M734]')
-print('[M1161]')
-print('[M1501]')
+logging.debug('[M556]')
+logging.debug('[M734]')
+logging.debug('[M1161]')
+logging.debug('[M1501]')
 
 import operator
 from functools import reduce
@@ -214,7 +215,7 @@ def _batched_p2p_ops(*, tensor_send_prev, tensor_recv_prev,
         reqs = torch.distributed.batch_isend_irecv(ops)
     else:
         reqs = []
-    print('[M1501] _batched_p2p_ops: dispatched', len(ops), 'ops')
+    logging.debug('[M1501] _batched_p2p_ops: dispatched', len(ops), 'ops')
     return reqs
 
 
@@ -254,7 +255,7 @@ def _p2p_ops(*, tensor_send_prev, tensor_recv_prev,
         if tensor_send_prev is not None:
             reqs.append(torch.distributed.isend(
                 tensor=tensor_send_prev, dst=_prev_rank()))
-    print('[M1501] _p2p_ops: rank', rank, 'dispatched', len(reqs), 'ops')
+    logging.debug('[M1501] _p2p_ops: rank', rank, 'dispatched', len(reqs), 'ops')
     return reqs
 
 
@@ -376,7 +377,8 @@ def _communicate(tensor_send_next, tensor_send_prev, recv_prev, recv_next,
     if batch_p2p_comm:
         # To protect against race condition when using batch_isend_irecv().
         torch.cuda.synchronize()
-    print('[M1501] _communicate: batch_p2p_comm=%s wait_on_reqs=%s' % (
+    
+    logging.debug('[M1501] _communicate: batch_p2p_comm=%s wait_on_reqs=%s' % (
         batch_p2p_comm, wait_on_reqs))
 
     # If using scatter-gather optimization, gather smaller chunks.
@@ -495,7 +497,8 @@ def send_backward(input_tensor_grad, timers=None, use_ring_exchange=False,
         return
     if timers is not None:
         timers('backward-send').start()
-    print(f'[M1501] send_backward: grad_shape='
+    
+    logging.debug(f'[M1501] send_backward: grad_shape='
           f'{input_tensor_grad.shape if input_tensor_grad is not None else None} '
           f'batch_p2p_comm={batch_p2p_comm}')
     _communicate(
@@ -520,7 +523,8 @@ def send_forward_recv_backward(output_tensor, timers=None, use_ring_exchange=Fal
         return None
     if timers is not None:
         timers('forward-send-backward-recv').start()
-    print(f'[M1501] send_forward_recv_backward: output_shape='
+    
+    logging.debug(f'[M1501] send_forward_recv_backward: output_shape='
           f'{output_tensor.shape if output_tensor is not None else None} '
           f'batch_p2p_comm={batch_p2p_comm}')
     _, output_tensor_grad, _ = _communicate(
@@ -532,7 +536,8 @@ def send_forward_recv_backward(output_tensor, timers=None, use_ring_exchange=Fal
         batch_p2p_comm=batch_p2p_comm)
     if timers is not None:
         timers('forward-send-backward-recv').stop()
-    print(f'[M1501] send_forward_recv_backward: received grad_shape='
+    
+    logging.debug(f'[M1501] send_forward_recv_backward: received grad_shape='
           f'{output_tensor_grad.shape if output_tensor_grad is not None else None}')
     return output_tensor_grad
 

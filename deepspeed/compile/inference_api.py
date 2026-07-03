@@ -1,3 +1,4 @@
+import logging
 # SPDX-License-Identifier: Apache-2.0
 # DeepSpeed Team
 
@@ -52,7 +53,7 @@ from deepspeed.compile import mpu_initialize as mpu
 from deepspeed.compile.text_generation_utils import generate as _generate_legacy
 
 
-print('[M835]')
+logging.debug('[M835]')
 
 
 def generate_and_post_process(model,

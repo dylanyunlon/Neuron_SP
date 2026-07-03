@@ -1,3 +1,4 @@
+import logging
 # coding=utf-8
 # Copyright (c) 2019, NVIDIA CORPORATION.  All rights reserved.
 #
@@ -28,6 +29,6 @@
 # Mapping: megatron/tokenizer/ → deepspeed/tokenizer/
 # ---------------------------------------------------------------------------
 
-print('[M76]')
+logging.debug('[M76]')
 
 from .tokenizer import build_tokenizer

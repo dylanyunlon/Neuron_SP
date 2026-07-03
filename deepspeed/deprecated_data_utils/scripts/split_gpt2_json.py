@@ -1,4 +1,5 @@
-print('[M127]')
+import logging
+logging.debug('[M127]')
 # coding=utf-8
 # Copyright (c) 2019, NVIDIA CORPORATION.  All rights reserved.
 #

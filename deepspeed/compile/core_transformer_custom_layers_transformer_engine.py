@@ -1,3 +1,4 @@
+import logging
 # Copyright (c) Microsoft Corporation.
 # SPDX-License-Identifier: Apache-2.0
 
@@ -29,7 +30,7 @@
 #   TELinear.__init__: param return_bias -> skip_bias_add
 #   self.te_return_bias = skip_bias_add and bias  (logic unchanged)
 #
-# 20% adaptation: adds print('[M1527]') diagnostic markers and 鲁迅式 docstring.
+# 20% adaptation: adds  logging.debug('[M1527]') diagnostic markers and 鲁迅式 docstring.
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
@@ -58,7 +59,7 @@
 # 20% adaptation (鲁迅式迁移):
 #   - 鲁迅云：「无穷的远方，无数的人们，都和我有关。」
 #     层归一化与线性层，合二为一，消弭边界，性能相关。
-#   - Adds print('[M1750]') diagnostic marker.
+#   - Adds  logging.debug('[M1750]') diagnostic marker.
 #   - TELayerNormColumnParallelLinear.__init__ prints fusion params on construction.
 #   - TELayerNormColumnParallelLinear.forward prints input shape for diagnostics.
 # ---------------------------------------------------------------------------
@@ -81,13 +82,13 @@
 #             ub_overlap_rs_dgrad 一旦启用，则 Reduce-Scatter 掩于 DGRAD 之下，
 #             如燕雀翱翔于长天，何其自在。」
 #   - Version guard mirrors upstream (> 1.6.0.dev0).
-#   - print('[M1960]') diagnostic in __init__ reports rs_dgrad setting.
+#   -  logging.debug('[M1960]') diagnostic in __init__ reports rs_dgrad setting.
 # ---------------------------------------------------------------------------
-print('[M1960] core_transformer_custom_layers_transformer_engine: ub_overlap_rs_dgrad support')
-print('[M1425]')
-print('[M1525]')
-print('[M1527]')
-print('[M1750]')
+logging.debug('[M1960] core_transformer_custom_layers_transformer_engine: ub_overlap_rs_dgrad support')
+logging.debug('[M1425]')
+logging.debug('[M1525]')
+logging.debug('[M1527]')
+logging.debug('[M1750]')
 # ---------------------------------------------------------------------------
 # M1870: Megatron 7a70c5401 — GPT model level change for context parallelism
 # Source: megatron/core/transformer/custom_layers/transformer_engine.py
@@ -102,7 +103,7 @@ print('[M1750]')
 # 20% adaptation (鲁迅式迁移):
 #   鲁迅云：「真的猛士，敢于直面惨淡的人生，敢于正视淋漓的鲜血。」
 #   注意力之计算，跨rank之通信，cp_stream承载异步之望，各rank之数据轮转如环。
-#   Adds print('[M1870]') diagnostic markers.
+#   Adds  logging.debug('[M1870]') diagnostic markers.
 # ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
 # M1940: Megatron 1a3e1c522 — Add transpose cache feature
@@ -121,10 +122,10 @@ print('[M1750]')
 #   鲁迅曰：「转置之缓存，犹如旧俗——废之则纯净，留之则高效，两难之间，配置为鉴。」
 #   - is_first_microbatch 追踪每轮首批，确保缓存在正确时刻失效。
 #   - disable_parameter_transpose_cache=True 时传 None，令 TE 逐步重计算转置。
-#   - Adds print('[M1940]') diagnostic markers in __init__ and forward.
+#   - Adds  logging.debug('[M1940]') diagnostic markers in __init__ and forward.
 # ---------------------------------------------------------------------------
-print('[M1940] transpose cache feature: disable_parameter_transpose_cache support')
-print('[M1870] context parallelism: cp_stream + CP group args for TEDotProductAttention')
+logging.debug('[M1940] transpose cache feature: disable_parameter_transpose_cache support')
+logging.debug('[M1870] context parallelism: cp_stream + CP group args for TEDotProductAttention')
 import torch
 import transformer_engine as te
 from importlib.metadata import version as _te_version
@@ -142,7 +143,7 @@ from megatron.core.tensor_parallel import get_cuda_rng_tracker
 # M1870: Dedicated CUDA stream for context-parallel ring-attention communication.
 # Allows CP all-to-all comms to overlap with compute on the main stream.
 cp_stream = torch.cuda.Stream()
-print('[M1870] cp_stream created: %s' % cp_stream)
+logging.debug('[M1870] cp_stream created: %s' % cp_stream)
 
 
 class TELayerNorm(te.pytorch.module.LayerNorm):
@@ -187,7 +188,8 @@ class TELinear(te.pytorch.module.Linear):
         # M1940: track first microbatch for transpose cache control.
         self.is_first_microbatch = True
         self.disable_parameter_transpose_cache = self.config.disable_parameter_transpose_cache
-        print(f'[M1940] TELinear.__init__ disable_parameter_transpose_cache='
+        
+        logging.debug(f'[M1940] TELinear.__init__ disable_parameter_transpose_cache='
               f'{self.disable_parameter_transpose_cache}')
 
         # M1527: skip_bias_add replaces return_bias (rename only, logic identical).
@@ -196,7 +198,8 @@ class TELinear(te.pytorch.module.Linear):
         # 由我们自己补 None——这样 forward 始终两个返回值，
         # 省得上层代码还要猜。
         self.te_return_bias = skip_bias_add and bias
-        print(f'[M1527] TELinear.__init__ bias={bias} skip_bias_add={skip_bias_add} '
+        
+        logging.debug(f'[M1527] TELinear.__init__ bias={bias} skip_bias_add={skip_bias_add} '
               f'te_return_bias={self.te_return_bias}')
 
         super().__init__(
@@ -220,16 +223,16 @@ class TELinear(te.pytorch.module.Linear):
         _is_first_microbatch = (
             None if self.disable_parameter_transpose_cache else self.is_first_microbatch
         )
-        print(f'[M1940] TELinear.forward _is_first_microbatch={_is_first_microbatch}')
+        logging.debug(f'[M1940] TELinear.forward _is_first_microbatch={_is_first_microbatch}')
         out = super().forward(x, is_first_microbatch=_is_first_microbatch)
         self.is_first_microbatch = False
 
         # TE 只在 return_bias=True 时返回元组，否则返回单个 Tensor；
         # 我们无论如何都返回两个值，调用方一律用 output, _ = layer(x)。
         if self.te_return_bias:
-            print(f'[M1527] TELinear.forward te_return_bias=True, returning tuple as-is')
+            logging.debug(f'[M1527] TELinear.forward te_return_bias=True, returning tuple as-is')
             return out
-        print(f'[M1527] TELinear.forward te_return_bias=False, appending None bias')
+        logging.debug(f'[M1527] TELinear.forward te_return_bias=False, appending None bias')
         return out, None
 
 
@@ -261,7 +264,8 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
         # M1940: track first microbatch for transpose cache control.
         self.is_first_microbatch = True
         self.disable_parameter_transpose_cache = self.config.disable_parameter_transpose_cache
-        print(f'[M1940] TELayerNormColumnParallelLinear.__init__ disable_parameter_transpose_cache='
+        
+        logging.debug(f'[M1940] TELayerNormColumnParallelLinear.__init__ disable_parameter_transpose_cache='
               f'{self.disable_parameter_transpose_cache}')
         # TE returns zero-length Tensor when bias=False and return_bias=True;
         # we prefer None — so we handle it ourselves.
@@ -278,12 +282,15 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
             if _te_ver > _pkg.version.Version("1.6.0.dev0"):
                 rs_dgrad = getattr(self.config, "tp_comm_overlap_rs_dgrad", False)
                 kwargs.setdefault("ub_overlap_rs_dgrad", rs_dgrad)
-                print(f'[M1960] TELayerNormColumnParallelLinear.__init__ \'
+                
+                logging.debug(f'[M1960] TELayerNormColumnParallelLinear.__init__ \'
                       f'ub_overlap_rs_dgrad={rs_dgrad} (TE={_te_ver})')
         except Exception:
             pass  # 无法检测版本时跳过，默认 LayerNorm
 
-        print(
+        
+
+        logging.debug(
             f'[M1750] TELayerNormColumnParallelLinear.__init__ '
             f'input={input_size} output={output_size} '
             f'bias={bias} skip_bias_add={skip_bias_add} '
@@ -307,12 +314,12 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
         )
 
     def forward(self, x):
-        print(f'[M1750] TELayerNormColumnParallelLinear.forward input_shape={tuple(x.shape)}')
+        logging.debug(f'[M1750] TELayerNormColumnParallelLinear.forward input_shape={tuple(x.shape)}')
         # M1940: None disables TE's transpose cache entirely; otherwise track first microbatch.
         _is_first_microbatch = (
             None if self.disable_parameter_transpose_cache else self.is_first_microbatch
         )
-        print(f'[M1940] TELayerNormColumnParallelLinear.forward _is_first_microbatch={_is_first_microbatch}')
+        logging.debug(f'[M1940] TELayerNormColumnParallelLinear.forward _is_first_microbatch={_is_first_microbatch}')
         out = super().forward(x, is_first_microbatch=_is_first_microbatch)
         self.is_first_microbatch = False
         # TE 只在 return_bias=True 时返回元组，否则返回单个 Tensor；
@@ -371,7 +378,7 @@ class TERowParallelLinear(TELinear):
 #
 # 20% adaptation (鲁迅式迁移):
 #   - 名不正则言不顺，TECoreAttention 终归其正名 TEDotProductAttention。
-#   - Adds print('[M1700]') diagnostic marker.
+#   - Adds  logging.debug('[M1700]') diagnostic marker.
 # ---------------------------------------------------------------------------
 class TEDotProductAttention(te.pytorch.transformer.DotProductAttention):
     """
@@ -400,4 +407,4 @@ class TEDotProductAttention(te.pytorch.transformer.DotProductAttention):
             cp_stream=cp_stream,
             **kwargs
         )
-        print('[M1870] TEDotProductAttention.__init__: cp_group=%s' % get_context_parallel_group())
+        logging.debug('[M1870] TEDotProductAttention.__init__: cp_group=%s' % get_context_parallel_group())

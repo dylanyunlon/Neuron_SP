@@ -1,3 +1,4 @@
+import logging
 # coding=utf-8
 # Copyright (c) 2020, NVIDIA CORPORATION.  All rights reserved.
 #
@@ -23,8 +24,8 @@ from flask_restful import Resource, Api
 from megatron import get_args
 from megatron.text_generation import generate_and_post_process
 
-print('[M852]')
-print('[M1215]')
+logging.debug('[M852]')
+logging.debug('[M1215]')
 
 GENERATE_NUM = 0
 lock = threading.Lock()

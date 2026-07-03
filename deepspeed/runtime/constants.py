@@ -1,3 +1,4 @@
+import logging
 # Copyright (c) Microsoft Corporation.
 # SPDX-License-Identifier: Apache-2.0
 
@@ -1182,7 +1183,7 @@ def desloc_clip_grad_per_tier(params, max_norm, tier, total_norm=None, mpu=None)
     parameters_for_norm (model-parallel aware, for norm calculation),
     matching Megatron fb5b2b362 l2_grad_clipper fix.
     """
-    print('[M200]')
+    logging.debug('[M200]')
     import torch as _torch
     # Make sure we have an iterable.
     if isinstance(params, _torch.Tensor):

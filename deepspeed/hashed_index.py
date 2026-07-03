@@ -1,7 +1,8 @@
-print('[M341]')
-print('[M284]')
-print('[M233]')
-print('[M276]')
+import logging
+logging.debug('[M341]')
+logging.debug('[M284]')
+logging.debug('[M233]')
+logging.debug('[M276]')
 import torch
 from torch.nn.parallel import DistributedDataParallel as torchDDP
 
@@ -11,7 +12,7 @@ from megatron.checkpointing import get_checkpoint_tracker_filename, get_checkpoi
 from megatron.data.bert_dataset import get_indexed_dataset_
 from megatron.data.realm_dataset import InverseClozeDataset  # M232: moved from ict_dataset (Megatron 0104f910b)
 from megatron.data.realm_index import BlockData, RandProjectionLSHIndex
-print('[M232]')
+logging.debug('[M232]')
 from megatron.data.samplers import DistributedBatchSampler
 from megatron.initialize import initialize_megatron
 from megatron.model import REALMRetriever
@@ -98,7 +99,7 @@ class IndexBuilder(object):
 
 
 def main():
-    print('[M228]')
+    logging.debug('[M228]')
 
     # TODO
     # consider broadcasting/all-reducing all in memory rather than using the filesystem

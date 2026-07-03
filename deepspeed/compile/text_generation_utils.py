@@ -1,3 +1,4 @@
+import logging
 # SPDX-License-Identifier: Apache-2.0
 # DeepSpeed Team
 
@@ -172,9 +173,9 @@ import torch.nn.functional as F
 
 import deepspeed.comm as dist
 
-print('[M447]')
-print('[M745]')
-print('[M797]')
+logging.debug('[M447]')
+logging.debug('[M745]')
+logging.debug('[M797]')
 
 
 # ---------------------------------------------------------------------------
@@ -578,7 +579,7 @@ def sample_sequence_batch(model, context_tokens, context_lengths,
 #     because this path is rank-0-centric and mirrors upstream exactly.
 # ===========================================================================
 
-print('[M729]')
+logging.debug('[M729]')
 
 
 def tokenize_batch(sentences, get_args_fn=None, get_tokenizer_fn=None):
@@ -729,7 +730,7 @@ def generate_samples_eval(model, context, max_gen_length, eos_token_id,
     the lm eval harness; the upstream comment "This implementation
     hasn't been tested yet to make sure it matches" still applies.
     """
-    print('[M853]')
+    logging.debug('[M853]')
     args = get_args_fn() if get_args_fn else _get_args()
     args.eos_id = eos_token_id
     raw_text_len = len(context)

@@ -1,3 +1,4 @@
+import logging
 # Copyright (c) Microsoft Corporation.
 # SPDX-License-Identifier: Apache-2.0
 
@@ -731,5 +732,5 @@ def _m169_assert_path_before_imports(sys_path, package_root):
         )
 
 
-print('[M169]')
+logging.debug('[M169]')
 # --- End M169 runner ---

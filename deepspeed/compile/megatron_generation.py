@@ -1,3 +1,4 @@
+import logging
 # Copyright (c) Microsoft Corporation.
 # SPDX-License-Identifier: Apache-2.0
 
@@ -45,7 +46,7 @@
 #     mapped to deepspeed/compile/megatron_p2p_communication.py equivalents.
 # ===========================================================================
 
-print('[M831]')
+logging.debug('[M831]')
 
 """Generation utilities — M831 port of Megatron a7539b0f8."""
 

@@ -1,8 +1,9 @@
+import logging
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 # Ported from Megatron-LM commit 98550bf32ab32e3bddeec29ccaa21b91080bf8a8
 # M1424: Add PipelineConfig.
 
-print('[M1424]')
+logging.debug('[M1424]')
 
 # ---------------------------------------------------------------------------
 # M1506: Megatron 4ef31451d — Fixes/cleanup from overlap p2p merge
@@ -23,7 +24,7 @@ print('[M1424]')
 # 20% adaptation: ValueError + print diagnostic in __post__init__.
 # ---------------------------------------------------------------------------
 
-print('[M1506]')
+logging.debug('[M1506]')
 from typing import Callable
 
 import torch
@@ -43,7 +44,7 @@ import torch
 # print diagnostic in __post__init__ reports the func presence.
 # ---------------------------------------------------------------------------
 
-print('[M1860]')
+logging.debug('[M1860]')
 @dataclass
 class PipelineConfig:
     """Pipeline configuration for Megatron Core
@@ -169,9 +170,11 @@ class PipelineConfig:
                 'overlap_p2p_comm and batch_p2p_comm are mutually exclusive '
                 '(Megatron 4ef31451d / Neuron_SP M1506).'
             )
-        print('[M1860] PipelineConfig.__post__init__: finalize_model_grads_func=%s' % (
+        
+        logging.debug('[M1860] PipelineConfig.__post__init__: finalize_model_grads_func=%s' % (
             self.finalize_model_grads_func is not None))
-        print('[M1506] PipelineConfig.__post__init__: overlap_p2p_comm=%s '
+        
+        logging.debug('[M1506] PipelineConfig.__post__init__: overlap_p2p_comm=%s '
               'batch_p2p_comm=%s batch_p2p_sync=%s' % (
                   self.overlap_p2p_comm, self.batch_p2p_comm, self.batch_p2p_sync))
         # DES-LOC M730: validate position_encoding_type for A/B comparison
@@ -181,5 +184,6 @@ class PipelineConfig:
                 f"position_encoding_type must be one of {sorted(_valid_pe)}, "
                 f"got '{self.position_encoding_type}' (Neuron_SP M730)."
             )
-        print('[M730] PipelineConfig.__post__init__: position_encoding_type=%s' % (
+        
+        logging.debug('[M730] PipelineConfig.__post__init__: position_encoding_type=%s' % (
             self.position_encoding_type))

@@ -68,4 +68,4 @@ def optim_state_to_sharding_state(optim_state_dict: StateDict, id_to_sharded_par
     for group in optim_state_dict['param_groups']:
         group['params'] = LocalNonpersitentObject(group['params'])
     optim_state_dict['state'] = sharded_state
-print('[M1437]')
+logging.debug('[M1437]')

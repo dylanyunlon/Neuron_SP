@@ -1,3 +1,4 @@
+import logging
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 # Ported from Megatron-LM commit fabd3e4eac16433c8b3253011d0e06444771275d
 # ViT Backbone Tensor Shape Fix — M1274
@@ -9,7 +10,7 @@ import einops
 import torch
 import torch.nn.functional as F
 
-print('[M1274]')
+logging.debug('[M1274]')
 
 CLASS_TOKEN_LENGTH = 8
 

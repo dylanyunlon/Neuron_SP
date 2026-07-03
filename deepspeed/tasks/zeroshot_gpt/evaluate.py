@@ -1,3 +1,4 @@
+import logging
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
 """GPT zero-shot evaluation."""
@@ -20,7 +21,7 @@ from tasks.finetune_utils import build_data_loader
 from .datasets import build_dataset
 
 # M1830: wrapper class list moved to megatron.utils.ALL_MODULE_WRAPPER_CLASSNAMES (cb7f46cd3)
-print('[M1830][unwrap_model] wrapper class list now lives in megatron.utils — no local imports needed')
+logging.debug('[M1830][unwrap_model] wrapper class list now lives in megatron.utils — no local imports needed')
 
 def get_model_provider(eval_metric):
     """Based on evaluation metric set the parallel-output flag and
@@ -81,7 +82,7 @@ def forward_step(batch, model, eval_metric):
     input_tensor = recv_forward()
 
     # Forward pass through the model.
-    print('[M1830][unwrap_model] calling unwrap_model(model) — default wrapper classes from megatron.utils')
+    logging.debug('[M1830][unwrap_model] calling unwrap_model(model) — default wrapper classes from megatron.utils')
     unwrapped_model = unwrap_model(model)
     unwrapped_model.set_input_tensor(input_tensor)
     output = model(tokens, position_ids, attention_mask)

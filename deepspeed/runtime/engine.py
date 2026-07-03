@@ -1,3 +1,4 @@
+import logging
 # Copyright (c) Microsoft Corporation.
 # SPDX-License-Identifier: Apache-2.0
 
@@ -12,7 +13,7 @@
 #          --merge-file, --data-impl mmap, --min-lr, logging/eval intervals),
 #          new distributed finetune scripts for RACE/MNLI, updated
 #          generate_text.sh to use tools/generate_samples_gpt2.py.
-print('[M171]')
+logging.debug('[M171]')
 
 import os
 import re
@@ -2936,7 +2937,8 @@ class DeepSpeedEngine(Module):
         reusable call.  Kept as additive — allreduce_gradients() still works
         unchanged; callers may opt into the helper for pipeline schedules.
         """
-        print(f"[M506-COMM-HELPER] _reduce_gradients_at_boundary called "
+        
+        logging.debug(f"[M506-COMM-HELPER] _reduce_gradients_at_boundary called "
               f"gas_boundary={self.is_gradient_accumulation_boundary()} "
               f"zero_stage={self.zero_optimization_stage()} "
               f"zenflow={getattr(self, 'zenflow', False)}")
@@ -3288,7 +3290,7 @@ class DeepSpeedEngine(Module):
             self.optimizer.zero_grad()
         else:
             # M393: fp32 path — zero_grad without set_grads_to_None (Megatron 28cd66e1a)
-            print('[M393]')
+            logging.debug('[M393]')
             self.zero_grad()
 
         # Check overflow here since in DS fp16 optimizer, the overflow is updated in above step() function.
@@ -4135,7 +4137,8 @@ class DeepSpeedEngine(Module):
             try:
                 module_state_dict = checkpoint['module']
             except KeyError:
-                print(f"[M455-COMPAT] 'module' key missing from checkpoint dict; "
+                
+                logging.debug(f"[M455-COMPAT] 'module' key missing from checkpoint dict; "
                       f"attempting to use checkpoint root as state_dict "
                       f"(old-format ckpt). Keys present: {list(checkpoint.keys())[:8]}")
                 module_state_dict = checkpoint
@@ -4147,7 +4150,8 @@ class DeepSpeedEngine(Module):
                 except RuntimeError as _ckpt_err:
                     # M455: unexpected keys / missing keys from old checkpoint
                     # format; retry with strict=False as a best-effort fallback.
-                    print(f"[M455-COMPAT] load_state_dict(strict={strict}) raised "
+                    
+                    logging.debug(f"[M455-COMPAT] load_state_dict(strict={strict}) raised "
                           f"RuntimeError: {_ckpt_err}. "
                           f"Retrying with strict=False for old-format compat.")
                     self.module.load_state_dict(module_state_dict, strict=False)
@@ -4392,7 +4396,8 @@ class DeepSpeedEngine(Module):
             self.loaded_checkpoint_dp_world_size = checkpoint['dp_world_size']
         else:
             self.loaded_checkpoint_dp_world_size = 1
-            print(f"[M455-COMPAT] 'dp_world_size' missing from checkpoint; "
+            
+            logging.debug(f"[M455-COMPAT] 'dp_world_size' missing from checkpoint; "
                   f"defaulting to 1 (old-format ckpt). "
                   f"Verify topology before continuing training.")
 
@@ -4429,7 +4434,8 @@ class DeepSpeedEngine(Module):
                 if 'lr_scheduler' in checkpoint:
                     self.lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
                 else:
-                    print(f"[M455-COMPAT] 'lr_scheduler' key absent from checkpoint; "
+                    
+                    logging.debug(f"[M455-COMPAT] 'lr_scheduler' key absent from checkpoint; "
                           f"skipping lr_scheduler restore (old-format ckpt).")
 
             if self.random_ltd_enabled() and self.random_ltd_scheduler is not None and 'random_ltd' in checkpoint:
@@ -4478,7 +4484,8 @@ class DeepSpeedEngine(Module):
                 self.global_steps = checkpoint['global_steps']
             except KeyError:
                 self.global_steps = 0
-                print(f"[M455-COMPAT] 'global_steps' missing from checkpoint; "
+                
+                logging.debug(f"[M455-COMPAT] 'global_steps' missing from checkpoint; "
                       f"defaulting to 0 (old-format ckpt). LR schedule may be wrong.")
 
             # M432: Megatron cebd3b8b1 — addrressed jareds comments
@@ -4491,20 +4498,22 @@ class DeepSpeedEngine(Module):
             self.global_samples = getattr(checkpoint, 'global_samples',
                                           checkpoint.get('global_samples',
                                                          self.global_steps * self.train_batch_size()))
-            print('[M432]')
+            logging.debug('[M432]')
 
             try:
                 self.skipped_steps = checkpoint['skipped_steps']
             except KeyError:
                 self.skipped_steps = 0
-                print(f"[M455-COMPAT] 'skipped_steps' missing from checkpoint; "
+                
+                logging.debug(f"[M455-COMPAT] 'skipped_steps' missing from checkpoint; "
                       f"defaulting to 0 (old-format ckpt).")
 
             try:
                 self.loaded_checkpoint_mp_world_size = checkpoint['mp_world_size']
             except KeyError:
                 self.loaded_checkpoint_mp_world_size = 1
-                print(f"[M455-COMPAT] 'mp_world_size' missing from checkpoint; "
+                
+                logging.debug(f"[M455-COMPAT] 'mp_world_size' missing from checkpoint; "
                       f"defaulting to 1 (old-format ckpt). Validate MP topology.")
             deepspeed_states = [
                 'module', 'sparse_tensor_module_names', 'skipped_steps', 'global_steps', 'dp_world_size',
@@ -5973,7 +5982,7 @@ class DeslocAutoSPCoordinator:
 #   pretrain_bert.py / pretrain_albert.py → deepspeed/runtime/engine.py
 # ---------------------------------------------------------------------------
 
-print('[M36] engine: residual_connection_post_layernorm True→False; padding_mask .byte()→.long(); removed 1-padding_mask inversion — ported from Megatron f6a6811fd')
+logging.debug('[M36] engine: residual_connection_post_layernorm True→False; padding_mask .byte()→.long(); removed 1-padding_mask inversion — ported from Megatron f6a6811fd')
 
 
 def _m36_get_padding_mask(data_b, key='pad_mask'):
@@ -6021,7 +6030,7 @@ _M36_RESIDUAL_POST_LN_DEFAULT = False  # was True in Megatron before this fix
 #   6. "Pretrain BERT" docstring corrected to "Pretrain ALBERT".
 # ---------------------------------------------------------------------------
 
-print('[M37]')
+logging.debug('[M37]')
 
 # Mapping note: pretrain_albert.py lives at the model-entry level in Megatron.
 # In DeepSpeed/Neuron_SP the equivalent training-loop logic is spread across
@@ -6080,7 +6089,7 @@ def _m37_compute_train_val_test_num_samples(train_iters, eval_interval,
 #   megatron/utils.py    → deepspeed/runtime/utils.py
 # ---------------------------------------------------------------------------
 
-print('[M43]')
+logging.debug('[M43]')
 
 # --- End M43 engine ---
 
@@ -6113,7 +6122,7 @@ print('[M43]')
 #     inheritance from MegatronModule.
 # ---------------------------------------------------------------------------
 
-print('[M54]')
+logging.debug('[M54]')
 
 
 def mark_lm_head_bias_parallel(bias, stride: int = 1) -> None:
@@ -6135,7 +6144,8 @@ def mark_lm_head_bias_parallel(bias, stride: int = 1) -> None:
     bias.model_parallel = True
     bias.partition_dim = 0
     bias.stride = stride
-    print(f'[M54-ENGINE] mark_lm_head_bias_parallel: '
+    
+    logging.debug(f'[M54-ENGINE] mark_lm_head_bias_parallel: '
           f'shape={list(bias.shape)} partition_dim=0 stride={stride}')
 
 
@@ -6153,7 +6163,7 @@ def record_layer_number(layer, layer_number: int) -> None:
         layer_number: int — 1-based layer index (Megatron convention).
     """
     layer.layer_number = layer_number
-    print(f'[M54-ENGINE] record_layer_number: layer_number={layer_number}')
+    logging.debug(f'[M54-ENGINE] record_layer_number: layer_number={layer_number}')
 
 # --- End M54 engine ---
 
@@ -6203,7 +6213,7 @@ def record_layer_number(layer, layer_number: int) -> None:
 #   generate_samples.py  → no direct file; pattern recorded here (engine.py)
 # ---------------------------------------------------------------------------
 
-print('[M58]')
+logging.debug('[M58]')
 
 # --- End M58 engine ---
 
@@ -6279,7 +6289,7 @@ print('[M58]')
 #   post-parse assertions) is recorded here as an engine.py annotation.
 # ---------------------------------------------------------------------------
 
-print('[M64]')
+logging.debug('[M64]')
 
 # --- End M64 engine ---
 
@@ -6346,7 +6356,7 @@ print('[M64]')
 #   megatron/model/bert_model.py  → deepspeed/runtime/engine.py
 # ---------------------------------------------------------------------------
 
-print('[M67]')
+logging.debug('[M67]')
 
 
 def _m67_bert_model_init_lm_head(model, hidden_size, init_method,
@@ -6465,7 +6475,7 @@ def _m67_bert_model_load_state_dict(model, state_dict, strict=True):
 #   in global_vars.py maps to DeepSpeedEngine's runtime configuration path.
 # ---------------------------------------------------------------------------
 
-print('[M76]')
+logging.debug('[M76]')
 
 
 def _m76_get_build_tokenizer_from_engine():
@@ -6531,7 +6541,7 @@ def _m102_get_ltor_masks_and_position_ids(get_ltor_fn, tokens, eod_token, reset_
     return get_ltor_fn(tokens, eod_token, reset_position_ids, reset_attention_mask, eod_mask_loss, fp16)
 
 
-print('[M102]')
+logging.debug('[M102]')
 # --- End M102 engine ---
 
 
@@ -6568,7 +6578,7 @@ print('[M102]')
 #   annotation.
 # ---------------------------------------------------------------------------
 
-print('[M155]')
+logging.debug('[M155]')
 
 # --- End M155 engine ---
 
@@ -6643,7 +6653,7 @@ print('[M155]')
 #   DeepSpeed-idiomatic form so downstream callers can adopt it.
 # ---------------------------------------------------------------------------
 
-print('[M297]')
+logging.debug('[M297]')
 
 
 def _m297_gpt2_forward_with_fp16_lm_cross_entropy(model, tokens, position_ids,
@@ -6713,7 +6723,7 @@ def _m297_gpt2_forward_with_fp16_lm_cross_entropy(model, tokens, position_ids,
 #   checkpoint saving with periodic evaluation.
 # ---------------------------------------------------------------------------
 
-print('[M467]')
+logging.debug('[M467]')
 
 
 def _m467_train_loop_step_order(
@@ -6819,7 +6829,7 @@ def _m467_train_loop_step_order(
 #    Applied in deepspeed/runtime/fp16/fused_optimizer.py ::
 #    FusedOptimizer.clip_grad_norm_optimizer().
 # ---------------------------------------------------------------------------
-print('[M472]')
+logging.debug('[M472]')
 # --- End M472 engine ---
 # ---------------------------------------------------------------------------
 # M503: Megatron 5b74f7643 — fixed validation loss reporting in tensorboard
@@ -6862,7 +6872,7 @@ print('[M472]')
 #   validation losses are written to tensorboard.
 # ---------------------------------------------------------------------------
 
-print('[M503]')
+logging.debug('[M503]')
 
 
 def _m503_write_validation_tensorboard(writer, key, loss_value, ppl, iteration, consumed_train_samples):
@@ -6913,7 +6923,7 @@ def _m503_write_validation_tensorboard(writer, key, loss_value, ppl, iteration, 
 #   Updated _m503_write_validation_tensorboard() scalar keys accordingly.
 # ---------------------------------------------------------------------------
 
-print('[M532]')
+logging.debug('[M532]')
 
 
 # --- End M532 engine ---
@@ -6955,9 +6965,10 @@ def _m642_pipelined_module_share_word_embeddings(share_word_embeddings: bool = T
     Returns:
         bool: the validated share_word_embeddings flag.
     """
-    print(f'[M642] PipelinedMegatronModule share_word_embeddings={share_word_embeddings}')
+    logging.debug(f'[M642] PipelinedMegatronModule share_word_embeddings={share_word_embeddings}')
     if not share_word_embeddings:
-        print('[M642] word-embedding sharing disabled — '
+        
+        logging.debug('[M642] word-embedding sharing disabled — '
               'word_embeddings_weight() and initialize_word_embeddings() '
               'will raise on invocation for this model')
     return share_word_embeddings

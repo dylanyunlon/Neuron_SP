@@ -1,3 +1,4 @@
+import logging
 # Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
 
 """ Various loading and saving strategies """
@@ -12,4 +13,4 @@ try:
     from .tensorstore import _import_trigger
 except ImportError:
     print('Zarr strategies will not be registered because of missing packages')
-print('[M1437]')
+logging.debug('[M1437]')

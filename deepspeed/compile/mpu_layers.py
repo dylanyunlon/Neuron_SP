@@ -1,3 +1,4 @@
+import logging
 # Copyright (c) Microsoft Corporation.
 # SPDX-License-Identifier: Apache-2.0
 
@@ -62,7 +63,7 @@
 #
 # 20% adaptation: GPU path uses get_cuda_rng_tracker from mpu_initialize;
 # CPU path calls get_args() from megatron_arguments for params_dtype;
-# mark_weight_parallel updated to use partition_stride; print('[M343]') added.
+# mark_weight_parallel updated to use partition_stride;  logging.debug('[M343]') added.
 # ---------------------------------------------------------------------------
 
 import torch
@@ -70,8 +71,8 @@ import torch.nn as nn
 
 from .mpu_initialize import get_model_parallel_world_size
 
-print('[M54]')
-print('[M343]')
+logging.debug('[M54]')
+logging.debug('[M343]')
 
 # ---------------------------------------------------------------------------
 # M343: _USE_CPU_INITIALIZATION
@@ -101,7 +102,8 @@ def mark_weight_parallel(weight: nn.Parameter,
     weight.model_parallel = True
     weight.partition_dim = partition_dim
     weight.partition_stride = stride  # M343: renamed from .stride → .partition_stride
-    print(f'[M54-LAYERS] mark_weight_parallel: '
+    
+    logging.debug(f'[M54-LAYERS] mark_weight_parallel: '
           f'shape={list(weight.shape)} '
           f'partition_dim={partition_dim} stride={stride}')
 
@@ -124,8 +126,9 @@ def maybe_mark_bias_parallel(bias: nn.Parameter,
     bias.model_parallel = True
     bias.partition_dim = partition_dim
     bias.partition_stride = stride  # M512: renamed from .stride → .partition_stride
-    print('[M512]')
-    print(f'[M54-LAYERS] maybe_mark_bias_parallel: '
+    logging.debug('[M512]')
+    
+    logging.debug(f'[M54-LAYERS] maybe_mark_bias_parallel: '
           f'shape={list(bias.shape)} '
           f'partition_dim={partition_dim} stride={stride}')
 
@@ -158,7 +161,7 @@ from torch.nn.parameter import Parameter
 import torch.nn.init as init
 from .mpu_initialize import get_model_parallel_rank
 
-print('[M342]')
+logging.debug('[M342]')
 
 
 def _initialize_affine_weight_m342(weight, output_size, input_size,
@@ -282,7 +285,9 @@ def _initialize_affine_weight_gpu(weight, init_method, partition_dim, stride=1):
         # Fallback: no RNG tracker available (e.g. unit tests without CUDA)
         init_method(weight)
 
-    print(f'[M343-LAYERS] _initialize_affine_weight_gpu: '
+    
+
+    logging.debug(f'[M343-LAYERS] _initialize_affine_weight_gpu: '
           f'shape={list(weight.shape)} partition_dim={partition_dim}')
 
 
@@ -355,7 +360,9 @@ def _initialize_affine_weight_cpu(weight, output_size, input_size,
     with torch.no_grad():
         torch.cat(my_weight_list, dim=partition_dim, out=weight)
 
-    print(f'[M343-LAYERS] _initialize_affine_weight_cpu: '
+    
+
+    logging.debug(f'[M343-LAYERS] _initialize_affine_weight_cpu: '
           f'shape={list(weight.shape)} partition_dim={partition_dim} '
           f'rank={rank}/{world_size}')
 
@@ -403,7 +410,7 @@ def _initialize_affine_weight_cpu(weight, output_size, input_size,
 #     setattr(self.bias, 'sequence_parallel', args.model_parallel_memory_opt)
 # ---------------------------------------------------------------------------
 
-print('[M1082]')
+logging.debug('[M1082]')
 
 # Change 2 reference implementation — to be applied when RowParallelLinear
 # is fully ported into this file:
@@ -473,7 +480,7 @@ print('[M1082]')
 # file, all three changes above must be applied verbatim.
 # ---------------------------------------------------------------------------
 
-print('[M1157]')
+logging.debug('[M1157]')
 
 # Change 1 reference — ColumnParallelLinear.__init__ signature delta:
 #
@@ -577,4 +584,4 @@ print('[M1157]')
 #   the AFTER pattern above verbatim inside backward().
 # ---------------------------------------------------------------------------
 
-print('[M1245]')
+logging.debug('[M1245]')

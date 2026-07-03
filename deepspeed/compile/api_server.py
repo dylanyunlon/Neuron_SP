@@ -1,3 +1,4 @@
+import logging
 # SPDX-License-Identifier: Apache-2.0
 # DeepSpeed Team
 
@@ -107,9 +108,9 @@ from flask_restful import Resource, Api
 
 from deepspeed.compile.inference_api import generate_and_post_process
 
-print('[M729]')
-print('[M745]')
-print('[M835]')
+logging.debug('[M729]')
+logging.debug('[M745]')
+logging.debug('[M835]')
 
 GENERATE_NUM = 0
 lock = threading.Lock()

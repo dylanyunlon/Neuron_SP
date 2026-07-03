@@ -1,3 +1,4 @@
+import logging
 # coding=utf-8
 # Copyright (c) 2020, NVIDIA CORPORATION.  All rights reserved.
 #
@@ -15,7 +16,7 @@
 
 """Tokenization utilities."""
 
-print('[M813]')
+logging.debug('[M813]')
 
 import torch
 

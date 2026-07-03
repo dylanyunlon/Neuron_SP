@@ -1,3 +1,4 @@
+import logging
 # Copyright (c) Microsoft Corporation.
 # SPDX-License-Identifier: Apache-2.0
 
@@ -49,7 +50,7 @@
 # explicit False can block autograd in edge cases).
 # ---------------------------------------------------------------------------
 
-print('[M1082]')
+logging.debug('[M1082]')
 
 # ---------------------------------------------------------------------------
 # Reference implementations of the three patched functions.
@@ -194,7 +195,7 @@ def _reduce_scatter_along_first_dim(input_, get_tensor_model_parallel_world_size
 #   from .mappings import reduce_scatter_to_sequence_parallel_region_from_moe
 # ---------------------------------------------------------------------------
 
-print('[M1157]')
+logging.debug('[M1157]')
 
 
 def _gather_along_first_dim_moe(input_):
@@ -295,5 +296,7 @@ def reduce_scatter_to_sequence_parallel_region_from_moe(input_):
 #   M1730 merely confirms they are canonical public API — no code change here.
 # ---------------------------------------------------------------------------
 
-print('[M1730] mpu_mappings: gather_from_sequence_parallel_region_to_moe and '
+
+
+logging.debug('[M1730] mpu_mappings: gather_from_sequence_parallel_region_to_moe and '
       'reduce_scatter_to_sequence_parallel_region_from_moe confirmed as public API')

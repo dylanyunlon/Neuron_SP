@@ -1,3 +1,4 @@
+import logging
 # coding=utf-8
 # Copyright (c) 2020, NVIDIA CORPORATION.  All rights reserved.
 #
@@ -15,7 +16,7 @@
 
 """Evaluation utilities."""
 
-print('[M641]')
+logging.debug('[M641]')
 
 from collections import OrderedDict
 import math
