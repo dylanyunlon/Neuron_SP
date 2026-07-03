@@ -96,23 +96,22 @@ def assert_no_cuda_mismatch(name=""):
     cuda_major, cuda_minor = installed_cuda_version(name)
     sys_cuda_version = f'{cuda_major}.{cuda_minor}'
     torch_cuda_version = ".".join(torch.version.cuda.split('.')[:2])
-    torch_cuda_major = int(torch_cuda_version.split('.')[0])
     # This is a show-stopping error, should probably not proceed past this
     if sys_cuda_version != torch_cuda_version:
+        torch_cuda_major = int(torch_cuda_version.split('.')[0])
+        # Allow compilation when system CUDA major version is newer than torch CUDA major version.
+        # CUDA toolkits are backward-compatible: a newer-major nvcc (e.g. 13.0) can compile
+        # extensions targeting an older torch CUDA ABI (e.g. cu124 = 12.4).
+        if cuda_major > torch_cuda_major:
+            print(f"Installed CUDA version {sys_cuda_version} is newer than the "
+                  f"version torch was compiled with {torch.version.cuda}. "
+                  "CUDA is backward-ABI compatible; allowing this cross-major combination.")
+            return True
         if (cuda_major in cuda_minor_mismatch_ok and sys_cuda_version in cuda_minor_mismatch_ok[cuda_major]
                 and torch_cuda_version in cuda_minor_mismatch_ok[cuda_major]):
             print(f"Installed CUDA version {sys_cuda_version} does not match the "
                   f"version torch was compiled with {torch.version.cuda} "
                   "but since the APIs are compatible, accepting this combination")
-            return True
-        elif cuda_major > torch_cuda_major:
-            # System nvcc is a newer major than the CUDA torch was compiled with.
-            # CUDA maintains backward ABI compatibility, so a newer-major nvcc can
-            # compile kernels that link against an older-major libcudart/torch.
-            # This is the common CUDA 13.x nvcc + torch cu12x scenario.
-            print(f"System CUDA {sys_cuda_version} is newer than the CUDA torch was compiled "
-                  f"with ({torch.version.cuda}). CUDA is backward-ABI compatible; "
-                  "allowing this cross-major combination.")
             return True
         elif os.getenv("DS_SKIP_CUDA_CHECK", "0") == "1":
             print(
