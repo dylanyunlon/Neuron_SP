@@ -1993,6 +1993,35 @@ def get_context_parallel_rank() -> int:
 # TP + CP combined world size / rank
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Sequence parallel (SP) accessors
+#
+# In Megatron-style sequence parallelism the sequence dimension is split
+# across the same ranks that hold the tensor-model-parallel group.  The SP
+# group is therefore identical to the TP group.  These thin wrappers exist
+# so that callers (e.g. attention.py, LayerNorm) can express intent clearly
+# without hard-coding the TP↔SP equivalence.
+# ---------------------------------------------------------------------------
+
+def get_sequence_parallel_group() -> torch.distributed.ProcessGroup:
+    """Return the sequence-parallel process group (same as the TP group)."""
+    return get_tensor_model_parallel_group()
+
+
+def get_sequence_parallel_world_size() -> int:
+    """Return the sequence-parallel world size (same as TP world size)."""
+    return get_tensor_model_parallel_world_size()
+
+
+def get_sequence_parallel_rank() -> int:
+    """Return the caller's rank in the sequence-parallel group (same as TP rank)."""
+    return get_tensor_model_parallel_rank()
+
+
+# ---------------------------------------------------------------------------
+# TP + CP combined world size / rank
+# ---------------------------------------------------------------------------
+
 def get_tensor_and_context_parallel_world_size() -> int:
     """Return world size for the TP + CP combined group."""
     if torch.distributed.is_available() and torch.distributed.is_initialized():
