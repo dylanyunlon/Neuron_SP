@@ -1167,6 +1167,16 @@ class DesLocEngine:
         self._core_ddp: Optional[CoreDDP] = None
         self._ddp_dp_group = None  # M4172: persisted for pg_collection threading
         if self._dist_optimizer is not None:
+            # ZeRO-3 path: DistributedOptimizer handles reduce-scatter internally.
+            # But finalize_model_grads still needs a valid DP group for the
+            # pg_collection threading (M4172) — otherwise it falls back to
+            # parallel_state globals which may not be initialized (DES-LOC
+            # skips Megatron parallel init).
+            self._ddp_dp_group = (
+                parallel_state.get_data_parallel_group()
+                if parallel_state.is_initialized()
+                else (dist.group.WORLD if dist.is_initialized() else None)
+            )
             logger.info(
                 "[zero3] core.optimizer.DistributedOptimizer active — "
                 "reduce-scatter via prepare_grads() "
