@@ -75,6 +75,10 @@ def get_default_compute_capabilities():
             compute_caps += ";8.0;8.6;9.0"
             if installed_cuda_version()[1] >= 8:
                 compute_caps += ";10.0;12.0"
+        elif installed_cuda_version()[0] == 13:
+            # CUDA 13 supports Blackwell (SM 12.x) and future architectures.
+            # Include all architectures supported by CUDA 12 plus newer ones.
+            compute_caps += ";8.0;8.6;9.0;10.0;12.0"
     return compute_caps
 
 
@@ -84,6 +88,7 @@ cuda_minor_mismatch_ok = {
     10: ["10.0", "10.1", "10.2"],
     11: ["11.0", "11.1", "11.2", "11.3", "11.4", "11.5", "11.6", "11.7", "11.8"],
     12: ["12.0", "12.1", "12.2", "12.3", "12.4", "12.5", "12.6", "12.8", "12.9"],  # There is no CUDATk 12.7
+    13: ["13.0", "13.1", "13.2"],  # CUDA 13 Blackwell+ series
 }
 
 
@@ -91,6 +96,7 @@ def assert_no_cuda_mismatch(name=""):
     cuda_major, cuda_minor = installed_cuda_version(name)
     sys_cuda_version = f'{cuda_major}.{cuda_minor}'
     torch_cuda_version = ".".join(torch.version.cuda.split('.')[:2])
+    torch_cuda_major = int(torch_cuda_version.split('.')[0])
     # This is a show-stopping error, should probably not proceed past this
     if sys_cuda_version != torch_cuda_version:
         if (cuda_major in cuda_minor_mismatch_ok and sys_cuda_version in cuda_minor_mismatch_ok[cuda_major]
@@ -98,6 +104,15 @@ def assert_no_cuda_mismatch(name=""):
             print(f"Installed CUDA version {sys_cuda_version} does not match the "
                   f"version torch was compiled with {torch.version.cuda} "
                   "but since the APIs are compatible, accepting this combination")
+            return True
+        elif cuda_major > torch_cuda_major:
+            # System nvcc is a newer major than the CUDA torch was compiled with.
+            # CUDA maintains backward ABI compatibility, so a newer-major nvcc can
+            # compile kernels that link against an older-major libcudart/torch.
+            # This is the common CUDA 13.x nvcc + torch cu12x scenario.
+            print(f"System CUDA {sys_cuda_version} is newer than the CUDA torch was compiled "
+                  f"with ({torch.version.cuda}). CUDA is backward-ABI compatible; "
+                  "allowing this cross-major combination.")
             return True
         elif os.getenv("DS_SKIP_CUDA_CHECK", "0") == "1":
             print(
@@ -791,7 +806,9 @@ class CUDAOpBuilder(OpBuilder):
 
             cuda_major, cuda_minor = installed_cuda_version()
             if cuda_major > 10:
-                if cuda_major == 12 and cuda_minor >= 5:
+                if cuda_major >= 13 or (cuda_major == 12 and cuda_minor >= 5):
+                    # CUDA 12.5+ and CUDA 13+ default to C++20 for better constexpr
+                    # and cooperative-groups support on Blackwell and newer architectures.
                     std_lib = '-std=c++20'
                 else:
                     std_lib = '-std=c++17'
