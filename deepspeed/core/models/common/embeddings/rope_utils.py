@@ -128,6 +128,12 @@ def _apply_rotary_pos_emb_bshd(
         x2 = t[..., 1::2]
         t = torch.cat((x1, x2), dim=-1)
 
+    # M-ROPE-FIX: ZeRO-3 + heterogeneous multi-GPU — freqs buffers may remain on CPU
+    # while t (query/key) lives on GPU. Move freqs to t's device before cos/sin computation.
+    # Ref: HuggingFace transformers PR #32312, DeepSpeed issue #5311, vLLM .to(device).
+    if freqs.device != t.device:
+        freqs = freqs.to(device=t.device)
+
     # first part is cosine component
     # second part is sine component, need to change signs with _rotate_half method
     cos_ = (torch.cos(freqs) * mscale).to(t.dtype)
@@ -365,8 +371,11 @@ def apply_rotary_pos_emb_with_cos_sin(
     This function applies rotary positional embedding to the target tensor t
     using precomputed cos and sin of size (seq_len, d_rot / 2)
     """
-    cos = cos.to(t.dtype)
-    sin = sin.to(t.dtype)
+    # M-ROPE-FIX: ZeRO-3 + heterogeneous multi-GPU — cos/sin may be on CPU while t is on GPU.
+    # Move to t's device (and cast dtype) before computation.
+    # Ref: HuggingFace transformers PR #32312, DeepSpeed issue #5311.
+    cos = cos.to(device=t.device, dtype=t.dtype)
+    sin = sin.to(device=t.device, dtype=t.dtype)
 
     if apply_rotary_emb_flash is None:
         # Combine cos and sin into freqs

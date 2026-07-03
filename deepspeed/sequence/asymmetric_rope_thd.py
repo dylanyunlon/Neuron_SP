@@ -404,6 +404,12 @@ def _apply_rotary_pos_emb_bshd(
     # Reshape for complex multiply: (..., rot_dim) → (..., rot_dim/2, 2)
     t_r = t_rot.float().reshape(*t_rot.shape[:-1], -1, 2)
 
+    # M-ROPE-FIX: ZeRO-3 + heterogeneous multi-GPU — freqs may remain on CPU
+    # while t (query/key) is on GPU. Move to t's device before cos/sin computation.
+    # Ref: HuggingFace transformers PR #32312, DeepSpeed issue #5311, vLLM .to(device).
+    if freqs.device != t.device:
+        freqs = freqs.to(device=t.device)
+
     cos_f = freqs.float().cos() * mscale  # (seqlen, 1, 1, rot_dim/2)
     sin_f = freqs.float().sin() * mscale
 

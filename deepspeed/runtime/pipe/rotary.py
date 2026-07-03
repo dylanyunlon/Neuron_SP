@@ -183,12 +183,15 @@ class NeoXRotaryEmbedding(nn.Module):
         cos = cos.unsqueeze(0).unsqueeze(0)
         sin = sin.unsqueeze(0).unsqueeze(0)
 
+        # M-ROPE-FIX: ZeRO-3 + heterogeneous multi-GPU: cos/sin buffers may remain on CPU
+        # while query/key are on GPU. Move them to query's device before computation.
+        # Ref: HuggingFace transformers PR #32312, DeepSpeed issue #5311, vLLM .to(device).
         # Cast to pipe_dtype for heterogeneous compute (FP16 / BF16)
         orig_dtype = q.dtype
         q_fp = q.to(self.pipe_dtype)
         k_fp = k.to(self.pipe_dtype)
-        cos  = cos.to(self.pipe_dtype)
-        sin  = sin.to(self.pipe_dtype)
+        cos  = cos.to(device=q.device, dtype=self.pipe_dtype)
+        sin  = sin.to(device=q.device, dtype=self.pipe_dtype)
 
         rotate_fn = self._rotate_interleaved if self.interleaved else self._rotate_half
 

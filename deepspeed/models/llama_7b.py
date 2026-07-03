@@ -117,6 +117,12 @@ class RotaryEmbedding(nn.Module):
         cos = self.cos_cached[offset : offset + seq_len].unsqueeze(0).unsqueeze(0)
         sin = self.sin_cached[offset : offset + seq_len].unsqueeze(0).unsqueeze(0)
 
+        # M-ROPE-FIX: ZeRO-3 + heterogeneous multi-GPU — cos/sin buffers (register_buffer)
+        # may remain on CPU while q/k live on GPU. Explicitly move to query's device.
+        # Ref: HuggingFace transformers PR #32312, DeepSpeed issue #5311, vLLM .to(device).
+        cos = cos.to(device=q.device, dtype=q.dtype)
+        sin = sin.to(device=q.device, dtype=q.dtype)
+
         q_rot = q * cos + self._rotate_half(q) * sin
         k_rot = k * cos + self._rotate_half(k) * sin
         return q_rot.to(q.dtype), k_rot.to(k.dtype)

@@ -95,7 +95,17 @@ def apply_rotary_pos_emb(t, freqs_cos, freqs_sin):
     input tensor t is of shape [seq_length, ..., dim]
     rotary positional embeding tensor freqs is of shape [seq_length, ..., dim]
     check https://kexue.fm/archives/8265 for detailed formulas
+
+    M-ROPE-FIX: ZeRO-3 + heterogeneous multi-GPU — freqs_cos/freqs_sin may remain
+    on CPU while t (query/key) is on GPU. Move them to t's device before use.
+    Ref: HuggingFace transformers PR #32312, DeepSpeed issue #5311, vLLM .to(device).
     """
+    # M-ROPE-FIX: ensure cos/sin are on the same device as the input tensor
+    if freqs_cos.device != t.device:
+        freqs_cos = freqs_cos.to(device=t.device)
+    if freqs_sin.device != t.device:
+        freqs_sin = freqs_sin.to(device=t.device)
+
     rot_dim = freqs_cos.shape[-1]
     # ideally t_pass is empty so rotary pos embedding is applied to all tensor t
     t, t_pass = t[..., :rot_dim], t[..., rot_dim:]

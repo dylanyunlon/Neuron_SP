@@ -567,9 +567,19 @@ class _RotaryEmbedding(nn.Module):
 
         Downstream code (rope_utils._apply_rotary_pos_emb_bshd) applies
         torch.cos / torch.sin itself, so we must NOT pre-compute them here.
+
+        M-ROPE-FIX: When device=None, use the accelerator device rather than
+        CPU to prevent ZeRO-3 + heterogeneous multi-GPU device mismatch where
+        cos/sin freqs stay on CPU while query/key tensors are on GPU.
+        Ref: HuggingFace transformers PR #32312, DeepSpeed issue #5311.
         """
         if device is None:
-            device = torch.device("cpu")
+            try:
+                from deepspeed.accelerator import get_accelerator
+                device = torch.device(get_accelerator().current_device_name())
+            except Exception:
+                # Only fall back to CUDA/CPU if accelerator detection fails entirely
+                device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self._build_cache(seq_len, device, torch.float32)
         assert self._freqs_cached is not None
         freqs = self._freqs_cached[:seq_len]  # [s, dim]

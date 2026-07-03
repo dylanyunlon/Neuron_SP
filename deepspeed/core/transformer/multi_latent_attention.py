@@ -279,48 +279,16 @@ except ImportError:
 # RoPE imports  (lazy from Megatron; fallback stubs for import-time safety)
 # ---------------------------------------------------------------------------
 
-try:
-    from megatron.core.models.common.embeddings import (
-        RotaryEmbedding,
-        YarnRotaryEmbedding,
-        _yarn_get_mscale,
-        apply_rotary_pos_emb,
-    )
-    _HAVE_MEGATRON_ROPE = True
-except ImportError:
-    _HAVE_MEGATRON_ROPE = False
-    RotaryEmbedding = None          # type: ignore[assignment]
-    YarnRotaryEmbedding = None      # type: ignore[assignment]
-
-    def _yarn_get_mscale(scaling_factor, mscale_all_dim):  # type: ignore[misc]
-        return 1.0
-
-    def apply_rotary_pos_emb(q, k, cos, sin, offset=0):  # type: ignore[misc]
-        """Apply Rotary Position Embedding to *q* and *k*.
-
-        Fallback when ``megatron.core`` RoPE is unavailable.  Supports both
-        ``(seq, batch, heads, dim)`` and ``(batch, heads, seq, dim)`` layouts.
-        Only the first ``rotary_dim`` channels are rotated; the remainder pass
-        through unchanged.
-        """
-        import torch
-
-        def _rotate_half(x):
-            half = x.shape[-1] // 2
-            return torch.cat((-x[..., half:], x[..., :half]), dim=-1)
-
-        def _apply(t, c, s):
-            rdim = c.shape[-1]
-            t_rot, t_pass = t[..., :rdim], t[..., rdim:]
-            out = t_rot * c + _rotate_half(t_rot) * s
-            return torch.cat((out, t_pass), dim=-1) if t_pass.shape[-1] else out
-
-        if cos.dim() == 2:
-            cos = cos.unsqueeze(1).unsqueeze(1)
-            sin = sin.unsqueeze(1).unsqueeze(1)
-        sq, sk = q.shape[0], k.shape[0]
-        return (_apply(q, cos[offset:offset + sq], sin[offset:offset + sq]),
-                _apply(k, cos[:sk], sin[:sk]))
+# M-ROPE-FIX: No fallback allowed — Megatron-LM RoPE is mandatory.
+# Ref: HuggingFace transformers PR #32312, DeepSpeed issue #5311.
+# All try/except fallback to local rope_utils has been removed per no-fallback policy.
+from megatron.core.models.common.embeddings import (
+    RotaryEmbedding,
+    YarnRotaryEmbedding,
+    _yarn_get_mscale,
+    apply_rotary_pos_emb,
+)
+_HAVE_MEGATRON_ROPE = True
 
 # ---------------------------------------------------------------------------
 # Fused MLA RoPE kernels  (optional Megatron fusions)
