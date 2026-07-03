@@ -1830,7 +1830,22 @@ class DesLocEngine:
         # and retain the returned controller to drive should_skip() /
         # record_step() manually inside the loop below.
         _hetero_config = HeteroGradNormConfig()
-        _skip_controller = integrate_with_deepspeed_engine(self, _hetero_config)
+        # FIX (NCCL hang): pass the data-parallel process group so that
+        # _maybe_allreduce_partials() inside should_skip() actually performs
+        # the allreduce of partial grad norms across DP ranks.  Without this,
+        # _pg is None and the allreduce is silently skipped, causing ranks to
+        # compute different combined_norm values and therefore diverge on the
+        # skip decision — half the ranks call optimizer.step(), the other half
+        # do not, producing a permanent NCCL deadlock on the next collective.
+        _hetero_pg = (
+            getattr(self, '_ddp_dp_group', None)
+            or (parallel_state.get_data_parallel_group()
+                if parallel_state.is_initialized() else None)
+            or (dist.group.WORLD if dist.is_initialized() else None)
+        )
+        _skip_controller = integrate_with_deepspeed_engine(
+            self, _hetero_config, process_group=_hetero_pg
+        )
         _skip_count = 0
 
         loss_accum = 0.0
@@ -2215,7 +2230,26 @@ class DesLocEngine:
                             step_loss += loss.item()
 
             # Post-microbatch: NaN guard
-            if not math.isfinite(step_loss):
+            # FIX (NCCL hang): the old `continue` jumped past finalize_model_grads
+            # and the _should_skip allreduce, leaving other ranks blocked in those
+            # collectives forever.  We must run every NCCL collective on all ranks
+            # every step, regardless of whether this rank saw a NaN.  Use a scalar
+            # allreduce to broadcast the NaN/skip decision so the decision is
+            # identical on all ranks, then fall through to the shared code paths
+            # (which are now all gated on _step_has_nan rather than `continue`).
+            _step_has_nan = not math.isfinite(step_loss)
+            if dist.is_initialized():
+                # All-reduce the NaN flag so every rank agrees before gating any
+                # subsequent NCCL calls (finalize_model_grads, should_skip, etc.).
+                _nan_flag = torch.tensor(
+                    1 if _step_has_nan else 0,
+                    dtype=torch.int32,
+                    device=torch.device(f"cuda:{torch.cuda.current_device()}"),
+                )
+                dist.all_reduce(_nan_flag, op=dist.ReduceOp.MAX)
+                _step_has_nan = _nan_flag.item() > 0
+
+            if _step_has_nan:
                 _nan_count = getattr(self, '_nan_count', 0) + 1
                 self._nan_count = _nan_count
                 logger.warning(
@@ -2223,11 +2257,11 @@ class DesLocEngine:
                     step, _nan_count,
                 )
                 self.optimizer.zero_grad(set_to_none=False)
-                continue
 
             # --- HeteroFP32GradAccumManager: after_backward ---
             # Skipped when DistributedOptimizer active (it owns grad reduction).
-            if self.fp32_grad_manager is not None and self._dist_optimizer is None:
+            # Also skipped on NaN steps (grads will be zeroed; no accumulation needed).
+            if self.fp32_grad_manager is not None and self._dist_optimizer is None and not _step_has_nan:
                 # Fix from Megatron M3313: clamp to avoid 1/0 when num_microbatches==0.
                 self.fp32_grad_manager.after_backward(scale=1.0 / max(num_microbatches, 1))
 
@@ -2245,6 +2279,13 @@ class DesLocEngine:
             # which is correct for the DesLoc single-tier-per-rank design.
             # ISSUE-2: _is_Kx_sync_pre was computed before backward; reuse here so
             # finalize_model_grads gets the same Kx decision that gated _skip_sync.
+            #
+            # FIX (NCCL hang): finalize_model_grads MUST be called on ALL ranks
+            # every step — even on NaN steps — because it contains NCCL collectives
+            # (allreduce / bucket finish_grad_sync) that require symmetric
+            # participation.  On NaN steps we pass skip_grad_sync=True so that no
+            # gradient data is actually transferred; the call becomes a collective
+            # no-op at the NCCL level but still keeps all ranks in lock-step.
             _is_Kx_sync = _is_Kx_sync_pre
             try:
                 import types as _types  # noqa: PLC0415
@@ -2258,12 +2299,15 @@ class DesLocEngine:
                     dp_cp=_dp_grp,
                 ) if _dp_grp is not None else None
                 _fmg_model = [self._core_ddp if self._core_ddp is not None else self.model]
+                # On NaN steps force skip_grad_sync=True: avoids sending garbage
+                # gradients across ranks while still completing the collective.
+                _fmg_skip_sync = (not _is_Kx_sync) or _step_has_nan
                 finalize_model_grads(
                     model=_fmg_model,
                     config=ModelParallelConfig(),
                     num_tokens=None,
-                    skip_grad_sync=not _is_Kx_sync,
-                    force_all_reduce=self._dist_optimizer is not None,
+                    skip_grad_sync=_fmg_skip_sync,
+                    force_all_reduce=self._dist_optimizer is not None and not _step_has_nan,
                     pg_collection=_fmg_pg,
                 )
             except Exception as _fmg_exc:  # noqa: BLE001
@@ -2286,8 +2330,27 @@ class DesLocEngine:
             # Collect parameter gradients for the skip evaluation; classify all
             # params as compute-side since DesLocEngine runs on a single device
             # class per rank (anchor/compute split is resolved at init time).
+            #
+            # FIX (NCCL hang): should_skip() calls _maybe_allreduce_partials()
+            # which is an allreduce collective.  The skip DECISION must therefore
+            # be identical on all ranks.  We run should_skip() on all ranks (it
+            # is already collective-safe when _pg is set), then broadcast the
+            # boolean result so that any rank-local numeric divergence (e.g. from
+            # FP precision differences between A6000 and H100) cannot cause some
+            # ranks to call optimizer.step() while others do not.
             _all_grads = [p.grad for p in self.model.parameters()]
             _should_skip, _skip_info = _skip_controller.should_skip([], _all_grads)
+            # Broadcast skip decision: allreduce MAX so that if ANY rank wants to
+            # skip (or saw a NaN), ALL ranks skip — keeps optimizer.step() symmetric.
+            _should_skip = _should_skip or _step_has_nan
+            if dist.is_initialized():
+                _skip_tensor = torch.tensor(
+                    1 if _should_skip else 0,
+                    dtype=torch.int32,
+                    device=torch.device(f"cuda:{torch.cuda.current_device()}"),
+                )
+                dist.all_reduce(_skip_tensor, op=dist.ReduceOp.MAX)
+                _should_skip = _skip_tensor.item() > 0
             _skip_controller.record_step(skipped=_should_skip, grad_norm=_skip_info.combined_norm)
             if _should_skip:
                 _skip_count += 1
