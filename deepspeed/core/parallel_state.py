@@ -4,8 +4,20 @@
 # with DES-LOC tier-group extensions for heterogeneous GPU clusters.
 """Parallel state management for DeepSpeed Neuron_SP.
 
-Manages TP / PP / DP / CP / EP process groups and optionally DES-LOC tier
-groups (one group per GPU-tier, e.g. 'datacenter' / 'professional').
+Manages TP / PP / DP / SP / CP / EP process groups and optionally DES-LOC tier
+groups (one group per GPU-tier: A6000 / H100 / Blackwell).
+
+Group hierarchy (from innermost to outermost):
+  - TP  (tensor parallel)        — intra-layer weight split
+  - SP  (sequence parallel)      — sequence-dimension split within TP group
+  - CP  (context parallel)       — sequence chunk exchange across DP replicas
+  - EP  (expert model parallel)  — MoE expert distribution
+  - DP  (data parallel)          — weight-replica gradient averaging
+  - PP  (pipeline parallel)      — inter-layer stage split
+
+Tier groups (DES-LOC heterogeneous extension):
+  Built by TierMap.discover() or desloc_config.tiers.
+  One NCCL group per hardware tier: 'a6000', 'h100', 'blackwell', 'unknown'.
 
 All collective operations in deepspeed/core/ should route through the
 accessors defined here rather than calling torch.distributed directly.
@@ -16,13 +28,16 @@ Typical usage::
     from deepspeed.core.parallel_state import (
         initialize_model_parallel,
         get_tensor_model_parallel_group,
+        get_sequence_parallel_group,
         get_data_parallel_group,
+        get_tier_group,
     )
 
     dist.init_process_group(backend="nccl")
     initialize_model_parallel(
         tensor_model_parallel_size=4,
         pipeline_model_parallel_size=2,
+        sequence_parallel_enabled=True,
     )
 """
 
@@ -49,6 +64,14 @@ logger = logging.getLogger(__name__)
 # Intra-layer model parallel (tensor parallel)
 _TENSOR_MODEL_PARALLEL_GROUP: Optional[torch.distributed.ProcessGroup] = None
 _TENSOR_MODEL_PARALLEL_GLOBAL_RANKS: Optional[List[int]] = None
+
+# Sequence parallel group — same ranks as TP but a *separate* NCCL communicator.
+# Having an independent communicator allows the NCCL scheduler to overlap
+# all-gather (forward) on the SP channel with reduce-scatter (backward) on the
+# TP channel, improving throughput on PCIe fabrics (DES-LOC: no NVLink).
+# When sequence_parallel_enabled=False this is set to _TENSOR_MODEL_PARALLEL_GROUP.
+_SEQUENCE_PARALLEL_GROUP: Optional[torch.distributed.ProcessGroup] = None
+_SEQUENCE_PARALLEL_GLOBAL_RANKS: Optional[List[int]] = None
 
 # Inter-layer model parallel (pipeline parallel)
 _PIPELINE_MODEL_PARALLEL_GROUP = None   # may become list[group] for VPP
@@ -146,6 +169,12 @@ _global_process_group_list: Optional[List] = None
 # ---------------------------------------------------------------------------
 _TIER_GROUPS: Dict[str, torch.distributed.ProcessGroup] = {}
 _LOCAL_TIER: Optional[TierSpec] = None
+
+# TierMap instance — populated by initialize_model_parallel when tier_map is
+# requested (either auto-discovered via TierMap.discover() or passed directly).
+# Kept here so downstream modules (dist_opt_adapter, hetero_bridge) can import
+# get_tier_map() without re-running discovery.
+_TIER_MAP = None  # type: Optional[Any]  # TierMap from hetero_bridge.tier_map
 
 
 # ---------------------------------------------------------------------------
@@ -706,12 +735,17 @@ def initialize_model_parallel(
     # DES-LOC extension
     desloc_config: Optional[DesLocConfig] = None,
     config=None,
+    # SP extension: sequence parallel
+    sequence_parallel_enabled: bool = False,
+    # TierMap extension: auto-discover heterogeneous GPU tiers
+    discover_tier_map: bool = False,
+    tier_map=None,
 ) -> None:
     """Initialize all model-parallel process groups.
 
     Must be called after ``torch.distributed.init_process_group()``.
 
-    Creates TP, PP, DP, CP, EP groups following Megatron's rank layout::
+    Creates TP, PP, DP, SP, CP, EP groups following Megatron's rank layout::
 
         global_rank = tp_rank
                     + cp_rank * tp
@@ -721,8 +755,11 @@ def initialize_model_parallel(
 
     (exact ordering controlled by the ``order`` parameter).
 
-    Additionally creates DES-LOC tier groups when ``desloc_config`` is
-    provided, grouping GPUs by their :class:`~deepspeed.core.desloc_config.TierType`.
+    Additionally creates:
+    - SP groups (same ranks as TP, independent NCCL communicator) when
+      ``sequence_parallel_enabled=True``.
+    - DES-LOC tier groups when ``desloc_config`` is provided (keyed by tier name)
+      or when ``discover_tier_map=True`` (auto-discovers via TierMap.discover()).
 
     Args:
         tensor_model_parallel_size: Number of GPUs for intra-layer (tensor) parallelism.
@@ -747,6 +784,18 @@ def initialize_model_parallel(
         rank_offset: Offset added to all ranks (for multi-node sub-worlds).
         local_world_size: Override torch.distributed world_size (for sub-worlds).
         desloc_config: DES-LOC configuration with tier specs for heterogeneous GPU groups.
+        config: Optional ModelParallelConfig (for flight recorder settings).
+        sequence_parallel_enabled: When True, create a *separate* NCCL communicator
+            for sequence parallelism (same TP ranks). This allows the NCCL scheduler
+            to overlap SP all-gather (forward) with TP reduce-scatter (backward) on
+            PCIe fabrics without NVLink. When False, get_sequence_parallel_group()
+            returns the same group as get_tensor_model_parallel_group().
+        discover_tier_map: When True, call TierMap.discover() to build per-tier
+            NCCL groups from actual GPU properties (SM capability + VRAM). If both
+            discover_tier_map and desloc_config are provided, TierMap takes precedence
+            for tier group creation (desloc_config is still used for other settings).
+        tier_map: Pre-built TierMap instance. When provided, skips discovery and uses
+            these tier assignments directly. Useful for offline testing.
     """
     # -- SHARP env-var cleanup (must precede any new_group calls) --
     if "NCCL_COLLNET_ENABLE" in os.environ:
@@ -1098,6 +1147,43 @@ def initialize_model_parallel(
             _TENSOR_MODEL_PARALLEL_GLOBAL_RANKS = ranks
 
     # -----------------------------------------------------------------------
+    # Sequence parallel groups
+    # SP has the SAME ranks as TP but uses an INDEPENDENT NCCL communicator.
+    # This matters on PCIe-only topologies (DES-LOC: A6000×2 + H100 + Blackwell×2
+    # without NVLink) where a shared TP/SP communicator serialises:
+    #   - SP all-gather in the forward pass (column-parallel Linear input gather)
+    #   - TP reduce-scatter in the backward pass (grad averaging)
+    # Two independent communicators let the NCCL scheduler run both directions
+    # concurrently on separate PCIe DMA engines, improving throughput.
+    #
+    # When sequence_parallel_enabled=False, SP group == TP group (zero overhead).
+    # -----------------------------------------------------------------------
+    global _SEQUENCE_PARALLEL_GROUP
+    global _SEQUENCE_PARALLEL_GLOBAL_RANKS
+    assert _SEQUENCE_PARALLEL_GROUP is None, "sequence parallel group is already initialized"
+
+    if sequence_parallel_enabled:
+        for ranks in decoder_rank_generator.get_ranks("tp"):
+            sp_grp = create_group(
+                ranks,
+                timeout=timeout,
+                pg_options=get_nccl_options("sp", nccl_comm_cfgs),
+                group_desc="SEQUENCE_PARALLEL_GROUP",
+            )
+            if rank in ranks:
+                _SEQUENCE_PARALLEL_GROUP = sp_grp
+                _SEQUENCE_PARALLEL_GLOBAL_RANKS = ranks
+        logger.info(
+            "Sequence parallel: created independent SP communicator "
+            "(tp_size=%d, separate from TP group).",
+            tensor_model_parallel_size,
+        )
+    else:
+        # No separate communicator: alias to the TP group.
+        _SEQUENCE_PARALLEL_GROUP = _TENSOR_MODEL_PARALLEL_GROUP
+        _SEQUENCE_PARALLEL_GLOBAL_RANKS = _TENSOR_MODEL_PARALLEL_GLOBAL_RANKS
+
+    # -----------------------------------------------------------------------
     # Pipeline model parallel groups  (+ embedding groups)
     # -----------------------------------------------------------------------
     global _PIPELINE_MODEL_PARALLEL_GROUP
@@ -1380,14 +1466,97 @@ def initialize_model_parallel(
             intra_dist_opt_ranks = []
 
     # -----------------------------------------------------------------------
-    # DES-LOC tier groups  (heterogeneous GPU grouping by TierType)
+    # DES-LOC tier groups  (heterogeneous GPU grouping by hardware tier)
     #
     # NCCL requires ALL ranks to call new_group() with the same ranks list,
     # even ranks that are not members.  We iterate every tier unconditionally.
+    #
+    # Priority for tier group creation:
+    #   1. Pre-built TierMap (tier_map argument) — highest priority, for tests
+    #      and offline planning.
+    #   2. TierMap.discover() — auto-discovery via torch.cuda + NVML when
+    #      discover_tier_map=True.  Each rank probes its GPU's SM capability and
+    #      VRAM; results are all_gathered so every rank has the complete map.
+    #   3. desloc_config.tiers — static configuration from DesLocConfig.
+    #
+    # The TierMap path builds one NCCL group per hardware tier:
+    #   'a6000'    → SM8.6 GPUs (2 × RTX A6000, 48 GB each)
+    #   'h100'     → SM9.0 GPUs (1 × H100 NVL, 80–96 GB)
+    #   'blackwell'→ SM12.0 GPUs (2 × RTX PRO 6000 Blackwell, 96+ GB)
+    #   'unknown'  → any GPU not matched by SM capability
     # -----------------------------------------------------------------------
     global _TIER_GROUPS
     global _LOCAL_TIER
-    if desloc_config is not None and desloc_config.tiers:
+    global _TIER_MAP
+
+    _effective_tier_map = None
+    if tier_map is not None:
+        # Path 1: caller supplied a pre-built TierMap (highest priority)
+        _effective_tier_map = tier_map
+        _TIER_MAP = tier_map
+        logger.info("initialize_model_parallel: using caller-provided TierMap: %s", tier_map)
+    elif discover_tier_map:
+        # Path 2: auto-discover tier map via TierMap.discover()
+        try:
+            from deepspeed.core.hetero_bridge.tier_map import TierMap
+            _effective_tier_map = TierMap.discover()
+            _TIER_MAP = _effective_tier_map
+            logger.info(
+                "initialize_model_parallel: TierMap.discover() = %s", _effective_tier_map
+            )
+        except Exception as exc:
+            logger.warning(
+                "initialize_model_parallel: TierMap.discover() failed (%s); "
+                "falling back to desloc_config tier assignment.", exc
+            )
+            _effective_tier_map = None
+
+    if _effective_tier_map is not None:
+        # Build tier groups from TierMap: group ranks by GPUTier value.
+        try:
+            from deepspeed.core.hetero_bridge.tier_map import GPUTier
+            for gpu_tier in GPUTier:
+                tier_ranks = _effective_tier_map.ranks_of_tier(gpu_tier)
+                if not tier_ranks:
+                    continue
+                tier_name = gpu_tier.value  # e.g. 'a6000', 'h100', 'blackwell', 'unknown'
+                sorted_tier_ranks = sorted(tier_ranks)
+                tier_grp = create_group(
+                    sorted_tier_ranks,
+                    timeout=timeout,
+                    group_desc=f"DES_LOC_TIER_{tier_name.upper()}",
+                )
+                _TIER_GROUPS[tier_name] = tier_grp
+                if rank in sorted_tier_ranks:
+                    # Synthesise a TierSpec-like object for _LOCAL_TIER
+                    # (allows downstream code that checks _LOCAL_TIER to work
+                    # regardless of whether a DesLocConfig was provided).
+                    try:
+                        from deepspeed.core.desloc_config import TierSpec, TierType
+                        # Map GPUTier → TierType by name (best-effort)
+                        tier_type_name = tier_name.upper()
+                        matching_types = [
+                            t for t in TierType if t.name.upper() == tier_type_name
+                        ]
+                        if matching_types:
+                            _LOCAL_TIER = TierSpec(
+                                tier_type=matching_types[0],
+                                gpu_indices=sorted_tier_ranks,
+                            )
+                    except Exception:
+                        pass  # TierSpec/TierType unavailable; _LOCAL_TIER stays None
+                    logger.debug(
+                        "Rank %d → DES-LOC tier '%s' (via TierMap, ranks=%s)",
+                        rank, tier_name, sorted_tier_ranks,
+                    )
+        except ImportError:
+            logger.warning(
+                "deepspeed.core.hetero_bridge.tier_map not importable; "
+                "skipping TierMap-based tier group creation."
+            )
+
+    elif desloc_config is not None and desloc_config.tiers:
+        # Path 3: static DesLocConfig tier assignment
         # Merge gpu_indices by tier_type name (handles duplicate TierSpec entries)
         tier_indices_map: Dict[str, List[int]] = {}
         tier_spec_map: Dict[str, TierSpec] = {}
@@ -1530,6 +1699,49 @@ def get_tensor_model_parallel_group(check_initialized: bool = True) -> Optional[
             "tensor model parallel group is not initialized"
         )
     return _TENSOR_MODEL_PARALLEL_GROUP
+
+
+def get_sequence_parallel_group(check_initialized: bool = True) -> Optional[torch.distributed.ProcessGroup]:
+    """Get the sequence-parallel group the caller belongs to.
+
+    When ``sequence_parallel_enabled=True`` was passed to
+    :func:`initialize_model_parallel`, this returns a *separate* NCCL
+    communicator whose rank set is identical to the TP group but whose
+    NCCL channel is independent.  This allows the NCCL scheduler on PCIe
+    fabrics (DES-LOC: A6000×2 + H100 + Blackwell×2, no NVLink) to overlap
+    SP all-gather (forward) with TP reduce-scatter (backward).
+
+    When ``sequence_parallel_enabled=False`` (default), this returns the
+    same group as :func:`get_tensor_model_parallel_group`.
+    """
+    if check_initialized:
+        assert _SEQUENCE_PARALLEL_GROUP is not None, (
+            "sequence parallel group is not initialized; "
+            "call initialize_model_parallel() first"
+        )
+    return _SEQUENCE_PARALLEL_GROUP
+
+
+def get_sequence_parallel_world_size() -> int:
+    """Return world size for the sequence-parallel group."""
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return get_sequence_parallel_group().size()
+    return 0
+
+
+def get_sequence_parallel_rank() -> int:
+    """Return the caller's rank in the sequence-parallel group."""
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return get_sequence_parallel_group().rank()
+    return 0
+
+
+def get_sequence_parallel_src_rank() -> int:
+    """Return the global rank of the first member in the sequence-parallel group."""
+    assert _SEQUENCE_PARALLEL_GLOBAL_RANKS is not None, (
+        "sequence parallel group is not initialized"
+    )
+    return _SEQUENCE_PARALLEL_GLOBAL_RANKS[0]
 
 
 def get_pipeline_model_parallel_group(check_initialized: bool = True):
@@ -2230,6 +2442,56 @@ def get_local_tier() -> Optional[TierSpec]:
     return _LOCAL_TIER
 
 
+def get_tier_map():
+    """Return the :class:`~deepspeed.core.hetero_bridge.tier_map.TierMap` instance.
+
+    Populated when ``discover_tier_map=True`` or ``tier_map=...`` was passed to
+    :func:`initialize_model_parallel`.  Returns ``None`` if tier discovery was
+    not requested (static ``desloc_config`` path or no tier config at all).
+
+    Usage example (dist_opt_adapter, shard_planner)::
+
+        tm = get_tier_map()
+        if tm is not None:
+            budget = tm.mem_budget(torch.distributed.get_rank())
+        else:
+            budget = DEFAULT_BUDGET
+    """
+    return _TIER_MAP
+
+
+def is_tier_aware() -> bool:
+    """Return True if tier-aware group assignment is active.
+
+    True when either TierMap-based or desloc_config-based tier groups have
+    been created (i.e. _TIER_GROUPS is non-empty).
+    """
+    return bool(_TIER_GROUPS)
+
+
+def get_tier_ranks(tier_name: str) -> List[int]:
+    """Return sorted global ranks in the named hardware tier group.
+
+    Requires that tier groups have been initialized (either via
+    ``discover_tier_map=True`` or ``desloc_config``).
+
+    Args:
+        tier_name: Tier identifier, e.g. ``'a6000'``, ``'h100'``, ``'blackwell'``,
+            ``'unknown'``.  Case-insensitive.
+
+    Returns:
+        Sorted list of global ranks in that tier, or empty list if not found.
+    """
+    tier_name = tier_name.lower()
+    pg = _TIER_GROUPS.get(tier_name)
+    if pg is None:
+        return []
+    try:
+        return sorted(torch.distributed.get_process_group_ranks(pg))
+    except Exception:
+        return []
+
+
 # ---------------------------------------------------------------------------
 # Global memory buffer
 # ---------------------------------------------------------------------------
@@ -2343,6 +2605,11 @@ def destroy_model_parallel() -> None:
     _TENSOR_MODEL_PARALLEL_GROUP = None
     global _TENSOR_MODEL_PARALLEL_GLOBAL_RANKS
     _TENSOR_MODEL_PARALLEL_GLOBAL_RANKS = None
+
+    global _SEQUENCE_PARALLEL_GROUP
+    _SEQUENCE_PARALLEL_GROUP = None
+    global _SEQUENCE_PARALLEL_GLOBAL_RANKS
+    _SEQUENCE_PARALLEL_GLOBAL_RANKS = None
 
     global _PIPELINE_MODEL_PARALLEL_GROUP
     _PIPELINE_MODEL_PARALLEL_GROUP = None
@@ -2466,6 +2733,8 @@ def destroy_model_parallel() -> None:
     _TIER_GROUPS = {}
     global _LOCAL_TIER
     _LOCAL_TIER = None
+    global _TIER_MAP
+    _TIER_MAP = None
 
 
 def dump_process_groups(rank: Optional[int] = None) -> str:
@@ -2494,6 +2763,8 @@ def dump_process_groups(rank: Optional[int] = None) -> str:
 
     lines = [f"=== Process Group Dump (rank={current_rank}) ==="]
     lines.append(_pg_info("TP",         _TENSOR_MODEL_PARALLEL_GROUP))
+    sp_label = "SP(=TP)" if _SEQUENCE_PARALLEL_GROUP is _TENSOR_MODEL_PARALLEL_GROUP else "SP"
+    lines.append(_pg_info(sp_label,     _SEQUENCE_PARALLEL_GROUP))
     lines.append(_pg_info("PP",         _PIPELINE_MODEL_PARALLEL_GROUP))
     lines.append(_pg_info("DP",         _DATA_PARALLEL_GROUP))
     lines.append(_pg_info("CP",         _CONTEXT_PARALLEL_GROUP))
