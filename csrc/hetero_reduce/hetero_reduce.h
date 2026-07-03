@@ -382,3 +382,68 @@ void launch_dequantise_int8_to_fp16(__nv_bfloat16* output,
                                      const float*   scales,
                                      size_t         n_elems,
                                      cudaStream_t   stream);
+
+// ===========================================================================
+// Additional API — Worker-12 (Opus) additions
+// ===========================================================================
+
+/**
+ * hetero_bucket_size_elems
+ *
+ * Returns the policy-recommended gradient bucket size in BF16 elements for
+ * a given SM version.  Derived from KernelPolicy<SmVer>::kBucketElems.
+ *
+ * H100  (SM 9.0):     4M elements (32 MB) — large L2, maximise reuse
+ * A6000 (SM 8.6):   512K elements  (4 MB) — small L2, avoid thrashing
+ * Blackwell (SM12.0): 2M elements (16 MB) — moderate L2
+ *
+ * @param sm_version  SM version (86, 90, 120, …)
+ * @returns           Recommended bucket size in BF16 elements
+ */
+size_t hetero_bucket_size_elems(int sm_version);
+
+/**
+ * compute_adaptive_chunk_size
+ *
+ * Computes adaptive ring-allreduce chunk size targeting kTargetOverlapMs ms
+ * of PCIe transfer time per chunk, based on measured or estimated bandwidth.
+ *
+ * @param pcie_bw_gbps  PCIe bandwidth in GB/s (from probe or estimate)
+ * @returns             Chunk size in bytes, aligned to 16 bytes
+ */
+size_t compute_adaptive_chunk_size(float pcie_bw_gbps);
+
+/**
+ * probe_pcie_bandwidth
+ *
+ * Sends a kProbeSizeBytes (4 MB) test buffer from src_device to dst_device
+ * via cudaMemcpyPeerAsync, times it with CUDA events, and returns the
+ * measured bandwidth in GB/s.  Caches results in a static table.
+ *
+ * Requires peer access to be enabled (cudaDeviceEnablePeerAccess).
+ * Falls back to 8.0 GB/s on allocation failure.
+ *
+ * @param src_device  CUDA device ordinal of sender
+ * @param dst_device  CUDA device ordinal of receiver
+ * @returns           Measured PCIe bandwidth in GB/s
+ */
+float probe_pcie_bandwidth(int src_device, int dst_device);
+
+/**
+ * launch_pcie_ring_reduce_step
+ *
+ * Single ring-reduce step: accum_buf[i] += recv_buf[i] (in FP32, stored BF16).
+ * Used by the double-buffered pipeline orchestration.
+ *
+ * @param accum_buf      [in/out] BF16 accumulator [chunk_elems]
+ * @param recv_buf       [in]     BF16 received chunk [chunk_elems]
+ * @param chunk_elems    Number of BF16 elements
+ * @param sm_version     SM version for kernel dispatch
+ * @param compute_stream CUDA stream for the reduce kernel
+ */
+void launch_pcie_ring_reduce_step(
+    __nv_bfloat16* __restrict__       accum_buf,
+    const __nv_bfloat16* __restrict__ recv_buf,
+    size_t                            chunk_elems,
+    int                               sm_version,
+    cudaStream_t                      compute_stream);

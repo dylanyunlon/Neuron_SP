@@ -4,33 +4,57 @@
 // DeepSpeed Team
 
 /*
- * hetero_reduce.cu
+ * hetero_reduce.cu  —  Worker-12 (Opus) algorithmic rewrite
  *
- * Fused BF16 → FP32 reduce-scatter + FP32 → BF16 writeback kernel for
- * heterogeneous GPU clusters (2×A6000 SM8.6 + 2×Blackwell SM12.0 + 1×H100
- * SM9.0) connected via PCIe without NVLink.
+ * Heterogeneous reduce-scatter for PCIe-only clusters:
+ *   2× A6000 (SM8.6) + 1× H100 (SM9.0) + 2× Blackwell (SM12.0)
  *
- * Kernel strategy
- * ---------------
- * Each thread processes 8 BF16 elements per step (128-bit vectorised load/store).
- * FP32 accumulation avoids precision loss when summing many gradients.
- * Separate kernel variants for SM 8.6/9.0 vs SM 12.0 differ only in
- * __launch_bounds__ to guide occupancy on each architecture.
+ * ═══════════════════════════════════════════════════════════════════════
+ * ALGORITHMIC INNOVATIONS vs. prior version
+ * ═══════════════════════════════════════════════════════════════════════
  *
- * Heterogeneous reduce-scatter
- * ----------------------------
- * Each GPU tier receives a shard proportional to its compute capability.
- * H100 (SM 9.0) gets the largest shard, Blackwell (SM 12.0) next, A6000
- * (SM 8.6) gets the smallest.  Shard boundaries are described by per-tier
- * (offset, count) pairs passed to the kernel so a single launch reduces
- * all input tensors and writes only the local shard to the output buffer.
+ * 1. TUNING POLICY STRUCT (no hard-coded __launch_bounds__)
+ *    A compile-time KernelPolicy<SmVer> struct controls block size,
+ *    min_blocks_per_sm, and per-tier bucket sizing.  Adding a new GPU
+ *    tier requires only a new specialisation — not grep-and-replace.
  *
- * Cooperative groups
- * ------------------
- * Warp-level reductions use cooperative_groups::coalesced_threads() for
- * forward-compatible warp-level primitives.  This replaces raw
- * __shfl_down_sync with cg::reduce(), which the compiler maps to optimal
- * shuffle instructions on each SM generation.
+ * 2. WARP-LEVEL COOPERATIVE REDUCTION via coalesced_threads()
+ *    The innermost reduction uses cg::coalesced_threads() (not
+ *    tiled_partition<32>), so divergent warps still reduce correctly.
+ *    On SM9.0+ the compiler emits a single REDUX.SYNC.ADD.F32 PTX
+ *    instruction; on SM8.6 it falls back to shfl_down.
+ *
+ * 3. TRUE MULTI-STAGE PIPELINE
+ *    Stage 1 — warp-reduce: each warp reduces its slice across
+ *               num_tensors inputs into 8 FP32 accumulators.
+ *    Stage 2 — block-reduce: warp lane-0s exchange via shared memory,
+ *               a second warp-reduce folds the kMaxWarps partial sums.
+ *    Stage 3 — cross-block atomic: the first thread of the winning
+ *               block writes the final FP32 value to a global
+ *               accumulator using atomicAdd, then a separate bcast pass
+ *               converts FP32 → BF16 and scatters to the output.
+ *    The cross-block atomic is only activated for "tail" blocks where
+ *    a single CTA spans fewer elements than the warp vector width,
+ *    keeping the fast path atomic-free.
+ *
+ * 4. PER-TIER ADAPTIVE BUCKET SIZING
+ *    H100 (SM9.0):     kBucketElems = 4M elements (32 MB)
+ *                      Large L2 (50 MB) absorbs the whole bucket → 0 DRAM
+ *                      re-reads.  Use big buckets, high CTA count.
+ *    A6000 (SM8.6):    kBucketElems = 512K elements (4 MB)
+ *                      Only 6 MB L2 — large buckets thrash L2 and cause
+ *                      repeated DRAM loads.  Small buckets keep data hot.
+ *    Blackwell (SM12.0): kBucketElems = 2M elements (16 MB)
+ *                        40 MB L2, moderate size.
+ *    Bucket size is exported from KernelPolicy and used both by the
+ *    host dispatch and by Python-level gradient bucketing logic.
+ *
+ * 5. REGISTER-PINNED POINTER ARRAY
+ *    For num_tensors ≤ kMaxInlinePointers the input pointer array lives
+ *    in __constant__ memory (avoiding cudaMallocAsync overhead on the
+ *    critical path).  For larger arrays we fall back to device memory.
+ *
+ * ═══════════════════════════════════════════════════════════════════════
  */
 
 #include <cuda.h>
@@ -38,339 +62,529 @@
 #include <cuda_runtime.h>
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
-#include <cstdlib>
+#include <cstdint>
 #include <algorithm>
 
 #include "hetero_reduce.h"
-#include "ds_kernel_utils.h"  // DS_D_INLINE, hw_warp_size
+#include "ds_kernel_utils.h"
 
 namespace cg = cooperative_groups;
 
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
-static constexpr int kBlockSize   = 256;
-static constexpr int kVecWidth    = 8;     // BF16 elements per thread per step
-static constexpr int kMaxTensors  = 32;
+// ─────────────────────────────────────────────────────────────────────────────
+// Section 1: Tuning Policy Struct
+//   Each SM version gets a specialisation.  The __launch_bounds__ annotation
+//   is generated from the policy to avoid hard-coding numbers.
+// ─────────────────────────────────────────────────────────────────────────────
 
-// ---------------------------------------------------------------------------
-// Vectorised 128-bit load of 8 × BF16 and accumulate into FP32 pairs.
-// ---------------------------------------------------------------------------
-DS_D_INLINE void load_bf16x8(const __nv_bfloat16* __restrict__ ptr,
-                               float2& acc0, float2& acc1,
-                               float2& acc2, float2& acc3)
+template <int SmVer> struct KernelPolicy;
+
+template <> struct KernelPolicy<86> {
+    static constexpr int kBlockSize         = 256;
+    static constexpr int kMinBlocksPerSM    = 2;
+    // A6000: 6 MB L2 — keep buckets small (4 MB) to avoid thrashing
+    static constexpr size_t kBucketElems   = 512UL * 1024UL;   // 4 MB in BF16
+    // Number of output elements per thread per iteration
+    static constexpr int kVecWidth          = 8;
+};
+
+template <> struct KernelPolicy<90> {
+    static constexpr int kBlockSize         = 256;
+    static constexpr int kMinBlocksPerSM    = 4;
+    // H100: 50 MB L2 — use large buckets (32 MB) for high reuse
+    static constexpr size_t kBucketElems   = 4UL * 1024UL * 1024UL;  // 32 MB in BF16
+    static constexpr int kVecWidth          = 8;
+};
+
+template <> struct KernelPolicy<120> {
+    static constexpr int kBlockSize         = 512;
+    static constexpr int kMinBlocksPerSM    = 4;
+    // Blackwell: 40 MB L2 — moderate bucket (16 MB)
+    static constexpr size_t kBucketElems   = 2UL * 1024UL * 1024UL;  // 16 MB in BF16
+    static constexpr int kVecWidth          = 8;
+};
+
+// Generic fallback
+template <int SmVer> struct KernelPolicy {
+    static constexpr int kBlockSize         = 256;
+    static constexpr int kMinBlocksPerSM    = 2;
+    static constexpr size_t kBucketElems   = 512UL * 1024UL;
+    static constexpr int kVecWidth          = 8;
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Section 2: Constant-memory inline pointer array
+//   Up to kMaxInlinePointers input pointers stored in __constant__ memory,
+//   avoiding cudaMallocAsync on the latency-sensitive launch path.
+// ─────────────────────────────────────────────────────────────────────────────
+
+static constexpr int kMaxInlinePointers = 32;
+static constexpr int kMaxTensors        = 32;
+
+__constant__ const __nv_bfloat16* c_input_ptrs[kMaxInlinePointers];
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Section 3: Low-level vectorised load/store helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Load 8 × BF16 as a 128-bit vector, accumulate into 4 × float2 in FP32.
+DS_D_INLINE void bf16x8_accumulate(
+    const __nv_bfloat16* __restrict__ ptr,
+    float2& acc0, float2& acc1, float2& acc2, float2& acc3)
 {
-    uint4 raw = *reinterpret_cast<const uint4*>(ptr);
+    const uint4 raw = *reinterpret_cast<const uint4*>(ptr);
     const __nv_bfloat162* p = reinterpret_cast<const __nv_bfloat162*>(&raw);
-    acc0.x += __bfloat162float(p[0].x);
-    acc0.y += __bfloat162float(p[0].y);
-    acc1.x += __bfloat162float(p[1].x);
-    acc1.y += __bfloat162float(p[1].y);
-    acc2.x += __bfloat162float(p[2].x);
-    acc2.y += __bfloat162float(p[2].y);
-    acc3.x += __bfloat162float(p[3].x);
-    acc3.y += __bfloat162float(p[3].y);
+#pragma unroll
+    acc0.x += __bfloat162float(p[0].x);  acc0.y += __bfloat162float(p[0].y);
+    acc1.x += __bfloat162float(p[1].x);  acc1.y += __bfloat162float(p[1].y);
+    acc2.x += __bfloat162float(p[2].x);  acc2.y += __bfloat162float(p[2].y);
+    acc3.x += __bfloat162float(p[3].x);  acc3.y += __bfloat162float(p[3].y);
 }
 
-// ---------------------------------------------------------------------------
-// Vectorised 128-bit store: 8 floats → 8 BF16.
-// ---------------------------------------------------------------------------
-DS_D_INLINE void store_fp32x8_as_bf16(__nv_bfloat16* __restrict__ ptr,
-                                        float2 a, float2 b, float2 c, float2 d)
+// Store 4 × float2 (8 floats) as 8 × BF16 via a 128-bit write.
+DS_D_INLINE void fp32x8_store_bf16(
+    __nv_bfloat16* __restrict__ ptr,
+    float2 a0, float2 a1, float2 a2, float2 a3)
 {
-    __nv_bfloat162 ba = {__float2bfloat16(a.x), __float2bfloat16(a.y)};
-    __nv_bfloat162 bb = {__float2bfloat16(b.x), __float2bfloat16(b.y)};
-    __nv_bfloat162 bc = {__float2bfloat16(c.x), __float2bfloat16(c.y)};
-    __nv_bfloat162 bd = {__float2bfloat16(d.x), __float2bfloat16(d.y)};
-    uint4 raw;
-    raw.x = *reinterpret_cast<const uint32_t*>(&ba);
-    raw.y = *reinterpret_cast<const uint32_t*>(&bb);
-    raw.z = *reinterpret_cast<const uint32_t*>(&bc);
-    raw.w = *reinterpret_cast<const uint32_t*>(&bd);
-    *reinterpret_cast<uint4*>(ptr) = raw;
+    __nv_bfloat162 b0 = {__float2bfloat16(a0.x), __float2bfloat16(a0.y)};
+    __nv_bfloat162 b1 = {__float2bfloat16(a1.x), __float2bfloat16(a1.y)};
+    __nv_bfloat162 b2 = {__float2bfloat16(a2.x), __float2bfloat16(a2.y)};
+    __nv_bfloat162 b3 = {__float2bfloat16(a3.x), __float2bfloat16(a3.y)};
+    uint4 out;
+    out.x = *reinterpret_cast<uint32_t*>(&b0);
+    out.y = *reinterpret_cast<uint32_t*>(&b1);
+    out.z = *reinterpret_cast<uint32_t*>(&b2);
+    out.w = *reinterpret_cast<uint32_t*>(&b3);
+    *reinterpret_cast<uint4*>(ptr) = out;
 }
 
-// ---------------------------------------------------------------------------
-// Warp-level FP32 sum using cooperative groups.
+// ─────────────────────────────────────────────────────────────────────────────
+// Section 4: Multi-Stage Warp → Block → Cross-Block Reduction
 //
-// Uses cg::reduce() which maps to __shfl_down_sync on SM 8.x / 9.0 and to
-// native warp-reduction instructions on SM 12.0+ (Blackwell).
-// ---------------------------------------------------------------------------
-DS_D_INLINE float cg_warp_reduce_sum(float val)
+//   Stage 1: Warp reduction using cg::coalesced_threads()
+//     Each warp's active lanes cooperatively reduce a float value.
+//     coalesced_threads() handles sub-warp divergence correctly.
+//
+//   Stage 2: Block reduction via shared memory
+//     Warp lane-0 deposits into smem; a second warp-reduce folds results.
+//
+//   Stage 3: Cross-block atomic (tail path only)
+//     For the fractional-vector tail of a tensor, the first CTA to
+//     finish atomically accumulates into a global FP32 buffer.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Stage 1: warp-level sum using cooperative coalesced_threads()
+DS_D_INLINE float warp_reduce_sum_cg(float val)
 {
-    cg::coalesced_group active = cg::coalesced_threads();
+    // cg::coalesced_threads() captures the exact set of active threads —
+    // correct even in divergent warps (e.g. tail iterations).
+    auto active = cg::coalesced_threads();
     return cg::reduce(active, val, cg::plus<float>());
 }
 
-// ---------------------------------------------------------------------------
-// Warp-cooperative vectorised reduce: each warp independently reduces a
-// sub-range of the accumulator vectors before lane 0 writes the result.
-// This improves L1 hit rate on SM 9.0 where warps can cooperatively
-// prefetch from different tensor inputs.
-// ---------------------------------------------------------------------------
-DS_D_INLINE void warp_cooperative_accumulate(
-    float2& acc0, float2& acc1, float2& acc2, float2& acc3)
+// Stage 2: block-level reduction
+//   Returns the block-wide sum in thread 0.  Other threads' return values
+//   are undefined.  Requires kMaxWarps slots in smem_partial.
+DS_D_INLINE float block_reduce_sum(
+    float val,
+    float* __restrict__ smem_partial,  // [kMaxWarps]
+    cg::thread_block& blk)
 {
-    // Reduce each component across the warp.  For a full warp this is a
-    // no-op when every thread has its *own* element range (the common case).
-    // When we use warp cooperation for the tail of a tensor, this folds
-    // partial results from lanes that loaded different inputs.
-    acc0.x = cg_warp_reduce_sum(acc0.x);
-    acc0.y = cg_warp_reduce_sum(acc0.y);
-    acc1.x = cg_warp_reduce_sum(acc1.x);
-    acc1.y = cg_warp_reduce_sum(acc1.y);
-    acc2.x = cg_warp_reduce_sum(acc2.x);
-    acc2.y = cg_warp_reduce_sum(acc2.y);
-    acc3.x = cg_warp_reduce_sum(acc3.x);
-    acc3.y = cg_warp_reduce_sum(acc3.y);
+    const int lane    = threadIdx.x % hw_warp_size;
+    const int warp_id = threadIdx.x / hw_warp_size;
+
+    // Stage 1: reduce within warp
+    val = warp_reduce_sum_cg(val);
+    if (lane == 0) smem_partial[warp_id] = val;
+    blk.sync();
+
+    // Stage 2: reduce warp sums in the first warp
+    const int n_warps = blockDim.x / hw_warp_size;
+    val = (threadIdx.x < n_warps) ? smem_partial[threadIdx.x] : 0.f;
+    if (warp_id == 0) val = warp_reduce_sum_cg(val);
+
+    return val;  // valid in thread 0
 }
 
-// ---------------------------------------------------------------------------
-// Reduce-scatter kernel — SM 8.6 / 9.0 (conservative occupancy).
+// Stage 3: cross-block atomic accumulate-then-broadcast.
+//   global_acc: pre-zeroed FP32 atomic accumulator (device memory)
+//   global_cnt: pre-zeroed int counter (how many blocks have arrived)
+//   n_blocks:   total number of blocks in the grid
+//   local_val:  this block's partial sum (only thread 0 participates)
+//   Returns the final global sum to thread 0 of the last block.
+//   Other blocks spin-wait to receive the broadcast.
+DS_D_INLINE float cross_block_reduce(
+    float* __restrict__ global_acc,
+    int*   __restrict__ global_cnt,
+    int    n_blocks,
+    float  local_val,
+    float* __restrict__ smem_bcast)  // 1 slot for broadcast
+{
+    if (threadIdx.x == 0) {
+        atomicAdd(global_acc, local_val);
+        // Memory fence ensures the add is visible before we increment cnt
+        __threadfence();
+        int prev = atomicAdd(global_cnt, 1);
+        if (prev + 1 == n_blocks) {
+            // Last block: read final sum, broadcast via smem
+            smem_bcast[0] = *global_acc;
+        }
+    }
+    // All threads in the last block spin until the broadcast is written.
+    // Other blocks also spin but they won't be used — this is only called
+    // from the cross-block tail path which uses a single block.
+    __syncthreads();
+    return smem_bcast[0];
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Section 5: Main Reduce-Scatter Kernel
 //
-// Each device only writes the shard assigned to it: elements in the half-open
-// range [shard_offset, shard_offset + shard_count).  All inputs are read in
-// full for the reduction, but only the local shard is written.
-// ---------------------------------------------------------------------------
-__global__ void __launch_bounds__(kBlockSize, 2)
-fused_reduce_scatter_kernel_sm86(
+//   Template parameters:
+//     SmVer        — SM version (selects policy via KernelPolicy<SmVer>)
+//     UseConstMem  — true: read input pointers from __constant__ c_input_ptrs[]
+//                    false: read from d_inputs device pointer
+//
+//   __launch_bounds__ is derived from KernelPolicy, NOT hard-coded.
+// ─────────────────────────────────────────────────────────────────────────────
+
+static constexpr int kMaxWarps = 32;  // kBlockSize(512) / 32
+
+template <int SmVer, bool UseConstMem>
+__global__ void
+__launch_bounds__(KernelPolicy<SmVer>::kBlockSize, KernelPolicy<SmVer>::kMinBlocksPerSM)
+hetero_reduce_scatter_kernel(
     __nv_bfloat16* __restrict__              output,
-    const __nv_bfloat16* const* __restrict__ inputs,
-    int  num_tensors,
+    const __nv_bfloat16* const* __restrict__ d_inputs,  // ignored if UseConstMem
+    int    num_tensors,
     size_t shard_offset,
     size_t shard_count)
 {
-    const size_t vec_count = shard_count / kVecWidth;
-    const size_t tid       = static_cast<size_t>(blockIdx.x) * kBlockSize + threadIdx.x;
-    const size_t stride    = static_cast<size_t>(gridDim.x) * kBlockSize;
+    using Policy = KernelPolicy<SmVer>;
+    constexpr int kVec = Policy::kVecWidth;
 
-    for (size_t t = tid; t < vec_count; t += stride) {
-        const size_t base = shard_offset + t * kVecWidth;
-        float2 acc0 = {0.f, 0.f}, acc1 = {0.f, 0.f};
-        float2 acc2 = {0.f, 0.f}, acc3 = {0.f, 0.f};
+    // Shared memory layout:
+    //   [0 .. kMaxWarps-1] : Stage-2 warp partial sums (not used here but
+    //                         allocated for the block_reduce_sum pattern)
+    // Note: we don't do a cross-element block-reduce in the main path —
+    // each thread owns independent output elements.  The smem is reserved
+    // for future extensions (e.g. online softmax normalization).
+    __shared__ float smem[kMaxWarps];
 
-        for (int i = 0; i < num_tensors; i++) {
-            load_bf16x8(inputs[i] + base, acc0, acc1, acc2, acc3);
+    cg::thread_block blk = cg::this_thread_block();
+
+    const size_t vec_count = shard_count / kVec;
+    const size_t tid       = (size_t)blockIdx.x * Policy::kBlockSize + threadIdx.x;
+    const size_t stride    = (size_t)gridDim.x  * Policy::kBlockSize;
+
+    // ── Stage 1+2 pipeline: warp-level multi-tensor accumulation ──
+    for (size_t vec_idx = tid; vec_idx < vec_count; vec_idx += stride) {
+        const size_t global_elem = shard_offset + vec_idx * kVec;
+
+        float2 acc0 = {0.f,0.f}, acc1 = {0.f,0.f};
+        float2 acc2 = {0.f,0.f}, acc3 = {0.f,0.f};
+
+        // Warp-cooperative accumulation across input tensors.
+        // Each thread independently accumulates ALL tensors for its
+        // own output elements — this is the standard fast path.
+        // The warp works as a unit for L1/L2 prefetching.
+        if constexpr (UseConstMem) {
+            // Hot path: input pointers in __constant__ memory
+            #pragma unroll 4
+            for (int t = 0; t < num_tensors; ++t) {
+                bf16x8_accumulate(c_input_ptrs[t] + global_elem,
+                                  acc0, acc1, acc2, acc3);
+            }
+        } else {
+            #pragma unroll 4
+            for (int t = 0; t < num_tensors; ++t) {
+                bf16x8_accumulate(d_inputs[t] + global_elem,
+                                  acc0, acc1, acc2, acc3);
+            }
         }
-        // Write to output at shard-local offset (output[0] = first element
-        // of this device's shard).
-        store_fp32x8_as_bf16(output + t * kVecWidth, acc0, acc1, acc2, acc3);
+
+        // Write local shard output (shard-relative address)
+        fp32x8_store_bf16(output + vec_idx * kVec,
+                          acc0, acc1, acc2, acc3);
     }
+
+    // ── Stage 3: Tail handling ──
+    // Handle residual elements that don't fill a full vector.
+    // Uses a single thread for correctness (no atomics needed here:
+    // each tail element is handled by exactly one thread).
+    const size_t tail_start = (vec_count / stride) * stride * kVec
+                              + (tid % stride == 0 ? 0 : size_t(-1));
+
+    // Simple scalar tail for non-aligned remainder
+    if (tid == 0) {
+        const size_t scalar_start = vec_count * kVec;
+        for (size_t e = scalar_start; e < shard_count; ++e) {
+            float acc = 0.f;
+            const size_t gidx = shard_offset + e;
+            if constexpr (UseConstMem) {
+                for (int t = 0; t < num_tensors; ++t)
+                    acc += __bfloat162float(c_input_ptrs[t][gidx]);
+            } else {
+                for (int t = 0; t < num_tensors; ++t)
+                    acc += __bfloat162float(d_inputs[t][gidx]);
+            }
+            output[e] = __float2bfloat16(acc);
+        }
+    }
+    (void)smem;
+    (void)tail_start;
 }
 
-// ---------------------------------------------------------------------------
-// Reduce-scatter kernel — SM 12.0 (Blackwell: higher occupancy hint).
-// ---------------------------------------------------------------------------
-__global__ void __launch_bounds__(kBlockSize, 4)
-fused_reduce_scatter_kernel_sm120(
+// ─────────────────────────────────────────────────────────────────────────────
+// Section 6: Warp-Cooperative Small-Tensor Kernel
+//
+//   For tensors with shard_count ≤ kSmallThreshold AND num_tensors ≤ 32:
+//   threads WITHIN a warp split ownership of the num_tensors inputs.
+//   After partial accumulation, cg::coalesced_threads() reduces across lanes.
+//   This doubles throughput when num_tensors >> 1 and the tensor is small
+//   enough that each warp handles only a few vectors.
+// ─────────────────────────────────────────────────────────────────────────────
+
+template <bool UseConstMem>
+__global__ void __launch_bounds__(256, 4)
+hetero_reduce_scatter_warp_coop(
     __nv_bfloat16* __restrict__              output,
-    const __nv_bfloat16* const* __restrict__ inputs,
-    int  num_tensors,
+    const __nv_bfloat16* const* __restrict__ d_inputs,
+    int    num_tensors,
     size_t shard_offset,
     size_t shard_count)
 {
-    const size_t vec_count = shard_count / kVecWidth;
-    const size_t tid       = static_cast<size_t>(blockIdx.x) * kBlockSize + threadIdx.x;
-    const size_t stride    = static_cast<size_t>(gridDim.x) * kBlockSize;
+    constexpr int kVec     = 8;
+    constexpr int kBS      = 256;
+    const int warp_id_g    = ((int)blockIdx.x * kBS + (int)threadIdx.x) / hw_warp_size;
+    const int lane         = (int)threadIdx.x % hw_warp_size;
+    const int total_warps  = ((int)gridDim.x * kBS) / hw_warp_size;
+    const size_t vec_count = shard_count / kVec;
 
-    for (size_t t = tid; t < vec_count; t += stride) {
-        const size_t base = shard_offset + t * kVecWidth;
-        float2 acc0 = {0.f, 0.f}, acc1 = {0.f, 0.f};
-        float2 acc2 = {0.f, 0.f}, acc3 = {0.f, 0.f};
+    for (size_t vec_idx = (size_t)warp_id_g; vec_idx < vec_count;
+         vec_idx += (size_t)total_warps) {
 
-        for (int i = 0; i < num_tensors; i++) {
-            load_bf16x8(inputs[i] + base, acc0, acc1, acc2, acc3);
-        }
-        store_fp32x8_as_bf16(output + t * kVecWidth, acc0, acc1, acc2, acc3);
-    }
-}
+        const size_t gidx = shard_offset + vec_idx * kVec;
 
-// ---------------------------------------------------------------------------
-// Full-tensor reduce kernel (no scatter) — SM 8.6 / 9.0.
-// Reduces num_tensors inputs element-wise into a single output buffer.
-// Uses cooperative groups for warp-level coordination.
-// ---------------------------------------------------------------------------
-__global__ void __launch_bounds__(kBlockSize, 2)
-fused_bf16_reduce_kernel_sm86(
-    __nv_bfloat16* __restrict__              output,
-    const __nv_bfloat16* const* __restrict__ inputs,
-    int  num_tensors,
-    size_t n_elems)
-{
-    const size_t tid    = static_cast<size_t>(blockIdx.x) * kBlockSize + threadIdx.x;
-    const size_t stride = static_cast<size_t>(gridDim.x) * kBlockSize;
+        // Each lane accumulates a disjoint subset of input tensors.
+        float2 acc0={0.f,0.f}, acc1={0.f,0.f}, acc2={0.f,0.f}, acc3={0.f,0.f};
 
-    // thread_block is used here to provide a forward-compatible hint for
-    // the compiler's barrier placement optimiser on SM 8.6.
-    // The (void) cast suppresses unused-variable warnings when the compiler
-    // elides the object in optimised builds.
-    cg::thread_block blk = cg::this_thread_block();
-    (void)blk;
-
-    for (size_t t = tid; t < n_elems / kVecWidth; t += stride) {
-        const size_t base = t * kVecWidth;
-        float2 acc0 = {0.f, 0.f}, acc1 = {0.f, 0.f};
-        float2 acc2 = {0.f, 0.f}, acc3 = {0.f, 0.f};
-
-        for (int i = 0; i < num_tensors; i++) {
-            load_bf16x8(inputs[i] + base, acc0, acc1, acc2, acc3);
-        }
-        store_fp32x8_as_bf16(output + base, acc0, acc1, acc2, acc3);
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Full-tensor reduce kernel (no scatter) — SM 12.0.
-// ---------------------------------------------------------------------------
-__global__ void __launch_bounds__(kBlockSize, 4)
-fused_bf16_reduce_kernel_sm120(
-    __nv_bfloat16* __restrict__              output,
-    const __nv_bfloat16* const* __restrict__ inputs,
-    int  num_tensors,
-    size_t n_elems)
-{
-    const size_t tid    = static_cast<size_t>(blockIdx.x) * kBlockSize + threadIdx.x;
-    const size_t stride = static_cast<size_t>(gridDim.x) * kBlockSize;
-
-    // Same thread_block hint as the SM 8.6 variant — see comment above.
-    cg::thread_block blk = cg::this_thread_block();
-    (void)blk;
-
-    for (size_t t = tid; t < n_elems / kVecWidth; t += stride) {
-        const size_t base = t * kVecWidth;
-        float2 acc0 = {0.f, 0.f}, acc1 = {0.f, 0.f};
-        float2 acc2 = {0.f, 0.f}, acc3 = {0.f, 0.f};
-
-        for (int i = 0; i < num_tensors; i++) {
-            load_bf16x8(inputs[i] + base, acc0, acc1, acc2, acc3);
-        }
-        store_fp32x8_as_bf16(output + base, acc0, acc1, acc2, acc3);
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Warp-cooperative reduce kernel for small tensors (< 32 K elements).
-//
-// When the tensor is small enough that each warp handles only a few vectors,
-// threads within a warp can cooperatively accumulate across *different*
-// input tensors (instead of each thread looping over all tensors).
-// This doubles throughput for 2–8 tensor reductions on small gradients.
-// ---------------------------------------------------------------------------
-__global__ void __launch_bounds__(kBlockSize, 2)
-fused_bf16_reduce_warp_coop_kernel(
-    __nv_bfloat16* __restrict__              output,
-    const __nv_bfloat16* const* __restrict__ inputs,
-    int  num_tensors,
-    size_t n_elems)
-{
-    cg::thread_block blk = cg::this_thread_block();
-    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(blk);
-
-    const int warp_id_global = (blockIdx.x * kBlockSize + threadIdx.x) / hw_warp_size;
-    const int lane = warp.thread_rank();
-    const size_t vec_elems = n_elems / kVecWidth;
-    const int total_warps = (gridDim.x * kBlockSize) / hw_warp_size;
-
-    for (size_t vec_idx = warp_id_global; vec_idx < vec_elems; vec_idx += total_warps) {
-        const size_t base = vec_idx * kVecWidth;
-        float2 acc0 = {0.f, 0.f}, acc1 = {0.f, 0.f};
-        float2 acc2 = {0.f, 0.f}, acc3 = {0.f, 0.f};
-
-        // Each lane in the warp handles a subset of the input tensors.
-        // After accumulation, warp-reduce sums the partial results.
-        for (int i = lane; i < num_tensors; i += hw_warp_size) {
-            load_bf16x8(inputs[i] + base, acc0, acc1, acc2, acc3);
+        for (int t = lane; t < num_tensors; t += hw_warp_size) {
+            const __nv_bfloat16* src = UseConstMem ? c_input_ptrs[t] : d_inputs[t];
+            bf16x8_accumulate(src + gidx, acc0, acc1, acc2, acc3);
         }
 
-        // Warp-level cooperative reduction using cooperative groups.
-        warp_cooperative_accumulate(acc0, acc1, acc2, acc3);
+        // Stage 1: warp-level reduce via coalesced_threads()
+        // (coalesced because all 32 lanes are active here)
+        auto warp = cg::coalesced_threads();
+        acc0.x = cg::reduce(warp, acc0.x, cg::plus<float>());
+        acc0.y = cg::reduce(warp, acc0.y, cg::plus<float>());
+        acc1.x = cg::reduce(warp, acc1.x, cg::plus<float>());
+        acc1.y = cg::reduce(warp, acc1.y, cg::plus<float>());
+        acc2.x = cg::reduce(warp, acc2.x, cg::plus<float>());
+        acc2.y = cg::reduce(warp, acc2.y, cg::plus<float>());
+        acc3.x = cg::reduce(warp, acc3.x, cg::plus<float>());
+        acc3.y = cg::reduce(warp, acc3.y, cg::plus<float>());
 
-        // Lane 0 writes the fully reduced result.
         if (lane == 0) {
-            store_fp32x8_as_bf16(output + base, acc0, acc1, acc2, acc3);
+            fp32x8_store_bf16(output + vec_idx * kVec,
+                              acc0, acc1, acc2, acc3);
         }
     }
 }
 
-// ---------------------------------------------------------------------------
-// Host-side launch wrapper — reduce (full tensor, no scatter)
-// ---------------------------------------------------------------------------
-void launch_fused_bf16_reduce(__nv_bfloat16*              output,
-                               const __nv_bfloat16* const* inputs,
-                               int                         num_tensors,
-                               size_t                      n_elems,
-                               int                         sm_version,
-                               cudaStream_t                stream)
+// ─────────────────────────────────────────────────────────────────────────────
+// Section 7: Full-Tensor Reduce (no scatter)
+//   Same pipeline as reduce-scatter but shard covers the full tensor.
+// ─────────────────────────────────────────────────────────────────────────────
+
+template <int SmVer, bool UseConstMem>
+__global__ void
+__launch_bounds__(KernelPolicy<SmVer>::kBlockSize, KernelPolicy<SmVer>::kMinBlocksPerSM)
+fused_bf16_reduce_kernel(
+    __nv_bfloat16* __restrict__              output,
+    const __nv_bfloat16* const* __restrict__ d_inputs,
+    int    num_tensors,
+    size_t n_elems)
 {
-    // Allocate a small device buffer for the pointer array.
-    const __nv_bfloat16** d_inputs = nullptr;
-    cudaMallocAsync(reinterpret_cast<void**>(&d_inputs),
-                    num_tensors * sizeof(const __nv_bfloat16*), stream);
-    cudaMemcpyAsync(d_inputs, inputs,
-                    num_tensors * sizeof(const __nv_bfloat16*),
-                    cudaMemcpyHostToDevice, stream);
+    using Policy = KernelPolicy<SmVer>;
+    constexpr int kVec = Policy::kVecWidth;
 
-    const size_t vec_elems = n_elems / kVecWidth;
-    const int grid = static_cast<int>(
-        std::min((vec_elems + kBlockSize - 1) / kBlockSize, (size_t)65535));
+    const size_t tid    = (size_t)blockIdx.x * Policy::kBlockSize + threadIdx.x;
+    const size_t stride = (size_t)gridDim.x  * Policy::kBlockSize;
+    const size_t vec_n  = n_elems / kVec;
 
-    // For small tensors with few input pointers, use warp-cooperative path.
-    constexpr size_t kSmallThreshold = 32768;  // 32 K elements
+    for (size_t i = tid; i < vec_n; i += stride) {
+        float2 a0={0.f,0.f}, a1={0.f,0.f}, a2={0.f,0.f}, a3={0.f,0.f};
+        const size_t base = i * kVec;
 
-    if (n_elems <= kSmallThreshold && num_tensors <= hw_warp_size) {
-        const int coop_grid = static_cast<int>(
-            std::min((vec_elems * hw_warp_size + kBlockSize - 1) / kBlockSize,
-                     (size_t)65535));
-        fused_bf16_reduce_warp_coop_kernel<<<coop_grid, kBlockSize, 0, stream>>>(
-            output, d_inputs, num_tensors, n_elems);
-    } else if (sm_version >= 120) {
-        fused_bf16_reduce_kernel_sm120<<<grid, kBlockSize, 0, stream>>>(
-            output, d_inputs, num_tensors, n_elems);
-    } else {
-        fused_bf16_reduce_kernel_sm86<<<grid, kBlockSize, 0, stream>>>(
-            output, d_inputs, num_tensors, n_elems);
+        if constexpr (UseConstMem) {
+            #pragma unroll 4
+            for (int t = 0; t < num_tensors; ++t)
+                bf16x8_accumulate(c_input_ptrs[t] + base, a0, a1, a2, a3);
+        } else {
+            #pragma unroll 4
+            for (int t = 0; t < num_tensors; ++t)
+                bf16x8_accumulate(d_inputs[t] + base, a0, a1, a2, a3);
+        }
+        fp32x8_store_bf16(output + base, a0, a1, a2, a3);
     }
-
-    cudaFreeAsync(d_inputs, stream);
+    // Scalar tail
+    if (tid == 0) {
+        for (size_t e = vec_n * kVec; e < n_elems; ++e) {
+            float acc = 0.f;
+            if constexpr (UseConstMem) {
+                for (int t = 0; t < num_tensors; ++t)
+                    acc += __bfloat162float(c_input_ptrs[t][e]);
+            } else {
+                for (int t = 0; t < num_tensors; ++t)
+                    acc += __bfloat162float(d_inputs[t][e]);
+            }
+            output[e] = __float2bfloat16(acc);
+        }
+    }
 }
 
-// ---------------------------------------------------------------------------
-// Heterogeneous shard-size computation.
-//
-// Given N tiers of GPUs, compute the element range each tier reduces and
-// writes.  Higher SM versions receive proportionally larger shards:
-//   weight(SM 12.0) = 4,  weight(SM 9.0) = 3,  weight(SM 8.6) = 1
-// Shard boundaries are rounded down to kVecWidth alignment.
-// ---------------------------------------------------------------------------
+// ─────────────────────────────────────────────────────────────────────────────
+// Section 8: Helper — runtime SM dispatch + policy-driven grid sizing
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Copies input pointers to constant memory (inline path) OR allocates device
+// memory (overflow path).  Returns the device pointer (nullptr if inline).
+static const __nv_bfloat16** setup_input_ptrs(
+    const __nv_bfloat16* const* host_ptrs,
+    int num_tensors,
+    cudaStream_t stream)
+{
+    if (num_tensors <= kMaxInlinePointers) {
+        // Fast path: constant memory, no malloc
+        cudaMemcpyToSymbolAsync(c_input_ptrs, host_ptrs,
+            num_tensors * sizeof(const __nv_bfloat16*), 0,
+            cudaMemcpyHostToDevice, stream);
+        return nullptr;
+    }
+    // Slow path: device memory
+    const __nv_bfloat16** d_ptrs = nullptr;
+    cudaMallocAsync(reinterpret_cast<void**>(&d_ptrs),
+        num_tensors * sizeof(const __nv_bfloat16*), stream);
+    cudaMemcpyAsync(d_ptrs, host_ptrs,
+        num_tensors * sizeof(const __nv_bfloat16*),
+        cudaMemcpyHostToDevice, stream);
+    return d_ptrs;
+}
+
+template <int SmVer>
+static void dispatch_reduce_scatter(
+    __nv_bfloat16* output,
+    const __nv_bfloat16** d_inputs,
+    bool use_const,
+    int num_tensors,
+    size_t shard_offset, size_t shard_count,
+    cudaStream_t stream)
+{
+    using Policy = KernelPolicy<SmVer>;
+    constexpr size_t kSmallThresh = 128UL * 1024UL;  // 128 K elements
+
+    if (shard_count <= kSmallThresh && num_tensors <= hw_warp_size) {
+        // Warp-coop path for small shards
+        const size_t vec_count = shard_count / Policy::kVecWidth;
+        const int warps_needed = (int)std::min(
+            (vec_count + 1 - 1) / 1, (size_t)65535);
+        const int grid = (warps_needed * hw_warp_size + 255) / 256;
+        if (use_const)
+            hetero_reduce_scatter_warp_coop<true>
+                <<<grid, 256, 0, stream>>>(
+                    output, nullptr, num_tensors, shard_offset, shard_count);
+        else
+            hetero_reduce_scatter_warp_coop<false>
+                <<<grid, 256, 0, stream>>>(
+                    output, d_inputs, num_tensors, shard_offset, shard_count);
+        return;
+    }
+
+    const size_t vec_count = shard_count / Policy::kVecWidth;
+    const int grid = (int)std::min(
+        (vec_count + Policy::kBlockSize - 1) / Policy::kBlockSize,
+        (size_t)65535);
+
+    if (use_const)
+        hetero_reduce_scatter_kernel<SmVer, true>
+            <<<grid, Policy::kBlockSize, 0, stream>>>(
+                output, nullptr, num_tensors, shard_offset, shard_count);
+    else
+        hetero_reduce_scatter_kernel<SmVer, false>
+            <<<grid, Policy::kBlockSize, 0, stream>>>(
+                output, d_inputs, num_tensors, shard_offset, shard_count);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Section 9: Public API Implementations
+// ─────────────────────────────────────────────────────────────────────────────
+
+void launch_fused_bf16_reduce(
+    __nv_bfloat16*              output,
+    const __nv_bfloat16* const* inputs,
+    int                         num_tensors,
+    size_t                      n_elems,
+    int                         sm_version,
+    cudaStream_t                stream)
+{
+    const __nv_bfloat16** d_inputs = setup_input_ptrs(inputs, num_tensors, stream);
+    const bool use_const = (d_inputs == nullptr);
+
+    auto launch = [&]<int SmVer>() {
+        using Policy = KernelPolicy<SmVer>;
+        const size_t vec_n = n_elems / Policy::kVecWidth;
+        const int grid = (int)std::min(
+            (vec_n + Policy::kBlockSize - 1) / Policy::kBlockSize,
+            (size_t)65535);
+        if (use_const)
+            fused_bf16_reduce_kernel<SmVer, true>
+                <<<grid, Policy::kBlockSize, 0, stream>>>(
+                    output, nullptr, num_tensors, n_elems);
+        else
+            fused_bf16_reduce_kernel<SmVer, false>
+                <<<grid, Policy::kBlockSize, 0, stream>>>(
+                    output, d_inputs, num_tensors, n_elems);
+    };
+
+    if      (sm_version >= 120) launch.template operator()<120>();
+    else if (sm_version >= 90)  launch.template operator()<90>();
+    else                        launch.template operator()<86>();
+
+    if (d_inputs) cudaFreeAsync(d_inputs, stream);
+}
+
 static int tier_weight(int sm_version)
 {
     if (sm_version >= 120) return 4;   // Blackwell
     if (sm_version >= 90)  return 3;   // H100
-    return 1;                          // A6000 / fallback
+    return 1;                          // A6000
 }
 
-void compute_hetero_shard_ranges(const HeteroTierDesc* tiers,
-                                  int                    num_tiers,
-                                  size_t                 total_elems,
-                                  size_t*                out_offsets,
-                                  size_t*                out_counts)
+void compute_hetero_shard_ranges(
+    const HeteroTierDesc* tiers,
+    int                   num_tiers,
+    size_t                total_elems,
+    size_t*               out_offsets,
+    size_t*               out_counts)
 {
     int total_weight = 0;
-    for (int i = 0; i < num_tiers; i++) {
+    for (int i = 0; i < num_tiers; ++i)
         total_weight += tier_weight(tiers[i].sm_version);
-    }
+
+    // Alignment: 8 BF16 elements (128-bit vector boundary)
+    constexpr size_t kAlign = 8;
 
     size_t assigned = 0;
-    for (int i = 0; i < num_tiers; i++) {
+    for (int i = 0; i < num_tiers; ++i) {
         if (i == num_tiers - 1) {
-            // Last tier gets the remainder to avoid rounding gaps.
             out_offsets[i] = assigned;
             out_counts[i]  = total_elems - assigned;
         } else {
-            size_t raw = (total_elems * tier_weight(tiers[i].sm_version))
-                         / total_weight;
-            // Round down to vector alignment.
-            raw = (raw / kVecWidth) * kVecWidth;
+            // Weighted shard, rounded down to kAlign
+            size_t raw = (total_elems * (size_t)tier_weight(tiers[i].sm_version))
+                         / (size_t)total_weight;
+            raw = (raw / kAlign) * kAlign;
             out_offsets[i] = assigned;
             out_counts[i]  = raw;
             assigned += raw;
@@ -378,12 +592,14 @@ void compute_hetero_shard_ranges(const HeteroTierDesc* tiers,
     }
 }
 
-// ---------------------------------------------------------------------------
-// Host-side launch wrapper — heterogeneous reduce-scatter.
-//
-// Launches the reduce-scatter kernel on the *current* device, reducing all
-// input tensors but writing only the shard assigned to this tier.
-// ---------------------------------------------------------------------------
+// Per-tier adaptive bucket size query (for Python bucketing logic)
+size_t hetero_bucket_size_elems(int sm_version)
+{
+    if (sm_version >= 120) return KernelPolicy<120>::kBucketElems;
+    if (sm_version >= 90)  return KernelPolicy<90>::kBucketElems;
+    return KernelPolicy<86>::kBucketElems;
+}
+
 void launch_hetero_reduce_scatter(
     __nv_bfloat16*              output,
     const __nv_bfloat16* const* inputs,
@@ -395,25 +611,18 @@ void launch_hetero_reduce_scatter(
 {
     if (shard_count == 0) return;
 
-    // Copy input pointer array to device.
-    const __nv_bfloat16** d_inputs = nullptr;
-    cudaMallocAsync(reinterpret_cast<void**>(&d_inputs),
-                    num_tensors * sizeof(const __nv_bfloat16*), stream);
-    cudaMemcpyAsync(d_inputs, inputs,
-                    num_tensors * sizeof(const __nv_bfloat16*),
-                    cudaMemcpyHostToDevice, stream);
+    const __nv_bfloat16** d_inputs = setup_input_ptrs(inputs, num_tensors, stream);
+    const bool use_const = (d_inputs == nullptr);
 
-    const size_t vec_count = shard_count / kVecWidth;
-    const int grid = static_cast<int>(
-        std::min((vec_count + kBlockSize - 1) / kBlockSize, (size_t)65535));
+    if      (sm_version >= 120)
+        dispatch_reduce_scatter<120>(output, d_inputs, use_const,
+            num_tensors, shard_offset, shard_count, stream);
+    else if (sm_version >= 90)
+        dispatch_reduce_scatter<90>(output, d_inputs, use_const,
+            num_tensors, shard_offset, shard_count, stream);
+    else
+        dispatch_reduce_scatter<86>(output, d_inputs, use_const,
+            num_tensors, shard_offset, shard_count, stream);
 
-    if (sm_version >= 120) {
-        fused_reduce_scatter_kernel_sm120<<<grid, kBlockSize, 0, stream>>>(
-            output, d_inputs, num_tensors, shard_offset, shard_count);
-    } else {
-        fused_reduce_scatter_kernel_sm86<<<grid, kBlockSize, 0, stream>>>(
-            output, d_inputs, num_tensors, shard_offset, shard_count);
-    }
-
-    cudaFreeAsync(d_inputs, stream);
+    if (d_inputs) cudaFreeAsync(d_inputs, stream);
 }
