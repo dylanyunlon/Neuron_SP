@@ -1,3 +1,8 @@
+import sys as _sys, os as _os
+_megatron_dir = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), 'Megatron-LM')
+if _os.path.isdir(_megatron_dir) and _megatron_dir not in _sys.path:
+    _sys.path.insert(0, _megatron_dir)
+
 # SPDX-License-Identifier: Apache-2.0
 # DeepSpeed Team
 """
