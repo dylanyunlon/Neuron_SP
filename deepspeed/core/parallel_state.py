@@ -2595,3 +2595,30 @@ def safe_get_world_size() -> int:
         stacklevel=2,
     )
     return 1
+
+
+# ---------------------------------------------------------------------------
+# set_data_parallel_world_size  (MPU override)
+# ---------------------------------------------------------------------------
+
+def set_data_parallel_world_size(world_size: int) -> None:
+    """Override the data-parallel world size (for unit testing / sub-world usage)."""
+    global _MPU_DATA_PARALLEL_WORLD_SIZE
+    _MPU_DATA_PARALLEL_WORLD_SIZE = world_size
+
+
+# ---------------------------------------------------------------------------
+# initialize_model_parallel_groups  — canonical alias for initialize_model_parallel
+#
+# Megatron-LM calls this function "initialize_model_parallel".  Various
+# callers in Neuron_SP (run_pretrain.py, tests, scripts) import it under the
+# name "initialize_model_parallel_groups" to make explicit that it creates
+# *all* parallel process groups (TP / PP / DP / CP / EP + DES-LOC tiers).
+# This alias ensures::
+#
+#     from deepspeed.core.parallel_state import initialize_model_parallel_groups
+#
+# works without any signature change.
+# ---------------------------------------------------------------------------
+
+initialize_model_parallel_groups = initialize_model_parallel
