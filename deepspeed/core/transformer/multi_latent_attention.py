@@ -279,15 +279,33 @@ except ImportError:
 # RoPE imports  (lazy from Megatron; fallback stubs for import-time safety)
 # ---------------------------------------------------------------------------
 
-# M-ROPE-FIX: No fallback allowed — Megatron-LM RoPE is mandatory.
+# M-ROPE-FIX: Use our LOCAL rope implementations (deepspeed.core + compile),
+# NOT the external megatron package. No fallback, no try/except.
 # Ref: HuggingFace transformers PR #32312, DeepSpeed issue #5311.
-# All try/except fallback to local rope_utils has been removed per no-fallback policy.
-from megatron.core.models.common.embeddings import (
-    RotaryEmbedding,
-    YarnRotaryEmbedding,
-    _yarn_get_mscale,
+from deepspeed.core.models.common.embeddings.rope_utils import (
     apply_rotary_pos_emb,
 )
+from deepspeed.compile.megatron_rotary_pos_embedding import RotaryEmbedding
+try:
+    from deepspeed.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb_with_cos_sin
+except ImportError:
+    pass
+# YarnRotaryEmbedding and _yarn_get_mscale: import from our vendored Megatron-LM subdir
+import sys as _sys
+import os as _os
+_megatron_path = _os.path.join(_os.path.dirname(__file__), '..', '..', '..', '..', 'Megatron-LM')
+if _os.path.isdir(_megatron_path) and _megatron_path not in _sys.path:
+    _sys.path.insert(0, _os.path.abspath(_megatron_path))
+try:
+    from megatron.core.models.common.embeddings.yarn_rotary_pos_embedding import (
+        YarnRotaryEmbedding, _yarn_get_mscale,
+    )
+except ImportError:
+    YarnRotaryEmbedding = None
+    def _yarn_get_mscale(scale=1, mscale=1):
+        if scale <= 1:
+            return 1.0
+        return 0.1 * mscale * (0.1 * scale - 1) + 1.0
 _HAVE_MEGATRON_ROPE = True
 
 # ---------------------------------------------------------------------------
