@@ -1744,7 +1744,7 @@ class DesLocEngine:
         # SP all-to-all collectives deadlock on heterogeneous PCIe meshes
         # because the bandwidth asymmetry causes timeout on slower links.
         # Check: if any tier has no NVLink, force SP=1.
-        _force_sp1 = getattr(config, 'no_sp', False)
+        _force_sp1 = getattr(self.config, 'no_sp', False)
         if not _force_sp1 and hasattr(self, '_tier_specs'):
             # PCIe-only: all GPUs connected via NODE/SYS, no NV# links
             _force_sp1 = True  # default to SP=1 on heterogeneous setups
