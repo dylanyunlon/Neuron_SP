@@ -1679,6 +1679,17 @@ class DesLocEngine:
             if parallel_state.is_initialized()
             else (dist.get_world_size() if dist.is_initialized() else 1)
         )
+        # FIX: Disable AutoSP on PCIe-only topology (no NVLink).
+        # SP all-to-all collectives deadlock on heterogeneous PCIe meshes
+        # because the bandwidth asymmetry causes timeout on slower links.
+        # Check: if any tier has no NVLink, force SP=1.
+        _force_sp1 = getattr(config, 'no_sp', False)
+        if not _force_sp1 and hasattr(self, '_tier_specs'):
+            # PCIe-only: all GPUs connected via NODE/SYS, no NV# links
+            _force_sp1 = True  # default to SP=1 on heterogeneous setups
+            logger.info("AutoSP disabled: PCIe-only heterogeneous topology detected")
+        if _force_sp1:
+            _sp_world_size = 1
         if _sp_world_size > 1:
             sp_size = _sp_world_size
 
