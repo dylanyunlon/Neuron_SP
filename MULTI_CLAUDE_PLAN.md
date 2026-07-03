@@ -5,10 +5,14 @@
 > 背景: 多个 Claude 并发改 main 会撞车。以下规则消除它。
 > (协议从 walpurgis-WTFGG 项目实战验证后移植)
 
-1. **里程碑认领 (claim-before-work)**: 动手前先在下方任务表把你的里程碑行改成
-   `🔒 认领中 (Claude-N, 起始HEAD=<短hash>, UTC时间)`, 并**单独先 push 这一行**。
-   认领冲突 (同号已被 🔒) → 顺延到下一个空号, 不要并行做同一号。
-2. **push 前必 rebase**: `git pull --rebase origin main` 再 push。失败别 `--force`, 解冲突后重试。
+1. **Issue-first**: 每个改动必须链接到 GitHub Issue。commit message 格式:
+   `feat(<module>): <description> — addresses #<issue_number>`
+   没有 issue 编号的 commit = 不被接受的 commit。
+2. **Branch + PR, 不直接 push main**: 子Claude在 `feat/<module>-<issue>` 分支工作,
+   管理者审核后合并。避免了并发撞车和无法追溯的问题。
+3. **Benchmark-backed**: 性能改动必须附 timing 对比数据,无 GPU 环境注明 N/A。
+4. **push 前必 rebase**: `git pull --rebase origin main` 再 push。失败别 `--force`, 解冲突后重试。
+5. ****: `git pull --rebase origin main` 再 push。失败别 `--force`, 解冲突后重试。
 3. **一个里程碑 = 一个聚焦改动**: 不在一个里程碑里塞跨模块大改, 减少撞面。
 4. **数据完整性闸门**: 任何写进论文/结果文件的数字, **必须**有同仓库已提交的原始凭证。
    禁止 `"attached by user"` 手工转录。未达目标就如实写未达。
