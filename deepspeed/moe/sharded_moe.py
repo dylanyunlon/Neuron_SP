@@ -1,3 +1,4 @@
+from __future__ import annotations
 import logging
 # Copyright (c) Microsoft Corporation.
 # SPDX-License-Identifier: Apache-2.0
@@ -22,7 +23,6 @@ The file has been adapted from two fairscale files:
 # still initializing (circular import via ops.transformer.inference.moe_inference)
 # raises: AttributeError: partially initialized module 'deepspeed.comm' has no
 # attribute 'ProcessGroup'.
-from __future__ import annotations
 
 from deepspeed.utils.timer import SynchronizedWallClockTimer
 from deepspeed.utils import logger

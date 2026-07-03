@@ -1,3 +1,6 @@
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
 import logging
 # coding=utf-8
 # Copyright 2018 The Google AI Language Team Authors.
@@ -31,9 +34,6 @@ logging.debug('[M76]')
 
 """Tokenization classes."""
 
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
 
 import collections
 import re
