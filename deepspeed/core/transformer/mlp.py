@@ -281,11 +281,37 @@ class _NativeLinear(nn.Module):
 
     Used as the default when Transformer Engine is not available.
 
+    This is the non-TE fallback that handles column-parallel (fc1) and
+    row-parallel (fc2) patterns manually without Megatron's tensor_parallel
+    module.  In DES-LOC heterogeneous clusters, A6000 tiers often cannot
+    use TE (SM86, no FP8 hardware), so this layer handles their MLP compute
+    at full precision.
+
+    TP sharding convention (mirrors Megatron ColumnParallelLinear /
+    RowParallelLinear):
+      * ``tp_parallel_dim=0`` (column-parallel / fc1):
+        Weight shape ``[out/tp, in]``.  Each TP rank owns a contiguous
+        slice of output features.  No all-reduce needed after fc1;
+        all-reduce happens after fc2.
+      * ``tp_parallel_dim=1`` (row-parallel / fc2):
+        Weight shape ``[out, in/tp]``.  Each TP rank owns a contiguous
+        slice of input features.  All-reduce is applied after fc2 to sum
+        partial outputs across TP ranks.
+      * ``None``: no TP sharding (full weight on every rank).
+
+    Stride support (M2312 / SwiGLU checkpoint portability):
+      When ``stride > 1`` (typically 2 for SwiGLU), the output tensor of
+      fc1 is ``[..., out_per_tp * stride]``.  The stride annotation on the
+      weight tensor is needed so that Megatron's distributed optimizer can
+      correctly re-shard the fc1 weights when changing TP size at checkpoint
+      load time.
+
     Args:
-        in_features: Input feature dimension.
-        out_features: Output feature dimension.
+        in_features: Input feature dimension (per-TP slice for row-parallel).
+        out_features: Output feature dimension (per-TP slice for col-parallel).
         bias: Whether to include a bias term.
         tp_parallel_dim: 0 = column-parallel, 1 = row-parallel, None = no TP.
+        stride: Stride factor for SwiGLU gate/up interleaving (default 1).
     """
 
     def __init__(
@@ -294,23 +320,114 @@ class _NativeLinear(nn.Module):
         out_features: int,
         bias: bool = False,
         tp_parallel_dim: Optional[int] = None,
+        stride: int = 1,
     ) -> None:
         super().__init__()
         self.linear = nn.Linear(in_features, out_features, bias=bias)
+        self.tp_parallel_dim = tp_parallel_dim
+        self.stride = stride
         if tp_parallel_dim is not None:
-            self.linear.weight.tensor_model_parallel = True
-            self.linear.weight.partition_dim = tp_parallel_dim
+            self.linear.weight.tensor_model_parallel = True  # type: ignore[attr-defined]
+            self.linear.weight.partition_dim = tp_parallel_dim  # type: ignore[attr-defined]
+            if stride > 1:
+                self.linear.weight.partition_stride = stride  # type: ignore[attr-defined]
 
     def forward(
         self, hidden_states: torch.Tensor, /
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        bias = self.linear.bias if hasattr(self.linear, "bias") else None
+        """Linear forward returning ``(output, bias)`` pair.
+
+        Returns bias separately (not added to output) so that callers can
+        fuse bias + activation in a single kernel when
+        ``config.bias_activation_fusion`` is True.  This matches the
+        ColumnParallelLinear / RowParallelLinear interface from Megatron.
+
+        Args:
+            hidden_states: Input tensor of any shape ending in ``in_features``.
+
+        Returns:
+            ``(output, bias)`` where bias is ``None`` if no bias is used.
+        """
         out = F.linear(hidden_states, self.linear.weight)
+        bias = self.linear.bias if (hasattr(self.linear, 'bias') and self.linear.bias is not None) else None
         return out, bias
 
     def backward_dw(self) -> None:
         """Weight gradient backward (no-op; handled by autograd)."""
         pass
+
+    def extra_repr(self) -> str:
+        return (
+            f"in={self.linear.in_features}, out={self.linear.out_features}, "
+            f"bias={self.linear.bias is not None}, "
+            f"tp_dim={self.tp_parallel_dim}, stride={self.stride}"
+        )
+
+
+class _ColumnParallelLinear(_NativeLinear):
+    """Column-parallel linear layer (fc1 / QKV projection style).
+
+    Equivalent to Megatron's ``ColumnParallelLinear`` but without the TE
+    dependency.  Partitions the output dimension across TP ranks.
+
+    Each TP rank holds ``out_features // tp_size`` output rows, so the
+    local weight shape is ``[out_features // tp_size, in_features]``.
+
+    No all-reduce is needed after this layer (the partial outputs are
+    consumed by the activation function and then ``_RowParallelLinear``
+    which performs the all-reduce).
+
+    For SwiGLU (``stride=2``), the output has shape
+    ``[..., 2 * ffn_hidden // tp_size]`` interleaved as
+    ``[gate_0, up_0, gate_1, up_1, ...]`` along the last dimension.
+
+    Args:
+        in_features: Full input size.
+        out_features_per_tp: Output size *per TP rank* (= full_out // tp_size).
+        bias: Whether to use bias.
+        stride: 1 for GELU, 2 for SwiGLU.
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features_per_tp: int,
+        bias: bool = False,
+        stride: int = 1,
+    ) -> None:
+        super().__init__(
+            in_features, out_features_per_tp, bias=bias,
+            tp_parallel_dim=0, stride=stride,
+        )
+
+
+class _RowParallelLinear(_NativeLinear):
+    """Row-parallel linear layer (fc2 / output projection style).
+
+    Equivalent to Megatron's ``RowParallelLinear`` but without TE.
+    Partitions the input dimension across TP ranks; each rank computes a
+    partial dot-product over ``in_features // tp_size`` input columns, then
+    an all-reduce sums the partial outputs.
+
+    The all-reduce is performed by the parent MLP.forward() rather than
+    inside this module, matching the pattern in Megatron where the caller
+    controls when the all-reduce happens (for overlap with backward pass).
+
+    Args:
+        in_features_per_tp: Input size *per TP rank* (= full_in // tp_size).
+        out_features: Full output size.
+        bias: Whether to use bias.
+    """
+
+    def __init__(
+        self,
+        in_features_per_tp: int,
+        out_features: int,
+        bias: bool = False,
+    ) -> None:
+        super().__init__(
+            in_features_per_tp, out_features, bias=bias, tp_parallel_dim=1
+        )
 
 
 def _build_native_fc1(
@@ -321,8 +438,12 @@ def _build_native_fc1(
     is_expert: bool,
     stride: int = 1,
     **_kwargs,
-) -> _NativeLinear:
-    return _NativeLinear(input_size, output_size, bias=bias, tp_parallel_dim=0)
+) -> _ColumnParallelLinear:
+    """Build a column-parallel fc1 linear layer (no TE fallback).
+
+    The output_size is already the per-TP slice (caller has divided by tp_size).
+    """
+    return _ColumnParallelLinear(input_size, output_size, bias=bias, stride=stride)
 
 
 def _build_native_fc2(
@@ -331,8 +452,12 @@ def _build_native_fc2(
     *,
     bias: bool,
     **_kwargs,
-) -> _NativeLinear:
-    return _NativeLinear(input_size, output_size, bias=bias, tp_parallel_dim=1)
+) -> _RowParallelLinear:
+    """Build a row-parallel fc2 linear layer (no TE fallback).
+
+    The input_size is already the per-TP slice (caller has divided by tp_size).
+    """
+    return _RowParallelLinear(input_size, output_size, bias=bias)
 
 
 # ---------------------------------------------------------------------------
@@ -668,6 +793,81 @@ class MLP(MegatronModule):
             self.linear_fc2.backward_dw()
         if hasattr(self.linear_fc1, "backward_dw"):
             self.linear_fc1.backward_dw()
+
+    def set_layer_number(self, layer_number: int) -> None:
+        """Set the 1-based global layer number for this MLP.
+
+        Called by ``TransformerLayer.__init__`` after MLP construction so that
+        the DES-LOC tier logging and fine-grained offloading hooks have access
+        to the correct layer index.  Without this, MLP's layer_number would
+        always be 0 (the default from the fallback MLP constructor path that
+        doesn't receive layer_number from the spec pattern).
+
+        Args:
+            layer_number: 1-based global layer index.
+        """
+        if self.layer_number == 0 and layer_number > 0:
+            self.layer_number = layer_number
+            # Update DES-LOC tier logging now that we have the real layer number.
+            tier = self.config.get_layer_tier(layer_number - 1)
+            if tier is not None:
+                logger.debug(
+                    "MLP layer %d → DES-LOC tier: %s (updated via set_layer_number)",
+                    layer_number, tier.upper(),
+                )
+
+    def count_parameters(self, *, exclude_shared: bool = False) -> int:
+        """Count the total number of parameters in this MLP.
+
+        Useful for the DES-LOC engine to balance parameter counts across
+        tier boundaries and for logging.
+
+        Args:
+            exclude_shared: If True, count only non-shared (local) parameters.
+                Shared expert parameters in MoE models should be excluded when
+                counting routed-expert parameter budgets.
+
+        Returns:
+            Total parameter count (all elements, not just the TP-local slice).
+        """
+        total = 0
+        for name, param in self.named_parameters():
+            if exclude_shared and getattr(param, 'shared', False):
+                continue
+            # Scale up by TP size for column-parallel params (dim 0 sharded)
+            tp_dim = getattr(param, 'partition_dim', None)
+            tp_size = _get_tp_world_size()
+            count = param.numel()
+            if tp_dim is not None and tp_size > 1:
+                count *= tp_size  # approximate full parameter count
+            total += count
+        return total
+
+    def get_parameter_groups(self) -> dict:
+        """Return parameter groups for DES-LOC tiered optimizer.
+
+        Groups parameters by their role (fc1/gate, fc1/up, fc2) to allow
+        the DES-LOC optimizer to apply different weight decay, learning rate
+        scaling, or sync periods per group.
+
+        Returns:
+            Dict mapping group name → list of parameters::
+
+                {
+                    "fc1": [fc1_weight, fc1_bias],        # gate+up (SwiGLU) or full
+                    "fc2": [fc2_weight, fc2_bias],        # down projection
+                    "activation": [],                      # learnable activation params
+                }
+        """
+        groups: dict = {"fc1": [], "fc2": [], "activation": []}
+        for name, param in self.linear_fc1.named_parameters():
+            groups["fc1"].append(param)
+        for name, param in self.linear_fc2.named_parameters():
+            groups["fc2"].append(param)
+        if isinstance(self.activation_func, torch.nn.Module):
+            for name, param in self.activation_func.named_parameters():
+                groups["activation"].append(param)
+        return groups
 
     # ------------------------------------------------------------------
     # Sharded state dict (M4000)
