@@ -1001,6 +1001,54 @@ def fine_grained_offloading_enable_offload() -> None:
     PipelineOffloadManager.get_instance().enable_offload()
 
 
+@contextlib.contextmanager
+def maybe_enable_activation_offload(tier_type=None, config=None):
+    """Context manager that enables activation offloading for A6000 / consumer GPUs.
+
+    DES-LOC core_adapters.py adapter #6: wraps a model forward pass so that
+    activation offloading is transparently enabled for memory-constrained GPU
+    tiers (A6000, RTX consumer GPUs) and skipped for data-centre GPUs (H100,
+    A100) where keeping activations in HBM is faster.
+
+    Decision is made by ``offload_required_for_tier(tier_type)``:
+      * PROFESSIONAL / CONSUMER  (≤49 GB VRAM): offload = True
+      * DATACENTER               (≥80 GB VRAM): offload = False  (no-op context)
+      * Unknown / None: falls back to VRAM inspection; offloads if < 60 GB.
+
+    Usage::
+
+        with maybe_enable_activation_offload(tier_type=TierType.PROFESSIONAL):
+            output = model(input)
+
+    Args:
+        tier_type: Optional DES-LOC ``TierType`` enum value.  Pass None to
+                   trigger automatic VRAM-based detection.
+        config:    Optional model config with ``fine_grained_activation_offloading``
+                   flag.  When set and False, the context is always a no-op.
+
+    Yields:
+        None
+    """
+    # Honour an explicit config-level disable
+    if config is not None and not getattr(config, 'fine_grained_activation_offloading', True):
+        yield
+        return
+
+    should_offload = offload_required_for_tier(tier_type)
+    if not should_offload:
+        yield
+        return
+
+    mgr = PipelineOffloadManager.get_instance()
+    was_enabled = mgr.do_offload
+    mgr.enable_offload()
+    try:
+        yield
+    finally:
+        if not was_enabled:
+            mgr.disable_offload()
+
+
 # ---------------------------------------------------------------------------
 # High-level context-manager interface (mirrors Megatron's)
 # ---------------------------------------------------------------------------
