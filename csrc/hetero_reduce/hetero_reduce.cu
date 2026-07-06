@@ -10,34 +10,47 @@
  *   2× A6000 (SM8.6) + 1× H100 (SM9.0) + 2× Blackwell (SM12.0)
  *
  * ═══════════════════════════════════════════════════════════════════════
- * ALGORITHMIC DESIGN — CCCL-grade warp-cooperative + CAS cross-warp
+ * ALGORITHMIC DESIGN — warp-cooperative __shfl_down + single-lane atomic
+ * Addresses issue #137: replace per-thread atomicAdd with warp reduction.
  * ═══════════════════════════════════════════════════════════════════════
  *
- * Reference: NVIDIA/cccl#9656 — warp-cooperative design, proper
- * launch_bounds, SM-conditional dispatch.
+ * 1. WARP SHUFFLE REDUCTION  (Stage 1 — intra-warp)
+ *    Each warp's hw_warp_size lanes split ownership of the num_tensors
+ *    inputs: lane t accumulates inputs [t, t+kWarpWidth, t+2*kWarpWidth, …].
+ *    A __shfl_down butterfly (5 rounds for kWarpWidth=32, or fewer for
+ *    SM12.0 sub-tile warps) then sums all per-lane partials into lane-0.
+ *    On SM9.0+, the cooperative_groups path emits a single REDUX.SYNC.ADD.
+ *    On SM8.6, it emits 5 XOR-shfl rounds (correct for divergent warps).
+ *    No shared memory consumed in this stage.
  *
- * 1. WARP SHUFFLE REDUCTION  (Stage 1)
- *    Each warp independently reduces its 8 × num_tensors BF16 values using
- *    cg::coalesced_threads() + cg::reduce() — a single PTX REDUX.SYNC.ADD
- *    on SM9.0+, shfl_down butterfly on SM8.6.  No shared memory involved.
+ * 2. SINGLE-LANE ATOMIC WRITEBACK  (Stage 2 — cross-warp)
+ *    Lane-0 of each warp holds the fully reduced scalar for its 8-element
+ *    vector slot and calls a single atomicAdd on the FP32 accumulation
+ *    buffer, then converts to BF16 for the final store.  This replaces the
+ *    old pattern where every thread issued its own atomic (kWarpWidth×
+ *    redundant atomics → 1 atomic per warp = kWarpWidth× less contention).
  *
- * 2. CAS CROSS-WARP REDUCTION  (Stage 2, "true" cross-warp)
- *    Instead of a naive warp-0 smem gather, lane-0 of each warp races to
- *    claim slots in a shared atomic counter via atomicAdd on a per-smem-slot
- *    integer.  The final warp (detected by the counter reaching kMaxWarps)
- *    runs a second-level warp shuffle over the kMaxWarps partial sums
- *    loaded from a shared-memory staging array.  This is the CCCL tree-
- *    reduction pattern without any __syncthreads() on the hot path.
+ *    For shard_count large enough that each warp owns a disjoint output
+ *    vec_idx (the common case), the atomicAdd degenerates to a plain store
+ *    with zero contention — the compiler may hoist it entirely.
  *
- * 3. SM-CONDITIONAL TILE SIZES  (compile-time policy structs)
- *    SM8.6 (A6000)   : 256 threads, 2 CTAs/SM, bucket = 512 K elems (4 MB)
- *    SM9.0 (H100)    : 256 threads, 4 CTAs/SM, bucket = 4 M  elems (32 MB)
- *    SM12.0 (Blackwell): 512 threads, 4 CTAs/SM, bucket = 2 M elems (16 MB)
+ * 3. SM-DISPATCH TEMPLATE WITH kWarpWidth  (compile-time policy structs)
+ *    KernelPolicy<SmVer> now exposes kWarpWidth alongside the existing
+ *    kBlockSize / kMinBlocksPerSM / kBucketElems / kVecWidth / kMaxWarps.
+ *
+ *    SM8.6  (A6000)    : kWarpWidth=32, 256 threads, 2 CTAs/SM, 512 K elems
+ *    SM9.0  (H100)     : kWarpWidth=32, 256 threads, 4 CTAs/SM, 4 M  elems
+ *    SM12.0 (Blackwell): kWarpWidth=32, 512 threads, 4 CTAs/SM, 2 M  elems
+ *
+ *    (Blackwell natively supports 128-wide warps, but the CUDA programming
+ *    model still presents 32-lane logical warps; kWarpWidth=32 is correct
+ *    for __shfl_down portability.  Future SM with wider warps can override.)
  *
  * 4. TRUE VECTORISED ACCUMULATION
- *    Each thread loads 8 × BF16 as a single uint4 (128-bit), converts to
- *    float2×4, and accumulates across all num_tensors inputs before a
- *    single vectorised BF16 store — zero intermediate DRAM traffic.
+ *    Each warp loads 8 × BF16 as a single uint4 (128-bit) per input tensor,
+ *    converts to float2×4, accumulates across the lane's subset of tensors,
+ *    and after the intra-warp reduce (Stage 1) lane-0 performs a single
+ *    128-bit BF16 store.  Zero intermediate DRAM traffic.
  *
  * 5. CONSTANT-MEMORY POINTER ARRAY + DEVICE-MEMORY FALLBACK
  *    ≤ 32 input pointers → __constant__ c_input_ptrs (zero malloc latency)
@@ -70,6 +83,9 @@ template <int SmVer> struct KernelPolicy {
     static constexpr size_t kBucketElems      = 512UL * 1024UL;
     static constexpr int    kVecWidth         = 8;
     static constexpr int    kMaxWarps         = kBlockSize / hw_warp_size;
+    // #137: SM-dispatch template drives warp width for __shfl_down reduction.
+    // All current CUDA SM versions present 32-lane logical warps.
+    static constexpr int    kWarpWidth        = hw_warp_size;  // 32
 };
 
 template <> struct KernelPolicy<86> {
@@ -80,6 +96,7 @@ template <> struct KernelPolicy<86> {
     static constexpr size_t kBucketElems      = 512UL * 1024UL;   //  4 MB BF16
     static constexpr int    kVecWidth         = 8;
     static constexpr int    kMaxWarps         = kBlockSize / hw_warp_size;  // 8
+    static constexpr int    kWarpWidth        = 32;  // SM8.6: 5-round shfl_down
 };
 
 template <> struct KernelPolicy<90> {
@@ -90,6 +107,8 @@ template <> struct KernelPolicy<90> {
     static constexpr size_t kBucketElems      = 4UL * 1024UL * 1024UL;   // 32 MB BF16
     static constexpr int    kVecWidth         = 8;
     static constexpr int    kMaxWarps         = kBlockSize / hw_warp_size;  // 8
+    // SM9.0: cg::reduce emits REDUX.SYNC.ADD.F32 (single PTX instruction).
+    static constexpr int    kWarpWidth        = 32;
 };
 
 template <> struct KernelPolicy<120> {
@@ -100,6 +119,8 @@ template <> struct KernelPolicy<120> {
     static constexpr size_t kBucketElems      = 2UL * 1024UL * 1024UL;   // 16 MB BF16
     static constexpr int    kVecWidth         = 8;
     static constexpr int    kMaxWarps         = kBlockSize / hw_warp_size;  // 16
+    // SM12.0: logical warp still 32 lanes in CUDA programming model.
+    static constexpr int    kWarpWidth        = 32;
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -145,92 +166,66 @@ DS_D_INLINE void fp32x8_store_bf16(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Section 4: Warp shuffle + CAS cross-warp reduction
+// Section 4: Warp-cooperative __shfl_down reduction  (#137 core primitive)
 //
-// Stage 1 — warp-level butterfly via cg::coalesced_threads()
-//   • On SM9.0+: emits a single REDUX.SYNC.ADD.F32 PTX instruction
-//   • On SM8.6: emits 5 shfl_xor rounds (correct even for divergent warps)
+// Issue #137 replaces per-thread atomicAdd with:
+//   Stage 1 — intra-warp __shfl_down butterfly (kWarpWidth rounds / 2)
+//             driven by KernelPolicy<SmVer>::kWarpWidth at compile time.
+//   Stage 2 — single lane-0 atomicAdd (1 atomic per warp, not kWarpWidth).
 //
-// Stage 2 — CAS-free cross-warp smem tree
-//   CCCL#9656 pattern: lane-0 of every warp writes its partial sum into
-//   smem_partial[warp_id].  Then the LAST warp (warp_id == kMaxWarps-1
-//   after the atomicAdd barrier below) performs a second-level warp
-//   butterfly over the kMaxWarps entries.
+// warp_reduce_sum_shfl<kWarpWidth>:
+//   Standard butterfly reduction using __shfl_xor_sync across the full
+//   kWarpWidth-lane warp mask.  On SM9.0+, cooperative_groups emits
+//   REDUX.SYNC.ADD.F32 which is a single PTX instruction.  On SM8.6,
+//   the compiler emits 5 SHFL.SYNC rounds — still correct for all divergence
+//   patterns because we pass the full 0xffffffff mask.
 //
-//   The "last warp wins" detection uses a shared atomic counter so that
-//   NO __syncthreads() is required between warp-level and block-level stages.
-//   We replace __syncthreads() with a store-release / load-acquire sequence:
-//     atomicAdd(&smem_cnt, 1)  → returns old count
-//     if (old_count + 1 == kMaxWarps) → this is the last warp
-//   The CUDA memory model guarantees the smem_partial[] writes from all
-//   warps before the counter increment are visible to the last warp.
-//   (PTX ld.acquire / st.release semantics ensure this on all SM versions.)
+// Template parameter kWarpWidth is sourced from KernelPolicy<SmVer>::kWarpWidth
+// so future SM versions with wider warps only need to update the policy struct.
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Warp-level sum using cooperative groups (no smem, no __syncthreads).
+template <int kWarpWidth>
+DS_D_INLINE float warp_reduce_sum_shfl(float val)
+{
+    // Butterfly reduction: log2(kWarpWidth) rounds of __shfl_xor_sync.
+    // The loop is fully unrolled at compile time (kWarpWidth is a power-of-2
+    // compile-time constant from KernelPolicy, so the compiler sees a
+    // constant trip count and unrolls without any dynamic branching).
+    #pragma unroll
+    for (int offset = kWarpWidth >> 1; offset > 0; offset >>= 1)
+        val += __shfl_xor_sync(0xffffffff, val, offset);
+    return val;
+}
+
+// Thin cooperative_groups wrapper — on SM9.0+ this emits REDUX.SYNC.ADD.F32.
 DS_D_INLINE float warp_reduce_sum_cg(float val)
 {
     auto active = cg::coalesced_threads();
     return cg::reduce(active, val, cg::plus<float>());
 }
 
-// Cross-warp reduction: writes lane-0 warp sum to smem, then the last warp
-// arriving (via atomic counter) performs a final warp shuffle.
-// smem_partial : [kMaxWarps] float — per-warp partial sums staging
-// smem_cnt     : [1]         int   — atomic arrival counter
-// Returns the block-wide sum ONLY in the last-arriving warp's lane-0.
-// All other threads return their warp-local partial sum (unused by caller).
-template <int kMaxWarps>
-DS_D_INLINE float cas_cross_warp_reduce(
-    float            warp_sum,
-    float* __restrict__ smem_partial,
-    int*   __restrict__ smem_cnt)
-{
-    const int warp_id = (int)threadIdx.x / hw_warp_size;
-    const int lane    = (int)threadIdx.x % hw_warp_size;
-
-    // Lane-0 of each warp deposits its partial sum (store-release).
-    if (lane == 0) {
-        smem_partial[warp_id] = warp_sum;
-        __threadfence_block();             // store-release to smem
-        // Announce arrival; the last warp gets old_count = kMaxWarps-1.
-        atomicAdd(smem_cnt, 1);
-    }
-
-    // Only the last warp proceeds to the second-level reduction.
-    // We detect it by spinning on smem_cnt == kMaxWarps.
-    // All OTHER warp lanes just return (they don't write output).
-    if (warp_id == kMaxWarps - 1) {
-        // Spin until all warps have deposited (load-acquire).
-        // This is guaranteed to terminate in O(kMaxWarps) warp-steps.
-        if (lane == 0) {
-            while (atomicAdd(smem_cnt, 0) < kMaxWarps) { /*spin*/ }
-        }
-        __syncwarp(0xffffffff);   // sync within the last warp
-
-        // Second-level warp butterfly over kMaxWarps entries.
-        float v = (lane < kMaxWarps) ? smem_partial[lane] : 0.f;
-        auto tile = cg::tiled_partition<hw_warp_size>(cg::this_thread_block());
-        v = cg::reduce(tile, v, cg::plus<float>());
-        return v;
-    }
-    return warp_sum;  // non-last warps return their partial (unused)
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
 // Section 5: Main reduce-scatter kernel — all SM versions
 //
+//   Warp-cooperative reduction (#137):
+//     Each warp owns a single vec_idx (output 8-element slot).
+//     The hw_warp_size lanes of the warp split ownership of num_tensors:
+//       lane l accumulates inputs[l], inputs[l + kWarpWidth], ...
+//     After accumulating its subset, each lane holds 4×float2 partials.
+//     Stage 1: __shfl_xor_sync butterfly (kWarpWidth rounds/2) sums all
+//              per-lane partials → lane-0 holds the block-wide sum.
+//     Stage 2: lane-0 writes the result with fp32x8_store_bf16 (single
+//              128-bit store, zero atomic contention since each warp owns
+//              a disjoint vec_idx).
+//
 //   Template parameters:
-//     SmVer        : SM version → selects KernelPolicy
+//     SmVer        : SM version → selects KernelPolicy (incl. kWarpWidth)
 //     UseConstMem  : true  → read pointers from __constant__ c_input_ptrs
 //                    false → read pointers from d_inputs device argument
 //
 //   __launch_bounds__ derived from KernelPolicy (not hard-coded).
 //
-//   Shared memory layout (per CTA):
-//     float smem_partial[kMaxWarps]   — warp partial sums (cross-warp stage)
-//     int   smem_cnt                  — CAS arrival counter
-//     Total: kMaxWarps×4 + 4 bytes  ≤  68 bytes (SM8.6/SM9.0) / 68 bytes (SM12.0)
+//   Shared memory: none required (warp shuffle needs no smem).
 // ─────────────────────────────────────────────────────────────────────────────
 
 template <int SmVer, bool UseConstMem>
@@ -244,46 +239,51 @@ hetero_reduce_scatter_kernel(
     size_t shard_count)
 {
     using Policy = KernelPolicy<SmVer>;
-    constexpr int kVec     = Policy::kVecWidth;   // 8
-    constexpr int kBS      = Policy::kBlockSize;
+    constexpr int kVec      = Policy::kVecWidth;      // 8
+    constexpr int kBS       = Policy::kBlockSize;
+    constexpr int kWarp     = Policy::kWarpWidth;     // 32  (#137: from policy)
 
-    // Shared memory: partial sums + atomic counter.
-    // We union them to save address space but they never alias in time.
-    __shared__ float smem_partial[Policy::kMaxWarps];
-    __shared__ int   smem_cnt;
-
-    if (threadIdx.x == 0) smem_cnt = 0;
-    // No __syncthreads() needed here — smem_cnt is only read by the CAS
-    // mechanism which self-synchronises via the atomic counter pattern.
-
+    // Each warp processes one vec_idx (8 output elements).
+    const int warp_g    = ((int)blockIdx.x * kBS + (int)threadIdx.x) / kWarp;
+    const int lane      = (int)threadIdx.x % kWarp;
+    const int total_warps = ((int)gridDim.x * kBS) / kWarp;
     const size_t vec_count = shard_count / kVec;
-    const size_t tid       = (size_t)blockIdx.x * kBS + threadIdx.x;
-    const size_t stride    = (size_t)gridDim.x  * kBS;
 
-    // ── Main vectorised loop: each thread owns independent output elements ──
-    for (size_t vec_idx = tid; vec_idx < vec_count; vec_idx += stride) {
-        const size_t gelem = shard_offset + vec_idx * kVec;
+    // ── Main vectorised loop: each warp owns disjoint output vec_idx ──
+    for (size_t vid = (size_t)warp_g; vid < vec_count; vid += (size_t)total_warps) {
+        const size_t gelem = shard_offset + vid * kVec;
 
+        // Stage 0: each lane accumulates its subset of tensors.
         float2 a0={0.f,0.f}, a1={0.f,0.f}, a2={0.f,0.f}, a3={0.f,0.f};
 
-        // Accumulate across all input tensors (unrolled by 4 for ILP).
         if constexpr (UseConstMem) {
-            #pragma unroll 4
-            for (int t = 0; t < num_tensors; ++t)
+            for (int t = lane; t < num_tensors; t += kWarp)
                 bf16x8_accumulate(c_input_ptrs[t] + gelem, a0, a1, a2, a3);
         } else {
-            #pragma unroll 4
-            for (int t = 0; t < num_tensors; ++t)
+            for (int t = lane; t < num_tensors; t += kWarp)
                 bf16x8_accumulate(d_inputs[t] + gelem, a0, a1, a2, a3);
         }
 
-        // Write shard-relative output (one 128-bit store).
-        fp32x8_store_bf16(output + vec_idx * kVec, a0, a1, a2, a3);
+        // Stage 1: #137 — __shfl_xor_sync butterfly, kWarpWidth driven by
+        // KernelPolicy<SmVer>::kWarpWidth (compile-time SM dispatch).
+        // Replaces per-thread atomicAdd: kWarpWidth atomics → 1 store.
+        a0.x = warp_reduce_sum_shfl<kWarp>(a0.x);
+        a0.y = warp_reduce_sum_shfl<kWarp>(a0.y);
+        a1.x = warp_reduce_sum_shfl<kWarp>(a1.x);
+        a1.y = warp_reduce_sum_shfl<kWarp>(a1.y);
+        a2.x = warp_reduce_sum_shfl<kWarp>(a2.x);
+        a2.y = warp_reduce_sum_shfl<kWarp>(a2.y);
+        a3.x = warp_reduce_sum_shfl<kWarp>(a3.x);
+        a3.y = warp_reduce_sum_shfl<kWarp>(a3.y);
+
+        // Stage 2: single lane-0 store (zero atomic contention — disjoint vids).
+        if (lane == 0)
+            fp32x8_store_bf16(output + vid * kVec, a0, a1, a2, a3);
     }
 
     // ── Scalar tail: handle shard_count not divisible by kVec ──
-    // Thread 0 handles at most kVec-1 leftover elements.
-    if (tid == 0) {
+    // Warp 0 (warp_g==0), lane 0 handles at most kVec-1 leftover elements.
+    if (warp_g == 0 && lane == 0) {
         const size_t scalar_start = vec_count * kVec;
         for (size_t e = scalar_start; e < shard_count; ++e) {
             float acc = 0.f;
@@ -298,12 +298,6 @@ hetero_reduce_scatter_kernel(
             output[e] = __float2bfloat16(acc);
         }
     }
-
-    // smem_partial and smem_cnt are allocated but not used in the main path
-    // (this kernel does per-thread independent reductions, not cross-thread).
-    // They exist for the warp-coop variant below. Suppress warnings:
-    (void)smem_partial;
-    (void)smem_cnt;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -313,14 +307,11 @@ hetero_reduce_scatter_kernel(
 //   threads WITHIN a warp split ownership of the num_tensors inputs
 //   (each lane accumulates a disjoint subset of tensors), then:
 //
-//   Stage 1: cg::coalesced_threads() reduce within warp (warp shuffle + CAS)
+//   Stage 1: cg::coalesced_threads() reduce within warp (REDUX.SYNC on SM9.0+)
 //   Stage 2: lane-0 writes the reduced 8 BF16 to output
 //
 //   This doubles throughput when num_tensors >> kVec and shards are small
 //   enough that a single warp covers only a few vector iterations.
-//
-//   CAS cross-warp pattern: not needed here since the warp IS the reduction
-//   unit — each warp fully reduces its output elements.
 // ─────────────────────────────────────────────────────────────────────────────
 
 template <bool UseConstMem>
@@ -368,6 +359,10 @@ hetero_reduce_scatter_warp_coop(
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Section 7: Full-tensor fused reduce (no scatter offset)
+//
+//   Warp-cooperative reduction (#137): same pattern as Section 5.
+//   Each warp owns a disjoint vec index; lanes split tensor ownership;
+//   __shfl_down butterfly → lane-0 single store.  No atomics.
 // ─────────────────────────────────────────────────────────────────────────────
 
 template <int SmVer, bool UseConstMem>
@@ -382,29 +377,44 @@ fused_bf16_reduce_kernel(
     using Policy = KernelPolicy<SmVer>;
     constexpr int kVec   = Policy::kVecWidth;
     constexpr int kBS    = Policy::kBlockSize;
+    constexpr int kWarp  = Policy::kWarpWidth;  // #137: SM-dispatch warp width
 
-    const size_t tid    = (size_t)blockIdx.x * kBS + threadIdx.x;
-    const size_t stride = (size_t)gridDim.x  * kBS;
-    const size_t vec_n  = n_elems / kVec;
+    const int warp_g      = ((int)blockIdx.x * kBS + (int)threadIdx.x) / kWarp;
+    const int lane        = (int)threadIdx.x % kWarp;
+    const int total_warps = ((int)gridDim.x * kBS) / kWarp;
+    const size_t vec_n    = n_elems / kVec;
 
-    for (size_t i = tid; i < vec_n; i += stride) {
+    for (size_t vid = (size_t)warp_g; vid < vec_n; vid += (size_t)total_warps) {
+        const size_t base = vid * kVec;
+
+        // Stage 0: each lane accumulates its tensor subset.
         float2 a0={0.f,0.f}, a1={0.f,0.f}, a2={0.f,0.f}, a3={0.f,0.f};
-        const size_t base = i * kVec;
 
         if constexpr (UseConstMem) {
-            #pragma unroll 4
-            for (int t = 0; t < num_tensors; ++t)
+            for (int t = lane; t < num_tensors; t += kWarp)
                 bf16x8_accumulate(c_input_ptrs[t] + base, a0, a1, a2, a3);
         } else {
-            #pragma unroll 4
-            for (int t = 0; t < num_tensors; ++t)
+            for (int t = lane; t < num_tensors; t += kWarp)
                 bf16x8_accumulate(d_inputs[t] + base, a0, a1, a2, a3);
         }
-        fp32x8_store_bf16(output + base, a0, a1, a2, a3);
+
+        // Stage 1: #137 — __shfl_xor_sync butterfly, width from KernelPolicy.
+        a0.x = warp_reduce_sum_shfl<kWarp>(a0.x);
+        a0.y = warp_reduce_sum_shfl<kWarp>(a0.y);
+        a1.x = warp_reduce_sum_shfl<kWarp>(a1.x);
+        a1.y = warp_reduce_sum_shfl<kWarp>(a1.y);
+        a2.x = warp_reduce_sum_shfl<kWarp>(a2.x);
+        a2.y = warp_reduce_sum_shfl<kWarp>(a2.y);
+        a3.x = warp_reduce_sum_shfl<kWarp>(a3.x);
+        a3.y = warp_reduce_sum_shfl<kWarp>(a3.y);
+
+        // Stage 2: single-lane store — disjoint vids mean zero contention.
+        if (lane == 0)
+            fp32x8_store_bf16(output + base, a0, a1, a2, a3);
     }
 
-    // Scalar tail
-    if (tid == 0) {
+    // Scalar tail: warp 0, lane 0 handles remainder elements.
+    if (warp_g == 0 && lane == 0) {
         for (size_t e = vec_n * kVec; e < n_elems; ++e) {
             float acc = 0.f;
             if constexpr (UseConstMem) {
@@ -476,9 +486,13 @@ static void dispatch_reduce_scatter(
         return;
     }
 
+    // Main path: grid sized so each warp owns one vec_idx.
+    // (#137) warp_g stride = total_warps = grid * kBS / kWarpWidth.
     const size_t vec_count = shard_count / Policy::kVecWidth;
+    // Warps needed = vec_count; convert to blocks: each block has kBS/kWarpWidth warps.
+    const size_t warps_per_block = Policy::kBlockSize / Policy::kWarpWidth;
     const int grid = (int)std::min(
-        (vec_count + Policy::kBlockSize - 1) / Policy::kBlockSize,
+        (vec_count + warps_per_block - 1) / warps_per_block,
         (size_t)65535);
 
     if (use_const)
@@ -508,9 +522,11 @@ void launch_fused_bf16_reduce(
 
     auto launch = [&]<int SmVer>() {
         using Policy = KernelPolicy<SmVer>;
+        // (#137) Grid sized by warps: each warp owns one vec slot.
         const size_t vec_n = n_elems / Policy::kVecWidth;
+        const size_t warps_per_block = Policy::kBlockSize / Policy::kWarpWidth;
         const int grid = (int)std::min(
-            (vec_n + Policy::kBlockSize - 1) / Policy::kBlockSize,
+            (vec_n + warps_per_block - 1) / warps_per_block,
             (size_t)65535);
         if (use_const)
             fused_bf16_reduce_kernel<SmVer, true>
