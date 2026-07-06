@@ -3,7 +3,7 @@
 """TransformerBlock — stack of TransformerLayers with DES-LOC tier-aware placement.
 
 Ported from Megatron-LM megatron/core/transformer/transformer_block.py
-(29 commits, M2260 → M3977).
+(29 commits, M2260 → M3977) and extended for the Neuron_SP / DES-LOC project.
 
 Key evolution tracked through the commit history:
   M2260 (5cc85f3a0) – Configurable double buffering for CPU offloading
@@ -53,6 +53,7 @@ Pipeline-parallel support:
   * Uneven first/last stage: ``config.num_layers_in_first_pipeline_stage`` /
     ``config.num_layers_in_last_pipeline_stage``
   * Virtual pipeline parallelism (VPP): ``config.virtual_pipeline_model_parallel_size``
+  * Custom layout object: ``config.pipeline_model_parallel_layout``
 
 Full-recompute and selective-recompute are controlled by
 ``config.recompute_granularity`` and ``config.recompute_modules``.
@@ -75,7 +76,15 @@ from torch import Tensor
 
 from deepspeed.core.transformer.module import MegatronModule
 from deepspeed.core.transformer.transformer_config import TransformerConfig
-from deepspeed.core.transformer.transformer_layer import TransformerLayer, _build_norm
+from deepspeed.core.transformer.transformer_layer import (
+    BaseTransformerLayer,
+    TransformerLayer,
+    TransformerLayerSubmodules,
+    _build_norm,
+    get_transformer_layer_offset,
+)
+from deepspeed.core.transformer.spec_utils import ModuleSpec, build_module
+from deepspeed.core.transformer.identity_op import IdentityOp
 
 logger = logging.getLogger(__name__)
 
@@ -109,7 +118,25 @@ def _get_tp_rank() -> int:
 
 
 # ---------------------------------------------------------------------------
-# get_num_layers_to_build helper (M2260 era logic, extended for DES-LOC)
+# make_viewless_tensor helper (wraps deepspeed.core.utils if available)
+# ---------------------------------------------------------------------------
+
+def _make_viewless_tensor(t: Tensor, requires_grad: bool = True, keep_graph: bool = True) -> Tensor:
+    """Return a viewless copy of *t*, guarding against schedule.py errors.
+
+    Tries to use ``deepspeed.core.utils.make_viewless_tensor`` (which uses the
+    JIT kernel for true viewlessness); falls back to ``.contiguous()`` so that
+    the code path always works even without the CUDA extension.
+    """
+    try:
+        from deepspeed.core.utils import make_viewless_tensor
+        return make_viewless_tensor(inp=t, requires_grad=requires_grad, keep_graph=keep_graph)
+    except Exception:
+        return t.contiguous() if not t.is_contiguous() else t
+
+
+# ---------------------------------------------------------------------------
+# get_num_layers_to_build helper (M2260 era logic, aligned with Megatron)
 # ---------------------------------------------------------------------------
 
 def get_num_layers_to_build(
@@ -120,11 +147,13 @@ def get_num_layers_to_build(
     """Determine the number of transformer layers to build for this PP stage.
 
     Supports:
-      * Even split (default)
-      * Explicit heterogeneous split (``config.pipeline_layer_split``)
+      * Custom layout object (``config.pipeline_model_parallel_layout``).
+      * Even split (default).
+      * Explicit heterogeneous split (``config.pipeline_layer_split``).
       * Uneven first/last stage (``config.num_layers_in_first_pipeline_stage``
-        / ``config.num_layers_in_last_pipeline_stage``)
-      * Virtual pipeline parallelism (VPP)
+        / ``config.num_layers_in_last_pipeline_stage``).
+      * Virtual pipeline parallelism (VPP).
+      * Embedding / loss layer accounting.
 
     Args:
         config: TransformerConfig.
@@ -141,11 +170,19 @@ def get_num_layers_to_build(
 
     is_first_pp_stage = pp_rank == 0
     is_last_pp_stage = pp_rank == pp_size - 1
+    vp_size = getattr(config, "virtual_pipeline_model_parallel_size", None)
 
-    # Explicit pipeline layout (DES-LOC heterogeneous split)
-    pipeline_layer_split: Optional[List[int]] = getattr(
-        config, "pipeline_layer_split", None
-    )
+    # Custom layout object (takes priority)
+    layout = getattr(config, "pipeline_model_parallel_layout", None)
+    if layout is not None and hasattr(layout, "get_num_layers_to_build"):
+        try:
+            from deepspeed.core.transformer.enums import LayerType
+            return layout.get_num_layers_to_build(layer_type=LayerType.decoder, vp_stage=vp_stage)
+        except Exception:
+            pass
+
+    # DES-LOC heterogeneous split
+    pipeline_layer_split: Optional[List[int]] = getattr(config, "pipeline_layer_split", None)
     if pipeline_layer_split is not None:
         if len(pipeline_layer_split) != pp_size:
             raise ValueError(
@@ -162,7 +199,7 @@ def get_num_layers_to_build(
         getattr(config, "num_layers_in_first_pipeline_stage", None) is not None
         or getattr(config, "num_layers_in_last_pipeline_stage", None) is not None
     ):
-        # Uneven first/last stage
+        # Uneven first/last stage — mirrors Megatron exactly
         layers_to_distribute = config.num_layers
         pipeline_stages_left = pp_size
 
@@ -209,7 +246,6 @@ def get_num_layers_to_build(
         num_layers_per_pipeline_rank = num_layers // pp_size
 
     # Virtual pipeline parallelism
-    vp_size = getattr(config, "virtual_pipeline_model_parallel_size", None)
     if vp_size is not None and pp_size > 1:
         if num_layers_per_pipeline_rank % vp_size != 0:
             raise ValueError(
@@ -220,54 +256,25 @@ def get_num_layers_to_build(
     else:
         num_layers_to_build = num_layers_per_pipeline_rank
 
-    # Subtract embedding/loss placeholder layers
-    if account_embedding and is_first_pp_stage and (vp_stage is None or vp_stage == 0):
-        num_layers_to_build = max(0, num_layers_to_build - 1)
-    if account_loss and is_last_pp_stage and (
-        vp_stage is None or vp_stage == (vp_size or 1) - 1
-    ):
-        num_layers_to_build = max(0, num_layers_to_build - 1)
+    # Subtract embedding/loss placeholder layers (mirrors Megatron is_vp_first/last_stage logic)
+    account_embedding = getattr(config, "account_for_embedding_in_pipeline_split", False)
+    account_loss = getattr(config, "account_for_loss_in_pipeline_split", False)
+
+    def _is_vp_first_stage(vs, vps):
+        return vs is None or vs == 0
+
+    def _is_vp_last_stage(vs, vps):
+        return vs is None or (vps is not None and vs == vps - 1) or vps is None
+
+    if account_embedding:
+        if _is_vp_first_stage(vp_stage, vp_size) and is_first_pp_stage:
+            num_layers_to_build = max(0, num_layers_to_build - 1)
+
+    if account_loss:
+        if _is_vp_last_stage(vp_stage, vp_size) and is_last_pp_stage:
+            num_layers_to_build = max(0, num_layers_to_build - 1)
 
     return num_layers_to_build
-
-
-def get_transformer_layer_offset(
-    config: TransformerConfig,
-    vp_stage: Optional[int] = None,
-    pp_rank: Optional[int] = None,
-) -> int:
-    """Return the 0-based global index of the first layer on this PP stage.
-
-    Used to compute 1-based layer numbers (offset + local_index + 1).
-
-    Args:
-        config: TransformerConfig.
-        vp_stage: Virtual pipeline stage.
-        pp_rank: Pipeline rank override.
-
-    Returns:
-        Integer offset (0-based).
-    """
-    pp_size = getattr(config, "pipeline_model_parallel_size", 1) or 1
-    if pp_rank is None:
-        pp_rank = _get_pp_rank()
-
-    pipeline_layer_split: Optional[List[int]] = getattr(
-        config, "pipeline_layer_split", None
-    )
-    if pipeline_layer_split is not None:
-        return sum(pipeline_layer_split[:pp_rank])
-
-    vp_size = getattr(config, "virtual_pipeline_model_parallel_size", None)
-    num_layers_per_rank = config.num_layers // pp_size
-
-    if vp_size is not None and pp_size > 1 and vp_stage is not None:
-        layers_per_vp_stage = num_layers_per_rank // vp_size
-        offset = vp_stage * pp_size * layers_per_vp_stage + pp_rank * layers_per_vp_stage
-    else:
-        offset = pp_rank * num_layers_per_rank
-
-    return offset
 
 
 # ---------------------------------------------------------------------------
@@ -279,12 +286,88 @@ class TransformerBlockSubmodules:
     """Dataclass for specifying the submodules of a transformer block.
 
     Args:
-        layer_specs: List of layer spec builders.
+        layer_specs: List of layer spec builders (one per local layer).
         layer_norm: LayerNorm builder for the final norm.
     """
 
     layer_specs: Optional[List] = None
     layer_norm: Optional[object] = None
+
+
+# ---------------------------------------------------------------------------
+# _get_block_submodules — spec resolver (mirrors Megatron)
+# ---------------------------------------------------------------------------
+
+def _get_block_submodules(
+    config: TransformerConfig,
+    spec: Union[TransformerBlockSubmodules, ModuleSpec],
+    vp_stage: Optional[int] = None,
+    pp_rank: Optional[int] = None,
+) -> TransformerBlockSubmodules:
+    """Retrieve or construct ``TransformerBlockSubmodules`` from *spec*.
+
+    Handles three cases:
+      1. ``spec`` is already a ``TransformerBlockSubmodules`` → return as-is.
+      2. ``spec`` is a ``ModuleSpec`` for a ``TransformerBlock`` subclass
+         → extract ``spec.submodules``.
+      3. ``spec`` is a ``ModuleSpec`` for a ``BaseTransformerLayer`` subclass
+         → fan out the spec for ``num_local_layers`` layers with the default
+         norm implementation.
+
+    Args:
+        config: TransformerConfig.
+        spec: Block spec or layer spec.
+        vp_stage: Virtual pipeline stage.
+        pp_rank: Pipeline rank override.
+
+    Returns:
+        Populated ``TransformerBlockSubmodules``.
+    """
+    if isinstance(spec, TransformerBlockSubmodules):
+        return spec
+
+    if isinstance(spec, ModuleSpec):
+        if issubclass(spec.module, TransformerBlock):
+            return spec.submodules
+        elif issubclass(spec.module, BaseTransformerLayer):
+            num_layers = get_num_layers_to_build(config, vp_stage, pp_rank)
+            # Use the configured norm implementation (TE > Apex > Torch)
+            norm_impl = _resolve_norm_impl(config)
+            return TransformerBlockSubmodules(
+                layer_specs=[spec] * num_layers,
+                layer_norm=norm_impl,
+            )
+        else:
+            raise Exception(f"specialize for {spec.module.__name__}.")
+    else:
+        raise Exception(f"specialize for {type(spec).__name__}.")
+
+
+def _resolve_norm_impl(config: TransformerConfig):
+    """Return the best available norm implementation class for *config*.
+
+    Priority: TransformerEngine TENorm > Apex FusedLayerNorm > WrappedTorchNorm.
+    Falls back to a factory that calls ``_build_norm`` if none are importable.
+    """
+    try:
+        from deepspeed.core.extensions.transformer_engine import TENorm, HAVE_TE
+        if HAVE_TE:
+            return TENorm
+    except ImportError:
+        pass
+    try:
+        from deepspeed.core.fusions.fused_layer_norm import FusedLayerNorm
+        return FusedLayerNorm
+    except ImportError:
+        pass
+
+    # Fallback: return a callable class that wraps _build_norm
+    class _WrappedTorchNorm:
+        def __call__(self, *, hidden_size, eps, **kwargs):
+            cfg = kwargs.get("config", config)
+            return _build_norm(cfg, hidden_size=hidden_size)
+
+    return _WrappedTorchNorm()
 
 
 # ---------------------------------------------------------------------------
@@ -295,12 +378,13 @@ class TransformerBlock(MegatronModule):
     """Stack of TransformerLayers with DES-LOC tier-aware layer placement.
 
     Main responsibilities:
-      * Build the local layer stack for this PP stage.
+      * Build the local layer stack for this PP stage from a spec or directly.
       * Assign DES-LOC tiers to each layer.
-      * Manage full/selective gradient checkpointing.
+      * Manage full/selective gradient checkpointing (uniform / block).
       * Apply the final layer norm on the last PP stage (or last MTP layer).
       * Provide ``set_input_tensor()`` for PP receives.
       * Expose ``get_desloc_tier_map()`` for DES-LOC engine integration.
+      * Wrap layers in inner FP8/FP4 quantisation contexts when needed.
 
     DES-LOC tier placement:
         Tier assignment is driven by ``TransformerConfig.get_layer_tier()``.
@@ -315,7 +399,7 @@ class TransformerBlock(MegatronModule):
 
     Args:
         config: TransformerConfig.
-        spec: TransformerBlockSubmodules or single ModuleSpec.
+        spec: TransformerBlockSubmodules, ModuleSpec, or None (builds directly).
         post_layer_norm: Whether to apply the final layer norm.
         pre_process: True if this is the first PP stage (receives embeddings).
         post_process: True if this is the last PP stage (runs final layernorm).
@@ -326,7 +410,7 @@ class TransformerBlock(MegatronModule):
     def __init__(
         self,
         config: TransformerConfig,
-        spec: Optional[Union[TransformerBlockSubmodules, object]] = None,
+        spec: Optional[Union[TransformerBlockSubmodules, ModuleSpec]] = None,
         post_layer_norm: bool = True,
         pre_process: bool = True,
         post_process: bool = True,
@@ -340,31 +424,108 @@ class TransformerBlock(MegatronModule):
         self.pre_process = pre_process
         self.post_process = post_process
         self.vp_stage = vp_stage
+        self.pg_collection = pg_collection
 
         # PP receive buffer
         self.input_tensor: Optional[Tensor] = None
 
+        # Resolve submodules from spec
+        pp_rank = _get_pp_rank()
+        if spec is not None:
+            self.submodules = _get_block_submodules(config, spec, vp_stage, pp_rank)
+        else:
+            self.submodules = None
+
+        # CPU offloading context (Megatron M2260: double-buffered offload)
+        self._setup_cpu_offloading()
+
         # Build local layers
-        self._build_layers(spec)
+        self._build_layers()
         self.num_layers_per_pipeline_rank = len(self.layers)
 
         # Final layer norm
         self.final_layernorm: Optional[nn.Module] = None
-        if self._has_final_layernorm():
-            self.final_layernorm = _build_norm(config)
+        if self.has_final_layernorm_in_this_stage():
+            if self.submodules is not None and self.submodules.layer_norm is not None:
+                norm_cls = self.submodules.layer_norm
+                try:
+                    self.final_layernorm = norm_cls(
+                        config=config,
+                        hidden_size=config.hidden_size,
+                        eps=config.layernorm_epsilon,
+                    )
+                except TypeError:
+                    # Fallback for norm classes that don't accept config=
+                    self.final_layernorm = _build_norm(config)
+            else:
+                self.final_layernorm = _build_norm(config)
+
+        # Fused TP inference wiring (M3030 / M3063)
+        if getattr(config, "inference_fuse_tp_communication", False):
+            self._setup_fused_tp_communication()
 
         # DES-LOC: log stage tier summary
         self._log_desloc_summary()
 
     # ------------------------------------------------------------------
+    # CPU offloading setup (M2260)
+    # ------------------------------------------------------------------
+
+    def _setup_cpu_offloading(self) -> None:
+        """Initialise CPU offloading context managers (M2260 double-buffer).
+
+        Tries to import TE's ``get_cpu_offload_context``; falls back to
+        nullcontext if TE is not available.  Mirrors Megatron's block init.
+        """
+        get_cpu_offload_context = None
+        try:
+            from deepspeed.core.extensions.transformer_engine import (
+                get_cpu_offload_context,
+            )
+        except ImportError:
+            pass
+
+        config = self.config
+        if get_cpu_offload_context is not None:
+            (self.offload_context, self.group_prefetch_offload_commit_async) = (
+                get_cpu_offload_context(
+                    config.cpu_offloading,
+                    config.cpu_offloading_num_layers,
+                    config.num_layers,
+                    getattr(config, "cpu_offloading_activations", True),
+                    getattr(config, "cpu_offloading_weights", False),
+                    getattr(config, "cpu_offloading_double_buffering", True),
+                    getattr(config, "cpu_offloading_retain_pinned_cpu_buffers", False),
+                )
+            )
+            config._cpu_offloading_context = (
+                self.offload_context if config.cpu_offloading else None
+            )
+        else:
+            if getattr(config, "cpu_offloading", False):
+                logger.warning(
+                    "CPU offloading is enabled but TransformerEngine is not available; "
+                    "falling back to no offloading."
+                )
+            self.offload_context = nullcontext()
+            self.group_prefetch_offload_commit_async = None
+            config._cpu_offloading_context = None
+
+    # ------------------------------------------------------------------
     # Layer construction
     # ------------------------------------------------------------------
 
-    def _build_layers(self, spec: Optional[object] = None) -> None:
+    def _build_layers(self) -> None:
         """Build the TransformerLayer stack for this PP stage.
 
-        Computes which global layer indices belong to this rank, then
-        instantiates one TransformerLayer per index.
+        When a ``submodules`` spec is available, each layer is built via
+        ``build_module`` using the corresponding ``layer_spec`` entry.
+        Otherwise falls back to direct ``TransformerLayer`` construction.
+
+        Global layer indices (1-based) are computed as:
+            ``global_layer_number = local_index + layer_offset``
+        where ``local_index`` is 1-based within this PP stage and
+        ``layer_offset`` is the 0-based global index of the first layer here.
 
         Sets:
             self.layers           — nn.ModuleList of local layers.
@@ -374,39 +535,130 @@ class TransformerBlock(MegatronModule):
         config = self.config
         pp_rank = _get_pp_rank()
 
-        # Determine how many layers to build
-        num_local = get_num_layers_to_build(config, self.vp_stage, pp_rank)
+        # Determine how many layers to build and the global offset
+        if self.submodules is not None and self.submodules.layer_specs is not None:
+            num_local = len(self.submodules.layer_specs)
+        else:
+            num_local = get_num_layers_to_build(config, self.vp_stage, pp_rank)
+
         offset = get_transformer_layer_offset(config, self.vp_stage, pp_rank)
 
         self._layer_offset = offset
         self._num_local_layers = num_local
 
-        self.layers = nn.ModuleList(
-            [
-                TransformerLayer(config, layer_number=offset + i + 1)
+        def _build_single_layer(layer_spec, local_idx: int) -> nn.Module:
+            """Build one layer (with optional FP8/FP4 context wrapping)."""
+            global_layer_number = local_idx + offset  # 1-based
+
+            # Heterogeneous block: fetch per-layer config if supported
+            if getattr(config, "heterogeneous_block_specs", False) and hasattr(
+                config, "get_config_for_layer"
+            ):
+                layer_config = config.get_config_for_layer(global_layer_number)
+            else:
+                layer_config = config
+
+            # Select quantisation context for this layer
+            quantization_context = nullcontext()
+            if getattr(layer_config, "fp8", False):
+                try:
+                    from deepspeed.core.fp8_utils import get_fp8_context
+                    quantization_context = get_fp8_context(
+                        layer_config, global_layer_number - 1, is_init=True
+                    )
+                except ImportError:
+                    pass
+            elif getattr(layer_config, "fp4", False):
+                try:
+                    from deepspeed.core.fp4_utils import get_fp4_context
+                    quantization_context = get_fp4_context(
+                        layer_config, global_layer_number - 1, is_init=True
+                    )
+                except ImportError:
+                    pass
+
+            with quantization_context:
+                if layer_spec is not None:
+                    return build_module(
+                        layer_spec,
+                        config=layer_config,
+                        layer_number=local_idx,
+                        pg_collection=self.pg_collection,
+                        vp_stage=self.vp_stage,
+                    )
+                else:
+                    return TransformerLayer(
+                        layer_config,
+                        layer_number=local_idx,
+                        pg_collection=self.pg_collection,
+                        vp_stage=self.vp_stage,
+                    )
+
+        if self.submodules is not None and self.submodules.layer_specs is not None:
+            self.layers = nn.ModuleList([
+                _build_single_layer(spec, i + 1)
+                for i, spec in enumerate(self.submodules.layer_specs)
+            ])
+        else:
+            self.layers = nn.ModuleList([
+                _build_single_layer(None, i + 1)
                 for i in range(num_local)
-            ]
-        )
+            ])
 
     # ------------------------------------------------------------------
-    # Final layernorm placement
+    # Final layernorm placement (Megatron has_final_layernorm_in_this_stage)
     # ------------------------------------------------------------------
 
-    def _has_final_layernorm(self) -> bool:
+    def has_final_layernorm_in_this_stage(self) -> bool:
         """Check whether the final layernorm belongs on this PP stage.
 
         When MTP layers are present the layernorm is placed on the stage
-        that holds the last decoder layer (layer_number == num_layers).
+        that holds the last decoder layer (``layer_number == config.num_layers``).
         Otherwise it goes on the last post-process stage.
+
+        Mirrors Megatron's ``has_final_layernorm_in_this_stage`` (M3009).
         """
+        # Check whether a norm implementation is configured
+        has_norm_spec = (
+            self.submodules is not None and self.submodules.layer_norm is not None
+        ) or True  # direct-build always has a norm available
+
         mtp_num_layers = getattr(self.config, "mtp_num_layers", None)
         if mtp_num_layers is None:
-            return self.post_process and self.post_layer_norm
+            return has_norm_spec and self.post_process and self.post_layer_norm
         else:
+            # MTP: final layernorm lives on the stage hosting the last decoder layer
             for layer in self.layers:
                 if layer.layer_number == self.config.num_layers:
-                    return self.post_layer_norm
+                    return has_norm_spec and self.post_layer_norm
             return False
+
+    # ------------------------------------------------------------------
+    # Fused TP inference wiring (M3030 / M3063)
+    # ------------------------------------------------------------------
+
+    def _setup_fused_tp_communication(self) -> None:
+        """Wire fused TP communication for all layers.
+
+        Passes the next layer's QKV norm weights to the current layer's MLP FC2
+        so the fused reduce-scatter + add + norm + all-gather kernel can be used
+        at inference time.  Mirrors Megatron's ``_setup_fused_tp_communication``.
+        """
+        for i in range(len(self.layers)):
+            current_layer = self.layers[i]
+            if not hasattr(current_layer, "configure_fused_tp_inference"):
+                continue
+
+            next_qkv_norm_weights = None
+            if i < len(self.layers) - 1:
+                next_layer = self.layers[i + 1]
+                if hasattr(next_layer, "get_qkv_layer_norm_weights"):
+                    next_qkv_norm_weights = next_layer.get_qkv_layer_norm_weights()
+
+            current_layer.configure_fused_tp_inference(
+                skip_qkv_norm_and_all_gather=(i > 0),
+                fc2_next_layer_norm_weights=next_qkv_norm_weights,
+            )
 
     # ------------------------------------------------------------------
     # DES-LOC helpers
@@ -450,12 +702,8 @@ class TransformerBlock(MegatronModule):
             result[i] = tier if tier is not None else "unassigned"
         return result
 
-    def get_layer_by_global_index(self, global_layer_idx: int) -> Optional["TransformerLayer"]:
+    def get_layer_by_global_index(self, global_layer_idx: int) -> Optional[TransformerLayer]:
         """Return the TransformerLayer for the given global (0-based) layer index.
-
-        Allows the DES-LOC engine and profilers to look up a specific layer
-        by its global position in the model without knowing the local PP-rank
-        offset.
 
         Args:
             global_layer_idx: 0-based global layer index
@@ -477,24 +725,7 @@ class TransformerBlock(MegatronModule):
         *,
         dtype_bytes: int = 2,
     ) -> Dict[str, int]:
-        """Compute approximate activation memory for this PP stage.
-
-        Breaks down activation memory by DES-LOC tier (H100 / A6000 /
-        unassigned) for this PP stage.  Used by ``DesLocEngine`` to
-        verify VRAM budgets before launching a training run, and by the
-        adaptive checkpoint scheduler to decide which layers to recompute.
-
-        Memory model:
-          * Full recompute (``recompute_granularity == "full"``):
-            Only I/O activations kept → ~8× reduction per layer.
-          * Selective recompute (``"selective"``): Core attention activations
-            discarded → ~3× reduction.
-          * No recompute: all activations kept (reduction = 1).
-
-        On a heterogeneous cluster, A6000 tiers (48 GB) have less VRAM
-        than H100 tiers (80–96 GB), so they benefit more from aggressive
-        recompute.  The DES-LOC engine uses this per-tier breakdown to
-        assign different ``recompute_granularity`` settings per tier.
+        """Compute approximate activation memory for this PP stage by DES-LOC tier.
 
         Args:
             batch_size: Micro-batch size.
@@ -502,7 +733,7 @@ class TransformerBlock(MegatronModule):
             dtype_bytes: Bytes per element (2 for BF16/FP16, 4 for FP32).
 
         Returns:
-            Dict mapping tier → approximate activation bytes on this stage::
+            Dict mapping tier → approximate activation bytes::
 
                 {
                     "h100": <bytes>,
@@ -544,18 +775,8 @@ class TransformerBlock(MegatronModule):
     def clip_qk_all_layers(self) -> None:
         """Run QK logit clipping on all local layers that support it.
 
-        Iterates over all layers on this PP stage and calls
-        ``TransformerLayer.clip_qk()`` for each layer that has the
-        ``qk_clip`` config flag enabled.  Silently skips layers where
-        ``current_max_attn_logits`` is None (M3217 fix — first step or
-        under gradient checkpointing).
-
         Called by the DES-LOC engine at the end of each training step
         (after ``optimizer.step()``) when ``config.qk_clip`` is True.
-
-        From Megatron M2831 / cherry-pick #2776: the per-layer clip is
-        guarded by the ``has_clip_qk`` property so it is safe to call
-        this method unconditionally regardless of model architecture.
         """
         if not getattr(self.config, "qk_clip", False):
             return
@@ -576,19 +797,6 @@ class TransformerBlock(MegatronModule):
     ) -> None:
         """Override activation recompute granularity for all layers of a given tier.
 
-        Allows the DES-LOC engine to apply aggressive recompute on A6000
-        tiers (limited VRAM) while using no recompute on H100 tiers (more
-        VRAM, faster recompute).
-
-        For example::
-
-            block.set_recompute_granularity_for_tier("a6000", "selective")
-            block.set_recompute_granularity_for_tier("h100", None)
-
-        This is called dynamically during training when the DES-LOC OOM
-        handler detects a near-OOM condition on a specific tier and wants
-        to enable recompute on the fly without restarting.
-
         Args:
             tier: ``"h100"``, ``"a6000"``, or ``"unassigned"``.
             granularity: ``"full"``, ``"selective"``, or ``None`` (no recompute).
@@ -601,9 +809,8 @@ class TransformerBlock(MegatronModule):
             layer_tier = getattr(layer, "desloc_tier", None) or "unassigned"
             if layer_tier == tier:
                 layer.recompute_granularity = granularity
-                # Also update recompute_pre_mlp_layernorm if the layer supports it
+                recompute_modules = getattr(self.config, "recompute_modules", None) or []
                 if hasattr(layer, "recompute_pre_mlp_layernorm"):
-                    recompute_modules = getattr(self.config, "recompute_modules", None) or []
                     layer.recompute_pre_mlp_layernorm = (
                         granularity == "selective" and "layernorm" in recompute_modules
                     )
@@ -629,41 +836,115 @@ class TransformerBlock(MegatronModule):
         self.input_tensor = input_tensor
 
     # ------------------------------------------------------------------
-    # Gradient checkpointing helpers
+    # Quantisation context helpers (M2297 / M2307 FP8 / FP4)
+    # ------------------------------------------------------------------
+
+    def _get_quantization_contexts(self):
+        """Return ``(outer_ctx, use_inner)`` for FP8/FP4 quantisation wrapping.
+
+        * Delayed FP8: wrap the entire forward with one outer context.
+        * Non-delayed FP8 / FP4: use a per-layer inner context inside the loop.
+        * No quantisation: both are nullcontext / False.
+        """
+        config = self.config
+        fp8 = getattr(config, "fp8", False)
+        fp4 = getattr(config, "fp4", False)
+
+        if fp8:
+            try:
+                from deepspeed.core.fp8_utils import get_fp8_context
+                from deepspeed.core.transformer.enums import Fp8Recipe
+                fp8_recipe = getattr(config, "fp8_recipe", None)
+                if fp8_recipe is not None and str(fp8_recipe).lower() == "delayed":
+                    return get_fp8_context(config), False  # outer only
+                else:
+                    return nullcontext(), True  # inner only
+            except ImportError:
+                pass
+        elif fp4:
+            return nullcontext(), True  # inner only
+        return nullcontext(), False
+
+    def _get_inner_quantization_context(self, layer: nn.Module):
+        """Return per-layer quantisation context (non-delayed FP8 or FP4)."""
+        config = self.config
+        try:
+            if getattr(config, "fp8", False):
+                from deepspeed.core.fp8_utils import get_fp8_context
+                return get_fp8_context(config, layer.layer_number - 1)
+            elif getattr(config, "fp4", False):
+                from deepspeed.core.fp4_utils import get_fp4_context
+                return get_fp4_context(config, layer.layer_number - 1)
+        except ImportError:
+            pass
+        return nullcontext()
+
+    # ------------------------------------------------------------------
+    # Forward: non-checkpointed layer loop
     # ------------------------------------------------------------------
 
     def _forward_layers(
         self,
         hidden_states: Tensor,
         attention_mask: Optional[Tensor],
+        context: Optional[Tensor],
+        context_mask: Optional[Tensor],
         rotary_pos_emb: Optional[Tensor],
         rotary_pos_cos: Optional[Tensor],
         rotary_pos_sin: Optional[Tensor],
+        rotary_pos_cos_sin: Optional[Tensor],
         attention_bias: Optional[Tensor],
         inference_context: Optional[object],
         packed_seq_params: Optional[object],
+        sequence_len_offset: Optional[Tensor],
+        padding_mask: Optional[Tensor],
         extract_layer_indices: Set[int],
         layer_offset: int,
-    ) -> Tuple[Tensor, List[Tensor]]:
-        """Run all local layers sequentially (non-checkpointed path)."""
+        use_inner_quantization_context: bool = False,
+    ) -> Tuple[Tensor, Optional[Tensor], List[Tensor]]:
+        """Run all local layers sequentially (non-checkpointed path).
+
+        Returns:
+            (hidden_states, context, intermediate_hidden_states)
+        """
         intermediate_hidden_states: List[Tensor] = []
 
         for l_no, layer in enumerate(self.layers):
-            hidden_states = layer(
-                hidden_states,
-                attention_mask=attention_mask,
-                rotary_pos_emb=rotary_pos_emb,
-                rotary_pos_cos=rotary_pos_cos,
-                rotary_pos_sin=rotary_pos_sin,
-                attention_bias=attention_bias,
-                inference_context=inference_context,
-                packed_seq_params=packed_seq_params,
+            inner_ctx = (
+                self._get_inner_quantization_context(layer)
+                if use_inner_quantization_context
+                else nullcontext()
             )
+            with self.offload_context, inner_ctx:
+                hidden_states, context = layer(
+                    hidden_states=hidden_states,
+                    attention_mask=attention_mask,
+                    context=context,
+                    context_mask=context_mask,
+                    rotary_pos_emb=rotary_pos_emb,
+                    rotary_pos_cos=rotary_pos_cos,
+                    rotary_pos_sin=rotary_pos_sin,
+                    rotary_pos_cos_sin=rotary_pos_cos_sin,
+                    attention_bias=attention_bias,
+                    inference_context=inference_context,
+                    packed_seq_params=packed_seq_params,
+                    sequence_len_offset=sequence_len_offset,
+                    padding_mask=padding_mask,
+                )
+
+            # CPU offload commit (M2260 double-buffer)
+            if (
+                torch.is_grad_enabled()
+                and getattr(self.config, "cpu_offloading", False)
+                and self.group_prefetch_offload_commit_async is not None
+            ):
+                hidden_states = self.group_prefetch_offload_commit_async(hidden_states)
+
             # Extract intermediate embeddings using global layer index (M3301)
             if (l_no + layer_offset) in extract_layer_indices:
                 intermediate_hidden_states.append(hidden_states)
 
-        return hidden_states, intermediate_hidden_states
+        return hidden_states, context, intermediate_hidden_states
 
     # ------------------------------------------------------------------
     # Forward
@@ -723,71 +1004,78 @@ class TransformerBlock(MegatronModule):
 
         if extract_layer_indices is None:
             extract_layer_indices = set()
-
-        # PP receive: override hidden_states with tensor from previous stage
-        if not self.pre_process and self.input_tensor is not None:
-            hidden_states = self.input_tensor
-            self.input_tensor = None
+        intermediate_hidden_states: List[Tensor] = []
 
         # Compute global layer offset for intermediate embedding extraction
         pp_rank = _get_pp_rank()
         layer_offset = get_transformer_layer_offset(self.config, self.vp_stage, pp_rank)
 
+        # PP receive: override hidden_states with tensor from previous stage
+        if not self.pre_process:
+            hidden_states = self.input_tensor
+
+        # Make viewless tensor (Megatron: avoids deallocate_output_tensor issues)
+        hidden_states = _make_viewless_tensor(hidden_states, requires_grad=True, keep_graph=True)
+
         # Sequence-parallel RNG context
-        seq_parallel = getattr(self.config, "sequence_parallel", False)
-        if seq_parallel:
+        if getattr(self.config, "sequence_parallel", False):
             try:
-                from megatron.core import tensor_parallel as _tp
+                from deepspeed.core import tensor_parallel as _tp
                 rng_context = _tp.get_cuda_rng_tracker().fork()
             except Exception:
                 rng_context = nullcontext()
         else:
             rng_context = nullcontext()
 
-        # Activation checkpointing
-        recompute_granularity = getattr(self.config, "recompute_granularity", None)
-        cpu_offloading = getattr(self.config, "cpu_offloading", False)
+        # Quantisation contexts (FP8 delayed = outer; FP8 non-delayed / FP4 = inner)
+        outer_quantization_context, use_inner_quantization_context = (
+            self._get_quantization_contexts()
+        )
 
-        with rng_context:
-            if recompute_granularity == "full" and self.training:
+        with rng_context, outer_quantization_context:
+            # --- Activation checkpointing paths ---
+            if getattr(self.config, "recompute_granularity", None) == "full" and self.training:
                 recompute_method = getattr(self.config, "recompute_method", None)
                 recompute_num_layers = getattr(self.config, "recompute_num_layers", None)
+                num_layers_local = self.num_layers_per_pipeline_rank
+
+                # Shared layer caller for checkpointed chunks
+                def _call_layers(layer_slice, h, ctx):
+                    for layer in self.layers[layer_slice]:
+                        h, ctx = layer(
+                            hidden_states=h,
+                            attention_mask=attention_mask,
+                            context=ctx,
+                            context_mask=context_mask,
+                            rotary_pos_emb=rotary_pos_emb,
+                            rotary_pos_cos=rotary_pos_cos,
+                            rotary_pos_sin=rotary_pos_sin,
+                            rotary_pos_cos_sin=rotary_pos_cos_sin,
+                            attention_bias=attention_bias,
+                            inference_context=inference_context,
+                            packed_seq_params=packed_seq_params,
+                            sequence_len_offset=sequence_len_offset,
+                            padding_mask=padding_mask,
+                        )
+                    return h, ctx
 
                 if recompute_method == "uniform" and recompute_num_layers is not None:
-                    # M3591 fix: compute chunk_end *before* calling checkpoint so
-                    # that the clamped boundary is used inside the custom() closure.
-                    # Without this, when num_layers_per_pipeline_rank is not
-                    # divisible by recompute_num_layers the last chunk would pass
-                    # an out-of-range end index causing an IndexError.
-                    intermediate_hidden_states: List[Tensor] = []
-                    num_layers_local = self.num_layers_per_pipeline_rank
-
-                    def _make_chunk_fn(start: int, end: int):
-                        """Return a no-arg callable that runs layers[start:end]."""
-                        def _fn(h):
-                            for layer in self.layers[start:end]:
-                                h = layer(
-                                    h,
-                                    attention_mask=attention_mask,
-                                    rotary_pos_emb=rotary_pos_emb,
-                                    rotary_pos_cos=rotary_pos_cos,
-                                    rotary_pos_sin=rotary_pos_sin,
-                                    attention_bias=attention_bias,
-                                    inference_context=inference_context,
-                                    packed_seq_params=packed_seq_params,
-                                )
-                            return h
-                        return _fn
-
+                    # M3591 fix: clamp chunk_end BEFORE passing to checkpoint
                     layer_idx = 0
                     while layer_idx < num_layers_local:
-                        # M3591: clamp chunk_end BEFORE passing to checkpoint
-                        chunk_end = min(
-                            layer_idx + recompute_num_layers, num_layers_local
-                        )
-                        chunk_fn = _make_chunk_fn(layer_idx, chunk_end)
+                        chunk_end = min(layer_idx + recompute_num_layers, num_layers_local)
+                        chunk_slice = slice(layer_idx, chunk_end)
+
+                        def _make_fn(sl, ctx_ref):
+                            def _fn(h):
+                                out_h, _ = _call_layers(sl, h, ctx_ref)
+                                return out_h
+                            return _fn
+
                         hidden_states = torch.utils.checkpoint.checkpoint(
-                            chunk_fn, hidden_states, use_reentrant=False
+                            _make_fn(chunk_slice, context),
+                            hidden_states,
+                            use_reentrant=False,
                         )
                         # Collect intermediate embeddings at chunk boundary
                         for idx in range(layer_idx, chunk_end):
@@ -796,89 +1084,82 @@ class TransformerBlock(MegatronModule):
                         layer_idx = chunk_end
 
                 elif recompute_method == "block" and recompute_num_layers is not None:
-                    # Block recompute: checkpoint the first recompute_num_layers layers,
-                    # run the rest without checkpointing.
-                    intermediate_hidden_states = []
-                    num_layers_local = self.num_layers_per_pipeline_rank
-                    num_layers_to_recompute = min(recompute_num_layers, num_layers_local)
+                    # Block: checkpoint first N layers, run rest normally
+                    num_to_recompute = min(recompute_num_layers, num_layers_local)
 
-                    def _make_chunk_fn(start: int, end: int):
+                    def _make_block_fn(sl, ctx_ref):
                         def _fn(h):
-                            for layer in self.layers[start:end]:
-                                h = layer(
-                                    h,
-                                    attention_mask=attention_mask,
-                                    rotary_pos_emb=rotary_pos_emb,
-                                    rotary_pos_cos=rotary_pos_cos,
-                                    rotary_pos_sin=rotary_pos_sin,
-                                    attention_bias=attention_bias,
-                                    inference_context=inference_context,
-                                    packed_seq_params=packed_seq_params,
-                                )
-                            return h
+                            out_h, _ = _call_layers(sl, h, ctx_ref)
+                            return out_h
                         return _fn
 
-                    # Checkpointed block
-                    chunk_fn = _make_chunk_fn(0, num_layers_to_recompute)
                     hidden_states = torch.utils.checkpoint.checkpoint(
-                        chunk_fn, hidden_states, use_reentrant=False
+                        _make_block_fn(slice(0, num_to_recompute), context),
+                        hidden_states,
+                        use_reentrant=False,
                     )
-                    for idx in range(0, num_layers_to_recompute):
+                    for idx in range(0, num_to_recompute):
                         if (idx + layer_offset) in extract_layer_indices:
                             intermediate_hidden_states.append(hidden_states)
 
                     # Remaining layers without checkpointing
-                    for l_no in range(num_layers_to_recompute, num_layers_local):
-                        hidden_states = self.layers[l_no](
-                            hidden_states,
-                            attention_mask=attention_mask,
-                            rotary_pos_emb=rotary_pos_emb,
-                            rotary_pos_cos=rotary_pos_cos,
-                            rotary_pos_sin=rotary_pos_sin,
-                            attention_bias=attention_bias,
-                            inference_context=inference_context,
-                            packed_seq_params=packed_seq_params,
+                    for l_no in range(num_to_recompute, num_layers_local):
+                        inner_ctx = (
+                            self._get_inner_quantization_context(self.layers[l_no])
+                            if use_inner_quantization_context
+                            else nullcontext()
                         )
+                        with inner_ctx:
+                            hidden_states, context = self.layers[l_no](
+                                hidden_states=hidden_states,
+                                attention_mask=attention_mask,
+                                context=context,
+                                context_mask=context_mask,
+                                rotary_pos_emb=rotary_pos_emb,
+                                rotary_pos_cos=rotary_pos_cos,
+                                rotary_pos_sin=rotary_pos_sin,
+                                rotary_pos_cos_sin=rotary_pos_cos_sin,
+                                attention_bias=attention_bias,
+                                inference_context=inference_context,
+                                packed_seq_params=packed_seq_params,
+                                sequence_len_offset=sequence_len_offset,
+                                padding_mask=padding_mask,
+                            )
                         if (l_no + layer_offset) in extract_layer_indices:
                             intermediate_hidden_states.append(hidden_states)
 
                 else:
-                    # Fallback: checkpoint the entire block as one unit
-                    intermediate_hidden_states = []
-
+                    # Fallback: checkpoint entire block as one unit
                     def _full_block(h):
-                        for layer in self.layers:
-                            h = layer(
-                                h,
-                                attention_mask=attention_mask,
-                                rotary_pos_emb=rotary_pos_emb,
-                                rotary_pos_cos=rotary_pos_cos,
-                                rotary_pos_sin=rotary_pos_sin,
-                                attention_bias=attention_bias,
-                                inference_context=inference_context,
-                                packed_seq_params=packed_seq_params,
-                            )
-                        return h
+                        out_h, _ = _call_layers(slice(None), h, context)
+                        return out_h
 
                     hidden_states = torch.utils.checkpoint.checkpoint(
                         _full_block, hidden_states, use_reentrant=False
                     )
+
             else:
-                hidden_states, intermediate_hidden_states = self._forward_layers(
-                    hidden_states, attention_mask, rotary_pos_emb,
-                    rotary_pos_cos, rotary_pos_sin, attention_bias,
-                    inference_context, packed_seq_params,
+                # Standard (non-checkpointed) path
+                hidden_states, context, intermediate_hidden_states = self._forward_layers(
+                    hidden_states, attention_mask, context, context_mask,
+                    rotary_pos_emb, rotary_pos_cos, rotary_pos_sin, rotary_pos_cos_sin,
+                    attention_bias, inference_context, packed_seq_params,
+                    sequence_len_offset, padding_mask,
                     extract_layer_indices, layer_offset,
+                    use_inner_quantization_context=use_inner_quantization_context,
                 )
 
         # Final layer norm (last PP stage or last decoder layer with MTP)
         if self.final_layernorm is not None:
             hidden_states = self.final_layernorm(hidden_states)
-            # Make viewless to prevent schedule.py's deallocate_output_tensor errors
-            hidden_states = self._make_viewless(hidden_states)
+            # TENorm can produce a viewed tensor; make viewless to avoid
+            # schedule.py's deallocate_output_tensor() errors.
+            hidden_states = _make_viewless_tensor(
+                hidden_states, requires_grad=True, keep_graph=True
+            )
 
         # Edge case: empty block with no pre-process and no final norm →
-        # clone to avoid in-place graph issues in pipeline schedules
+        # clone to avoid in-place graph issues in pipeline schedules.
         if (
             not self.pre_process
             and len(self.layers) == 0
@@ -890,17 +1171,6 @@ class TransformerBlock(MegatronModule):
             return hidden_states, intermediate_hidden_states
 
         return hidden_states
-
-    @staticmethod
-    def _make_viewless(t: Tensor) -> Tensor:
-        """Return a viewless tensor (no .storage() cross-reference).
-
-        Prevents schedule.py's ``deallocate_output_tensor()`` from raising an
-        error when TENorm produces a viewed tensor.
-        """
-        if t.is_contiguous():
-            return t
-        return t.contiguous()
 
     # ------------------------------------------------------------------
     # Sharded state dict
@@ -918,6 +1188,10 @@ class TransformerBlock(MegatronModule):
         PP) layer layouts.  Non-homogeneous keys use the global layer index
         in the key path; homogeneous keys use a sharded offset.
 
+        Mirrors Megatron's ``TransformerBlock.sharded_state_dict`` (M3231 era):
+        applies ``replace_prefix_for_sharding`` on each layer's dict and then
+        delegates non-layer modules to ``sharded_state_dict_default``.
+
         Args:
             prefix: Key prefix.
             sharded_offsets: PP/TP sharding offsets tuple.
@@ -932,11 +1206,10 @@ class TransformerBlock(MegatronModule):
         non_homogeneous_layers = (metadata or {}).get("non_homogeneous_layers", False)
 
         # Force non-homogeneous if layout is irregular
-        hetero = getattr(self.config, "hetereogenous_dist_checkpoint", False)
-        if hetero:
+        if getattr(self.config, "hetereogenous_dist_checkpoint", False):
             non_homogeneous_layers = True
 
-        moe_freq = getattr(self.config, "moe_layer_freq", 0)
+        moe_freq = getattr(self.config, "moe_layer_freq", 1)
         if isinstance(moe_freq, list) or (isinstance(moe_freq, int) and moe_freq > 1):
             non_homogeneous_layers = True
 
@@ -949,6 +1222,11 @@ class TransformerBlock(MegatronModule):
 
         singleton_local_shards = (metadata or {}).get("singleton_local_shards", False)
         if singleton_local_shards:
+            if (metadata or {}).get("non_homogeneous_layers") is False:
+                logger.warning(
+                    "non_homogeneous_layers=False is deprecated. "
+                    "Setting non_homogeneous_layers=True."
+                )
             non_homogeneous_layers = True
 
         sharded_state_dict: dict = {}
@@ -978,24 +1256,44 @@ class TransformerBlock(MegatronModule):
                     for k, v in layer.state_dict(prefix="").items()
                 }
 
-            # Remap keys from state_dict_prefix → sharded_prefix
-            for k in list(layer_sd.keys()):
-                new_k = k.replace(state_dict_prefix, sharded_prefix, 1)
-                if new_k != k:
-                    layer_sd[new_k] = layer_sd.pop(k)
+            # Remap keys: state_dict_prefix → sharded_prefix
+            # Mirrors Megatron's replace_prefix_for_sharding
+            if state_dict_prefix != sharded_prefix:
+                for k in list(layer_sd.keys()):
+                    new_k = k.replace(state_dict_prefix, sharded_prefix, 1)
+                    if new_k != k:
+                        layer_sd[new_k] = layer_sd.pop(k)
 
             sharded_state_dict.update(layer_sd)
 
-        # Add non-layer modules (e.g. final_layernorm)
+        # Add non-layer modules (e.g. final_layernorm) via sharded_state_dict_default
+        tp_group = None
+        if self.pg_collection is not None and hasattr(self.pg_collection, "tp"):
+            tp_group = self.pg_collection.tp
+
         for name, module in self.named_children():
             if module is self.layers:
                 continue
-            if hasattr(module, "sharded_state_dict"):
+            sub_prefix = f"{prefix}{name}."
+            try:
+                from deepspeed.core.transformer.utils import sharded_state_dict_default
                 sharded_state_dict.update(
-                    module.sharded_state_dict(f"{prefix}{name}.", sharded_offsets, metadata)
+                    sharded_state_dict_default(
+                        module,
+                        sub_prefix,
+                        sharded_offsets,
+                        metadata,
+                        tp_group=tp_group,
+                    )
                 )
-            else:
-                for k, v in module.state_dict(prefix="").items():
-                    sharded_state_dict[f"{prefix}{name}.{k}"] = v
+            except Exception:
+                # Fallback: plain state dict
+                if hasattr(module, "sharded_state_dict"):
+                    sharded_state_dict.update(
+                        module.sharded_state_dict(sub_prefix, sharded_offsets, metadata)
+                    )
+                else:
+                    for k, v in module.state_dict(prefix="").items():
+                        sharded_state_dict[f"{sub_prefix}{k}"] = v
 
         return sharded_state_dict

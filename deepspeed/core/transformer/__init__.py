@@ -33,8 +33,18 @@ TransformerBlock exposes:
 """
 
 from deepspeed.core.transformer.transformer_config import TransformerConfig
-from deepspeed.core.transformer.transformer_block import TransformerBlock
-from deepspeed.core.transformer.transformer_layer import TransformerLayer
+from deepspeed.core.transformer.transformer_block import (
+    TransformerBlock,
+    TransformerBlockSubmodules,
+    get_num_layers_to_build,
+)
+from deepspeed.core.transformer.transformer_layer import (
+    TransformerLayer,
+    TransformerLayerSubmodules,
+    BaseTransformerLayer,
+    get_transformer_layer_offset,
+    annotate_desloc_tiers,
+)
 from deepspeed.core.transformer.attention import (
     Attention,
     SelfAttention,
@@ -74,7 +84,13 @@ __all__ = [
     "TransformerConfig",
     # Block / layer
     "TransformerBlock",
+    "TransformerBlockSubmodules",
+    "get_num_layers_to_build",
     "TransformerLayer",
+    "TransformerLayerSubmodules",
+    "BaseTransformerLayer",
+    "get_transformer_layer_offset",
+    "annotate_desloc_tiers",
     # Attention
     "Attention",
     "SelfAttention",
