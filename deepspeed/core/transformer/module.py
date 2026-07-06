@@ -89,3 +89,36 @@ class MegatronModule(nn.Module, ABC):
                     sharded_sd[key] = {"param": param, "shape": tuple(param.shape)}
 
         return sharded_sd
+
+
+class GraphableMegatronModule(MegatronModule):
+    """Marker base class for modules that support CUDA graph capture.
+
+    Any module intended to be captured via ``CudaGraphManager`` or
+    ``TECudaGraphHelper`` must inherit from this class instead of bare
+    ``MegatronModule``.  The ``_layer_is_graphable`` helper in
+    ``cuda_graphs.py`` uses ``isinstance`` checks against this class to
+    decide which layers to capture.
+    """
+
+    def get_layer_static_inputs(self, seq_length: int, micro_batch_size: int) -> dict:
+        """Return static input tensors for CUDA graph capture warm-up.
+
+        Sub-classes should override this to return a dict mapping input
+        argument names (e.g. ``"hidden_states"``, ``"attention_mask"``) to
+        zero-initialised tensors with the shapes expected during inference or
+        training.  The default implementation returns only ``hidden_states``.
+        """
+        import torch
+
+        hidden_size = self.config.hidden_size
+        return {
+            "hidden_states": torch.zeros(
+                seq_length,
+                micro_batch_size,
+                hidden_size,
+                dtype=torch.bfloat16,
+                device="cuda",
+                requires_grad=True,
+            )
+        }
