@@ -48,6 +48,21 @@ foreach(bench hetero_reduce fused_swiglu_ln pcie_allreduce)
         CUDA_ARCHITECTURES ${CMAKE_CUDA_ARCHITECTURES})
 endforeach()
 
+# ─── reduce-scatter vs naive baseline (issue #21) ────────────────────
+# Compares hetero_reduce_scatter_kernel against two naive single-GPU
+# baselines that model what non-fused NCCL reduce-scatter does on device.
+# Produces throughput (GB/s) and speedup numbers for each SM dispatch path.
+add_executable(bench_reduce_scatter_vs_naive
+    bench_reduce_scatter_vs_naive.cu)
+target_link_libraries(bench_reduce_scatter_vs_naive
+    PRIVATE hetero_kernels CUDA::cudart)
+target_include_directories(bench_reduce_scatter_vs_naive
+    PRIVATE ${HETERO_INCLUDE_DIRS})
+target_compile_options(bench_reduce_scatter_vs_naive PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:${CUDA_FLAGS}>)
+set_property(TARGET bench_reduce_scatter_vs_naive PROPERTY
+    CUDA_ARCHITECTURES ${CMAKE_CUDA_ARCHITECTURES})
+
 # ─── NVTX profiling support (optional) ───────────────────────────────
 find_library(NVTX_LIB nvToolsExt PATHS ${CUDAToolkit_ROOT}/lib64)
 if(NVTX_LIB)
