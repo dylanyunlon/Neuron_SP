@@ -1312,3 +1312,145 @@ void launch_pcie_tree_reduce_step(
     size_t                            chunk_elems,
     int                               sm_version,
     cudaStream_t                      compute_stream);
+
+// ===========================================================================
+// hetero_ring_allreduce — Heterogeneous ring allreduce for PCIe-only topology
+//   (hetero_ring_allreduce.cu)
+//
+// Ring allreduce across 5 GPUs on 2 NUMA nodes connected by PCIe without
+// NVLink.  Bandwidth-aware chunking: 4 MB intra-NUMA, 2 MB cross-NUMA.
+// Double-buffered with independent transfer and compute streams.
+// ===========================================================================
+
+/**
+ * NumaAwareRingDesc (forward declaration for callers).
+ *
+ * Initialise with hetero_ring_init(); pass to launch_hetero_ring_allreduce().
+ * Full definition in hetero_ring_allreduce.cu.
+ */
+struct NumaAwareRingDesc;
+
+/**
+ * hetero_ring_init
+ *
+ * Initialises a NumaAwareRingDesc for a world_size-GPU PCIe ring.
+ *
+ * Default NUMA assignment (if numa_nodes == nullptr):
+ *   For world_size = 5: positions {0,1,2} → NUMA-0; {3,4} → NUMA-1.
+ *
+ * @param desc        [out] Topology descriptor (caller-allocated)
+ * @param device_ids  [in]  CUDA device ordinals for ring positions 0..P-1
+ * @param numa_nodes  [in]  NUMA node per ring position, or nullptr for default
+ * @param sm_versions [in]  SM version (86, 90, 120) per ring position
+ * @param world_size  Number of participating GPUs (≤ 8)
+ * @param this_rank   Ring position of the calling process (0-indexed)
+ */
+void hetero_ring_init(
+    NumaAwareRingDesc* desc,
+    const int*         device_ids,
+    const int*         numa_nodes,
+    const int*         sm_versions,
+    int                world_size,
+    int                this_rank);
+
+/**
+ * launch_hetero_ring_reduce_step
+ *
+ * Single reduce-scatter step: accum[i] += recv[i]  (BF16 → FP32 → BF16).
+ * Dispatches SM-specialised kernel (SM8.6 / SM9.0 / SM12.0 cp.async).
+ *
+ * @param accum        [in/out] BF16 accumulator [chunk_elems]
+ * @param recv         [in]     BF16 received chunk [chunk_elems]
+ * @param chunk_elems  Number of BF16 elements
+ * @param sm_version   SM version (86, 90, 120)
+ * @param stream       CUDA compute stream
+ */
+void launch_hetero_ring_reduce_step(
+    __nv_bfloat16* __restrict__       accum,
+    const __nv_bfloat16* __restrict__ recv,
+    size_t                            chunk_elems,
+    int                               sm_version,
+    cudaStream_t                      stream);
+
+/**
+ * launch_hetero_ring_gather_step
+ *
+ * Single all-gather step: output[i] = recv[i]  (128-bit vectorised copy).
+ * No accumulation — the incoming chunk is already fully reduced.
+ *
+ * @param output       [out] BF16 destination [chunk_elems]
+ * @param recv         [in]  BF16 received fully-reduced chunk [chunk_elems]
+ * @param chunk_elems  Number of BF16 elements
+ * @param sm_version   SM version (86, 90, 120)
+ * @param stream       CUDA compute stream
+ */
+void launch_hetero_ring_gather_step(
+    __nv_bfloat16* __restrict__       output,
+    const __nv_bfloat16* __restrict__ recv,
+    size_t                            chunk_elems,
+    int                               sm_version,
+    cudaStream_t                      stream);
+
+/**
+ * launch_hetero_ring_allreduce
+ *
+ * Full reduce-scatter + all-gather ring allreduce for a heterogeneous
+ * PCIe cluster.  Both phases execute (P-1) steps each with double-buffered
+ * DMA/compute overlap.
+ *
+ * Caller must pre-allocate on this rank's device:
+ *   data         — full BF16 gradient tensor [total_elems]  (in-place)
+ *   ping_buf     — receive ping buffer [hetero_ring_max_chunk_bytes() / 2]
+ *   pong_buf     — receive pong buffer [hetero_ring_max_chunk_bytes() / 2]
+ *   peer_data[r] — peer-mapped device pointer to rank r's data buffer
+ *   xfer_done[2] — two pre-created CUDA events for double-buffer sync
+ *
+ * @param data          [in/out] BF16 gradient [total_elems], modified in-place
+ * @param ping_buf      Receive ping buffer (device, max chunk size)
+ * @param pong_buf      Receive pong buffer (device, max chunk size)
+ * @param peer_data     Device pointers to all ranks' data buffers (length P)
+ * @param desc          Topology descriptor from hetero_ring_init()
+ * @param total_elems   Number of BF16 gradient elements
+ * @param sm_version    SM version of this rank's device
+ * @param stream_xfer   CUDA stream for cudaMemcpyPeerAsync (DMA)
+ * @param stream_comp   CUDA stream for reduce/gather kernels (compute)
+ * @param xfer_done     Two pre-created CUDA events for double-buffer handshake
+ */
+void launch_hetero_ring_allreduce(
+    __nv_bfloat16*          data,
+    __nv_bfloat16*          ping_buf,
+    __nv_bfloat16*          pong_buf,
+    __nv_bfloat16* const*   peer_data,
+    const NumaAwareRingDesc& desc,
+    size_t                  total_elems,
+    int                     sm_version,
+    cudaStream_t            stream_xfer,
+    cudaStream_t            stream_comp,
+    cudaEvent_t             xfer_done[2]);
+
+/**
+ * hetero_ring_intra_numa_chunk_bytes / hetero_ring_cross_numa_chunk_bytes
+ *
+ * Returns the bandwidth-aware chunk size constants for buffer sizing.
+ *   Intra-NUMA: 4 MB  (targets ~0.5 ms at 32 GB/s PCIe 4.0 x16)
+ *   Cross-NUMA: 2 MB  (targets ~0.5 ms at 16 GB/s cross-switch PCIe)
+ *   Max:        4 MB  (use for ping/pong buffer allocation)
+ */
+size_t hetero_ring_intra_numa_chunk_bytes();
+size_t hetero_ring_cross_numa_chunk_bytes();
+size_t hetero_ring_max_chunk_bytes();
+
+/**
+ * hetero_ring_sm_block_size
+ *
+ * Returns the thread-block size used by the reduce/gather kernels for a
+ * given SM version.  Useful for occupancy analysis and buffer alignment.
+ *
+ * SM8.6 (A6000): 128  (fewer SMs -> smaller blocks)
+ * SM9.0  (H100): 256
+ * SM12.0 (Blackwell): 512
+ *
+ * @param sm_version  SM version (86, 90, 120)
+ * @returns           Thread-block size
+ */
+int hetero_ring_sm_block_size(int sm_version);

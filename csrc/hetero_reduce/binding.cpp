@@ -1460,5 +1460,98 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("fp8_scale") = 1.f,
           py::arg("sm_version") = 86);
 
+    // -----------------------------------------------------------------------
+    // hetero_ring_allreduce — 5-GPU 2-NUMA PCIe ring allreduce
+    //
+    // Exposed API:
+    //   hetero_ring_reduce_step(accum_buf, recv_buf, sm_version) -> None
+    //   hetero_ring_gather_step(output, recv_buf, sm_version)    -> None
+    //   hetero_ring_intra_numa_chunk_bytes()  -> int
+    //   hetero_ring_cross_numa_chunk_bytes()  -> int
+    //   hetero_ring_max_chunk_bytes()         -> int
+    //   hetero_ring_sm_block_size(sm_version) -> int
+    // -----------------------------------------------------------------------
+
+    m.def("hetero_ring_reduce_step",
+          [](at::Tensor accum_buf, at::Tensor recv_buf, int sm_version) {
+              check_bf16(accum_buf, "accum_buf");
+              check_bf16(recv_buf,  "recv_buf");
+              TORCH_CHECK(accum_buf.numel() == recv_buf.numel(),
+                          "accum_buf and recv_buf must have the same number of elements");
+              const size_t n = (size_t)accum_buf.numel();
+              cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+              launch_hetero_ring_reduce_step(
+                  reinterpret_cast<__nv_bfloat16*>(accum_buf.data_ptr()),
+                  reinterpret_cast<const __nv_bfloat16*>(recv_buf.data_ptr()),
+                  n, sm_version, stream);
+          },
+          "Single heterogeneous ring reduce-scatter step.\n"
+          "accum_buf[i] += recv_buf[i]  (BF16 -> FP32 accumulation -> BF16).\n"
+          "Dispatches SM-specialised kernel: SM8.6 (A6000), SM9.0 (H100),\n"
+          "or SM12.0 (Blackwell, cp.async double-buffered).\n"
+          "\n"
+          "Args:\n"
+          "  accum_buf  (Tensor BF16 [N]): local accumulator (modified in-place)\n"
+          "  recv_buf   (Tensor BF16 [N]): received chunk from ring predecessor\n"
+          "  sm_version (int): 86, 90, or 120",
+          py::arg("accum_buf"),
+          py::arg("recv_buf"),
+          py::arg("sm_version") = 86);
+
+    m.def("hetero_ring_gather_step",
+          [](at::Tensor output, at::Tensor recv_buf, int sm_version) {
+              check_bf16(output,   "output");
+              check_bf16(recv_buf, "recv_buf");
+              TORCH_CHECK(output.numel() == recv_buf.numel(),
+                          "output and recv_buf must have the same number of elements");
+              const size_t n = (size_t)output.numel();
+              cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+              launch_hetero_ring_gather_step(
+                  reinterpret_cast<__nv_bfloat16*>(output.data_ptr()),
+                  reinterpret_cast<const __nv_bfloat16*>(recv_buf.data_ptr()),
+                  n, sm_version, stream);
+          },
+          "Single heterogeneous ring all-gather step.\n"
+          "output[i] = recv_buf[i]  (128-bit vectorised copy, no accumulation).\n"
+          "Used in the all-gather phase after reduce-scatter completes.\n"
+          "\n"
+          "Args:\n"
+          "  output     (Tensor BF16 [N]): destination buffer\n"
+          "  recv_buf   (Tensor BF16 [N]): fully-reduced chunk from ring predecessor\n"
+          "  sm_version (int): 86, 90, or 120",
+          py::arg("output"),
+          py::arg("recv_buf"),
+          py::arg("sm_version") = 86);
+
+    m.def("hetero_ring_intra_numa_chunk_bytes",
+          []() -> int64_t { return (int64_t)hetero_ring_intra_numa_chunk_bytes(); },
+          "Intra-NUMA chunk size in bytes (4 MB).\n"
+          "Used for ring steps within the same NUMA node (~32 GB/s PCIe 4.0 x16).\n"
+          "Returns: int");
+
+    m.def("hetero_ring_cross_numa_chunk_bytes",
+          []() -> int64_t { return (int64_t)hetero_ring_cross_numa_chunk_bytes(); },
+          "Cross-NUMA chunk size in bytes (2 MB).\n"
+          "Used for ring steps crossing NUMA domains (~16 GB/s cross-switch PCIe).\n"
+          "Returns: int");
+
+    m.def("hetero_ring_max_chunk_bytes",
+          []() -> int64_t { return (int64_t)hetero_ring_max_chunk_bytes(); },
+          "Maximum chunk size in bytes (4 MB = intra-NUMA chunk).\n"
+          "Allocate ping/pong receive buffers with at least this many bytes.\n"
+          "Returns: int");
+
+    m.def("hetero_ring_sm_block_size",
+          &hetero_ring_sm_block_size,
+          "Thread-block size for hetero ring reduce/gather kernels.\n"
+          "SM8.6 (A6000): 128 threads (fewer SMs -> smaller blocks)\n"
+          "SM9.0  (H100): 256 threads\n"
+          "SM12.0 (Blackwell): 512 threads (widest warp scheduler)\n"
+          "\n"
+          "Args:\n"
+          "  sm_version (int): 86, 90, or 120\n"
+          "Returns: int (thread-block size)",
+          py::arg("sm_version") = 86);
+
 
 }

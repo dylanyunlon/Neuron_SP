@@ -116,6 +116,7 @@ set(HETERO_REDUCE_SOURCES
     # Core reduce kernels
     "${HETERO_REDUCE_DIR}/hetero_reduce.cu"              # warp-coop + CAS reduction
     "${HETERO_REDUCE_DIR}/pcie_adaptive_allreduce.cu"    # ring allreduce + SM12 async
+    "${HETERO_REDUCE_DIR}/hetero_ring_allreduce.cu"      # 5-GPU 2-NUMA hetero ring AR
     "${HETERO_REDUCE_DIR}/cross_entropy_tp.cu"           # online log-softmax TP loss
     "${HETERO_REDUCE_DIR}/fused_swiglu_ln.cu"            # SwiGLU + RMSNorm
     "${HETERO_REDUCE_DIR}/fused_layernorm_residual.cu"   # pre-LN residual add
