@@ -392,6 +392,156 @@ int64_t pcie_bucket_size_py(float pcie_bw_gbps)
 }
 
 // ---------------------------------------------------------------------------
+// fused_cross_entropy bindings
+// ---------------------------------------------------------------------------
+
+void fused_local_max_expsum_py(at::Tensor logits,
+                                at::Tensor local_max,
+                                at::Tensor local_expsum,
+                                int sm_version)
+{
+    check_bf16(logits, "logits");
+    check_fp32(local_max, "local_max");
+    check_fp32(local_expsum, "local_expsum");
+
+    TORCH_CHECK(logits.dim() == 2, "logits must be 2-D [B, V_local]");
+    const int batch = static_cast<int>(logits.size(0));
+    const int local_vocab = static_cast<int>(logits.size(1));
+    TORCH_CHECK(local_max.numel() >= batch, "local_max too small");
+    TORCH_CHECK(local_expsum.numel() >= batch, "local_expsum too small");
+
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    launch_fused_local_max_expsum(
+        reinterpret_cast<const __nv_bfloat16*>(logits.data_ptr<at::BFloat16>()),
+        local_max.data_ptr<float>(),
+        local_expsum.data_ptr<float>(),
+        batch, local_vocab, sm_version, stream);
+}
+
+void adjust_expsum_py(at::Tensor local_expsum,
+                       at::Tensor local_max,
+                       at::Tensor global_max,
+                       int batch_size)
+{
+    check_fp32(local_expsum, "local_expsum");
+    check_fp32(local_max, "local_max");
+    check_fp32(global_max, "global_max");
+
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    launch_adjust_expsum(
+        local_expsum.data_ptr<float>(),
+        local_max.data_ptr<float>(),
+        global_max.data_ptr<float>(),
+        batch_size, stream);
+}
+
+std::tuple<at::Tensor, at::Tensor>
+gather_target_logit_py(at::Tensor logits,
+                        at::Tensor targets,
+                        int vocab_start)
+{
+    check_bf16(logits, "logits");
+    TORCH_CHECK(targets.scalar_type() == at::ScalarType::Long,
+                "targets must be Int64");
+    TORCH_CHECK(targets.is_cuda() && targets.is_contiguous());
+    TORCH_CHECK(logits.dim() == 2, "logits must be 2-D [B, V_local]");
+
+    const int batch = static_cast<int>(logits.size(0));
+    const int local_vocab = static_cast<int>(logits.size(1));
+
+    auto opts_f = at::TensorOptions().dtype(at::kFloat).device(logits.device());
+    auto opts_i = at::TensorOptions().dtype(at::kInt).device(logits.device());
+    at::Tensor target_logit = at::empty({batch}, opts_f);
+    at::Tensor target_mask  = at::empty({batch}, opts_i);
+
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    launch_gather_target_logit(
+        reinterpret_cast<const __nv_bfloat16*>(logits.data_ptr<at::BFloat16>()),
+        targets.data_ptr<int64_t>(),
+        target_logit.data_ptr<float>(),
+        target_mask.data_ptr<int>(),
+        batch, local_vocab, vocab_start, stream);
+
+    return std::make_tuple(target_logit, target_mask);
+}
+
+at::Tensor cross_entropy_loss_py(at::Tensor global_max,
+                                   at::Tensor global_expsum,
+                                   at::Tensor target_logit,
+                                   at::Tensor targets,
+                                   bool compute_mean,
+                                   int ignore_index)
+{
+    check_fp32(global_max, "global_max");
+    check_fp32(global_expsum, "global_expsum");
+    check_fp32(target_logit, "target_logit");
+    TORCH_CHECK(targets.scalar_type() == at::ScalarType::Long,
+                "targets must be Int64");
+    TORCH_CHECK(targets.is_cuda() && targets.is_contiguous());
+
+    const int batch = static_cast<int>(global_max.numel());
+    auto opts = at::TensorOptions().dtype(at::kFloat).device(global_max.device());
+    at::Tensor loss = at::empty({batch}, opts);
+
+    float* mean_ptr = nullptr;
+    at::Tensor mean_loss;
+    if (compute_mean) {
+        mean_loss = at::zeros({2}, opts);  // [total_loss, total_count]
+        mean_ptr = mean_loss.data_ptr<float>();
+    }
+
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    launch_cross_entropy_loss(
+        loss.data_ptr<float>(),
+        mean_ptr,
+        global_max.data_ptr<float>(),
+        global_expsum.data_ptr<float>(),
+        target_logit.data_ptr<float>(),
+        targets.data_ptr<int64_t>(),
+        batch, ignore_index, stream);
+
+    if (compute_mean) {
+        return mean_loss.slice(0, 0, 1);  // return just the mean scalar
+    }
+    return loss;
+}
+
+void fused_cross_entropy_backward_py(at::Tensor d_logits,
+                                       at::Tensor logits,
+                                       at::Tensor global_max,
+                                       at::Tensor global_expsum,
+                                       at::Tensor grad_output,
+                                       at::Tensor targets,
+                                       int vocab_start,
+                                       int ignore_index,
+                                       int sm_version)
+{
+    check_bf16(d_logits, "d_logits");
+    check_bf16(logits, "logits");
+    check_fp32(global_max, "global_max");
+    check_fp32(global_expsum, "global_expsum");
+    check_fp32(grad_output, "grad_output");
+    TORCH_CHECK(targets.scalar_type() == at::ScalarType::Long,
+                "targets must be Int64");
+
+    TORCH_CHECK(logits.dim() == 2, "logits must be 2-D [B, V_local]");
+    TORCH_CHECK(d_logits.sizes() == logits.sizes(), "d_logits/logits shape mismatch");
+
+    const int batch = static_cast<int>(logits.size(0));
+    const int local_vocab = static_cast<int>(logits.size(1));
+
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    launch_fused_cross_entropy_backward(
+        reinterpret_cast<__nv_bfloat16*>(d_logits.data_ptr<at::BFloat16>()),
+        reinterpret_cast<const __nv_bfloat16*>(logits.data_ptr<at::BFloat16>()),
+        global_max.data_ptr<float>(),
+        global_expsum.data_ptr<float>(),
+        grad_output.data_ptr<float>(),
+        targets.data_ptr<int64_t>(),
+        batch, local_vocab, vocab_start, ignore_index, sm_version, stream);
+}
+
+// ---------------------------------------------------------------------------
 // tier_activation_offload bindings
 // ---------------------------------------------------------------------------
 
@@ -513,7 +663,8 @@ int64_t compute_offload_budget_py(int64_t total_act_bytes,
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
     m.doc() = "DeepSpeed hetero_reduce: fused BF16 reduce-scatter + SwiGLU-LN + "
-              "RoPE + PCIe allreduce + tier activation offload kernels "
+              "RoPE + PCIe allreduce + tier activation offload + "
+              "vocab-parallel cross-entropy kernels "
               "for heterogeneous GPU clusters (SM 8.6 / 9.0 / 12.0).";
 
     m.def("fused_bf16_reduce",
@@ -653,6 +804,92 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           "  pcie_bw_gbps (float): measured or estimated PCIe bandwidth in GB/s\n"
           "Returns: int (bucket size in bytes)",
           py::arg("pcie_bw_gbps") = 32.f);
+
+    // -----------------------------------------------------------------------
+    // fused_cross_entropy
+    // -----------------------------------------------------------------------
+    m.def("fused_local_max_expsum",
+          &fused_local_max_expsum_py,
+          "Compute per-row local max and exp-sum over a vocab partition.\n"
+          "Phase 1+2 of heterogeneous vocab-parallel cross-entropy.\n"
+          "Args:\n"
+          "  logits       (Tensor BF16 [B, V_local]): local logit partition\n"
+          "  local_max    (Tensor FP32 [B]): output per-row local max\n"
+          "  local_expsum (Tensor FP32 [B]): output per-row exp-sum\n"
+          "  sm_version   (int): 86, 90, or 120",
+          py::arg("logits"),
+          py::arg("local_max"),
+          py::arg("local_expsum"),
+          py::arg("sm_version") = 86);
+
+    m.def("adjust_expsum",
+          &adjust_expsum_py,
+          "Correct local exp-sum after global max allreduce.\n"
+          "In-place: local_expsum *= exp(local_max - global_max).\n"
+          "Args:\n"
+          "  local_expsum (Tensor FP32 [B]): corrected in-place\n"
+          "  local_max    (Tensor FP32 [B]): per-row local max\n"
+          "  global_max   (Tensor FP32 [B]): per-row global max\n"
+          "  batch_size   (int): number of tokens",
+          py::arg("local_expsum"),
+          py::arg("local_max"),
+          py::arg("global_max"),
+          py::arg("batch_size"));
+
+    m.def("gather_target_logit",
+          &gather_target_logit_py,
+          "Extract target logit from local partition.\n"
+          "Returns (target_logit, target_mask) tensors.\n"
+          "Args:\n"
+          "  logits      (Tensor BF16 [B, V_local]): local logit partition\n"
+          "  targets     (Tensor Int64 [B]): global target indices\n"
+          "  vocab_start (int): starting global vocab index of this partition",
+          py::arg("logits"),
+          py::arg("targets"),
+          py::arg("vocab_start") = 0);
+
+    m.def("cross_entropy_loss",
+          &cross_entropy_loss_py,
+          "Compute final cross-entropy loss from global softmax statistics.\n"
+          "loss = log(global_expsum) - (target_logit - global_max).\n"
+          "Returns per-token loss or scalar mean.\n"
+          "Args:\n"
+          "  global_max    (Tensor FP32 [B]): global max across partitions\n"
+          "  global_expsum (Tensor FP32 [B]): global exp-sum denominator\n"
+          "  target_logit  (Tensor FP32 [B]): logit at target position\n"
+          "  targets       (Tensor Int64 [B]): target indices\n"
+          "  compute_mean  (bool): if True, return scalar mean loss\n"
+          "  ignore_index  (int): target value to ignore (default -100)",
+          py::arg("global_max"),
+          py::arg("global_expsum"),
+          py::arg("target_logit"),
+          py::arg("targets"),
+          py::arg("compute_mean") = true,
+          py::arg("ignore_index") = -100);
+
+    m.def("fused_cross_entropy_backward",
+          &fused_cross_entropy_backward_py,
+          "Backward pass for vocab-parallel cross-entropy.\n"
+          "d_logit = (softmax - indicator) * grad_output.\n"
+          "Args:\n"
+          "  d_logits      (Tensor BF16 [B, V_local]): output gradient\n"
+          "  logits        (Tensor BF16 [B, V_local]): forward logits\n"
+          "  global_max    (Tensor FP32 [B]): global max\n"
+          "  global_expsum (Tensor FP32 [B]): global exp-sum\n"
+          "  grad_output   (Tensor FP32 [B]): upstream per-token gradient\n"
+          "  targets       (Tensor Int64 [B]): target indices\n"
+          "  vocab_start   (int): starting global vocab index\n"
+          "  ignore_index  (int): target value to ignore\n"
+          "  sm_version    (int): 86, 90, or 120",
+          py::arg("d_logits"),
+          py::arg("logits"),
+          py::arg("global_max"),
+          py::arg("global_expsum"),
+          py::arg("grad_output"),
+          py::arg("targets"),
+          py::arg("vocab_start") = 0,
+          py::arg("ignore_index") = -100,
+          py::arg("sm_version") = 86);
 
     // -----------------------------------------------------------------------
     // tier_activation_offload

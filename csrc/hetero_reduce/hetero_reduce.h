@@ -384,6 +384,141 @@ void launch_dequantise_int8_to_fp16(__nv_bfloat16* output,
                                      cudaStream_t   stream);
 
 // ===========================================================================
+// fused_cross_entropy — Heterogeneous vocab-parallel cross-entropy loss
+// ===========================================================================
+
+/**
+ * launch_fused_local_max_expsum
+ *
+ * Phase 1+2 of vocab-parallel cross-entropy.  For each row (token) computes
+ * the local maximum logit and sum(exp(logit - local_max)) over the local
+ * vocabulary partition.
+ *
+ * @param logits           [in]  BF16 logit partition [batch_size, local_vocab_size]
+ * @param local_max        [out] FP32 per-row local maximum [batch_size]
+ * @param local_expsum     [out] FP32 per-row local exp-sum [batch_size]
+ * @param batch_size       Number of tokens (rows)
+ * @param local_vocab_size Number of vocab entries on this partition
+ * @param sm_version       SM version of active device (86, 90, 120)
+ * @param stream           CUDA stream
+ */
+void launch_fused_local_max_expsum(
+    const __nv_bfloat16* logits,
+    float*               local_max,
+    float*               local_expsum,
+    int                  batch_size,
+    int                  local_vocab_size,
+    int                  sm_version,
+    cudaStream_t         stream);
+
+/**
+ * launch_adjust_expsum
+ *
+ * After allreduce of local maxes yields global_max, corrects each partition's
+ * exp-sum: corrected = local_expsum * exp(local_max - global_max).
+ * A subsequent allreduce-sum of corrected values gives the global denominator.
+ *
+ * @param local_expsum [in/out] FP32 per-row exp-sum [batch_size], corrected in-place
+ * @param local_max    [in]     FP32 per-row local max [batch_size]
+ * @param global_max   [in]     FP32 per-row global max [batch_size]
+ * @param batch_size   Number of tokens
+ * @param stream       CUDA stream
+ */
+void launch_adjust_expsum(
+    float*       local_expsum,
+    const float* local_max,
+    const float* global_max,
+    int          batch_size,
+    cudaStream_t stream);
+
+/**
+ * launch_gather_target_logit
+ *
+ * For each token, extracts the logit at the target position if the target
+ * falls within this partition's vocab range [vocab_start, vocab_start + V_local).
+ * Writes 0 otherwise.  An allreduce-sum across partitions recovers the true
+ * target logit.
+ *
+ * @param logits          [in]  BF16 logit partition [batch_size, local_vocab_size]
+ * @param targets         [in]  INT64 target indices [batch_size]
+ * @param target_logit    [out] FP32 target logit (or 0) [batch_size]
+ * @param target_mask     [out] INT32 ownership mask (1 if target on this partition)
+ * @param batch_size      Number of tokens
+ * @param local_vocab_size Partition vocab size
+ * @param vocab_start     Starting global vocab index of this partition
+ * @param stream          CUDA stream
+ */
+void launch_gather_target_logit(
+    const __nv_bfloat16* logits,
+    const int64_t*       targets,
+    float*               target_logit,
+    int*                 target_mask,
+    int                  batch_size,
+    int                  local_vocab_size,
+    int                  vocab_start,
+    cudaStream_t         stream);
+
+/**
+ * launch_cross_entropy_loss
+ *
+ * Final loss computation:  loss = log(global_expsum) - (target_logit - global_max).
+ * Optionally computes mean across non-ignored tokens.
+ *
+ * @param loss           [out] FP32 per-token loss [batch_size]
+ * @param mean_loss      [out] FP32 scalar mean [2] (loss, count) or NULL to skip
+ * @param global_max     [in]  FP32 global max [batch_size]
+ * @param global_expsum  [in]  FP32 global exp-sum [batch_size]
+ * @param target_logit   [in]  FP32 target logit [batch_size]
+ * @param targets        [in]  INT64 target indices [batch_size]
+ * @param batch_size     Number of tokens
+ * @param ignore_index   Target value to ignore (e.g. -100)
+ * @param stream         CUDA stream
+ */
+void launch_cross_entropy_loss(
+    float*         loss,
+    float*         mean_loss,
+    const float*   global_max,
+    const float*   global_expsum,
+    const float*   target_logit,
+    const int64_t* targets,
+    int            batch_size,
+    int            ignore_index,
+    cudaStream_t   stream);
+
+/**
+ * launch_fused_cross_entropy_backward
+ *
+ * Backward pass: computes d_logit = (softmax - indicator) * grad for each
+ * element in the local vocab partition.
+ *
+ * @param d_logits        [out] BF16 gradient w.r.t. logits [batch_size, local_vocab_size]
+ * @param logits          [in]  BF16 forward logits [batch_size, local_vocab_size]
+ * @param global_max      [in]  FP32 global max [batch_size]
+ * @param global_expsum   [in]  FP32 global exp-sum [batch_size]
+ * @param grad_output     [in]  FP32 upstream gradient [batch_size]
+ * @param targets         [in]  INT64 target indices [batch_size]
+ * @param batch_size      Number of tokens
+ * @param local_vocab_size Partition vocab size
+ * @param vocab_start     Starting global vocab index
+ * @param ignore_index    Target value to ignore
+ * @param sm_version      SM version (86, 90, 120)
+ * @param stream          CUDA stream
+ */
+void launch_fused_cross_entropy_backward(
+    __nv_bfloat16*       d_logits,
+    const __nv_bfloat16* logits,
+    const float*         global_max,
+    const float*         global_expsum,
+    const float*         grad_output,
+    const int64_t*       targets,
+    int                  batch_size,
+    int                  local_vocab_size,
+    int                  vocab_start,
+    int                  ignore_index,
+    int                  sm_version,
+    cudaStream_t         stream);
+
+// ===========================================================================
 // Additional API — Worker-12 (Opus) additions
 // ===========================================================================
 
