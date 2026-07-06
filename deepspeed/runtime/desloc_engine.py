@@ -1813,7 +1813,19 @@ class DesLocEngine:
                     ctx.group = group
                     ctx.n_heads = n_heads
                     ctx.T = T
-                    ctx.out3_shape_before_trim = (_raw_a2a(out2, 1, 2, group)).shape
+                    # FIX (NCCL hang): compute out3_shape_before_trim analytically
+                    # instead of doing a real all-to-all just for .shape.  The extra
+                    # _raw_a2a(out2, 1, 2, group) was a 5th collective per layer that
+                    # caused deadlocks when activation-checkpoint recompute re-ran
+                    # forward (the backward path has only 4 collectives, so the counts
+                    # became asymmetric across recompute / non-recompute ranks).
+                    # Shape derivation: out2 is [B, P*n_heads, T_pad//P, head_dim]
+                    # after reverse a2a(scatter=1,gather=2): [B, n_heads, T_pad, head_dim]
+                    # where T_pad = T + (P - T % P) % P.
+                    _B_s = out2.shape[0]
+                    _H_s = out2.shape[3]
+                    _T_pad = T + (P - T % P) % P
+                    ctx.out3_shape_before_trim = (_B_s, n_heads, _T_pad, _H_s)
                     return out3
 
                 @staticmethod
