@@ -2364,6 +2364,7 @@ class DesLocEngine:
             # --- HeteroFP32GradAccumManager: after_backward ---
             # Skipped when DistributedOptimizer active (it owns grad reduction).
             # Also skipped on NaN steps (grads will be zeroed; no accumulation needed).
+            logger.warning("rank=%d: post-nan-check, fp32_mgr=%s, dist_opt=%s, nan=%s", dist.get_rank() if dist.is_initialized() else 0, self.fp32_grad_manager is not None, self._dist_optimizer is not None, _step_has_nan)
             if self.fp32_grad_manager is not None and self._dist_optimizer is None and not _step_has_nan:
                 # Fix from Megatron M3313: clamp to avoid 1/0 when num_microbatches==0.
                 self.fp32_grad_manager.after_backward(scale=1.0 / max(num_microbatches, 1))
@@ -2389,6 +2390,7 @@ class DesLocEngine:
             # participation.  On NaN steps we pass skip_grad_sync=True so that no
             # gradient data is actually transferred; the call becomes a collective
             # no-op at the NCCL level but still keeps all ranks in lock-step.
+            logger.warning("rank=%d: about to enter finalize_model_grads block", dist.get_rank() if dist.is_initialized() else 0)
             _is_Kx_sync = _is_Kx_sync_pre
             try:
                 import types as _types  # noqa: PLC0415
