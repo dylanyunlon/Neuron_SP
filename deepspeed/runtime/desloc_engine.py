@@ -296,7 +296,7 @@ class DesLocEngine:
         self.registry.discover()
         _initial_hooks = self.registry.register_hooks(self)
         logger.info(
-            "HeteroRegistry loaded %d modules; %d hooks activated.",
+            "HeteroRegistry loaded %d modules; %d newly hooked in initial pass.",
             len(self.registry), _initial_hooks,
         )
 
@@ -1408,7 +1408,7 @@ class DesLocEngine:
             self.registry.discover()
             activated = self.registry.register_hooks(self)
             logger.info(
-                "HeteroRegistry: final pass activated %d hooks on engine.",
+                "HeteroRegistry: final pass hooked %d additional modules on engine.",
                 activated,
             )
         except Exception as _reg_exc:  # noqa: BLE001
