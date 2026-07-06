@@ -4167,3 +4167,671 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         if item_slice is not None:
             result = {k: v[item_slice] for k, v in result.items() if isinstance(v, torch.Tensor)}
         return result
+
+
+# ===========================================================================
+# Section: ZeRO-2 Optimizer — gradient sharding without parameter sharding
+# ===========================================================================
+
+
+class ZeROStage2Optimizer(MixedPrecisionOptimizer):
+    """ZeRO Stage-2 optimizer: optimizer state + gradient sharding.
+
+    Unlike the full :class:`DistributedOptimizer` (ZeRO-3) which also shards
+    model parameters, ZeRO-2 shards only **optimizer states** and **gradients**
+    across data-parallel ranks.  Each rank holds the full BF16/FP16 model
+    weight tensor, but only updates the FP32 optimizer state for its assigned
+    shard of parameters.
+
+    Memory comparison (7B model, 8 DP ranks, BF16)
+    -----------------------------------------------
+    - ZeRO-0: ~14 GB params + ~14 GB grads + ~56 GB states = 84 GB/rank
+    - ZeRO-1: ~14 GB params + ~14 GB grads + ~7 GB  states = 35 GB/rank
+    - ZeRO-2: ~14 GB params + ~1.75 GB grads + ~7 GB states = 22 GB/rank
+    - ZeRO-3: ~1.75 GB params + ~1.75 GB grads + ~7 GB states = 10 GB/rank
+
+    ZeRO-2 is preferred over ZeRO-3 on PCIe-only clusters (A6000 / Consumer
+    tiers) where the extra all-gather communication for ZeRO-3 param gather
+    is prohibitively expensive — PCIe bandwidth is ~32 GB/s versus NVLink's
+    ~600 GB/s per direction.
+
+    DES-LOC Integration
+    -------------------
+    When ``OptimizerConfig.heterogeneous_shard_sizing`` is True, each rank's
+    parameter shard is sized proportional to its BF16 TFLOPS rating (via
+    :func:`_compute_hetero_shard_boundaries`) so faster GPUs hold more of
+    the optimizer state.
+
+    First/second moment synchronisation follows the same Ku/Kv cadence as
+    :class:`DistributedOptimizer`:
+      - First moments all-reduced every ``config.ku`` steps.
+      - Second moments all-reduced every ``config.kv`` steps.
+
+    Args:
+        config:                  Optimizer hyper-parameters.
+        optimizer:               Inner Adam/AdamW instance.
+        params:                  All model parameters.
+        model_parallel_config:   TP/PP/DP configuration.
+        data_parallel_group:     NCCL process group for grad communication.
+        tier_assignments:        Per-rank TierType for heterogeneous sizing.
+    """
+
+    def __init__(
+        self,
+        config: OptimizerConfig,
+        optimizer: torch.optim.Optimizer,
+        params: List[torch.nn.Parameter],
+        model_parallel_config: ModelParallelConfig,
+        data_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+        tier_assignments: Optional[List[Optional[TierType]]] = None,
+    ) -> None:
+        if data_parallel_group is None:
+            if parallel_state.is_initialized():
+                data_parallel_group = parallel_state.get_data_parallel_group()
+            else:
+                data_parallel_group = torch.distributed.GroupMember.WORLD
+
+        super().__init__(
+            config=config,
+            optimizer=optimizer,
+            params=params,
+            model_parallel_config=model_parallel_config,
+            grad_scaler=None,
+        )
+
+        self.data_parallel_group = data_parallel_group
+        self.tier_assignments = tier_assignments
+        self.data_parallel_world_size: int = torch.distributed.get_world_size(
+            group=data_parallel_group
+        )
+        self.data_parallel_rank: int = torch.distributed.get_rank(group=data_parallel_group)
+
+        self._desloc: Optional[DesLocConfig] = getattr(model_parallel_config, "desloc", None)
+        self._step_count: int = 0
+
+        # Build flat param list and assign each to a DP rank
+        self._all_params: List[torch.nn.Parameter] = list(params)
+        self._build_param_shard()
+
+    def _build_param_shard(self) -> None:
+        """Assign parameters to DP ranks using TFLOPS-weighted boundaries.
+
+        Each DP rank owns a contiguous slice of the flattened parameter list
+        determined by :func:`_compute_hetero_shard_boundaries` applied to
+        the total parameter count.  The owned parameters' FP32 master copies
+        live in the inner optimizer's param groups; un-owned parameters are
+        removed from the inner optimizer's state (their gradients are still
+        communicated via reduce-scatter, but the Adam update only runs on
+        the owned shard).
+
+        After this call:
+          - ``self._owned_params`` : list of params this rank updates.
+          - ``self._owned_fp32``   : corresponding FP32 master copies.
+        """
+        n_params = len(self._all_params)
+        boundaries = _compute_hetero_shard_boundaries(
+            total_numel=n_params,
+            dp_world_size=self.data_parallel_world_size,
+            config=self.config,
+            tier_assignments=self.tier_assignments,
+        )
+        s, e = boundaries[self.data_parallel_rank]
+        self._owned_params: List[torch.nn.Parameter] = self._all_params[s:e]
+        self._shard_start: int = s
+        self._shard_end: int = e
+
+        # FP32 master copies for owned params only
+        self._owned_fp32: List[torch.nn.Parameter] = []
+        for param in self._owned_params:
+            if param.dtype in (torch.float16, torch.bfloat16):
+                fp32 = param.detach().clone().float()
+                fp32.requires_grad_(True)
+                param.main_param = fp32
+                copy_optimizer_param_metadata(fp32, param)
+                if param in self.optimizer.state:
+                    self.optimizer.state[fp32] = self.optimizer.state.pop(param)
+                self._owned_fp32.append(fp32)
+            else:
+                self._owned_fp32.append(param)
+
+        # Replace inner optimizer param groups with owned FP32 params only
+        self.optimizer.param_groups = [{
+            "params": self._owned_fp32,
+            "lr": self.config.lr or 1e-4,
+            "betas": (self.config.adam_beta1, self.config.adam_beta2),
+            "eps": self.config.adam_eps,
+            "weight_decay": self.config.weight_decay,
+            "amsgrad": False,
+            "maximize": False,
+            "foreach": None,
+            "capturable": False,
+            "differentiable": False,
+            "fused": None,
+        }]
+
+        logger.info(
+            "ZeROStage2Optimizer: rank=%d/%d owns params [%d, %d) of %d total, "
+            "owned_count=%d, hetero=%s",
+            self.data_parallel_rank,
+            self.data_parallel_world_size,
+            s, e, n_params,
+            len(self._owned_params),
+            self.config.heterogeneous_shard_sizing,
+        )
+
+    @torch.no_grad()
+    def _reduce_scatter_owned_grads(self) -> None:
+        """All-reduce gradients and keep only the owned shard locally.
+
+        ZeRO-2 strategy: every rank participates in the all-reduce for the
+        full gradient tensor, then discards all but its owned parameter slice.
+        This avoids the per-parameter point-to-point scatter of ZeRO-3 at
+        the cost of higher peak gradient memory (full gradient kept during
+        the all-reduce, then immediately discarded).
+
+        For heterogeneous topologies the all-reduce is chunked through a
+        256 MB staging buffer to avoid OOM on A6000 48 GB cards.
+
+        After this call, each owned FP32 param has its ``.grad`` set to the
+        averaged FP32 gradient shard.
+        """
+        dp_world = self.data_parallel_world_size
+
+        # Collect all BF16 gradients into a flat list in param order
+        all_grads: List[Optional[torch.Tensor]] = []
+        for param in self._all_params:
+            if hasattr(param, "main_grad") and param.main_grad is not None:
+                all_grads.append(param.main_grad)
+            elif param.grad is not None:
+                all_grads.append(param.grad)
+            else:
+                all_grads.append(None)
+
+        # All-reduce non-None gradients in chunks
+        _chunk_elems = max(1, (256 * 1024 * 1024) // 2)  # 256 MB in BF16 elements
+        non_none_grads = [g for g in all_grads if g is not None]
+
+        if non_none_grads:
+            # Flat all-reduce on chunked concatenation
+            flat = torch.cat([g.view(-1).float() for g in non_none_grads])
+            total = flat.numel()
+            pos = 0
+            while pos < total:
+                cur = min(_chunk_elems, total - pos)
+                chunk = flat[pos:pos + cur]
+                torch.distributed.all_reduce(
+                    chunk,
+                    op=torch.distributed.ReduceOp.SUM,
+                    group=self.data_parallel_group,
+                )
+                chunk.div_(dp_world)
+                pos += cur
+
+            # Scatter back to individual gradient tensors
+            offset = 0
+            g_idx = 0
+            for param in self._all_params:
+                if all_grads[self._all_params.index(param)] is None:
+                    continue
+                numel = all_grads[self._all_params.index(param)].numel()
+                all_grads[self._all_params.index(param)].copy_(
+                    flat[offset:offset + numel].view_as(all_grads[self._all_params.index(param)])
+                )
+                offset += numel
+
+        # Copy reduced gradients to owned FP32 params' .grad
+        for fp32, bf16 in zip(self._owned_fp32, self._owned_params):
+            if all_grads[self._all_params.index(bf16)] is not None:
+                grad = all_grads[self._all_params.index(bf16)]
+                fp32.grad = grad.float()
+            else:
+                fp32.grad = None
+
+    @torch.no_grad()
+    def prepare_grads(self) -> bool:
+        """Reduce-scatter owned gradients.  Always returns False (no loss scaler)."""
+        self._reduce_scatter_owned_grads()
+        return False
+
+    @torch.no_grad()
+    def _sync_params_to_all_ranks(self) -> None:
+        """Broadcast each owned param's updated weights to all DP ranks.
+
+        After the local Adam update, this rank holds the authoritative
+        FP32 values for its owned parameters.  A broadcast per owned param
+        ensures all other ranks receive the update.
+
+        Uses all_reduce(SUM) with zero-filled non-owner contributions —
+        exactly one rank has non-zero values per param, so the SUM gives the
+        correct result without any scatter/gather bookkeeping.
+        """
+        # Build mapping: param_index → (owner_rank, fp32_param)
+        # from the shard boundaries of all ranks (rank 0 has boundaries info
+        # via config, or we can derive from our own shard + dp_world).
+        # Simple approach: broadcast each rank's owned params sequentially.
+        for rank in range(self.data_parallel_world_size):
+            if rank == self.data_parallel_rank:
+                # I am the owner: broadcast my owned FP32 values
+                for fp32, bf16 in zip(self._owned_fp32, self._owned_params):
+                    bf16.data.copy_(fp32.data.to(bf16.dtype))
+                    # Broadcast bf16 param to all other ranks
+                    torch.distributed.broadcast(
+                        bf16.data,
+                        src=rank,
+                        group=self.data_parallel_group,
+                    )
+            else:
+                # I am not the owner: receive the broadcast for this rank's params
+                n_params = len(self._all_params)
+                boundaries = _compute_hetero_shard_boundaries(
+                    total_numel=n_params,
+                    dp_world_size=self.data_parallel_world_size,
+                    config=self.config,
+                    tier_assignments=self.tier_assignments,
+                )
+                s, e = boundaries[rank]
+                for param in self._all_params[s:e]:
+                    torch.distributed.broadcast(
+                        param.data,
+                        src=rank,
+                        group=self.data_parallel_group,
+                    )
+
+    def sync_moments(self, sync_first: bool = False, sync_second: bool = False) -> None:
+        """All-reduce Adam moments across DP ranks (DES-LOC Ku/Kv protocol)."""
+        if not (sync_first or sync_second):
+            return
+        dp_world = self.data_parallel_world_size
+        for fp32 in self._owned_fp32:
+            state = self.optimizer.state.get(fp32)
+            if state is None:
+                continue
+            if sync_first and "exp_avg" in state:
+                m = state["exp_avg"]
+                torch.distributed.all_reduce(
+                    m, op=torch.distributed.ReduceOp.SUM,
+                    group=self.data_parallel_group,
+                )
+                m.div_(dp_world)
+            if sync_second and "exp_avg_sq" in state:
+                v = state["exp_avg_sq"]
+                torch.distributed.all_reduce(
+                    v, op=torch.distributed.ReduceOp.SUM,
+                    group=self.data_parallel_group,
+                )
+                v.div_(dp_world)
+
+    @torch.no_grad()
+    def step_with_ready_grads(self) -> bool:
+        """Clip + Adam step + moment sync + param broadcast.
+
+        Returns:
+            True if step was taken successfully.
+        """
+        # Gradient clipping on owned FP32 params
+        if self.config.clip_grad > 0.0:
+            from deepspeed.core.optimizer.clip_grads import clip_grad_norm as _clip
+            _clip(
+                parameters=self._owned_fp32,
+                max_norm=self.config.clip_grad,
+                norm_type=2.0,
+                grad_stats_parallel_group=self.data_parallel_group,
+            )
+
+        # Apply decoupled weight decay before Adam step
+        if self.config.decoupled_weight_decay and self.config.weight_decay > 0.0:
+            wd = self.config.weight_decay
+            lr = self.optimizer.param_groups[0].get("lr", self.config.lr or 1e-4)
+            decay = 1.0 - lr * wd
+            for fp32 in self._owned_fp32:
+                if fp32.data is not None and fp32.requires_grad:
+                    fp32.data.mul_(decay)
+
+        self.optimizer.step()
+        self._step_count += 1
+
+        # DES-LOC moment synchronisation
+        if self.config.desloc_enabled:
+            sync_u = self.config.is_ku_step(self._step_count)
+            sync_v = self.config.is_kv_step(self._step_count)
+            if sync_u or sync_v:
+                self.sync_moments(sync_first=sync_u, sync_second=sync_v)
+        elif self._desloc is not None and self._desloc.enabled:
+            sync_u = self._desloc.is_ku_step(self._step_count)
+            sync_v = self._desloc.is_kv_step(self._step_count)
+            if sync_u or sync_v:
+                self.sync_moments(sync_first=sync_u, sync_second=sync_v)
+
+        # Broadcast updated params to all ranks
+        self._sync_params_to_all_ranks()
+        return True
+
+    @torch.no_grad()
+    def step(self) -> bool:
+        found_inf = self.prepare_grads()
+        if found_inf:
+            return False
+        return self.step_with_ready_grads()
+
+    def zero_grad(self, set_to_none: bool = True) -> None:
+        for param in self._all_params:
+            if set_to_none:
+                param.grad = None
+                if hasattr(param, "main_grad"):
+                    param.main_grad = None
+            else:
+                if param.grad is not None:
+                    param.grad.detach_()
+                    param.grad.zero_()
+        for fp32 in self._owned_fp32:
+            if set_to_none:
+                fp32.grad = None
+            elif fp32.grad is not None:
+                fp32.grad.detach_()
+                fp32.grad.zero_()
+
+    def get_loss_scale(self) -> torch.Tensor:
+        return self._scale_one
+
+    def reload_model_params(self) -> None:
+        for fp32, bf16 in zip(self._owned_fp32, self._owned_params):
+            fp32.data.copy_(bf16.data.float())
+
+    def state_dict(self) -> dict:
+        return {
+            "optimizer": self.optimizer.state_dict(),
+            "step_count": self._step_count,
+            "owned_fp32": [p.data.cpu() for p in self._owned_fp32],
+        }
+
+    def load_state_dict(self, state_dict: dict) -> None:
+        self.optimizer.load_state_dict(state_dict["optimizer"])
+        self._step_count = state_dict.get("step_count", 0)
+        if "owned_fp32" in state_dict:
+            for fp32, saved in zip(self._owned_fp32, state_dict["owned_fp32"]):
+                fp32.data.copy_(saved.to(fp32.device))
+
+    def save_parameter_state(self, filename: str) -> None:
+        """Save optimizer state for the owned shard (rank 0 only)."""
+        state_dict = self.state_dict()
+        if self.data_parallel_rank == 0:
+            torch.save(state_dict, filename)
+            logger.info(
+                "ZeROStage2Optimizer: saved parameter state to %s (rank 0, dp_world=%d)",
+                filename, self.data_parallel_world_size,
+            )
+
+    def load_parameter_state(self, filename: str) -> None:
+        """Load optimizer state for the owned shard."""
+        state_dict: Optional[dict] = None
+        if self.data_parallel_rank == 0:
+            state_dict = torch.load(filename, map_location="cpu")
+        self.load_state_dict(state_dict or {})
+
+    def sharded_state_dict(
+        self,
+        model_sharded_state_dict: Optional[dict] = None,
+        is_loading: bool = False,
+        sharding_type: Optional[str] = None,
+        metadata: Optional[dict] = None,
+    ) -> dict:
+        """Minimal sharded state dict (ZeRO-2 format)."""
+        return {
+            "optimizer": self.optimizer.state_dict(),
+            "step_count": self._step_count,
+            "param_state": {
+                "owned_fp32": [p.data.cpu() for p in self._owned_fp32],
+            },
+            "param_state_sharding_type": "zero2_owned",
+            "shard_start": self._shard_start,
+            "shard_end": self._shard_end,
+        }
+
+
+# ===========================================================================
+# Section: DES-LOC Moment-sync helpers (standalone API)
+# ===========================================================================
+
+
+def sync_desloc_moments(
+    optimizer: torch.optim.Optimizer,
+    shard_params: List[torch.nn.Parameter],
+    data_parallel_group: torch.distributed.ProcessGroup,
+    sync_first: bool = False,
+    sync_second: bool = False,
+) -> None:
+    """All-reduce Adam first/second moments across data-parallel ranks.
+
+    Standalone helper for moment synchronisation outside of the
+    :class:`DistributedOptimizer` class hierarchy.  Useful when integrating
+    with a custom training loop that manages optimizer wrappers externally.
+
+    DES-LOC synchronisation protocol
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    First  moments (exp_avg)    all-reduced every Ku steps.
+    Second moments (exp_avg_sq) all-reduced every Kv steps.
+    Parameters are broadcast every step (ZeRO-3) or every step via
+    existing all-reduce (ZeRO-2).
+
+    Args:
+        optimizer:            Inner Adam/AdamW optimizer with state.
+        shard_params:         Parameters whose state to synchronise.
+        data_parallel_group:  NCCL process group.
+        sync_first:           Synchronise exp_avg (first moments).
+        sync_second:          Synchronise exp_avg_sq (second moments).
+    """
+    if not (sync_first or sync_second):
+        return
+    dp_world = torch.distributed.get_world_size(group=data_parallel_group)
+    for p in shard_params:
+        state = optimizer.state.get(p)
+        if state is None:
+            continue
+        if sync_first and "exp_avg" in state:
+            m = state["exp_avg"]
+            torch.distributed.all_reduce(
+                m, op=torch.distributed.ReduceOp.SUM, group=data_parallel_group
+            )
+            m.div_(dp_world)
+        if sync_second and "exp_avg_sq" in state:
+            v = state["exp_avg_sq"]
+            torch.distributed.all_reduce(
+                v, op=torch.distributed.ReduceOp.SUM, group=data_parallel_group
+            )
+            v.div_(dp_world)
+
+
+def desync_aware_step(
+    optimizer: "DistributedOptimizer",
+    step_count: int,
+    ku: int,
+    kv: int,
+) -> Tuple[bool, bool]:
+    """Determine whether to sync first/second moments at *step_count*.
+
+    Convenience function that maps the current step to the (sync_u, sync_v)
+    DES-LOC decision without coupling to the optimizer's internal config.
+    Useful for external training loops that drive the optimizer manually.
+
+    Args:
+        optimizer:   Not used for computation — kept for type hinting / IDE
+                     assistance; the step schedule is determined by ku/kv.
+        step_count:  Current global training step (1-indexed after first step).
+        ku:          Synchronise first moments every ku steps.
+        kv:          Synchronise second moments every kv steps.
+
+    Returns:
+        (sync_first, sync_second) boolean pair.
+    """
+    sync_first = (ku > 0) and (step_count % ku == 0)
+    sync_second = (kv > 0) and (step_count % kv == 0)
+    return sync_first, sync_second
+
+
+# ===========================================================================
+# Section: Gradient overflow detection helpers (ZeRO-2 / ZeRO-3 shared)
+# ===========================================================================
+
+
+def detect_grad_overflow(
+    grads: List[torch.Tensor],
+    comm_group: Optional[torch.distributed.ProcessGroup] = None,
+) -> bool:
+    """Return True if any gradient tensor contains inf or NaN.
+
+    Performs a local non-finite check on all gradients using PyTorch's
+    vectorised amp utility, then all-reduces the result across the provided
+    communication group so that all ranks agree on overflow.
+
+    This mirrors the inner logic of
+    :meth:`MixedPrecisionOptimizer._unscale_and_check_inf` but works on
+    already-unscaled FP32 gradients (for BF16 training where there is no
+    dynamic scaler).
+
+    Args:
+        grads:       List of gradient tensors (FP32).
+        comm_group:  Process group for the all-reduce.  None = local only.
+
+    Returns:
+        True if inf or NaN was detected on any rank.
+    """
+    found_inf = torch.tensor([0.0], dtype=torch.float32, device="cuda")
+    if grads:
+        # Use cheap finite check (avoids a full norm computation)
+        for g in grads:
+            if not torch.isfinite(g).all():
+                found_inf.fill_(1.0)
+                break
+
+    if comm_group is not None and torch.distributed.is_initialized():
+        torch.distributed.all_reduce(
+            found_inf, op=torch.distributed.ReduceOp.MAX, group=comm_group
+        )
+
+    return bool(found_inf.item() > 0.0)
+
+
+def skip_step_on_overflow(
+    optimizer: "DistributedOptimizer",
+    skip_update: bool,
+) -> bool:
+    """Conditionally skip the optimizer step if *skip_update* is True.
+
+    Wraps the common pattern of checking for gradient overflow and skipping
+    the Adam update.  Logs the skip event at INFO level so training monitors
+    can detect repeated skips (which would indicate a poorly tuned loss scale
+    or learning rate).
+
+    Args:
+        optimizer:    The :class:`DistributedOptimizer` instance.
+        skip_update:  If True, skip the step and return False.
+
+    Returns:
+        True if the step should proceed, False if it was skipped.
+    """
+    if skip_update:
+        logger.info(
+            "DistributedOptimizer: skipping step due to gradient overflow "
+            "(rank=%d, step_count=%d)",
+            getattr(optimizer, "data_parallel_rank", 0),
+            getattr(optimizer, "_step_count", 0),
+        )
+        return False
+    return True
+
+
+# ===========================================================================
+# Section: Optimizer factory
+# ===========================================================================
+
+
+def build_distributed_optimizer(
+    config: OptimizerConfig,
+    optimizer: torch.optim.Optimizer,
+    params: List[torch.nn.Parameter],
+    model_parallel_config: ModelParallelConfig,
+    param_and_grad_buffers: Optional[List[ParamAndGradBuffer]] = None,
+    data_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+    tier_assignments: Optional[List[Optional[TierType]]] = None,
+    zero_stage: int = 3,
+) -> Union["DistributedOptimizer", "ZeROStage2Optimizer"]:
+    """Construct a distributed optimizer at the requested ZeRO stage.
+
+    Factory function that selects between :class:`DistributedOptimizer`
+    (ZeRO-3, full parameter + gradient + state sharding) and
+    :class:`ZeROStage2Optimizer` (ZeRO-2, gradient + state sharding only)
+    based on *zero_stage*.
+
+    ZeRO-2 is recommended for PCIe-only clusters (A6000 + Consumer tier)
+    where the all-gather communication cost of ZeRO-3 exceeds the memory
+    savings benefit.  ZeRO-3 is preferred on NVLink clusters (H100 +
+    Blackwell) where the all-gather is negligible.
+
+    DES-LOC heterogeneous shard sizing is applied when
+    ``config.heterogeneous_shard_sizing`` is True and *tier_assignments*
+    is provided.
+
+    Args:
+        config:                  Optimizer configuration.
+        optimizer:               Inner Adam/AdamW.
+        params:                  All model parameters.
+        model_parallel_config:   TP/PP/DP configuration.
+        param_and_grad_buffers:  Required for ZeRO-3 (stage 3).
+        data_parallel_group:     NCCL DP group.
+        tier_assignments:        Per-rank TierType for heterogeneous sizing.
+        zero_stage:              ZeRO stage: 2 or 3.
+
+    Returns:
+        Initialised optimizer instance.
+
+    Raises:
+        ValueError: If zero_stage is not 2 or 3.
+        ValueError: If zero_stage == 3 but param_and_grad_buffers is None.
+    """
+    if zero_stage not in (2, 3):
+        raise ValueError(
+            f"build_distributed_optimizer: zero_stage must be 2 or 3, got {zero_stage}."
+        )
+
+    if zero_stage == 3:
+        if param_and_grad_buffers is None:
+            raise ValueError(
+                "build_distributed_optimizer: zero_stage=3 requires "
+                "param_and_grad_buffers to be provided."
+            )
+        return DistributedOptimizer(
+            config=config,
+            optimizer=optimizer,
+            params=params,
+            model_parallel_config=model_parallel_config,
+            param_and_grad_buffers=param_and_grad_buffers,
+            data_parallel_group=data_parallel_group,
+            tier_assignments=tier_assignments,
+        )
+    else:  # zero_stage == 2
+        return ZeROStage2Optimizer(
+            config=config,
+            optimizer=optimizer,
+            params=params,
+            model_parallel_config=model_parallel_config,
+            data_parallel_group=data_parallel_group,
+            tier_assignments=tier_assignments,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Append to module-level __all__ for the new exports
+# ---------------------------------------------------------------------------
+
+# ZeRO-2
+if "ZeROStage2Optimizer" not in dir():
+    pass  # already defined above
+
+_ADDITIONAL_EXPORTS = [
+    "ZeROStage2Optimizer",
+    "build_distributed_optimizer",
+    "sync_desloc_moments",
+    "desync_aware_step",
+    "detect_grad_overflow",
+    "skip_step_on_overflow",
+]

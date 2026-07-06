@@ -165,3 +165,79 @@ __all__ = [
     "pad_to_divisor",
     "bucket_end_divisor",
 ]
+
+# ---------------------------------------------------------------------------
+# ZeRO-2 + DES-LOC additional exports (from distrib_optimizer.py appendix)
+# ---------------------------------------------------------------------------
+from deepspeed.core.optimizer.distrib_optimizer import (
+    ZeROStage2Optimizer,
+    build_distributed_optimizer,
+    sync_desloc_moments,
+    desync_aware_step,
+    detect_grad_overflow,
+    skip_step_on_overflow,
+)
+
+# ---------------------------------------------------------------------------
+# Additional optimizer utilities (from optimizer.py appendix)
+# ---------------------------------------------------------------------------
+from deepspeed.core.optimizer.optimizer import (
+    GradNormSkipScheduler,
+    StubOptimizer,
+    OptimizerGroupBuilder,
+    get_optimizer_lr,
+    _safe_get_rank,
+    _safe_get_world_size,
+)
+
+# ---------------------------------------------------------------------------
+# Per-tier and QK clipping (from clip_grads.py)
+# ---------------------------------------------------------------------------
+from deepspeed.core.optimizer.clip_grads import (
+    get_grad_norm_fp32,
+    clip_grad_by_total_norm_fp32,
+    clip_grad_norm,
+    count_zeros_fp32,
+    clip_grad_by_tier,
+    clip_qk_grad_norm,
+    clip_grads_with_norm_by_group,
+    TierClipConfig,
+    QKClipConfig,
+    GradNormEMA,
+    TIER_H100,
+    TIER_A6000,
+    TIER_BLACKWELL,
+    TIER_CONSUMER,
+)
+
+__all__ += [
+    # ZeRO-2 + DES-LOC
+    "ZeROStage2Optimizer",
+    "build_distributed_optimizer",
+    "sync_desloc_moments",
+    "desync_aware_step",
+    "detect_grad_overflow",
+    "skip_step_on_overflow",
+    # Optimizer utilities
+    "GradNormSkipScheduler",
+    "StubOptimizer",
+    "OptimizerGroupBuilder",
+    "get_optimizer_lr",
+    "_safe_get_rank",
+    "_safe_get_world_size",
+    # Clip grads
+    "get_grad_norm_fp32",
+    "clip_grad_by_total_norm_fp32",
+    "clip_grad_norm",
+    "count_zeros_fp32",
+    "clip_grad_by_tier",
+    "clip_qk_grad_norm",
+    "clip_grads_with_norm_by_group",
+    "TierClipConfig",
+    "QKClipConfig",
+    "GradNormEMA",
+    "TIER_H100",
+    "TIER_A6000",
+    "TIER_BLACKWELL",
+    "TIER_CONSUMER",
+]

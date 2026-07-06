@@ -1675,3 +1675,402 @@ __all__ = [
     "_multi_tensor_copy_this_to_that",
     "param_group_identifier_keys",
 ]
+
+
+# ===========================================================================
+# Section: Additional Megatron-LM optimizer commits (M3998, M4022, M4171)
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# GradNormSkipScheduler (From Megatron M3998: grad_norm_skip_threshold)
+# ---------------------------------------------------------------------------
+
+class GradNormSkipScheduler:
+    """Dynamic gradient norm skip threshold scheduler.
+
+    From Megatron M3998 (PR #4667): instead of a static
+    ``grad_norm_skip_threshold``, this scheduler adapts the threshold
+    based on the EMA of observed gradient norms.  On PCIe-only clusters
+    (DES-LOC A6000 / Consumer tiers), gradient norm spikes are more
+    frequent and the static threshold causes excessive step-skips.
+
+    Algorithm:
+      - EMA of gradient norms is maintained with decay ``ema_decay``.
+      - Skip if ``grad_norm > ema * multiplier``.
+      - After a skip, the EMA is not updated (prevents spike contamination).
+
+    Args:
+        base_threshold:  Initial fixed threshold (used before EMA warms up).
+        multiplier:      Skip if norm > ema * multiplier.
+        ema_decay:       EMA decay coefficient.
+        warmup_steps:    Steps before switching from base to EMA threshold.
+
+    Examples::
+
+        scheduler = GradNormSkipScheduler(
+            base_threshold=100.0,
+            multiplier=3.0,
+            ema_decay=0.99,
+        )
+        should_skip = scheduler.should_skip(grad_norm=observed_norm)
+        if not should_skip:
+            optimizer.step()
+            scheduler.update(grad_norm=observed_norm)
+    """
+
+    def __init__(
+        self,
+        base_threshold: float = 100.0,
+        multiplier: float = 3.0,
+        ema_decay: float = 0.99,
+        warmup_steps: int = 100,
+    ) -> None:
+        self.base_threshold = base_threshold
+        self.multiplier = multiplier
+        self.ema_decay = ema_decay
+        self.warmup_steps = warmup_steps
+        self._ema: Optional[float] = None
+        self._count: int = 0
+
+    def _effective_threshold(self) -> float:
+        if self._count < self.warmup_steps or self._ema is None:
+            return self.base_threshold
+        correction = 1.0 - self.ema_decay ** self._count
+        ema_corrected = self._ema / correction
+        return ema_corrected * self.multiplier
+
+    def should_skip(self, grad_norm: Union[float, torch.Tensor]) -> bool:
+        """Return True if the step should be skipped for *grad_norm*.
+
+        Args:
+            grad_norm: Current gradient norm (float or 0-D tensor).
+
+        Returns:
+            True if grad_norm exceeds the current skip threshold.
+        """
+        if isinstance(grad_norm, torch.Tensor):
+            grad_norm = float(grad_norm.item())
+        threshold = self._effective_threshold()
+        return grad_norm > threshold
+
+    def update(self, grad_norm: Union[float, torch.Tensor]) -> None:
+        """Update EMA with *grad_norm* after a successful step.
+
+        Should NOT be called after a skipped step (to prevent spike
+        contamination of the EMA).
+
+        Args:
+            grad_norm: Gradient norm from the step that was executed.
+        """
+        if isinstance(grad_norm, torch.Tensor):
+            grad_norm = float(grad_norm.item())
+        if self._ema is None:
+            self._ema = grad_norm
+        else:
+            self._ema = self.ema_decay * self._ema + (1.0 - self.ema_decay) * grad_norm
+        self._count += 1
+
+    def state_dict(self) -> dict:
+        return {
+            "ema": self._ema,
+            "count": self._count,
+            "base_threshold": self.base_threshold,
+            "multiplier": self.multiplier,
+            "ema_decay": self.ema_decay,
+        }
+
+    def load_state_dict(self, state_dict: dict) -> None:
+        self._ema = state_dict.get("ema")
+        self._count = state_dict.get("count", 0)
+        self.base_threshold = state_dict.get("base_threshold", self.base_threshold)
+        self.multiplier = state_dict.get("multiplier", self.multiplier)
+        self.ema_decay = state_dict.get("ema_decay", self.ema_decay)
+
+
+# ---------------------------------------------------------------------------
+# safe_get_rank / safe_get_world_size (From Megatron M4022)
+# ---------------------------------------------------------------------------
+
+def _safe_get_rank(group: Optional[torch.distributed.ProcessGroup] = None) -> int:
+    """Return the current rank, or 0 if distributed is not initialized.
+
+    From Megatron M4022: safe_get_rank falls back to 0 rather than
+    crashing when called before ``torch.distributed.init_process_group``
+    or in a single-GPU training run.
+
+    Args:
+        group: Optional process group (None = global group).
+
+    Returns:
+        Current rank in the group, or 0 if not initialized.
+    """
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return 0
+    return torch.distributed.get_rank(group=group) if group is not None else torch.distributed.get_rank()
+
+
+def _safe_get_world_size(group: Optional[torch.distributed.ProcessGroup] = None) -> int:
+    """Return the world size, or 1 if distributed is not initialized.
+
+    From Megatron M4022: counterpart to ``safe_get_rank``.
+
+    Args:
+        group: Optional process group (None = global group).
+
+    Returns:
+        World size in the group, or 1 if not initialized.
+    """
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return 1
+    return torch.distributed.get_world_size(group=group) if group is not None else torch.distributed.get_world_size()
+
+
+# ---------------------------------------------------------------------------
+# Optimizer LR accessor (From Megatron M3286: fix LR logging under MP)
+# ---------------------------------------------------------------------------
+
+def get_optimizer_lr(optimizer: "MegatronOptimizer") -> Optional[float]:
+    """Return the canonical learning rate from the optimizer.
+
+    From Megatron M3286: fix LR logging under model parallelism.  Under TP
+    or PP some ranks may have empty param groups but the scheduler still
+    writes a valid ``lr`` value.  This function returns the first non-None lr
+    found in any ``default_config=True`` group, or the first group's lr as
+    fallback.
+
+    Args:
+        optimizer: Any MegatronOptimizer subclass.
+
+    Returns:
+        Current learning rate float, or None if no param groups found.
+    """
+    param_groups = getattr(optimizer, "param_groups", [])
+    if not param_groups:
+        return None
+    # Prefer default_config groups (From Megatron M3286)
+    for pg in param_groups:
+        if pg.get("default_config", False):
+            lr = pg.get("lr")
+            if lr is not None:
+                return float(lr)
+    # Fallback: any group with an lr key
+    for pg in param_groups:
+        lr = pg.get("lr")
+        if lr is not None:
+            return float(lr)
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Stub optimizer support  (From Megatron M3543: handle frozen sub-models)
+# ---------------------------------------------------------------------------
+
+class StubOptimizer(MegatronOptimizer):
+    """A no-op optimizer for frozen sub-models.
+
+    From Megatron M3543: when part of the model is frozen (e.g. the language
+    backbone in a multimodal model), a ``StubOptimizer`` is used as a
+    placeholder in the :class:`ChainedOptimizer` so that the scheduler and
+    logging infrastructure do not need special-casing.
+
+    All step/grad/state methods are no-ops.  ``is_stub_optimizer = True``
+    signals to the :class:`ChainedOptimizer` to skip this instance.
+
+    Args:
+        config: OptimizerConfig (for scheduling attributes).
+
+    Examples::
+
+        # Freeze a vision encoder sub-model
+        stub = StubOptimizer(config)
+        chained = ChainedOptimizer([main_optimizer, stub])
+    """
+
+    is_stub_optimizer: bool = True
+
+    def __init__(self, config: OptimizerConfig) -> None:
+        # Do NOT call super().__init__: there is no inner optimizer.
+        self.config = config
+        self.optimizer = None
+        self._scale_one = torch.tensor([1.0], dtype=torch.float32)
+
+    def get_parameters(self) -> list:
+        return []
+
+    def prepare_grads(self) -> bool:
+        return False
+
+    def step_with_ready_grads(self) -> bool:
+        return True
+
+    def step(self):
+        return True, None, None
+
+    def zero_grad(self, set_to_none: bool = True) -> None:
+        pass
+
+    def get_loss_scale(self) -> torch.Tensor:
+        return self._scale_one
+
+    def scale_loss(self, loss: torch.Tensor) -> torch.Tensor:
+        return loss
+
+    def reload_model_params(self, state_dict=None) -> None:
+        pass
+
+    def state_dict(self) -> dict:
+        return {}
+
+    def load_state_dict(self, state_dict: dict) -> None:
+        pass
+
+    def clip_grad_norm(self, clip_grad: float) -> float:
+        return 0.0
+
+    def count_zeros(self) -> float:
+        return 0.0
+
+    def get_grad_norm(self) -> float:
+        return 0.0
+
+    def offload_to_cpu(self) -> None:
+        pass
+
+    def restore_from_cpu(self) -> None:
+        pass
+
+    def sharded_state_dict(
+        self,
+        model_sharded_state_dict=None,
+        is_loading: bool = False,
+        metadata: Optional[dict] = None,
+    ) -> dict:
+        return {}
+
+    @property
+    def param_groups(self) -> list:
+        return []
+
+    @property
+    def state(self) -> dict:
+        return {}
+
+
+# ---------------------------------------------------------------------------
+# OptimizerGroupBuilder (From Megatron M2654 / M2933)
+# ---------------------------------------------------------------------------
+
+class OptimizerGroupBuilder:
+    """Build optimizer param groups with per-param overrides.
+
+    From Megatron M2654 / M2933: enables different lr/wd/schedule for
+    different parameter subsets (embeddings, biases, expert-parallel params)
+    without maintaining multiple optimizer instances.
+
+    Usage::
+
+        builder = OptimizerGroupBuilder(
+            config=optimizer_config,
+            overrides={
+                ParamKey(name="embedding"): {"lr_mult": 0.1},
+                ParamKey(attr="no_weight_decay"): {"wd_mult": 0.0},
+            }
+        )
+        param_groups = builder.build(named_params=model.named_parameters())
+        optimizer = torch.optim.AdamW(param_groups, lr=config.lr)
+    """
+
+    def __init__(
+        self,
+        config: "OptimizerConfig",
+        overrides: Optional[Dict] = None,
+    ) -> None:
+        self.config = config
+        self.overrides = overrides or {}
+
+    def build(
+        self,
+        named_params: List[Tuple[str, torch.nn.Parameter]],
+    ) -> List[Dict]:
+        """Group parameters by matching override keys.
+
+        Parameters that match no override go into the default group.
+        Parameters that match one or more overrides go into a dedicated group
+        with the merged override applied.
+
+        Args:
+            named_params: List of (name, param) pairs from model.named_parameters().
+
+        Returns:
+            List of param-group dicts suitable for passing to a PyTorch optimizer.
+        """
+        from deepspeed.core.optimizer.optimizer_config import (
+            ParamKey,
+            combine_param_group_overrides,
+            param_group_override_to_tuple,
+        )
+
+        default_group: List[torch.nn.Parameter] = []
+        override_buckets: Dict[tuple, List[torch.nn.Parameter]] = {}
+        override_meta: Dict[tuple, dict] = {}
+
+        for name, param in named_params:
+            if not param.requires_grad:
+                continue
+            matched: List[dict] = []
+            for key, ov in self.overrides.items():
+                if isinstance(key, ParamKey) and key.matches(param, name):
+                    matched.append(ov)
+
+            if not matched:
+                default_group.append(param)
+            else:
+                merged = combine_param_group_overrides(matched)
+                bucket_key = param_group_override_to_tuple(merged)
+                override_buckets.setdefault(bucket_key, []).append(param)
+                override_meta[bucket_key] = merged
+
+        base_lr = self.config.lr or 1e-4
+        base_wd = self.config.weight_decay
+
+        groups: List[Dict] = []
+
+        if default_group:
+            groups.append({
+                "params": default_group,
+                "lr": base_lr,
+                "weight_decay": base_wd,
+                "default_config": True,
+                "wd_mult": 1.0,
+                "lr_mult": 1.0,
+            })
+
+        for bucket_key, params in override_buckets.items():
+            meta = override_meta[bucket_key]
+            lr_mult = meta.get("lr_mult", 1.0)
+            wd_mult = meta.get("wd_mult", 1.0)
+            groups.append({
+                "params": params,
+                "lr": base_lr * lr_mult,
+                "weight_decay": base_wd * wd_mult,
+                "default_config": False,
+                "wd_mult": wd_mult,
+                "lr_mult": lr_mult,
+                **{k: v for k, v in meta.items() if k not in ("lr_mult", "wd_mult")},
+            })
+
+        return groups
+
+
+# ---------------------------------------------------------------------------
+# Append additional exports
+# ---------------------------------------------------------------------------
+
+__all__ += [  # type: ignore[name-defined]
+    "GradNormSkipScheduler",
+    "_safe_get_rank",
+    "_safe_get_world_size",
+    "get_optimizer_lr",
+    "StubOptimizer",
+    "OptimizerGroupBuilder",
+]
