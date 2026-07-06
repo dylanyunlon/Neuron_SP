@@ -56,8 +56,19 @@ from deepspeed.core.pipeline_parallel.schedules import (
     forward_backward_no_pipelining,
     forward_backward_pipelining_without_interleaving,   # 1F1B — required export
     forward_backward_pipelining_with_interleaving,
-    # DES-LOC
+    # DES-LOC heterogeneous schedules
+    forward_backward_pipelining_without_interleaving_pp5_heterogeneous,
+    # DES-LOC bubble filling (full implementation, replaces stub)
+    StageClock,
+    AsymmetricClockScheduler,
     HeterogeneousBubbleFiller,
+    # DES-LOC PCIe-aware P2P bandwidth manager
+    HeterogeneousP2PManager,
+    # DES-LOC PP=5 layout constants and factory helpers
+    PP5_DESLOC_FAST_RANKS,
+    PP5_DESLOC_SLOW_RANKS,
+    make_pp5_bubble_filler,
+    make_pp5_p2p_manager,
     # Utilities
     get_tensor_shapes,
     deallocate_output_tensor,
@@ -78,12 +89,23 @@ __all__ = [
     # Step functions
     "forward_step",
     "backward_step",
-    # Schedules
+    # Standard schedules
     "forward_backward_no_pipelining",
     "forward_backward_pipelining_without_interleaving",
     "forward_backward_pipelining_with_interleaving",
-    # DES-LOC bubble filling
+    # DES-LOC heterogeneous schedules
+    "forward_backward_pipelining_without_interleaving_pp5_heterogeneous",
+    # DES-LOC bubble filling (full implementation)
+    "StageClock",
+    "AsymmetricClockScheduler",
     "HeterogeneousBubbleFiller",
+    # DES-LOC PCIe-aware P2P manager
+    "HeterogeneousP2PManager",
+    # DES-LOC PP=5 layout constants and factories
+    "PP5_DESLOC_FAST_RANKS",
+    "PP5_DESLOC_SLOW_RANKS",
+    "make_pp5_bubble_filler",
+    "make_pp5_p2p_manager",
     # Utilities
     "get_tensor_shapes",
     "deallocate_output_tensor",

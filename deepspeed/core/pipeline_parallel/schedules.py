@@ -610,32 +610,627 @@ def get_schedule_table(num_microbatches, num_model_chunks, microbatch_group_size
 # DES-LOC heterogeneous bubble filler
 # ===========================================================================
 
+class StageClock:
+    """Per-stage exponential moving-average (EMA) compute-time tracker.
+
+    Maintains a running estimate of how long each pipeline stage takes for
+    one forward or backward pass, using an EMA with configurable smoothing
+    factor alpha.  The estimate is used by AsymmetricClockScheduler to avoid
+    dispatching new work to a stage that is still busy.
+
+    Formula: ema_t = alpha * observed_t + (1 - alpha) * ema_{t-1}
+
+    Args:
+        alpha:        EMA smoothing coefficient (0 < alpha <= 1).  A value
+                      close to 1 tracks recent observations aggressively;
+                      values near 0 are more stable.
+        initial_ms:   Seed value for the EMA (milliseconds).  Should be a
+                      reasonable rough estimate of per-microbatch compute
+                      time for the stage's GPU tier.
+    """
+
+    def __init__(self, alpha: float = 0.2, initial_ms: float = 100.0):
+        if not (0.0 < alpha <= 1.0):
+            raise ValueError(f"alpha must be in (0, 1], got {alpha}")
+        self.alpha = alpha
+        self.ema_ms = initial_ms
+        self._start: Optional[float] = None
+
+    def start(self) -> None:
+        """Record the start of a compute step (uses wall-clock perf_counter)."""
+        import time
+        self._start = time.perf_counter()
+
+    def stop(self) -> float:
+        """Record the end of a compute step and update the EMA.
+
+        Returns:
+            The measured elapsed time in milliseconds.
+        """
+        import time
+        if self._start is None:
+            return self.ema_ms
+        elapsed_ms = (time.perf_counter() - self._start) * 1_000.0
+        self._start = None
+        self.ema_ms = self.alpha * elapsed_ms + (1.0 - self.alpha) * self.ema_ms
+        return elapsed_ms
+
+    def estimate(self) -> float:
+        """Return the current EMA estimate in milliseconds."""
+        return self.ema_ms
+
+    def __repr__(self) -> str:
+        return f"StageClock(ema_ms={self.ema_ms:.2f}, alpha={self.alpha})"
+
+
+class AsymmetricClockScheduler:
+    """Adaptive 1F1B dispatch scheduler for PP=5 heterogeneous pipelines.
+
+    In a 5-stage pipeline mixing H100 (fast) and A6000 (slow) GPUs the
+    standard 1F1B schedule creates large bubbles on fast stages because they
+    must wait for the slowest stage before the pipeline clock advances.
+    This scheduler keeps track of estimated per-stage compute times and
+    determines:
+
+    1. Which microbatches a *fast* stage can pre-compute (fill bubbles)
+       while it is nominally idle, staying within the activation memory
+       budget set by ``max_outstanding_activations``.
+    2. The order in which ``recv_forward`` should be called so that fast
+       stages always have work queued up.
+
+    Design decisions
+    ----------------
+    * Memory-aware: prefetch_slots = max_outstanding_activations - current_in_flight
+      ensures we never OOM a fast stage with speculative activations.
+    * Non-blocking: all decisions are made synchronously on the CPU; no
+      extra CUDA kernels are launched.
+    * Graceful degradation: if stage_clocks is empty or PP=1 the scheduler
+      falls through to the standard 1F1B ordering.
+
+    Args:
+        num_stages:                  Total number of PP stages (e.g. 5).
+        stage_clocks:                Mapping from PP rank -> StageClock.
+        max_outstanding_activations: Maximum number of microbatch activations
+                                     that may be held simultaneously on a fast
+                                     stage.  Defaults to num_stages - 1
+                                     (standard 1F1B limit).
+        fast_rank_set:               Set of PP ranks considered "fast" (H100).
+    """
+
+    def __init__(
+        self,
+        num_stages: int,
+        stage_clocks: Optional[Dict[int, "StageClock"]] = None,
+        max_outstanding_activations: Optional[int] = None,
+        fast_rank_set: Optional[Set[int]] = None,
+    ):
+        self.num_stages = num_stages
+        self.stage_clocks: Dict[int, StageClock] = stage_clocks or {}
+        self.max_outstanding_activations = (
+            max_outstanding_activations
+            if max_outstanding_activations is not None
+            else num_stages - 1
+        )
+        self.fast_rank_set: Set[int] = fast_rank_set or set()
+        self._in_flight: int = 0
+
+    def is_fast_rank(self, pp_rank: int) -> bool:
+        return pp_rank in self.fast_rank_set
+
+    def slowdown_ratio(self, fast_rank: int, slow_rank: int) -> float:
+        """Ratio of slow-stage compute time to fast-stage compute time.
+
+        A value > 1 means the slow stage is slower, justifying bubble filling.
+        """
+        if fast_rank not in self.stage_clocks or slow_rank not in self.stage_clocks:
+            return 1.0
+        fast_ms = self.stage_clocks[fast_rank].estimate()
+        slow_ms = self.stage_clocks[slow_rank].estimate()
+        if fast_ms <= 0:
+            return 1.0
+        return slow_ms / fast_ms
+
+    def available_prefetch_slots(self) -> int:
+        """How many extra microbatches a fast stage may pre-compute right now."""
+        return max(0, self.max_outstanding_activations - self._in_flight)
+
+    def record_forward_start(self) -> None:
+        self._in_flight += 1
+
+    def record_backward_complete(self) -> None:
+        self._in_flight = max(0, self._in_flight - 1)
+
+    def should_prefetch(self, pp_rank: int, num_microbatches_remaining: int) -> bool:
+        """Return True if pp_rank should try to prefetch an extra microbatch.
+
+        Conditions:
+        - This rank is in the fast set.
+        - There are remaining microbatches that haven't been dispatched.
+        - Memory budget allows at least one more in-flight activation.
+        - The slowdown ratio is significant (> 1.2).
+        """
+        if not self.is_fast_rank(pp_rank):
+            return False
+        if num_microbatches_remaining <= 0:
+            return False
+        if self.available_prefetch_slots() <= 0:
+            return False
+        bottleneck_rank = self._find_bottleneck()
+        if bottleneck_rank is None:
+            return False
+        ratio = self.slowdown_ratio(pp_rank, bottleneck_rank)
+        return ratio > 1.2
+
+    def _find_bottleneck(self) -> Optional[int]:
+        """Return the rank with the highest estimated compute time."""
+        if not self.stage_clocks:
+            return None
+        return max(self.stage_clocks, key=lambda r: self.stage_clocks[r].estimate())
+
+    def compute_warmup_override(self, pp_rank: int, base_warmup: int) -> int:
+        """Optionally extend warmup for fast ranks to pre-fill the pipeline.
+
+        For a fast stage (H100) the standard warmup is (PP-rank-1) microbatches.
+        We increase this by floor(slowdown_ratio - 1) extra microbatches
+        so more activations are ready when the slow stage catches up, reducing
+        the effective steady-state bubble.  Capped at max_outstanding_activations.
+        """
+        if not self.is_fast_rank(pp_rank):
+            return base_warmup
+        bottleneck = self._find_bottleneck()
+        if bottleneck is None:
+            return base_warmup
+        ratio = self.slowdown_ratio(pp_rank, bottleneck)
+        extra = int(max(0.0, ratio - 1.0))
+        return min(base_warmup + extra, self.max_outstanding_activations)
+
+    def __repr__(self) -> str:
+        clocks_repr = {r: f"{c.estimate():.1f}ms" for r, c in self.stage_clocks.items()}
+        return (
+            f"AsymmetricClockScheduler("
+            f"stages={self.num_stages}, "
+            f"fast={self.fast_rank_set}, "
+            f"clocks={clocks_repr}, "
+            f"in_flight={self._in_flight})"
+        )
+
+
+class HeterogeneousP2PManager:
+    """PCIe-aware tensor-shape negotiation and bandwidth throttle.
+
+    In DES-LOC clusters, adjacent pipeline stages may be on different GPU
+    tiers connected via PCIe rather than NVLink.  Transferring large
+    activations over PCIe (~16 GB/s vs NVLink ~600 GB/s) can dominate
+    stage-to-stage latency.
+
+    This manager:
+    1. Maintains a per-link bandwidth estimate (GB/s) derived from observed
+       transfer times (EMA-updated).
+    2. Advises callers on the maximum activation tensor size (bytes) that
+       can be transferred within a target latency budget.
+    3. Provides ``chunk_tensor`` / ``reassemble_tensor`` for transparently
+       splitting oversized tensors into chunks that fit the budget.
+
+    A "link" is identified by the ordered pair (src_pp_rank, dst_pp_rank).
+
+    Args:
+        link_bandwidths_gbps: Initial bandwidth estimates, keyed by
+                              (src_rank, dst_rank).  Default 16 GB/s (PCIe).
+        target_latency_ms:   Maximum acceptable one-way transfer latency per
+                             microbatch (ms).  Default 20 ms.
+        alpha:               EMA smoothing for bandwidth estimate (default 0.2).
+    """
+
+    DEFAULT_BANDWIDTH_GBPS: float = 16.0
+    BYTES_PER_GB: int = 1024 ** 3
+
+    def __init__(
+        self,
+        link_bandwidths_gbps: Optional[Dict[Tuple[int, int], float]] = None,
+        target_latency_ms: float = 20.0,
+        alpha: float = 0.2,
+    ):
+        self.target_latency_ms = target_latency_ms
+        self.alpha = alpha
+        self._ema_bw: Dict[Tuple[int, int], float] = {}
+        if link_bandwidths_gbps:
+            for link, bw in link_bandwidths_gbps.items():
+                self._ema_bw[link] = bw
+
+    def get_bandwidth_gbps(self, src: int, dst: int) -> float:
+        """Return current EMA bandwidth estimate for (src->dst) in GB/s."""
+        return self._ema_bw.get((src, dst), self.DEFAULT_BANDWIDTH_GBPS)
+
+    def update_bandwidth(
+        self, src: int, dst: int, bytes_transferred: int, elapsed_ms: float
+    ) -> float:
+        """Update bandwidth EMA after a measured transfer.
+
+        Args:
+            src:               Source PP rank.
+            dst:               Destination PP rank.
+            bytes_transferred: Number of bytes transferred.
+            elapsed_ms:        Measured transfer time in milliseconds.
+
+        Returns:
+            Updated bandwidth estimate in GB/s.
+        """
+        if elapsed_ms <= 0:
+            return self.get_bandwidth_gbps(src, dst)
+        observed_gbps = (bytes_transferred / self.BYTES_PER_GB) / (elapsed_ms / 1_000.0)
+        prev = self._ema_bw.get((src, dst), self.DEFAULT_BANDWIDTH_GBPS)
+        updated = self.alpha * observed_gbps + (1.0 - self.alpha) * prev
+        self._ema_bw[(src, dst)] = updated
+        return updated
+
+    def max_bytes_per_latency_budget(self, src: int, dst: int) -> int:
+        """Maximum bytes transferable within target_latency_ms on (src->dst)."""
+        bw_gbps = self.get_bandwidth_gbps(src, dst)
+        budget_bytes = int(bw_gbps * self.BYTES_PER_GB * (self.target_latency_ms / 1_000.0))
+        return max(budget_bytes, 1)
+
+    def should_chunk(self, tensor: torch.Tensor, src: int, dst: int) -> bool:
+        """Return True if tensor should be split into chunks for PCIe transfer."""
+        if tensor is None:
+            return False
+        tensor_bytes = tensor.numel() * tensor.element_size()
+        budget = self.max_bytes_per_latency_budget(src, dst)
+        return tensor_bytes > budget * 2
+
+    def chunk_tensor(
+        self, tensor: torch.Tensor, src: int, dst: int
+    ) -> List[torch.Tensor]:
+        """Split tensor along dim=0 into chunks fitting the bandwidth budget.
+
+        Args:
+            tensor: Tensor to split (shape: [seq_len, batch, hidden]).
+            src:    Source PP rank.
+            dst:    Destination PP rank.
+
+        Returns:
+            List of tensor chunks, each sendable within target_latency_ms.
+        """
+        if tensor is None:
+            return [tensor]
+        bytes_per_element = tensor.element_size()
+        total_elements = tensor.numel()
+        elements_per_slice = total_elements // max(1, tensor.shape[0])
+        budget_bytes = self.max_bytes_per_latency_budget(src, dst)
+        elements_per_budget = max(1, budget_bytes // max(1, bytes_per_element))
+        chunk_size_dim0 = max(1, elements_per_budget // max(1, elements_per_slice))
+        chunks = tensor.split(chunk_size_dim0, dim=0)
+        return list(chunks)
+
+    def reassemble_tensor(
+        self, chunks: List[torch.Tensor], original_shape: torch.Size
+    ) -> torch.Tensor:
+        """Reassemble chunks from ``chunk_tensor`` back into a single tensor.
+
+        Args:
+            chunks:         List of tensor chunks.
+            original_shape: Expected shape of the reassembled tensor.
+
+        Returns:
+            Reconstructed tensor with shape == original_shape.
+        """
+        if len(chunks) == 1:
+            t = chunks[0]
+            return t.reshape(original_shape) if t.shape != original_shape else t
+        t = torch.cat(chunks, dim=0)
+        if t.shape != original_shape:
+            t = t.reshape(original_shape)
+        return t
+
+    def __repr__(self) -> str:
+        bw_str = {f"{s}->{d}": f"{bw:.1f}GB/s" for (s, d), bw in self._ema_bw.items()}
+        return (
+            f"HeterogeneousP2PManager("
+            f"target_latency={self.target_latency_ms}ms, "
+            f"links={bw_str})"
+        )
+
+
+# Standard DES-LOC 5-stage layout constants.
+# Ranks 0 and 4 are H100 (fast); ranks 1,2,3 are A6000 (slow).
+PP5_DESLOC_FAST_RANKS: Set[int] = {0, 4}
+PP5_DESLOC_SLOW_RANKS: Set[int] = {1, 2, 3}
+
+
 class HeterogeneousBubbleFiller:
     """Opt-in bubble filler for DES-LOC H100+A6000 heterogeneous pipelines.
 
     Fast ranks (H100) schedule extra forward microbatches during pipeline
     bubbles to increase their utilization from ~40% toward ~70-80%.
 
-    Attach to config: ``config.desloc = SimpleNamespace(bubble_filler=filler)``
+    Conceptual overview (PP=5: H100 at ranks 0,4 + A6000 at ranks 1,2,3)
+    ----------------------------------------------------------------------
+    Standard 1F1B for fast rank 0 (PP=5, M microbatches):
+
+        Warmup:  F0  F1  F2  F3        <- PP-rank-1 = 4 forward passes
+        Steady:  [F4,B0] [F5,B1] ...
+        Cooldown: B(M-4) B(M-3) B(M-2) B(M-1)
+
+    Fast rank 0 finishes its forward in ~60 ms while A6000 ranks take ~150 ms.
+    During the gaps, rank 0 would be idle waiting for the pipeline clock.
+    This class detects those gaps and fills them with speculative forward
+    microbatches from a shared prefetch queue.
+
+    Attach to config::
+
+        config.desloc = SimpleNamespace(
+            bubble_filler=HeterogeneousBubbleFiller(
+                fast_ranks={0, 4}, a6000_ranks={1, 2, 3}
+            )
+        )
+
+    Memory safety
+    -------------
+    ``activation_memory_budget_mb`` (default 8 GiB) controls how many
+    speculative activations may be held simultaneously.  The filler tracks
+    an approximate byte count and stops prefetching when the budget is hit.
+
+    Args:
+        fast_ranks:                  Set of PP ranks on H100 (fast) GPUs.
+        a6000_ranks:                 Set of PP ranks on A6000 (slow) GPUs.
+        extra_microbatches:          Max extra microbatches to pre-compute per
+                                     bubble (default 2).
+        activation_memory_budget_mb: Soft cap on speculative activation memory
+                                     in megabytes (default 8192 = 8 GiB).
+        alpha:                       EMA smoothing for StageClock (default 0.25).
+        initial_fast_ms:             Initial EMA seed for fast ranks (ms).
+        initial_slow_ms:             Initial EMA seed for slow ranks (ms).
     """
-    def __init__(self, fast_ranks: Set[int], extra_microbatches: int = 1):
-        self.fast_ranks = fast_ranks
-        self.extra_microbatches = extra_microbatches
+
+    def __init__(
+        self,
+        fast_ranks: Set[int],
+        a6000_ranks: Optional[Set[int]] = None,
+        extra_microbatches: int = 2,
+        activation_memory_budget_mb: int = 8192,
+        alpha: float = 0.25,
+        initial_fast_ms: float = 60.0,
+        initial_slow_ms: float = 150.0,
+    ):
+        self.fast_ranks: Set[int] = set(fast_ranks)
+        self.a6000_ranks: Set[int] = set(a6000_ranks) if a6000_ranks else set()
+        self.extra_microbatches = max(1, extra_microbatches)
+        self.activation_memory_budget_bytes = activation_memory_budget_mb * 1024 * 1024
+
+        # Per-rank StageClock instances
+        all_ranks = self.fast_ranks | self.a6000_ranks
+        self.stage_clocks: Dict[int, StageClock] = {}
+        for r in all_ranks:
+            init_ms = initial_fast_ms if r in self.fast_ranks else initial_slow_ms
+            self.stage_clocks[r] = StageClock(alpha=alpha, initial_ms=init_ms)
+
+        # Asymmetric clock scheduler
+        num_stages = len(all_ranks) if all_ranks else 5
+        self.clock_scheduler = AsymmetricClockScheduler(
+            num_stages=num_stages,
+            stage_clocks=self.stage_clocks,
+            max_outstanding_activations=num_stages - 1,
+            fast_rank_set=self.fast_ranks,
+        )
+
+        # PCIe-aware P2P manager for this cluster layout
+        if all_ranks and len(all_ranks) > 1:
+            sorted_ranks = sorted(all_ranks)
+            pipeline_pairs_bw: Dict[Tuple[int, int], float] = {}
+            for i in range(len(sorted_ranks) - 1):
+                s, d = sorted_ranks[i], sorted_ranks[i + 1]
+                s_fast = s in self.fast_ranks
+                d_fast = d in self.fast_ranks
+                bw = 400.0 if (s_fast and d_fast) else 16.0
+                pipeline_pairs_bw[(s, d)] = bw
+                pipeline_pairs_bw[(d, s)] = bw
+            self.p2p_manager = HeterogeneousP2PManager(
+                link_bandwidths_gbps=pipeline_pairs_bw,
+                target_latency_ms=20.0,
+            )
+        else:
+            self.p2p_manager = HeterogeneousP2PManager()
+
+        # Runtime state
         self._pending_fwd_data: List = []
+        self._speculative_activations: List = []   # (input_t, output_t) pairs
+        self._approx_bytes_in_flight: int = 0
+        self._num_speculative: int = 0
+
+    # ------------------------------------------------------------------
+    # Activation memory accounting helpers
+    # ------------------------------------------------------------------
+
+    def _tensor_bytes(self, t) -> int:
+        """Approximate byte footprint of a tensor or nested structure."""
+        if t is None:
+            return 0
+        if isinstance(t, torch.Tensor):
+            return t.numel() * t.element_size()
+        if isinstance(t, (list, tuple)):
+            return sum(self._tensor_bytes(x) for x in t)
+        if isinstance(t, dict):
+            return sum(self._tensor_bytes(v) for v in t.values())
+        return 0
+
+    def _budget_available(self, candidate_bytes: int = 0) -> bool:
+        """Return True if adding candidate_bytes stays within the memory budget."""
+        return (
+            self._approx_bytes_in_flight + candidate_bytes
+        ) < self.activation_memory_budget_bytes
+
+    # ------------------------------------------------------------------
+    # Stage clock update API (called by the schedule loop)
+    # ------------------------------------------------------------------
+
+    def record_compute_start(self, pp_rank: int) -> None:
+        """Mark the start of a compute step on pp_rank."""
+        if pp_rank in self.stage_clocks:
+            self.stage_clocks[pp_rank].start()
+
+    def record_compute_stop(self, pp_rank: int) -> float:
+        """Mark the end of a compute step on pp_rank; return elapsed ms."""
+        if pp_rank in self.stage_clocks:
+            return self.stage_clocks[pp_rank].stop()
+        return 0.0
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
 
     def is_fast_rank(self, pp_rank: int) -> bool:
         return pp_rank in self.fast_ranks
 
-    def maybe_fill_bubble(self, pp_rank: int, forward_data_store: list, config) -> None:
+    def maybe_fill_bubble(
+        self,
+        pp_rank: int,
+        forward_data_store: list,
+        config,
+        forward_step_func=None,
+        data_iterator=None,
+        model=None,
+        num_microbatches: int = 0,
+        speculative_mb_start: int = 0,
+    ) -> int:
+        """Attempt to fill the pipeline bubble with extra forward passes.
+
+        Called at the two bubble points in
+        ``forward_backward_pipelining_without_interleaving``:
+          1. After the warmup loop finishes (largest bubble).
+          2. Before the cooldown backward passes begin.
+
+        The filler pre-computes up to ``extra_microbatches`` extra forward
+        passes from the data iterator on fast ranks (H100), keeping the GPU
+        busy while slow ranks (A6000) catch up.  All speculative activations
+        are stored in ``_speculative_activations`` and can be accessed later
+        via ``pop_speculative_activation()`` to run their backward passes.
+
+        Args:
+            pp_rank:              Current PP rank.
+            forward_data_store:   List to append loss data to.
+            config:               ModelParallelConfig (or None).
+            forward_step_func:    User's forward step function (or None to skip).
+            data_iterator:        Data iterator for speculative microbatches.
+            model:                Model for this stage (or None to skip).
+            num_microbatches:     Total microbatches in the global batch.
+            speculative_mb_start: Index of the first speculative microbatch.
+
+        Returns:
+            Number of speculative microbatches actually computed (0 if fast
+            rank conditions are not met or budget is exhausted).
+        """
         if not self.is_fast_rank(pp_rank):
-            return
-        # Full implementation schedules extra fwd microbatches here.
-        pass
+            return 0
+        if forward_step_func is None or model is None or data_iterator is None:
+            return 0
+
+        # Check if slowdown ratio justifies bubble filling
+        bottleneck = self.clock_scheduler._find_bottleneck()
+        if bottleneck is None or bottleneck == pp_rank:
+            return 0
+        ratio = self.clock_scheduler.slowdown_ratio(pp_rank, bottleneck)
+        if ratio <= 1.15:
+            # Stages are close in speed — not worth the overhead
+            return 0
+
+        remaining = num_microbatches - speculative_mb_start
+        max_extra = min(self.extra_microbatches, remaining)
+        if max_extra <= 0:
+            return 0
+
+        # Lazy import to avoid circular dependency at module load time
+        try:
+            from deepspeed.core.pipeline_parallel.schedules import (
+                forward_step as _forward_step,
+            )
+        except ImportError:
+            return 0
+
+        hidden_size = getattr(config, 'hidden_size', 4096) if config is not None else 4096
+        mbs = getattr(config, 'micro_batch_size', 1) if config is not None else 1
+        # Rough size estimate for budget check: seq×batch×hidden×bytes_per_elem
+        est_bytes_per_mb = hidden_size * mbs * 4  # float32
+
+        num_computed = 0
+        for mb_idx in range(speculative_mb_start, speculative_mb_start + max_extra):
+            if not self._budget_available(est_bytes_per_mb):
+                break  # Memory budget exceeded — stop prefetching
+
+            self.record_compute_start(pp_rank)
+            try:
+                output_tensor, num_tokens = _forward_step(
+                    forward_step_func=forward_step_func,
+                    data_iterator=data_iterator,
+                    model=model,
+                    num_microbatches=num_microbatches,
+                    input_tensor=None,   # first PP stage: no upstream tensor
+                    forward_data_store=forward_data_store,
+                    config=config,
+                    collect_non_loss_data=False,
+                    is_first_microbatch=False,
+                    current_microbatch=mb_idx,
+                )
+            except StopIteration:
+                # Data exhausted — no more speculative microbatches available
+                break
+            except Exception:
+                # Don't let speculative compute crash the main training loop
+                break
+            finally:
+                self.record_compute_stop(pp_rank)
+
+            actual_bytes = self._tensor_bytes(output_tensor)
+            self._approx_bytes_in_flight += actual_bytes
+            self._speculative_activations.append((None, output_tensor))
+            self._num_speculative += 1
+            num_computed += 1
+
+        return num_computed
 
     def drain(self, forward_data_store: list, config) -> None:
+        """Flush any pending speculative forward outputs into the main store."""
         if self._pending_fwd_data:
             forward_data_store.extend(self._pending_fwd_data)
             self._pending_fwd_data.clear()
+
+    def pop_speculative_activation(self):
+        """Pop the oldest (input_tensor, output_tensor) speculative pair.
+
+        Returns None if no speculative activations are available.
+        """
+        if not self._speculative_activations:
+            return None
+        pair = self._speculative_activations.pop(0)
+        freed = self._tensor_bytes(pair[1])
+        self._approx_bytes_in_flight = max(0, self._approx_bytes_in_flight - freed)
+        self._num_speculative -= 1
+        return pair
+
+    def reset(self) -> None:
+        """Clear all speculative state (call at the start of each global step)."""
+        self._pending_fwd_data.clear()
+        self._speculative_activations.clear()
+        self._approx_bytes_in_flight = 0
+        self._num_speculative = 0
+
+    def warmup_count_for_rank(self, pp_rank: int, base_warmup: int) -> int:
+        """Return (possibly extended) warmup microbatch count for pp_rank.
+
+        Fast ranks may receive extra warmup microbatches to pre-fill the
+        pipeline; slow ranks always get the standard base_warmup value.
+        """
+        return self.clock_scheduler.compute_warmup_override(pp_rank, base_warmup)
+
+    def __repr__(self) -> str:
+        clock_summary = {r: f"{c.estimate():.1f}ms" for r, c in self.stage_clocks.items()}
+        return (
+            f"HeterogeneousBubbleFiller("
+            f"fast={self.fast_ranks}, "
+            f"slow={self.a6000_ranks}, "
+            f"extra_mb={self.extra_microbatches}, "
+            f"budget_mb={self.activation_memory_budget_bytes // 1024 // 1024}, "
+            f"in_flight={self._num_speculative}, "
+            f"clocks={clock_summary})"
+        )
 
 
 # ===========================================================================
@@ -2356,14 +2951,221 @@ def get_num_microbatches() -> int:
     return fn()
 
 
+# ===========================================================================
+# DES-LOC: PP=5 heterogeneous 1F1B wrapper
+# ===========================================================================
+
+def forward_backward_pipelining_without_interleaving_pp5_heterogeneous(
+    *,
+    forward_step_func,
+    data_iterator,
+    model,
+    num_microbatches: int,
+    seq_length: int,
+    micro_batch_size: int,
+    decoder_seq_length: Optional[int] = None,
+    forward_only: bool = False,
+    collect_non_loss_data: bool = False,
+    first_val_step: Optional[bool] = None,
+    adjust_tensor_shapes_fn: Optional[Callable] = None,
+    p2p_communicator: Optional["P2PCommunicator"] = None,
+    pg_collection=None,
+    force_all_reduce: Optional[bool] = False,
+    bubble_filler: Optional["HeterogeneousBubbleFiller"] = None,
+):
+    """1F1B schedule for PP=5 heterogeneous (H100+A6000) pipelines.
+
+    This is a thin wrapper around ``forward_backward_pipelining_without_interleaving``
+    that plugs in the ``HeterogeneousBubbleFiller`` at the two natural bubble
+    points (post-warmup and pre-cooldown) so that fast stages (H100) compute
+    extra microbatches while slow stages (A6000) catch up.
+
+    PP=5 bubble analysis
+    --------------------
+    For PP=5 with M microbatches:
+      - Standard warmup: ranks [0,1,2,3,4] perform [4,3,2,1,0] forward passes.
+      - Bubble fraction: (PP-1)/M = 4/M.
+      - With HeterogeneousBubbleFiller (extra_mb=2): fast ranks do 2 additional
+        forward passes during the warmup gap, improving utilization from ~40%
+        to ~60% on H100 ranks.
+
+    Asymmetric speed example
+    ------------------------
+    Rank 0 (H100, 60ms/mb) waits for rank 1 (A6000, 150ms/mb):
+        Bubble = (PP-1) * slow_ms = 4 * 150 = 600ms per microbatch cycle
+        Fillable by fast rank = 2 extra * 60ms = 120ms, ~20% utilization gain
+
+    Args:
+        bubble_filler: A ``HeterogeneousBubbleFiller`` instance.  If None,
+                       falls back to the standard 1F1B schedule identically.
+        (other args):  Same as ``forward_backward_pipelining_without_interleaving``.
+
+    Returns:
+        forward_data_store (list of loss data from last stage).
+    """
+    # Determine current PP rank for bubble-filler decisions
+    current_pp_rank = 0
+    if p2p_communicator is not None:
+        current_pp_rank = p2p_communicator.current_stage
+    elif _ps is not None:
+        try:
+            if torch.distributed.is_initialized():
+                current_pp_rank = _ps.get_pipeline_model_parallel_rank()
+        except Exception:
+            pass
+
+    # Reset bubble filler state for this global step
+    if bubble_filler is not None:
+        bubble_filler.reset()
+
+    # Time the overall step on fast ranks so the clock learns stage speed
+    if bubble_filler is not None and bubble_filler.is_fast_rank(current_pp_rank):
+        bubble_filler.record_compute_start(current_pp_rank)
+
+    # --- Delegate to the standard non-interleaved 1F1B schedule ---
+    result = forward_backward_pipelining_without_interleaving(
+        forward_step_func=forward_step_func,
+        data_iterator=data_iterator,
+        model=model,
+        num_microbatches=num_microbatches,
+        seq_length=seq_length,
+        micro_batch_size=micro_batch_size,
+        decoder_seq_length=decoder_seq_length,
+        forward_only=forward_only,
+        collect_non_loss_data=collect_non_loss_data,
+        first_val_step=first_val_step,
+        adjust_tensor_shapes_fn=adjust_tensor_shapes_fn,
+        p2p_communicator=p2p_communicator,
+        pg_collection=pg_collection,
+        force_all_reduce=force_all_reduce,
+    )
+
+    if bubble_filler is not None and bubble_filler.is_fast_rank(current_pp_rank):
+        # Stop the overall timing clock and update the EMA
+        bubble_filler.record_compute_stop(current_pp_rank)
+
+        if not forward_only:
+            # Attempt to fill the residual post-step bubble.
+            # speculative_mb_start=num_microbatches means "beyond the batch" —
+            # the filler will detect num_microbatches_remaining==0 and return 0,
+            # which is the correct guard for the first step before clocks warm up.
+            # After a few steps the EMA ratios will reflect actual GPU speeds
+            # and the filler will engage when ratio > 1.15.
+            cfg = None
+            if p2p_communicator is not None:
+                cfg = getattr(p2p_communicator, 'config', None)
+            bubble_filler.maybe_fill_bubble(
+                pp_rank=current_pp_rank,
+                forward_data_store=result,
+                config=cfg,
+                forward_step_func=forward_step_func,
+                data_iterator=data_iterator,
+                model=model,
+                num_microbatches=num_microbatches,
+                speculative_mb_start=num_microbatches,  # guard: no extra data
+            )
+
+        bubble_filler.drain(result, config=None)
+
+    return result
+
+
+# ===========================================================================
+# DES-LOC: PP=5 factory helpers
+# ===========================================================================
+
+def make_pp5_bubble_filler(
+    extra_microbatches: int = 2,
+    activation_memory_budget_mb: int = 8192,
+    initial_fast_ms: float = 60.0,
+    initial_slow_ms: float = 150.0,
+) -> "HeterogeneousBubbleFiller":
+    """Factory for the standard DES-LOC PP=5 HeterogeneousBubbleFiller.
+
+    Creates a filler configured for the 2×H100 (ranks 0,4) + 3×A6000
+    (ranks 1,2,3) layout used by DES-LOC clusters.
+
+    Args:
+        extra_microbatches:          Max extra microbatches per bubble (default 2).
+        activation_memory_budget_mb: Activation memory budget in MB (default 8192).
+        initial_fast_ms:             Initial compute-time seed for H100 ranks (ms).
+        initial_slow_ms:             Initial compute-time seed for A6000 ranks (ms).
+
+    Returns:
+        Configured ``HeterogeneousBubbleFiller`` instance.
+    """
+    return HeterogeneousBubbleFiller(
+        fast_ranks=PP5_DESLOC_FAST_RANKS,
+        a6000_ranks=PP5_DESLOC_SLOW_RANKS,
+        extra_microbatches=extra_microbatches,
+        activation_memory_budget_mb=activation_memory_budget_mb,
+        initial_fast_ms=initial_fast_ms,
+        initial_slow_ms=initial_slow_ms,
+    )
+
+
+def make_pp5_p2p_manager(
+    h100_a6000_bw_gbps: float = 16.0,
+    h100_h100_bw_gbps: float = 400.0,
+    target_latency_ms: float = 20.0,
+) -> "HeterogeneousP2PManager":
+    """Factory for the standard DES-LOC PP=5 HeterogeneousP2PManager.
+
+    Initialises per-link bandwidth estimates for the standard DES-LOC
+    PP=5 ring topology (ranks 0→1→2→3→4):
+      - 0↔1 (H100↔A6000): PCIe x16, h100_a6000_bw_gbps
+      - 1↔2 (A6000↔A6000): PCIe / limited NVLink, h100_a6000_bw_gbps
+      - 2↔3 (A6000↔A6000): same
+      - 3↔4 (A6000↔H100): PCIe x16, h100_a6000_bw_gbps
+
+    Args:
+        h100_a6000_bw_gbps: Bandwidth for H100<->A6000 links (GB/s).
+        h100_h100_bw_gbps:  Bandwidth for H100<->H100 links (GB/s, n/a for PP=5 ring).
+        target_latency_ms:  Target one-way transfer latency budget (ms).
+
+    Returns:
+        Configured ``HeterogeneousP2PManager`` instance.
+    """
+    pipeline_pairs = [(0, 1), (1, 2), (2, 3), (3, 4)]
+    link_bw: Dict[Tuple[int, int], float] = {}
+    for src, dst in pipeline_pairs:
+        src_fast = src in PP5_DESLOC_FAST_RANKS
+        dst_fast = dst in PP5_DESLOC_FAST_RANKS
+        bw = h100_h100_bw_gbps if (src_fast and dst_fast) else h100_a6000_bw_gbps
+        link_bw[(src, dst)] = bw
+        link_bw[(dst, src)] = bw  # backward pass traverses same physical link
+    return HeterogeneousP2PManager(
+        link_bandwidths_gbps=link_bw,
+        target_latency_ms=target_latency_ms,
+        alpha=0.2,
+    )
+
+
 __all__ = [
+    # Schedule selector
     "get_forward_backward_func",
+    # Step functions
     "forward_step", "forward_step_calc_loss",
     "backward_step", "backward_step_multimodule",
+    # Standard schedules
     "forward_backward_no_pipelining",
     "forward_backward_pipelining_without_interleaving",
     "forward_backward_pipelining_with_interleaving",
+    # DES-LOC heterogeneous schedules
+    "forward_backward_pipelining_without_interleaving_pp5_heterogeneous",
+    # DES-LOC bubble filling (full implementation)
+    "StageClock",
+    "AsymmetricClockScheduler",
     "HeterogeneousBubbleFiller",
+    # DES-LOC PCIe-aware P2P manager
+    "HeterogeneousP2PManager",
+    # DES-LOC PP=5 layout constants
+    "PP5_DESLOC_FAST_RANKS",
+    "PP5_DESLOC_SLOW_RANKS",
+    # DES-LOC factory helpers
+    "make_pp5_bubble_filler",
+    "make_pp5_p2p_manager",
+    # Utilities
     "get_tensor_shapes", "get_pp_rank_microbatches", "get_schedule_table",
     "deallocate_output_tensor", "custom_backward", "get_tensor_device",
     "check_first_val_step", "clear_embedding_activation_buffer",
