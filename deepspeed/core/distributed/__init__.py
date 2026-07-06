@@ -5,6 +5,7 @@
 Re-exports all public names from submodules so that callers can use:
 
     from deepspeed.core.distributed import DistributedDataParallel, finalize_model_grads
+    from deepspeed.core.distributed import save_checkpoint, load_checkpoint, sharded_state_dict
 
 without knowing the internal file layout.
 """
@@ -59,6 +60,13 @@ from deepspeed.core.distributed.distributed_data_parallel import (
     force_param_sync,
 )
 
+# Issue #121: ShardedTensor-based save / load for DDP models.
+from deepspeed.core.distributed.sharded_checkpoint import (
+    sharded_state_dict,
+    save_checkpoint,
+    load_checkpoint,
+)
+
 __all__ = [
     # param_and_grad_buffer
     "BufferType",
@@ -80,6 +88,10 @@ __all__ = [
     "DistributedDataParallelConfig",
     "DistributedDataParallel",
     "force_param_sync",
+    # sharded_checkpoint (issue #121)
+    "sharded_state_dict",
+    "save_checkpoint",
+    "load_checkpoint",
     # finalize_model_grads
     "finalize_model_grads",
     "fuse_grad_reductions",

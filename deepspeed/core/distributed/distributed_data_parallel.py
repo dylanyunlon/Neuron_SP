@@ -974,6 +974,113 @@ class DistributedDataParallel(nn.Module):
             torch.distributed.broadcast(param.data, src=src_rank, group=dp_grp)
 
     # ------------------------------------------------------------------
+    # ShardedTensor-based save / load (issue #121)
+    # ------------------------------------------------------------------
+
+    def sharded_state_dict(
+        self,
+        prefix: str = "",
+        sharded_offsets: tuple = (),
+    ) -> dict:
+        """Return a state dict with :class:`ShardedTensor` values for distributed checkpointing.
+
+        Wraps each parameter of the inner model with sharding metadata encoding
+        its tensor-parallel (TP) and data-parallel (DP) position so that
+        :func:`~deepspeed.core.distributed.save_checkpoint` and
+        :func:`~deepspeed.core.distributed.load_checkpoint` can correctly
+        save and reconstruct parameters across topology changes.
+
+        TP-parallel parameters (``param.tensor_model_parallel == True``) are
+        represented as partial shards along ``param.partition_dim``; all other
+        parameters are treated as DP replicas and only the primary replica saves.
+
+        Args:
+            prefix:           dot-separated prefix prepended to every key.
+            sharded_offsets:  pipeline-parallel ``(axis, rank_offset, n_ranks)``
+                              tuples prepended to each ShardedTensor (for PP-stage
+                              models that pass their PP offsets through this API).
+
+        Returns:
+            Dict mapping qualified parameter name → :class:`ShardedTensor`.
+        """
+        from deepspeed.core.distributed.sharded_checkpoint import sharded_state_dict as _ssd
+        return _ssd(self._module, prefix=prefix, sharded_offsets=sharded_offsets)
+
+    def save_checkpoint(
+        self,
+        checkpoint_dir: str,
+        *,
+        prefix: str = "",
+        sharded_offsets: tuple = (),
+        extra_state: Optional[dict] = None,
+    ) -> None:
+        """Save model parameters as a distributed checkpoint using ShardedTensor.
+
+        Convenience method that calls
+        :func:`~deepspeed.core.distributed.save_checkpoint` on this
+        wrapper's inner module.  Each rank writes its own shard file; rank 0
+        additionally writes ``common.pt`` (non-sharded scalars) and
+        ``metadata.json`` (topology info).
+
+        Before calling this method, ensure all parameters are fully gathered
+        by calling ``start_param_sync(force_sync=True)`` if
+        ``overlap_param_gather`` is enabled.
+
+        Args:
+            checkpoint_dir:   target directory (must already exist and be empty).
+            prefix:           optional key prefix inserted into every key.
+            sharded_offsets:  pipeline-parallel ``(axis, rank_offset, n_ranks)``
+                              tuples forwarded to every ShardedTensor.
+            extra_state:      additional non-sharded data to save alongside
+                              model parameters (e.g. iteration count, RNG).
+        """
+        from deepspeed.core.distributed.sharded_checkpoint import save_checkpoint as _save
+        # Ensure params are up-to-date before snapshotting (M2853 pattern).
+        if self.ddp_config.overlap_param_gather:
+            self.start_param_sync(force_sync=True)
+        _save(
+            self._module,
+            checkpoint_dir,
+            prefix=prefix,
+            sharded_offsets=sharded_offsets,
+            extra_state=extra_state,
+        )
+
+    def load_checkpoint(
+        self,
+        checkpoint_dir: str,
+        *,
+        prefix: str = "",
+        sharded_offsets: tuple = (),
+        strict: bool = True,
+    ) -> dict:
+        """Load a distributed checkpoint into this model using ShardedTensor resharding.
+
+        Convenience method that calls
+        :func:`~deepspeed.core.distributed.load_checkpoint` on this
+        wrapper's inner module.  Handles topology changes transparently:
+        the checkpoint can have been saved with a different TP / PP world
+        size than the current run.
+
+        Args:
+            checkpoint_dir:   directory produced by :meth:`save_checkpoint`.
+            prefix:           the same key prefix used when saving.
+            sharded_offsets:  the same pipeline-parallel offsets used when saving.
+            strict:           passed to ``load_state_dict`` (default ``True``).
+
+        Returns:
+            Dict of any ``extra_state`` entries saved alongside the model.
+        """
+        from deepspeed.core.distributed.sharded_checkpoint import load_checkpoint as _load
+        return _load(
+            self._module,
+            checkpoint_dir,
+            prefix=prefix,
+            sharded_offsets=sharded_offsets,
+            strict=strict,
+        )
+
+    # ------------------------------------------------------------------
     # Free overlap buffers (M3904 async checkpoint OOM fix)
     # ------------------------------------------------------------------
 
