@@ -89,6 +89,22 @@ from deepspeed.core.distributed.overlap_grad_reduce import (
     recommend_pp_stage_bucket_size,
 )
 
+# Extended overlapped grad-reduce: VPP multi-chunk + dedicated CUDA streams.
+from deepspeed.core.distributed.overlapped_grad_reduce import (
+    StreamPool,
+    VPPOverlapGradReduceManager,
+    OverlappedGradReduceContext,
+    build_overlapped_grad_reduce_manager,
+)
+
+# Async parameter all-gather synchronization (overlap_param_gather / LayerWise opt).
+from deepspeed.core.distributed.async_param_sync import (
+    ParamSyncScheduler,
+    AsyncParamSyncManager,
+    async_param_sync_context,
+    build_vpp_param_sync_manager,
+)
+
 __all__ = [
     # grad_buffer
     "GradBuffer",
@@ -143,4 +159,14 @@ __all__ = [
     "OverlapGradReduceManager",
     "PPStageGradReduceScheduler",
     "recommend_pp_stage_bucket_size",
+    # overlapped_grad_reduce (VPP multi-chunk + dedicated CUDA streams)
+    "StreamPool",
+    "VPPOverlapGradReduceManager",
+    "OverlappedGradReduceContext",
+    "build_overlapped_grad_reduce_manager",
+    # async_param_sync (overlap_param_gather / LayerWise optimizer)
+    "ParamSyncScheduler",
+    "AsyncParamSyncManager",
+    "async_param_sync_context",
+    "build_vpp_param_sync_manager",
 ]
