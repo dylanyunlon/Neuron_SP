@@ -576,3 +576,162 @@ void launch_cross_entropy_tp_backward(__nv_bfloat16*       d_logits,
                                        float                inv_batch,
                                        int                  sm_version,
                                        cudaStream_t         stream);
+
+// ===========================================================================
+// fused_gradient_allreduce — INT8 mixed-precision compressed all-reduce
+//   for heterogeneous PCIe topology  (fused_gradient_allreduce.cu)
+// ===========================================================================
+
+/**
+ * launch_gradient_compress
+ *
+ * Phase 1: compress a BF16 gradient tensor to INT8 with per-block FP32 scales.
+ *
+ * Each kBlockElems-element block of the gradient is independently quantised:
+ *   scale[b]    = max|x[b]| / 127
+ *   out_int8[i] = round(x[i] / scale[block(i)])  clamped to [-128, 127]
+ *
+ * Uses cub::BlockReduce to compute per-block ℓ∞ norms efficiently.
+ *
+ * @param out_int8    [out] INT8 device buffer, n_elems bytes
+ * @param out_scale   [out] FP32 device buffer, ceil(n_elems/256) floats
+ * @param input       [in]  BF16 device buffer, n_elems elements
+ * @param n_elems     Number of BF16 gradient elements
+ * @param sm_version  SM version (86, 90, 120)
+ * @param stream      CUDA stream
+ */
+void launch_gradient_compress(int8_t*               out_int8,
+                               float*                out_scale,
+                               const __nv_bfloat16*  input,
+                               size_t                n_elems,
+                               int                   sm_version,
+                               cudaStream_t          stream);
+
+/**
+ * launch_int8_ring_reduce_step
+ *
+ * Fused INT8 ring-allreduce accumulation: dequantise dst and src (with their
+ * respective per-block scales), sum them, re-quantise the result and update
+ * dst_int8 and dst_scale in-place.  Keeps the entire ring reduce in INT8,
+ * halving PCIe traffic vs. BF16 ring reduce.
+ *
+ * @param dst_int8    [in/out] INT8 accumulator chunk
+ * @param dst_scale   [in/out] FP32 per-block scales for dst_int8
+ * @param src_int8    [in]     INT8 received chunk from ring peer
+ * @param src_scale   [in]     FP32 per-block scales for src_int8
+ * @param n_elems     Number of elements in this chunk
+ * @param sm_version  SM version (86, 90, 120)
+ * @param stream      CUDA compute stream
+ */
+void launch_int8_ring_reduce_step(int8_t*       dst_int8,
+                                   float*        dst_scale,
+                                   const int8_t* src_int8,
+                                   const float*  src_scale,
+                                   size_t        n_elems,
+                                   int           sm_version,
+                                   cudaStream_t  stream);
+
+/**
+ * launch_gradient_decompress
+ *
+ * Phase 3: reconstruct BF16 gradient from INT8 data + per-block FP32 scales.
+ *   output[i] = int8_data[i] × (scale[block(i)] / 127)
+ *
+ * @param output     [out] BF16 device buffer, n_elems elements
+ * @param int8_data  [in]  INT8 device buffer, n_elems bytes
+ * @param scale_buf  [in]  FP32 per-block scales, ceil(n_elems/256) floats
+ * @param n_elems    Number of elements
+ * @param sm_version SM version (86, 90, 120)
+ * @param stream     CUDA stream
+ */
+void launch_gradient_decompress(__nv_bfloat16* output,
+                                 const int8_t*  int8_data,
+                                 const float*   scale_buf,
+                                 size_t         n_elems,
+                                 int            sm_version,
+                                 cudaStream_t   stream);
+
+/**
+ * launch_gradient_allreduce_finalise
+ *
+ * Applies the averaging step (÷ world_size) to all per-block scale factors
+ * after the ring reduce-scatter completes.  No INT8 data is touched;
+ * only the scale_buf is updated, so the final decompress produces
+ * the mean gradient directly.
+ *
+ * @param scale_buf   [in/out] FP32 per-block scales
+ * @param n_elems     Total gradient elements (used to compute n_scale_blocks)
+ * @param world_size  Number of participating ranks
+ * @param stream      CUDA stream
+ */
+void launch_gradient_allreduce_finalise(float*       scale_buf,
+                                         size_t       n_elems,
+                                         int          world_size,
+                                         cudaStream_t stream);
+
+/**
+ * launch_fused_gradient_allreduce
+ *
+ * High-level 3-phase pipeline: compress → ring-allreduce → decompress.
+ * Executes the full gradient all-reduce in INT8 (2× PCIe bandwidth reduction
+ * vs. BF16) using a double-buffered ring over heterogeneous PCIe topology.
+ *
+ * The caller must pre-allocate all staging buffers and provide per-peer
+ * device pointers (from cudaIpcGetMemHandle / cudaIpcOpenMemHandle or
+ * cudaMallocAsync on peer-accessible devices).
+ *
+ * @param grad            [in/out] BF16 gradient [n_elems], updated in-place
+ * @param int8_staging    working INT8 buffer    [n_elems bytes]
+ * @param scale_staging   working scale buffer   [ceil(n_elems/256) floats]
+ * @param ping_int8       receive ping buffer    [n_elems bytes]
+ * @param pong_int8       receive pong buffer    [n_elems bytes]
+ * @param ping_scale      receive ping scale     [ceil(n_elems/256) floats]
+ * @param pong_scale      receive pong scale     [ceil(n_elems/256) floats]
+ * @param peer_int8       device pointers to peers' int8_staging, length world_size
+ * @param peer_scale      device pointers to peers' scale_staging, length world_size
+ * @param rank            this rank in [0, world_size)
+ * @param world_size      number of participating GPUs
+ * @param n_elems         BF16 gradient elements
+ * @param sm_version      SM version of the current device (86, 90, 120)
+ * @param transfer_stream CUDA stream for cudaMemcpyPeerAsync
+ * @param compute_stream  CUDA stream for compress/reduce/decompress kernels
+ * @param xfer_events     two pre-created CUDA events for double-buffer sync
+ */
+void launch_fused_gradient_allreduce(__nv_bfloat16*  grad,
+                                      int8_t*         int8_staging,
+                                      float*          scale_staging,
+                                      int8_t*         ping_int8,
+                                      int8_t*         pong_int8,
+                                      float*          ping_scale,
+                                      float*          pong_scale,
+                                      int8_t* const*  peer_int8,
+                                      float*  const*  peer_scale,
+                                      int             rank,
+                                      int             world_size,
+                                      size_t          n_elems,
+                                      int             sm_version,
+                                      cudaStream_t    transfer_stream,
+                                      cudaStream_t    compute_stream,
+                                      cudaEvent_t     xfer_events[2]);
+
+/**
+ * gradient_compress_bytes
+ *
+ * Returns the INT8 staging buffer size (bytes) required for n_elems gradient
+ * elements.  Always equals n_elems * sizeof(int8_t).
+ *
+ * @param n_elems  Number of BF16 gradient elements
+ * @returns        Required INT8 buffer size in bytes
+ */
+size_t gradient_compress_bytes(size_t n_elems);
+
+/**
+ * gradient_scale_bytes
+ *
+ * Returns the per-block scale buffer size (bytes) required alongside an
+ * n_elems-element compressed gradient.
+ *
+ * @param n_elems  Number of BF16 gradient elements
+ * @returns        Required scale buffer size in bytes
+ */
+size_t gradient_scale_bytes(size_t n_elems);
