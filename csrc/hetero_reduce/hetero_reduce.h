@@ -909,7 +909,7 @@ void launch_grad_norm_sq(
 
 // ===========================================================================
 // fused_layernorm_residual extended — Welford full LN + optional bias + FP32 out
-// ===========================================================================
+// ====================================================================
 
 /**
  * launch_fused_layernorm_residual_ex
@@ -1010,3 +1010,97 @@ void launch_grad_norm_sq_fp8(
     cudaStream_t   stream);
 
 
+// pcie_adaptive_allreduce — NUMA-aware topology-aware dispatch  (issue #138)
+// ===========================================================================
+
+/**
+ * TopoInfo — NUMA node and PCIe switch affinity for each rank.
+ *
+ * Populated by query_topo_info() and consumed by select_allreduce_algo()
+ * to choose between direct, ring, and tree allreduce algorithms.
+ *
+ * Fields:
+ *   world_size   — total participating ranks.
+ *   numa_node    — NUMA node index per rank (0-indexed).
+ *   pcie_switch  — PCIe switch domain index per rank (0-indexed).
+ *   device_id    — CUDA device ordinal per rank.
+ *   num_numa     — count of distinct NUMA nodes present.
+ *   num_switches — count of distinct PCIe switch domains present.
+ */
+struct TopoInfo;   // full definition in pcie_adaptive_allreduce.cu
+
+/**
+ * AllreduceAlgo — algorithm selected by select_allreduce_algo().
+ *
+ *   kDirect  payload < 256 KB   root pulls all shards point-to-point
+ *   kRing    256 KB ≤ payload < 64 MB   ring allreduce
+ *   kTree    payload ≥ 64 MB, pow2 world, multi-switch   recursive-halving tree
+ */
+enum class AllreduceAlgo : int {
+    kDirect = 0,
+    kRing   = 1,
+    kTree   = 2,
+};
+
+/**
+ * query_topo_info
+ *
+ * Probes CUDA runtime attributes to fill TopoInfo for world_size ranks.
+ * Falls back to NEURON_PCIE_SWITCH_WIDTH env var (default 4 GPUs/switch).
+ *
+ * @param topo        [out] Topology descriptor to populate
+ * @param device_ids  [in]  CUDA device ordinals, one per rank
+ * @param world_size  Number of participating ranks (≤ TopoInfo::kMaxRanks)
+ */
+void query_topo_info(TopoInfo* topo, const int* device_ids, int world_size);
+
+/**
+ * select_allreduce_algo
+ *
+ * Returns the optimal algorithm for the given payload and topology.
+ *
+ * Thresholds:
+ *   payload < 256 KB                              → kDirect
+ *   256 KB ≤ payload < 64 MB                     → kRing
+ *   payload ≥ 64 MB, pow2 world, multi-switch     → kTree
+ *   payload ≥ 64 MB, non-pow2 or single-switch   → kRing (fallback)
+ *
+ * @param topo          Populated topology descriptor
+ * @param payload_bytes Allreduce payload size in bytes
+ * @returns             AllreduceAlgo enum value
+ */
+AllreduceAlgo select_allreduce_algo(const TopoInfo& topo, size_t payload_bytes);
+
+/**
+ * build_numa_ring_order
+ *
+ * Produces a NUMA-locality-optimised ring permutation.
+ * Ranks sharing a NUMA node are placed adjacent in the ring to minimise
+ * cross-NUMA PCIe traffic per ring step.
+ *
+ * @param topo        Topology descriptor
+ * @param ring_order  [out] Permutation array, caller-allocated length world_size
+ */
+void build_numa_ring_order(const TopoInfo& topo, int* ring_order);
+
+/**
+ * launch_pcie_tree_reduce_step
+ *
+ * Single recursive-halving tree-reduce step:
+ *   accum_buf[i] += recv_buf[i]  (BF16 → FP32 accumulation → BF16)
+ *
+ * Mirrors launch_pcie_ring_reduce_step; used by the tree-allreduce
+ * orchestration for each reduce phase step.
+ *
+ * @param accum_buf      [in/out] BF16 accumulator [chunk_elems]
+ * @param recv_buf       [in]     BF16 received shard [chunk_elems]
+ * @param chunk_elems    Number of BF16 elements in this step's shard
+ * @param sm_version     SM version for kernel dispatch (86, 90, 120)
+ * @param compute_stream CUDA stream for the reduce kernel
+ */
+void launch_pcie_tree_reduce_step(
+    __nv_bfloat16* __restrict__       accum_buf,
+    const __nv_bfloat16* __restrict__ recv_buf,
+    size_t                            chunk_elems,
+    int                               sm_version,
+    cudaStream_t                      compute_stream);
