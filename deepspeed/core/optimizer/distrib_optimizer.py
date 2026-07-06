@@ -4334,10 +4334,18 @@ class ZeROStage2Optimizer(MixedPrecisionOptimizer):
 
         After this call, each owned FP32 param has its ``.grad`` set to the
         averaged FP32 gradient shard.
+
+        Perf note: O(n) — uses an index map (param → position) to avoid the
+        O(n²) list.index() calls that appeared in the earlier draft.
         """
         dp_world = self.data_parallel_world_size
 
-        # Collect all BF16 gradients into a flat list in param order
+        # Build O(1) param-to-index map so scatter-back avoids list.index() O(n²).
+        _param_to_idx: Dict[int, int] = {
+            id(p): i for i, p in enumerate(self._all_params)
+        }
+
+        # Collect all BF16/FP32 gradients into a flat list in param order.
         all_grads: List[Optional[torch.Tensor]] = []
         for param in self._all_params:
             if hasattr(param, "main_grad") and param.main_grad is not None:
@@ -4347,14 +4355,16 @@ class ZeROStage2Optimizer(MixedPrecisionOptimizer):
             else:
                 all_grads.append(None)
 
-        # All-reduce non-None gradients in chunks
-        _chunk_elems = max(1, (256 * 1024 * 1024) // 2)  # 256 MB in BF16 elements
-        non_none_grads = [g for g in all_grads if g is not None]
+        # Identify non-None grads and their indices for scatter-back.
+        non_none_indices: List[int] = [i for i, g in enumerate(all_grads) if g is not None]
+        non_none_grads: List[torch.Tensor] = [all_grads[i] for i in non_none_indices]  # type: ignore[misc]
 
         if non_none_grads:
-            # Flat all-reduce on chunked concatenation
+            # Flatten all non-None grads into a contiguous FP32 buffer and
+            # all-reduce in 256 MB chunks to avoid OOM on A6000 (48 GB).
             flat = torch.cat([g.view(-1).float() for g in non_none_grads])
             total = flat.numel()
+            _chunk_elems = max(1, (256 * 1024 * 1024) // 4)  # 256 MB in FP32 elements
             pos = 0
             while pos < total:
                 cur = min(_chunk_elems, total - pos)
@@ -4367,25 +4377,21 @@ class ZeROStage2Optimizer(MixedPrecisionOptimizer):
                 chunk.div_(dp_world)
                 pos += cur
 
-            # Scatter back to individual gradient tensors
+            # Scatter the averaged flat buffer back into the original grad tensors.
+            # O(n) via non_none_indices — no list.index() needed.
             offset = 0
-            g_idx = 0
-            for param in self._all_params:
-                if all_grads[self._all_params.index(param)] is None:
-                    continue
-                numel = all_grads[self._all_params.index(param)].numel()
-                all_grads[self._all_params.index(param)].copy_(
-                    flat[offset:offset + numel].view_as(all_grads[self._all_params.index(param)])
+            for grad_idx, g in zip(non_none_indices, non_none_grads):
+                numel = g.numel()
+                all_grads[grad_idx].copy_(  # type: ignore[union-attr]
+                    flat[offset:offset + numel].view_as(g)
                 )
                 offset += numel
 
-        # Copy reduced gradients to owned FP32 params' .grad
+        # Copy reduced gradients to owned FP32 params' .grad using O(1) index lookup.
         for fp32, bf16 in zip(self._owned_fp32, self._owned_params):
-            if all_grads[self._all_params.index(bf16)] is not None:
-                grad = all_grads[self._all_params.index(bf16)]
-                fp32.grad = grad.float()
-            else:
-                fp32.grad = None
+            idx = _param_to_idx[id(bf16)]
+            g = all_grads[idx]
+            fp32.grad = g.float() if g is not None else None
 
     @torch.no_grad()
     def prepare_grads(self) -> bool:

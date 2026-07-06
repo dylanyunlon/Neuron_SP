@@ -1815,9 +1815,19 @@ def partition_buckets(
 #
 # These are conservative defaults; operators should tune per cluster.
 _TIER_BUCKET_MULTIPLIERS: Dict[str, float] = {
-    "a6000":     0.5,
+    # NVLink-connected datacenter GPUs: large buckets amortise NCCL overhead.
+    # H100 SXM5 NVLink bandwidth: ~900 GB/s bidirectional → benefit from large buckets.
     "h100":      1.5,
+    # Blackwell B200/B100 NVLink bandwidth: ~1.8 TB/s → can handle even larger buckets.
     "blackwell": 2.0,
+    # PCIe-connected professional GPUs (A6000 / A6000 Ada): ~64 GB/s bidirectional.
+    # Smaller buckets allow the collective to finish faster, enabling more backward overlap.
+    "a6000":     0.5,
+    # Consumer GPUs (RTX 4090, RTX 3090, etc.): PCIe 4.0 x16 ~32 GB/s bidirectional.
+    # Even smaller buckets needed due to lower PCIe bandwidth than A6000.
+    # DES-LOC extension: RTX 4090 BF16 TFLOPS ≈82.6, similar PCIe profile to A6000.
+    "consumer":  0.4,
+    # Unknown / undetected tier: use the base bucket size unchanged.
     "unknown":   1.0,
 }
 
