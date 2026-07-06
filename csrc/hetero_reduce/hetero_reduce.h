@@ -813,3 +813,96 @@ void launch_fused_adam_heterogeneous(
     float                weight_decay,
     int                  sm_version,
     cudaStream_t         stream);
+
+/**
+ * launch_fused_adamw_amsgrad_heterogeneous
+ *
+ * Extended heterogeneous Adam launch supporting AMSGrad, per-tier gradient
+ * clipping, and FP8-E4M3 gradient inputs.
+ *
+ * AMSGrad (Reddi et al., 2018) maintains a running maximum of the
+ * bias-corrected second moment, ensuring a non-increasing effective step size:
+ *   v̂_max_t = max(v̂_max_{t-1}, v̂_t)
+ *   θ_t     = θ_{t-1} − lr_eff · m̂_t / (√v̂_max_t + ε)
+ *
+ * Gradient clipping:
+ *   clip_scale = min(1, clip_norm / global_grad_norm).
+ *   Use launch_grad_norm_sq to accumulate the per-shard squared norm, then
+ *   reduce across tiers on the host before computing clip_scale.
+ *
+ * FP8-E4M3 gradient path:
+ *   Set grad_dtype = 1 (kGradFP8_E4M3) and pass a non-null uint8_t* grads.
+ *   fp8_grad_scale absorbs the per-tensor quantisation scale so the kernel
+ *   sees properly scaled FP32 gradients.  Requires CUDA >= 12.1 on SM >= 8.9
+ *   for hardware decode; older toolchains use a software fallback.
+ *
+ * @param params            [in/out] BF16 working parameters [n_elems]
+ * @param master_params     [in/out] FP32 master copy [n_elems], or nullptr
+ * @param exp_avg           [in/out] FP32 first-moment  (m) [n_elems]
+ * @param exp_avg_sq        [in/out] FP32 second-moment (v) [n_elems]
+ * @param exp_avg_sq_max    [in/out] FP32 v_max [n_elems], or nullptr (→ classic Adam)
+ * @param grads             [in]     Gradient buffer (BF16 or FP8-E4M3) [n_elems]
+ * @param n_elems           Number of parameter elements
+ * @param lr_base           Base learning rate (before tier scaling)
+ * @param lr_scale          Per-tier LR scale (use hetero_adam_lr_scale())
+ * @param beta1             Adam β₁ (typically 0.9)
+ * @param beta2             Adam β₂ (typically 0.999)
+ * @param bc1               Bias correction 1 = 1/(1−β₁^step)
+ * @param bc2               Bias correction 2 = 1/(1−β₂^step)
+ * @param eps               Adam ε (typically 1e-8)
+ * @param weight_decay      Decoupled weight-decay coefficient (0.0 to disable)
+ * @param clip_scale        Gradient clip multiplier = min(1, clip_norm/global_norm).
+ *                          Pass 1.0f to disable clipping.
+ * @param fp8_grad_scale    Per-tensor FP8 quantisation scale (ignored for BF16)
+ * @param grad_dtype        0 = BF16, 1 = FP8-E4M3
+ * @param sm_version        SM version of the current device (86, 90, 120, …)
+ * @param stream            CUDA stream
+ */
+void launch_fused_adamw_amsgrad_heterogeneous(
+    __nv_bfloat16*       params,
+    float*               master_params,
+    float*               exp_avg,
+    float*               exp_avg_sq,
+    float*               exp_avg_sq_max,
+    const void*          grads,
+    size_t               n_elems,
+    float                lr_base,
+    float                lr_scale,
+    float                beta1,
+    float                beta2,
+    float                bc1,
+    float                bc2,
+    float                eps,
+    float                weight_decay,
+    float                clip_scale,
+    float                fp8_grad_scale,
+    int                  grad_dtype,
+    int                  sm_version,
+    cudaStream_t         stream);
+
+/**
+ * launch_grad_norm_sq
+ *
+ * Accumulates ‖g‖² from a BF16 gradient shard into a device-resident FP32
+ * scalar accumulator via atomicAdd, for use in global gradient norm clipping.
+ *
+ * The caller must zero *norm_sq_accum (e.g. via cudaMemsetAsync) before the
+ * first call in a training step.  After all shards are processed, copy the
+ * scalar to host, take the square root to obtain the global gradient norm,
+ * then compute:
+ *   clip_scale = (clip_norm > 0 && global_norm > clip_norm)
+ *                  ? clip_norm / global_norm : 1.0f;
+ * and pass it to launch_fused_adamw_amsgrad_heterogeneous.
+ *
+ * @param grads         [in]  BF16 gradient shard (device), length n_elems
+ * @param n_elems       Number of gradient elements
+ * @param norm_sq_accum [in/out] Device scalar accumulator (pre-zeroed by caller)
+ * @param sm_version    SM version of the current device (86, 90, 120, …)
+ * @param stream        CUDA stream
+ */
+void launch_grad_norm_sq(
+    const __nv_bfloat16* grads,
+    size_t               n_elems,
+    float*               norm_sq_accum,
+    int                  sm_version,
+    cudaStream_t         stream);
