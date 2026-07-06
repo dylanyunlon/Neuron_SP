@@ -89,6 +89,7 @@ set(HETERO_REDUCE_SOURCES
     "${HETERO_REDUCE_DIR}/fused_layernorm_residual.cu"      # #110
     "${HETERO_REDUCE_DIR}/cross_entropy_tp.cu"               # #110
     "${HETERO_REDUCE_DIR}/fused_gradient_allreduce.cu"       # INT8 compressed all-reduce
+    "${HETERO_REDUCE_DIR}/fused_adam_heterogeneous.cu"       # per-tier LR Adam
 )
 
 # ─── Static library target ───────────────────────────────────────────────────

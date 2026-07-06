@@ -643,6 +643,74 @@ void cross_entropy_tp_backward_py(at::Tensor d_logits,
 }
 
 // ---------------------------------------------------------------------------
+// fused_adam_heterogeneous bindings
+// ---------------------------------------------------------------------------
+
+void fused_adam_heterogeneous_py(
+    at::Tensor  params,
+    at::Tensor  exp_avg,
+    at::Tensor  exp_avg_sq,
+    at::Tensor  grads,
+    float       lr_base,
+    float       lr_scale,
+    float       beta1,
+    float       beta2,
+    float       bc1,
+    float       bc2,
+    float       eps,
+    float       weight_decay,
+    int         sm_version,
+    at::Tensor  master_params_opt)   // pass empty tensor to disable
+{
+    check_bf16(params,  "params");
+    check_bf16(grads,   "grads");
+    check_fp32(exp_avg,    "exp_avg");
+    check_fp32(exp_avg_sq, "exp_avg_sq");
+    TORCH_CHECK(params.is_contiguous(), "params must be contiguous");
+    TORCH_CHECK(exp_avg.is_contiguous(),    "exp_avg must be contiguous");
+    TORCH_CHECK(exp_avg_sq.is_contiguous(), "exp_avg_sq must be contiguous");
+    TORCH_CHECK(grads.is_contiguous(),      "grads must be contiguous");
+
+    const size_t n_elems = static_cast<size_t>(params.numel());
+    TORCH_CHECK(static_cast<size_t>(exp_avg.numel())    == n_elems, "exp_avg numel mismatch");
+    TORCH_CHECK(static_cast<size_t>(exp_avg_sq.numel()) == n_elems, "exp_avg_sq numel mismatch");
+    TORCH_CHECK(static_cast<size_t>(grads.numel())      == n_elems, "grads numel mismatch");
+    TORCH_CHECK(lr_base  > 0.f, "lr_base must be positive");
+    TORCH_CHECK(lr_scale > 0.f, "lr_scale must be positive");
+    TORCH_CHECK(bc1 > 0.f, "bc1 must be positive (step > 0?)");
+    TORCH_CHECK(bc2 > 0.f, "bc2 must be positive (step > 0?)");
+    TORCH_CHECK(eps > 0.f, "eps must be positive");
+
+    float* master_ptr = nullptr;
+    if (master_params_opt.defined() && master_params_opt.numel() > 0) {
+        check_fp32(master_params_opt, "master_params");
+        TORCH_CHECK(master_params_opt.is_contiguous(), "master_params must be contiguous");
+        TORCH_CHECK(static_cast<size_t>(master_params_opt.numel()) == n_elems,
+                    "master_params numel mismatch");
+        master_ptr = master_params_opt.data_ptr<float>();
+    }
+
+    __nv_bfloat16* params_ptr =
+        reinterpret_cast<__nv_bfloat16*>(params.data_ptr<at::BFloat16>());
+    const __nv_bfloat16* grads_ptr =
+        reinterpret_cast<const __nv_bfloat16*>(grads.data_ptr<at::BFloat16>());
+
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    launch_fused_adam_heterogeneous(
+        params_ptr, master_ptr,
+        exp_avg.data_ptr<float>(), exp_avg_sq.data_ptr<float>(),
+        grads_ptr, n_elems,
+        lr_base, lr_scale,
+        beta1, beta2, bc1, bc2, eps, weight_decay,
+        sm_version, stream);
+}
+
+float hetero_adam_lr_scale_py(int sm_version)
+{
+    return hetero_adam_lr_scale(sm_version);
+}
+
+// ---------------------------------------------------------------------------
 // PYBIND11_MODULE
 // ---------------------------------------------------------------------------
 
@@ -901,5 +969,55 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("shard_offset") = 0,
           py::arg("inv_batch") = 1.f,
           py::arg("sm_version") = 86);
+
+    // -----------------------------------------------------------------------
+    // fused_adam_heterogeneous — per-tier LR-scaled Adam for A6000/H100/Blackwell
+    // -----------------------------------------------------------------------
+    m.def("fused_adam_heterogeneous",
+          &fused_adam_heterogeneous_py,
+          "Fused Adam optimizer with per-tier learning-rate scaling.\n"
+          "Applies the AdamW update (decoupled weight decay) with an effective\n"
+          "LR of lr_base × lr_scale.  BF16 params/grads, FP32 moments.\n"
+          "Optional FP32 master-weight copy kept when master_params is non-empty.\n"
+          "\n"
+          "Args:\n"
+          "  params        (Tensor BF16  [N]): working parameters (updated in-place)\n"
+          "  exp_avg       (Tensor FP32  [N]): first-moment  buffer (updated in-place)\n"
+          "  exp_avg_sq    (Tensor FP32  [N]): second-moment buffer (updated in-place)\n"
+          "  grads         (Tensor BF16  [N]): gradient tensor for this step\n"
+          "  lr_base       (float): base learning rate\n"
+          "  lr_scale      (float): per-tier LR multiplier (use hetero_adam_lr_scale)\n"
+          "  beta1         (float): Adam β₁, default 0.9\n"
+          "  beta2         (float): Adam β₂, default 0.999\n"
+          "  bc1           (float): bias-correction-1 = 1/(1−β₁^step)\n"
+          "  bc2           (float): bias-correction-2 = 1/(1−β₂^step)\n"
+          "  eps           (float): Adam ε, default 1e-8\n"
+          "  weight_decay  (float): decoupled weight-decay coefficient, default 0.0\n"
+          "  sm_version    (int)  : 86, 90, or 120\n"
+          "  master_params (Tensor FP32 [N]): optional FP32 master copy; pass an\n"
+          "                 empty tensor (torch.Tensor()) to disable",
+          py::arg("params"),
+          py::arg("exp_avg"),
+          py::arg("exp_avg_sq"),
+          py::arg("grads"),
+          py::arg("lr_base"),
+          py::arg("lr_scale"),
+          py::arg("beta1")        = 0.9f,
+          py::arg("beta2")        = 0.999f,
+          py::arg("bc1")          = 1.f,
+          py::arg("bc2")          = 1.f,
+          py::arg("eps")          = 1e-8f,
+          py::arg("weight_decay") = 0.f,
+          py::arg("sm_version")   = 86,
+          py::arg("master_params") = at::Tensor());
+
+    m.def("hetero_adam_lr_scale",
+          &hetero_adam_lr_scale_py,
+          "Return the default per-tier LR scale for a given SM version.\n"
+          "SM12.0 (Blackwell) → 4.0, SM9.0 (H100) → 3.0, SM8.6 (A6000) → 1.0.\n"
+          "Args:\n"
+          "  sm_version (int): 86, 90, or 120\n"
+          "Returns: float",
+          py::arg("sm_version"));
 
 }

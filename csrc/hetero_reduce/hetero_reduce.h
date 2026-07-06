@@ -735,3 +735,81 @@ size_t gradient_compress_bytes(size_t n_elems);
  * @returns        Required scale buffer size in bytes
  */
 size_t gradient_scale_bytes(size_t n_elems);
+
+// ===========================================================================
+// fused_adam_heterogeneous — Per-tier LR-scaled Adam optimizer kernel
+//   (fused_adam_heterogeneous.cu)
+// ===========================================================================
+
+/**
+ * hetero_adam_lr_scale
+ *
+ * Returns the default per-tier learning-rate scale factor proportional to
+ * each GPU tier's relative throughput:
+ *   SM 12.0 (Blackwell) → 4.0
+ *   SM  9.0 (H100)      → 3.0
+ *   SM  8.6 (A6000)     → 1.0
+ *
+ * Python-level schedulers may override this per-step.
+ *
+ * @param sm_version  SM version of the current device (86, 90, 120, …)
+ * @returns           Float scale factor ≥ 1.0
+ */
+float hetero_adam_lr_scale(int sm_version);
+
+/**
+ * launch_fused_adam_heterogeneous
+ *
+ * Fused Adam optimizer update with per-tier learning-rate scaling, designed
+ * for heterogeneous A6000/H100/Blackwell mixed-GPU clusters.
+ *
+ * Applies the standard Adam update (Kingma & Ba, 2015) with decoupled weight
+ * decay (AdamW) and an effective learning rate of lr_base × lr_scale:
+ *
+ *   m_t   = β₁·m_{t-1} + (1−β₁)·g_t
+ *   v_t   = β₂·v_{t-1} + (1−β₂)·g_t²
+ *   m̂_t   = m_t · bc1            (bc1 = 1/(1−β₁ᵗ), pre-computed by caller)
+ *   v̂_t   = v_t · bc2            (bc2 = 1/(1−β₂ᵗ))
+ *   θ_t   = (1−lr_eff·wd)·θ_{t-1} − lr_eff · m̂_t / (√v̂_t + ε)
+ *
+ * where lr_eff = lr_base × lr_scale.
+ *
+ * BF16 params and gradients; FP32 moments; optional FP32 master-weight copy.
+ * Uses 128-bit vectorised loads (8 BF16 / 4 FP32 per instruction).
+ * SM-specialised via AdamPolicy<SmVer>: SM8.6→(256,2), SM9.0→(256,4),
+ * SM12.0→(512,4).
+ *
+ * @param params        [in/out] BF16 working parameters [n_elems]
+ * @param master_params [in/out] FP32 master copy [n_elems], or nullptr
+ * @param exp_avg       [in/out] FP32 first-moment  (m) [n_elems]
+ * @param exp_avg_sq    [in/out] FP32 second-moment (v) [n_elems]
+ * @param grads         [in]     BF16 gradients [n_elems]
+ * @param n_elems       Number of parameter elements
+ * @param lr_base       Base learning rate (before tier scaling)
+ * @param lr_scale      Per-tier LR scale (use hetero_adam_lr_scale() for defaults)
+ * @param beta1         Adam β₁ (typically 0.9)
+ * @param beta2         Adam β₂ (typically 0.999)
+ * @param bc1           Bias correction 1 = 1/(1−β₁^step)
+ * @param bc2           Bias correction 2 = 1/(1−β₂^step)
+ * @param eps           Adam ε (typically 1e-8)
+ * @param weight_decay  Decoupled weight-decay coefficient (0.0 to disable)
+ * @param sm_version    SM version of the current device (86, 90, 120, …)
+ * @param stream        CUDA stream
+ */
+void launch_fused_adam_heterogeneous(
+    __nv_bfloat16*       params,
+    float*               master_params,
+    float*               exp_avg,
+    float*               exp_avg_sq,
+    const __nv_bfloat16* grads,
+    size_t               n_elems,
+    float                lr_base,
+    float                lr_scale,
+    float                beta1,
+    float                beta2,
+    float                bc1,
+    float                bc2,
+    float                eps,
+    float                weight_decay,
+    int                  sm_version,
+    cudaStream_t         stream);
