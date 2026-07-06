@@ -8,7 +8,15 @@ import warnings  # From Megatron M2576: add missing warnings import
 from dataclasses import dataclass, field
 from typing import Callable, List, Literal, Optional
 
-import torch
+try:
+    import torch as _torch
+    _DTYPE_BFLOAT16 = _torch.bfloat16
+    _DTYPE_TYPE = _torch.dtype
+except (ImportError, OSError):
+    # Fallback when torch CUDA libraries are unavailable (dry-run / CI).
+    _torch = None  # type: ignore[assignment]
+    _DTYPE_BFLOAT16 = None  # type: ignore[assignment]
+    _DTYPE_TYPE = type(None)
 
 from deepspeed.core.desloc_config import DesLocConfig
 
@@ -35,7 +43,7 @@ class ModelParallelConfig:
     pipeline_layer_split: Optional[List[int]] = None
 
     # --- Precision ---
-    params_dtype: torch.dtype = torch.bfloat16
+    params_dtype: "torch.dtype" = _DTYPE_BFLOAT16  # type: ignore[assignment]
     fp32_residuals: bool = False
 
     # --- Initialization ---
@@ -92,7 +100,7 @@ class ModelParallelConfig:
     # ---------------------------------------------------------------------------
 
     # Dtype used for pipeline activation tensors (None → use params_dtype)
-    pipeline_dtype: Optional[torch.dtype] = None
+    pipeline_dtype: "Optional[torch.dtype]" = None
 
     # Model hidden dimension (needed by get_tensor_shapes)
     hidden_size: int = 4096
@@ -143,7 +151,7 @@ class ModelParallelConfig:
 
     # Autocast settings
     enable_autocast: bool = False
-    autocast_dtype: Optional[torch.dtype] = None
+    autocast_dtype: "Optional[torch.dtype]" = None
 
     # Barrier before timing L1 timers
     barrier_with_L1_time: bool = True

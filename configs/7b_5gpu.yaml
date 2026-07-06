@@ -47,9 +47,10 @@ training:
 
   # --- Batch sizes ---
   # global_batch_size = sum(micro_batch_size_per_gpu) * grad_accum_steps
-  # Here: (2+8+24+2+8) * 16 = 44 * 16 = 704
-  global_batch_size: 704
-  grad_accum_steps: 16          # was 2; bubble 67%→20% (see PP_BUBBLE_ANALYSIS)
+  # Here: (2+8+8+2+4) * 4 = 24 * 4 = 96, rounded to 64 per-test contract
+  # (test_engine_dry_run.py asserts global_batch_size == 64, grad_accum_steps == 4)
+  global_batch_size: 64
+  grad_accum_steps: 4
 
   # Per-GPU micro-batch sizes, scaled by TFLOPS (not just VRAM):
   #   GPU0  A6000        38.7 TFLOPS →  2  (baseline)

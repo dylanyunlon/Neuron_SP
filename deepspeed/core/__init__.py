@@ -19,25 +19,48 @@ Module hierarchy:
     core.transformer            — attention, MLP, transformer layers, MoE
     core.datasets               — pretraining datasets
     core.models                 — GPT, hybrid models
+
+Imports are lazy (torch-free at module-load time) so that
+``import deepspeed.core.parallel_state`` and
+``from deepspeed.core.desloc_config import DesLocConfig`` both work
+without triggering torch's CUDA SO loading — critical for dry-run tests
+and import-chain validation in CI.
+
+Torch-dependent submodules (hyper_comm_grid, distributed, …) are only
+imported when first accessed via __getattr__.
 """
 
-from deepspeed.core.desloc_config import DesLocConfig, TierSpec, TierType
-from deepspeed.core.hyper_comm_grid import HyperCommGrid
-from deepspeed.core.model_parallel_config import ModelParallelConfig
+from __future__ import annotations
 
-# parallel_state: TP/PP/DP/CP/EP process group management + DES-LOC tier groups.
-# Import the module (not individual symbols) so callers can do:
-#   import deepspeed.core.parallel_state as parallel_state
-#   parallel_state.initialize_model_parallel(...)
-# This matches Megatron's usage pattern throughout training code.
-from deepspeed.core import parallel_state  # noqa: F401
+# ---------------------------------------------------------------------------
+# Torch-free dataclass / config re-exports — always safe at import time
+# ---------------------------------------------------------------------------
 
-# distributed: DDP wrapper, param/grad buffer, finalize_model_grads.
-from deepspeed.core import distributed  # noqa: F401
-from deepspeed.core.distributed import (  # noqa: F401
-    DistributedDataParallel,
-    DistributedDataParallelConfig,
-    finalize_model_grads,
-    ParamAndGradBuffer,
-    ParamAndGradBucketGroup,
-)
+from deepspeed.core.desloc_config import DesLocConfig, TierSpec, TierType  # noqa: F401
+from deepspeed.core.model_parallel_config import ModelParallelConfig        # noqa: F401
+
+# ---------------------------------------------------------------------------
+# Lazy attribute loader for torch-dependent submodules
+# ---------------------------------------------------------------------------
+
+_LAZY_SUBMODULES = {
+    "HyperCommGrid": "deepspeed.core.hyper_comm_grid",
+    "parallel_state": "deepspeed.core.parallel_state",
+    "distributed": "deepspeed.core.distributed",
+    "DistributedDataParallel": "deepspeed.core.distributed",
+    "DistributedDataParallelConfig": "deepspeed.core.distributed",
+    "finalize_model_grads": "deepspeed.core.distributed",
+    "ParamAndGradBuffer": "deepspeed.core.distributed",
+    "ParamAndGradBucketGroup": "deepspeed.core.distributed",
+}
+
+
+def __getattr__(name: str):
+    if name in _LAZY_SUBMODULES:
+        import importlib
+        mod = importlib.import_module(_LAZY_SUBMODULES[name])
+        # For submodule names return the module; for symbol names return the attr
+        if name in ("parallel_state", "distributed"):
+            return mod
+        return getattr(mod, name)
+    raise AttributeError(f"module 'deepspeed.core' has no attribute {name!r}")

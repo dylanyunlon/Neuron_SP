@@ -8,8 +8,6 @@ from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Dict, List, Optional, Tuple
 
-import torch
-
 
 class TierType(Enum):
     """GPU tier classification based on compute capability."""
