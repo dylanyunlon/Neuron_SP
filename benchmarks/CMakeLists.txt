@@ -28,14 +28,12 @@ set(CUDA_FLAGS
     -Xcompiler=-Wall
 )
 
-# ─── Kernel source library ───────────────────────────────────────────
-add_library(hetero_kernels STATIC
-    ${CMAKE_CURRENT_SOURCE_DIR}/../csrc/hetero_reduce/hetero_reduce.cu
-    ${CMAKE_CURRENT_SOURCE_DIR}/../csrc/hetero_reduce/fused_swiglu_ln.cu
-    ${CMAKE_CURRENT_SOURCE_DIR}/../csrc/hetero_reduce/pcie_adaptive_allreduce.cu
-)
-target_include_directories(hetero_kernels PUBLIC ${HETERO_INCLUDE_DIRS})
-target_compile_options(hetero_kernels PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${CUDA_FLAGS}>)
+# ─── Kernel source library (via csrc/hetero_reduce/CMakeLists.txt) ──
+# All five kernel TUs + correct __launch_bounds__ for SM8.6/9.0/12.0.
+add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../csrc/hetero_reduce
+                 ${CMAKE_CURRENT_BINARY_DIR}/hetero_reduce_lib)
+# Alias so benchmark targets can use the same name as before.
+add_library(hetero_kernels ALIAS hetero_reduce_kernels)
 
 # ─── Benchmarks ──────────────────────────────────────────────────────
 foreach(bench hetero_reduce fused_swiglu_ln pcie_allreduce)
