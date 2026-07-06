@@ -308,13 +308,9 @@ hetero_reduce_scatter_kernel(
     }
 
     // ── Stage 3: Tail handling ──
-    // Handle residual elements that don't fill a full vector.
-    // Uses a single thread for correctness (no atomics needed here:
-    // each tail element is handled by exactly one thread).
-    const size_t tail_start = (vec_count / stride) * stride * kVec
-                              + (tid % stride == 0 ? 0 : size_t(-1));
-
-    // Simple scalar tail for non-aligned remainder
+    // Handle residual elements (shard_count not divisible by kVec).
+    // Thread 0 handles the scalar tail sequentially; no atomics needed
+    // because all other threads have already written their vector elements.
     if (tid == 0) {
         const size_t scalar_start = vec_count * kVec;
         for (size_t e = scalar_start; e < shard_count; ++e) {
@@ -331,7 +327,6 @@ hetero_reduce_scatter_kernel(
         }
     }
     (void)smem;
-    (void)tail_start;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

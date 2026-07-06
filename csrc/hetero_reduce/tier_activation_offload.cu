@@ -65,6 +65,7 @@
 #include <stdint.h>
 #include <math.h>
 #include <algorithm>
+#include <type_traits>
 
 #include "hetero_reduce.h"
 #include "ds_kernel_utils.h"
@@ -74,10 +75,19 @@ namespace cg = cooperative_groups;
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
-static constexpr int kOffloadBlock   = 256;
-static constexpr int kOffloadVecW    = 8;   // BF16 elements per 128-bit load
-static constexpr int kQuantTileSize  = 128; // elements per quantisation tile
-static constexpr int kInt8VecW       = 16;  // INT8 elements per 128-bit load
+// SM8.6/SM9.0: 256 threads, 2 CTAs/SM.  SM12.0 Blackwell: 512 threads, 4 CTAs/SM.
+// Larger blocks on Blackwell improve occupancy on the wider 128-wide SMs.
+static constexpr int kOffloadBlockSm86   = 256;
+static constexpr int kOffloadBlockSm120  = 512;
+static constexpr int kOffloadVecW        = 8;    // BF16 elements per 128-bit load
+static constexpr int kQuantTileSize      = 128;  // elements per quantisation tile
+static constexpr int kInt8VecW           = 16;   // INT8 elements per 128-bit load
+
+// Compile-time policy: select block size and min-CTAs-per-SM by SM version.
+template <int SmVer> struct OffloadPolicy {
+    static constexpr int kBlockSize      = (SmVer >= 120) ? kOffloadBlockSm120 : kOffloadBlockSm86;
+    static constexpr int kMinBlocksPerSM = (SmVer >= 90)  ? 4 : 2;
+};
 
 // ---------------------------------------------------------------------------
 // Vectorised BF16 copy helpers
@@ -103,18 +113,20 @@ DS_D_INLINE void copy_bf16x8(const __nv_bfloat16* __restrict__ src,
 // @param num_tensors  number of activation tensors to pack
 // @param tensor_elems elements per tensor (must be divisible by 8)
 // ---------------------------------------------------------------------------
-template <int kBlockSize>
-__global__ void __launch_bounds__(kBlockSize, 2)
+template <int SmVer>
+__global__ void
+__launch_bounds__(OffloadPolicy<SmVer>::kBlockSize, OffloadPolicy<SmVer>::kMinBlocksPerSM)
 activation_pack_kernel(
     __nv_bfloat16* __restrict__              output,
     const __nv_bfloat16* const* __restrict__ inputs,
     int    num_tensors,
     size_t tensor_elems)
 {
+    constexpr int kBS = OffloadPolicy<SmVer>::kBlockSize;
     const size_t vec_per_tensor = tensor_elems / kOffloadVecW;
     const size_t total_vecs     = (size_t)num_tensors * vec_per_tensor;
-    const size_t tid    = (size_t)blockIdx.x * kBlockSize + threadIdx.x;
-    const size_t stride = (size_t)gridDim.x  * kBlockSize;
+    const size_t tid    = (size_t)blockIdx.x * kBS + threadIdx.x;
+    const size_t stride = (size_t)gridDim.x  * kBS;
 
     for (size_t v = tid; v < total_vecs; v += stride) {
         const int    tensor_idx = (int)(v / vec_per_tensor);
@@ -132,18 +144,20 @@ activation_pack_kernel(
 // Scatters a flat buffer back to `num_tensors` output tensors.
 // Inverse of activation_pack_kernel.
 // ---------------------------------------------------------------------------
-template <int kBlockSize>
-__global__ void __launch_bounds__(kBlockSize, 2)
+template <int SmVer>
+__global__ void
+__launch_bounds__(OffloadPolicy<SmVer>::kBlockSize, OffloadPolicy<SmVer>::kMinBlocksPerSM)
 activation_unpack_kernel(
     __nv_bfloat16* const* __restrict__       outputs,
     const __nv_bfloat16* __restrict__        flat,
     int    num_tensors,
     size_t tensor_elems)
 {
+    constexpr int kBS = OffloadPolicy<SmVer>::kBlockSize;
     const size_t vec_per_tensor = tensor_elems / kOffloadVecW;
     const size_t total_vecs     = (size_t)num_tensors * vec_per_tensor;
-    const size_t tid    = (size_t)blockIdx.x * kBlockSize + threadIdx.x;
-    const size_t stride = (size_t)gridDim.x  * kBlockSize;
+    const size_t tid    = (size_t)blockIdx.x * kBS + threadIdx.x;
+    const size_t stride = (size_t)gridDim.x  * kBS;
 
     for (size_t v = tid; v < total_vecs; v += stride) {
         const int    tensor_idx = (int)(v / vec_per_tensor);
@@ -275,14 +289,33 @@ void launch_activation_pack(
                     num_tensors * sizeof(const __nv_bfloat16*),
                     cudaMemcpyHostToDevice, stream);
 
-    const size_t total_vecs = (size_t)num_tensors * (tensor_elems / kOffloadVecW);
-    const int grid = (int)std::min(
-        (total_vecs + kOffloadBlock - 1) / kOffloadBlock, (size_t)65535);
-
-    // Pack is bandwidth-bound; block size doesn't change throughput much.
-    // Use 256 threads for all SM versions.
-    activation_pack_kernel<kOffloadBlock><<<grid, kOffloadBlock, 0, stream>>>(
-        output, d_inputs, num_tensors, tensor_elems);
+    // SM12.0 (Blackwell): 512-thread blocks improve occupancy on wider SMs.
+    // SM8.6 / SM9.0: 256-thread blocks.
+    // Three-way SM dispatch: SM12.0 (512 threads, 4 CTAs/SM),
+    //                          SM9.0  (256 threads, 4 CTAs/SM),
+    //                          SM8.6  (256 threads, 2 CTAs/SM).
+    // Using block-size as the sole discriminator conflated SM9.0 and SM8.6,
+    // giving H100 the wrong kMinBlocksPerSM=2 __launch_bounds__ hint.
+    // Fix: dispatch on sm_version first, then block size.
+    if (sm_version >= 120) {
+        constexpr int kBS = kOffloadBlockSm120;
+        const size_t total_vecs = (size_t)num_tensors * (tensor_elems / kOffloadVecW);
+        const int grid = (int)std::min((total_vecs + kBS - 1) / kBS, (size_t)65535);
+        activation_pack_kernel<120><<<grid, kBS, 0, stream>>>(
+            output, d_inputs, num_tensors, tensor_elems);
+    } else if (sm_version >= 90) {
+        constexpr int kBS = kOffloadBlockSm86;  // same block size, different min-CTAs
+        const size_t total_vecs = (size_t)num_tensors * (tensor_elems / kOffloadVecW);
+        const int grid = (int)std::min((total_vecs + kBS - 1) / kBS, (size_t)65535);
+        activation_pack_kernel<90><<<grid, kBS, 0, stream>>>(
+            output, d_inputs, num_tensors, tensor_elems);
+    } else {
+        constexpr int kBS = kOffloadBlockSm86;
+        const size_t total_vecs = (size_t)num_tensors * (tensor_elems / kOffloadVecW);
+        const int grid = (int)std::min((total_vecs + kBS - 1) / kBS, (size_t)65535);
+        activation_pack_kernel<86><<<grid, kBS, 0, stream>>>(
+            output, d_inputs, num_tensors, tensor_elems);
+    }
 
     cudaFreeAsync(d_inputs, stream);
 }
@@ -302,12 +335,26 @@ void launch_activation_unpack(
                     num_tensors * sizeof(__nv_bfloat16*),
                     cudaMemcpyHostToDevice, stream);
 
-    const size_t total_vecs = (size_t)num_tensors * (tensor_elems / kOffloadVecW);
-    const int grid = (int)std::min(
-        (total_vecs + kOffloadBlock - 1) / kOffloadBlock, (size_t)65535);
-
-    activation_unpack_kernel<kOffloadBlock><<<grid, kOffloadBlock, 0, stream>>>(
-        d_outputs, flat, num_tensors, tensor_elems);
+    // Three-way SM dispatch — mirrors launch_activation_pack fix above.
+    if (sm_version >= 120) {
+        constexpr int kBS = kOffloadBlockSm120;
+        const size_t total_vecs = (size_t)num_tensors * (tensor_elems / kOffloadVecW);
+        const int grid = (int)std::min((total_vecs + kBS - 1) / kBS, (size_t)65535);
+        activation_unpack_kernel<120><<<grid, kBS, 0, stream>>>(
+            d_outputs, flat, num_tensors, tensor_elems);
+    } else if (sm_version >= 90) {
+        constexpr int kBS = kOffloadBlockSm86;
+        const size_t total_vecs = (size_t)num_tensors * (tensor_elems / kOffloadVecW);
+        const int grid = (int)std::min((total_vecs + kBS - 1) / kBS, (size_t)65535);
+        activation_unpack_kernel<90><<<grid, kBS, 0, stream>>>(
+            d_outputs, flat, num_tensors, tensor_elems);
+    } else {
+        constexpr int kBS = kOffloadBlockSm86;
+        const size_t total_vecs = (size_t)num_tensors * (tensor_elems / kOffloadVecW);
+        const int grid = (int)std::min((total_vecs + kBS - 1) / kBS, (size_t)65535);
+        activation_unpack_kernel<86><<<grid, kBS, 0, stream>>>(
+            d_outputs, flat, num_tensors, tensor_elems);
+    }
 
     cudaFreeAsync(d_outputs, stream);
 }
