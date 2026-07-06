@@ -1952,11 +1952,9 @@ class DesLocEngine:
         from deepspeed.runtime.core_adapters import build_hybrid_cp_schedule
         _cp_fb = build_hybrid_cp_schedule(cfg)
 
-        # Synchronize all ranks once before the training loop begins.
-        # This ensures every rank is ready before step 0, preventing NCCL
-        # deadlocks caused by ranks entering the loop at different times.
-        if dist.is_initialized():
-            dist.barrier()
+        # Log that this rank is entering the training loop (no barrier — barriers deadlock)
+        _my_rank = dist.get_rank() if dist.is_initialized() else 0
+        logger.warning("rank=%d entering training loop (step=%d)", _my_rank, self.global_step)
 
         for step in range(self.global_step, cfg.total_steps):
             # DistributedOptimizer.zero_grad() zeroes its grad_data buffers +
