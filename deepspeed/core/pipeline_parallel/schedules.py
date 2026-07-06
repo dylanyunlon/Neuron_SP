@@ -2662,6 +2662,23 @@ def forward_backward_pipelining_without_interleaving(
     # Compute number of warmup microbatches.
     num_warmup_microbatches = p2p_communicator.total_stages - p2p_communicator.current_stage - 1
     num_warmup_microbatches = min(num_warmup_microbatches, num_microbatches)
+
+    # DES-LOC: let the bubble filler extend the warmup count for fast ranks (H100).
+    # Fast ranks pre-compute extra microbatches during the warmup phase so that
+    # more activations are ready in SRAM when the slow stages catch up, reducing
+    # the effective steady-state bubble.  The extension is capped at
+    # min(num_microbatches, total_stages - 1) so we never exceed the activation
+    # memory budget.
+    _desloc = getattr(config, 'desloc', None)
+    _bubble_filler: Optional["HeterogeneousBubbleFiller"] = getattr(_desloc, 'bubble_filler', None)
+    _current_pp_rank = p2p_communicator.current_stage
+    if _bubble_filler is not None:
+        _extended_warmup = _bubble_filler.warmup_count_for_rank(
+            _current_pp_rank, num_warmup_microbatches
+        )
+        # Cap at num_microbatches so we never run more warmups than microbatches
+        num_warmup_microbatches = min(_extended_warmup, num_microbatches)
+
     num_microbatches_remaining = num_microbatches - num_warmup_microbatches
 
     # Checkpoint the activations of partial Transformer layers in a number of micro-batches
@@ -2735,6 +2752,11 @@ def forward_backward_pipelining_without_interleaving(
         input_tensor = p2p_communicator.recv_forward(
             recv_tensor_shapes, p2p_communicator.is_pp_first_stage
         )
+
+        # DES-LOC: time each warmup forward pass to calibrate the stage clock
+        if _bubble_filler is not None:
+            _bubble_filler.record_compute_start(_current_pp_rank)
+
         output_tensor, num_tokens = forward_step(
             forward_step_func,
             data_iterator,
@@ -2750,6 +2772,10 @@ def forward_backward_pipelining_without_interleaving(
             current_microbatch=i,
             is_last_stage=p2p_communicator.is_pp_last_stage,
         )
+
+        if _bubble_filler is not None:
+            _bubble_filler.record_compute_stop(_current_pp_rank)
+
         p2p_communicator.send_forward(output_tensor, p2p_communicator.is_pp_last_stage)
         total_num_tokens += num_tokens
 
@@ -2766,6 +2792,22 @@ def forward_backward_pipelining_without_interleaving(
             recv_tensor_shapes, p2p_communicator.is_pp_first_stage
         )
 
+    # DES-LOC: fill the post-warmup bubble on fast ranks (H100).
+    # This is the largest bubble in the 1F1B schedule — (PP-1) * slow_stage_time.
+    # Fast ranks can pre-compute extra microbatches here while slow ranks are
+    # still finishing their warmup passes.
+    if _bubble_filler is not None and not forward_only:
+        _bubble_filler.maybe_fill_bubble(
+            pp_rank=_current_pp_rank,
+            forward_data_store=forward_data_store,
+            config=config,
+            forward_step_func=forward_step_func,
+            data_iterator=data_iterator,
+            model=model,
+            num_microbatches=num_microbatches,
+            speculative_mb_start=num_warmup_microbatches,
+        )
+
     # Run 1F1B in steady state.
     for i in range(num_microbatches_remaining):
         last_iteration = i == (num_microbatches_remaining - 1)
@@ -2777,6 +2819,10 @@ def forward_backward_pipelining_without_interleaving(
             ) >= config.num_microbatches_with_partial_activation_checkpoints
         else:
             checkpoint_activations_microbatch = None
+
+        # DES-LOC: time each steady-state forward pass to keep stage-clock EMA current
+        if _bubble_filler is not None:
+            _bubble_filler.record_compute_start(_current_pp_rank)
 
         output_tensor, num_tokens = forward_step(
             forward_step_func,
@@ -2795,6 +2841,9 @@ def forward_backward_pipelining_without_interleaving(
             current_microbatch=i + num_warmup_microbatches,
             is_last_stage=p2p_communicator.is_pp_last_stage,
         )
+
+        if _bubble_filler is not None:
+            _bubble_filler.record_compute_stop(_current_pp_rank)
         total_num_tokens += num_tokens
 
         if forward_only:
@@ -2898,11 +2947,11 @@ def forward_backward_pipelining_without_interleaving(
     if hasattr(config, 'cuda_graph_impl') and config.cuda_graph_impl == "local":
         create_cudagraphs()
 
-    return forward_data_store
+    # DES-LOC: flush any pending speculative forward data from the bubble filler
+    if _bubble_filler is not None:
+        _bubble_filler.drain(forward_data_store, config=None)
 
-# ===========================================================================
-# DES-LOC pipeline layer-split registry
-# ===========================================================================
+    return forward_data_store
 
 def set_pipeline_layer_split(split: List[int]) -> None:
     """Register per-stage layer counts for heterogeneous (DES-LOC) pipelines."""
