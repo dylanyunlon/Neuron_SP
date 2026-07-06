@@ -61,6 +61,7 @@ import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
 from deepspeed.core.model_parallel_config import ModelParallelConfig
+import copy
 
 
 # ---------------------------------------------------------------------------

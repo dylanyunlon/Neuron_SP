@@ -13,6 +13,7 @@ from deepspeed.core.fp8_utils import is_mxfp8tensor
 from .copy_services.base import CopyService
 from .transforms import ReshardTransform, _ensure_sendable
 from .utils import ReshardPlan, get_refit_tensor_dict
+import copy
 
 logger = logging.getLogger(__name__)
 

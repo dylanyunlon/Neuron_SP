@@ -7,6 +7,7 @@ from collections.abc import Callable
 from typing import Any, Concatenate, Generic, Literal, ParamSpec, Protocol, TypeVar, overload
 
 import torch
+import functools
 
 P = ParamSpec('P')
 R_co = TypeVar('R_co', covariant=True)

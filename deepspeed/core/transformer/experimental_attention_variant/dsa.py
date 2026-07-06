@@ -20,6 +20,7 @@ from deepspeed.core.transformer.enums import AttnMaskType
 from deepspeed.core.transformer.module import MegatronModule
 from deepspeed.core.transformer.spec_utils import ModuleSpec, build_module
 from deepspeed.core.transformer.transformer_config import TransformerConfig
+import logging
 
 try:
     from fast_hadamard_transform import hadamard_transform

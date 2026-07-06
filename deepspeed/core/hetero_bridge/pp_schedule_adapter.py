@@ -33,6 +33,7 @@ import torch
 
 import logging
 from typing import Callable, Dict, List, Optional, TYPE_CHECKING
+import math
 
 if TYPE_CHECKING:
     import torch

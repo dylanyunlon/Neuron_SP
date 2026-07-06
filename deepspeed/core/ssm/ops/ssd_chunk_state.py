@@ -9,6 +9,7 @@ import triton.language as tl
 from packaging import version
 
 from deepspeed.core.ssm.ops.determinism import autotune_configs
+import math
 
 try:
     TRITON3 = version.parse(triton.__version__) >= version.parse("3.0.0")

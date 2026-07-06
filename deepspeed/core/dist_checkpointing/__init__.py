@@ -467,6 +467,7 @@ def load(
 
 import os as _os
 import threading as _threading
+import copy
 
 
 def _background_checkpoint_worker(save_fn, *args, **kwargs):

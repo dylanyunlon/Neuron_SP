@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 from collections import defaultdict, deque
+import contextlib
 from contextlib import nullcontext
 from typing import Any, Dict, List, Optional, Tuple
 

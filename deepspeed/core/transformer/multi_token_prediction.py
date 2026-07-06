@@ -53,6 +53,7 @@ from deepspeed.core.tensor_parallel import (
 )
 from deepspeed.core.transformer.module import MegatronModule
 from deepspeed.core.transformer.transformer_config import TransformerConfig
+import logging
 
 # ---------------------------------------------------------------------------
 # Optional / conditional imports

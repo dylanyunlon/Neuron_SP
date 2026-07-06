@@ -843,6 +843,7 @@ import enum
 import torch
 import torch.distributed as dist
 from typing import Optional
+import os
 
 
 class CommRole(enum.Enum):

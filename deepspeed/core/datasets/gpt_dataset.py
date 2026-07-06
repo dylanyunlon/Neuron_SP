@@ -17,6 +17,7 @@ from deepspeed.core.datasets.object_storage_utils import ObjectStorageConfig, is
 from deepspeed.core.datasets.utils import Split
 from deepspeed.core.tokenizers import MegatronTokenizerBase
 from deepspeed.core.utils import log_single_rank
+import copy
 
 logger = logging.getLogger(__name__)
 
