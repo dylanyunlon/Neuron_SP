@@ -1745,12 +1745,9 @@ class DesLocEngine:
         # because the bandwidth asymmetry causes timeout on slower links.
         # Check: if any tier has no NVLink, force SP=1.
         _force_sp1 = getattr(self.config, 'no_sp', False)
-        if not _force_sp1 and hasattr(self, '_tier_specs'):
-            # PCIe-only: all GPUs connected via NODE/SYS, no NV# links
-            _force_sp1 = True  # default to SP=1 on heterogeneous setups
-            logger.info("AutoSP disabled: PCIe-only heterogeneous topology detected")
         if _force_sp1:
             _sp_world_size = 1
+            logger.info("AutoSP disabled via config.no_sp=True")
         if _sp_world_size > 1:
             sp_size = _sp_world_size
 
@@ -1892,6 +1889,11 @@ class DesLocEngine:
                         layer.attn.forward = types.MethodType(_sp_attn_forward, layer.attn)
 
             self._sp_active = True
+            # Propagate to model so RoPE uses full seq_len for freqs generation
+            try:
+                self.model._sp_active = True
+            except (AttributeError, TypeError):
+                pass
             logger.info("AutoSP: direct SP injection (sp_size=%d, monkey-patch, no torch.compile)", sp_size)
 
         # Wire HeteroGradNormSkipController into this engine via

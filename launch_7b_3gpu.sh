@@ -37,7 +37,7 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,max_split_size_mb:256
 # To re-enable SP once the deadlock is resolved, either:
 #   export NEURON_SP_DISABLE_AUTOSP=0   (before calling this script), or
 #   remove / comment-out the line below.
-export NEURON_SP_DISABLE_AUTOSP=${NEURON_SP_DISABLE_AUTOSP:-1}
+export NEURON_SP_DISABLE_AUTOSP=${NEURON_SP_DISABLE_AUTOSP:-0}
 
 # ── Optional per-layer forward logging ───────────────────────────────────────
 # Set NEURON_SP_LAYER_LOG=1 to emit a log line before/after every transformer
