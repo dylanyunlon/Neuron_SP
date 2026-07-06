@@ -35,9 +35,29 @@ Public API:
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any, List, Optional
 
 import torch
+
+# ---------------------------------------------------------------------------
+# Neuron_SP hetero CUDA reduce kernel — fast path for BF16 allreduce shard sum.
+# When available, replaces torch.sum in the wait() accumulation with our
+# launch_fused_bf16_reduce CUDA kernel (vectorised BF16->FP32->BF16).
+# ---------------------------------------------------------------------------
+try:
+    from op_builder.hetero_reduce import HeteroReduceBuilder as _RSHeteroBuilder
+    _rs_hetero_op = _RSHeteroBuilder().load()
+    _HAVE_RS_HETERO = hasattr(_rs_hetero_op, "fused_bf16_reduce")
+except Exception:
+    _rs_hetero_op = None
+    _HAVE_RS_HETERO = False
+
+def _rs_sm_version() -> int:
+    try:
+        major, minor = torch.cuda.get_device_capability()
+        return major * 10 + minor
+    except Exception:
+        return 86
 
 
 # ---------------------------------------------------------------------------
@@ -83,18 +103,46 @@ class _ReduceScatterWithFP32AccumulationWorkHandle:
         if self.all_to_all_handle is not None:
             self.all_to_all_handle.wait()
 
-        # 2. Local FP32 accumulation: reshape to (world_size, shard_size) then
-        #    sum along dim=0 in float32 for higher-precision gradient accumulation.
-        #    This avoids the precision loss of NCCL's built-in BF16/FP16 reduce.
+        # 2. Local FP32 accumulation: sum world_size shards.
+        #
+        # Fast path: for BF16 tensors with numel divisible by 8, use our
+        # launch_fused_bf16_reduce CUDA kernel which does BF16->FP32->BF16
+        # accumulation in a single vectorised pass.  This avoids the
+        # intermediate FP32 allocation of the torch.sum path.
+        #
+        # Fallback: torch.sum(dtype=float32) for FP16 or non-div-8 cases.
+        ata = self.all_to_all_output_tensor
+        shard_size = ata.numel() // self.world_size
+
+        if (_HAVE_RS_HETERO
+                and ata.dtype == torch.bfloat16
+                and shard_size % 8 == 0
+                and self.output_tensor.is_contiguous()):
+            try:
+                # Build list of shard views — each is [shard_size] BF16.
+                shards: List[torch.Tensor] = [
+                    ata[i * shard_size:(i + 1) * shard_size].contiguous()
+                    for i in range(self.world_size)
+                ]
+                # fused_bf16_reduce accumulates into output_tensor in-place.
+                _rs_hetero_op.fused_bf16_reduce(
+                    self.output_tensor,
+                    shards,
+                    _rs_sm_version(),
+                )
+                return  # done — output_tensor is already in BF16
+            except Exception:
+                pass  # fall through to torch.sum
+
+        # Standard FP32 accumulation path.
         output_tensor_in_fp32 = torch.sum(
-            self.all_to_all_output_tensor.view((self.world_size, -1)),
+            ata.view((self.world_size, -1)),
             dim=0,
             dtype=torch.float32,
         )
         assert output_tensor_in_fp32.dtype == torch.float32
 
-        # 3. Downcast the FP32 sum back to the original tensor dtype and write
-        #    into output_tensor in-place (copy_ handles dtype conversion).
+        # 3. Downcast FP32 -> original dtype and write into output_tensor.
         self.output_tensor.copy_(output_tensor_in_fp32)
 
 
