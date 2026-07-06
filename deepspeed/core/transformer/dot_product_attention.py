@@ -48,6 +48,117 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# Fused attention kernel (issue #135)
+# ---------------------------------------------------------------------------
+# Lazy import: ds_fused_attention is a CUDA extension compiled via
+# deepspeed.ops.op_builder (setup.py entry "ds_fused_attention").
+# If the extension is not compiled or unavailable we fall back to the
+# existing pure-PyTorch path transparently — no change in correctness.
+
+_ds_fused_attn: object = None
+_ds_fused_attn_tried: bool = False
+
+
+def _load_fused_attn() -> object:
+    """Return the ds_fused_attention extension module, or None on failure."""
+    global _ds_fused_attn, _ds_fused_attn_tried
+    if _ds_fused_attn_tried:
+        return _ds_fused_attn
+    _ds_fused_attn_tried = True
+    try:
+        import ds_fused_attention as _mod  # built by setup.py / op_builder
+        _ds_fused_attn = _mod
+        logger.debug("DotProductAttention: ds_fused_attention CUDA kernel loaded (issue #135).")
+    except ImportError:
+        try:
+            # Fallback: torch.ops load path used by some DeepSpeed op builders
+            import torch.ops
+            import deepspeed.ops.op_builder as _ob
+            builder = _ob.FusedAttentionBuilder()
+            _ds_fused_attn = builder.load()
+            logger.debug(
+                "DotProductAttention: ds_fused_attention loaded via op_builder (issue #135)."
+            )
+        except Exception as e:
+            logger.debug(
+                "DotProductAttention: fused attention kernel unavailable (%s). "
+                "Using PyTorch fallback.", e
+            )
+            _ds_fused_attn = None
+    return _ds_fused_attn
+
+
+def _sm_version() -> int:
+    """Return SM version integer (e.g. 86, 90, 120) for the current device."""
+    if not torch.cuda.is_available():
+        return 86
+    dev = torch.cuda.current_device()
+    major, minor = torch.cuda.get_device_capability(dev)
+    return major * 10 + minor
+
+
+def _fused_attn_available() -> bool:
+    """Return True if the fused kernel is loaded and CUDA is available."""
+    return _load_fused_attn() is not None and torch.cuda.is_available()
+
+
+def _run_fused_attention(
+    query: Tensor,
+    key: Tensor,
+    value: Tensor,
+    softmax_scale: float,
+    causal: bool,
+    window_size: Optional[tuple],
+    attention_dropout: "nn.Dropout",
+    training: bool,
+) -> Tensor:
+    """Run the fused BF16 attention kernel.
+
+    Converts SBH layout [sq, b, np, hn] → BHSD layout [b, np, sq, hn],
+    calls launch_fused_attention, then reshapes back.
+
+    Returns context in [sq, b, hp] layout (same as the PyTorch path).
+    """
+    mod = _load_fused_attn()
+    if mod is None:
+        raise RuntimeError("ds_fused_attention kernel not available")
+
+    # Input layout: [sq, b, np, hn] → [b, np, sq, hn] (contiguous)
+    sq, b, np_heads, hn = query.shape
+    sk = key.shape[0]
+
+    # Cast to BF16 if needed (kernel requires BF16)
+    q_bf = query.permute(1, 2, 0, 3).contiguous().to(torch.bfloat16)   # [b, np, sq, hn]
+    k_bf = key.permute(1, 2, 0, 3).contiguous().to(torch.bfloat16)     # [b, nkv, sk, hn]
+    v_bf = value.permute(1, 2, 0, 3).contiguous().to(torch.bfloat16)   # [b, nkv, sk, hn]
+
+    # SWA window
+    win_left  = window_size[0] if window_size is not None else -1
+    win_right = window_size[1] if window_size is not None else -1
+
+    # Dropout
+    dropout_p = attention_dropout.p if training else 0.0
+
+    sm = _sm_version()
+
+    output, _lse = mod.fused_attention_forward(
+        q_bf, k_bf, v_bf,
+        softmax_scale,
+        causal,
+        win_left,
+        win_right,
+        dropout_p,
+        0,   # philox_seed  (Python CUDARNGTracker manages RNG externally)
+        0,   # philox_offset
+        sm,
+    )
+    # output: [b, np, sq, hn] → [sq, b, np * hn]
+    output = output.permute(2, 0, 1, 3).contiguous()  # [sq, b, np, hn]
+    output = output.view(sq, b, np_heads * hn)
+    return output
+
+
+# ---------------------------------------------------------------------------
 # Lazy parallel-state helpers (safe when dist not initialised)
 # ---------------------------------------------------------------------------
 
@@ -966,6 +1077,50 @@ class DotProductAttention(MegatronModule):
         # ------------------------------------------------------------------
         # Standard (non-CP) path
         # ------------------------------------------------------------------
+
+        # ---------------------------------------------------------------
+        # Fast path: fused CUDA kernel (issue #135)
+        # Conditions for fused kernel dispatch:
+        #   1. ds_fused_attention extension is compiled and available.
+        #   2. No softmax_offset (learnable / off-by-one variants are
+        #      incompatible with the fused online-softmax; they go through
+        #      the full PyTorch path which applies them in FusedScaleMaskSoftmax).
+        #   3. No attention_bias (e.g. ALiBi) — the fused kernel does not yet
+        #      accept an additive pre-softmax bias tensor.
+        #   4. apply_query_key_layer_scaling == False  OR  coeff already folded
+        #      into softmax_scale (which it is — see __init__).
+        #   5. query dtype is BF16 (kernel only supports BF16; FP16 and FP32
+        #      fall through to the PyTorch path).
+        # ---------------------------------------------------------------
+        _use_fused = (
+            _fused_attn_available()
+            and getattr(self, "softmax_offset", None) is None
+            and attention_bias is None
+            and query.dtype == torch.bfloat16
+            and not (self.qk_clip and self.training)  # logit tracking needs scores
+        )
+
+        if _use_fused:
+            is_causal = (self.attn_mask_type == "causal") and (attention_mask is None)
+            try:
+                context = _run_fused_attention(
+                    query=query,
+                    key=key,
+                    value=value,
+                    softmax_scale=self.softmax_scale,
+                    causal=is_causal,
+                    window_size=self.window_size,
+                    attention_dropout=self.attention_dropout,
+                    training=self.training,
+                )
+                return context
+            except Exception as _fused_err:
+                logger.debug(
+                    "DotProductAttention layer %d: fused kernel failed (%s), "
+                    "falling back to PyTorch path.",
+                    self.layer_number, _fused_err,
+                )
+                # Fall through to the PyTorch path below.
 
         # ---------------------------------------------------------------
         # Raw attention scores  [b, np/p, sq, sk]
