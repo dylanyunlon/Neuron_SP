@@ -6,7 +6,8 @@ implementations per compute capability (SM86 for A6000, SM90 for H100).
 Key fusions:
 - fused_bias_dropout:  bias + dropout + residual add (JIT-fused)
 - fused_bias_geglu / fused_bias_swiglu: bias + activation in one kernel
-- fused_layer_norm:  apex persistent / fused LayerNorm with PyTorch fallback
+- fused_layer_norm:  apex persistent / fused LayerNorm + RMSNorm with PyTorch fallback
+- fused_rope:        rotary position embedding CUDA kernel wrapper
 - fused_softmax:     memory-efficient softmax (critical for A6000 VRAM)
 """
 from deepspeed.core.fusions.fused_bias_dropout import (
@@ -31,7 +32,18 @@ from deepspeed.core.fusions.fused_bias_swiglu import (
     weighted_bias_swiglu_impl,
     weighted_swiglu,
 )
-from deepspeed.core.fusions.fused_layer_norm import FusedLayerNorm
+from deepspeed.core.fusions.fused_layer_norm import (
+    FusedLayerNorm,
+    FusedRMSNorm,
+    MixedFusedLayerNorm,
+    MixedFusedRMSNorm,
+    get_layer_norm,
+)
+from deepspeed.core.fusions.fused_rope import (
+    FusedRoPEFunc,
+    apply_rotary_pos_emb_fused,
+    yarn_get_mscale,
+)
 from deepspeed.core.fusions.fused_softmax import (
     FusedScaleMaskSoftmax,
     ScaledMaskedSoftmax,
@@ -62,6 +74,14 @@ __all__ = [
     "weighted_swiglu",
     # fused_layer_norm
     "FusedLayerNorm",
+    "FusedRMSNorm",
+    "MixedFusedLayerNorm",
+    "MixedFusedRMSNorm",
+    "get_layer_norm",
+    # fused_rope
+    "FusedRoPEFunc",
+    "apply_rotary_pos_emb_fused",
+    "yarn_get_mscale",
     # fused_softmax
     "FusedScaleMaskSoftmax",
     "ScaledMaskedSoftmax",
