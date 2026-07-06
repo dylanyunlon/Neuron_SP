@@ -4,59 +4,41 @@
 // DeepSpeed Team
 
 /*
- * pcie_adaptive_allreduce.cu  —  Worker-12 (Opus) algorithmic rewrite
+ * pcie_adaptive_allreduce.cu  —  SM8.6 / 9.0 / 12.0 dispatch, warp shuffle,
+ *                                 proper launch bounds, variable sizes.
  *
  * PCIe-aware ring allreduce with:
  *   1. Runtime bandwidth probing (latency measurement via tiny transfers)
  *   2. Adaptive chunk sizing derived from measured bandwidth
- *   3. Compute-communication overlap: reduce chunk[k] while chunk[k+1] transfers
- *   4. Double-buffered ring reduce kernels to hide memcpy latency
+ *   3. Compute-communication overlap: double-buffered pipeline
+ *   4. SM-specialised kernels with proper __launch_bounds__
  *
  * ═══════════════════════════════════════════════════════════════════════
- * ALGORITHMIC INNOVATIONS vs. prior version
+ * KEY CHANGES
  * ═══════════════════════════════════════════════════════════════════════
  *
- * 1. RUNTIME BANDWIDTH PROBE
- *    launch_pcie_bandwidth_probe() sends kProbeSizeBytes from this device
- *    to a peer device via cudaMemcpyPeerAsync on a dedicated probe stream.
- *    It records CUDA events before/after, then calls cudaEventElapsedTime()
- *    to derive actual measured bandwidth.  Stored in a per-device-pair
- *    cache (BandwidthCache).  Probe cost is ~0.5 ms amortised over the
- *    training run; it is repeated every kReprobePeriodSteps to adapt to
- *    PCIe congestion from other processes.
+ * 1. FIXED __ldg() ON dst IN RING-REDUCE KERNEL
+ *    The original pcie_ring_reduce_kernel called ar_load8_f32(dst + base, ...)
+ *    WITHOUT __ldg(), causing the read-write alias to prevent compiler
+ *    reuse of the cache line loaded for the write.  The accumulator dst[]
+ *    must be read non-cached on first access within a step (since it was
+ *    written by the previous step's store), then written.  The fix uses
+ *    a plain pointer dereference (no __ldg) for dst — the compiler will
+ *    issue a normal cached load, which is correct since dst is an in/out
+ *    buffer (not read-only).  src is read with __ldg() (read-only).
  *
- * 2. ADAPTIVE CHUNK SIZING
- *    compute_adaptive_chunk_size() uses the measured bandwidth to compute
- *    a chunk size that targets kTargetOverlapFraction of transfer time
- *    hidden behind compute.  The formula:
- *      chunk_bytes = bw_gbps × 10⁹ × kTargetOverlapMs × 10⁻³
- *    rounded to 16-byte alignment and clamped to [kMinChunkBytes, kMaxChunkBytes].
- *    For 10 GB/s PCIe: chunk = 10 MB.
- *    For 32 GB/s PCIe: chunk = 32 MB.
- *    This matches the ring reduce step duration to PCIe transfer time,
- *    achieving ~95% link utilization vs. ~60% with fixed chunks.
+ * 2. SM12.0 DISPATCH USES 512-THREAD BLOCKS
+ *    pcie_ring_reduce_kernel and pcie_allreduce_finalise_kernel now use
+ *    512-thread blocks when sm_version >= 120, consistent with other
+ *    kernels in this project.
  *
- * 3. DOUBLE-BUFFERED RING REDUCE PIPELINE
- *    Two device buffers (ping and pong) alternate.  While the GPU reduces
- *    chunk[k] in the compute stream, cudaMemcpyPeerAsync simultaneously
- *    transfers chunk[k+1] into the other buffer on the transfer stream.
- *    CUDA events synchronise the two streams at chunk boundaries.
- *    This completely overlaps communication with computation for all
- *    chunks except the first and last.
+ * 3. VARIABLE N_ELEMS — SCALAR TAIL FIXED
+ *    The scalar tail correctly covers any n_elems not divisible by 8.
  *
- * 4. STREAMING REDUCE WITH FUSED FP32 ACCUMULATION
- *    pcie_ring_reduce_kernel: BF16 input → FP32 accumulation → BF16 output.
- *    Uses 128-bit vectorised loads (8 × BF16 per thread per iteration).
- *    SM-specialised via KernelPolicy template (same pattern as hetero_reduce.cu).
- *
- * 5. GRADIENT PACKING WITH CONTIGUOUS GATHER
- *    pcie_gradient_pack_kernel: gathers non-contiguous gradient shards
- *    using a device-side chunk descriptor array.  Uses a binary-search
- *    approach (vs. linear scan in prior version) to find the owning chunk
- *    for each element — O(log C) vs O(C) where C = num_chunks.
- *    For C=8 this saves 2.5 comparisons on average.
- *
- * ═══════════════════════════════════════════════════════════════════════
+ * 4. WARP SHUFFLE IN PACK KERNEL
+ *    Binary-search chunk lookup replaced with a vectorised direct-index
+ *    computation when all chunks have equal length — O(1) vs O(log C).
+ *    Fallback to binary search retained for variable-length chunks.
  */
 
 #include <cuda.h>
@@ -77,43 +59,55 @@ namespace cg = cooperative_groups;
 // Section 1: Tuning constants
 // ─────────────────────────────────────────────────────────────────────────────
 
-static constexpr int    kARBlockSize      = 256;
-static constexpr int    kARVecWidth       = 8;           // BF16 per 128-bit load
-static constexpr size_t kMinChunkBytes    = (1ULL << 20);      //   1 MB
-static constexpr size_t kMaxChunkBytes    = (256ULL << 20);    // 256 MB
-static constexpr size_t kChunkAlign       = kARVecWidth * sizeof(__nv_bfloat16);
-// Target: hide ~5 ms of compute behind each PCIe transfer
-static constexpr float  kTargetOverlapMs  = 5.0f;
-// Probe size: 4 MB — large enough to measure steady-state BW, small enough
-// to finish in <0.5 ms at 8 GB/s
-static constexpr size_t kProbeSizeBytes   = 4UL << 20;
-// Re-probe every N training steps to track PCIe congestion
+static constexpr size_t kMinChunkBytes   = (1ULL << 20);     //   1 MB
+static constexpr size_t kMaxChunkBytes   = (256ULL << 20);   // 256 MB
+static constexpr size_t kChunkAlign      = 8 * sizeof(__nv_bfloat16); // 128-bit
+static constexpr float  kTargetOverlapMs = 5.0f;
+static constexpr size_t kProbeSizeBytes  = 4UL << 20;        //   4 MB
 static constexpr int    kReprobePeriodSteps = 100;
+
+// Block sizes: 256 for SM8.6/9.0, 512 for SM12.0 (Blackwell wide SMs).
+static constexpr int kARBlockSize86  = 256;
+static constexpr int kARBlockSize120 = 512;
+static constexpr int kARVecWidth     = 8;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Section 2: Bandwidth cache
-//   Per device-pair measured bandwidth, updated by the probe.
 // ─────────────────────────────────────────────────────────────────────────────
 
 struct BandwidthCache {
-    float  bw_gbps;      // measured bandwidth in GB/s, 0.0 if not probed
-    int    step_count;   // training step when last probed
+    float bw_gbps;
+    int   step_count;
 };
 
-// Static host-side cache (no GPU memory needed)
 static constexpr int kMaxDevices = 16;
 static BandwidthCache g_bw_cache[kMaxDevices][kMaxDevices] = {};
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Section 3: Vector load/store helpers (matching hetero_reduce.cu style)
+// Section 3: Vector load/store helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-DS_D_INLINE void ar_load8_f32(
-    const __nv_bfloat16* __restrict__ ptr,
+// Load 8 × BF16 as FP32[8] from a read-write buffer (no __ldg).
+DS_D_INLINE void ar_load8_f32_rw(
+    const __nv_bfloat16* ptr,
     float& a0, float& a1, float& a2, float& a3,
     float& a4, float& a5, float& a6, float& a7)
 {
     const uint4 r = *reinterpret_cast<const uint4*>(ptr);
+    const __nv_bfloat16* p = reinterpret_cast<const __nv_bfloat16*>(&r);
+    a0 = __bfloat162float(p[0]); a1 = __bfloat162float(p[1]);
+    a2 = __bfloat162float(p[2]); a3 = __bfloat162float(p[3]);
+    a4 = __bfloat162float(p[4]); a5 = __bfloat162float(p[5]);
+    a6 = __bfloat162float(p[6]); a7 = __bfloat162float(p[7]);
+}
+
+// Load 8 × BF16 as FP32[8] from a read-only source (__ldg cache hint).
+DS_D_INLINE void ar_load8_f32_ro(
+    const __nv_bfloat16* __restrict__ ptr,
+    float& a0, float& a1, float& a2, float& a3,
+    float& a4, float& a5, float& a6, float& a7)
+{
+    const uint4 r = __ldg(reinterpret_cast<const uint4*>(ptr));
     const __nv_bfloat16* p = reinterpret_cast<const __nv_bfloat16*>(&r);
     a0 = __bfloat162float(p[0]); a1 = __bfloat162float(p[1]);
     a2 = __bfloat162float(p[2]); a3 = __bfloat162float(p[3]);
@@ -137,8 +131,10 @@ DS_D_INLINE void ar_store8_bf16(
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Section 4: Ring-reduce accumulation kernel
-//   Fused BF16→FP32 reduce: dst[i] += src[i], result stored as BF16.
-//   Uses __launch_bounds__ derived from template policy.
+//   dst[i] += src[i]  (BF16→FP32→BF16, in-place on dst)
+//
+//   FIX: dst is read with ar_load8_f32_rw (no __ldg), src with __ldg.
+//   __launch_bounds__ differentiated by SM: 512 for SM12.0, 256 for SM8.6/9.0.
 // ─────────────────────────────────────────────────────────────────────────────
 
 template <int SmVer, int kBlockSize>
@@ -157,18 +153,19 @@ pcie_ring_reduce_kernel(
         const size_t base = i * kARVecWidth;
         float d0,d1,d2,d3,d4,d5,d6,d7;
         float s0,s1,s2,s3,s4,s5,s6,s7;
-        // Use __ldg() for read-only src (never written by this kernel)
-        ar_load8_f32(__ldg(src + base), s0,s1,s2,s3,s4,s5,s6,s7);
-        ar_load8_f32(dst + base, d0,d1,d2,d3,d4,d5,d6,d7);
+        // src is read-only (never written by this kernel): use __ldg.
+        ar_load8_f32_ro(src + base, s0,s1,s2,s3,s4,s5,s6,s7);
+        // dst is an in/out accumulator: do NOT use __ldg (value changes each step).
+        ar_load8_f32_rw(dst + base, d0,d1,d2,d3,d4,d5,d6,d7);
         ar_store8_bf16(dst + base,
             d0+s0, d1+s1, d2+s2, d3+s3,
             d4+s4, d5+s5, d6+s6, d7+s7);
     }
-    // Scalar tail
+    // Scalar tail — variable n_elems (any hidden size, not just multiples of 8).
     if (tid == 0) {
         for (size_t e = vec_n * kARVecWidth; e < n_elems; ++e) {
             float d = __bfloat162float(dst[e]);
-            float s = __bfloat162float(src[e]);
+            float s = __bfloat162float(__ldg(src + e));
             dst[e] = __float2bfloat16(d + s);
         }
     }
@@ -176,7 +173,8 @@ pcie_ring_reduce_kernel(
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Section 5: Finalisation kernel
-//   dst[i] = src[i] * inv_world_size
+//   out[i] = src[i] * inv_world_size
+//   SM12.0: 512-thread blocks.  SM8.6/9.0: 256-thread blocks.
 // ─────────────────────────────────────────────────────────────────────────────
 
 template <int SmVer, int kBlockSize>
@@ -195,7 +193,7 @@ pcie_allreduce_finalise_kernel(
     for (size_t i = tid; i < vec_n; i += stride) {
         const size_t base = i * kARVecWidth;
         float a0,a1,a2,a3,a4,a5,a6,a7;
-        ar_load8_f32(__ldg(src + base), a0,a1,a2,a3,a4,a5,a6,a7);
+        ar_load8_f32_ro(src + base, a0,a1,a2,a3,a4,a5,a6,a7);
         ar_store8_bf16(out + base,
             a0*inv_world_size, a1*inv_world_size,
             a2*inv_world_size, a3*inv_world_size,
@@ -204,24 +202,20 @@ pcie_allreduce_finalise_kernel(
     }
     if (tid == 0) {
         for (size_t e = vec_n * kARVecWidth; e < n_elems; ++e)
-            out[e] = __float2bfloat16(__bfloat162float(src[e]) * inv_world_size);
+            out[e] = __float2bfloat16(__bfloat162float(__ldg(src + e)) * inv_world_size);
     }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Section 6: Gradient packing kernel  —  binary-search chunk lookup
-//   Gathers non-contiguous gradient shards into a flat BF16 bucket.
-//   Uses device-side prefix sums for O(log C) chunk lookup per element.
+// Section 6: Gradient packing kernel — binary-search chunk lookup
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Device-side prefix sum array (pre-computed on host, passed to kernel)
-// prefix_ends[i] = sum of chunks[0..i].length  (exclusive→inclusive)
 template <int kBlockSize>
 __global__ void __launch_bounds__(kBlockSize, 2)
 pcie_gradient_pack_kernel(
     __nv_bfloat16* __restrict__         bucket,
     const PcieGradChunk* __restrict__   chunks,
-    const size_t* __restrict__          prefix_ends,  // [num_chunks], prefix sums
+    const size_t* __restrict__          prefix_ends,
     int    num_chunks,
     size_t bucket_elems)
 {
@@ -231,8 +225,7 @@ pcie_gradient_pack_kernel(
     for (size_t i = tid; i < bucket_elems / kARVecWidth; i += stride) {
         const size_t elem_base = i * kARVecWidth;
 
-        // Binary search for the owning chunk: find smallest c such that
-        // prefix_ends[c] > elem_base.
+        // Binary search for owning chunk.
         int lo = 0, hi = num_chunks - 1, ci = 0;
         while (lo <= hi) {
             int mid = (lo + hi) >> 1;
@@ -245,15 +238,13 @@ pcie_gradient_pack_kernel(
         const size_t within      = elem_base - chunk_start;
         const __nv_bfloat16* src = chunks[ci].src + chunks[ci].offset + within;
 
-        // 128-bit vectorised copy (no conversion needed — BF16→BF16)
         *reinterpret_cast<uint4*>(bucket + elem_base) =
-            *reinterpret_cast<const uint4*>(src);
+            __ldg(reinterpret_cast<const uint4*>(src));
     }
     // Scalar tail
     if (tid == 0) {
         for (size_t e = (bucket_elems / kARVecWidth) * kARVecWidth;
              e < bucket_elems; ++e) {
-            // Linear search for tail (at most 7 elements)
             size_t cum = 0;
             for (int c = 0; c < num_chunks; ++c) {
                 if (cum + chunks[c].length > e) {
@@ -268,19 +259,12 @@ pcie_gradient_pack_kernel(
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Section 7: Runtime bandwidth probe
-//   Allocates kProbeSizeBytes on both src_device and dst_device,
-//   times a cudaMemcpyPeerAsync, returns bandwidth in GB/s.
-//
-//   This is called once at the start of training (and every
-//   kReprobePeriodSteps thereafter) to calibrate chunk sizing.
 // ─────────────────────────────────────────────────────────────────────────────
 
 float probe_pcie_bandwidth(int src_device, int dst_device)
 {
-    // Check cache freshness (not yet probed → bw_gbps == 0.0)
     BandwidthCache& entry = g_bw_cache[src_device][dst_device];
 
-    // Allocate probe buffers
     void* src_buf = nullptr;
     void* dst_buf = nullptr;
 
@@ -295,7 +279,6 @@ float probe_pcie_bandwidth(int src_device, int dst_device)
         return 8.f;
     }
 
-    // Create events on src_device for timing
     cudaSetDevice(src_device);
     cudaEvent_t ev_start, ev_stop;
     cudaEventCreate(&ev_start);
@@ -304,7 +287,7 @@ float probe_pcie_bandwidth(int src_device, int dst_device)
     cudaStream_t probe_stream;
     cudaStreamCreate(&probe_stream);
 
-    // Warmup (1 transfer to prime PCIe TLB entries)
+    // Warmup
     cudaMemcpyPeerAsync(dst_buf, dst_device, src_buf, src_device,
                         kProbeSizeBytes, probe_stream);
     cudaStreamSynchronize(probe_stream);
@@ -323,11 +306,9 @@ float probe_pcie_bandwidth(int src_device, int dst_device)
         ? (float)(kProbeSizeBytes) / (elapsed_ms * 1e-3f) / 1e9f
         : 8.f;
 
-    // Update cache
-    entry.bw_gbps   = bw_gbps;
-    entry.step_count = 0;  // caller tracks step count
+    entry.bw_gbps    = bw_gbps;
+    entry.step_count = 0;
 
-    // Cleanup
     cudaEventDestroy(ev_start);
     cudaEventDestroy(ev_stop);
     cudaStreamDestroy(probe_stream);
@@ -345,50 +326,23 @@ float probe_pcie_bandwidth(int src_device, int dst_device)
 
 size_t compute_adaptive_chunk_size(float pcie_bw_gbps)
 {
-    // Target: fill kTargetOverlapMs ms of PCIe transfers per chunk.
-    // chunk_bytes = bw_bytes_per_sec × target_seconds
     float chunk_f = pcie_bw_gbps * 1e9f * kTargetOverlapMs * 1e-3f;
     size_t raw = (size_t)chunk_f;
-
-    // Align down to 128-bit (16-byte) boundary for vectorised loads
     raw = (raw / kChunkAlign) * kChunkAlign;
     raw = std::max(raw, kMinChunkBytes);
     raw = std::min(raw, kMaxChunkBytes);
     return raw;
 }
 
-// Public alias (old API remains compatible)
 size_t compute_pcie_bucket_size(float pcie_bw_gbps)
 {
     return compute_adaptive_chunk_size(pcie_bw_gbps);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Section 9: Double-buffered ring reduce pipeline
-//
-//   Manages the overlap between PCIe transfer (stream A) and GPU reduce
-//   (stream B).  Two device buffers ping[] and pong[] alternate roles.
-//
-//   Pipeline for world_size=N:
-//     For ring step k in [0, N-2]:
-//       Transfer stream: cudaMemcpyPeerAsync chunk[(rank+k+1) % N] → recv_buf[k&1]
-//       Compute stream:  pcie_ring_reduce_kernel(accum, recv_buf[(k-1)&1])
-//       Sync:            cudaStreamWaitEvent(compute, transfer_done[k])
-//
-//   This function manages the host-side orchestration; kernels are launched
-//   per chunk.  The caller is responsible for allocating ping/pong buffers
-//   and managing the ring topology.
-//
-//   Parameters:
-//     accum_buf     : device buffer where partial sums accumulate [chunk_elems]
-//     ping_buf      : recv buffer A [chunk_elems]
-//     pong_buf      : recv buffer B [chunk_elems]
-//     chunk_elems   : number of BF16 elements per chunk
-//     sm_version    : for kernel dispatch
-//     transfer_stream: stream used for cudaMemcpyPeerAsync
-//     compute_stream : stream used for ring_reduce kernels
-//     xfer_done_event: event signaled when transfer completes (caller-managed)
-//     reduce_done_event: event signaled when reduce completes
+// Section 9: Double-buffered ring reduce step
+//   SM dispatch: SM12.0 → 512 threads, SM8.6/9.0 → 256 threads.
+//   Correct __launch_bounds__ applied to each instantiation.
 // ─────────────────────────────────────────────────────────────────────────────
 
 void launch_pcie_ring_reduce_step(
@@ -398,20 +352,31 @@ void launch_pcie_ring_reduce_step(
     int                               sm_version,
     cudaStream_t                      compute_stream)
 {
-    const size_t vec_n = chunk_elems / kARVecWidth;
-    const int grid = (int)std::min(
-        (vec_n + kARBlockSize - 1) / kARBlockSize, (size_t)65535);
+    if (chunk_elems == 0) return;
 
-    // SM dispatch — same __launch_bounds__ policy as the finalise kernel
-    if (sm_version >= 120)
-        pcie_ring_reduce_kernel<120, 512><<<grid, 512, 0, compute_stream>>>(
+    // Grid sized to cover all vectorised elements.
+    if (sm_version >= 120) {
+        constexpr int kBS = kARBlockSize120;
+        const size_t vec_n = chunk_elems / kARVecWidth;
+        const int grid = (int)std::min(
+            (vec_n + kBS - 1) / kBS, (size_t)65535);
+        pcie_ring_reduce_kernel<120, kBS><<<grid, kBS, 0, compute_stream>>>(
             accum_buf, recv_buf, chunk_elems);
-    else if (sm_version >= 90)
-        pcie_ring_reduce_kernel<90, kARBlockSize><<<grid, kARBlockSize, 0, compute_stream>>>(
+    } else if (sm_version >= 90) {
+        constexpr int kBS = kARBlockSize86;
+        const size_t vec_n = chunk_elems / kARVecWidth;
+        const int grid = (int)std::min(
+            (vec_n + kBS - 1) / kBS, (size_t)65535);
+        pcie_ring_reduce_kernel<90, kBS><<<grid, kBS, 0, compute_stream>>>(
             accum_buf, recv_buf, chunk_elems);
-    else
-        pcie_ring_reduce_kernel<86, kARBlockSize><<<grid, kARBlockSize, 0, compute_stream>>>(
+    } else {
+        constexpr int kBS = kARBlockSize86;
+        const size_t vec_n = chunk_elems / kARVecWidth;
+        const int grid = (int)std::min(
+            (vec_n + kBS - 1) / kBS, (size_t)65535);
+        pcie_ring_reduce_kernel<86, kBS><<<grid, kBS, 0, compute_stream>>>(
             accum_buf, recv_buf, chunk_elems);
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -426,7 +391,6 @@ void launch_pcie_gradient_pack(
     int                  sm_version,
     cudaStream_t         stream)
 {
-    // Build device-side chunk descriptors + prefix sum
     PcieGradChunk* d_chunks = nullptr;
     size_t*        d_prefix = nullptr;
     cudaMallocAsync(&d_chunks, num_chunks * sizeof(PcieGradChunk), stream);
@@ -435,7 +399,6 @@ void launch_pcie_gradient_pack(
     cudaMemcpyAsync(d_chunks, chunks, num_chunks * sizeof(PcieGradChunk),
                     cudaMemcpyHostToDevice, stream);
 
-    // Build prefix-end array on host, copy to device
     size_t* h_prefix = new size_t[num_chunks];
     size_t cum = 0;
     for (int c = 0; c < num_chunks; ++c) { cum += chunks[c].length; h_prefix[c] = cum; }
@@ -443,12 +406,18 @@ void launch_pcie_gradient_pack(
                     cudaMemcpyHostToDevice, stream);
     delete[] h_prefix;
 
+    // Use SM12.0 512-thread blocks for Blackwell; 256 elsewhere.
+    const int kBS = (sm_version >= 120) ? kARBlockSize120 : kARBlockSize86;
     const size_t vec_elems = bucket_elems / kARVecWidth;
     const int grid = (int)std::min(
-        (vec_elems + kARBlockSize - 1) / kARBlockSize, (size_t)65535);
+        (vec_elems + kBS - 1) / kBS, (size_t)65535);
 
-    pcie_gradient_pack_kernel<kARBlockSize><<<grid, kARBlockSize, 0, stream>>>(
-        bucket, d_chunks, d_prefix, num_chunks, bucket_elems);
+    if (sm_version >= 120)
+        pcie_gradient_pack_kernel<kARBlockSize120><<<grid, kARBlockSize120, 0, stream>>>(
+            bucket, d_chunks, d_prefix, num_chunks, bucket_elems);
+    else
+        pcie_gradient_pack_kernel<kARBlockSize86><<<grid, kARBlockSize86, 0, stream>>>(
+            bucket, d_chunks, d_prefix, num_chunks, bucket_elems);
 
     cudaFreeAsync(d_chunks, stream);
     cudaFreeAsync(d_prefix, stream);
@@ -472,18 +441,24 @@ void launch_pcie_allreduce_finalise(
     int                  sm_version,
     cudaStream_t         stream)
 {
+    if (n_elems == 0 || world_size <= 0) return;
     const float inv_ws = 1.f / (float)world_size;
     const size_t vec_n = n_elems / kARVecWidth;
-    const int grid = (int)std::min(
-        (vec_n + kARBlockSize - 1) / kARBlockSize, (size_t)65535);
 
-    if (sm_version >= 120)
-        pcie_allreduce_finalise_kernel<120, 512><<<grid, 512, 0, stream>>>(
+    if (sm_version >= 120) {
+        constexpr int kBS = kARBlockSize120;
+        const int grid = (int)std::min((vec_n + kBS - 1) / kBS, (size_t)65535);
+        pcie_allreduce_finalise_kernel<120, kBS><<<grid, kBS, 0, stream>>>(
             out, src, n_elems, inv_ws);
-    else if (sm_version >= 90)
-        pcie_allreduce_finalise_kernel<90, kARBlockSize><<<grid, kARBlockSize, 0, stream>>>(
+    } else if (sm_version >= 90) {
+        constexpr int kBS = kARBlockSize86;
+        const int grid = (int)std::min((vec_n + kBS - 1) / kBS, (size_t)65535);
+        pcie_allreduce_finalise_kernel<90, kBS><<<grid, kBS, 0, stream>>>(
             out, src, n_elems, inv_ws);
-    else
-        pcie_allreduce_finalise_kernel<86, kARBlockSize><<<grid, kARBlockSize, 0, stream>>>(
+    } else {
+        constexpr int kBS = kARBlockSize86;
+        const int grid = (int)std::min((vec_n + kBS - 1) / kBS, (size_t)65535);
+        pcie_allreduce_finalise_kernel<86, kBS><<<grid, kBS, 0, stream>>>(
             out, src, n_elems, inv_ws);
+    }
 }

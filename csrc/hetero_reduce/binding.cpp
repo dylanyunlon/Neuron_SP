@@ -8,35 +8,16 @@
  *
  * PyTorch / pybind11 bindings for the hetero_reduce CUDA kernels.
  *
- * Exposed Python API
- * ------------------
- *   hetero_reduce.fused_bf16_reduce(output, inputs, sm_version) -> None
- *       output : torch.Tensor  BF16, device tensor, shape [N]
- *       inputs : List[torch.Tensor]  BF16 device tensors, each shape [N]
- *       sm_version : int  e.g. 86, 90, 120
- *
- *   hetero_reduce.hetero_reduce_scatter(output, inputs, shard_offset,
- *                                        shard_count, sm_version) -> None
- *       output       : torch.Tensor BF16, device tensor [shard_count]
- *       inputs       : List[torch.Tensor] BF16 device tensors [N]
- *       shard_offset : int  starting element index in the full tensor
- *       shard_count  : int  number of elements this device writes
- *       sm_version   : int  e.g. 86, 90, 120
- *
- *   hetero_reduce.compute_shard_ranges(sm_versions, total_elems)
- *                                        -> List[Tuple[int, int]]
- *       sm_versions : List[int]  per-tier SM versions
- *       total_elems : int        total BF16 elements
- *       Returns list of (offset, count) tuples, one per tier.
- *
- *   hetero_reduce.fused_swiglu_ln(output, gate_proj, up_proj, ln_weight,
- *                                  eps, sm_version) -> None
- *       output     : torch.Tensor  BF16  [batch, hidden]
- *       gate_proj  : torch.Tensor  BF16  [batch, hidden]
- *       up_proj    : torch.Tensor  BF16  [batch, hidden]
- *       ln_weight  : torch.Tensor  FP32  [hidden]
- *       eps        : float
- *       sm_version : int
+ * Expanded in this revision:
+ *   - probe_pcie_bandwidth           (bandwidth measurement between devices)
+ *   - compute_adaptive_chunk_size    (adaptive ring-allreduce chunk sizing)
+ *   - hetero_bucket_size_elems       (per-SM bucket size query)
+ *   - gradient_compress              (BF16 → INT8 compressed gradient)
+ *   - int8_ring_reduce_step          (INT8 ring-reduce accumulation)
+ *   - gradient_decompress            (INT8 → BF16 gradient)
+ *   - gradient_allreduce_finalise    (scale divide by world_size)
+ *   - fused_gradient_allreduce       (high-level 3-phase INT8 all-reduce)
+ *   - gradient_compress_bytes/scale_bytes (buffer sizing utilities)
  */
 
 #include <ATen/cuda/CUDAContext.h>
@@ -66,6 +47,14 @@ static void check_fp32(const at::Tensor& t, const char* name)
     TORCH_CHECK(t.is_contiguous(), name, " must be contiguous");
 }
 
+static void check_int8(const at::Tensor& t, const char* name)
+{
+    TORCH_CHECK(t.scalar_type() == at::ScalarType::Char,
+                name, " must be Int8, got ", t.scalar_type());
+    TORCH_CHECK(t.is_cuda(), name, " must be a CUDA tensor");
+    TORCH_CHECK(t.is_contiguous(), name, " must be contiguous");
+}
+
 // ---------------------------------------------------------------------------
 // fused_bf16_reduce binding
 // ---------------------------------------------------------------------------
@@ -83,7 +72,6 @@ void fused_bf16_reduce_py(at::Tensor output,
     TORCH_CHECK(n_elems % 8 == 0,
                 "output numel must be divisible by 8 for vectorised loads, got ", n_elems);
 
-    // Collect raw device pointers.
     std::vector<const __nv_bfloat16*> ptrs;
     ptrs.reserve(inputs.size());
     for (size_t i = 0; i < inputs.size(); i++) {
@@ -117,7 +105,6 @@ void hetero_reduce_scatter_py(at::Tensor output,
     TORCH_CHECK(!inputs.empty(), "inputs list must not be empty");
     TORCH_CHECK(inputs.size() <= 32,
                 "supports at most 32 input tensors, got ", inputs.size());
-
     TORCH_CHECK(shard_offset >= 0, "shard_offset must be >= 0");
     TORCH_CHECK(shard_count > 0,   "shard_count must be > 0");
     TORCH_CHECK(shard_count % 8 == 0,
@@ -204,26 +191,18 @@ void fused_swiglu_ln_py(at::Tensor output,
     const int batch  = static_cast<int>(output.size(0));
     const int hidden = static_cast<int>(output.size(1));
 
-    TORCH_CHECK(hidden % 8 == 0,
-                "hidden must be divisible by 8, got ", hidden);
-    TORCH_CHECK(gate_proj.size(0) == batch && gate_proj.size(1) == hidden,
-                "gate_proj shape mismatch");
-    TORCH_CHECK(up_proj.size(0) == batch && up_proj.size(1) == hidden,
-                "up_proj shape mismatch");
-    TORCH_CHECK(ln_weight.numel() == hidden,
-                "ln_weight must have numel == hidden, got ", ln_weight.numel());
-
-    __nv_bfloat16* out_ptr =
-        reinterpret_cast<__nv_bfloat16*>(output.data_ptr<at::BFloat16>());
-    const __nv_bfloat16* gate_ptr =
-        reinterpret_cast<const __nv_bfloat16*>(gate_proj.data_ptr<at::BFloat16>());
-    const __nv_bfloat16* up_ptr =
-        reinterpret_cast<const __nv_bfloat16*>(up_proj.data_ptr<at::BFloat16>());
-    const float* w_ptr = ln_weight.data_ptr<float>();
+    TORCH_CHECK(hidden % 8 == 0, "hidden must be divisible by 8, got ", hidden);
+    TORCH_CHECK(gate_proj.size(0) == batch && gate_proj.size(1) == hidden, "gate_proj shape mismatch");
+    TORCH_CHECK(up_proj.size(0)   == batch && up_proj.size(1)   == hidden, "up_proj shape mismatch");
+    TORCH_CHECK(ln_weight.numel() == hidden, "ln_weight numel must equal hidden");
 
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-    launch_fused_swiglu_ln(out_ptr, gate_ptr, up_ptr, w_ptr,
-                            batch, hidden, eps, sm_version, stream);
+    launch_fused_swiglu_ln(
+        reinterpret_cast<__nv_bfloat16*>(output.data_ptr<at::BFloat16>()),
+        reinterpret_cast<const __nv_bfloat16*>(gate_proj.data_ptr<at::BFloat16>()),
+        reinterpret_cast<const __nv_bfloat16*>(up_proj.data_ptr<at::BFloat16>()),
+        ln_weight.data_ptr<float>(),
+        batch, hidden, eps, sm_version, stream);
 }
 
 // ---------------------------------------------------------------------------
@@ -242,10 +221,8 @@ void rope_cache_py(at::Tensor cos_cache,
     TORCH_CHECK(cos_cache.is_contiguous(), "cos_cache must be contiguous");
     TORCH_CHECK(sin_cache.is_contiguous(), "sin_cache must be contiguous");
     const int half_dim = head_dim / 2;
-    TORCH_CHECK(cos_cache.numel() == (int64_t)seq_len * half_dim,
-                "cos_cache size mismatch");
-    TORCH_CHECK(sin_cache.numel() == (int64_t)seq_len * half_dim,
-                "sin_cache size mismatch");
+    TORCH_CHECK(cos_cache.numel() == (int64_t)seq_len * half_dim, "cos_cache size mismatch");
+    TORCH_CHECK(sin_cache.numel() == (int64_t)seq_len * half_dim, "sin_cache size mismatch");
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
     launch_rope_cache(cos_cache.data_ptr<float>(),
                       sin_cache.data_ptr<float>(),
@@ -274,12 +251,9 @@ void fused_rope_hetero_py(at::Tensor output,
     const int head_dim  = (int)input.size(3);
 
     TORCH_CHECK(head_dim % 2 == 0, "head_dim must be even, got ", head_dim);
-
     const int half_dim = head_dim / 2;
-    TORCH_CHECK(cos_cache.numel() == (int64_t)seq_len * half_dim,
-                "cos_cache numel mismatch");
-    TORCH_CHECK(sin_cache.numel() == (int64_t)seq_len * half_dim,
-                "sin_cache numel mismatch");
+    TORCH_CHECK(cos_cache.numel() == (int64_t)seq_len * half_dim, "cos_cache numel mismatch");
+    TORCH_CHECK(sin_cache.numel() == (int64_t)seq_len * half_dim, "sin_cache numel mismatch");
 
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
     launch_fused_rope_hetero(
@@ -295,19 +269,6 @@ void fused_rope_hetero_py(at::Tensor output,
 // pcie_adaptive_allreduce bindings
 // ---------------------------------------------------------------------------
 
-/**
- * pcie_gradient_pack_py
- *
- * Gathers non-contiguous gradient slices from multiple BF16 tensors into a
- * flat contiguous BF16 bucket (device-side gather kernel).
- *
- * Each chunk is described by (tensor, byte_offset, length_in_elements).
- * Python-side interface uses a list of (Tensor, int, int) tuples.
- *
- * @param bucket      BF16 output bucket [bucket_elems]
- * @param chunks_in   List of (Tensor, offset_elems, length_elems) tuples
- * @param sm_version  SM version of the active device
- */
 void pcie_gradient_pack_py(at::Tensor bucket,
                             std::vector<std::tuple<at::Tensor, int64_t, int64_t>> chunks_in,
                             int sm_version)
@@ -315,19 +276,17 @@ void pcie_gradient_pack_py(at::Tensor bucket,
     check_bf16(bucket, "bucket");
     TORCH_CHECK(!chunks_in.empty(), "chunks must not be empty");
 
-    // Build C-side PcieGradChunk array from Python tuples.
     std::vector<PcieGradChunk> chunks;
     chunks.reserve(chunks_in.size());
     size_t total_elems = 0;
     for (size_t i = 0; i < chunks_in.size(); i++) {
-        at::Tensor& t = std::get<0>(chunks_in[i]);
-        int64_t offset = std::get<1>(chunks_in[i]);
-        int64_t length = std::get<2>(chunks_in[i]);
+        at::Tensor& t   = std::get<0>(chunks_in[i]);
+        int64_t offset  = std::get<1>(chunks_in[i]);
+        int64_t length  = std::get<2>(chunks_in[i]);
         check_bf16(t, ("chunks[" + std::to_string(i) + "].tensor").c_str());
-        TORCH_CHECK(offset >= 0, "chunk offset must be >= 0");
-        TORCH_CHECK(length > 0,  "chunk length must be > 0");
-        TORCH_CHECK(length % 8 == 0,
-                    "chunk length must be divisible by 8, got ", length);
+        TORCH_CHECK(offset >= 0,    "chunk offset must be >= 0");
+        TORCH_CHECK(length > 0,     "chunk length must be > 0");
+        TORCH_CHECK(length % 8 == 0, "chunk length must be divisible by 8, got ", length);
         TORCH_CHECK(offset + length <= t.numel(),
                     "chunk[", i, "] offset+length exceeds tensor numel");
         PcieGradChunk c;
@@ -389,6 +348,28 @@ void pcie_allreduce_finalise_py(at::Tensor out,
 int64_t pcie_bucket_size_py(float pcie_bw_gbps)
 {
     return (int64_t)compute_pcie_bucket_size(pcie_bw_gbps);
+}
+
+// New: probe PCIe bandwidth
+float probe_pcie_bandwidth_py(int src_device, int dst_device)
+{
+    TORCH_CHECK(src_device >= 0 && src_device < 16, "src_device out of range");
+    TORCH_CHECK(dst_device >= 0 && dst_device < 16, "dst_device out of range");
+    TORCH_CHECK(src_device != dst_device, "src_device must differ from dst_device");
+    return probe_pcie_bandwidth(src_device, dst_device);
+}
+
+// New: adaptive chunk size
+int64_t compute_adaptive_chunk_size_py(float pcie_bw_gbps)
+{
+    TORCH_CHECK(pcie_bw_gbps > 0.f, "pcie_bw_gbps must be > 0");
+    return (int64_t)compute_adaptive_chunk_size(pcie_bw_gbps);
+}
+
+// New: per-SM bucket size
+int64_t hetero_bucket_size_py(int sm_version)
+{
+    return (int64_t)hetero_bucket_size_elems(sm_version);
 }
 
 // ---------------------------------------------------------------------------
@@ -454,11 +435,9 @@ void quantise_bf16_to_int8_py(at::Tensor output,
                                 at::Tensor scales,
                                 at::Tensor input)
 {
-    TORCH_CHECK(output.scalar_type() == at::ScalarType::Char,
-                "output must be Int8");
-    TORCH_CHECK(output.is_cuda() && output.is_contiguous());
-    check_fp32(scales, "scales");
-    check_bf16(input,  "input");
+    check_int8(output, "output");
+    check_fp32(scales,  "scales");
+    check_bf16(input,   "input");
     TORCH_CHECK(output.numel() == input.numel(), "output/input numel mismatch");
 
     const size_t n_elems = (size_t)input.numel();
@@ -479,16 +458,13 @@ void dequantise_int8_to_bf16_py(at::Tensor output,
                                   at::Tensor scales)
 {
     check_bf16(output, "output");
-    TORCH_CHECK(input.scalar_type() == at::ScalarType::Char,
-                "input must be Int8");
-    TORCH_CHECK(input.is_cuda() && input.is_contiguous());
+    check_int8(input,  "input");
     check_fp32(scales, "scales");
     TORCH_CHECK(output.numel() == input.numel(), "output/input numel mismatch");
 
     const size_t n_elems = (size_t)input.numel();
     const size_t n_tiles = (n_elems + 127) / 128;
-    TORCH_CHECK((size_t)scales.numel() >= n_tiles,
-                "scales buffer too small");
+    TORCH_CHECK((size_t)scales.numel() >= n_tiles, "scales buffer too small");
 
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
     launch_dequantise_int8_to_fp16(
@@ -529,12 +505,10 @@ void fused_layernorm_residual_py(at::Tensor output,
     const int batch  = (int)output.size(0);
     const int hidden = (int)output.size(1);
 
-    TORCH_CHECK(hidden % 8 == 0,
-                "hidden must be divisible by 8, got ", hidden);
+    TORCH_CHECK(hidden % 8 == 0, "hidden must be divisible by 8, got ", hidden);
     TORCH_CHECK(residual.sizes() == output.sizes(), "residual/output shape mismatch");
     TORCH_CHECK(input.sizes()    == output.sizes(), "input/output shape mismatch");
-    TORCH_CHECK(ln_weight.numel() == hidden,
-                "ln_weight numel must equal hidden, got ", ln_weight.numel());
+    TORCH_CHECK(ln_weight.numel() == hidden, "ln_weight numel must equal hidden");
 
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
     launch_fused_layernorm_residual(
@@ -566,13 +540,12 @@ cross_entropy_tp_forward_py(at::Tensor logits,
 
     const int batch   = (int)logits.size(0);
     const int v_local = (int)logits.size(1);
-
     TORCH_CHECK(shard_offset >= 0, "shard_offset must be >= 0");
 
     auto opts = at::TensorOptions().dtype(at::kFloat).device(logits.device());
     at::Tensor local_max     = at::empty({batch}, opts);
     at::Tensor local_sum_exp = at::empty({batch}, opts);
-    at::Tensor local_logit   = at::zeros({batch}, opts);  // zeros for non-shard labels
+    at::Tensor local_logit   = at::zeros({batch}, opts);
 
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
     launch_cross_entropy_tp_forward(
@@ -593,8 +566,8 @@ at::Tensor cross_entropy_tp_loss_py(at::Tensor global_max,
     check_fp32(global_max,     "global_max");
     check_fp32(global_sum_exp, "global_sum_exp");
     check_fp32(global_logit,   "global_logit");
-    TORCH_CHECK(global_max.numel()     == global_sum_exp.numel(), "shape mismatch");
-    TORCH_CHECK(global_max.numel()     == global_logit.numel(),   "shape mismatch");
+    TORCH_CHECK(global_max.numel() == global_sum_exp.numel(), "shape mismatch");
+    TORCH_CHECK(global_max.numel() == global_logit.numel(),   "shape mismatch");
 
     const int batch = (int)global_max.numel();
     at::Tensor loss = at::empty({batch},
@@ -619,12 +592,11 @@ void cross_entropy_tp_backward_py(at::Tensor d_logits,
                                     float      inv_batch,
                                     int        sm_version)
 {
-    check_bf16(d_logits,   "d_logits");
-    check_bf16(logits,     "logits");
-    check_fp32(global_max, "global_max");
+    check_bf16(d_logits,    "d_logits");
+    check_bf16(logits,      "logits");
+    check_fp32(global_max,  "global_max");
     check_fp32(log_sum_exp, "log_sum_exp");
-    TORCH_CHECK(labels.scalar_type() == at::ScalarType::Int,
-                "labels must be Int32");
+    TORCH_CHECK(labels.scalar_type() == at::ScalarType::Int, "labels must be Int32");
     TORCH_CHECK(d_logits.sizes() == logits.sizes(), "d_logits/logits shape mismatch");
 
     const int batch   = (int)logits.size(0);
@@ -708,6 +680,92 @@ void fused_adam_heterogeneous_py(
 float hetero_adam_lr_scale_py(int sm_version)
 {
     return hetero_adam_lr_scale(sm_version);
+// fused_gradient_allreduce bindings (INT8 compressed allreduce)
+// ---------------------------------------------------------------------------
+
+void gradient_compress_py(at::Tensor out_int8,
+                            at::Tensor out_scale,
+                            at::Tensor input,
+                            int sm_version)
+{
+    check_int8(out_int8,  "out_int8");
+    check_fp32(out_scale, "out_scale");
+    check_bf16(input,     "input");
+    const size_t n_elems = (size_t)input.numel();
+    TORCH_CHECK((size_t)out_int8.numel() >= n_elems, "out_int8 too small");
+    const size_t n_scale = (n_elems + 255) / 256;
+    TORCH_CHECK((size_t)out_scale.numel() >= n_scale, "out_scale too small");
+
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    launch_gradient_compress(
+        reinterpret_cast<int8_t*>(out_int8.data_ptr<int8_t>()),
+        out_scale.data_ptr<float>(),
+        reinterpret_cast<const __nv_bfloat16*>(input.data_ptr<at::BFloat16>()),
+        n_elems, sm_version, stream);
+}
+
+void gradient_decompress_py(at::Tensor output,
+                              at::Tensor int8_data,
+                              at::Tensor scale_buf,
+                              int sm_version)
+{
+    check_bf16(output,   "output");
+    check_int8(int8_data, "int8_data");
+    check_fp32(scale_buf, "scale_buf");
+    const size_t n_elems = (size_t)output.numel();
+    TORCH_CHECK((size_t)int8_data.numel() >= n_elems, "int8_data too small");
+
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    launch_gradient_decompress(
+        reinterpret_cast<__nv_bfloat16*>(output.data_ptr<at::BFloat16>()),
+        reinterpret_cast<const int8_t*>(int8_data.data_ptr<int8_t>()),
+        scale_buf.data_ptr<float>(),
+        n_elems, sm_version, stream);
+}
+
+void int8_ring_reduce_step_py(at::Tensor dst_int8,
+                               at::Tensor dst_scale,
+                               at::Tensor src_int8,
+                               at::Tensor src_scale,
+                               int sm_version)
+{
+    check_int8(dst_int8,  "dst_int8");
+    check_fp32(dst_scale, "dst_scale");
+    check_int8(src_int8,  "src_int8");
+    check_fp32(src_scale, "src_scale");
+    TORCH_CHECK(dst_int8.numel() == src_int8.numel(), "int8 size mismatch");
+
+    const size_t n_elems = (size_t)dst_int8.numel();
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    launch_int8_ring_reduce_step(
+        reinterpret_cast<int8_t*>(dst_int8.data_ptr<int8_t>()),
+        dst_scale.data_ptr<float>(),
+        reinterpret_cast<const int8_t*>(src_int8.data_ptr<int8_t>()),
+        src_scale.data_ptr<float>(),
+        n_elems, sm_version, stream);
+}
+
+void gradient_allreduce_finalise_py(at::Tensor scale_buf,
+                                     int64_t n_elems,
+                                     int world_size)
+{
+    check_fp32(scale_buf, "scale_buf");
+    TORCH_CHECK(n_elems > 0,    "n_elems must be > 0");
+    TORCH_CHECK(world_size > 0, "world_size must be > 0");
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    launch_gradient_allreduce_finalise(
+        scale_buf.data_ptr<float>(),
+        (size_t)n_elems, world_size, stream);
+}
+
+int64_t gradient_compress_bytes_py(int64_t n_elems)
+{
+    return (int64_t)gradient_compress_bytes((size_t)n_elems);
+}
+
+int64_t gradient_scale_bytes_py(int64_t n_elems)
+{
+    return (int64_t)gradient_scale_bytes((size_t)n_elems);
 }
 
 // ---------------------------------------------------------------------------
@@ -717,246 +775,154 @@ float hetero_adam_lr_scale_py(int sm_version)
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
     m.doc() = "DeepSpeed hetero_reduce: fused BF16 reduce-scatter + SwiGLU-LN + "
-              "RoPE + PCIe allreduce + tier activation offload kernels "
-              "for heterogeneous GPU clusters (SM 8.6 / 9.0 / 12.0).";
+              "RoPE + PCIe allreduce + tier activation offload + INT8 gradient "
+              "allreduce kernels for heterogeneous GPU clusters (SM 8.6 / 9.0 / 12.0).";
 
-    m.def("fused_bf16_reduce",
-          &fused_bf16_reduce_py,
-          "Fused BF16→FP32 reduce + FP32→BF16 writeback across multiple tensors.\n"
-          "Args:\n"
-          "  output     (Tensor BF16): in-place reduction destination\n"
-          "  inputs     (List[Tensor BF16]): tensors to reduce\n"
-          "  sm_version (int): SM version of active device (86, 90, 120, …)",
-          py::arg("output"),
-          py::arg("inputs"),
+    // ── Core reduce-scatter ──────────────────────────────────────────────
+    m.def("fused_bf16_reduce",      &fused_bf16_reduce_py,
+          py::arg("output"), py::arg("inputs"), py::arg("sm_version") = 86);
+
+    m.def("hetero_reduce_scatter",  &hetero_reduce_scatter_py,
+          py::arg("output"), py::arg("inputs"), py::arg("shard_offset"),
+          py::arg("shard_count"), py::arg("sm_version") = 86);
+
+    m.def("compute_shard_ranges",   &compute_shard_ranges_py,
+          py::arg("sm_versions"), py::arg("total_elems"));
+
+    // ── Fused activations ────────────────────────────────────────────────
+    m.def("fused_swiglu_ln",        &fused_swiglu_ln_py,
+          py::arg("output"), py::arg("gate_proj"), py::arg("up_proj"),
+          py::arg("ln_weight"), py::arg("eps") = 1e-6f,
           py::arg("sm_version") = 86);
 
-    m.def("hetero_reduce_scatter",
-          &hetero_reduce_scatter_py,
-          "Heterogeneous reduce-scatter: reduces all inputs but writes only the\n"
-          "local shard [shard_offset, shard_offset + shard_count) to output.\n"
-          "Args:\n"
-          "  output       (Tensor BF16): shard output buffer [shard_count]\n"
-          "  inputs       (List[Tensor BF16]): full-length input gradient tensors\n"
-          "  shard_offset (int): starting element index in full tensor\n"
-          "  shard_count  (int): number of elements to reduce and write\n"
-          "  sm_version   (int): SM version of active device",
-          py::arg("output"),
-          py::arg("inputs"),
-          py::arg("shard_offset"),
-          py::arg("shard_count"),
-          py::arg("sm_version") = 86);
+    // ── RoPE ─────────────────────────────────────────────────────────────
+    m.def("rope_cache",             &rope_cache_py,
+          py::arg("cos_cache"), py::arg("sin_cache"),
+          py::arg("seq_len"), py::arg("head_dim"),
+          py::arg("base") = 10000.f, py::arg("pos_offset") = 0);
 
-    m.def("compute_shard_ranges",
-          &compute_shard_ranges_py,
-          "Compute non-uniform shard ranges for heterogeneous GPU tiers.\n"
-          "Returns List[Tuple[offset, count]] with one entry per tier.\n"
-          "Weight: SM12.0=4, SM9.0=3, SM8.6=1.\n"
-          "Args:\n"
-          "  sm_versions (List[int]): per-tier SM versions\n"
-          "  total_elems (int): total BF16 elements in gradient tensor",
-          py::arg("sm_versions"),
-          py::arg("total_elems"));
+    m.def("fused_rope_hetero",      &fused_rope_hetero_py,
+          py::arg("output"), py::arg("input"),
+          py::arg("cos_cache"), py::arg("sin_cache"),
+          py::arg("neox_style") = true, py::arg("sm_version") = 86);
 
-    m.def("fused_swiglu_ln",
-          &fused_swiglu_ln_py,
-          "Fused SwiGLU activation + RMS LayerNorm.\n"
-          "Args:\n"
-          "  output     (Tensor BF16  [B, H]): output buffer\n"
-          "  gate_proj  (Tensor BF16  [B, H]): gate projection\n"
-          "  up_proj    (Tensor BF16  [B, H]): up   projection\n"
-          "  ln_weight  (Tensor FP32  [H])   : RMSNorm scale\n"
-          "  eps        (float)               : RMSNorm epsilon\n"
-          "  sm_version (int)                 : 86, 90, or 120",
-          py::arg("output"),
-          py::arg("gate_proj"),
-          py::arg("up_proj"),
-          py::arg("ln_weight"),
-          py::arg("eps") = 1e-6f,
-          py::arg("sm_version") = 86);
+    // ── PCIe allreduce ───────────────────────────────────────────────────
+    m.def("pcie_gradient_pack",     &pcie_gradient_pack_py,
+          py::arg("bucket"), py::arg("chunks"), py::arg("sm_version") = 86);
 
-    // -----------------------------------------------------------------------
-    // fused_rope_hetero
-    // -----------------------------------------------------------------------
-    m.def("rope_cache",
-          &rope_cache_py,
-          "Precompute RoPE cos/sin cache on device.\n"
-          "Args:\n"
-          "  cos_cache  (Tensor FP32 [S, D/2]): output cosine table\n"
-          "  sin_cache  (Tensor FP32 [S, D/2]): output sine table\n"
-          "  seq_len    (int): sequence length\n"
-          "  head_dim   (int): full head dimension\n"
-          "  base       (float): RoPE base, default 10000.0\n"
-          "  pos_offset (int): global position offset for packed seqs",
-          py::arg("cos_cache"),
-          py::arg("sin_cache"),
-          py::arg("seq_len"),
-          py::arg("head_dim"),
-          py::arg("base") = 10000.f,
-          py::arg("pos_offset") = 0);
+    m.def("pcie_ring_reduce",       &pcie_ring_reduce_py,
+          py::arg("dst"), py::arg("src"), py::arg("sm_version") = 86);
 
-    m.def("fused_rope_hetero",
-          &fused_rope_hetero_py,
-          "Fused RoPE for heterogeneous head counts.\n"
-          "Args:\n"
-          "  output     (Tensor BF16 [B, S, H, D]): output (may alias input)\n"
-          "  input      (Tensor BF16 [B, S, H, D]): query or key tensor\n"
-          "  cos_cache  (Tensor FP32 [S, D/2])    : precomputed cosines\n"
-          "  sin_cache  (Tensor FP32 [S, D/2])    : precomputed sines\n"
-          "  neox_style (bool): True=Llama/NeoX, False=GPT-J interleaved\n"
-          "  sm_version (int): 86, 90, or 120",
-          py::arg("output"),
-          py::arg("input"),
-          py::arg("cos_cache"),
-          py::arg("sin_cache"),
-          py::arg("neox_style") = true,
-          py::arg("sm_version") = 86);
+    m.def("pcie_allreduce_finalise", &pcie_allreduce_finalise_py,
+          py::arg("out"), py::arg("src"),
+          py::arg("world_size"), py::arg("sm_version") = 86);
 
-    // -----------------------------------------------------------------------
-    // pcie_adaptive_allreduce
-    // -----------------------------------------------------------------------
-    m.def("pcie_gradient_pack",
-          &pcie_gradient_pack_py,
-          "Gather non-contiguous gradient shards into a flat BF16 bucket.\n"
-          "Args:\n"
-          "  bucket     (Tensor BF16 [bucket_elems]): flat output bucket\n"
-          "  chunks     (List[Tuple[Tensor, int, int]]): (tensor, offset, length) per shard\n"
-          "  sm_version (int): 86, 90, or 120",
-          py::arg("bucket"),
-          py::arg("chunks"),
-          py::arg("sm_version") = 86);
-
-    m.def("pcie_ring_reduce",
-          &pcie_ring_reduce_py,
-          "PCIe ring-allreduce reduce phase: dst += src (BF16, in-place).\n"
-          "Args:\n"
-          "  dst        (Tensor BF16): local accumulator (modified in-place)\n"
-          "  src        (Tensor BF16): incoming peer gradient bucket\n"
-          "  sm_version (int): 86, 90, or 120",
-          py::arg("dst"),
-          py::arg("src"),
-          py::arg("sm_version") = 86);
-
-    m.def("pcie_allreduce_finalise",
-          &pcie_allreduce_finalise_py,
-          "Divide allreduce sum by world_size and write BF16 output.\n"
-          "Args:\n"
-          "  out        (Tensor BF16): output buffer\n"
-          "  src        (Tensor BF16): sum buffer\n"
-          "  world_size (int): number of participating GPUs\n"
-          "  sm_version (int): 86, 90, or 120",
-          py::arg("out"),
-          py::arg("src"),
-          py::arg("world_size"),
-          py::arg("sm_version") = 86);
-
-    m.def("pcie_bucket_size",
-          &pcie_bucket_size_py,
-          "Compute recommended PCIe gradient bucket size in bytes.\n"
-          "Args:\n"
-          "  pcie_bw_gbps (float): measured or estimated PCIe bandwidth in GB/s\n"
-          "Returns: int (bucket size in bytes)",
+    m.def("pcie_bucket_size",        &pcie_bucket_size_py,
           py::arg("pcie_bw_gbps") = 32.f);
 
-    // -----------------------------------------------------------------------
-    // tier_activation_offload
-    // -----------------------------------------------------------------------
-    m.def("activation_pack",
-          &activation_pack_py,
-          "Pack activation tensors into a flat BF16 offload buffer.\n"
+    m.def("probe_pcie_bandwidth",    &probe_pcie_bandwidth_py,
+          "Measure PCIe bandwidth between two CUDA devices in GB/s.\n"
           "Args:\n"
-          "  output     (Tensor BF16 [N * tensor_elems]): flat output buffer\n"
-          "  inputs     (List[Tensor BF16]): activation tensors to pack\n"
-          "  sm_version (int): 86, 90, or 120",
-          py::arg("output"),
-          py::arg("inputs"),
+          "  src_device (int): CUDA device ordinal of sender\n"
+          "  dst_device (int): CUDA device ordinal of receiver\n"
+          "Returns: float (measured GB/s)",
+          py::arg("src_device"), py::arg("dst_device"));
+
+    m.def("compute_adaptive_chunk_size", &compute_adaptive_chunk_size_py,
+          "Compute ring-allreduce chunk size targeting ~5 ms of PCIe overlap.\n"
+          "Args:\n"
+          "  pcie_bw_gbps (float): PCIe bandwidth in GB/s\n"
+          "Returns: int (chunk size in bytes, 16-byte aligned)",
+          py::arg("pcie_bw_gbps"));
+
+    m.def("hetero_bucket_size_elems", &hetero_bucket_size_py,
+          "Per-SM recommended gradient bucket size in BF16 elements.\n"
+          "Args:\n"
+          "  sm_version (int): 86, 90, or 120\n"
+          "Returns: int (elements)",
           py::arg("sm_version") = 86);
 
-    m.def("activation_unpack",
-          &activation_unpack_py,
-          "Unpack a flat BF16 buffer back to individual activation tensors.\n"
-          "Args:\n"
-          "  outputs    (List[Tensor BF16]): destination activation tensors\n"
-          "  flat       (Tensor BF16 [N * tensor_elems]): flat source buffer\n"
-          "  sm_version (int): 86, 90, or 120",
-          py::arg("outputs"),
-          py::arg("flat"),
-          py::arg("sm_version") = 86);
+    // ── Activation offload ───────────────────────────────────────────────
+    m.def("activation_pack",        &activation_pack_py,
+          py::arg("output"), py::arg("inputs"), py::arg("sm_version") = 86);
 
-    m.def("quantise_bf16_to_int8",
-          &quantise_bf16_to_int8_py,
-          "Block-wise INT8 quantisation of BF16 activation buffer.\n"
-          "Tile size = 128 elements, scale = absmax / 127 per tile.\n"
-          "Args:\n"
-          "  output (Tensor Int8  [N]): quantised output\n"
-          "  scales (Tensor FP32  [ceil(N/128)]): per-tile scales\n"
-          "  input  (Tensor BF16  [N]): input activations",
-          py::arg("output"),
-          py::arg("scales"),
-          py::arg("input"));
+    m.def("activation_unpack",      &activation_unpack_py,
+          py::arg("outputs"), py::arg("flat"), py::arg("sm_version") = 86);
 
-    m.def("dequantise_int8_to_bf16",
-          &dequantise_int8_to_bf16_py,
-          "Block-wise INT8 dequantisation to BF16.\n"
-          "Args:\n"
-          "  output (Tensor BF16  [N]): dequantised output\n"
-          "  input  (Tensor Int8  [N]): quantised input\n"
-          "  scales (Tensor FP32  [ceil(N/128)]): per-tile scales",
-          py::arg("output"),
-          py::arg("input"),
-          py::arg("scales"));
+    m.def("quantise_bf16_to_int8",   &quantise_bf16_to_int8_py,
+          py::arg("output"), py::arg("scales"), py::arg("input"));
 
-    m.def("compute_offload_budget",
-          &compute_offload_budget_py,
-          "Compute activation offload budget for a GPU tier.\n"
-          "Args:\n"
-          "  total_act_bytes  (int): total activation bytes required\n"
-          "  vram_free_bytes  (int): current free VRAM on this device\n"
-          "  headroom_frac    (float): fraction of free VRAM to keep unused\n"
-          "Returns: int (bytes to offload, 0 if activations fit in VRAM)",
-          py::arg("total_act_bytes"),
-          py::arg("vram_free_bytes"),
+    m.def("dequantise_int8_to_bf16", &dequantise_int8_to_bf16_py,
+          py::arg("output"), py::arg("input"), py::arg("scales"));
+
+    m.def("compute_offload_budget",  &compute_offload_budget_py,
+          py::arg("total_act_bytes"), py::arg("vram_free_bytes"),
           py::arg("headroom_frac") = 0.1f);
-    // -----------------------------------------------------------------------
-    // fused_layernorm_residual  (#110)
-    // -----------------------------------------------------------------------
-    m.def("fused_layernorm_residual",
-          &fused_layernorm_residual_py,
-          "Fused residual add + RMS LayerNorm (pre-LN Llama/Mistral style).\n"
-          "residual_i += input_i;  output_i = rmsnorm(residual_i) * weight.\n"
+
+    // ── LayerNorm + residual ─────────────────────────────────────────────
+    m.def("fused_layernorm_residual", &fused_layernorm_residual_py,
+          py::arg("output"), py::arg("residual"), py::arg("input"),
+          py::arg("ln_weight"), py::arg("eps") = 1e-6f,
+          py::arg("sm_version") = 86);
+
+    // ── Cross-entropy TP ─────────────────────────────────────────────────
+    m.def("cross_entropy_tp_forward",   &cross_entropy_tp_forward_py,
+          py::arg("logits"), py::arg("labels"),
+          py::arg("shard_offset") = 0, py::arg("sm_version") = 86);
+
+    m.def("cross_entropy_tp_loss",      &cross_entropy_tp_loss_py,
+          py::arg("global_max"), py::arg("global_sum_exp"), py::arg("global_logit"));
+
+    m.def("cross_entropy_tp_backward",  &cross_entropy_tp_backward_py,
+          py::arg("d_logits"), py::arg("logits"), py::arg("labels"),
+          py::arg("global_max"), py::arg("log_sum_exp"),
+          py::arg("shard_offset") = 0, py::arg("inv_batch") = 1.f,
+          py::arg("sm_version") = 86);
+
+    // ── INT8 compressed gradient allreduce ───────────────────────────────
+    m.def("gradient_compress",       &gradient_compress_py,
+          "Compress BF16 gradient to INT8 + per-block FP32 scale.\n"
           "Args:\n"
-          "  output     (Tensor BF16  [B, H]): LN output\n"
-          "  residual   (Tensor BF16  [B, H]): residual stream, updated in-place\n"
-          "  input      (Tensor BF16  [B, H]): new sub-layer contribution\n"
-          "  ln_weight  (Tensor FP32  [H])   : RMSNorm gamma scale\n"
-          "  eps        (float)               : RMSNorm epsilon (default 1e-6)\n"
-          "  sm_version (int)                 : 86, 90, or 120",
-          py::arg("output"),
-          py::arg("residual"),
-          py::arg("input"),
-          py::arg("ln_weight"),
-          py::arg("eps") = 1e-6f,
+          "  out_int8  (Tensor Int8  [n_elems]): compressed output\n"
+          "  out_scale (Tensor FP32  [n_blocks]): per-block scales\n"
+          "  input     (Tensor BF16  [n_elems]): gradient input\n"
+          "  sm_version (int): 86, 90, or 120",
+          py::arg("out_int8"), py::arg("out_scale"),
+          py::arg("input"), py::arg("sm_version") = 86);
+
+    m.def("gradient_decompress",     &gradient_decompress_py,
+          "Decompress INT8 + per-block FP32 scale back to BF16.\n"
+          "Args:\n"
+          "  output    (Tensor BF16  [n_elems]): decompressed output\n"
+          "  int8_data (Tensor Int8  [n_elems]): compressed input\n"
+          "  scale_buf (Tensor FP32  [n_blocks]): per-block scales\n"
+          "  sm_version (int): 86, 90, or 120",
+          py::arg("output"), py::arg("int8_data"),
+          py::arg("scale_buf"), py::arg("sm_version") = 86);
+
+    m.def("int8_ring_reduce_step",   &int8_ring_reduce_step_py,
+          "Fused INT8 ring-allreduce step: dequant + add + requant.\n"
+          "Args:\n"
+          "  dst_int8  (Tensor Int8  [n_elems]): accumulator (in/out)\n"
+          "  dst_scale (Tensor FP32  [n_blocks]): accumulator scales (in/out)\n"
+          "  src_int8  (Tensor Int8  [n_elems]): received peer data\n"
+          "  src_scale (Tensor FP32  [n_blocks]): received peer scales\n"
+          "  sm_version (int): 86, 90, or 120",
+          py::arg("dst_int8"), py::arg("dst_scale"),
+          py::arg("src_int8"), py::arg("src_scale"),
           py::arg("sm_version") = 86);
 
-    // -----------------------------------------------------------------------
-    // cross_entropy_tp  (#110)
-    // -----------------------------------------------------------------------
-    m.def("cross_entropy_tp_forward",
-          &cross_entropy_tp_forward_py,
-          "Phase-1 TP cross-entropy: local (max, sum_exp, label_logit).\n"
-          "Returns Tuple[Tensor FP32 [B], Tensor FP32 [B], Tensor FP32 [B]].",
-          py::arg("logits"),
-          py::arg("labels"),
-          py::arg("shard_offset") = 0,
-          py::arg("sm_version") = 86);
+    m.def("gradient_allreduce_finalise", &gradient_allreduce_finalise_py,
+          "Divide per-block scales by world_size after ring allreduce.\n"
+          "Args:\n"
+          "  scale_buf  (Tensor FP32): per-block scales (in/out)\n"
+          "  n_elems    (int): total gradient elements\n"
+          "  world_size (int): number of participating GPUs",
+          py::arg("scale_buf"), py::arg("n_elems"), py::arg("world_size"));
 
-    m.def("cross_entropy_tp_loss",
-          &cross_entropy_tp_loss_py,
-          "Phase-2 TP cross-entropy: per-sample CE loss from reduced scalars.\n"
-          "Returns: loss (Tensor FP32 [B])",
-          py::arg("global_max"),
-          py::arg("global_sum_exp"),
-          py::arg("global_logit"));
+    m.def("gradient_compress_bytes", &gradient_compress_bytes_py,
+          "INT8 staging buffer size in bytes for n_elems gradient elements.",
+          py::arg("n_elems"));
 
     m.def("cross_entropy_tp_backward",
           &cross_entropy_tp_backward_py,
@@ -1019,5 +985,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           "  sm_version (int): 86, 90, or 120\n"
           "Returns: float",
           py::arg("sm_version"));
+
+    m.def("gradient_scale_bytes",    &gradient_scale_bytes_py,
+          "Per-block scale buffer size in bytes for n_elems gradient elements.",
+          py::arg("n_elems"));
 
 }
