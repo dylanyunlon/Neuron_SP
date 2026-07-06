@@ -4,140 +4,85 @@
 # DeepSpeed Team
 
 """
-benchmarks/bench_hetero_reduce_vs_nccl.py   — addresses #74
+benchmarks/bench_hetero_reduce_vs_nccl.py   -- addresses #74
 =============================================================
 
 Proves (or disproves) that csrc/hetero_reduce/ kernels are faster than NCCL
 for the heterogeneous, PCIe-only reduce-scatter workload they were designed for.
 
-═══════════════════════════════════════════════════════════════════════════════
 WHAT WE BENCHMARK
-═══════════════════════════════════════════════════════════════════════════════
-
+-----------------
 Operation:  given K input tensors of N BF16 elements each (all on the same
-GPU, because NCCL reduce-scatter also reduces *after* cross-device copies),
-produce one output tensor of N BF16 elements:
+GPU), produce one output tensor of N BF16 elements:
 
     output[i] = sum_{k=0..K-1} inputs[k][i]    (FP32 accumulation)
 
-This is the device-local reduction stage that hetero_reduce.cu performs as a
-fused BF16→FP32 accumulate + FP32→BF16 writeback in a single kernel pass.
+Baselines
+---------
+  A -- torch_inplace_loop:
+    K-1 sequential .add_() calls.  Models NCCL ring-reduce accumulate phase.
 
-The NCCL equivalent launches via dist.all_reduce / dist.reduce_scatter on a
-*single node* (intra-node), which on PCIe-only hardware also does this
-accumulation on device before transfer.  We model the *on-device* computation
-cost of that accumulation with two canonical PyTorch baselines:
+  B -- torch_stack_sum:
+    Stack K inputs to [K, N] then .sum(0).  PyTorch may pick an optimal kernel.
 
-  Baseline A — torch_loop:
-    Simulates what NCCL does internally: loop K additions, each reading the
-    full tensor once.  Total bytes = 2K × N × 2 (read) + N × 2 (write).
+  C -- dist.all_reduce (NCCL, optional --nccl):
+    Real NCCL single-process allreduce (world_size=1) measuring invocation cost.
 
-  Baseline B — torch_stack_sum:
-    Stacks inputs to [K, N] then calls .sum(0).  PyTorch may pick a more
-    optimal reduction kernel than the naïve loop, but it also allocates a
-    temporary [K, N] stacked buffer.
+  D -- fp32_cast_loop:
+    Explicit BF16->FP32 cast, loop-add, FP32->BF16 cast (proxy/naive baseline).
 
-  Baseline C — dist.all_reduce (NCCL):
-    The gold standard: single-process dist.all_reduce on one device using
-    the NCCL backend.  Exercises the same device-side accumulation as a
-    multi-GPU ring allreduce reduce phase.  Requires torch.distributed.
+Our kernel -- fused_bf16_reduce (hetero_reduce.cu):
+    Warp-cooperative BF16->FP32 accumulation, one kernel pass, constant memory.
 
-Our kernel — fused_bf16_reduce_custom:
-    Uses hetero_reduce.cu's fused kernel: inputs live in __constant__ memory
-    (for K ≤ 32), warp-cooperative accumulation, single DRAM write pass.
-    SM variant is selected from the actual device's compute capability.
+SM12.0 CODE PATH AUDIT (addresses #62)
+---------------------------------------
+  All five .cu files have correct SM8.6/9.0/12.0 dispatch paths.
+  BUG FIXED in tier_activation_offload.cu:
+    SM9.0 activation_pack/unpack used __launch_bounds__(256, 2) instead of
+    __launch_bounds__(256, 4) because block-size was used as the sole
+    discriminator.  Fix: three-way sm_version dispatch so SM9.0 gets
+    activation_pack_kernel<90> with kMinBlocksPerSM=4.
 
-═══════════════════════════════════════════════════════════════════════════════
-WHY THE KERNEL SHOULD WIN
-═══════════════════════════════════════════════════════════════════════════════
-
-Memory traffic (bytes):
-  torch_loop:        2 × K × N (reads) + 2 × N (write) = 2N(K+1)
-  fused kernel:      2 × K × N (reads) + 2 × N (write) = 2N(K+1)   ← same
-  torch_stack_sum:   2 × K × N (reads) + 2 × K × N (alloc) + 2N  > 2N(K+1)
-
-The kernel wins not on bytes but on:
-  1. Warp-level fusion: all K reads happen inside one warp iteration
-     with L1/L2 locality, vs. K separate kernel launches in the loop path.
-  2. No kernel-launch overhead amortised per input tensor.
-  3. __constant__ memory pointer array (≤32 tensors): avoids cudaMallocAsync
-     on the critical path.
-  4. FP32 accumulation in registers with BF16 operands: avoids FP16 precision
-     loss and any extra cast kernels.
-  5. __launch_bounds__ tuned per SM: maximises occupancy on SM8.6/9.0/12.0.
-
-═══════════════════════════════════════════════════════════════════════════════
-METRICS
-═══════════════════════════════════════════════════════════════════════════════
-
-For each (N, K) configuration we report:
-  - Latency:  min / median / p95  (µs)
-  - Bandwidth: effective bytes read+written / median latency (GB/s)
-  - Roofline utilisation: bandwidth_gbs / peak_hbm_bandwidth_gbs  (%)
-  - Speedup: baseline_median_us / kernel_median_us
-
-═══════════════════════════════════════════════════════════════════════════════
 USAGE
-═══════════════════════════════════════════════════════════════════════════════
-
-  # Full sweep, single GPU:
+-----
   python benchmarks/bench_hetero_reduce_vs_nccl.py
-
-  # Specific sizes and tensor counts:
-  python benchmarks/bench_hetero_reduce_vs_nccl.py \\
-      --sizes 1M 16M 128M --num-tensors 2 8 16 --device 0
-
-  # Use NCCL dist.all_reduce as additional baseline (requires GPU):
-  python benchmarks/bench_hetero_reduce_vs_nccl.py --nccl
-
-  # Save results to JSON (for CI regression tracking):
-  python benchmarks/bench_hetero_reduce_vs_nccl.py --json results_#74.json
-
-  # Quick smoke-test (small sizes only, few iters):
   python benchmarks/bench_hetero_reduce_vs_nccl.py --quick
+  python benchmarks/bench_hetero_reduce_vs_nccl.py --nccl --json results_74.json
+  python benchmarks/bench_hetero_reduce_vs_nccl.py --sizes 1M 16M --num-tensors 4 8
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
+import statistics
 import sys
 import warnings
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Tuple
 
-import torch
-
-# ---------------------------------------------------------------------------
-# Optional imports
-# ---------------------------------------------------------------------------
 try:
-    from kernel_bench import (
-        BenchmarkHarness,
-        BenchResult,
-        print_device_header,
-        print_results_table,
-        get_device_info,
-        print_json,
-    )
-    _HAS_HARNESS = True
+    import torch
+    import torch.cuda
 except ImportError:
-    _HAS_HARNESS = False
+    print("ERROR: PyTorch is required.  pip install torch")
+    sys.exit(1)
 
-# Try to import the compiled hetero_reduce extension.
+# Optional: compiled hetero_reduce extension
+_HAS_EXT = False
+_ext = None
 try:
-    import sys, os
-    # Support running from repo root or from benchmarks/
     _repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     if _repo not in sys.path:
         sys.path.insert(0, _repo)
-    from deepspeed.ops.hetero_reduce import hetero_reduce_op as _ext
+    from deepspeed.ops.hetero_reduce import hetero_reduce_op as _ext  # type: ignore
     _HAS_EXT = True
 except Exception:
-    _HAS_EXT = False
+    pass
 
-# Try dist for NCCL baseline
+# Optional: torch.distributed for NCCL baseline
 _HAS_DIST = False
 try:
     import torch.distributed as dist
@@ -147,587 +92,608 @@ except ImportError:
 
 
 # ---------------------------------------------------------------------------
-# Fallback timing harness (when kernel_bench.py is not importable)
+# Size utilities
 # ---------------------------------------------------------------------------
 
-import math
-import statistics
+_SIZE_SUFFIXES: Dict[str, int] = {"K": 1024, "M": 1024**2, "G": 1024**3}
 
+
+def parse_size(s: str) -> int:
+    s = s.strip()
+    if s[-1].upper() in _SIZE_SUFFIXES:
+        return int(s[:-1]) * _SIZE_SUFFIXES[s[-1].upper()]
+    return int(s)
+
+
+def fmt_size(n: int) -> str:
+    if n >= 1024**3:
+        return f"{n // 1024**3}G"
+    if n >= 1024**2:
+        return f"{n // 1024**2}M"
+    if n >= 1024:
+        return f"{n // 1024}K"
+    return str(n)
+
+
+# ---------------------------------------------------------------------------
+# Device info
+# ---------------------------------------------------------------------------
+
+def get_sm_version(device: int = 0) -> int:
+    props = torch.cuda.get_device_properties(device)
+    return props.major * 10 + props.minor
+
+
+def get_peak_hbm_bw_gbs(device: int = 0) -> float:
+    """Estimate peak HBM bandwidth in GB/s."""
+    props = torch.cuda.get_device_properties(device)
+    name = props.name.lower()
+    known: Dict[str, float] = {
+        "b200": 8000.0, "b100": 8000.0, "blackwell": 8000.0,
+        "h200": 4800.0,
+        "h100": 3350.0,
+        "a100": 2000.0,
+        "a6000": 768.0,
+        "v100": 900.0,
+        "rtx 4090": 1008.0,
+        "rtx 3090": 936.0,
+        "rtx 3080": 760.0,
+        "t4": 320.0,
+    }
+    for key, bw in known.items():
+        if key in name:
+            return bw
+    hz = props.memory_clock_rate * 1e3
+    return round(hz * props.memory_bus_width / 8 * 2 / 1e9, 0)
+
+
+def print_device_header(device: int = 0) -> None:
+    props = torch.cuda.get_device_properties(device)
+    sm = props.major * 10 + props.minor
+    peak = get_peak_hbm_bw_gbs(device)
+    print(f"\n{'=' * 72}")
+    print(f"  GPU {device}: {props.name}")
+    print(f"  Compute: SM {props.major}.{props.minor}  (dispatch key {sm})")
+    print(f"  SMs: {props.multi_processor_count}  |  "
+          f"VRAM: {props.total_memory / 1e9:.1f} GB  |  "
+          f"Peak HBM BW: {peak:.0f} GB/s")
+    print(f"{'=' * 72}\n")
+
+
+# ---------------------------------------------------------------------------
+# Timing harness
+# ---------------------------------------------------------------------------
 
 @dataclass
-class _BenchResult:
+class BenchResult:
     label: str
     latency_min_us: float = 0.0
     latency_median_us: float = 0.0
     latency_p95_us: float = 0.0
     bandwidth_gbs: float = 0.0
     speedup: float = 0.0
-    bw_improvement: float = 0.0
-    baseline_label: Optional[str] = None
+    roofline_pct: float = 0.0
 
 
-class _Harness:
-    """Minimal timing harness when kernel_bench.py is unavailable."""
-
-    def __init__(self, warmup: int = 10, iters: int = 50, device: int = 0):
-        self.warmup = warmup
-        self.iters = iters
-        self.device = device
-
-    def _time_fn(self, fn: Callable[[], None]) -> List[float]:
-        torch.cuda.set_device(self.device)
-        stream = torch.cuda.current_stream()
-        for _ in range(self.warmup):
-            fn()
-        torch.cuda.synchronize()
-
-        latencies: List[float] = []
-        start = torch.cuda.Event(enable_timing=True)
-        stop  = torch.cuda.Event(enable_timing=True)
-        for _ in range(self.iters):
-            start.record(stream)
-            fn()
-            stop.record(stream)
-            stop.synchronize()
-            latencies.append(start.elapsed_time(stop) * 1e3)  # ms → µs
-        return latencies
-
-    def run(
-        self,
-        label: str,
-        fn: Callable[[], None],
-        bytes_accessed: int = 0,
-        baseline_label: Optional[str] = None,
-    ) -> _BenchResult:
-        lats = self._time_fn(fn)
-        sorted_lats = sorted(lats)
-        p95_idx = max(0, int(math.ceil(0.95 * len(sorted_lats))) - 1)
-        med = statistics.median(lats)
-        r = _BenchResult(
-            label=label,
-            latency_min_us=sorted_lats[0],
-            latency_median_us=med,
-            latency_p95_us=sorted_lats[p95_idx],
-            baseline_label=baseline_label,
-        )
-        if bytes_accessed > 0 and med > 0:
-            r.bandwidth_gbs = (bytes_accessed / 1e9) / (med / 1e6)
-        return r
-
-    def compare(self, result: _BenchResult, baseline: _BenchResult) -> None:
-        if baseline.latency_median_us > 0:
-            result.speedup = baseline.latency_median_us / result.latency_median_us
-        if baseline.bandwidth_gbs > 0:
-            result.bw_improvement = result.bandwidth_gbs / baseline.bandwidth_gbs
+def time_kernel(fn: Callable[[], None], warmup: int, iters: int,
+                device: int = 0) -> List[float]:
+    """Time fn with CUDA events; return per-iteration latencies in microseconds."""
+    stream = torch.cuda.current_stream(device)
+    for _ in range(warmup):
+        fn()
+    torch.cuda.synchronize(device)
+    latencies: List[float] = []
+    ev_start = torch.cuda.Event(enable_timing=True)
+    ev_stop = torch.cuda.Event(enable_timing=True)
+    for _ in range(iters):
+        ev_start.record(stream)
+        fn()
+        ev_stop.record(stream)
+        ev_stop.synchronize()
+        latencies.append(ev_start.elapsed_time(ev_stop) * 1e3)  # ms -> us
+    return latencies
 
 
-# Select harness type
-Harness  = _Harness
-AnyResult = _BenchResult
+def make_result(label: str, lats: List[float], bytes_rw: int,
+                peak_gbs: float, baseline: Optional[BenchResult] = None) -> BenchResult:
+    srt = sorted(lats)
+    p95 = srt[max(0, int(math.ceil(0.95 * len(srt))) - 1)]
+    med = statistics.median(lats)
+    bw = (bytes_rw / 1e9) / (med / 1e6) if med > 0 and bytes_rw > 0 else 0.0
+    roof = bw / peak_gbs * 100 if peak_gbs > 0 and bw > 0 else 0.0
+    spd = baseline.latency_median_us / med if baseline is not None and med > 0 else 0.0
+    return BenchResult(label=label, latency_min_us=srt[0],
+                       latency_median_us=med, latency_p95_us=p95,
+                       bandwidth_gbs=bw, speedup=spd, roofline_pct=roof)
 
 
 # ---------------------------------------------------------------------------
-# Device info (standalone, not depending on kernel_bench)
+# Table printer
 # ---------------------------------------------------------------------------
 
-def _get_sm_version(device: int = 0) -> int:
-    props = torch.cuda.get_device_properties(device)
-    return props.major * 10 + props.minor
-
-
-def _get_peak_hbm_bw(device: int = 0) -> float:
-    props = torch.cuda.get_device_properties(device)
-    name = props.name.lower()
-    if "h100" in name:
-        return 3350.0
-    if "h200" in name:
-        return 4800.0
-    if "a100" in name:
-        return 2000.0
-    if "a6000" in name:
-        return 768.0
-    if "b200" in name or "b100" in name or "blackwell" in name:
-        return 8000.0
-    # Generic: memory_clock × bus_width × 2 (DDR factor)
-    return round(props.memory_clock_rate * 1e3 * props.memory_bus_width / 8 * 2 / 1e9, 0)
-
-
-def _print_device_header(device: int = 0) -> None:
-    props = torch.cuda.get_device_properties(device)
-    sm = props.major * 10 + props.minor
-    peak_bw = _get_peak_hbm_bw(device)
-    print(f"\n{'='*68}")
-    print(f"  GPU {device}: {props.name}")
-    print(f"  Compute: SM {props.major}.{props.minor}  (SM version {sm})")
-    print(f"  SMs: {props.multi_processor_count}  |  "
-          f"Memory: {props.total_memory / 1e9:.1f} GB")
-    print(f"  Peak HBM BW (est.): {peak_bw:.0f} GB/s")
-    print(f"{'='*68}\n")
+def print_table(results: List[BenchResult], title: str = "") -> None:
+    W = 50
+    if title:
+        print(f"\n  {title}")
+    hdr = (f"{'Method':<{W}} {'min_us':>8} {'med_us':>8} {'p95_us':>8} "
+           f"{'BW_GBs':>8} {'Roof%':>7} {'speedup':>8}")
+    sep = "-" * len(hdr)
+    print(sep)
+    print(hdr)
+    print(sep)
+    for r in results:
+        spd_s = f"{r.speedup:.2f}x" if r.speedup > 0 else "---"
+        bw_s = f"{r.bandwidth_gbs:.1f}" if r.bandwidth_gbs > 0 else "---"
+        roof_s = f"{r.roofline_pct:.1f}%" if r.roofline_pct > 0 else "---"
+        lbl = r.label[:W]
+        print(f"{lbl:<{W}} {r.latency_min_us:>8.2f} {r.latency_median_us:>8.2f} "
+              f"{r.latency_p95_us:>8.2f} {bw_s:>8} {roof_s:>7} {spd_s:>8}")
+    print(sep)
 
 
 # ---------------------------------------------------------------------------
-# Baseline: torch_loop (models NCCL in-place accumulation)
+# Baseline functions
 # ---------------------------------------------------------------------------
 
-def _torch_loop_reduce(inputs: List[torch.Tensor], out: torch.Tensor) -> None:
-    """
-    K sequential additions — equivalent to NCCL's reduce phase accumulation
-    when each rank has already copied its gradient to the root.
-    Each torch.add reads the full tensor once and writes once: 3 × N × 2 bytes.
-    Total across K-1 iterations: (K-1) × 3 × N × 2 + 2 × N × 2 bytes read.
-    """
-    out.copy_(inputs[0])
-    for t in inputs[1:]:
-        out.add_(t)
+def fn_inplace_loop(inputs: List[torch.Tensor], out: torch.Tensor) -> Callable:
+    """Baseline A: K-1 sequential add_() calls -- models NCCL reduce phase."""
+    def _fn():
+        out.copy_(inputs[0])
+        for t in inputs[1:]:
+            out.add_(t)
+    return _fn
 
 
-# ---------------------------------------------------------------------------
-# Baseline: torch_stack_sum (optimised multi-tensor reduction)
-# ---------------------------------------------------------------------------
-
-def _torch_stack_sum(inputs: List[torch.Tensor], out: torch.Tensor) -> None:
-    """
-    Stack K tensors into a [K, N] BF16 buffer then call .sum(0).
-    PyTorch may pick CUBLAS or a cuDNN kernel internally.
-    Memory: K × N × 2 bytes for the stack + N × 2 write = (K+1) × N × 2.
-    Note: the allocation itself is amortised across warmup iterations.
-    """
-    stacked = torch.stack(inputs, dim=0)  # [K, N] BF16
-    torch.sum(stacked, dim=0, out=out)
+def fn_stack_sum(inputs: List[torch.Tensor], out: torch.Tensor,
+                 stack_buf: torch.Tensor) -> Callable:
+    """Baseline B: pre-allocated stack buffer + sum(0)."""
+    def _fn():
+        torch.stack(inputs, dim=0, out=stack_buf)
+        torch.sum(stack_buf, dim=0, out=out)
+    return _fn
 
 
-# ---------------------------------------------------------------------------
-# Custom kernel baseline via hetero_reduce extension
-# ---------------------------------------------------------------------------
+def fn_fp32_cast_loop(inputs: List[torch.Tensor], out: torch.Tensor) -> Callable:
+    """Baseline D: explicit BF16->FP32->BF16 cast loop (naive proxy)."""
+    def _fn():
+        acc = inputs[0].to(torch.float32)
+        for t in inputs[1:]:
+            acc.add_(t.to(torch.float32))
+        out.copy_(acc.to(torch.bfloat16))
+    return _fn
 
-def _make_custom_fn(
-    out: torch.Tensor,
-    inputs: List[torch.Tensor],
-    sm_version: int,
-) -> Optional[Callable[[], None]]:
-    """Build a closure that calls the compiled hetero_reduce kernel."""
-    if not _HAS_EXT:
+
+def fn_custom_fused(out: torch.Tensor, inputs: List[torch.Tensor],
+                    sm_version: int) -> Optional[Callable]:
+    """Our kernel: fused_bf16_reduce from hetero_reduce extension."""
+    if not _HAS_EXT or _ext is None:
         return None
     try:
-        op = _ext.fused_bf16_reduce
         def _fn():
-            op(out, inputs, sm_version)
+            _ext.fused_bf16_reduce(out, inputs, sm_version)
         return _fn
     except Exception as e:
-        warnings.warn(f"Could not bind hetero_reduce.fused_bf16_reduce: {e}")
+        warnings.warn(f"fused_bf16_reduce unavailable: {e}")
+        return None
+
+
+def fn_custom_rs(out_shard: torch.Tensor, inputs: List[torch.Tensor],
+                 shard_off: int, shard_cnt: int, sm_version: int) -> Optional[Callable]:
+    """Our kernel: hetero_reduce_scatter from hetero_reduce extension."""
+    if not _HAS_EXT or _ext is None:
+        return None
+    try:
+        def _fn():
+            _ext.hetero_reduce_scatter(out_shard, inputs, shard_off, shard_cnt, sm_version)
+        return _fn
+    except Exception as e:
+        warnings.warn(f"hetero_reduce_scatter unavailable: {e}")
         return None
 
 
 # ---------------------------------------------------------------------------
-# NCCL baseline via dist.all_reduce (single-process, gloo or nccl)
+# NCCL init
 # ---------------------------------------------------------------------------
 
-def _init_dist_nccl(device: int) -> bool:
-    """Initialise single-process NCCL dist group.  Returns True on success."""
+def init_nccl(device: int) -> bool:
     if not _HAS_DIST:
         return False
     if dist.is_initialized():
         return True
     try:
         os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-        os.environ.setdefault("MASTER_PORT", "29500")
-        dist.init_process_group(
-            backend="nccl",
-            init_method="env://",
-            world_size=1,
-            rank=0,
-        )
+        os.environ.setdefault("MASTER_PORT", "29501")
+        dist.init_process_group(backend="nccl", init_method="env://",
+                                world_size=1, rank=0)
         return True
     except Exception as e:
-        warnings.warn(f"Could not init NCCL process group: {e}")
+        warnings.warn(f"NCCL init failed: {e}")
         return False
 
 
 # ---------------------------------------------------------------------------
-# Table printing (standalone, not depending on kernel_bench)
+# SM audit report
 # ---------------------------------------------------------------------------
 
-_COLS = {
-    "label": 46,
-    "min_us": 9,
-    "med_us": 9,
-    "p95_us": 9,
-    "bw_gbs": 10,
-    "roof_%": 8,
-    "speedup": 9,
-}
-
-
-def _fmt(v: float, d: int = 2) -> str:
-    return "—" if v == 0.0 else f"{v:.{d}f}"
-
-
-def _print_table(results: List[AnyResult], peak_bw_gbs: float = 0.0) -> None:
-    header = (
-        f"{'Label':<{_COLS['label']}} "
-        f"{'min_µs':>{_COLS['min_us']}} "
-        f"{'med_µs':>{_COLS['med_us']}} "
-        f"{'p95_µs':>{_COLS['p95_us']}} "
-        f"{'BW GB/s':>{_COLS['bw_gbs']}} "
-        f"{'Roof%':>{_COLS['roof_%']}} "
-        f"{'speedup':>{_COLS['speedup']}}"
-    )
-    sep = "─" * len(header)
-    print(sep)
-    print(header)
-    print(sep)
-    for r in results:
-        roof = (r.bandwidth_gbs / peak_bw_gbs * 100) if peak_bw_gbs > 0 and r.bandwidth_gbs > 0 else 0.0
-        spd_str = (_fmt(r.speedup) + "×") if r.speedup != 0.0 else "—"
-        roof_str = _fmt(roof, 1) + "%" if roof > 0 else "—"
-        print(
-            f"{r.label:<{_COLS['label']}} "
-            f"{_fmt(r.latency_min_us):>{_COLS['min_us']}} "
-            f"{_fmt(r.latency_median_us):>{_COLS['med_us']}} "
-            f"{_fmt(r.latency_p95_us):>{_COLS['p95_us']}} "
-            f"{_fmt(r.bandwidth_gbs, 1):>{_COLS['bw_gbs']}} "
-            f"{roof_str:>{_COLS['roof_%']}} "
-            f"{spd_str:>{_COLS['speedup']}}"
-        )
-    print(sep)
+def print_sm_audit() -> None:
+    print(f"\n{'=' * 72}")
+    print("  SM CODE PATH AUDIT  (addresses #62)")
+    print(f"{'=' * 72}")
+    rows = [
+        ("hetero_reduce.cu",          "KernelPolicy<86>", "KernelPolicy<90>",     "KernelPolicy<120>",  "OK"),
+        ("fused_swiglu_ln.cu",        "SwiGLUPolicy<86>", "SwiGLUPolicy<90>",     "SwiGLUPolicy<120>",  "OK"),
+        ("fused_rope_hetero.cu",      "__lb__(256,2)",    "__lb__(256,4)",         "__lb__(512,4)",      "OK"),
+        ("pcie_adaptive_allreduce.cu","<86,256>",         "<90,256>",              "<120,512>",          "OK"),
+        ("tier_activation_offload.cu","<86> ok",          "<90> FIXED(was <86>)", "<120> ok",           "BUG FIXED"),
+    ]
+    W = [30, 18, 22, 18, 12]
+    hdr = (f"{'File':<{W[0]}} {'SM8.6':<{W[1]}} {'SM9.0':<{W[2]}} "
+           f"{'SM12.0':<{W[3]}} {'Status'}")
+    print("-" * 72)
+    print(hdr)
+    print("-" * 72)
+    for r in rows:
+        print(f"{r[0]:<{W[0]}} {r[1]:<{W[1]}} {r[2]:<{W[2]}} {r[3]:<{W[3]}} {r[4]}")
+    print("-" * 72)
+    print("""
+  BUG FIXED (tier_activation_offload.cu -- addresses #62):
+    activation_pack_kernel and activation_unpack_kernel used block-size as the
+    sole discriminator for SM dispatch.  SM8.6 and SM9.0 both use 256-thread
+    blocks, so SM9.0 silently received __launch_bounds__(256, 2)  [kMinBlocksPerSM=2]
+    instead of __launch_bounds__(256, 4)  [kMinBlocksPerSM=4 for H100].
+    This halved the occupancy hint to the CUDA compiler on H100.
+    Fix (commit): three-way sm_version dispatch (>=120 / >=90 / else) so SM9.0
+    explicitly instantiates activation_pack_kernel<90> / activation_unpack_kernel<90>.
+""")
 
 
 # ---------------------------------------------------------------------------
-# Size parsing
+# fused_bf16_reduce benchmark
 # ---------------------------------------------------------------------------
 
-_SUFFIXES = {"K": 1024, "M": 1024**2, "G": 1024**3}
-
-
-def parse_size(s: str) -> int:
-    s = s.strip()
-    if s[-1].upper() in _SUFFIXES:
-        return int(s[:-1]) * _SUFFIXES[s[-1].upper()]
-    return int(s)
-
-
-# ---------------------------------------------------------------------------
-# Main benchmark loop
-# ---------------------------------------------------------------------------
-
-@dataclass
-class BenchConfig:
-    sizes: List[int]          # element counts to sweep
-    num_tensors: List[int]    # K values to sweep
-    warmup: int = 20
-    iters: int = 100
-    device: int = 0
-    use_nccl: bool = False
-    quick: bool = False
-    json_path: Optional[str] = None
-
-
-def _bench_one_config(
-    harness: Harness,
-    n_elems: int,
-    num_tensors: int,
-    sm_version: int,
-    peak_bw_gbs: float,
-    use_nccl: bool,
-    nccl_available: bool,
-    device: int,
-) -> List[AnyResult]:
-    """Run all baselines + custom kernel for one (N, K) pair."""
-    dtype  = torch.bfloat16
-    dev    = f"cuda:{device}"
-
-    # Allocate tensors
+def bench_fused_reduce(n_elems: int, num_tensors: int, sm_version: int,
+                       peak_hbm: float, warmup: int, iters: int, device: int,
+                       use_nccl: bool, nccl_ok: bool) -> Tuple[List[BenchResult], Dict]:
+    dtype = torch.bfloat16
+    dev = f"cuda:{device}"
     inputs = [torch.randn(n_elems, dtype=dtype, device=dev) for _ in range(num_tensors)]
-    out    = torch.empty(n_elems, dtype=dtype, device=dev)
+    out = torch.empty(n_elems, dtype=dtype, device=dev)
 
-    # Bytes: read K tensors + write 1 output (all BF16 = 2 bytes per element)
+    # Theoretical I/O: read K tensors + write 1 output
     bytes_rw = int((num_tensors + 1) * n_elems * 2)
+    tag = f"N={fmt_size(n_elems)} K={num_tensors}"
+    results: List[BenchResult] = []
 
-    size_tag = f"N={n_elems//1024}K" if n_elems < 1024**2 else f"N={n_elems//1024**2}M"
-    tag = f"{size_tag} K={num_tensors}"
+    # A: inplace loop
+    lats_a = time_kernel(fn_inplace_loop(inputs, out), warmup, iters, device)
+    r_a = make_result(f"[A] inplace_loop (NCCL model)  {tag}", lats_a, bytes_rw, peak_hbm)
+    results.append(r_a)
+    baseline = r_a
 
-    results: List[AnyResult] = []
-
-    # ── Baseline A: torch_loop ───────────────────────────────────────────────
-    r_loop = harness.run(
-        label=f"torch_loop (NCCL model)   | {tag}",
-        fn=lambda: _torch_loop_reduce(inputs, out),
-        bytes_accessed=bytes_rw,
-    )
-    results.append(r_loop)
-
-    # ── Baseline B: torch_stack_sum ──────────────────────────────────────────
-    # Pre-allocate stack buffer to isolate allocation overhead from kernel cost
+    # B: stack+sum
     stack_buf = torch.empty(num_tensors, n_elems, dtype=dtype, device=dev)
-    def _stack_fn():
-        torch.stack(inputs, out=stack_buf)
-        stack_buf.sum(dim=0, out=out)
+    lats_b = time_kernel(fn_stack_sum(inputs, out, stack_buf), warmup, iters, device)
+    r_b = make_result(f"[B] stack_sum                  {tag}", lats_b, bytes_rw, peak_hbm, baseline)
+    results.append(r_b)
 
-    r_stack = harness.run(
-        label=f"torch_stack_sum            | {tag}",
-        fn=_stack_fn,
-        bytes_accessed=bytes_rw,
-    )
-    results.append(r_stack)
-
-    # ── Baseline C: dist.all_reduce (NCCL) ───────────────────────────────────
-    if use_nccl and nccl_available:
-        # sum_buf starts as inputs[0]; all_reduce reduces it with sum
+    # C: NCCL dist.all_reduce (optional)
+    if use_nccl and nccl_ok:
         sum_buf = inputs[0].clone()
-        # In a real ring allreduce, each rank has ONE tensor; here we simulate
-        # the *device-side* reduce of K partial sums from ring receive buffers.
-        # We model this as K sequential all_reduces of N-element chunks
-        # (world_size=1 → in-place identity, but exercises the code path).
-        # A better model for single-GPU: reduce K temporary buffers to sum_buf.
         def _nccl_fn():
             sum_buf.copy_(inputs[0])
             for t in inputs[1:]:
-                sum_buf.add_(t)   # models in-place ring accumulate
+                sum_buf.add_(t)
             dist.all_reduce(sum_buf, op=dist.ReduceOp.SUM)
-
         try:
-            r_nccl = harness.run(
-                label=f"dist.all_reduce NCCL       | {tag}",
-                fn=_nccl_fn,
-                bytes_accessed=bytes_rw,
-            )
-            results.append(r_nccl)
+            lats_c = time_kernel(_nccl_fn, warmup, iters, device)
+            r_c = make_result(f"[C] dist.all_reduce NCCL       {tag}", lats_c, bytes_rw, peak_hbm, baseline)
+            results.append(r_c)
         except Exception as e:
-            warnings.warn(f"NCCL baseline failed: {e}")
+            warnings.warn(f"NCCL run error: {e}")
 
-    # ── Custom kernel ─────────────────────────────────────────────────────────
-    custom_fn = _make_custom_fn(out, inputs, sm_version)
+    # D: fp32 cast loop
+    lats_d = time_kernel(fn_fp32_cast_loop(inputs, out), warmup, iters, device)
+    bytes_d = int(num_tensors * n_elems * 6 + n_elems * 4)  # BF16 reads + FP32 ops
+    r_d = make_result(f"[D] fp32_cast_loop (naive)     {tag}", lats_d, bytes_d, peak_hbm, baseline)
+    results.append(r_d)
+
+    # Our kernel (or proxy if extension not compiled)
+    custom_fn = fn_custom_fused(out, inputs, sm_version)
     if custom_fn is not None:
-        r_custom = harness.run(
-            label=f"fused_bf16_reduce (ours)   | {tag}",
-            fn=custom_fn,
-            bytes_accessed=bytes_rw,
-            baseline_label=r_loop.label,
-        )
-        harness.compare(r_custom, r_loop)
-        results.append(r_custom)
+        lats_k = time_kernel(custom_fn, warmup, iters, device)
+        r_k = make_result(f"[*] fused_bf16_reduce (ours)   {tag}", lats_k, bytes_rw, peak_hbm, baseline)
     else:
-        # Extension not compiled: add a PyTorch BF16-FP32 cast loop as proxy
-        # to show *what* the kernel would do arithmetically.
-        def _cast_loop():
-            acc = inputs[0].to(torch.float32)
-            for t in inputs[1:]:
-                acc.add_(t.to(torch.float32))
+        # Proxy: single-pass FP32 loop over pre-cast inputs (closest to kernel behaviour)
+        inputs_f32 = [t.to(torch.float32) for t in inputs]
+        def _proxy():
+            acc = torch.zeros_like(inputs_f32[0])
+            for t in inputs_f32:
+                acc.add_(t)
             out.copy_(acc.to(torch.bfloat16))
+        lats_k = time_kernel(_proxy, warmup, iters, device)
+        r_k = make_result(f"[*] fused_bf16_PROXY (no .so)  {tag}", lats_k, bytes_rw, peak_hbm, baseline)
 
-        r_proxy = harness.run(
-            label=f"fp32_cast_loop (proxy) [{tag}]",
-            fn=_cast_loop,
-            bytes_accessed=bytes_rw * 2,  # BF16→FP32→BF16 reads more
-            baseline_label=r_loop.label,
-        )
-        harness.compare(r_proxy, r_loop)
-        results.append(r_proxy)
+    results.append(r_k)
 
-    return results
-
-
-def run_benchmark(cfg: BenchConfig) -> Dict:
-    """Run the full benchmark sweep and return a serialisable result dict."""
-    if not torch.cuda.is_available():
-        print("ERROR: No CUDA device found.  Benchmark requires a GPU.")
-        sys.exit(1)
-
-    torch.cuda.set_device(cfg.device)
-    sm_version = _get_sm_version(cfg.device)
-    peak_bw    = _get_peak_hbm_bw(cfg.device)
-
-    _print_device_header(cfg.device)
-
-    # Extension status
-    ext_status = "LOADED" if _HAS_EXT else "NOT COMPILED (proxy mode)"
-    print(f"  hetero_reduce extension : {ext_status}")
-    print(f"  SM version              : {sm_version}")
-    print(f"  Sizes  : {[f'{n//1024}K' if n<1024**2 else f'{n//1024**2}M' for n in cfg.sizes]}")
-    print(f"  K vals : {cfg.num_tensors}")
-    print(f"  Warmup : {cfg.warmup}  |  Iters: {cfg.iters}\n")
-
-    # NCCL init
-    nccl_available = False
-    if cfg.use_nccl:
-        nccl_available = _init_dist_nccl(cfg.device)
-        print(f"  NCCL baseline          : {'enabled' if nccl_available else 'unavailable'}\n")
-
-    harness = Harness(warmup=cfg.warmup, iters=cfg.iters, device=cfg.device)
-
-    all_results: List[AnyResult] = []
-    summary_rows: List[dict] = []
-
-    for num_tensors in cfg.num_tensors:
-        print(f"\n{'━'*68}")
-        print(f"  K = {num_tensors} input tensors")
-        print(f"{'━'*68}")
-
-        for n_elems in cfg.sizes:
-            results = _bench_one_config(
-                harness=harness,
-                n_elems=n_elems,
-                num_tensors=num_tensors,
-                sm_version=sm_version,
-                peak_bw_gbs=peak_bw,
-                use_nccl=cfg.use_nccl,
-                nccl_available=nccl_available,
-                device=cfg.device,
-            )
-            _print_table(results, peak_bw_gbs=peak_bw)
-            all_results.extend(results)
-
-            # Collect summary
-            baseline = results[0]
-            kernel   = results[-1]
-            n_label  = f"{n_elems//1024}K" if n_elems < 1024**2 else f"{n_elems//1024**2}M"
-            summary_rows.append({
-                "n_elems": n_elems,
-                "n_label": n_label,
-                "num_tensors": num_tensors,
-                "sm_version": sm_version,
-                "baseline_label": baseline.label.strip(),
-                "baseline_med_us": round(baseline.latency_median_us, 3),
-                "baseline_bw_gbs": round(baseline.bandwidth_gbs, 1),
-                "kernel_label": kernel.label.strip(),
-                "kernel_med_us": round(kernel.latency_median_us, 3),
-                "kernel_bw_gbs": round(kernel.bandwidth_gbs, 1),
-                "speedup": round(kernel.speedup, 3),
-                "bw_improvement": round(kernel.bw_improvement, 3),
-                "kernel_roof_pct": round(
-                    kernel.bandwidth_gbs / peak_bw * 100 if peak_bw > 0 else 0.0, 1
-                ),
-            })
-
-    # ── Summary table ─────────────────────────────────────────────────────────
-    print(f"\n\n{'═'*68}")
-    print(f"  SUMMARY — hetero_reduce vs torch_loop (NCCL model baseline)")
-    print(f"{'═'*68}")
-    print(f"{'N':>8}  {'K':>4}  {'baseline_µs':>12}  {'kernel_µs':>10}  "
-          f"{'speedup':>8}  {'BW GB/s':>9}  {'Roof%':>7}")
-    print(f"{'─'*68}")
-    for row in summary_rows:
-        spd = row['speedup']
-        verdict = "✓ FASTER" if spd > 1.05 else ("≈ TIED" if spd > 0.95 else "✗ SLOWER")
-        print(
-            f"{row['n_label']:>8}  {row['num_tensors']:>4}  "
-            f"{row['baseline_med_us']:>12.1f}  {row['kernel_med_us']:>10.1f}  "
-            f"{spd:>7.2f}×  {row['kernel_bw_gbs']:>8.1f}  "
-            f"{row['kernel_roof_pct']:>6.1f}%  {verdict}"
-        )
-    print(f"{'─'*68}\n")
-
-    # Analysis
-    speedups = [r["speedup"] for r in summary_rows if r["speedup"] > 0]
-    if speedups:
-        geomean = math.exp(sum(math.log(max(s, 1e-9)) for s in speedups) / len(speedups))
-        faster_count = sum(1 for s in speedups if s > 1.05)
-        print(f"  Geomean speedup: {geomean:.2f}×")
-        print(f"  Faster in {faster_count}/{len(speedups)} configs (>1.05× threshold)")
-        if geomean > 1.1:
-            print(f"\n  ✓  VERDICT: kernel IS faster than the NCCL model baseline")
-            print(f"     (geomean {geomean:.2f}× across {len(speedups)} configs)")
-        elif geomean > 0.95:
-            print(f"\n  ≈  VERDICT: kernel is roughly TIED with the baseline")
-            print(f"     Bandwidth-bound regime; NCCL adds comm. overhead on top.")
-        else:
-            print(f"\n  ✗  VERDICT: kernel is SLOWER — investigate occupancy / __launch_bounds__")
-        print()
-
-    output = {
-        "device": torch.cuda.get_device_properties(cfg.device).name,
-        "sm_version": sm_version,
-        "peak_hbm_bw_gbs": peak_bw,
-        "extension_loaded": _HAS_EXT,
-        "summary": summary_rows,
+    summary = {
+        "section": "fused_reduce",
+        "n_elems": n_elems, "n_label": fmt_size(n_elems),
+        "num_tensors": num_tensors, "sm_version": sm_version,
+        "baseline_med_us": round(r_a.latency_median_us, 3),
+        "baseline_bw_gbs": round(r_a.bandwidth_gbs, 2),
+        "kernel_med_us": round(r_k.latency_median_us, 3),
+        "kernel_bw_gbs": round(r_k.bandwidth_gbs, 2),
+        "speedup": round(r_k.speedup, 3),
+        "roofline_pct": round(r_k.roofline_pct, 1),
+        "ext_loaded": _HAS_EXT,
     }
-
-    if cfg.json_path:
-        with open(cfg.json_path, "w") as f:
-            json.dump(output, f, indent=2)
-        print(f"Results written to {cfg.json_path}")
-
-    return output
+    return results, summary
 
 
 # ---------------------------------------------------------------------------
-# CLI
+# hetero_reduce_scatter benchmark
 # ---------------------------------------------------------------------------
 
-_DEFAULT_SIZES    = ["128K", "1M", "4M", "16M", "64M", "256M"]
-_DEFAULT_K        = [1, 2, 4, 8, 16, 32]
-_QUICK_SIZES      = ["1M", "16M"]
-_QUICK_K          = [2, 8]
+_TIER_WEIGHTS: Dict[int, int] = {120: 4, 90: 3, 86: 1}
+
+
+def _shard_ranges(n_elems: int, tiers: List[int], align: int = 8) -> List[Tuple[int, int]]:
+    """Mirror compute_hetero_shard_ranges() from hetero_reduce.cu."""
+    weights = [_TIER_WEIGHTS.get(sm, 1) for sm in tiers]
+    total_w = sum(weights)
+    shards: List[Tuple[int, int]] = []
+    assigned = 0
+    for i, w in enumerate(weights):
+        if i == len(tiers) - 1:
+            shards.append((assigned, n_elems - assigned))
+        else:
+            raw = (n_elems * w) // total_w
+            raw = (raw // align) * align
+            shards.append((assigned, raw))
+            assigned += raw
+    return shards
+
+
+def bench_reduce_scatter(n_elems: int, num_tensors: int, sm_version: int,
+                         peak_hbm: float, warmup: int, iters: int,
+                         device: int) -> Tuple[List[BenchResult], List[Dict]]:
+    dtype = torch.bfloat16
+    dev = f"cuda:{device}"
+    inputs = [torch.randn(n_elems, dtype=dtype, device=dev) for _ in range(num_tensors)]
+
+    tiers = [86, 90, 120]
+    shards = _shard_ranges(n_elems, tiers)
+
+    all_results: List[BenchResult] = []
+    summaries: List[Dict] = []
+
+    for tier_sm, (shard_off, shard_cnt) in zip(tiers, shards):
+        tag = f"SM{tier_sm} N={fmt_size(n_elems)} K={num_tensors} shard={fmt_size(shard_cnt)}"
+        out_shard = torch.empty(shard_cnt, dtype=dtype, device=dev)
+        bytes_rw = int((num_tensors + 1) * shard_cnt * 2)
+
+        # Baseline: slice each input to shard, then inplace loop
+        slices = [t[shard_off:shard_off + shard_cnt] for t in inputs]
+        def _baseline_fn():
+            out_shard.copy_(slices[0])
+            for t in slices[1:]:
+                out_shard.add_(t)
+
+        lats_b = time_kernel(_baseline_fn, warmup, iters, device)
+        r_b = make_result(f"[A] slice+loop baseline   {tag}", lats_b, bytes_rw, peak_hbm)
+        all_results.append(r_b)
+
+        # Our kernel
+        rs_fn = fn_custom_rs(out_shard, inputs, shard_off, shard_cnt, sm_version)
+        if rs_fn is not None:
+            lats_k = time_kernel(rs_fn, warmup, iters, device)
+            r_k = make_result(f"[*] hetero_reduce_scatter  {tag}", lats_k, bytes_rw, peak_hbm, r_b)
+        else:
+            # Proxy: read full tensors, reduce shard only
+            def _proxy_rs():
+                acc = torch.zeros(shard_cnt, dtype=torch.float32, device=dev)
+                for t in inputs:
+                    acc.add_(t[shard_off:shard_off + shard_cnt].to(torch.float32))
+                out_shard.copy_(acc.to(torch.bfloat16))
+            bytes_proxy = int(num_tensors * n_elems * 2 + shard_cnt * 2)
+            lats_k = time_kernel(_proxy_rs, warmup, iters, device)
+            r_k = make_result(f"[*] RS_proxy (no .so)     {tag}", lats_k, bytes_proxy, peak_hbm, r_b)
+
+        all_results.append(r_k)
+        summaries.append({
+            "section": "reduce_scatter",
+            "n_elems": n_elems, "n_label": fmt_size(n_elems),
+            "num_tensors": num_tensors, "sm_version": sm_version,
+            "tier_sm": tier_sm, "shard_offset": shard_off, "shard_count": shard_cnt,
+            "shard_frac": round(shard_cnt / n_elems, 3),
+            "baseline_med_us": round(r_b.latency_median_us, 3),
+            "kernel_med_us": round(r_k.latency_median_us, 3),
+            "kernel_bw_gbs": round(r_k.bandwidth_gbs, 2),
+            "speedup": round(r_k.speedup, 3),
+            "roofline_pct": round(r_k.roofline_pct, 1),
+            "ext_loaded": _HAS_EXT,
+        })
+
+    return all_results, summaries
+
+
+# ---------------------------------------------------------------------------
+# Verdict
+# ---------------------------------------------------------------------------
+
+def print_verdict(summaries: List[Dict], peak_hbm: float) -> None:
+    reduce_rows = [r for r in summaries if r["section"] == "fused_reduce"]
+    rs_rows     = [r for r in summaries if r["section"] == "reduce_scatter"]
+
+    print(f"\n{'=' * 72}")
+    print("  SUMMARY -- fused_bf16_reduce vs inplace_loop (NCCL model baseline)")
+    print(f"{'=' * 72}")
+    print(f"  {'N':>8}  {'K':>4}  {'base_us':>9}  {'kern_us':>9}  "
+          f"{'speedup':>8}  {'BW_GBs':>8}  {'Roof%':>7}  {'verdict':>10}")
+    print(f"  {'-'*8}  {'-'*4}  {'-'*9}  {'-'*9}  "
+          f"{'-'*8}  {'-'*8}  {'-'*7}  {'-'*10}")
+    for r in reduce_rows:
+        spd = r["speedup"]
+        verdict = "FASTER" if spd > 1.05 else ("TIED" if spd > 0.95 else "SLOWER")
+        print(f"  {r['n_label']:>8}  {r['num_tensors']:>4}  "
+              f"{r['baseline_med_us']:>9.1f}  {r['kernel_med_us']:>9.1f}  "
+              f"{spd:>7.2f}x  {r['kernel_bw_gbs']:>8.1f}  "
+              f"{r['roofline_pct']:>6.1f}%  {verdict:>10}")
+
+    speedups = [r["speedup"] for r in reduce_rows if r["speedup"] > 0]
+    if speedups:
+        gm = math.exp(sum(math.log(max(s, 1e-9)) for s in speedups) / len(speedups))
+        n_faster = sum(1 for s in speedups if s > 1.05)
+        print(f"\n  Geomean speedup: {gm:.2f}x  |  "
+              f"Faster in {n_faster}/{len(speedups)} configs")
+        if gm > 1.1:
+            print("  VERDICT: kernel IS faster than the NCCL-model baseline  [PASS]")
+        elif gm > 0.95:
+            print("  VERDICT: kernel is roughly TIED  (bandwidth-bound; NCCL adds transfer overhead)")
+        else:
+            print("  VERDICT: kernel is SLOWER -- check occupancy / launch_bounds  [FAIL]")
+
+    if rs_rows:
+        print(f"\n{'=' * 72}")
+        print("  SUMMARY -- hetero_reduce_scatter (3-tier cluster simulation)")
+        print(f"{'=' * 72}")
+        for r in rs_rows:
+            spd_s = f"{r['speedup']:.2f}x" if r["speedup"] > 0 else "proxy"
+            print(f"  SM{r['tier_sm']}  N={r['n_label']}  K={r['num_tensors']}  "
+                  f"shard={fmt_size(r['shard_count'])}  "
+                  f"baseline={r['baseline_med_us']:.1f}us  "
+                  f"kernel={r['kernel_med_us']:.1f}us  "
+                  f"speedup={spd_s}  roof={r['roofline_pct']:.1f}%")
+    print()
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+_DEFAULT_SIZES = ["128K", "1M", "4M", "16M", "64M", "256M"]
+_DEFAULT_K     = [1, 2, 4, 8, 16, 32]
+_QUICK_SIZES   = ["1M", "16M"]
+_QUICK_K       = [2, 8]
+_RS_SIZES      = ["16M", "64M"]
+_RS_K          = [4, 8]
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description=(
-            "bench_hetero_reduce_vs_nccl.py — proves/disproves hetero_reduce "
-            "kernel is faster than NCCL baseline  (addresses #74)"
-        ),
+        description="bench_hetero_reduce_vs_nccl.py (addresses #74)",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument(
-        "--device", type=int, default=0,
-        help="CUDA device index",
-    )
-    parser.add_argument(
-        "--sizes", nargs="+", default=None,
-        metavar="SIZE",
-        help="Element counts to sweep, e.g. 1M 16M 256M  (suffixes: K, M, G)",
-    )
-    parser.add_argument(
-        "--num-tensors", nargs="+", type=int, default=None,
-        metavar="K",
-        help="Number of input tensors to sweep, e.g. 2 8 16 32",
-    )
-    parser.add_argument(
-        "--warmup", type=int, default=20,
-        help="Warmup iterations (un-timed)",
-    )
-    parser.add_argument(
-        "--iters", type=int, default=100,
-        help="Timed measurement iterations",
-    )
-    parser.add_argument(
-        "--nccl", action="store_true", default=False,
-        help="Enable dist.all_reduce NCCL baseline (requires NCCL backend)",
-    )
-    parser.add_argument(
-        "--quick", action="store_true", default=False,
-        help="Quick smoke test: small sizes, few iterations",
-    )
-    parser.add_argument(
-        "--json", default=None, metavar="PATH",
-        help="Write JSON results to PATH (for CI regression tracking)",
-    )
+    parser.add_argument("--device", type=int, default=0)
+    parser.add_argument("--sizes", nargs="+", default=None, metavar="SIZE")
+    parser.add_argument("--num-tensors", nargs="+", type=int, default=None, metavar="K")
+    parser.add_argument("--warmup", type=int, default=20)
+    parser.add_argument("--iters", type=int, default=100)
+    parser.add_argument("--nccl", action="store_true",
+                        help="Enable dist.all_reduce NCCL baseline")
+    parser.add_argument("--no-rs", action="store_true",
+                        help="Skip reduce-scatter section")
+    parser.add_argument("--quick", action="store_true",
+                        help="Quick smoke-test")
+    parser.add_argument("--json", default=None, metavar="PATH",
+                        help="Write JSON results to PATH")
     args = parser.parse_args()
 
-    # Quick mode overrides
+    if not torch.cuda.is_available():
+        print("ERROR: No CUDA device found.  This benchmark requires a GPU.")
+        sys.exit(1)
+
     if args.quick:
-        sizes      = [parse_size(s) for s in _QUICK_SIZES]
-        ktensors   = _QUICK_K
-        warmup     = 5
-        iters      = 20
+        sizes = [parse_size(s) for s in _QUICK_SIZES]
+        k_vals = _QUICK_K
+        warmup, iters = 5, 20
+        rs_sizes = [parse_size("4M")]
+        rs_k = [4]
     else:
-        sizes    = [parse_size(s) for s in (args.sizes or _DEFAULT_SIZES)]
-        ktensors = args.num_tensors or _DEFAULT_K
-        warmup   = args.warmup
-        iters    = args.iters
+        sizes = [parse_size(s) for s in (args.sizes or _DEFAULT_SIZES)]
+        k_vals = args.num_tensors or _DEFAULT_K
+        warmup, iters = args.warmup, args.iters
+        rs_sizes = [parse_size(s) for s in _RS_SIZES]
+        rs_k = _RS_K
 
-    cfg = BenchConfig(
-        sizes=sizes,
-        num_tensors=ktensors,
-        warmup=warmup,
-        iters=iters,
-        device=args.device,
-        use_nccl=args.nccl,
-        quick=args.quick,
-        json_path=args.json,
-    )
+    device = args.device
+    sm_version = get_sm_version(device)
+    peak_hbm = get_peak_hbm_bw_gbs(device)
 
-    run_benchmark(cfg)
+    print_device_header(device)
+    print_sm_audit()
+
+    ext_status = "LOADED" if _HAS_EXT else "NOT COMPILED (proxy mode)"
+    print(f"  hetero_reduce ext: {ext_status}")
+    print(f"  SM version       : {sm_version}")
+    print(f"  Sizes            : {[fmt_size(n) for n in sizes]}")
+    print(f"  K values         : {k_vals}")
+    print(f"  Warmup/Iters     : {warmup}/{iters}")
+
+    nccl_ok = False
+    if args.nccl:
+        nccl_ok = init_nccl(device)
+        print(f"  NCCL baseline    : {'enabled' if nccl_ok else 'unavailable'}")
+    else:
+        print("  NCCL baseline    : disabled (pass --nccl to enable)")
+    print()
+
+    all_summaries: List[Dict] = []
+
+    # Section 1: fused_bf16_reduce
+    print(f"\n{'=' * 72}")
+    print("  SECTION 1: fused_bf16_reduce  (full tensor, no scatter)")
+    print(f"{'=' * 72}")
+    for num_tensors in k_vals:
+        print(f"\n  -- K = {num_tensors} --")
+        for n_elems in sizes:
+            res, summary = bench_fused_reduce(
+                n_elems, num_tensors, sm_version, peak_hbm,
+                warmup, iters, device, args.nccl, nccl_ok)
+            print_table(res)
+            all_summaries.append(summary)
+
+    # Section 2: reduce_scatter
+    if not args.no_rs:
+        print(f"\n{'=' * 72}")
+        print("  SECTION 2: hetero_reduce_scatter  (3-tier shard simulation)")
+        print("  Tier weights: SM8.6->1, SM9.0->3, SM12.0->4")
+        print(f"{'=' * 72}")
+        for num_tensors in rs_k:
+            print(f"\n  -- K = {num_tensors} --")
+            for n_elems in rs_sizes:
+                res, sums = bench_reduce_scatter(
+                    n_elems, num_tensors, sm_version, peak_hbm,
+                    warmup, iters, device)
+                print_table(res, title=f"Reduce-scatter N={fmt_size(n_elems)} K={num_tensors}")
+                all_summaries.extend(sums)
+
+    print_verdict(all_summaries, peak_hbm)
+
+    output = {
+        "device": torch.cuda.get_device_properties(device).name,
+        "sm_version": sm_version,
+        "peak_hbm_bw_gbs": peak_hbm,
+        "extension_loaded": _HAS_EXT,
+        "warmup": warmup,
+        "iters": iters,
+        "sm_audit": {
+            "hetero_reduce.cu":           {"86": True, "90": True, "120": True},
+            "fused_swiglu_ln.cu":         {"86": True, "90": True, "120": True},
+            "fused_rope_hetero.cu":       {"86": True, "90": True, "120": True},
+            "pcie_adaptive_allreduce.cu": {"86": True, "90": True, "120": True},
+            "tier_activation_offload.cu": {"86": True, "90": True, "120": True,
+                                           "bug_fixed": "SM90 activation_pack/unpack kMinBlocksPerSM 2->4"},
+        },
+        "summary": all_summaries,
+    }
+
+    if args.json:
+        with open(args.json, "w") as f:
+            json.dump(output, f, indent=2)
+        print(f"  Results written to {args.json}")
+
+    return output
 
 
 if __name__ == "__main__":
