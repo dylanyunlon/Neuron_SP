@@ -137,6 +137,13 @@ fused_rope_neox_kernel(
     // Each thread handles kVecPairs consecutive pairs.
     // Neox-style: in_row[k] and in_row[k + half_dim] form a rotation pair.
     for (int k = threadIdx.x; k < half_dim; k += kBlockSize) {
+#if __CUDA_ARCH__ >= 1200
+        // Blackwell: prefetch next iteration's data into L1
+        if (k + kBlockSize < half_dim) {
+            asm volatile("prefetch.global.L1 [%0];" :: "l"(in_row  + k + kBlockSize));
+            asm volatile("prefetch.global.L1 [%0];" :: "l"(cos_row + k + kBlockSize));
+        }
+#endif
         float xv = __bfloat162float(in_row[k]);
         float yv = __bfloat162float(in_row[k + half_dim]);
         float c  = cos_row[k];
@@ -181,6 +188,13 @@ fused_rope_gptj_kernel(
 
     // GPT-J: pair (2k, 2k+1) are adjacent.
     for (int k = threadIdx.x; k < half_dim; k += kBlockSize) {
+#if __CUDA_ARCH__ >= 1200
+        // Blackwell: prefetch next iteration's data into L1
+        if (k + kBlockSize < half_dim) {
+            asm volatile("prefetch.global.L1 [%0];" :: "l"(in_row  + 2 * (k + kBlockSize)));
+            asm volatile("prefetch.global.L1 [%0];" :: "l"(cos_row + k + kBlockSize));
+        }
+#endif
         float xv = __bfloat162float(in_row[2 * k]);
         float yv = __bfloat162float(in_row[2 * k + 1]);
         float c  = cos_row[k];
@@ -196,7 +210,8 @@ fused_rope_gptj_kernel(
 // cos/sin cache precomputation kernel.
 // Fills cos_cache[s, k] = cos(theta_k * s) for s in [0, seq_len).
 // ---------------------------------------------------------------------------
-__global__ void rope_cache_kernel(
+__global__ void __launch_bounds__(256)
+rope_cache_kernel(
     float* __restrict__ cos_cache,  // [seq_len, half_dim]
     float* __restrict__ sin_cache,  // [seq_len, half_dim]
     int   seq_len,
@@ -213,9 +228,16 @@ __global__ void rope_cache_kernel(
     float sv, cv;
     fast_sincosf(theta, &sv, &cv);
 
+#if __CUDA_ARCH__ >= 1200
+    // Blackwell: use streaming stores to avoid polluting L2 cache
+    const size_t idx = (size_t)s * half_dim + k;
+    __stcs(cos_cache + idx, cv);
+    __stcs(sin_cache + idx, sv);
+#else
     const size_t idx = (size_t)s * half_dim + k;
     cos_cache[idx] = cv;
     sin_cache[idx] = sv;
+#endif
 }
 
 // ---------------------------------------------------------------------------

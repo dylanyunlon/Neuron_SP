@@ -233,6 +233,14 @@ fused_swiglu_ln_kernel(
         for (int col = (int)threadIdx.x * kVec; col < hidden;
              col += kBS * kVec, ++n_iter) {
 
+#if __CUDA_ARCH__ >= 1200
+            // Blackwell: prefetch next chunk of gate/up projections
+            const int next_col = col + kBS * kVec;
+            if (next_col < hidden) {
+                asm volatile("prefetch.global.L1 [%0];" :: "l"(g_row + next_col));
+                asm volatile("prefetch.global.L1 [%0];" :: "l"(u_row + next_col));
+            }
+#endif
             const uint4 g_raw = *reinterpret_cast<const uint4*>(g_row + col);
             const uint4 u_raw = *reinterpret_cast<const uint4*>(u_row + col);
             const __nv_bfloat16* gp = reinterpret_cast<const __nv_bfloat16*>(&g_raw);

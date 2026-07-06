@@ -287,6 +287,17 @@ hetero_reduce_scatter_kernel(
         // Each thread independently accumulates ALL tensors for its
         // own output elements — this is the standard fast path.
         // The warp works as a unit for L1/L2 prefetching.
+#if __CUDA_ARCH__ >= 1200
+        // Blackwell: prefetch next vector batch into L1 for reduced latency
+        if (vec_idx + stride < vec_count) {
+            const size_t next_elem = shard_offset + (vec_idx + stride) * kVec;
+            if constexpr (UseConstMem) {
+                asm volatile("prefetch.global.L1 [%0];" :: "l"(c_input_ptrs[0] + next_elem));
+            } else {
+                asm volatile("prefetch.global.L1 [%0];" :: "l"(d_inputs[0] + next_elem));
+            }
+        }
+#endif
         if constexpr (UseConstMem) {
             // Hot path: input pointers in __constant__ memory
             #pragma unroll 4
@@ -417,6 +428,17 @@ fused_bf16_reduce_kernel(
         float2 a0={0.f,0.f}, a1={0.f,0.f}, a2={0.f,0.f}, a3={0.f,0.f};
         const size_t base = i * kVec;
 
+#if __CUDA_ARCH__ >= 1200
+        // Blackwell: prefetch next iteration's first tensor into L1
+        if (i + stride < vec_n) {
+            const size_t next_base = (i + stride) * kVec;
+            if constexpr (UseConstMem) {
+                asm volatile("prefetch.global.L1 [%0];" :: "l"(c_input_ptrs[0] + next_base));
+            } else {
+                asm volatile("prefetch.global.L1 [%0];" :: "l"(d_inputs[0] + next_base));
+            }
+        }
+#endif
         if constexpr (UseConstMem) {
             #pragma unroll 4
             for (int t = 0; t < num_tensors; ++t)

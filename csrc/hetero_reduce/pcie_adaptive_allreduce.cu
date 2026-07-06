@@ -155,6 +155,14 @@ pcie_ring_reduce_kernel(
 
     for (size_t i = tid; i < vec_n; i += stride) {
         const size_t base = i * kARVecWidth;
+#if __CUDA_ARCH__ >= 1200
+        // Blackwell: prefetch next vector batch to hide memory latency
+        if (i + stride < vec_n) {
+            const size_t next_base = (i + stride) * kARVecWidth;
+            asm volatile("prefetch.global.L1 [%0];" :: "l"(src + next_base));
+            asm volatile("prefetch.global.L1 [%0];" :: "l"(dst + next_base));
+        }
+#endif
         float d0,d1,d2,d3,d4,d5,d6,d7;
         float s0,s1,s2,s3,s4,s5,s6,s7;
         // Use __ldg() for read-only src (never written by this kernel)
@@ -194,6 +202,12 @@ pcie_allreduce_finalise_kernel(
 
     for (size_t i = tid; i < vec_n; i += stride) {
         const size_t base = i * kARVecWidth;
+#if __CUDA_ARCH__ >= 1200
+        // Blackwell: prefetch next iteration's source data
+        if (i + stride < vec_n) {
+            asm volatile("prefetch.global.L1 [%0];" :: "l"(src + (i + stride) * kARVecWidth));
+        }
+#endif
         float a0,a1,a2,a3,a4,a5,a6,a7;
         ar_load8_f32(__ldg(src + base), a0,a1,a2,a3,a4,a5,a6,a7);
         ar_store8_bf16(out + base,

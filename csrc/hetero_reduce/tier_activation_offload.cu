@@ -122,6 +122,14 @@ activation_pack_kernel(
         const size_t src_elem   = vec_idx * kOffloadVecW;
         const size_t dst_elem   = (size_t)tensor_idx * tensor_elems + src_elem;
 
+#if __CUDA_ARCH__ >= 1200
+        // Blackwell: prefetch next vector's source data
+        if (v + stride < total_vecs) {
+            const int    next_tidx = (int)((v + stride) / vec_per_tensor);
+            const size_t next_vidx = (v + stride) % vec_per_tensor;
+            asm volatile("prefetch.global.L1 [%0];" :: "l"(inputs[next_tidx] + next_vidx * kOffloadVecW));
+        }
+#endif
         copy_bf16x8(inputs[tensor_idx] + src_elem, output + dst_elem);
     }
 }
@@ -152,6 +160,16 @@ activation_unpack_kernel(
                                   + vec_idx * kOffloadVecW;
         const size_t dst_elem   = vec_idx * kOffloadVecW;
 
+#if __CUDA_ARCH__ >= 1200
+        // Blackwell: prefetch next vector's source data
+        if (v + stride < total_vecs) {
+            const int    next_tidx = (int)((v + stride) / vec_per_tensor);
+            const size_t next_vidx = (v + stride) % vec_per_tensor;
+            const size_t next_src  = (size_t)next_tidx * tensor_elems
+                                     + next_vidx * kOffloadVecW;
+            asm volatile("prefetch.global.L1 [%0];" :: "l"(flat + next_src));
+        }
+#endif
         copy_bf16x8(flat + src_elem, outputs[tensor_idx] + dst_elem);
     }
 }
