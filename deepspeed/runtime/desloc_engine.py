@@ -463,70 +463,6 @@ class DesLocEngine:
         logger.info("[hetero_bridge] Phase 5: install() succeeded — "
                     "optimizer=%s, _cpu_offload=%s",
                     type(self.optimizer).__name__, self._cpu_offload_optim)
-        if False:  # dead code — fallback removed per no-fallback policy
-            # ── Legacy fallback path (original Phase 5 behaviour) ─────────
-            _local_vram_gb = torch.cuda.get_device_properties(
-                _local_device
-            ).total_memory / (1 << 30)
-            self._cpu_offload_optim = _local_vram_gb < 50.0
-
-            if self.param_shard_state is not None:
-                _shard = self.param_shard_state.param_shard
-                _shard.requires_grad_(True)
-
-                if self._cpu_offload_optim:
-                    _gpu_device = _shard.device
-                    _shard_cpu = _shard.detach().to("cpu", non_blocking=False)
-                    _shard_cpu.requires_grad_(True)
-                    self.param_shard_state.param_shard = _shard_cpu
-                    self.param_shard = _shard_cpu
-                    # NO FALLBACK (issue #12): DeepSpeedCPUAdam is mandatory
-                    # for A6000 (49 GB VRAM).  Compile with DS_BUILD_CPU_ADAM=1.
-                    from deepspeed.ops.adam import DeepSpeedCPUAdam
-                    self.optimizer = DeepSpeedCPUAdam(
-                        [_shard_cpu],
-                        lr=config.max_lr,
-                        betas=(config.beta1, config.beta2),
-                        eps=config.eps,
-                        weight_decay=config.weight_decay,
-                        adamw_mode=True,
-                        fp32_optimizer_states=True,
-                    )
-                    self._optim_type = "DeepSpeedCPUAdam"
-                    if False:  # dead code — fallback removed per no-fallback policy
-                        self.optimizer = AdamW(
-                            [_shard_cpu],
-                            lr=config.max_lr,
-                            betas=(config.beta1, config.beta2),
-                            eps=config.eps,
-                            weight_decay=config.weight_decay,
-                        )
-                        self._optim_type = "AdamW(cpu)"
-                    self._optim_gpu_device = _gpu_device
-                else:
-                    _use_foreach = _shard.numel() <= 2**31 - 1
-                    self.optimizer = AdamW(
-                        [_shard],
-                        lr=config.max_lr,
-                        betas=(config.beta1, config.beta2),
-                        eps=config.eps,
-                        weight_decay=config.weight_decay,
-                        foreach=_use_foreach,
-                    )
-                    self._optim_type = "AdamW(gpu)"
-                self.model = self.model.to(_local_device)
-            else:
-                self.model = self.model.to(_local_device)
-                self.optimizer = AdamW(
-                    self.model.parameters(),
-                    lr=config.max_lr,
-                    betas=(config.beta1, config.beta2),
-                    eps=config.eps,
-                    weight_decay=config.weight_decay,
-                    fused=self._fused_adam_available(),
-                )
-                self._optim_type = "AdamW(full-replica)"
-                self._cpu_offload_optim = False
         # LRScheduler requires a torch.optim.Optimizer instance.
         # Unwrap chain: DistOptAdapter._opt → DistributedOptimizer.optimizer → AdamW
         _sched_opt = self.optimizer
@@ -967,11 +903,6 @@ class DesLocEngine:
                 "[ActCkpt] GPU%d — master=%s  config_granularity=%s",
                 _local_rank, _ckpt_master_on, _ckpt_granularity,
             )
-            print(
-                f"[Neuron_SP] Activation-checkpoint strategy "
-                f"(master={'ON' if _ckpt_master_on else 'OFF'}, "
-                f"config_granularity={_ckpt_granularity}):"
-            )
 
             for layer_idx, block in enumerate(block_list):
                 dev_idx = layer_device_map.get(layer_idx, primary_idx)
@@ -1034,20 +965,11 @@ class DesLocEngine:
                     "ON " if apply_ckpt else "OFF",
                     policy_label,
                 )
-                print(
-                    f"  GPU{_local_rank}  layer {layer_idx:3d} -> GPU{dev_idx} "
-                    f"({tier.value:18s})  ckpt={'ON ' if apply_ckpt else 'OFF'}  "
-                    f"[{policy_label}]"
-                )
         else:
             logger.warning(
                 "[ActCkpt] GPU%d: model exposes no .blocks/.layers; "
                 "per-layer activation-checkpoint wrapping skipped.",
                 _local_rank,
-            )
-            print(
-                f"[Neuron_SP] WARNING GPU{_local_rank}: model exposes no .blocks/.layers; "
-                "activation-checkpoint wrapping skipped."
             )
 
         # --- Phase 7b: Fine-grained activation offload (A6000 only) ---
@@ -1968,7 +1890,7 @@ class DesLocEngine:
 
         # Log that this rank is entering the training loop (no barrier — barriers deadlock)
         _my_rank = dist.get_rank() if dist.is_initialized() else 0
-        logger.warning("rank=%d entering training loop (step=%d)", _my_rank, self.global_step)
+        logger.debug("rank=%d entering training loop (step=%d)", _my_rank, self.global_step)
 
         for step in range(self.global_step, cfg.total_steps):
             # DistributedOptimizer.zero_grad() zeroes its grad_data buffers +
@@ -2288,12 +2210,12 @@ class DesLocEngine:
                                 else _nullctx()
                             )
                             _dbg_rank = dist.get_rank() if dist.is_initialized() else 0
-                            logger.info("rank=%d: before forward (step=%d micro=%d)", _dbg_rank, step, micro)
+                            logger.debug("rank=%d: before forward (step=%d micro=%d)", _dbg_rank, step, micro)
                             with _offload_ctx:
                                 loss, scaled_loss = self.forward(
                                     input_ids, labels, num_microbatches=num_microbatches,
                                 )
-                            logger.info("rank=%d: after forward (step=%d micro=%d)", _dbg_rank, step, micro)
+                            logger.debug("rank=%d: after forward (step=%d micro=%d)", _dbg_rank, step, micro)
                             # Commit offload group: flush any pending D2H transfers
                             # for this micro-batch before backward begins.
                             if getattr(self, "_activation_offload_iface", None) is not None:
@@ -2314,9 +2236,9 @@ class DesLocEngine:
                                     # Tensor: divide by num_microbatches to match
                                     # the main-loss scale convention.
                                     scaled_loss = scaled_loss + _aux / max(num_microbatches, 1)
-                            logger.info("rank=%d: before backward (step=%d micro=%d)", _dbg_rank, step, micro)
+                            logger.debug("rank=%d: before backward (step=%d micro=%d)", _dbg_rank, step, micro)
                             scaled_loss.backward()
-                            logger.info("rank=%d: after backward (step=%d micro=%d)", _dbg_rank, step, micro)
+                            logger.debug("rank=%d: after backward (step=%d micro=%d)", _dbg_rank, step, micro)
                             # --- HeteroFP32GradAccumManager: accumulate (standard path) ---
                             # Promote BF16 param.grad into FP32 main_grad accumulators
                             # after each micro-batch backward.
@@ -2333,9 +2255,9 @@ class DesLocEngine:
             # identical on all ranks, then fall through to the shared code paths
             # (which are now all gated on _step_has_nan rather than `continue`).
             _step_has_nan = not math.isfinite(step_loss)
-            logger.warning("rank=%d: post-microbatch, step_loss=%.4f, nan=%s",
-                          dist.get_rank() if dist.is_initialized() else 0,
-                          step_loss, _step_has_nan)
+            logger.debug("rank=%d: post-microbatch, step_loss=%.4f, nan=%s",
+                         dist.get_rank() if dist.is_initialized() else 0,
+                         step_loss, _step_has_nan)
             if dist.is_initialized():
                 # All-reduce the NaN flag so every rank agrees before gating any
                 # subsequent NCCL calls (finalize_model_grads, should_skip, etc.).
@@ -2400,8 +2322,8 @@ class DesLocEngine:
                 # On NaN steps force skip_grad_sync=True: avoids sending garbage
                 # gradients across ranks while still completing the collective.
                 _fmg_skip_sync = (not _is_Kx_sync) or _step_has_nan
-                logger.warning("rank=%d: entering finalize_model_grads (Kx_sync=%s, nan=%s)",
-                    dist.get_rank() if dist.is_initialized() else 0, _is_Kx_sync, _step_has_nan)
+                logger.debug("rank=%d: entering finalize_model_grads (Kx_sync=%s, nan=%s)",
+                             dist.get_rank() if dist.is_initialized() else 0, _is_Kx_sync, _step_has_nan)
                 finalize_model_grads(
                     model=_fmg_model,
                     config=ModelParallelConfig(),
@@ -2455,10 +2377,11 @@ class DesLocEngine:
             if _should_skip:
                 _skip_count += 1
             if _is_main:
-                print(
-                    f"[hetero_grad] step={step} loss={step_loss:.4f} grad_norm={gnorm:.6f} "
-                    f"skip={_should_skip} total_skips={_skip_count} "
-                    f"ctrl_norm={_skip_info.combined_norm:.6f}"
+                logger.debug(
+                    "[hetero_grad] step=%d loss=%.4f grad_norm=%.6f "
+                    "skip=%s total_skips=%d ctrl_norm=%.6f",
+                    step, step_loss, gnorm,
+                    _should_skip, _skip_count, _skip_info.combined_norm,
                 )
             if not _should_skip:
                 self.optimizer.step()
