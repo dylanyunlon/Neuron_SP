@@ -218,3 +218,120 @@ class DesLocSyncPolicy:
             var_proxy = (g * g).mean().item()
             prev = self._var_ema.get(pid, var_proxy)
             self._var_ema[pid] = (1.0 - _EMA_ALPHA) * prev + _EMA_ALPHA * var_proxy
+
+    def update_variance_ema_cuda(
+        self,
+        named_params: "list[tuple[str, torch.Tensor]]",
+    ) -> None:
+        """Update gradient variance EMAs via a single batched CPU sync.
+
+        Accumulates all variance estimates as CUDA scalars, then transfers
+        them to CPU in ONE call (torch.stack + .cpu().tolist()), reducing
+        GPU->CPU synchronisations from O(num_params) to O(1) per step.
+
+        Args:
+            named_params: list of (name, param) from model.named_parameters().
+        """
+        import torch
+
+        cuda_vars: list = []
+        pids: list = []
+        for _, param in named_params:
+            if param.grad is None:
+                continue
+            g = param.grad.detach().float()
+            cuda_vars.append(g.mul(g).mean())  # CUDA scalar, no sync yet
+            pids.append(id(param))
+
+        if not cuda_vars:
+            return
+
+        values = torch.stack(cuda_vars).cpu().tolist()  # single D->H transfer
+        for pid, var_proxy in zip(pids, values):
+            prev = self._var_ema.get(pid, var_proxy)
+            self._var_ema[pid] = (1.0 - _EMA_ALPHA) * prev + _EMA_ALPHA * var_proxy
+
+    def reclassify_if_stale(
+        self,
+        named_params: "list[tuple[str, torch.Tensor]]",
+        steps_since_classify: int,
+        reclassify_every: int = 500,
+    ) -> bool:
+        """Re-run classify() if classification is stale.
+
+        Args:
+            named_params: model.named_parameters() list.
+            steps_since_classify: steps elapsed since last classify().
+            reclassify_every: period between reclassifications (default 500).
+
+        Returns:
+            True if reclassification was performed.
+        """
+        if not self._classified or steps_since_classify >= reclassify_every:
+            self.classify(named_params)
+            return True
+        return False
+
+    def numel_weighted_classify(
+        self,
+        named_params: "list[tuple[str, torch.Tensor]]",
+    ) -> "Dict[int, str]":
+        """Classify parameters weighted by numel, not count.
+
+        Standard classify() defines thirds by parameter count (num params).
+        This variant defines thirds by cumulative numel (total float elements):
+          top-1/3 of total bytes by variance -> 'x'
+          mid-1/3 -> 'u'
+          bottom-1/3 -> 'v'
+
+        Name overrides still apply. Large matrices (attention, MLP weights)
+        dominate the numel budget and get correct sync-class priority.
+
+        Returns:
+            Dict mapping id(param) -> sync class string.
+        """
+        result: Dict[int, str] = {}
+
+        forced: Dict[int, str] = {}
+        for name, param in named_params:
+            name_lower = name.lower()
+            for pattern, cls in _NAME_OVERRIDES:
+                if pattern in name_lower:
+                    forced[id(param)] = cls
+                    break
+
+        variance_scores: list = []
+        for name, param in named_params:
+            pid = id(param)
+            if pid in forced:
+                continue
+            var_proxy = self._var_ema.get(pid, 0.0)
+            variance_scores.append((pid, var_proxy, param.numel()))
+
+        variance_scores.sort(key=lambda t: t[1], reverse=True)
+        total_numel = sum(t[2] for t in variance_scores)
+        third = max(1, total_numel // 3)
+        cumulative = 0
+        for pid, _var, numel in variance_scores:
+            cumulative += numel
+            if cumulative <= third:
+                result[pid] = "x"
+            elif cumulative <= 2 * third:
+                result[pid] = "u"
+            else:
+                result[pid] = "v"
+
+        result.update(forced)
+        self._classes = result
+        self._classified = True
+
+        n_x = sum(1 for c in result.values() if c == "x")
+        n_u = sum(1 for c in result.values() if c == "u")
+        n_v = sum(1 for c in result.values() if c == "v")
+        logger.info(
+            "[DesLocSyncPolicy] numel_weighted_classify: x=%d u=%d v=%d "
+            "(total_numel=%dM)",
+            n_x, n_u, n_v, total_numel // 1_000_000,
+        )
+        return result
+

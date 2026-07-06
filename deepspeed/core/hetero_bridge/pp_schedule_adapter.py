@@ -251,6 +251,159 @@ class PPScheduleAdapter:
     # Internal helpers
     # ------------------------------------------------------------------
 
+
+    def detect_layer_imbalance(
+        self,
+        stage_times: "list[float]",
+        threshold: float = 0.20,
+    ) -> "dict":
+        """Detect load imbalance across pipeline stages and suggest rebalancing.
+
+        Measures the coefficient of variation (CV = std/mean) of per-stage
+        forward pass times.  If any stage is more than threshold faster or
+        slower than the mean, suggests a layer count adjustment.
+
+        Args:
+            stage_times:  List of per-stage measured forward pass times (ms).
+                          Length must equal world_size.
+            threshold:    Fraction above mean that triggers rebalancing (0.20 = 20%).
+
+        Returns:
+            dict with keys:
+              "imbalanced" (bool): True if CV > threshold.
+              "cv" (float): Coefficient of variation.
+              "slowest_stage" (int): Index of the slowest stage.
+              "suggested_split" (list[int]): Adjusted layer counts (or None if balanced).
+        """
+        import math
+
+        world_size = self.tier_map.world_size
+        if len(stage_times) != world_size:
+            raise ValueError(
+                f"stage_times length {len(stage_times)} != world_size {world_size}"
+            )
+
+        mean_t = sum(stage_times) / world_size
+        if mean_t <= 0:
+            return {"imbalanced": False, "cv": 0.0, "slowest_stage": -1, "suggested_split": None}
+
+        variance = sum((t - mean_t) ** 2 for t in stage_times) / world_size
+        cv = math.sqrt(variance) / mean_t
+
+        slowest = max(range(world_size), key=lambda i: stage_times[i])
+        fastest = min(range(world_size), key=lambda i: stage_times[i])
+
+        if cv <= threshold:
+            return {"imbalanced": False, "cv": cv, "slowest_stage": slowest, "suggested_split": None}
+
+        # Suggest adjustment: redistribute layers proportional to 1/time
+        # (faster stages should hold more layers)
+        inv_times = [1.0 / max(t, 1e-9) for t in stage_times]
+        total_inv = sum(inv_times)
+        current_split = self.layer_split()
+
+        suggested: list = []
+        assigned = 0
+        for i in range(world_size - 1):
+            count = int(self.num_layers * inv_times[i] / total_inv)
+            count = max(1, count)
+            suggested.append(count)
+            assigned += count
+        suggested.append(max(1, self.num_layers - assigned))
+
+        # Correct overshoot
+        overshoot = sum(suggested) - self.num_layers
+        if overshoot > 0:
+            for _ in range(overshoot):
+                max_idx = suggested.index(max(suggested))
+                if suggested[max_idx] > 1:
+                    suggested[max_idx] -= 1
+
+        logger.info(
+            "[PPScheduleAdapter] detect_layer_imbalance: CV=%.3f > threshold=%.2f. "
+            "Slowest stage=%d (%.1fms), fastest=%d (%.1fms). "
+            "Current split=%s → suggested=%s",
+            cv, threshold, slowest, stage_times[slowest],
+            fastest, stage_times[fastest],
+            current_split, suggested,
+        )
+        return {
+            "imbalanced": True,
+            "cv": cv,
+            "slowest_stage": slowest,
+            "suggested_split": suggested,
+        }
+
+    def rebalance_layers(self, suggested_split: "list[int]") -> None:
+        """Apply a new layer split and invalidate the cached split.
+
+        Validates the proposed split (sum == num_layers, all >= 1) then
+        updates the cached value so subsequent layer_split() calls return
+        the new assignment.
+
+        Args:
+            suggested_split: New per-stage layer counts from detect_layer_imbalance().
+
+        Raises:
+            ValueError: If the split is invalid.
+        """
+        if sum(suggested_split) != self.num_layers:
+            raise ValueError(
+                f"suggested_split sum {sum(suggested_split)} != num_layers {self.num_layers}"
+            )
+        if any(c < 1 for c in suggested_split):
+            raise ValueError("All stages must have at least 1 layer.")
+        if len(suggested_split) != self.tier_map.world_size:
+            raise ValueError(
+                f"suggested_split length {len(suggested_split)} != world_size "
+                f"{self.tier_map.world_size}"
+            )
+
+        old_split = self._cached_split
+        self._cached_split = list(suggested_split)
+        logger.info(
+            "[PPScheduleAdapter] rebalance_layers: %s → %s",
+            old_split, suggested_split,
+        )
+
+    def estimate_bubble_fraction(self, num_microbatches: int) -> float:
+        """Estimate the pipeline bubble fraction for the current schedule.
+
+        For 1F1B without interleaving:
+          bubble_fraction = (num_stages - 1) / num_microbatches
+
+        For the heterogeneous PP=5 path with HeterogeneousBubbleFiller
+        injecting extra_mb=2 forward passes per fast rank:
+          effective_bubble ≈ max(0, (num_stages - 1 - 2) / num_microbatches)
+
+        Args:
+            num_microbatches: Number of micro-batches in the global batch.
+
+        Returns:
+            float: Estimated bubble fraction in [0, 1].
+        """
+        world_size = self.tier_map.world_size
+        if world_size <= 1:
+            return 0.0
+        if num_microbatches <= 0:
+            return 1.0
+
+        # Heterogeneous PP=5: bubble filler provides 2 extra micro-batches
+        # per bubble on fast stages, reducing effective bubble.
+        if world_size == 5 and self._has_fast_ranks():
+            extra_mb = 2  # matches _build_bubble_filler extra_mb=2
+            effective_stages = max(1, world_size - 1 - extra_mb)
+        else:
+            effective_stages = world_size - 1
+
+        bubble = effective_stages / max(num_microbatches, effective_stages)
+        logger.debug(
+            "[PPScheduleAdapter] estimate_bubble_fraction: world_size=%d, "
+            "num_microbatches=%d, bubble=%.3f",
+            world_size, num_microbatches, bubble,
+        )
+        return min(1.0, max(0.0, bubble))
+
     def _has_fast_ranks(self) -> bool:
         """Return True if any rank in the cluster is H100 or Blackwell."""
         from .tier_map import GPUTier
