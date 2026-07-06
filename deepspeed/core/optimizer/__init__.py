@@ -24,6 +24,7 @@ Guaranteed import paths
     from deepspeed.core.optimizer.distrib_optimizer import DistributedOptimizer
 """
 
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 from deepspeed.core.optimizer.optimizer_config import (
     OptimizerConfig,
     ParamKey,
