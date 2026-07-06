@@ -2321,6 +2321,9 @@ class DesLocEngine:
             # identical on all ranks, then fall through to the shared code paths
             # (which are now all gated on _step_has_nan rather than `continue`).
             _step_has_nan = not math.isfinite(step_loss)
+            logger.warning("rank=%d: post-microbatch, step_loss=%.4f, nan=%s",
+                          dist.get_rank() if dist.is_initialized() else 0,
+                          step_loss, _step_has_nan)
             if dist.is_initialized():
                 # All-reduce the NaN flag so every rank agrees before gating any
                 # subsequent NCCL calls (finalize_model_grads, should_skip, etc.).
@@ -2385,6 +2388,8 @@ class DesLocEngine:
                 # On NaN steps force skip_grad_sync=True: avoids sending garbage
                 # gradients across ranks while still completing the collective.
                 _fmg_skip_sync = (not _is_Kx_sync) or _step_has_nan
+                logger.warning("rank=%d: entering finalize_model_grads (Kx_sync=%s, nan=%s)",
+                    dist.get_rank() if dist.is_initialized() else 0, _is_Kx_sync, _step_has_nan)
                 finalize_model_grads(
                     model=_fmg_model,
                     config=ModelParallelConfig(),
