@@ -143,6 +143,83 @@ void launch_fused_swiglu_ln(__nv_bfloat16* output,
                              int sm_version,
                              cudaStream_t stream);
 
+/**
+ * launch_fused_swiglu_ln_fwd_save
+ *
+ * Forward pass variant that additionally writes rms_inv[row] into a
+ * caller-allocated FP32 device buffer (length = batch).  Pass this buffer
+ * to launch_fused_swiglu_ln_backward to avoid recomputing the RMS
+ * denominator on the backward pass.
+ *
+ * @param output       [out] BF16 output        [batch, hidden]
+ * @param rms_inv_out  [out] FP32 rms_inv       [batch]
+ * @param gate_proj    [in]  BF16 gate          [batch, hidden]
+ * @param up_proj      [in]  BF16 up            [batch, hidden]
+ * @param ln_weight    [in]  FP32 LN weight     [hidden]
+ * @param batch        Batch size
+ * @param hidden       Hidden size (divisible by 8)
+ * @param eps          LayerNorm epsilon
+ * @param sm_version   SM version (86 / 90 / 120)
+ * @param stream       CUDA stream
+ */
+void launch_fused_swiglu_ln_fwd_save(__nv_bfloat16*       output,
+                                      float*               rms_inv_out,
+                                      const __nv_bfloat16* gate_proj,
+                                      const __nv_bfloat16* up_proj,
+                                      const float*         ln_weight,
+                                      int batch,
+                                      int hidden,
+                                      float eps,
+                                      int sm_version,
+                                      cudaStream_t stream);
+
+/**
+ * launch_fused_swiglu_ln_backward
+ *
+ * Backward pass for fused SwiGLU + RMSNorm.  Computes gradients for
+ * gate_proj, up_proj, and ln_weight given the upstream gradient d_output.
+ *
+ * The caller must:
+ *   1. Have run launch_fused_swiglu_ln_fwd_save to obtain rms_inv_buf.
+ *   2. Zero d_ln_weight before the first backward call (gradients accumulate
+ *      via atomicAdd across the batch).
+ *
+ * Math (per row i):
+ *   dot_i     = Σ_j  d_out[i,j] · w_j · swiglu(gate[i,j], up[i,j])
+ *   d_s_j     = rms_inv_i · w_j · d_out[i,j]
+ *               - rms_inv_i³ · swiglu_j · dot_i / hidden
+ *   d_gate_j  = d_s_j · up_j · σ(gate_j) · (1 + gate_j · (1 − σ(gate_j)))
+ *   d_up_j    = d_s_j · gate_j · σ(gate_j)
+ *   d_w_j    += d_out[i,j] · swiglu[i,j] · rms_inv_i
+ *
+ * @param d_gate       [out] BF16 gradient for gate_proj [batch, hidden]
+ * @param d_up         [out] BF16 gradient for up_proj   [batch, hidden]
+ * @param d_ln_weight  [out] FP32 gradient for ln_weight [hidden] — ACCUMULATES
+ * @param d_output     [in]  BF16 upstream gradient      [batch, hidden]
+ * @param gate_proj    [in]  BF16 forward gate input     [batch, hidden]
+ * @param up_proj      [in]  BF16 forward up input       [batch, hidden]
+ * @param ln_weight    [in]  FP32 LN weight              [hidden]
+ * @param rms_inv_buf  [in]  FP32 rms_inv from fwd_save  [batch]
+ * @param batch        Batch size
+ * @param hidden       Hidden size (divisible by 8)
+ * @param eps          LayerNorm epsilon (must match forward call)
+ * @param sm_version   SM version (86 / 90 / 120)
+ * @param stream       CUDA stream
+ */
+void launch_fused_swiglu_ln_backward(__nv_bfloat16*       d_gate,
+                                      __nv_bfloat16*       d_up,
+                                      float*               d_ln_weight,
+                                      const __nv_bfloat16* d_output,
+                                      const __nv_bfloat16* gate_proj,
+                                      const __nv_bfloat16* up_proj,
+                                      const float*         ln_weight,
+                                      const float*         rms_inv_buf,
+                                      int batch,
+                                      int hidden,
+                                      float eps,
+                                      int sm_version,
+                                      cudaStream_t stream);
+
 // ===========================================================================
 // fused_rope_hetero — Heterogeneous-head-count RoPE kernel
 // ===========================================================================

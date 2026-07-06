@@ -378,3 +378,486 @@ void launch_fused_swiglu_ln(
                     output, gate_proj, up_proj, ln_weight, hidden, eps);
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Section 6: Backward kernel — fused SwiGLU + RMSNorm
+//
+// Given upstream gradient d_output ∈ BF16[batch, hidden], the forward
+// inputs gate_proj / up_proj ∈ BF16[batch, hidden], the LN weight
+// ln_weight ∈ FP32[hidden], and the forward RMS inverse rms_inv ∈ FP32[batch]
+// saved from the forward pass, this kernel computes:
+//
+//   Let  σ(x) = sigmoid(x) = 1 / (1 + exp(-x))
+//        s_j  = gate_j · σ(gate_j) · up_j           (SwiGLU output)
+//        ŷ_j  = s_j · w_j · rms_inv                 (forward output)
+//
+//   d_ln_weight_j  += Σ_i  d_out[i,j] · ŷ[i,j] / w_j     (batch reduce)
+//
+//   For each row i (CTA handles one row):
+//     dot_i = Σ_j  d_out[i,j] · w_j · s[i,j]              (RMSNorm chain-rule dot)
+//
+//     d_s_j = rms_inv · w_j · d_out[i,j]
+//             - rms_inv³ · s_j · dot_i / hidden            (RMSNorm upstream grad)
+//
+//     d_gate_j = d_s_j · up_j · σ(gate_j) · (1 + gate_j · (1 − σ(gate_j)))
+//     d_up_j   = d_s_j · gate_j · σ(gate_j)
+//
+// Shared memory layout  (kMaxWarps + kMaxWarps floats):
+//   smem[0 .. kMaxWarps-1]          : warp partial sums for dot reduction
+//   smem[kMaxWarps .. 2kMaxWarps-1] : unused (padding for alignment)
+//
+// d_ln_weight is accumulated via atomicAdd over the batch dimension;
+// it must be zeroed by the caller before the first backward call.
+//
+// Template parameters mirror the forward kernel (SmVer, kSinglePass).
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ── Derivative helpers ────────────────────────────────────────────────────────
+
+// d(SwiGLU)/d(gate)  =  up · σ(gate) · (1 + gate · (1 − σ(gate)))
+DS_D_INLINE float dswiglu_dgate(float gate, float up)
+{
+    float sig = fast_sigmoid(gate);
+    return up * sig * (1.f + gate * (1.f - sig));
+}
+
+// d(SwiGLU)/d(up)  =  gate · σ(gate)
+DS_D_INLINE float dswiglu_dup(float gate)
+{
+    return gate * fast_sigmoid(gate);
+}
+
+// ── Backward kernel ───────────────────────────────────────────────────────────
+
+template <int SmVer, bool kSinglePass>
+__global__ void
+__launch_bounds__(SwiGLUPolicy<SmVer>::kBlockSize,
+                  SwiGLUPolicy<SmVer>::kMinBlocksPerSM)
+fused_swiglu_ln_backward_kernel(
+    __nv_bfloat16* __restrict__       d_gate,       // [batch, hidden]
+    __nv_bfloat16* __restrict__       d_up,         // [batch, hidden]
+    float*         __restrict__       d_ln_weight,  // [hidden]  atomicAdd
+    const __nv_bfloat16* __restrict__ d_output,     // [batch, hidden]
+    const __nv_bfloat16* __restrict__ gate_proj,    // [batch, hidden]
+    const __nv_bfloat16* __restrict__ up_proj,      // [batch, hidden]
+    const float*          __restrict__ ln_weight,   // [hidden]
+    const float*          __restrict__ rms_inv_buf, // [batch]  saved from fwd
+    int   hidden,
+    float eps)
+{
+    using Policy = SwiGLUPolicy<SmVer>;
+    constexpr int kVec      = Policy::kVecWidth;   // 8
+    constexpr int kBS       = Policy::kBlockSize;
+    constexpr int kMaxWarps = Policy::kMaxWarps;
+
+    // Shared memory: one warp-sum array (used for the dot reduction and
+    // the RMS-inv broadcast that follows).
+    __shared__ float smem_warps[kMaxWarps];
+
+    cg::thread_block blk = cg::this_thread_block();
+
+    const int row = blockIdx.x;
+
+    // Row pointers
+    const __nv_bfloat16* __restrict__ do_row = d_output  + (size_t)row * hidden;
+    const __nv_bfloat16* __restrict__  g_row = gate_proj + (size_t)row * hidden;
+    const __nv_bfloat16* __restrict__  u_row = up_proj   + (size_t)row * hidden;
+          __nv_bfloat16* __restrict__ dg_row = d_gate    + (size_t)row * hidden;
+          __nv_bfloat16* __restrict__ du_row = d_up      + (size_t)row * hidden;
+
+    // Saved forward RMS inverse for this row.
+    const float rms_inv = rms_inv_buf[row];
+    const float rms_inv3 = rms_inv * rms_inv * rms_inv;   // rms_inv^3
+
+    // ──────────────────────────────────────────────────────────────────────
+    // SINGLE-PASS backward (kSinglePass=true)
+    //   All inputs fit in registers; two logical passes but zero extra DRAM.
+    //
+    //   Register-file pass 1: load gate/up/d_out, compute SwiGLU, store
+    //       gate, up, d_out, and s in register arrays; accumulate dot.
+    //   Block reduce → dot.
+    //   Register-file pass 2: compute d_s, d_gate, d_up and write outputs.
+    //       Also atomicAdd d_ln_weight (one atomic per element per CTA).
+    // ──────────────────────────────────────────────────────────────────────
+    if constexpr (kSinglePass) {
+        constexpr int kMaxIter = Policy::kRegBudgetPerThread / kVec;
+
+        // Register arrays (4 × kMaxIter × kVec floats, ~4 KB on SM9.0)
+        float reg_gate[kMaxIter * kVec];
+        float reg_up  [kMaxIter * kVec];
+        float reg_do  [kMaxIter * kVec];
+        float reg_sw  [kMaxIter * kVec];
+
+        float thread_dot = 0.f;
+
+        // ── Register-file pass 1: load + SwiGLU + dot accumulation ──
+        int n_iter = 0;
+        for (int col = (int)threadIdx.x * kVec; col < hidden;
+             col += kBS * kVec, ++n_iter) {
+
+            const uint4  g_raw = *reinterpret_cast<const uint4*>( g_row + col);
+            const uint4  u_raw = *reinterpret_cast<const uint4*>( u_row + col);
+            const uint4 do_raw = *reinterpret_cast<const uint4*>(do_row + col);
+
+            const __nv_bfloat16* gp  = reinterpret_cast<const __nv_bfloat16*>(&g_raw);
+            const __nv_bfloat16* up  = reinterpret_cast<const __nv_bfloat16*>(&u_raw);
+            const __nv_bfloat16* dop = reinterpret_cast<const __nv_bfloat16*>(&do_raw);
+
+            const int base = n_iter * kVec;
+            #pragma unroll
+            for (int v = 0; v < kVec; ++v) {
+                float gv  = __bfloat162float(gp[v]);
+                float uv  = __bfloat162float(up[v]);
+                float dov = __bfloat162float(dop[v]);
+                float sw  = swiglu(gv, uv);
+                float w   = __ldg(ln_weight + col + v);
+
+                reg_gate[base + v] = gv;
+                reg_up  [base + v] = uv;
+                reg_do  [base + v] = dov;
+                reg_sw  [base + v] = sw;
+
+                // dot_i = Σ_j  d_out_j · w_j · s_j
+                thread_dot += dov * w * sw;
+            }
+        }
+
+        // ── Block-level dot reduction ──
+        float dot = block_reduce_sum<kBS>(thread_dot, smem_warps, blk);
+
+        // ── Register-file pass 2: compute gradients + write ──
+        n_iter = 0;
+        for (int col = (int)threadIdx.x * kVec; col < hidden;
+             col += kBS * kVec, ++n_iter) {
+
+            const int base = n_iter * kVec;
+            __nv_bfloat16 dg_buf[kVec];
+            __nv_bfloat16 du_buf[kVec];
+
+            #pragma unroll
+            for (int v = 0; v < kVec; ++v) {
+                float gv  = reg_gate[base + v];
+                float uv  = reg_up  [base + v];
+                float dov = reg_do  [base + v];
+                float sw  = reg_sw  [base + v];
+                float w   = __ldg(ln_weight + col + v);
+
+                // RMSNorm upstream gradient for s_j:
+                //   d_s_j = rms_inv · w_j · d_out_j
+                //         - rms_inv³ · s_j · dot / hidden
+                float d_s = rms_inv * w * dov
+                            - rms_inv3 * sw * dot / (float)hidden;
+
+                // Chain rule through SwiGLU
+                dg_buf[v] = __float2bfloat16(d_s * dswiglu_dgate(gv, uv));
+                du_buf[v] = __float2bfloat16(d_s * dswiglu_dup(gv));
+
+                // Accumulate d_ln_weight (atomic over batch)
+                // d_ln_weight_j = Σ_i  d_out[i,j] · ŷ[i,j] / w_j
+                //               = Σ_i  d_out[i,j] · s[i,j] · rms_inv_i
+                // We use the equivalent form to avoid re-reading output:
+                //   d_out_j · s_j · rms_inv  (already have all three values)
+                atomicAdd(&d_ln_weight[col + v], dov * sw * rms_inv);
+            }
+
+            // Vectorised 128-bit store
+            *reinterpret_cast<uint4*>(dg_row + col) =
+                *reinterpret_cast<const uint4*>(dg_buf);
+            *reinterpret_cast<uint4*>(du_row + col) =
+                *reinterpret_cast<const uint4*>(du_buf);
+        }
+
+    } else {
+        // ──────────────────────────────────────────────────────────────────
+        // TWO-PASS backward (kSinglePass=false, large hidden)
+        //   Pass 1: stream gate/up/d_out, compute SwiGLU, accumulate dot.
+        //   Block reduce → dot.
+        //   Pass 2: re-read gate/up/d_out (L2 hit), compute gradients, write.
+        // ──────────────────────────────────────────────────────────────────
+
+        // ── Pass 1: dot accumulation ──
+        float thread_dot = 0.f;
+        for (int col = (int)threadIdx.x * kVec; col < hidden; col += kBS * kVec) {
+            const uint4  g_raw = __ldg(reinterpret_cast<const uint4*>( g_row + col));
+            const uint4  u_raw = __ldg(reinterpret_cast<const uint4*>( u_row + col));
+            const uint4 do_raw = __ldg(reinterpret_cast<const uint4*>(do_row + col));
+            const __nv_bfloat16* gp  = reinterpret_cast<const __nv_bfloat16*>(&g_raw);
+            const __nv_bfloat16* up  = reinterpret_cast<const __nv_bfloat16*>(&u_raw);
+            const __nv_bfloat16* dop = reinterpret_cast<const __nv_bfloat16*>(&do_raw);
+            #pragma unroll
+            for (int v = 0; v < kVec; ++v) {
+                float sw = swiglu(__bfloat162float(gp[v]), __bfloat162float(up[v]));
+                float w  = __ldg(ln_weight + col + v);
+                thread_dot += __bfloat162float(dop[v]) * w * sw;
+            }
+        }
+
+        // ── Block-level dot reduction ──
+        float dot = block_reduce_sum<kBS>(thread_dot, smem_warps, blk);
+
+        // ── Pass 2: compute and write d_gate, d_up; accumulate d_ln_weight ──
+        for (int col = (int)threadIdx.x * kVec; col < hidden; col += kBS * kVec) {
+            const uint4  g_raw = __ldg(reinterpret_cast<const uint4*>( g_row + col));
+            const uint4  u_raw = __ldg(reinterpret_cast<const uint4*>( u_row + col));
+            const uint4 do_raw = __ldg(reinterpret_cast<const uint4*>(do_row + col));
+            const __nv_bfloat16* gp  = reinterpret_cast<const __nv_bfloat16*>(&g_raw);
+            const __nv_bfloat16* up  = reinterpret_cast<const __nv_bfloat16*>(&u_raw);
+            const __nv_bfloat16* dop = reinterpret_cast<const __nv_bfloat16*>(&do_raw);
+
+            __nv_bfloat16 dg_buf[kVec];
+            __nv_bfloat16 du_buf[kVec];
+
+            #pragma unroll
+            for (int v = 0; v < kVec; ++v) {
+                float gv  = __bfloat162float(gp[v]);
+                float uv  = __bfloat162float(up[v]);
+                float dov = __bfloat162float(dop[v]);
+                float sw  = swiglu(gv, uv);
+                float w   = __ldg(ln_weight + col + v);
+
+                float d_s = rms_inv * w * dov
+                            - rms_inv3 * sw * dot / (float)hidden;
+
+                dg_buf[v] = __float2bfloat16(d_s * dswiglu_dgate(gv, uv));
+                du_buf[v] = __float2bfloat16(d_s * dswiglu_dup(gv));
+
+                atomicAdd(&d_ln_weight[col + v], dov * sw * rms_inv);
+            }
+
+            *reinterpret_cast<uint4*>(dg_row + col) =
+                *reinterpret_cast<const uint4*>(dg_buf);
+            *reinterpret_cast<uint4*>(du_row + col) =
+                *reinterpret_cast<const uint4*>(du_buf);
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Section 7: Forward kernel variant that also saves rms_inv per row
+//
+// An overload of the forward kernel that writes rms_inv[row] into a
+// preallocated FP32 buffer so that the backward pass can reuse it without
+// recomputing the RMS denominator.
+//
+// Interface is identical to fused_swiglu_ln_kernel except for the extra
+// rms_inv_out pointer.  The saved value is:
+//   rms_inv_out[row] = 1 / sqrt(mean(swiglu(gate,up)²) + eps)
+// ─────────────────────────────────────────────────────────────────────────────
+
+template <int SmVer, bool kSinglePass>
+__global__ void
+__launch_bounds__(SwiGLUPolicy<SmVer>::kBlockSize,
+                  SwiGLUPolicy<SmVer>::kMinBlocksPerSM)
+fused_swiglu_ln_fwd_save_kernel(
+    __nv_bfloat16* __restrict__       output,
+    float*         __restrict__       rms_inv_out,  // [batch]
+    const __nv_bfloat16* __restrict__ gate_proj,
+    const __nv_bfloat16* __restrict__ up_proj,
+    const float*          __restrict__ ln_weight,
+    int   hidden,
+    float eps)
+{
+    using Policy = SwiGLUPolicy<SmVer>;
+    constexpr int kVec      = Policy::kVecWidth;
+    constexpr int kBS       = Policy::kBlockSize;
+    constexpr int kMaxWarps = Policy::kMaxWarps;
+
+    __shared__ float smem_warps[kMaxWarps];
+    cg::thread_block blk = cg::this_thread_block();
+
+    const int row = blockIdx.x;
+    const __nv_bfloat16* __restrict__ g_row = gate_proj + (size_t)row * hidden;
+    const __nv_bfloat16* __restrict__ u_row = up_proj   + (size_t)row * hidden;
+          __nv_bfloat16* __restrict__ o_row = output    + (size_t)row * hidden;
+
+    if constexpr (kSinglePass) {
+        constexpr int kMaxIter = Policy::kRegBudgetPerThread / kVec;
+        float reg_swiglu[kMaxIter * kVec];
+        float thread_sq = 0.f;
+
+        int n_iter = 0;
+        for (int col = (int)threadIdx.x * kVec; col < hidden;
+             col += kBS * kVec, ++n_iter) {
+            const uint4 g_raw = *reinterpret_cast<const uint4*>(g_row + col);
+            const uint4 u_raw = *reinterpret_cast<const uint4*>(u_row + col);
+            const __nv_bfloat16* gp = reinterpret_cast<const __nv_bfloat16*>(&g_raw);
+            const __nv_bfloat16* up = reinterpret_cast<const __nv_bfloat16*>(&u_raw);
+            const int base = n_iter * kVec;
+            #pragma unroll
+            for (int v = 0; v < kVec; ++v) {
+                float sw = swiglu(__bfloat162float(gp[v]), __bfloat162float(up[v]));
+                reg_swiglu[base + v] = sw;
+                thread_sq += sw * sw;
+            }
+        }
+
+        float sq_sum  = block_reduce_sum<kBS>(thread_sq, smem_warps, blk);
+        float rms_inv = rsqrtf(sq_sum / (float)hidden + eps);
+
+        // Save for backward
+        if (threadIdx.x == 0) rms_inv_out[row] = rms_inv;
+
+        n_iter = 0;
+        for (int col = (int)threadIdx.x * kVec; col < hidden;
+             col += kBS * kVec, ++n_iter) {
+            const int base = n_iter * kVec;
+            __nv_bfloat16 out_buf[kVec];
+            #pragma unroll
+            for (int v = 0; v < kVec; ++v) {
+                float w   = __ldg(ln_weight + col + v);
+                out_buf[v] = __float2bfloat16(reg_swiglu[base + v] * rms_inv * w);
+            }
+            *reinterpret_cast<uint4*>(o_row + col) =
+                *reinterpret_cast<const uint4*>(out_buf);
+        }
+
+    } else {
+        float thread_sq = 0.f;
+        for (int col = (int)threadIdx.x * kVec; col < hidden; col += kBS * kVec) {
+            const uint4 g_raw = __ldg(reinterpret_cast<const uint4*>(g_row + col));
+            const uint4 u_raw = __ldg(reinterpret_cast<const uint4*>(u_row + col));
+            const __nv_bfloat16* gp = reinterpret_cast<const __nv_bfloat16*>(&g_raw);
+            const __nv_bfloat16* up = reinterpret_cast<const __nv_bfloat16*>(&u_raw);
+            #pragma unroll
+            for (int v = 0; v < kVec; ++v) {
+                float sw = swiglu(__bfloat162float(gp[v]), __bfloat162float(up[v]));
+                thread_sq += sw * sw;
+            }
+        }
+
+        float sq_sum  = block_reduce_sum<kBS>(thread_sq, smem_warps, blk);
+        float rms_inv = rsqrtf(sq_sum / (float)hidden + eps);
+
+        if (threadIdx.x == 0) rms_inv_out[row] = rms_inv;
+
+        for (int col = (int)threadIdx.x * kVec; col < hidden; col += kBS * kVec) {
+            const uint4 g_raw = __ldg(reinterpret_cast<const uint4*>(g_row + col));
+            const uint4 u_raw = __ldg(reinterpret_cast<const uint4*>(u_row + col));
+            const __nv_bfloat16* gp = reinterpret_cast<const __nv_bfloat16*>(&g_raw);
+            const __nv_bfloat16* up = reinterpret_cast<const __nv_bfloat16*>(&u_raw);
+            __nv_bfloat16 out_buf[kVec];
+            #pragma unroll
+            for (int v = 0; v < kVec; ++v) {
+                float w = __ldg(ln_weight + col + v);
+                out_buf[v] = __float2bfloat16(
+                    swiglu(__bfloat162float(gp[v]), __bfloat162float(up[v])) * rms_inv * w);
+            }
+            *reinterpret_cast<uint4*>(o_row + col) =
+                *reinterpret_cast<const uint4*>(out_buf);
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Section 8: Host-side dispatch for forward-with-save and backward
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Helper macro to avoid repetition across the three SM specialisations.
+#define DISPATCH_FWD_SAVE(SmVer_)                                              \
+    do {                                                                        \
+        using P = SwiGLUPolicy<SmVer_>;                                        \
+        const int max_sp = P::kBlockSize * P::kVecWidth * P::kRegBudgetPerThread; \
+        if (hidden <= max_sp)                                                   \
+            fused_swiglu_ln_fwd_save_kernel<SmVer_, true>                      \
+                <<<grid, P::kBlockSize, 0, stream>>>(                           \
+                    output, rms_inv_out,                                        \
+                    gate_proj, up_proj, ln_weight, hidden, eps);                \
+        else                                                                    \
+            fused_swiglu_ln_fwd_save_kernel<SmVer_, false>                     \
+                <<<grid, P::kBlockSize, 0, stream>>>(                           \
+                    output, rms_inv_out,                                        \
+                    gate_proj, up_proj, ln_weight, hidden, eps);                \
+    } while (0)
+
+#define DISPATCH_BWD(SmVer_)                                                   \
+    do {                                                                        \
+        using P = SwiGLUPolicy<SmVer_>;                                        \
+        const int max_sp = P::kBlockSize * P::kVecWidth * P::kRegBudgetPerThread; \
+        if (hidden <= max_sp)                                                   \
+            fused_swiglu_ln_backward_kernel<SmVer_, true>                      \
+                <<<grid, P::kBlockSize, 0, stream>>>(                           \
+                    d_gate, d_up, d_ln_weight,                                  \
+                    d_output, gate_proj, up_proj, ln_weight,                    \
+                    rms_inv_buf, hidden, eps);                                  \
+        else                                                                    \
+            fused_swiglu_ln_backward_kernel<SmVer_, false>                     \
+                <<<grid, P::kBlockSize, 0, stream>>>(                           \
+                    d_gate, d_up, d_ln_weight,                                  \
+                    d_output, gate_proj, up_proj, ln_weight,                    \
+                    rms_inv_buf, hidden, eps);                                  \
+    } while (0)
+
+/**
+ * launch_fused_swiglu_ln_fwd_save
+ *
+ * Forward pass variant that also writes rms_inv[row] into a caller-allocated
+ * FP32 buffer.  This buffer must be passed verbatim to
+ * launch_fused_swiglu_ln_backward so the backward kernel can avoid
+ * recomputing the RMS denominator.
+ *
+ * Caller must allocate: rms_inv_out — FP32 device buffer of length `batch`.
+ */
+void launch_fused_swiglu_ln_fwd_save(
+    __nv_bfloat16*       output,
+    float*               rms_inv_out,
+    const __nv_bfloat16* gate_proj,
+    const __nv_bfloat16* up_proj,
+    const float*         ln_weight,
+    int                  batch,
+    int                  hidden,
+    float                eps,
+    int                  sm_version,
+    cudaStream_t         stream)
+{
+    const int grid = batch;
+    if      (sm_version >= 120) { DISPATCH_FWD_SAVE(120); }
+    else if (sm_version >=  90) { DISPATCH_FWD_SAVE( 90); }
+    else                        { DISPATCH_FWD_SAVE( 86); }
+}
+
+/**
+ * launch_fused_swiglu_ln_backward
+ *
+ * Backward pass for the fused SwiGLU + RMSNorm kernel.
+ *
+ * Computes:
+ *   d_gate     [batch, hidden] BF16  — gradient w.r.t. gate_proj
+ *   d_up       [batch, hidden] BF16  — gradient w.r.t. up_proj
+ *   d_ln_weight[hidden]        FP32  — gradient w.r.t. ln_weight
+ *                                      (accumulated via atomicAdd; caller must
+ *                                       zero before the first backward call)
+ *
+ * @param d_gate       [out] BF16 gradient for gate_proj [batch, hidden]
+ * @param d_up         [out] BF16 gradient for up_proj   [batch, hidden]
+ * @param d_ln_weight  [out] FP32 gradient for ln_weight [hidden] — ACCUMULATES
+ * @param d_output     [in]  BF16 upstream gradient      [batch, hidden]
+ * @param gate_proj    [in]  BF16 forward input gate     [batch, hidden]
+ * @param up_proj      [in]  BF16 forward input up       [batch, hidden]
+ * @param ln_weight    [in]  FP32 LN weight              [hidden]
+ * @param rms_inv_buf  [in]  FP32 rms_inv saved by fwd   [batch]
+ * @param batch        Batch size (rows)
+ * @param hidden       Hidden size (must be divisible by 8)
+ * @param eps          LayerNorm epsilon (must match forward)
+ * @param sm_version   SM version of the active device (86, 90, 120)
+ * @param stream       CUDA stream
+ */
+void launch_fused_swiglu_ln_backward(
+    __nv_bfloat16*       d_gate,
+    __nv_bfloat16*       d_up,
+    float*               d_ln_weight,
+    const __nv_bfloat16* d_output,
+    const __nv_bfloat16* gate_proj,
+    const __nv_bfloat16* up_proj,
+    const float*         ln_weight,
+    const float*         rms_inv_buf,
+    int                  batch,
+    int                  hidden,
+    float                eps,
+    int                  sm_version,
+    cudaStream_t         stream)
+{
+    const int grid = batch;
+    if      (sm_version >= 120) { DISPATCH_BWD(120); }
+    else if (sm_version >=  90) { DISPATCH_BWD( 90); }
+    else                        { DISPATCH_BWD( 86); }
+}
