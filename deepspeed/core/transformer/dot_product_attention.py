@@ -371,6 +371,134 @@ def attention_mask_func(attn_weights: Tensor, mask: Tensor) -> Tensor:
     return attn_weights.masked_fill(mask, -10000.0)
 
 
+def apply_sliding_window_mask(
+    attn_scores: Tensor,
+    window_size: tuple,
+    q_offset: int = 0,
+    k_offset: int = 0,
+) -> Tensor:
+    """Apply sliding-window attention (SWA) mask to attention scores.
+
+    Ported from Megatron M2305 / M2343 SWA implementation.  Tokens outside
+    the (left, right) window are masked to -inf.
+
+    ``window_size = (left, right)`` where:
+      * ``left``: number of tokens to the left that each query can attend to
+        (exclusive of the token itself).  -1 means "full causal" (attend to all).
+      * ``right``: number of tokens to the right (0 for causal, -1 for bidirectional
+        full attention, positive for sliding).
+
+    In DES-LOC heterogeneous training, SWA is particularly valuable on A6000
+    tiers where the KV cache footprint needs to be bounded.  A6000 GPUs have
+    48 GB vs 80 GB on H100; SWA with window=4096 reduces KV cache from
+    O(full_seq) to O(window), fitting 4× longer sequences on A6000.
+
+    Args:
+        attn_scores: ``[batch, heads, sq, sk]`` raw attention logits.
+        window_size: ``(left, right)`` window size.  -1 = full attention.
+        q_offset: Global token offset of Q tensor (for CP ring splits).
+        k_offset: Global token offset of K tensor (for CP ring splits).
+
+    Returns:
+        Attention scores with out-of-window positions masked to -10000.0.
+    """
+    left, right = window_size
+    if left == -1 and right == -1:
+        return attn_scores  # no-op: full attention
+
+    b, nh, sq, sk = attn_scores.shape
+    device = attn_scores.device
+
+    # Global positions of each Q and K token
+    q_pos = torch.arange(sq, device=device).unsqueeze(1) + q_offset  # [sq, 1]
+    k_pos = torch.arange(sk, device=device).unsqueeze(0) + k_offset  # [1, sk]
+
+    # Build windowed mask: True = outside window = should be masked
+    mask = torch.zeros(sq, sk, dtype=torch.bool, device=device)
+
+    if left >= 0:
+        # Mask keys that are too far to the left
+        mask |= (q_pos - k_pos) > left
+
+    if right >= 0:
+        # Mask keys that are to the right (standard causal when right=0)
+        mask |= (k_pos - q_pos) > right
+    else:
+        # right == -1: allow all future tokens (bidirectional within window)
+        pass
+
+    # Broadcast to [b, nh, sq, sk]
+    attn_scores = attn_scores.masked_fill(mask.unsqueeze(0).unsqueeze(0), -10000.0)
+    return attn_scores
+
+
+def build_alibi_attention_bias(
+    num_heads: int,
+    seq_len: int,
+    *,
+    dtype: torch.dtype = torch.float32,
+    device: Optional[torch.device] = None,
+) -> Tensor:
+    """Build ALiBi (Attention with Linear Biases) attention bias.
+
+    Computes the additive ALiBi bias ``m * |i - j|`` for each head, where
+    ``m`` is a head-specific slope derived from the number of heads.
+
+    ALiBi enables the model to generalise to longer sequences at inference
+    time than seen during training by replacing positional embeddings with
+    a causal distance penalty applied directly to the attention logits.
+
+    Ported from the ALiBi paper (Press et al., 2022) / Megatron's ALiBi
+    attention bias computation.  The slope schedule follows the geometric
+    progression: for n heads, slopes are 2^(-8/n * i) for i=1..n.
+
+    Args:
+        num_heads: Number of attention heads (TP-local count).
+        seq_len: Full sequence length.
+        dtype: Output dtype (typically the model's params_dtype).
+        device: Target device.
+
+    Returns:
+        ALiBi bias tensor of shape ``[1, num_heads, seq_len, seq_len]``
+        (additive, pre-softmax).
+    """
+    # Compute head slopes: 2^(-8/n * i) for i in 1..n
+    closest_power_of_2 = 2 ** math.floor(math.log2(num_heads))
+    base = torch.tensor(
+        2 ** (-(2 ** -(math.log2(closest_power_of_2) - 3))),
+        dtype=torch.float32,
+    )
+    # slopes for power-of-2 heads
+    powers = torch.arange(1, 1 + closest_power_of_2, dtype=torch.float32)
+    slopes = torch.pow(base, powers)
+
+    if closest_power_of_2 != num_heads:
+        # Extra heads beyond the closest power of 2
+        extra = num_heads - closest_power_of_2
+        base_extra = torch.tensor(
+            2 ** (-(2 ** -(math.log2(2 * closest_power_of_2) - 3))),
+            dtype=torch.float32,
+        )
+        powers_extra = torch.arange(1, 1 + 2 * extra, 2, dtype=torch.float32)
+        slopes_extra = torch.pow(base_extra, powers_extra)
+        slopes = torch.cat([slopes, slopes_extra], dim=0)
+
+    # ALiBi bias: slopes * relative positions (causal: j - i for j < i)
+    # Shape: [1, num_heads, seq_len, seq_len]
+    positions = torch.arange(seq_len, dtype=torch.float32)
+    relative = positions.unsqueeze(0) - positions.unsqueeze(1)  # [seq, seq]
+    # Causal: only look at past (relative <= 0)
+    relative = relative.clamp(max=0)
+
+    bias = slopes.unsqueeze(1).unsqueeze(1) * relative.unsqueeze(0)  # [nh, sq, sk]
+    bias = bias.unsqueeze(0)  # [1, nh, sq, sk]
+
+    if device is not None:
+        bias = bias.to(device)
+    bias = bias.to(dtype)
+    return bias
+
+
 class FusedScaleMaskSoftmax(nn.Module):
     """Scale + optional mask + softmax.
 

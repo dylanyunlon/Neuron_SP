@@ -450,6 +450,85 @@ class TransformerBlock(MegatronModule):
             result[i] = tier if tier is not None else "unassigned"
         return result
 
+    def get_layer_by_global_index(self, global_layer_idx: int) -> Optional["TransformerLayer"]:
+        """Return the TransformerLayer for the given global (0-based) layer index.
+
+        Allows the DES-LOC engine and profilers to look up a specific layer
+        by its global position in the model without knowing the local PP-rank
+        offset.
+
+        Args:
+            global_layer_idx: 0-based global layer index
+                (i.e. ``layer.layer_number - 1``).
+
+        Returns:
+            The ``TransformerLayer`` if it lives on this PP stage, else ``None``.
+        """
+        target_layer_number = global_layer_idx + 1  # convert to 1-based
+        for layer in self.layers:
+            if layer.layer_number == target_layer_number:
+                return layer
+        return None
+
+    def compute_activation_memory(
+        self,
+        batch_size: int,
+        seq_len: int,
+        *,
+        dtype_bytes: int = 2,
+    ) -> Dict[str, int]:
+        """Compute approximate activation memory for this PP stage.
+
+        Breaks down activation memory by DES-LOC tier (H100 / A6000 /
+        unassigned) for this PP stage.  Used by ``DesLocEngine`` to
+        verify VRAM budgets before launching a training run, and by the
+        adaptive checkpoint scheduler to decide which layers to recompute.
+
+        Memory model:
+          * Full recompute (``recompute_granularity == "full"``):
+            Only I/O activations kept → ~8× reduction per layer.
+          * Selective recompute (``"selective"``): Core attention activations
+            discarded → ~3× reduction.
+          * No recompute: all activations kept (reduction = 1).
+
+        On a heterogeneous cluster, A6000 tiers (48 GB) have less VRAM
+        than H100 tiers (80–96 GB), so they benefit more from aggressive
+        recompute.  The DES-LOC engine uses this per-tier breakdown to
+        assign different ``recompute_granularity`` settings per tier.
+
+        Args:
+            batch_size: Micro-batch size.
+            seq_len: Sequence length.
+            dtype_bytes: Bytes per element (2 for BF16/FP16, 4 for FP32).
+
+        Returns:
+            Dict mapping tier → approximate activation bytes on this stage::
+
+                {
+                    "h100": <bytes>,
+                    "a6000": <bytes>,
+                    "unassigned": <bytes>,
+                }
+        """
+        h = self.config.hidden_size
+        recompute = getattr(self.config, "recompute_granularity", None)
+
+        if recompute == "full":
+            reduction = 8
+        elif recompute == "selective":
+            reduction = 3
+        else:
+            reduction = 1
+
+        act_per_layer = int(4 * batch_size * seq_len * h * dtype_bytes // reduction)
+
+        result: Dict[str, int] = {"h100": 0, "a6000": 0, "unassigned": 0}
+        for layer in self.layers:
+            tier = getattr(layer, "desloc_tier", None) or "unassigned"
+            result[tier] = result.get(tier, 0) + act_per_layer
+
+        return result
+
     def get_desloc_layer_assignments(self) -> Dict[str, List[int]]:
         """Return per-tier lists of global layer indices (1-based).
 
@@ -461,6 +540,78 @@ class TransformerBlock(MegatronModule):
             tier = getattr(layer, "desloc_tier", None) or "unassigned"
             assignments[tier].append(layer.layer_number)
         return assignments
+
+    def clip_qk_all_layers(self) -> None:
+        """Run QK logit clipping on all local layers that support it.
+
+        Iterates over all layers on this PP stage and calls
+        ``TransformerLayer.clip_qk()`` for each layer that has the
+        ``qk_clip`` config flag enabled.  Silently skips layers where
+        ``current_max_attn_logits`` is None (M3217 fix — first step or
+        under gradient checkpointing).
+
+        Called by the DES-LOC engine at the end of each training step
+        (after ``optimizer.step()``) when ``config.qk_clip`` is True.
+
+        From Megatron M2831 / cherry-pick #2776: the per-layer clip is
+        guarded by the ``has_clip_qk`` property so it is safe to call
+        this method unconditionally regardless of model architecture.
+        """
+        if not getattr(self.config, "qk_clip", False):
+            return
+        for layer in self.layers:
+            if getattr(layer, "has_clip_qk", False):
+                try:
+                    layer.clip_qk()
+                except Exception as exc:
+                    logger.debug(
+                        "TransformerBlock: clip_qk skipped for layer %d: %s",
+                        layer.layer_number, exc,
+                    )
+
+    def set_recompute_granularity_for_tier(
+        self,
+        tier: str,
+        granularity: Optional[str],
+    ) -> None:
+        """Override activation recompute granularity for all layers of a given tier.
+
+        Allows the DES-LOC engine to apply aggressive recompute on A6000
+        tiers (limited VRAM) while using no recompute on H100 tiers (more
+        VRAM, faster recompute).
+
+        For example::
+
+            block.set_recompute_granularity_for_tier("a6000", "selective")
+            block.set_recompute_granularity_for_tier("h100", None)
+
+        This is called dynamically during training when the DES-LOC OOM
+        handler detects a near-OOM condition on a specific tier and wants
+        to enable recompute on the fly without restarting.
+
+        Args:
+            tier: ``"h100"``, ``"a6000"``, or ``"unassigned"``.
+            granularity: ``"full"``, ``"selective"``, or ``None`` (no recompute).
+        """
+        assert granularity in (None, "full", "selective"), (
+            f"granularity must be None, 'full', or 'selective', got {granularity!r}"
+        )
+        count = 0
+        for layer in self.layers:
+            layer_tier = getattr(layer, "desloc_tier", None) or "unassigned"
+            if layer_tier == tier:
+                layer.recompute_granularity = granularity
+                # Also update recompute_pre_mlp_layernorm if the layer supports it
+                if hasattr(layer, "recompute_pre_mlp_layernorm"):
+                    recompute_modules = getattr(self.config, "recompute_modules", None) or []
+                    layer.recompute_pre_mlp_layernorm = (
+                        granularity == "selective" and "layernorm" in recompute_modules
+                    )
+                count += 1
+        logger.info(
+            "TransformerBlock: set recompute_granularity=%r for %d %s-tier layers.",
+            granularity, count, tier,
+        )
 
     # ------------------------------------------------------------------
     # Pipeline-parallel helpers

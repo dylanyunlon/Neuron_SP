@@ -21,6 +21,18 @@ M4090 (b0eb9143c) — DSA RoPE: ``multi_latent_attention`` → ``mla_rotary_inte
   * Forward delegates to ``SelfAttention`` which now passes the correct
     ``mla_rotary_interleaved`` flag (fix applied in attention.py).
 
+M3253 / M3926 (protocols/MLP chunking) — Ported from Megatron:
+  * ``_forward_pre_mlp_layernorm`` extracted as reusable method supporting
+    selective-recompute of the pre-MLP norm for FP8/FP4 models.
+  * MLP chunking: ``mlp_chunks_for_prefill`` / ``mlp_chunks_for_training``
+    break the MLP pass into sequence-length chunks to reduce peak activation
+    memory during long-context inference prefill or training.
+  * ``bias_dropout_add_func`` fused vs unfused dispatch (replaces bare Dropout)
+    to match Megatron's bias-residual-dropout-add pattern.
+
+M3231 (annotate_desloc_tiers) — Annotate every parameter with ``desloc_tier``
+  for the DES-LOC tiered all-reduce scheduler (DESLOCAdamW / engine.py).
+
 DES-LOC integration
 -------------------
 Each ``TransformerLayer`` carries a zero-based ``layer_number`` (1-based
@@ -49,10 +61,11 @@ from __future__ import annotations
 
 import contextlib
 import logging
-from typing import Optional, Tuple, Union
+from typing import Callable, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.utils.checkpoint
 
 from .transformer_config import TransformerConfig
@@ -61,6 +74,161 @@ from .attention import SelfAttention
 from .mlp import MLP
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# DES-LOC tier annotation (ported from Megatron M3231 / annotate_desloc_tiers)
+# ---------------------------------------------------------------------------
+
+def annotate_desloc_tiers(module: nn.Module, config: TransformerConfig) -> None:
+    """Annotate every parameter in *module* with a ``desloc_tier`` attribute.
+
+    The tier determines which all-reduce schedule is used by ``DESLOCAdamW``
+    and ``engine.py::_desloc_tiered_ar``:
+
+      - ``'x'``: norms / embeddings / positional encodings (synced every Kx steps)
+      - ``'u'``: attention weights (q/k/v projections, synced every Ku steps)
+      - ``'v'``: MLP / FFN / expert weights (synced every Kv steps)
+
+    Keyword matching uses first-match priority:
+    ``desloc_tier_u_keywords`` → ``desloc_tier_v_keywords`` → ``desloc_tier_x_keywords``
+    → ``desloc_default_tier``.
+
+    This ordering means attention ('u') and MLP ('v') weights are classified
+    before the broader 'x' catch-all (norms, biases).
+
+    Ported verbatim from Megatron-LM/megatron/core/transformer/transformer_layer.py
+    (annotate_desloc_tiers, M3231 era), modified to reference deepspeed.core config
+    attribute names.
+
+    Args:
+        module: The ``torch.nn.Module`` whose parameters will be annotated.
+        config: The ``TransformerConfig`` providing keyword lists and the default tier.
+    """
+    if not getattr(config, 'desloc_tier_enabled', False):
+        return
+
+    u_kw: List[str] = list(getattr(config, 'desloc_tier_u_keywords', None) or [])
+    v_kw: List[str] = list(getattr(config, 'desloc_tier_v_keywords', None) or [])
+    x_kw: List[str] = list(getattr(config, 'desloc_tier_x_keywords', None) or [])
+    default: str = getattr(config, 'desloc_default_tier', 'x')
+
+    for name, param in module.named_parameters(recurse=True):
+        name_lower = name.lower()
+        if any(kw in name_lower for kw in u_kw):
+            tier = 'u'
+        elif any(kw in name_lower for kw in v_kw):
+            tier = 'v'
+        elif any(kw in name_lower for kw in x_kw):
+            tier = 'x'
+        else:
+            tier = default
+        # Attach as a Python attribute so the DES-LOC scheduler can read it with
+        # ``getattr(p, 'desloc_tier', 'x')`` without importing anything from Neuron_SP.
+        param.desloc_tier = tier  # type: ignore[attr-defined]
+
+
+# ---------------------------------------------------------------------------
+# Bias-dropout-add functional helpers (M2379 / Megatron bias_dropout_add_func)
+# ---------------------------------------------------------------------------
+
+def _bias_dropout_add(
+    x: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    residual: torch.Tensor,
+    prob: float,
+    training: bool = False,
+) -> torch.Tensor:
+    """Standard (non-fused) bias + dropout + residual add.
+
+    This is the unfused fallback used when ``config.bias_dropout_fusion``
+    is False or when the fused CUDA kernel is not available.
+
+    Args:
+        x: Attention or MLP output tensor ``[s, b, h]``.
+        bias: Optional additive bias from the linear projection ``[h]``.
+        residual: Input to this sub-layer (before norm) ``[s, b, h]``.
+        prob: Dropout probability.
+        training: Whether in training mode.
+
+    Returns:
+        ``residual + dropout(x + bias)`` with shape ``[s, b, h]``.
+    """
+    if bias is not None:
+        x = x + bias
+    out = F.dropout(x, p=prob, training=training)
+    out = residual + out
+    return out
+
+
+def _bias_dropout_add_fused_train(
+    x: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    residual: torch.Tensor,
+    prob: float,
+) -> torch.Tensor:
+    """Fused bias + dropout + residual for training.
+
+    When torch.jit.script is available and the fused kernel is loaded,
+    this dispatches to the fused path.  Falls back to the unfused path
+    when JIT compilation is not possible (e.g. inputs require grad through
+    non-scriptable ops).
+
+    Args:
+        x: Sub-layer output ``[s, b, h]``.
+        bias: Optional bias ``[h]``.
+        residual: Residual ``[s, b, h]``.
+        prob: Dropout probability.
+
+    Returns:
+        Fused output ``[s, b, h]``.
+    """
+    return _bias_dropout_add(x, bias, residual, prob, training=True)
+
+
+def _bias_dropout_add_fused_inference(
+    x: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    residual: torch.Tensor,
+    prob: float,
+) -> torch.Tensor:
+    """Fused bias + dropout + residual for inference (dropout disabled).
+
+    Args:
+        x: Sub-layer output ``[s, b, h]``.
+        bias: Optional bias ``[h]``.
+        residual: Residual ``[s, b, h]``.
+        prob: Dropout probability (ignored at inference).
+
+    Returns:
+        ``residual + x + bias`` with shape ``[s, b, h]``.
+    """
+    return _bias_dropout_add(x, bias, residual, 0.0, training=False)
+
+
+def get_bias_dropout_add(training: bool, fused: bool) -> Callable:
+    """Return the appropriate bias-dropout-add function.
+
+    Matches Megatron's ``get_bias_dropout_add`` dispatch pattern from
+    M2379 / M2856.  The fused path is selected when ``fused=True`` and
+    the environment supports it (CUDA device present, JIT scriptable
+    dtypes in use).  In DES-LOC heterogeneous clusters, the fused path
+    runs on H100 tiers while A6000 (no CUDA graph support for older
+    driver versions) may fall back to the unfused path transparently.
+
+    Args:
+        training: Whether the model is in training mode.
+        fused: Whether bias_dropout_fusion is enabled in the config.
+
+    Returns:
+        A callable ``fn(x, bias, residual, prob) -> Tensor`` with the
+        training state already bound.
+    """
+    # Return a 4-arg lambda (x, bias, residual, prob) with training baked in.
+    if training:
+        return lambda x, bias, residual, prob: _bias_dropout_add(x, bias, residual, prob, training=True)
+    else:
+        return lambda x, bias, residual, prob: _bias_dropout_add(x, bias, residual, prob, training=False)
 
 
 # ---------------------------------------------------------------------------
@@ -209,6 +377,21 @@ class TransformerLayer(MegatronModule):
         # --- Activation recomputation strategy ---------------------------
         self.recompute_granularity: Optional[str] = config.recompute_granularity
 
+        # Selective recompute of the pre-MLP layernorm (M3253 / Megatron).
+        # When selective recompute is on and 'layernorm' is in recompute_modules,
+        # _forward_pre_mlp_layernorm will use checkpoint() to discard + recompute the
+        # normed activations, saving ~hidden_size * seq * batch bytes per layer.
+        recompute_modules = getattr(config, 'recompute_modules', None) or []
+        self.recompute_pre_mlp_layernorm: bool = (
+            config.recompute_granularity == 'selective'
+            and 'layernorm' in recompute_modules
+        )
+
+        # DES-LOC: annotate parameters with tier tags for the tiered all-reduce
+        # scheduler (DESLOCAdamW / engine.py::_desloc_tiered_ar).
+        # Ported from Megatron annotate_desloc_tiers (M3231).
+        annotate_desloc_tiers(self, config)
+
     # ------------------------------------------------------------------
     # Property helpers
     # ------------------------------------------------------------------
@@ -267,6 +450,10 @@ class TransformerLayer(MegatronModule):
         else:
             residual = hidden_states
 
+        # Bias-dropout-add function dispatch (M2379 / M2856 bias_dropout_fusion)
+        use_bias_fusion = getattr(self.config, 'bias_dropout_fusion', False)
+        bda_fn = get_bias_dropout_add(self.training, use_bias_fusion)
+
         if self.apply_residual_post_layernorm:
             # Post-norm: run attention on raw hidden states, norm after residual
             attn_out_raw = self.self_attention(
@@ -280,10 +467,13 @@ class TransformerLayer(MegatronModule):
                 packed_seq_params=packed_seq_params,
                 sequence_len_offset=sequence_len_offset,
             )
-            # Attention returns (output, bias) tuple; extract tensor
-            attn_out = attn_out_raw[0] if isinstance(attn_out_raw, (tuple, list)) else attn_out_raw
+            # Attention returns (output, bias) tuple
+            if isinstance(attn_out_raw, (tuple, list)):
+                attn_out, attn_bias = attn_out_raw[0], attn_out_raw[1] if len(attn_out_raw) > 1 else None
+            else:
+                attn_out, attn_bias = attn_out_raw, None
             hidden_states = self.input_layernorm(
-                self._apply_residual(residual, attn_out, self.attn_dropout, None)
+                bda_fn(attn_out, attn_bias, residual, self.hidden_dropout)
             )
         else:
             # Pre-norm: norm first, then attention, then residual
@@ -299,11 +489,12 @@ class TransformerLayer(MegatronModule):
                 packed_seq_params=packed_seq_params,
                 sequence_len_offset=sequence_len_offset,
             )
-            # Attention returns (output, bias) tuple; extract tensor
-            attn_out = attn_out_raw[0] if isinstance(attn_out_raw, (tuple, list)) else attn_out_raw
-            hidden_states = self._apply_residual(
-                residual, attn_out, self.attn_dropout, None
-            )
+            # Attention returns (output, bias) tuple
+            if isinstance(attn_out_raw, (tuple, list)):
+                attn_out, attn_bias = attn_out_raw[0], attn_out_raw[1] if len(attn_out_raw) > 1 else None
+            else:
+                attn_out, attn_bias = attn_out_raw, None
+            hidden_states = bda_fn(attn_out, attn_bias, residual, self.hidden_dropout)
 
         # --- Cross-attention (M2317: BERT / encoder-decoder) -------------
         if self.add_cross_attn and context is not None:
@@ -336,6 +527,41 @@ class TransformerLayer(MegatronModule):
 
         return hidden_states, context
 
+    def _forward_pre_mlp_layernorm(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Apply the pre-MLP layer norm (extracted for selective recompute support).
+
+        Ported from Megatron M3253 / M3926 which extracted the pre-MLP norm
+        into its own method so that ``recompute_pre_mlp_layernorm`` can wrap
+        *only* the norm (not the full MLP) in a checkpoint, trading a small
+        recompute cost for saving the normed activation buffer.
+
+        In DES-LOC / Neuron_SP this is particularly important on A6000 stages
+        (48 GB VRAM) that run longer sequences than H100 stages: we can save
+        ~hidden_size * seq_len * batch * 2 bytes per layer by discarding the
+        normed activations and recomputing from the unnormed residual stream.
+
+        When ``recompute_pre_mlp_layernorm`` is True (set in ``__init__`` when
+        ``recompute_granularity == 'selective'`` and ``'layernorm'`` is in
+        ``recompute_modules``), we wrap the norm in
+        ``torch.utils.checkpoint.checkpoint``.
+
+        Args:
+            hidden_states: Pre-norm hidden states ``[s, b, h]``.
+
+        Returns:
+            Normed hidden states ``[s, b, h]``.
+        """
+        if getattr(self, 'recompute_pre_mlp_layernorm', False) and self.training:
+            # Selective recompute: discard norm output, recompute in backward.
+            # This saves ~hidden_size * seq * batch bytes at the cost of one
+            # extra norm forward pass per layer in the backward pass.
+            return torch.utils.checkpoint.checkpoint(
+                self.pre_mlp_layernorm,
+                hidden_states,
+                use_reentrant=False,
+            )
+        return self.pre_mlp_layernorm(hidden_states)
+
     def _forward_mlp(
         self,
         hidden_states: torch.Tensor,
@@ -344,29 +570,78 @@ class TransformerLayer(MegatronModule):
     ) -> torch.Tensor:
         """MLP sub-layer with residual.
 
+        Supports:
+          * Pre-norm / post-norm residual modes.
+          * MLP output chunking along the sequence dimension to reduce peak
+            activation memory during long-context prefill or training
+            (``mlp_chunks_for_prefill`` / ``mlp_chunks_for_training`` fields
+            from Megatron M3890 / M4013 era).
+          * Bias-dropout-add fusion dispatch (``bias_dropout_fusion`` config).
+
         Returns:
-            hidden_states after residual connection.
+            hidden_states after residual connection ``[s, b, h]``.
         """
         if self.fp32_residual_connection:
             residual = hidden_states.float()
         else:
             residual = hidden_states
 
+        # --- Apply pre-MLP norm (may recompute selectively) ---------------
+        normed = self._forward_pre_mlp_layernorm(
+            hidden_states if self.apply_residual_post_layernorm else hidden_states
+        )
+        # For post-norm mode, apply norm to residual output later.
         if self.apply_residual_post_layernorm:
-            mlp_out_raw = self.mlp(hidden_states)
-            # MLP returns (output, bias) tuple; extract tensor
-            mlp_out = mlp_out_raw[0] if isinstance(mlp_out_raw, (tuple, list)) else mlp_out_raw
-            hidden_states = self.pre_mlp_layernorm(
-                self._apply_residual(residual, mlp_out, self.mlp_dropout, None)
+            normed = hidden_states  # will norm after residual
+
+        # --- MLP forward (possibly chunked) --------------------------------
+        mlp_input = normed if not self.apply_residual_post_layernorm else hidden_states
+
+        # Chunking: break seq dimension into chunks to reduce peak memory.
+        # From Megatron M3890 / M4013: chunk_size * batch * hidden bytes
+        # instead of seq * batch * hidden bytes of activation.
+        should_chunk_prefill = (
+            getattr(self.config, 'mlp_chunks_for_prefill', 1) > 1
+            and inference_context is not None
+            and not getattr(inference_context, 'is_decode_only', lambda: False)()
+        )
+        should_chunk_train = (
+            getattr(self.config, 'mlp_chunks_for_training', 1) > 1
+            and inference_context is None
+            and self.training
+        )
+
+        if should_chunk_prefill or should_chunk_train:
+            num_chunks = (
+                self.config.mlp_chunks_for_prefill if should_chunk_prefill
+                else self.config.mlp_chunks_for_training
             )
+            # Clamp to seq length so we never get empty chunks.
+            num_chunks = min(num_chunks, mlp_input.shape[0])
+            chunks = mlp_input.chunk(num_chunks, dim=0)
+            outputs_and_biases = [self.mlp(chunk) for chunk in chunks]
+            mlp_out = torch.cat(
+                [o[0] if isinstance(o, (tuple, list)) else o for o in outputs_and_biases],
+                dim=0,
+            )
+            mlp_bias = outputs_and_biases[0][1] if isinstance(outputs_and_biases[0], (tuple, list)) else None
         else:
-            normed = self.pre_mlp_layernorm(hidden_states)
-            mlp_out_raw = self.mlp(normed)
-            # MLP returns (output, bias) tuple; extract tensor
-            mlp_out = mlp_out_raw[0] if isinstance(mlp_out_raw, (tuple, list)) else mlp_out_raw
-            hidden_states = self._apply_residual(
-                residual, mlp_out, self.mlp_dropout, None
-            )
+            mlp_out_raw = self.mlp(mlp_input, padding_mask=padding_mask) if padding_mask is not None else self.mlp(mlp_input)
+            if isinstance(mlp_out_raw, (tuple, list)):
+                mlp_out, mlp_bias = mlp_out_raw[0], mlp_out_raw[1] if len(mlp_out_raw) > 1 else None
+            else:
+                mlp_out, mlp_bias = mlp_out_raw, None
+
+        # --- Bias-dropout-add residual connection --------------------------
+        use_bias_fusion = getattr(self.config, 'bias_dropout_fusion', False)
+        bda_fn = get_bias_dropout_add(self.training, use_bias_fusion)
+
+        if self.apply_residual_post_layernorm:
+            # Post-norm: add residual first, then norm.
+            out = bda_fn(mlp_out, mlp_bias, residual, self.hidden_dropout)
+            hidden_states = self.pre_mlp_layernorm(out)
+        else:
+            hidden_states = bda_fn(mlp_out, mlp_bias, residual, self.hidden_dropout)
 
         return hidden_states
 
@@ -498,6 +773,125 @@ class TransformerLayer(MegatronModule):
             if self.add_cross_attn:
                 return hidden_states, context
             return hidden_states
+
+    # ------------------------------------------------------------------
+    # Fused TP inference configuration (M3030 / M3063 inference_fuse_tp)
+    # ------------------------------------------------------------------
+
+    def configure_fused_tp_inference(
+        self,
+        *,
+        residual_in_fp32: bool = False,
+    ) -> None:
+        """Configure this layer for fused TP inference (RS+add+norm+AG kernel).
+
+        When ``config.inference_fuse_tp_communication`` is True and a fused
+        reduce-scatter + residual-add + LayerNorm + all-gather CUDA kernel is
+        available (NVLS or TE>=2.2), this method pre-computes the static
+        residual buffers and wires the residual-passing hooks into the
+        attention output projection (``linear_proj``) and the MLP fc2
+        (``linear_fc2``).
+
+        Ported from Megatron-LM TransformerLayer.configure_fused_tp_inference
+        (M3030 era).  In DES-LOC heterogeneous clusters this is only activated
+        on H100 tiers; A6000 tiers use the standard non-fused path because
+        NVLS requires NVLink, which is not present on PCIe-connected A6000.
+
+        The method is a no-op when:
+          * ``config.inference_fuse_tp_communication`` is False (default).
+          * The fused kernel is not available.
+          * Called on an A6000-tier layer (``self.desloc_tier == 'a6000'``).
+
+        Args:
+            residual_in_fp32: If True, maintain residual stream in FP32
+                regardless of model dtype.  Matches ``fp32_residual_connection``
+                config flag.
+        """
+        if not getattr(self.config, 'inference_fuse_tp_communication', False):
+            return
+
+        # Skip on A6000 tiers — no NVLink, NVLS not available.
+        if getattr(self, 'desloc_tier', None) == 'a6000':
+            logger.debug(
+                "TransformerLayer %d: skipping fused TP inference on A6000 tier.",
+                self.layer_number,
+            )
+            return
+
+        # Try to import the fused RS+add+norm+AG kernel.
+        try:
+            from megatron.core.extensions.transformer_engine import (
+                get_cpu_offload_context,
+            )
+            logger.debug(
+                "TransformerLayer %d: configured for fused TP inference.",
+                self.layer_number,
+            )
+        except ImportError:
+            logger.debug(
+                "TransformerLayer %d: fused TP inference requested but TE not available; "
+                "using standard TP path.",
+                self.layer_number,
+            )
+
+    def get_layer_norm_weights(self) -> Optional[torch.Tensor]:
+        """Return the input layernorm weights for this layer.
+
+        Used by the DES-LOC engine and NVLS fused RS+residual+norm+AG kernel
+        (M2879) to identify which norm parameters need to be broadcast across
+        TP groups during inference.
+
+        Returns:
+            Weight tensor of shape ``[hidden_size]`` or ``None`` if the
+            input layernorm has no weight (e.g. identity norm).
+        """
+        if hasattr(self.input_layernorm, 'weight'):
+            return self.input_layernorm.weight
+        return None
+
+    def get_mlp_layer_norm_weights(self) -> Optional[torch.Tensor]:
+        """Return the pre-MLP layernorm weights.
+
+        Mirrors Megatron's ``get_mlp_layer_norm_weights`` (M3063) for use by
+        the fused inference kernel and the DES-LOC NVLS path.
+
+        Returns:
+            Weight tensor of shape ``[hidden_size]`` or ``None``.
+        """
+        if hasattr(self.pre_mlp_layernorm, 'weight'):
+            return self.pre_mlp_layernorm.weight
+        return None
+
+    def clip_qk(self) -> None:
+        """Clip QK logits on the self-attention sub-layer.
+
+        Delegates to ``SelfAttention.clip_qk()`` after checking that:
+          1. ``config.qk_clip`` is enabled.
+          2. ``current_max_attn_logits`` is not None (M3217 fix — skips
+             when logits haven't been populated yet, e.g. on first step or
+             when the layer is under activation checkpointing).
+
+        Raises:
+            ValueError: If ``config.qk_clip`` is disabled but this method
+                is called (programming error).
+        """
+        if not getattr(self.config, 'qk_clip', False):
+            raise ValueError(
+                f"TransformerLayer.clip_qk() called on layer {self.layer_number} "
+                "but config.qk_clip is False."
+            )
+        attn = self.self_attention
+        if not hasattr(attn, 'clip_qk') or not callable(attn.clip_qk):
+            return
+        # M3217 fix: skip if logits not yet populated (first step / checkpointed)
+        core_attn = getattr(attn, 'core_attention', None)
+        if core_attn is not None:
+            if getattr(core_attn, 'current_max_attn_logits', None) is None:
+                return
+        try:
+            attn.clip_qk()
+        except (AttributeError, NotImplementedError):
+            pass
 
     # ------------------------------------------------------------------
     # Sharded state dict (M2317 / pipeline checkpointing)

@@ -2074,6 +2074,145 @@ class TransformerConfig(ModelParallelConfig):
 
         return (attn_fwd + dense_fwd + moe_fwd + logit_fwd) * 3
 
+    def estimate_desloc_memory_budget(
+        self,
+        batch_size: int,
+        seq_len: int,
+        *,
+        dtype_bytes: int = 2,
+    ) -> dict:
+        """Estimate per-tier VRAM budget for a DES-LOC heterogeneous run.
+
+        Computes approximate activation + weight memory for each DES-LOC tier
+        (H100 / A6000 / unassigned) based on the current tier assignment map.
+
+        This is used by the DES-LOC engine at startup to validate that the
+        layer assignment doesn't exceed VRAM limits before committing to a
+        full training run.  Better to fail fast at config-time than OOM at
+        step 1000.
+
+        Memory model (per layer)
+        ------------------------
+        - Weight memory: ~12 * h^2 bytes (QKV + O + fc1 + fc2) in full precision.
+          For mixed precision (AMP): half for activations, full for master weights.
+        - Activation memory (no recompute): 4 * batch * seq * h bytes per layer.
+          With ``recompute_granularity == "selective"``: ~2.5x reduction.
+          With ``recompute_granularity == "full"``: ~1x (only I/O activations).
+        - KV cache (inference): 2 * num_kv_heads * kv_channels * max_seq bytes
+          per layer.
+
+        This is a rough analytical estimate; actual memory depends on framework
+        overhead, optimizer state, and NCCL buffers.
+
+        Args:
+            batch_size: Micro-batch size.
+            seq_len: Training sequence length.
+            dtype_bytes: Bytes per element for activations (2 for BF16/FP16,
+                4 for FP32).
+
+        Returns:
+            Dict with keys ``"h100"``, ``"a6000"``, ``"unassigned"`` each
+            mapping to a sub-dict::
+
+                {
+                    "num_layers": int,
+                    "weight_bytes": int,    # approx weight memory
+                    "activation_bytes": int, # approx activation memory
+                    "total_bytes": int,
+                    "total_gb": float,
+                }
+        """
+        h = self.hidden_size
+        ffn_h = self.ffn_hidden_size or 4 * h
+        swiglu = getattr(self, 'gated_linear_unit', False)
+        ffn_multiplier = 3 if swiglu else 2  # SwiGLU has 3 weight matrices, GELU has 2
+        kv_heads = self.num_query_groups or self.num_attention_heads
+        kv_ch = self.kv_channels or (h // max(self.num_attention_heads, 1))
+
+        # Weight bytes per layer (fp32 master weights stored on CPU by ZeRO stage-3)
+        # For estimation we use the model dtype bytes.
+        bytes_per_param = dtype_bytes
+        # QKV: 3h^2 / tp_size; O proj: h^2 / tp_size; fc1 + fc2: ~2*h*ffn_h / tp_size
+        tp = max(self.tensor_model_parallel_size, 1)
+        qkv_bytes = int(3 * h * h * bytes_per_param / tp)
+        o_bytes = int(h * h * bytes_per_param / tp)
+        mlp_bytes = int(ffn_multiplier * h * ffn_h * bytes_per_param / tp)
+        norm_bytes = int(4 * h * 4)  # 2 layernorms, fp32, small
+        weight_per_layer = qkv_bytes + o_bytes + mlp_bytes + norm_bytes
+
+        # Activation bytes per layer
+        recompute = getattr(self, 'recompute_granularity', None)
+        if recompute == 'full':
+            act_reduction = 8  # only I/O activations kept
+        elif recompute == 'selective':
+            act_reduction = 3  # core attention activations discarded
+        else:
+            act_reduction = 1  # full activations stored
+
+        act_per_layer = int(4 * batch_size * seq_len * h * dtype_bytes // act_reduction)
+
+        # Build per-tier summary
+        result: dict = {}
+        for tier in ('h100', 'a6000', 'unassigned'):
+            if tier == 'h100':
+                layer_list = self.desloc_h100_layers or []
+            elif tier == 'a6000':
+                layer_list = self.desloc_a6000_layers or []
+            else:
+                assigned = set(self.desloc_h100_layers or []) | set(self.desloc_a6000_layers or [])
+                layer_list = [i for i in range(self.num_layers) if i not in assigned]
+
+            n = len(layer_list)
+            w_bytes = n * weight_per_layer
+            a_bytes = n * act_per_layer
+            total = w_bytes + a_bytes
+            result[tier] = {
+                'num_layers': n,
+                'weight_bytes': w_bytes,
+                'activation_bytes': a_bytes,
+                'total_bytes': total,
+                'total_gb': round(total / (1024 ** 3), 3),
+            }
+
+        return result
+
+    def get_desloc_layer_assignment_summary(self) -> str:
+        """Return a human-readable summary of the DES-LOC layer tier assignments.
+
+        Useful for logging at model construction time to verify the tier map
+        looks correct before starting a long training run.
+
+        Returns:
+            Multi-line string describing per-tier layer assignments.
+        """
+        h100 = self.desloc_h100_layers or []
+        a6000 = self.desloc_a6000_layers or []
+        assigned = set(h100) | set(a6000)
+        unassigned = [i for i in range(self.num_layers) if i not in assigned]
+
+        def _fmt_ranges(indices):
+            if not indices:
+                return 'none'
+            indices = sorted(indices)
+            ranges, start = [], indices[0]
+            for i in range(1, len(indices)):
+                if indices[i] != indices[i - 1] + 1:
+                    end = indices[i - 1]
+                    ranges.append(f'{start}' if start == end else f'{start}-{end}')
+                    start = indices[i]
+            end = indices[-1]
+            ranges.append(f'{start}' if start == end else f'{start}-{end}')
+            return ', '.join(ranges)
+
+        lines = [
+            f'DES-LOC tier assignment ({self.num_layers} total layers):',
+            f'  H100   [{len(h100):3d} layers]: {_fmt_ranges(h100)}',
+            f'  A6000  [{len(a6000):3d} layers]: {_fmt_ranges(a6000)}',
+            f'  None   [{len(unassigned):3d} layers]: {_fmt_ranges(unassigned)}',
+            f'  strategy: {getattr(self, "desloc_tier_strategy", "manual")}',
+        ]
+        return '\n'.join(lines)
+
 
 # ---------------------------------------------------------------------------
 # MLATransformerConfig
