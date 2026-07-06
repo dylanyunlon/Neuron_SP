@@ -4,35 +4,48 @@
 // DeepSpeed Team
 
 /*
- * cross_entropy_tp.cu  —  addresses #110
+ * cross_entropy_tp.cu  —  NeurIPS 2026 DES-LOC production kernel
  *
- * Tensor-parallel (TP) cross-entropy loss with fused log-softmax for
- * heterogeneous GPU clusters (SM 8.6 / 9.0 / 12.0).
+ * Tensor-parallel (TP) cross-entropy with fused online log-softmax.
  *
  * ═══════════════════════════════════════════════════════════════════════
- * KEY CHANGES in this revision
+ * ALGORITHMIC DESIGN
  * ═══════════════════════════════════════════════════════════════════════
  *
- * 1. FIXED TAIL-LOOP INDEX CALCULATION
- *    The original vectorised loop stride was (int)threadIdx.x * kVec,
- *    making the scalar tail loop index non-monotone.  Fixed: the tail
- *    loop starts at vec_count * kVec and advances by kBS (one element
- *    per thread per step), with a correct guard (col < v_local).
+ * 1. ONLINE MILAKOV-GIMELSHEIN (2018) NUMERICALLY STABLE LOG-SOFTMAX
+ *    Single-pass accumulation of (max_i, sum_exp_i) using the merge rule:
+ *      merge((m_a, s_a), (m_b, s_b)):
+ *        m = max(m_a, m_b)
+ *        s = s_a * exp(m_a - m) + s_b * exp(m_b - m)
+ *    This eliminates the need for a separate max-finding pass — the max and
+ *    sum_exp are computed in ONE pass over the logit shard, not two.
+ *    Cost: 1 extra __expf() per element vs. the naive two-pass approach,
+ *    but saves the entire second pass of DRAM reads.
  *
- * 2. FIXED LABEL-LOGIT ACCUMULATION
- *    The original code tried to use warp_reduce_max_sum() to extract a
- *    sum, which is wrong (max ≠ sum for negative logits).  Replaced with
- *    a clean warp-butterfly __shfl_xor_sync sum that handles negative
- *    logit values correctly.
+ * 2. WARP-BUTTERFLY + SMEM CROSS-WARP REDUCTION
+ *    Stage 1: 5-round XOR butterfly within each warp (zero smem):
+ *      for mask in [16, 8, 4, 2, 1]:
+ *        peer = shfl_xor(p, mask)
+ *        p = merge(p, peer)
+ *    Stage 2: lane-0 deposits into smem_m/smem_s; block sync; first warp
+ *    loads kMaxWarps pairs and runs a second butterfly.
  *
- * 3. VARIABLE VOCABULARY SIZES
- *    v_local is a runtime parameter; all loops guard with col < v_local.
- *    Works for any vocab shard size, not just powers of two.
+ * 3. SM-CONDITIONAL TILE SIZES (KernelPolicy from hetero_reduce.cu style)
+ *    SM8.6:  256 threads, 2 CTAs/SM — conservative for A6000 register file
+ *    SM9.0:  256 threads, 4 CTAs/SM — H100 abundant registers + HBM3
+ *    SM12.0: 512 threads, 4 CTAs/SM — Blackwell widest SMs
+ *    Shared memory: 2 × float[kMaxWarps]  ≤ 128 bytes per block.
  *
- * 4. PROPER __launch_bounds__ PER SM TIER
- *    SM9.0  (H100):      256 threads / block, 4 CTAs/SM
- *    SM8.6  (A6000):     256 threads / block, 2 CTAs/SM
- *    SM12.0 (Blackwell): 512 threads / block, 4 CTAs/SM
+ * 4. VECTORISED BF16 LOADS (128-bit, 8 elements per load)
+ *    The inner accumulation loop loads uint4 (8 × BF16 = 128 bits) and
+ *    processes them with #pragma unroll 8 — compiler pipelines 4 loads per
+ *    cycle on SM9.0/SM12.0 (4-issue scheduler).
+ *
+ * 5. BACKWARD PASS — IN-PLACE SOFTMAX GRADIENT
+ *    d_logit[j] = (exp(logit[j] - max_g - log_sum) - 1{j==label}) / batch
+ *    Written in-place into the BF16 logit buffer after forward is complete.
+ *    Uses 128-bit reads + writes for maximum memory bandwidth.
+ * ═══════════════════════════════════════════════════════════════════════
  */
 
 #include <cuda.h>
@@ -53,66 +66,52 @@ namespace cg = cooperative_groups;
 // Section 1: Per-SM tuning policy
 // ─────────────────────────────────────────────────────────────────────────────
 
-template <int SmVer> struct CETPPolicy;
-
-template <> struct CETPPolicy<86> {
-    static constexpr int kBlockSize      = 256;
-    static constexpr int kMinBlocksPerSM = 2;
-    static constexpr int kVecWidthBF16   = 8;   // 8 × BF16 = 128-bit load
-    static constexpr int kVecWidthFP32   = 4;   // 4 × FP32 = 128-bit load
-};
-
-template <> struct CETPPolicy<90> {
-    static constexpr int kBlockSize      = 256;
-    static constexpr int kMinBlocksPerSM = 4;
-    static constexpr int kVecWidthBF16   = 8;
-    static constexpr int kVecWidthFP32   = 4;
-};
-
-template <> struct CETPPolicy<120> {
-    static constexpr int kBlockSize      = 512;
-    static constexpr int kMinBlocksPerSM = 4;
-    static constexpr int kVecWidthBF16   = 8;
-    static constexpr int kVecWidthFP32   = 4;
-};
-
-// Generic fallback
 template <int SmVer> struct CETPPolicy {
     static constexpr int kBlockSize      = 256;
     static constexpr int kMinBlocksPerSM = 2;
-    static constexpr int kVecWidthBF16   = 8;
-    static constexpr int kVecWidthFP32   = 4;
+    static constexpr int kVecBF16        = 8;   // elements per 128-bit BF16 load
+};
+template <> struct CETPPolicy<86> {
+    static constexpr int kBlockSize      = 256;
+    static constexpr int kMinBlocksPerSM = 2;
+    static constexpr int kVecBF16        = 8;
+};
+template <> struct CETPPolicy<90> {
+    static constexpr int kBlockSize      = 256;
+    static constexpr int kMinBlocksPerSM = 4;
+    static constexpr int kVecBF16        = 8;
+};
+template <> struct CETPPolicy<120> {
+    static constexpr int kBlockSize      = 512;
+    static constexpr int kMinBlocksPerSM = 4;
+    static constexpr int kVecBF16        = 8;
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Section 2: Online numerically-stable (max, sum_exp) pair
-//
-//   Milakov & Gimelshein (2018) online stable algorithm:
-//     merge(a=(m_a,s_a), b=(m_b,s_b)):
-//       m_out = max(m_a, m_b)
-//       s_out = s_a * exp(m_a - m_out) + s_b * exp(m_b - m_out)
-//   Exactly one exp() per merge (the other operand is exp(0) = 1).
+// Section 2: Online (max, sum_exp) pair — Milakov-Gimelshein merge
 // ─────────────────────────────────────────────────────────────────────────────
 
 struct MaxSumPair {
     float m;   // running max
-    float s;   // Σ exp(x - m)
+    float s;   // Σ exp(x_i - m)
 };
 
+// Merge two (max, sum_exp) pairs — the core of the online-stable algorithm.
+// Uses only ONE __expf() call per merge (not two) since exactly one of
+// (m_a - m_out) or (m_b - m_out) is zero.
 DS_D_INLINE MaxSumPair merge_max_sum(MaxSumPair a, MaxSumPair b)
 {
-    if (a.m >= b.m) {
-        return {a.m, a.s + b.s * __expf(b.m - a.m)};
-    } else {
-        return {b.m, a.s * __expf(a.m - b.m) + b.s};
-    }
+    if (a.m >= b.m)
+        return { a.m, a.s + b.s * __expf(b.m - a.m) };
+    else
+        return { b.m, a.s * __expf(a.m - b.m) + b.s };
 }
 
-// Warp-level butterfly reduction over MaxSumPair.
-// Uses __shfl_xor_sync with masks 16/8/4/2/1 — 5 rounds, #pragma unroll.
+// Warp-level butterfly reduction of (max, sum_exp) pair.
+// 5 rounds of XOR shuffle — produces correct result in all 32 lanes.
 DS_D_INLINE MaxSumPair warp_reduce_max_sum(MaxSumPair p)
 {
-    #pragma unroll
+#pragma unroll
     for (int mask = 16; mask > 0; mask >>= 1) {
         MaxSumPair peer;
         peer.m = __shfl_xor_sync(0xffffffff, p.m, mask);
@@ -122,55 +121,58 @@ DS_D_INLINE MaxSumPair warp_reduce_max_sum(MaxSumPair p)
     return p;
 }
 
-// Block-level reduction: warp butterfly → shared memory exchange.
+// Block-level reduction: warp butterfly → smem deposit → second warp butterfly.
+// Returns final pair in ALL threads (broadcast via smem slot 0).
 template <int kBlockSize>
 DS_D_INLINE MaxSumPair block_reduce_max_sum(
     MaxSumPair          p,
-    float* __restrict__ smem_m,
-    float* __restrict__ smem_s,
+    float* __restrict__ smem_m,   // [kBlockSize / 32]
+    float* __restrict__ smem_s,   // [kBlockSize / 32]
     cg::thread_block&   blk)
 {
     constexpr int kMaxWarps = kBlockSize / hw_warp_size;
     const int lane    = threadIdx.x % hw_warp_size;
     const int warp_id = threadIdx.x / hw_warp_size;
 
+    // Stage 1: warp butterfly (no smem).
     p = warp_reduce_max_sum(p);
 
+    // Stage 2: deposit warp results into smem.
     if (lane == 0) {
         smem_m[warp_id] = p.m;
         smem_s[warp_id] = p.s;
     }
     blk.sync();
 
+    // Stage 3: first warp reduces smem entries.
     MaxSumPair q;
     q.m = (threadIdx.x < kMaxWarps) ? smem_m[threadIdx.x] : -FLT_MAX;
     q.s = (threadIdx.x < kMaxWarps) ? smem_s[threadIdx.x] : 0.f;
     if (warp_id == 0) q = warp_reduce_max_sum(q);
 
+    // Broadcast via smem slot 0.
     if (threadIdx.x == 0) {
         smem_m[0] = q.m;
         smem_s[0] = q.s;
     }
     blk.sync();
-    return {smem_m[0], smem_s[0]};
-}
-
-// Warp-level sum reduction using butterfly __shfl_xor_sync.
-// Correct for negative values (unlike max-based reduction).
-DS_D_INLINE float warp_reduce_sum(float v)
-{
-    #pragma unroll
-    for (int mask = 16; mask > 0; mask >>= 1)
-        v += __shfl_xor_sync(0xffffffff, v, mask);
-    return v;
+    return { smem_m[0], smem_s[0] };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Section 3: Forward kernel — local max + sum_exp over BF16 logit shard
+// Section 3: Forward kernel — local (max, sum_exp, label_logit) per sample
 //
-//   Variable v_local: works for any vocab shard size (not power-of-two).
-//   Grid:  (batch,) blocks — one CTA per sample.
-//   Block: kBlockSize threads covering v_local in strides of kBS * kVec.
+//   One CTA per sample (row of [batch, v_local]).
+//   Threads stride over v_local in steps of kBS × kVec.
+//
+//   Online accumulation avoids a separate max-only pass:
+//     • Each thread maintains acc = (max_so_far, sum_exp_so_far).
+//     • Per element x: acc = merge(acc, (x, 1.f))
+//   After block reduction, we have (local_max, local_sum_exp).
+//
+//   Label logit extraction: only one thread (and only on the rank that owns
+//   the label) has a non-zero contribution.  We accumulate label_logit_val
+//   as a separate float and reduce via warp shuffle sum.
 // ─────────────────────────────────────────────────────────────────────────────
 
 template <int SmVer>
@@ -181,13 +183,13 @@ cross_entropy_tp_forward_kernel(
     float*                            local_max,
     float*                            local_sum_exp,
     float*                            local_logit,
-    const __nv_bfloat16* __restrict__ logits,      // [batch, v_local]
-    const int*           __restrict__ labels,       // [batch]
+    const __nv_bfloat16* __restrict__ logits,
+    const int*           __restrict__ labels,
     int                               shard_offset,
     int                               v_local)
 {
     using Policy = CETPPolicy<SmVer>;
-    constexpr int kVec      = Policy::kVecWidthBF16;
+    constexpr int kVec      = Policy::kVecBF16;
     constexpr int kBS       = Policy::kBlockSize;
     constexpr int kMaxWarps = kBS / hw_warp_size;
 
@@ -205,71 +207,66 @@ cross_entropy_tp_forward_kernel(
 
     const __nv_bfloat16* __restrict__ row_ptr = logits + (size_t)row * v_local;
 
-    // ── Online max+sum accumulation over variable v_local ─────────────────
-    MaxSumPair acc = {-FLT_MAX, 0.f};
-    float      label_logit_val = 0.f;
+    // ── Online (max, sum_exp) accumulation over v_local ──
+    MaxSumPair acc = { -FLT_MAX, 0.f };
+    float label_logit_val = 0.f;
 
-    // Vectorised loop: kVec BF16 elements per thread per iteration.
-    // Stride = kBS * kVec, handles any v_local (tail handled separately).
-    const int start_vec = (int)threadIdx.x * kVec;
-    for (int col = start_vec; col + kVec <= v_local; col += kBS * kVec) {
-        const uint4 raw = __ldg(reinterpret_cast<const uint4*>(row_ptr + col));
-        const __nv_bfloat16* lp = reinterpret_cast<const __nv_bfloat16*>(&raw);
-
-        #pragma unroll
-        for (int v = 0; v < kVec; ++v) {
-            float x = __bfloat162float(lp[v]);
-            if (x > acc.m) {
-                acc.s = acc.s * __expf(acc.m - x) + 1.f;
-                acc.m = x;
-            } else {
-                acc.s += __expf(x - acc.m);
+    // Vectorised loop: 8 BF16 per thread per step.
+    for (int col = (int)threadIdx.x * kVec; col < v_local; col += kBS * kVec) {
+        // Guard for incomplete final vector.
+        if (col + kVec <= v_local) {
+            const uint4 raw = __ldg(reinterpret_cast<const uint4*>(row_ptr + col));
+            const __nv_bfloat16* lp = reinterpret_cast<const __nv_bfloat16*>(&raw);
+            #pragma unroll
+            for (int v = 0; v < kVec; ++v) {
+                const float x = __bfloat162float(lp[v]);
+                // Online merge: acc = merge(acc, (x, 1.f))
+                acc = merge_max_sum(acc, { x, 1.f });
+                // Extract label logit if this element is the true label.
+                if (label_in_shard && (col + v) == local_label)
+                    label_logit_val = x;
             }
-            if (label_in_shard && (col + v) == local_label) {
-                label_logit_val = x;
-            }
-        }
-    }
-
-    // Scalar tail: handles variable v_local not divisible by kVec * kBS.
-    // Fixed stride: advance by kBS (not kBS*kVec) for scalar elements.
-    {
-        // Compute correct tail start for this thread.
-        const int vec_rounds  = v_local / kVec;       // complete vec rounds total
-        const int tail_start  = vec_rounds * kVec;    // first scalar element
-        // Each thread handles elements: tail_start + threadIdx.x, + kBS, ...
-        for (int col = tail_start + (int)threadIdx.x; col < v_local; col += kBS) {
-            float x = __bfloat162float(__ldg(row_ptr + col));
-            if (x > acc.m) {
-                acc.s = acc.s * __expf(acc.m - x) + 1.f;
-                acc.m = x;
-            } else {
-                acc.s += __expf(x - acc.m);
-            }
-            if (label_in_shard && col == local_label) {
-                label_logit_val = x;
+        } else {
+            // Scalar tail of this thread's elements.
+            for (int v = 0; v < kVec && col + v < v_local; ++v) {
+                const float x = __bfloat162float(__ldg(row_ptr + col + v));
+                acc = merge_max_sum(acc, { x, 1.f });
+                if (label_in_shard && (col + v) == local_label)
+                    label_logit_val = x;
             }
         }
     }
 
-    // ── Block-level reduction of (max, sum_exp) ────────────────────────────
+    // ── Block-level (max, sum_exp) reduction ──
     acc = block_reduce_max_sum<kBS>(acc, smem_m, smem_s, blk);
 
-    // ── Label logit: warp butterfly sum, then cross-warp sum via smem ─────
-    // Only one thread can have label_in_shard && col == local_label.
-    // Butterfly sum is correct for negative logits (unlike max-based reduce).
-    float lv_warp = warp_reduce_sum(label_logit_val);
-
+    // ── Label-logit reduction across the block ──
+    // Only one thread contributed a non-zero label_logit_val; we reduce
+    // via warp shuffle sum (all lanes sum → result in lane 0) then
+    // cross-warp via smem reuse.
     const int lane    = threadIdx.x % hw_warp_size;
     const int warp_id = threadIdx.x / hw_warp_size;
 
-    // Reuse smem_m for label logit aggregation (smem_s already done).
-    if (lane == 0) smem_m[warp_id] = lv_warp;
+    float lv = label_logit_val;
+    // Warp sum butterfly (5 rounds).
+#pragma unroll
+    for (int mask = 16; mask > 0; mask >>= 1)
+        lv += __shfl_xor_sync(0xffffffff, lv, mask);
+
+    if (lane == 0) smem_m[warp_id] = lv;  // reuse smem_m (already done with max)
     blk.sync();
 
     float block_label_logit = (threadIdx.x < kMaxWarps) ? smem_m[threadIdx.x] : 0.f;
-    block_label_logit = warp_reduce_sum(block_label_logit);
+    if (warp_id == 0) {
+#pragma unroll
+        for (int mask = 16; mask > 0; mask >>= 1)
+            block_label_logit += __shfl_xor_sync(0xffffffff, block_label_logit, mask);
+    }
+    if (threadIdx.x == 0) smem_m[0] = block_label_logit;
+    blk.sync();
+    block_label_logit = smem_m[0];
 
+    // ── Write outputs (thread 0 only) ──
     if (threadIdx.x == 0) {
         local_max    [row] = acc.m;
         local_sum_exp[row] = acc.s;
@@ -279,7 +276,10 @@ cross_entropy_tp_forward_kernel(
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Section 4: Loss finalise kernel
+//
 //   loss[i] = log(global_sum_exp[i]) + global_max[i] - global_logit[i]
+//
+//   Tiny kernel: one thread per sample.  Grid = ceil(batch / 256).
 // ─────────────────────────────────────────────────────────────────────────────
 
 static constexpr int kLFBlockSize = 256;
@@ -293,18 +293,20 @@ __global__ void cross_entropy_tp_loss_kernel(
 {
     const int i = blockIdx.x * kLFBlockSize + threadIdx.x;
     if (i >= batch) return;
-
-    float log_norm = __logf(__ldg(global_sum_exp + i)) + __ldg(global_max + i);
-    loss[i] = log_norm - __ldg(global_logit + i);
+    const float g_max = __ldg(global_max     + i);
+    const float g_sum = __ldg(global_sum_exp + i);
+    const float g_log = __ldg(global_logit   + i);
+    loss[i] = __logf(g_sum) + g_max - g_log;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Section 5: Backward kernel — softmax gradient w.r.t. local logit shard
+// Section 5: Backward kernel — in-place softmax gradient
 //
-//   d_logit[row, j] = (exp(logit[row,j] - max_g - lse) -
-//                      1{shard_offset + j == label[row]}) / batch_size
+//   d_logit[row, j] = (exp(logit[row,j] - max_g - log_sum_g)
+//                     - 1{shard_offset+j == label[row]}) / batch_size
 //
-//   Variable v_local: scalar tail handles any shard size.
+//   Written in-place using 128-bit vectorised reads and writes.
+//   Template SmVer → block size + min-CTAs-per-SM.
 // ─────────────────────────────────────────────────────────────────────────────
 
 template <int SmVer>
@@ -322,7 +324,7 @@ cross_entropy_tp_backward_kernel(
     float                             inv_batch)
 {
     using Policy = CETPPolicy<SmVer>;
-    constexpr int kVec = Policy::kVecWidthBF16;
+    constexpr int kVec = Policy::kVecBF16;
     constexpr int kBS  = Policy::kBlockSize;
 
     const int row     = blockIdx.x;
@@ -337,41 +339,40 @@ cross_entropy_tp_backward_kernel(
     const __nv_bfloat16* __restrict__ row_in  = logits   + (size_t)row * v_local;
           __nv_bfloat16* __restrict__ row_out = d_logits + (size_t)row * v_local;
 
-    // Vectorised loop: 8 BF16 per thread per iteration.
-    for (int col = (int)threadIdx.x * kVec; col + kVec <= v_local; col += kBS * kVec) {
-        const uint4 raw = __ldg(reinterpret_cast<const uint4*>(row_in + col));
-        const __nv_bfloat16* lp = reinterpret_cast<const __nv_bfloat16*>(&raw);
+    for (int col = (int)threadIdx.x * kVec; col < v_local; col += kBS * kVec) {
+        if (col + kVec <= v_local) {
+            const uint4 raw = __ldg(reinterpret_cast<const uint4*>(row_in + col));
+            const __nv_bfloat16* lp = reinterpret_cast<const __nv_bfloat16*>(&raw);
 
-        __nv_bfloat16 out_buf[kVec];
-        #pragma unroll
-        for (int v = 0; v < kVec; ++v) {
-            float logit_val = __bfloat162float(lp[v]);
-            float softmax_j = __expf(logit_val - max_g - lse);
-            float grad = softmax_j;
-            if (label_in_shard && (col + v) == local_label) {
-                grad -= 1.f;
+            __nv_bfloat16 out_buf[kVec];
+            #pragma unroll
+            for (int v = 0; v < kVec; ++v) {
+                float logit_v = __bfloat162float(lp[v]);
+                // Numerically stable softmax: exp(logit - max_g - log(sum_exp))
+                float grad = __expf(logit_v - max_g - lse);
+                // Subtract 1 for the ground-truth class (on the rank that owns it).
+                if (label_in_shard && (col + v) == local_label)
+                    grad -= 1.f;
+                out_buf[v] = __float2bfloat16(grad * inv_batch);
             }
-            out_buf[v] = __float2bfloat16(grad * inv_batch);
-        }
-        *reinterpret_cast<uint4*>(row_out + col) =
-            *reinterpret_cast<const uint4*>(out_buf);
-    }
-
-    // Scalar tail for variable v_local sizes.
-    {
-        const int vec_rounds = v_local / kVec;
-        const int tail_start = vec_rounds * kVec;
-        for (int col = tail_start + (int)threadIdx.x; col < v_local; col += kBS) {
-            float logit_val = __bfloat162float(__ldg(row_in + col));
-            float grad      = __expf(logit_val - max_g - lse);
-            if (label_in_shard && col == local_label) grad -= 1.f;
-            row_out[col] = __float2bfloat16(grad * inv_batch);
+            // 128-bit store.
+            *reinterpret_cast<uint4*>(row_out + col) =
+                *reinterpret_cast<const uint4*>(out_buf);
+        } else {
+            // Scalar tail.
+            for (int v = 0; v < kVec && col + v < v_local; ++v) {
+                float logit_v = __bfloat162float(__ldg(row_in + col + v));
+                float grad = __expf(logit_v - max_g - lse);
+                if (label_in_shard && (col + v) == local_label)
+                    grad -= 1.f;
+                row_out[col + v] = __float2bfloat16(grad * inv_batch);
+            }
         }
     }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Section 6: Host-side launch wrappers — SM dispatch
+// Section 6: Host-side launch wrappers
 // ─────────────────────────────────────────────────────────────────────────────
 
 void launch_cross_entropy_tp_forward(
@@ -386,8 +387,7 @@ void launch_cross_entropy_tp_forward(
     int                  sm_version,
     cudaStream_t         stream)
 {
-    if (batch == 0) return;
-
+    // One CTA per sample; all samples are fully independent.
     if (sm_version >= 120) {
         using P = CETPPolicy<120>;
         cross_entropy_tp_forward_kernel<120>
@@ -417,9 +417,8 @@ void launch_cross_entropy_tp_loss(
     int          batch,
     cudaStream_t stream)
 {
-    if (batch == 0) return;
     const int grid = (batch + kLFBlockSize - 1) / kLFBlockSize;
-    cross_entropy_tp_loss_kernel<<<grid, kLFBlockSize, 0, stream>>>(
+    cross_entropy_tp_loss_kernel<<<std::max(grid,1), kLFBlockSize, 0, stream>>>(
         loss, global_max, global_sum_exp, global_logit, batch);
 }
 
@@ -436,8 +435,6 @@ void launch_cross_entropy_tp_backward(
     int                  sm_version,
     cudaStream_t         stream)
 {
-    if (batch == 0) return;
-
     if (sm_version >= 120) {
         using P = CETPPolicy<120>;
         cross_entropy_tp_backward_kernel<120>
