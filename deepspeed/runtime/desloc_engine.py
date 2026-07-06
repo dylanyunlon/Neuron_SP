@@ -2405,8 +2405,10 @@ class DesLocEngine:
                 # On NaN steps force skip_grad_sync=True: avoids sending garbage
                 # gradients across ranks while still completing the collective.
                 _fmg_skip_sync = (not _is_Kx_sync) or _step_has_nan
-                logger.warning("rank=%d: entering finalize_model_grads (Kx_sync=%s, nan=%s)",
-                    dist.get_rank() if dist.is_initialized() else 0, _is_Kx_sync, _step_has_nan)
+                logger.warning("rank=%d: ENTERING finalize_model_grads (Kx=%s, nan=%s, skip=%s, force_ar=%s)",
+                    dist.get_rank() if dist.is_initialized() else 0,
+                    _is_Kx_sync, _step_has_nan, _fmg_skip_sync,
+                    self._dist_optimizer is not None and not _step_has_nan)
                 finalize_model_grads(
                     model=_fmg_model,
                     config=ModelParallelConfig(),
@@ -2421,11 +2423,15 @@ class DesLocEngine:
                     "falling back to no-op (grads may be unreduced).",
                     _fmg_exc,
                 )
+            else:
+                logger.warning("rank=%d: EXITED finalize_model_grads OK",
+                    dist.get_rank() if dist.is_initialized() else 0)
 
             # Gradient clipping — unified via core clip_grad_norm on all paths.
             # finalize_model_grads has already all-reduced grads; clip globally.
             # core clip_grad_norm avoids host/device sync and handles model-parallel
             # norm reduction — replaces torch.nn.utils.clip_grad_norm_ (M2335).
+            logger.warning("rank=%d: ENTERING clip_grad_norm", dist.get_rank() if dist.is_initialized() else 0)
             gnorm = clip_grad_norm(self.model.parameters(), cfg.grad_clip)
             if torch.is_tensor(gnorm):
                 gnorm = gnorm.item()
@@ -2466,8 +2472,10 @@ class DesLocEngine:
                     f"ctrl_norm={_skip_info.combined_norm:.6f}"
                 )
             if not _should_skip:
+                logger.warning("rank=%d: ENTERING optimizer.step", dist.get_rank() if dist.is_initialized() else 0)
                 self.optimizer.step()
                 self.scheduler.step()
+                logger.warning("rank=%d: EXITED optimizer.step", dist.get_rank() if dist.is_initialized() else 0)
 
                 # --- DES-LOC: Algorithm 1 — Kx/Ku/Kv conditional sync ---
                 _is_Kx = (step + 1) % self.desloc_Kx == 0
