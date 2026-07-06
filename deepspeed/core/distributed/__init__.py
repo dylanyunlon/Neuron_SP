@@ -10,6 +10,21 @@ Re-exports all public names from submodules so that callers can use:
 without knowing the internal file layout.
 """
 
+from deepspeed.core.distributed.grad_buffer import (
+    GradBuffer,
+    GradBufferRegistry,
+    build_grad_buffer_registry,
+)
+
+from deepspeed.core.distributed.bucket_aware_grad_sync import (
+    pcie_overlap_trigger_elems,
+    pcie_bucket_size,
+    should_use_async_op,
+    BucketAwareGradSync,
+    bucket_aware_grad_sync_context,
+    log_bucket_sync_plan,
+)
+
 from deepspeed.core.distributed.param_and_grad_buffer import (
     BufferType,
     BufferOwnership,
@@ -68,6 +83,17 @@ from deepspeed.core.distributed.sharded_checkpoint import (
 )
 
 __all__ = [
+    # grad_buffer
+    "GradBuffer",
+    "GradBufferRegistry",
+    "build_grad_buffer_registry",
+    # bucket_aware_grad_sync
+    "pcie_overlap_trigger_elems",
+    "pcie_bucket_size",
+    "should_use_async_op",
+    "BucketAwareGradSync",
+    "bucket_aware_grad_sync_context",
+    "log_bucket_sync_plan",
     # param_and_grad_buffer
     "BufferType",
     "BufferOwnership",
