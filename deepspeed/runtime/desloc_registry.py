@@ -15,6 +15,7 @@ logger = logging.getLogger(__name__)
 
 _REGISTRY_BASE = "deepspeed"
 _HETERO_PREFIX = "hetero_"
+_SENTINEL = object()  # Used to distinguish "attribute absent" from "attribute is None"
 
 
 class HeteroRegistry:
@@ -79,11 +80,16 @@ class HeteroRegistry:
              the registry.  This ensures even passive extension modules are
              discoverable from the engine instance.
 
+        A module is counted as *actually activated* only when the engine
+        attribute that ``register()`` is expected to set is present **and
+        non-None**.  Modules whose ``register()`` merely installs a ``None``
+        placeholder (deferred initialisation) are tracked separately so the
+        caller can distinguish "hooked but pending" from "fully initialised".
+
         Returns:
-            The number of modules that were successfully activated
-            (either via register() or via the fallback path).
+            The number of modules that are fully initialised on the engine
+            (engine attribute exists and is not None).
         """
-        activated = 0
         for key, mod in self._modules.items():
             if key in self._hooks:
                 continue
@@ -93,7 +99,6 @@ class HeteroRegistry:
                 try:
                     register_fn(engine)
                     self._hooks[key] = mod
-                    activated += 1
                     logger.debug("Hook registered from module: %s", key)
                     continue
                 except Exception as exc:  # noqa: BLE001
@@ -115,17 +120,54 @@ class HeteroRegistry:
                 if not hasattr(engine, engine_attr):
                     setattr(engine, engine_attr, cls)
                 self._hooks[key] = mod
-                activated += 1
                 logger.debug(
                     "Hook fallback for %s: attached %s as engine.%s",
                     key, attr_name, engine_attr,
                 )
 
+        # Count only modules that are genuinely initialised on the engine:
+        # their engine attribute must exist and be non-None.  Modules whose
+        # register() only installed a None placeholder are "hooked" (present
+        # in self._hooks) but not yet "activated".
+        activated = self._count_activated(engine)
+        hooked = len(self._hooks)
+
         logger.info(
-            "HeteroRegistry: activated %d/%d hetero_* modules on engine.",
-            activated, len(self._modules),
+            "HeteroRegistry: %d/%d hetero_* modules fully initialised on engine "
+            "(%d hooked, %d pending placeholder).",
+            activated, len(self._modules), hooked, hooked - activated,
         )
         return activated
+
+    def _count_activated(self, engine: "DesLocEngine") -> int:
+        """Return the number of hooked modules that are fully initialised.
+
+        A module is considered *fully initialised* when the engine carries a
+        non-None attribute for it.  The attribute name is derived by
+        convention: for modules registered via ``register(engine)`` DeepSpeed
+        attaches the instance as ``engine.hetero_<short_module_name>`` (e.g.
+        ``engine.hetero_fp32_grad_accum``).  For fallback-attached modules the
+        attribute is ``engine._hetero_mod_<short_module_name>``.
+
+        Modules that only set a ``None`` placeholder during ``register()``
+        are counted as *pending*, not activated.
+        """
+        count = 0
+        for key, mod in self._hooks.items():
+            short = mod.__name__.rsplit(".", 1)[-1]  # e.g. "hetero_fp32_grad_accum"
+
+            # Preferred path: engine.hetero_<name> (strip the hetero_ prefix
+            # already present in short so we don't double it).
+            preferred_attr = short  # e.g. "hetero_fp32_grad_accum"
+            fallback_attr = f"_hetero_mod_{short}"  # e.g. "_hetero_mod_hetero_fp32_grad_accum"
+
+            for attr in (preferred_attr, fallback_attr):
+                val = getattr(engine, attr, _SENTINEL)
+                if val is not _SENTINEL and val is not None:
+                    count += 1
+                    break
+
+        return count
 
     def get(self, name: str) -> Optional[Any]:
         """Retrieve a registered module by its registry name."""
