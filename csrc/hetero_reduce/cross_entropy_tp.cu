@@ -458,3 +458,306 @@ void launch_cross_entropy_tp_backward(
                 shard_offset, v_local, inv_batch);
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Section 7: Heterogeneous VocabPartition support  (issue #141)
+//
+// Heterogeneous TP splits assign different shard widths (v_local) to each
+// rank.  The kernel logic is identical to the uniform path; only v_local and
+// shard_offset come from a VocabPartition descriptor instead of being derived
+// from V/tp_size.
+//
+// Two-pass strategy (matches the uniform path, fully allreduce-compatible):
+//   Pass A — this file: per-rank local (max, sum_exp, label_logit) over the
+//             rank's own shard.  Kernel is templated on SmVer; v_local is now
+//             a runtime value that may differ across ranks.
+//   Pass B — caller: AllReduce_max(local_max), AllReduce_sum(...), then
+//             launch_cross_entropy_tp_loss (unchanged).
+//
+// compute_hetero_vocab_partition()
+// ─────────────────────────────────────────────────────────────────────────────
+// Weight table: SM 12.0 → 4, SM 9.0 → 3, everything else → 1.
+// Boundaries aligned to kVecBF16=8 elements.  Last rank gets the residual.
+// ─────────────────────────────────────────────────────────────────────────────
+
+static inline int sm_to_weight(int sm_version)
+{
+    if (sm_version >= 120) return 4;
+    if (sm_version >= 90)  return 3;
+    return 1;
+}
+
+void compute_hetero_vocab_partition(VocabPartition* out_parts,
+                                     const int*      sm_versions,
+                                     int             tp_size,
+                                     int             vocab_size)
+{
+    constexpr int kAlign = 8;   // must match kVecBF16
+
+    // Sum all weights.
+    int total_weight = 0;
+    for (int r = 0; r < tp_size; ++r)
+        total_weight += sm_to_weight(sm_versions[r]);
+
+    // Assign aligned shard widths.  Accumulate offset as we go.
+    int offset = 0;
+    for (int r = 0; r < tp_size; ++r) {
+        int w     = sm_to_weight(sm_versions[r]);
+        // Proportional share, floored to kAlign.
+        int share = (int)((long long)vocab_size * w / total_weight);
+        share = (share / kAlign) * kAlign;
+        if (share < kAlign) share = kAlign;  // minimum one vector's worth
+
+        // Last rank absorbs residual to ensure full vocab coverage.
+        if (r == tp_size - 1)
+            share = vocab_size - offset;
+
+        out_parts[r].v_local      = share;
+        out_parts[r].shard_offset = offset;
+        out_parts[r].tp_size      = tp_size;
+        out_parts[r].rank         = r;
+
+        offset += share;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Section 7a: Forward hetero kernel
+//
+// Structurally identical to cross_entropy_tp_forward_kernel<SmVer>.
+// The only change is that v_local is now a runtime parameter sourced from
+// VocabPartition rather than an implicit constant.
+// ─────────────────────────────────────────────────────────────────────────────
+
+template <int SmVer>
+__global__ void
+__launch_bounds__(CETPPolicy<SmVer>::kBlockSize,
+                  CETPPolicy<SmVer>::kMinBlocksPerSM)
+cross_entropy_tp_forward_hetero_kernel(
+    float*                            local_max,
+    float*                            local_sum_exp,
+    float*                            local_logit,
+    const __nv_bfloat16* __restrict__ logits,
+    const int*           __restrict__ labels,
+    int                               shard_offset,
+    int                               v_local)   // runtime — may differ per rank
+{
+    using Policy = CETPPolicy<SmVer>;
+    constexpr int kVec      = Policy::kVecBF16;
+    constexpr int kBS       = Policy::kBlockSize;
+    constexpr int kMaxWarps = kBS / hw_warp_size;
+
+    __shared__ float smem_m[kMaxWarps];
+    __shared__ float smem_s[kMaxWarps];
+
+    cg::thread_block blk = cg::this_thread_block();
+
+    const int row   = blockIdx.x;
+    const int label = __ldg(labels + row);
+
+    const bool label_in_shard = (label >= shard_offset) &&
+                                 (label <  shard_offset + v_local);
+    const int  local_label    = label - shard_offset;
+
+    const __nv_bfloat16* __restrict__ row_ptr =
+        logits + (size_t)row * v_local;
+
+    // ── Pass A: online (max, sum_exp) over this rank's shard ──
+    MaxSumPair acc = { -FLT_MAX, 0.f };
+    float label_logit_val = 0.f;
+
+    for (int col = (int)threadIdx.x * kVec; col < v_local; col += kBS * kVec) {
+        if (col + kVec <= v_local) {
+            const uint4 raw = __ldg(reinterpret_cast<const uint4*>(row_ptr + col));
+            const __nv_bfloat16* lp = reinterpret_cast<const __nv_bfloat16*>(&raw);
+            #pragma unroll
+            for (int v = 0; v < kVec; ++v) {
+                const float x = __bfloat162float(lp[v]);
+                acc = merge_max_sum(acc, { x, 1.f });
+                if (label_in_shard && (col + v) == local_label)
+                    label_logit_val = x;
+            }
+        } else {
+            for (int v = 0; v < kVec && col + v < v_local; ++v) {
+                const float x = __bfloat162float(__ldg(row_ptr + col + v));
+                acc = merge_max_sum(acc, { x, 1.f });
+                if (label_in_shard && (col + v) == local_label)
+                    label_logit_val = x;
+            }
+        }
+    }
+
+    // ── Block reduce: (max, sum_exp) ──
+    acc = block_reduce_max_sum<kBS>(acc, smem_m, smem_s, blk);
+
+    // ── Block reduce: label logit ──
+    const int lane    = threadIdx.x % hw_warp_size;
+    const int warp_id = threadIdx.x / hw_warp_size;
+
+    float lv = label_logit_val;
+    #pragma unroll
+    for (int mask = 16; mask > 0; mask >>= 1)
+        lv += __shfl_xor_sync(0xffffffff, lv, mask);
+
+    if (lane == 0) smem_m[warp_id] = lv;
+    blk.sync();
+
+    float blk_lv = (threadIdx.x < kMaxWarps) ? smem_m[threadIdx.x] : 0.f;
+    if (warp_id == 0) {
+        #pragma unroll
+        for (int mask = 16; mask > 0; mask >>= 1)
+            blk_lv += __shfl_xor_sync(0xffffffff, blk_lv, mask);
+    }
+    if (threadIdx.x == 0) smem_m[0] = blk_lv;
+    blk.sync();
+    blk_lv = smem_m[0];
+
+    // ── Write outputs ──
+    if (threadIdx.x == 0) {
+        local_max    [row] = acc.m;
+        local_sum_exp[row] = acc.s;
+        local_logit  [row] = blk_lv;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Section 7b: Backward hetero kernel
+// ─────────────────────────────────────────────────────────────────────────────
+
+template <int SmVer>
+__global__ void
+__launch_bounds__(CETPPolicy<SmVer>::kBlockSize,
+                  CETPPolicy<SmVer>::kMinBlocksPerSM)
+cross_entropy_tp_backward_hetero_kernel(
+    __nv_bfloat16* __restrict__       d_logits,
+    const __nv_bfloat16* __restrict__ logits,
+    const int*           __restrict__ labels,
+    const float*         __restrict__ global_max,
+    const float*         __restrict__ log_sum_exp,
+    int                               shard_offset,
+    int                               v_local,   // runtime — may differ per rank
+    float                             inv_batch)
+{
+    using Policy = CETPPolicy<SmVer>;
+    constexpr int kVec = Policy::kVecBF16;
+    constexpr int kBS  = Policy::kBlockSize;
+
+    const int row     = blockIdx.x;
+    const int label   = __ldg(labels + row);
+    const float max_g = __ldg(global_max  + row);
+    const float lse   = __ldg(log_sum_exp + row);
+
+    const bool label_in_shard = (label >= shard_offset) &&
+                                 (label <  shard_offset + v_local);
+    const int local_label = label - shard_offset;
+
+    const __nv_bfloat16* __restrict__ row_in  =
+        logits   + (size_t)row * v_local;
+          __nv_bfloat16* __restrict__ row_out =
+        d_logits + (size_t)row * v_local;
+
+    for (int col = (int)threadIdx.x * kVec; col < v_local; col += kBS * kVec) {
+        if (col + kVec <= v_local) {
+            const uint4 raw = __ldg(reinterpret_cast<const uint4*>(row_in + col));
+            const __nv_bfloat16* lp = reinterpret_cast<const __nv_bfloat16*>(&raw);
+
+            __nv_bfloat16 out_buf[kVec];
+            #pragma unroll
+            for (int v = 0; v < kVec; ++v) {
+                float logit_v = __bfloat162float(lp[v]);
+                float grad = __expf(logit_v - max_g - lse);
+                if (label_in_shard && (col + v) == local_label)
+                    grad -= 1.f;
+                out_buf[v] = __float2bfloat16(grad * inv_batch);
+            }
+            *reinterpret_cast<uint4*>(row_out + col) =
+                *reinterpret_cast<const uint4*>(out_buf);
+        } else {
+            for (int v = 0; v < kVec && col + v < v_local; ++v) {
+                float logit_v = __bfloat162float(__ldg(row_in + col + v));
+                float grad = __expf(logit_v - max_g - lse);
+                if (label_in_shard && (col + v) == local_label)
+                    grad -= 1.f;
+                row_out[col + v] = __float2bfloat16(grad * inv_batch);
+            }
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Section 7c: Host-side hetero launch wrappers
+// ─────────────────────────────────────────────────────────────────────────────
+
+void launch_cross_entropy_tp_forward_hetero(
+    float*               local_max,
+    float*               local_sum_exp,
+    float*               local_logit,
+    const __nv_bfloat16* logits,
+    const int*           labels,
+    int                  batch,
+    VocabPartition       vp,
+    int                  sm_version,
+    cudaStream_t         stream)
+{
+    const int v_local      = vp.v_local;
+    const int shard_offset = vp.shard_offset;
+
+    if (sm_version >= 120) {
+        using P = CETPPolicy<120>;
+        cross_entropy_tp_forward_hetero_kernel<120>
+            <<<batch, P::kBlockSize, 0, stream>>>(
+                local_max, local_sum_exp, local_logit,
+                logits, labels, shard_offset, v_local);
+    } else if (sm_version >= 90) {
+        using P = CETPPolicy<90>;
+        cross_entropy_tp_forward_hetero_kernel<90>
+            <<<batch, P::kBlockSize, 0, stream>>>(
+                local_max, local_sum_exp, local_logit,
+                logits, labels, shard_offset, v_local);
+    } else {
+        using P = CETPPolicy<86>;
+        cross_entropy_tp_forward_hetero_kernel<86>
+            <<<batch, P::kBlockSize, 0, stream>>>(
+                local_max, local_sum_exp, local_logit,
+                logits, labels, shard_offset, v_local);
+    }
+}
+
+void launch_cross_entropy_tp_backward_hetero(
+    __nv_bfloat16*       d_logits,
+    const __nv_bfloat16* logits,
+    const int*           labels,
+    const float*         global_max,
+    const float*         log_sum_exp,
+    int                  batch,
+    VocabPartition       vp,
+    float                inv_batch,
+    int                  sm_version,
+    cudaStream_t         stream)
+{
+    const int v_local      = vp.v_local;
+    const int shard_offset = vp.shard_offset;
+
+    if (sm_version >= 120) {
+        using P = CETPPolicy<120>;
+        cross_entropy_tp_backward_hetero_kernel<120>
+            <<<batch, P::kBlockSize, 0, stream>>>(
+                d_logits, logits, labels,
+                global_max, log_sum_exp,
+                shard_offset, v_local, inv_batch);
+    } else if (sm_version >= 90) {
+        using P = CETPPolicy<90>;
+        cross_entropy_tp_backward_hetero_kernel<90>
+            <<<batch, P::kBlockSize, 0, stream>>>(
+                d_logits, logits, labels,
+                global_max, log_sum_exp,
+                shard_offset, v_local, inv_batch);
+    } else {
+        using P = CETPPolicy<86>;
+        cross_entropy_tp_backward_hetero_kernel<86>
+            <<<batch, P::kBlockSize, 0, stream>>>(
+                d_logits, logits, labels,
+                global_max, log_sum_exp,
+                shard_offset, v_local, inv_batch);
+    }
+}

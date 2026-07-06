@@ -578,6 +578,137 @@ void launch_cross_entropy_tp_backward(__nv_bfloat16*       d_logits,
                                        cudaStream_t         stream);
 
 // ===========================================================================
+// VocabPartition — heterogeneous (non-uniform) TP vocab split  (#141)
+//
+// In homogeneous TP all ranks receive V/tp_size tokens.  In a heterogeneous
+// cluster (mixed SM8.6/SM9.0/SM12.0) it is advantageous to assign more vocab
+// tokens to faster GPUs.  VocabPartition captures the arbitrary shard
+// boundaries so the kernel can work correctly regardless of shard size.
+//
+// Design: two-pass approach
+//   Pass 1 (local)  — each rank runs cross_entropy_tp_forward_hetero_kernel
+//                     over its own shard of size v_local[rank].  Produces
+//                     (local_max, local_sum_exp, local_logit) — identical
+//                     semantics to the uniform path but v_local is now
+//                     per-rank rather than V/tp_size.
+//   Pass 2 (global) — caller performs:
+//                       global_max     = AllReduce_max(local_max)
+//                       global_sum_exp = AllReduce_sum(
+//                                          local_sum_exp
+//                                          * exp(local_max - global_max))
+//                       global_logit   = AllReduce_sum(local_logit)
+//                     and then calls launch_cross_entropy_tp_loss as before.
+//
+// The two new launch wrappers below are drop-in replacements for the uniform
+// versions; the only difference is that v_local (the shard width) is now
+// supplied at call-time rather than being an implicit V/tp_size constant.
+// ===========================================================================
+
+/**
+ * VocabPartition
+ *
+ * Describes this rank's slice of the full vocabulary in a non-uniform TP
+ * split.  Populated by compute_hetero_vocab_partition() below, or filled
+ * directly by the caller for custom splits.
+ *
+ * Fields:
+ *   v_local       — number of vocab tokens assigned to this rank
+ *   shard_offset  — global vocab index of logits[:,0] on this rank
+ *   tp_size       — total number of TP ranks (informational)
+ *   rank          — index of this rank within the TP group
+ */
+struct VocabPartition {
+    int v_local;       // vocab tokens on this rank
+    int shard_offset;  // first global vocab index owned by this rank
+    int tp_size;       // total TP ranks
+    int rank;          // this rank's index in [0, tp_size)
+};
+
+/**
+ * compute_hetero_vocab_partition
+ *
+ * Compute per-rank VocabPartition entries for a non-uniform vocabulary split.
+ * Tokens are distributed proportionally to each rank's SM-version weight:
+ *   SM 12.0 (Blackwell) → weight 4
+ *   SM  9.0 (H100)      → weight 3
+ *   SM  8.6 (A6000)     → weight 1
+ * All shard boundaries are aligned to 8-element (kVecBF16) boundaries.
+ * The last rank absorbs any residual from alignment.
+ *
+ * @param out_parts   [out] Array of VocabPartition, length tp_size (caller-alloc)
+ * @param sm_versions [in]  SM version of each rank, length tp_size
+ * @param tp_size     Number of TP ranks
+ * @param vocab_size  Total vocabulary size V (must be divisible by 8 for best perf)
+ */
+void compute_hetero_vocab_partition(VocabPartition* out_parts,
+                                     const int*      sm_versions,
+                                     int             tp_size,
+                                     int             vocab_size);
+
+/**
+ * launch_cross_entropy_tp_forward_hetero
+ *
+ * Phase-1 forward pass for a non-uniform vocab shard described by `vp`.
+ * Identical semantics to launch_cross_entropy_tp_forward; the shard width
+ * and offset are taken from `vp` rather than separate parameters.
+ *
+ * Two-pass local-max / local-sum strategy:
+ *   Pass A (this kernel): compute local (max, sum_exp, label_logit) over
+ *           logits[0..batch-1][0..vp.v_local-1].
+ *   Pass B (caller, cross-rank): AllReduce to obtain global scalars, then
+ *           call launch_cross_entropy_tp_loss as usual.
+ *
+ * @param local_max      [out] FP32 [batch]
+ * @param local_sum_exp  [out] FP32 [batch]
+ * @param local_logit    [out] FP32 [batch]  (0.0 for samples whose label is not in vp)
+ * @param logits         [in]  BF16 [batch, vp.v_local]
+ * @param labels         [in]  int32 [batch] global vocab label per sample
+ * @param batch          Batch size
+ * @param vp             VocabPartition for this rank
+ * @param sm_version     SM version of the active device (86, 90, 120)
+ * @param stream         CUDA stream
+ */
+void launch_cross_entropy_tp_forward_hetero(
+    float*               local_max,
+    float*               local_sum_exp,
+    float*               local_logit,
+    const __nv_bfloat16* logits,
+    const int*           labels,
+    int                  batch,
+    VocabPartition       vp,
+    int                  sm_version,
+    cudaStream_t         stream);
+
+/**
+ * launch_cross_entropy_tp_backward_hetero
+ *
+ * Backward pass for a non-uniform vocab shard described by `vp`.
+ * Identical semantics to launch_cross_entropy_tp_backward.
+ *
+ * @param d_logits       [out] BF16 [batch, vp.v_local]
+ * @param logits         [in]  BF16 [batch, vp.v_local]
+ * @param labels         [in]  int32 [batch]
+ * @param global_max     [in]  FP32 [batch]
+ * @param log_sum_exp    [in]  FP32 [batch]
+ * @param batch          Batch size
+ * @param vp             VocabPartition for this rank
+ * @param inv_batch      1.f / batch_size
+ * @param sm_version     SM version (86, 90, 120)
+ * @param stream         CUDA stream
+ */
+void launch_cross_entropy_tp_backward_hetero(
+    __nv_bfloat16*       d_logits,
+    const __nv_bfloat16* logits,
+    const int*           labels,
+    const float*         global_max,
+    const float*         log_sum_exp,
+    int                  batch,
+    VocabPartition       vp,
+    float                inv_batch,
+    int                  sm_version,
+    cudaStream_t         stream);
+
+// ===========================================================================
 // fused_gradient_allreduce — INT8 mixed-precision compressed all-reduce
 //   for heterogeneous PCIe topology  (fused_gradient_allreduce.cu)
 // ===========================================================================

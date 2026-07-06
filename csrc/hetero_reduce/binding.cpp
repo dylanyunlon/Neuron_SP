@@ -643,6 +643,137 @@ void cross_entropy_tp_backward_py(at::Tensor d_logits,
 }
 
 // ---------------------------------------------------------------------------
+// cross_entropy_tp heterogeneous vocab partition bindings  (#141)
+// ---------------------------------------------------------------------------
+
+// compute_hetero_vocab_partition_py
+//   sm_versions: list[int] of length tp_size
+//   vocab_size:  int
+//   returns:     list of dicts {v_local, shard_offset, tp_size, rank}
+py::list compute_hetero_vocab_partition_py(
+    std::vector<int> sm_versions,
+    int              vocab_size)
+{
+    const int tp_size = (int)sm_versions.size();
+    TORCH_CHECK(tp_size >= 1, "sm_versions must be non-empty");
+    TORCH_CHECK(vocab_size >= tp_size,
+                "vocab_size must be >= tp_size");
+
+    std::vector<VocabPartition> parts(tp_size);
+    compute_hetero_vocab_partition(parts.data(), sm_versions.data(),
+                                    tp_size, vocab_size);
+
+    py::list result;
+    for (int r = 0; r < tp_size; ++r) {
+        py::dict d;
+        d["v_local"]      = parts[r].v_local;
+        d["shard_offset"] = parts[r].shard_offset;
+        d["tp_size"]      = parts[r].tp_size;
+        d["rank"]         = parts[r].rank;
+        result.append(d);
+    }
+    return result;
+}
+
+// cross_entropy_tp_forward_hetero_py
+//   logits:       BF16 Tensor [batch, v_local]  — this rank's shard
+//   labels:       Int32 Tensor [batch]           — global vocab label
+//   v_local:      int   — number of vocab tokens on this rank
+//   shard_offset: int   — first global vocab index on this rank
+//   sm_version:   int
+//   returns:      Tuple[Tensor FP32 [B], Tensor FP32 [B], Tensor FP32 [B]]
+std::tuple<at::Tensor, at::Tensor, at::Tensor>
+cross_entropy_tp_forward_hetero_py(
+    at::Tensor logits,
+    at::Tensor labels,
+    int64_t    v_local,
+    int64_t    shard_offset,
+    int        sm_version)
+{
+    check_bf16(logits, "logits");
+    TORCH_CHECK(logits.dim() == 2,
+                "logits must be 2-D [batch, v_local]");
+    TORCH_CHECK(labels.scalar_type() == at::ScalarType::Int,
+                "labels must be Int32, got ", labels.scalar_type());
+    TORCH_CHECK(labels.is_cuda() && labels.is_contiguous(),
+                "labels must be a contiguous CUDA tensor");
+    TORCH_CHECK(labels.numel() == logits.size(0),
+                "labels numel must equal batch size");
+    TORCH_CHECK(v_local > 0,        "v_local must be > 0");
+    TORCH_CHECK(shard_offset >= 0,  "shard_offset must be >= 0");
+    TORCH_CHECK((int64_t)logits.size(1) == v_local,
+                "logits.size(1) must equal v_local");
+
+    const int batch = (int)logits.size(0);
+
+    auto opts = at::TensorOptions().dtype(at::kFloat).device(logits.device());
+    at::Tensor local_max     = at::empty({batch}, opts);
+    at::Tensor local_sum_exp = at::empty({batch}, opts);
+    at::Tensor local_logit   = at::zeros({batch}, opts);
+
+    VocabPartition vp;
+    vp.v_local      = (int)v_local;
+    vp.shard_offset = (int)shard_offset;
+    vp.tp_size      = 0;   // not needed by the kernel
+    vp.rank         = 0;
+
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    launch_cross_entropy_tp_forward_hetero(
+        local_max.data_ptr<float>(),
+        local_sum_exp.data_ptr<float>(),
+        local_logit.data_ptr<float>(),
+        reinterpret_cast<const __nv_bfloat16*>(logits.data_ptr<at::BFloat16>()),
+        labels.data_ptr<int>(),
+        batch, vp, sm_version, stream);
+
+    return std::make_tuple(local_max, local_sum_exp, local_logit);
+}
+
+// cross_entropy_tp_backward_hetero_py
+void cross_entropy_tp_backward_hetero_py(
+    at::Tensor d_logits,
+    at::Tensor logits,
+    at::Tensor labels,
+    at::Tensor global_max,
+    at::Tensor log_sum_exp,
+    int64_t    v_local,
+    int64_t    shard_offset,
+    float      inv_batch,
+    int        sm_version)
+{
+    check_bf16(d_logits,    "d_logits");
+    check_bf16(logits,      "logits");
+    check_fp32(global_max,  "global_max");
+    check_fp32(log_sum_exp, "log_sum_exp");
+    TORCH_CHECK(labels.scalar_type() == at::ScalarType::Int,
+                "labels must be Int32");
+    TORCH_CHECK(d_logits.sizes() == logits.sizes(),
+                "d_logits/logits shape mismatch");
+    TORCH_CHECK(v_local > 0,        "v_local must be > 0");
+    TORCH_CHECK(shard_offset >= 0,  "shard_offset must be >= 0");
+    TORCH_CHECK((int64_t)logits.size(1) == v_local,
+                "logits.size(1) must equal v_local");
+    TORCH_CHECK(inv_batch > 0.f, "inv_batch must be > 0");
+
+    const int batch = (int)logits.size(0);
+
+    VocabPartition vp;
+    vp.v_local      = (int)v_local;
+    vp.shard_offset = (int)shard_offset;
+    vp.tp_size      = 0;
+    vp.rank         = 0;
+
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    launch_cross_entropy_tp_backward_hetero(
+        reinterpret_cast<__nv_bfloat16*>(d_logits.data_ptr<at::BFloat16>()),
+        reinterpret_cast<const __nv_bfloat16*>(logits.data_ptr<at::BFloat16>()),
+        labels.data_ptr<int>(),
+        global_max.data_ptr<float>(),
+        log_sum_exp.data_ptr<float>(),
+        batch, vp, inv_batch, sm_version, stream);
+}
+
+// ---------------------------------------------------------------------------
 // fused_adam_heterogeneous bindings
 // ---------------------------------------------------------------------------
 
@@ -1123,6 +1254,55 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("labels"),
           py::arg("global_max"),
           py::arg("log_sum_exp"),
+          py::arg("shard_offset") = 0,
+          py::arg("inv_batch") = 1.f,
+          py::arg("sm_version") = 86);
+
+    // -----------------------------------------------------------------------
+    // cross_entropy_tp heterogeneous vocab partition  (#141)
+    // -----------------------------------------------------------------------
+    m.def("compute_hetero_vocab_partition",
+          &compute_hetero_vocab_partition_py,
+          "Compute per-rank VocabPartition for a non-uniform TP vocab split.\n"
+          "Returns a list of dicts {v_local, shard_offset, tp_size, rank}.\n"
+          "\n"
+          "Token counts are proportional to SM weights (SM12.0→4, SM9.0→3,\n"
+          "SM8.6→1) and aligned to 8 elements (kVecBF16).  The last rank\n"
+          "absorbs any residual.\n"
+          "\n"
+          "Args:\n"
+          "  sm_versions (List[int]): SM version per rank, e.g. [86, 90, 120]\n"
+          "  vocab_size  (int):       full vocabulary size V\n",
+          py::arg("sm_versions"),
+          py::arg("vocab_size"));
+
+    m.def("cross_entropy_tp_forward_hetero",
+          &cross_entropy_tp_forward_hetero_py,
+          "Phase-1 heterogeneous TP cross-entropy forward (issue #141).\n"
+          "Pass A: compute local (max, sum_exp, label_logit) for a non-uniform\n"
+          "vocab shard of width v_local starting at shard_offset.\n"
+          "\n"
+          "Pass B (caller): AllReduce across TP ranks, then call\n"
+          "cross_entropy_tp_loss as usual.\n"
+          "\n"
+          "Returns Tuple[Tensor FP32 [B], Tensor FP32 [B], Tensor FP32 [B]]\n"
+          "        (local_max, local_sum_exp, local_logit).",
+          py::arg("logits"),
+          py::arg("labels"),
+          py::arg("v_local"),
+          py::arg("shard_offset") = 0,
+          py::arg("sm_version") = 86);
+
+    m.def("cross_entropy_tp_backward_hetero",
+          &cross_entropy_tp_backward_hetero_py,
+          "Backward pass for heterogeneous TP cross-entropy (issue #141).\n"
+          "Computes softmax gradient w.r.t. a non-uniform vocab shard.",
+          py::arg("d_logits"),
+          py::arg("logits"),
+          py::arg("labels"),
+          py::arg("global_max"),
+          py::arg("log_sum_exp"),
+          py::arg("v_local"),
           py::arg("shard_offset") = 0,
           py::arg("inv_batch") = 1.f,
           py::arg("sm_version") = 86);
