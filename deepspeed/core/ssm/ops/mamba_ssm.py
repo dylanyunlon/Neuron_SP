@@ -7,6 +7,7 @@
 # LICENSE file in the root directory of this source tree.
 
 
+from typing import Optional
 import torch
 from packaging import version
 

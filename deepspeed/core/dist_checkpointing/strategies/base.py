@@ -1,3 +1,4 @@
+import torch
 import logging
 # Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
 

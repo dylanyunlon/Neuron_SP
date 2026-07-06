@@ -14,6 +14,7 @@ is intentional: each rank that touches any bytes of a param must know about
 it for gradient accumulation purposes.
 """
 from __future__ import annotations
+import torch
 
 import logging
 import os

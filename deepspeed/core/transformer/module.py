@@ -3,6 +3,7 @@
 """MegatronModule — base class for all transformer sub-modules."""
 
 from __future__ import annotations
+import torch
 
 from abc import ABC
 from typing import Optional

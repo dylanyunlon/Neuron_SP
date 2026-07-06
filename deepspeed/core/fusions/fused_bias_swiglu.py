@@ -19,6 +19,7 @@ correctly on SM86 (A6000) without additional CUDA compilation.
 Megatron source: Megatron-LM/megatron/core/fusions/fused_bias_swiglu.py
 """
 from __future__ import annotations
+from typing import Tuple
 
 import torch
 import torch.nn.functional as F

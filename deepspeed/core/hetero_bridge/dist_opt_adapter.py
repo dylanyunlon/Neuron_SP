@@ -33,6 +33,7 @@ References
 * git log HEAD~1 commit a52efee1                 (VRAM-adaptive optimizer)
 """
 from __future__ import annotations
+import torch
 
 import logging
 import os

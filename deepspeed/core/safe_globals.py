@@ -16,6 +16,7 @@ Call register_safe_globals() once at process startup, or import this module
 (it auto-registers on import).
 """
 from __future__ import annotations
+import torch
 
 import io
 import logging

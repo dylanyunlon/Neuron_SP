@@ -2,6 +2,7 @@
 
 """Utility functions related to FP4 that are used throughout Megatron core"""
 
+from typing import List, Optional
 from contextlib import nullcontext
 
 import torch

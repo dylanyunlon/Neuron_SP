@@ -26,6 +26,7 @@ This cluster has no NVLink.  SP all-to-all deadlocks on PCIe-only topologies
 disabled — matching the kill-switch in ``desloc_engine.py`` line ~1738.
 """
 from __future__ import annotations
+import torch
 
 import logging
 import os

@@ -1,4 +1,5 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+from typing import List
 import logging
 import os
 from contextlib import nullcontext

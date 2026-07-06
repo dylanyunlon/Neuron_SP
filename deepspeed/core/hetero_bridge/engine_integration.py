@@ -32,6 +32,7 @@ After install() returns:
   - engine.model                  has been moved to the local CUDA device
 """
 from __future__ import annotations
+import torch
 
 import logging
 import os

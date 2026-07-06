@@ -5,6 +5,7 @@
 # Ported from Megatron-LM megatron/core/transformer/spec_utils.py
 # megatron.core imports replaced with deepspeed.core equivalents.
 
+import torch
 import functools
 import logging
 import types

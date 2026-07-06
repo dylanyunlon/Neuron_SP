@@ -9,6 +9,7 @@ manager.  Ported from ``Megatron-LM/megatron/core/hyper_comm_grid.py``
 with import paths adapted to the ``deepspeed`` package.
 """
 
+import torch
 import numbers
 import os
 from dataclasses import dataclass

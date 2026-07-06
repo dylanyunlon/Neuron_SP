@@ -1,5 +1,6 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
+import torch
 from typing import Dict, List, Tuple
 
 from ..logger import PELogger

@@ -26,6 +26,7 @@ Name-based overrides (applied before variance ranking):
   - '*norm*', '*ln*'             → always 'v' (layer norms converge quickly)
 """
 from __future__ import annotations
+import torch
 
 import logging
 import math

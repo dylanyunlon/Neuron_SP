@@ -1,5 +1,6 @@
 # Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
 
+import torch
 import json
 import logging
 from dataclasses import dataclass, asdict, field

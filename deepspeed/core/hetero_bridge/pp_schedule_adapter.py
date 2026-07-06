@@ -29,6 +29,7 @@ Bubble filler
   - the tier map contains at least one H100 or Blackwell rank (fast stage).
 """
 from __future__ import annotations
+import torch
 
 import logging
 from typing import Callable, Dict, List, Optional, TYPE_CHECKING

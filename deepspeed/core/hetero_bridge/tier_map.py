@@ -12,6 +12,7 @@ Cluster topology (the contract from ARCHITECTURE.md):
   No NVLink — all inter-GPU comms over PCIe
 """
 from __future__ import annotations
+import torch
 
 import enum
 import logging
