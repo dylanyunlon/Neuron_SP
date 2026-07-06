@@ -333,6 +333,25 @@ def bias_swiglu_impl(
         output = BiasSwiGLUFunction.apply(
             input, bias, fp8_input_store, cpu_offload_input
         )
+    elif (HAVE_HETERO_SWIGLU and not fp8_input_store and not cpu_offload_input
+          and input.dtype == torch.bfloat16 and input.dim() == 2
+          and input.size(1) % 16 == 0):
+        # Hetero CUDA fast path: fused_swiglu_ln with identity weight (no LN).
+        # Input: [batch, 2*H] -> gate=input[:, :H], up=input[:, H:]
+        # We pass a ones weight [H] to get pure SwiGLU output (no LN scaling).
+        try:
+            batch, two_h = input.shape
+            h = two_h // 2
+            gate = input[:, :h].contiguous()
+            up   = input[:, h:].contiguous()
+            ln_w = input.new_ones(h, dtype=torch.float32)  # identity weight
+            out  = torch.empty(batch, h, dtype=torch.bfloat16, device=input.device)
+            _hetero_swiglu_op.fused_swiglu_ln(
+                out, gate, up, ln_w, 1e-5, _swiglu_sm_version()
+            )
+            output = out
+        except Exception:
+            output = SwiGLUFunction.apply(input, fp8_input_store, cpu_offload_input)
     else:
         output = SwiGLUFunction.apply(input, fp8_input_store, cpu_offload_input)
 

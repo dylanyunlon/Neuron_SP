@@ -344,8 +344,31 @@ class FusedRMSNorm(torch.nn.Module):
                 )
             return normed * weight
 
+        # Neuron_SP hetero CUDA RMSNorm — fast path for BF16 2-D inputs.
+        # Uses our fused_swiglu_ln.cu RMSNorm kernel (without SwiGLU — just LN).
+        # Requires: BF16 dtype, 2-D [batch, hidden] shape, hidden divisible by 8.
+        if (HAVE_HETERO_LN and input.dtype == torch.bfloat16
+                and input.dim() == 2
+                and input.size(1) % 8 == 0
+                and weight.dtype == torch.float32):
+            try:
+                import torch
+                sm_ver = _hetero_ln_sm_version()
+                batch, hidden = input.shape
+                out = torch.empty_like(input)
+                # fused_swiglu_ln computes: out = swiglu(gate, up) * rmsnorm_weight
+                # We repurpose fused_layernorm_residual: residual = input, output = normed.
+                # Use residual = zeros (no residual add), input = x, weight = rmsnorm weight.
+                residual = torch.zeros_like(input)
+                _hetero_ln_op.fused_layernorm_residual(
+                    out, residual, input, weight, self.eps, sm_ver
+                )
+                return out
+            except Exception:
+                pass  # fall through to PyTorch fallback
+
         # Pure-PyTorch fallback — always correct.
-        # RMSNorm: x / sqrt(mean(x²) + eps) * weight
+        # RMSNorm: x / sqrt(mean(x^2) + eps) * weight
         input_f32 = input.float()
         variance = input_f32.pow(2).mean(-1, keepdim=True)
         normed = input_f32 * torch.rsqrt(variance + self.eps)

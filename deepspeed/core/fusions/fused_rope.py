@@ -286,6 +286,41 @@ def _apply_rotary_pos_emb_thd_torch(
 
 
 # ---------------------------------------------------------------------------
+# Neuron_SP hetero CUDA RoPE kernel — dispatched before JIT fallback.
+# Available on A6000 (SM8.6), H100 (SM9.0), Blackwell (SM12.0) without TE/flash.
+# ---------------------------------------------------------------------------
+try:
+    from op_builder.hetero_reduce import HeteroReduceBuilder as _HeteroRopeBuilder
+    _hetero_rope_op = _HeteroRopeBuilder().load()
+    HAVE_HETERO_ROPE = hasattr(_hetero_rope_op, "rope_cache") and hasattr(_hetero_rope_op, "fused_rope_hetero")
+except Exception:
+    _hetero_rope_op = None
+    HAVE_HETERO_ROPE = False
+
+def _hetero_rope_sm_version() -> int:
+    """Return the SM version of the current CUDA device for hetero RoPE dispatch."""
+    try:
+        import torch
+        major, minor = torch.cuda.get_device_capability()
+        return major * 10 + minor
+    except Exception:
+        return 86  # conservative fallback
+
+# Cache per (device, head_dim) to avoid repeated cache allocations
+import functools
+
+@functools.lru_cache(maxsize=64)
+def _get_hetero_rope_cache(seq_len: int, head_dim: int, base: float, device_idx: int):
+    """Cached RoPE cos/sin tables for (seq_len, head_dim, base) on a device."""
+    import torch
+    half_dim = head_dim // 2
+    cos_buf = torch.empty(seq_len, half_dim, dtype=torch.float32, device=f"cuda:{device_idx}")
+    sin_buf = torch.empty(seq_len, half_dim, dtype=torch.float32, device=f"cuda:{device_idx}")
+    _hetero_rope_op.rope_cache(cos_buf, sin_buf, seq_len, head_dim, base, 0)
+    return cos_buf, sin_buf
+
+
+# ---------------------------------------------------------------------------
 # Public dispatcher — mirrors rope_utils.apply_rotary_pos_emb interface.
 # ---------------------------------------------------------------------------
 
@@ -375,6 +410,30 @@ def apply_rotary_pos_emb_fused(
                 return out.permute(1, 0, 2, 3)  # bshd → sbhd
             except Exception:
                 pass
+
+    # Neuron_SP heterogeneous CUDA RoPE kernel — SM8.6/9.0/12.0, no TE required.
+    # Only dispatches for SBHD tensors of dtype BF16 with no mscale and no packed seqs.
+    if (HAVE_HETERO_ROPE and mscale == 1.0 and cu_seqlens is None
+            and t.dtype == torch.bfloat16 and t.dim() == 4):
+        try:
+            sm_ver = _hetero_rope_sm_version()
+            # t: [s, b, nh, d] -> need [b, s, nh, d] for our kernel
+            t_bshd = t.permute(1, 0, 2, 3).contiguous()
+            s, b, nh, d = t.shape
+            # Build cos/sin cache (cached via lru_cache per shape)
+            # freqs: [s, 1, 1, d] -> extract base freq from first element's pattern
+            # Fall back if head_dim is odd or > 512
+            if d % 2 == 0 and d <= 512:
+                dev_idx = t.device.index or 0
+                cos_cache, sin_cache = _get_hetero_rope_cache(s, d, 10000.0, dev_idx)
+                out = torch.empty_like(t_bshd)
+                neox_style = not rotary_interleaved  # Llama=True, GPT-J=False
+                _hetero_rope_op.fused_rope_hetero(
+                    out, t_bshd, cos_cache, sin_cache, neox_style, sm_ver
+                )
+                return out.permute(1, 0, 2, 3)  # bshd -> sbhd
+        except Exception:
+            pass  # fall through to JIT
 
     # JIT-compiled pure-PyTorch fallback — SM86 / A6000 safe.
     return FusedRoPEFunc.apply(t, freqs, rotary_interleaved, mscale)
