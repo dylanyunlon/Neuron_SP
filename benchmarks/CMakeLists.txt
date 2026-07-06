@@ -36,7 +36,8 @@ add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../csrc/hetero_reduce
 add_library(hetero_kernels ALIAS hetero_reduce_kernels)
 
 # ─── Benchmarks ──────────────────────────────────────────────────────
-foreach(bench hetero_reduce fused_swiglu_ln pcie_allreduce)
+foreach(bench hetero_reduce fused_swiglu_ln pcie_allreduce
+              fused_layernorm_residual cross_entropy_tp)
     add_executable(bench_${bench} bench_${bench}.cu)
     target_link_libraries(bench_${bench} PRIVATE hetero_kernels CUDA::cudart)
     target_include_directories(bench_${bench} PRIVATE ${HETERO_INCLUDE_DIRS})
@@ -65,7 +66,8 @@ set_property(TARGET bench_reduce_scatter_vs_naive PROPERTY
 find_library(NVTX_LIB nvToolsExt PATHS ${CUDAToolkit_ROOT}/lib64)
 if(NVTX_LIB)
     message(STATUS "NVTX found: ${NVTX_LIB}")
-    foreach(bench hetero_reduce fused_swiglu_ln pcie_allreduce)
+    foreach(bench hetero_reduce fused_swiglu_ln pcie_allreduce
+              fused_layernorm_residual cross_entropy_tp)
         target_compile_definitions(bench_${bench} PRIVATE NVTX_ENABLED=1)
         target_link_libraries(bench_${bench} PRIVATE ${NVTX_LIB})
     endforeach()
