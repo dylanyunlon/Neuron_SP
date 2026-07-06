@@ -196,6 +196,133 @@ class DistributedDataParallelConfig:
     # Set to True automatically when cuda_graph_impl == 'full_iteration'.
     cuda_graph_mode: bool = False
 
+    # -----------------------------------------------------------------------
+    # Megatron upstream fields (ported from distributed_data_parallel_config.py)
+    # These are not yet wired into DES-LOC training paths but are kept for
+    # API compatibility with callers that pass Megatron-style configs.
+    # -----------------------------------------------------------------------
+
+    num_buckets: Optional[int] = None
+    """Number of buckets for data-parallel communication. Mutually exclusive
+    with bucket_size. When specified, bucket_size is computed at runtime by
+    dividing total parameter count by num_buckets. Only effective when
+    overlap_grad_reduce=True (otherwise bucket boundaries don't matter)."""
+
+    fp8_param_gather: bool = False
+    """If True, keep the compute param in fp8 (no intermediate dtype) and
+    perform the param all-gather in fp8. Requires reuse_grad_buf_for_mxfp8_param_ag
+    to be True when using mxfp8 recipe."""
+
+    fp4_param_gather: bool = False
+    """If True, keep the compute param in fp4 (no intermediate dtype) and
+    perform the param all-gather in fp4 (NVFP4 native weight path, M3737)."""
+
+    gradient_reduce_div_fusion: bool = True
+    """If True, fuse gradient division into the reduction collective kernel
+    instead of a separate element-wise divide. Reduces kernel launch overhead
+    at the cost of a slightly different numerics path (Megatron upstream)."""
+
+    use_custom_fsdp: bool = False
+    """Deprecated alias for use_megatron_fsdp. Retained for backward
+    compatibility; callers should migrate to use_megatron_fsdp=True."""
+
+    data_parallel_sharding_strategy: str = 'no_shard'
+    """Sharding strategy for Megatron-FSDP. Valid values:
+      'no_shard'           — standard DDP, no parameter sharding.
+      'optim'              — shard optimizer state only.
+      'optim_grads'        — shard optimizer state + gradients.
+      'optim_grads_params' — full ZeRO-3 (optimizer + grads + params)."""
+
+    suggested_communication_unit_size: Optional[int] = None
+    """Number of elements to communicate at once during FSDP operations.
+    Affects FSDP all-gather prefetch behavior. Larger values increase the
+    communication buffer size; smaller values disable prefetching."""
+
+    keep_fp8_transpose_cache: bool = False
+    """If True, keep the fp8 transpose cache when using Megatron FSDP.
+    Trades memory for reduced recomputation of transposed fp8 weights."""
+
+    fsdp_double_buffer: bool = False
+    """If True, use persistently allocated double buffers for the temporary
+    memory needed in Megatron FSDP communications. Required when nccl_ub=True
+    (automatically set True in that case)."""
+
+    fsdp_db_use_persist_buf_on_alloc_fail: bool = False
+    """Whether to fall back to persistent buffer when a bucket does not fit
+    the FSDP double buffer size. When True, enables NCCL UB for that bucket
+    at the cost of extra memory; when False uses dynamic allocation."""
+
+    outer_dp_sharding_strategy: str = 'no_shard'
+    """Sharding strategy for outer DP group in Hybrid Sharded Data Parallel
+    (HSDP) mode. Valid values: 'no_shard', 'optim'. Only effective when
+    Hybrid FSDP is enabled."""
+
+    fsdp_manual_registration: bool = False
+    """If True, manually register FSDP communication buffers to NCCL user
+    buffer. Only effective when use_megatron_fsdp=True and nccl_ub=True.
+    Minimises registration call count for large models."""
+
+    megatron_fsdp_use_decoupled_grad: bool = False
+    """If True, Megatron-FSDP uses the precision-aware optimizer gradient path
+    (decoupled_grad on optimizer params) instead of casting main gradients to
+    param dtype for .grad."""
+
+    megatron_fsdp_cuda_graph_mode: bool = False
+    """If True, Megatron-FSDP practices CUDA-graph-safe operations, such as
+    not dereferencing param.grad after the optimizer step to preserve
+    references for CUDA-graph replay."""
+
+    megatron_fsdp_enable_fine_grained_param_gather: bool = False
+    """If True, enables fine-grained parameter gathering for Megatron-FSDP,
+    increasing overlap between param all-gather and forward computation.
+    Particularly useful for MXFP8 activation recomputation memory savings."""
+
+    def __post_init__(self) -> None:
+        """Validate configuration after dataclass field initialisation.
+
+        Mirrors Megatron's DistributedDataParallelConfig.__post_init__ with
+        additional DES-LOC consistency checks.
+
+        Raises:
+            AssertionError: if mutually exclusive options are both set.
+            ValueError: if field values are out of range.
+        """
+        # num_buckets and bucket_size are mutually exclusive.
+        if self.num_buckets is not None:
+            assert self.bucket_size is None, (
+                "Cannot specify both num_buckets and bucket_size in "
+                "DistributedDataParallelConfig"
+            )
+            assert self.num_buckets > 0, (
+                f"num_buckets must be > 0, got {self.num_buckets}"
+            )
+
+        # fp8_param_gather is required when reusing grad buffer for MXFP8 AG.
+        if self.reuse_grad_buf_for_mxfp8_param_ag:
+            assert self.fp8_param_gather, (
+                "reuse_grad_buf_for_mxfp8_param_ag requires fp8_param_gather=True"
+            )
+
+        # FP32 local accumulation patterns are redundant when grad_reduce_in_fp32 is True.
+        if len(self.param_name_patterns_for_fp32_local_accumulation) > 0:
+            assert not self.grad_reduce_in_fp32, (
+                "param_name_patterns_for_fp32_local_accumulation should only be specified "
+                "when grad_reduce_in_fp32 is False — otherwise all grads are already FP32"
+            )
+
+        # Deprecation shim: use_custom_fsdp → use_megatron_fsdp.
+        if self.use_custom_fsdp and not self.use_megatron_fsdp:
+            logger.warning(
+                "DistributedDataParallelConfig: use_custom_fsdp is deprecated; "
+                "setting use_megatron_fsdp=True automatically."
+            )
+            object.__setattr__(self, 'use_megatron_fsdp', True)
+
+        # DES-LOC: allow_skip_grad_sync=False with overlap_grad_reduce=True is valid
+        # (forces every step to sync, disabling Kx gating entirely).
+        # allow_skip_grad_sync=True without overlap_grad_reduce is also valid
+        # (finalize_model_grads controls skip_sync on the synchronous path).
+
 
 # ---------------------------------------------------------------------------
 # DistributedDataParallel
@@ -286,7 +413,8 @@ class DistributedDataParallel(nn.Module):
         # full rationale and multiplier table.)
         # ------------------------------------------------------------------
         _apply_tier_bucketing = (
-            ddp_config.bucket_size is None  # only auto-tune; respect explicit override
+            ddp_config.bucket_size is None          # only auto-tune; respect explicit override
+            and getattr(ddp_config, 'num_buckets', None) is None  # num_buckets → fixed count
             and parallel_state.is_initialized()
         )
 
@@ -386,6 +514,29 @@ class DistributedDataParallel(nn.Module):
             param.grad_added_to_main_grad = False
             param_to_name[param] = name
             all_params.append(param)
+
+        # ------------------------------------------------------------------
+        # num_buckets → bucket_size resolution (Megatron upstream).
+        # When num_buckets is specified instead of bucket_size, derive the
+        # target bucket_size by dividing the total trainable parameter count
+        # by the requested number of buckets.  Only effective when
+        # overlap_grad_reduce=True; bucket boundaries are irrelevant otherwise.
+        # This must happen after all_params is populated and before the
+        # tier-aware bucket sizing block that reads ddp_config.bucket_size.
+        # ------------------------------------------------------------------
+        if getattr(ddp_config, 'num_buckets', None) is not None:
+            assert ddp_config.bucket_size is None, (
+                "num_buckets and bucket_size are mutually exclusive"
+            )
+            total_params = sum(p.data.nelement() for p in all_params)
+            ddp_config.bucket_size = max(1, total_params // ddp_config.num_buckets)
+            logger.info(
+                "num_buckets=%d → computed bucket_size=%d "
+                "(total_params=%d trainable elements)",
+                ddp_config.num_buckets,
+                ddp_config.bucket_size,
+                total_params,
+            )
 
         # ------------------------------------------------------------------
         # Group parameters by (param_dtype, grad_dtype, is_expert, is_layerwise)
