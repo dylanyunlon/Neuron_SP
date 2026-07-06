@@ -836,36 +836,114 @@ class DistributedDataParallel(nn.Module):
     # ------------------------------------------------------------------
 
     def _make_backward_post_hook(self, param: torch.nn.Parameter):
-        """Create backward post-hook to accumulate grad and trigger async reduce."""
+        """Create backward post-hook to accumulate grad and trigger async reduce.
+
+        Handles four orthogonal concerns that must compose correctly:
+
+        1. **Grad accumulation into main_grad** (all paths):
+           ``param.grad`` is the raw PyTorch autograd gradient for one micro-
+           batch; ``param.main_grad`` is the contiguous flat-buffer slice that
+           accumulates across micro-batches (and is what the optimizer sees).
+           We add ``param.grad`` into ``param.main_grad`` unless the TE/Apex
+           wgrad kernel already did it (``grad_added_to_main_grad=True``) *and*
+           the param is not marked ``zero_out_wgrad`` (which forces a fresh
+           copy every micro-batch regardless of ``grad_added_to_main_grad``).
+
+        2. **M3087 (dbde759da) — dgrad / wgrad saving**:
+           When ``ddp_config.delay_wgrad_compute=True`` *and* the module
+           registered its own ``register_wgrad_accumulation_and_reduce_hooks``
+           (TransformerEngine / Apex weight-grad deferred path), the
+           accumulation into ``main_grad`` is deferred to ``backward_dw()``.
+           This hook therefore skips the ``add_`` for those params and only
+           handles the ``register_grad_ready`` handoff so the bucket-group
+           can track readiness independently of wgrad availability.
+
+        3. **M4041 (67b2f3878) — full-iteration CUDA graph compatibility**:
+           Setting ``param.grad = None`` during CUDA graph replay would
+           invalidate the captured tensor address and corrupt subsequent
+           replays.  When ``ddp_config.cuda_graph_mode=True`` we skip the
+           ``param.grad = None`` line; the grad tensor lives until the next
+           step's ``zero_grad_buffer()`` clears it naturally.
+
+        4. **DES-LOC Kx gating** (non-Kx steps):
+           ``register_grad_ready`` / ``start_grad_sync`` on the bucket-group
+           are called regardless; the bucket-group's ``_skip_sync`` flag
+           (set by ``start_grad_sync(skip_sync=True)``) prevents the actual
+           collective so gradients just accumulate locally.
+
+        See also: ``_make_param_hook`` (historical Megatron name, points here).
+        """
 
         def hook(*unused) -> None:
             if is_graph_capturing():
                 return
 
-            if param in self.param_to_bucket_group:
-                assert param.requires_grad
-                if self.ddp_config.overlap_grad_reduce:
-                    assert param.grad is not None, \
-                        "param.grad is None but overlap_grad_reduce=True"
+            if param not in self.param_to_bucket_group:
+                return
+
+            assert param.requires_grad
+
+            if self.ddp_config.overlap_grad_reduce:
+                assert param.grad is not None, (
+                    "param.grad is None but overlap_grad_reduce=True; "
+                    "this can happen if the param has no gradient path in "
+                    "the current micro-batch (e.g. dropped expert)."
+                )
+
+            # -----------------------------------------------------------
+            # Step 1: accumulate param.grad → param.main_grad
+            # M3087: delay_wgrad_compute params skip this here; their
+            # accumulation happens inside backward_dw() / the module hook.
+            # -----------------------------------------------------------
+            skip_main_grad_add = (
+                self.ddp_config.delay_wgrad_compute
+                and getattr(param, 'skip_backward_post_hook', False)
+            )
+            if not skip_main_grad_add:
                 if param.grad is not None and (
                     not param.grad_added_to_main_grad
                     or getattr(param, 'zero_out_wgrad', False)
                 ):
                     param.main_grad.add_(param.grad.data)
-                # M4041 (Megatron 67b2f3878): Conditional param.grad deref.
-                # In full-iteration CUDA graph mode we must NOT set param.grad
-                # to None here: the graph was recorded with a live grad tensor
-                # address, and overwriting the attribute would break replay.
-                # On non-graph paths (and non-Kx DES-LOC steps) the usual
-                # eager deref frees the gradient storage immediately.
-                if not self.ddp_config.cuda_graph_mode:
-                    param.grad = None
-                if self.ddp_config.overlap_grad_reduce:
-                    self.param_to_bucket_group[param].register_grad_ready(
-                        param, self.force_all_reduce
-                    )
+
+            # -----------------------------------------------------------
+            # Step 2: release the raw autograd grad tensor (if safe to do so).
+            # M4041: skip when running under a full-iteration CUDA graph.
+            # -----------------------------------------------------------
+            if not self.ddp_config.cuda_graph_mode:
+                param.grad = None
+
+            # -----------------------------------------------------------
+            # Step 3: notify bucket-group that this param's grad is ready.
+            # When overlap_grad_reduce=True the bucket-group may launch an
+            # async collective once all params in the bucket are ready.
+            # -----------------------------------------------------------
+            if self.ddp_config.overlap_grad_reduce:
+                self.param_to_bucket_group[param].register_grad_ready(
+                    param, self.force_all_reduce
+                )
 
         return hook
+
+    def _make_param_hook(self, param: torch.nn.Parameter):
+        """Backward post-hook factory — historical Megatron name (commit 0203a13f).
+
+        This is a named alias for :meth:`_make_backward_post_hook` kept for
+        compatibility with callers that reference the pre-M2777 API name
+        (e.g. ``deepspeed/comm/comm.py`` attach_model_hooks documentation,
+        unit tests that monkeypatch ``_make_param_hook``, and any downstream
+        code that follows the Megatron DDP hook-naming convention).
+
+        All logic lives in ``_make_backward_post_hook``; this method simply
+        forwards the call.
+
+        Args:
+            param: The parameter for which to create a grad-accumulation hook.
+
+        Returns:
+            A callable suitable for ``grad_acc.register_hook(...)``.
+        """
+        return self._make_backward_post_hook(param)
 
     # ------------------------------------------------------------------
     # no_sync context manager (gradient accumulation)
@@ -915,18 +993,106 @@ class DistributedDataParallel(nn.Module):
     ) -> None:
         """Initiate param sync (all-gather) for all model parameters.
 
-        By default when overlap_param_gather=True, dispatches async AGs.
-        When overlap_param_gather=False, issues synchronous collective.
+        Behaviour matrix (mirrors Megatron M3443 / M3948 / M4020):
+
+        +--------------------------+------------+---------+-----------------------------------+
+        | overlap_param_gather     | force_sync | outcome                                     |
+        +==========================+============+=========+===================================+
+        | False                    | any        | synchronous all-gather for every bucket;   |
+        |                          |            | _post_param_sync() called inline.           |
+        +--------------------------+------------+---------------------------------------------+
+        | True                     | False      | async all-gather dispatched; pipeline       |
+        |                          |            | schedules call finish_param_sync() later    |
+        |                          |            | via the forward pre-hook.                   |
+        +--------------------------+------------+---------------------------------------------+
+        | True                     | True       | waits for any in-flight AG handle, then     |
+        |                          |            | issues a *synchronous* all-gather; used by  |
+        |                          |            | disable_forward_pre_hook and checkpointing. |
+        +--------------------------+------------+---------------------------------------------+
+
+        Early-return conditions (from Megatron M3443 align_param_gather path):
+
+        * ``overlap_param_gather_with_optimizer_step=True and not force_dispatch``:
+          the optimizer step already dispatched the first-bucket AG at the end
+          of the previous iteration; forward pre-hooks will chain the remaining
+          buckets.  Re-dispatching here would corrupt the handle state.
+
+        * ``ddp_config.align_param_gather=True``:
+          All-gathers are *only* dispatched from the pipeline-schedule
+          synchronisation points (``start_param_sync`` calls in schedules.py)
+          and the forward pre-hook.  An additional dispatch from, e.g.,
+          ``finalize_model_grads`` would break the intentional alignment.
+          Unless ``force_sync`` is set (explicit synchronous drain requested),
+          we return immediately so the caller does not double-dispatch.
 
         Args:
-            force_sync: Force synchronous collective regardless of other settings.
-            force_dispatch: Force dispatch even if overlap_param_gather_with_optimizer_step.
+            force_sync:     Force synchronous collective regardless of
+                            ``overlap_param_gather``.  Also overrides
+                            ``align_param_gather`` early-return.
+            force_dispatch: Force dispatch even when
+                            ``overlap_param_gather_with_optimizer_step=True``.
+                            Used by the layer-wise optimizer path which needs
+                            to (re-)dispatch all-gathers after the optimizer
+                            step updates the local param shard.
         """
         if not force_sync:
+            # M3443: when AG is already handled by the optimizer step overlap,
+            # avoid redundant dispatches in forward_backward_step.
             if self.overlap_param_gather_with_optimizer_step and not force_dispatch:
                 return
+
+            # M3443 align_param_gather: dispatches are gated to schedule
+            # synchronisation points.  Don't issue an extra one here.
+            if self.ddp_config.align_param_gather:
+                return
+
         for bg in self.bucket_groups + self.expert_parallel_bucket_groups:
             self._start_bucket_group_param_sync(bg, force_sync=force_sync)
+
+    def finish_param_sync(
+        self,
+        *unused,
+        skip_next_bucket_dispatch: bool = False,
+    ) -> None:
+        """Wait for all outstanding param all-gathers to complete (DDP level).
+
+        This is the DDP-level counterpart of
+        ``ParamAndGradBucketGroup.finish_param_sync``.  It is called by the
+        pipeline schedule after the final forward pre-hook has returned and
+        we need to ensure every bucket's all-gather is fully materialised
+        before the next backward pass begins.
+
+        Behaviour (mirrors Megatron M3443 / M3948):
+
+        * When ``overlap_param_gather=True`` (standard path): iterates all
+          bucket groups in *forward order* and calls
+          ``finish_param_sync(skip_next_bucket_dispatch=skip_next_bucket_dispatch)``
+          on each.  Each bucket group's ``finish_param_sync`` waits on its
+          async handle and, unless ``skip_next_bucket_dispatch`` is True,
+          auto-dispatches the next bucket's all-gather for the following
+          forward pass.
+        * When ``overlap_param_gather=False``: this is a no-op — all-gathers
+          were already synchronous in ``start_param_sync``.
+
+        ``align_param_gather`` note: when the flag is set, all-gather
+        dispatches are gated to explicit ``start_param_sync`` calls in the
+        pipeline schedule.  ``finish_param_sync`` is still required to *wait*
+        for the last bucket in each model chunk, so we don't skip it here.
+
+        Args:
+            skip_next_bucket_dispatch: If True, suppress the automatic
+                next-bucket AG dispatch that normally fires from the bucket
+                group's ``finish_param_sync``.  Set by the pipeline schedule
+                when it wants to control dispatch timing explicitly (e.g.
+                ``align_param_gather`` mode or the optimizer-step overlap).
+        """
+        if not self.ddp_config.overlap_param_gather:
+            return
+
+        for bg in self.bucket_groups + self.expert_parallel_bucket_groups:
+            bg.finish_param_sync(
+                skip_next_bucket_dispatch=skip_next_bucket_dispatch
+            )
 
     # ------------------------------------------------------------------
     # Grad sync
@@ -1102,14 +1268,68 @@ class DistributedDataParallel(nn.Module):
     # Zero grad buffer
     # ------------------------------------------------------------------
 
-    def zero_grad_buffer(self) -> None:
-        """Zero out all grad buffers. Call at the beginning of each training step."""
+    def zero_grad_buffer(self, zero_buffer: bool = True) -> None:
+        """Zero out all grad buffers. Call at the beginning of each training step.
+
+        Resets per-parameter bookkeeping and the flat grad buffers so that
+        gradient accumulation for the next step starts from zero.
+
+        Evolution:
+          M2777 (fp8 cuda-graph): guard ``grad_added_to_main_grad`` reset
+              behind cuda_graph_impl check to avoid double-GA in TE graph mode.
+          M3087 (dbde759da): delay_wgrad_compute support — when a param's
+              wgrad is computed lazily (``delay_wgrad_compute=True`` and
+              ``skip_backward_post_hook=True``), the module's own backward_dw()
+              hook sets ``grad_added_to_main_grad=True`` during the backward
+              pass.  We must reset it here so the *next* step's backward hook
+              knows whether the TE/Apex kernel has already accumulated into
+              main_grad.
+          M3616 (FP32 local accumulation): params with extra main grads need
+              their local accumulation buffers zeroed too; this is handled
+              inside ``ParamAndGradBuffer.reset()`` (called via ``buf.reset()``
+              below).
+
+        Interaction with CUDA graphs (M2777 / M4041):
+          The ``cuda_graph_impl='transformer_engine'`` check prevents resetting
+          ``grad_added_to_main_grad`` when TransformerEngine manages the wgrad
+          accumulation inside a captured CUDA graph.  In that mode the TE
+          kernel sets the flag *during the captured replay*; if we reset it here
+          (outside the graph) the captured replay would re-accumulate on top of
+          a stale main_grad instead of overwriting it, causing silent divergence
+          (double gradient accumulation).
+
+        Interaction with DES-LOC Kx gating:
+          On non-Kx steps the bucket-group's ``_skip_sync`` flag remains True
+          through the step; ``reset()`` clears it unconditionally so the *next*
+          step starts with a clean slate.  The Kx predicate in
+          ``finalize_model_grads`` sets ``_skip_sync`` appropriately each step.
+
+        Args:
+            zero_buffer: If True (default), zero out the underlying flat grad
+                buffers by calling ``buffer.reset()`` on each
+                ``ParamAndGradBuffer``.  Set to False only when the caller
+                guarantees the buffers are already zero (e.g. right after
+                ``restore_grad_buffers()`` which zeros on reallocation).
+        """
         cuda_graph_impl = getattr(self.config, 'cuda_graph_impl', 'none')
         if cuda_graph_impl != 'transformer_engine':
+            # Reset the flag for every trainable parameter so that the next
+            # backward hook knows whether the TE/Apex kernel will accumulate
+            # wgrads into main_grad on its own (flag → True) or whether the
+            # hook itself must do the ``main_grad.add_(grad)`` (flag → False).
+            # M3087: delay_wgrad_compute params are included here because the
+            # module hook that sets the flag runs *during* the backward pass,
+            # after zero_grad_buffer has already been called for that step.
             for param in self.params_with_grad:
                 param.grad_added_to_main_grad = False
-        for buf in self.buffers + self.expert_parallel_buffers:
-            buf.reset()
+
+        # Reset flat grad buffers (zeros grad_data; resets bucket internals).
+        if zero_buffer:
+            for buf in self.buffers + self.expert_parallel_buffers:
+                buf.reset()
+
+        # Reset bucket-group state machines (per-param ready counts, async
+        # handles, idempotency flags, DES-LOC _skip_sync, buffer ownership FSM).
         for bg in self.bucket_groups + self.expert_parallel_bucket_groups:
             bg.reset()
 
