@@ -29,6 +29,16 @@ export OMP_NUM_THREADS=8
 export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,max_split_size_mb:256
 
+# ── NCCL flight recorder (issue #92) ─────────────────────────────────────────
+# Keeps the last 1000 collective operations in a ring buffer so that hang /
+# crash post-mortems can reconstruct exactly which collective stalled.
+# TORCH_NCCL_TRACE_BUFFER_SIZE sets the per-rank buffer depth; the flight
+# recorder itself is enabled by TORCH_NCCL_ENABLE_MONITORING (PyTorch ≥ 2.1)
+# and the trace dump path is set via TORCH_NCCL_TRACE_BUFFER_SIZE together
+# with the flight-recorder write-on-abort flag.
+export TORCH_NCCL_TRACE_BUFFER_SIZE=1000
+export TORCH_NCCL_FLIGHT_RECORDER_ENABLED=1
+
 # ── AutoSP kill-switch ────────────────────────────────────────────────────────
 # PCIe-only topology (H100 + 2×A6000, no NVLink): Ulysses SP=3 all-to-all
 # collectives deadlock inside model.forward() at step 0.  Force DP-only mode

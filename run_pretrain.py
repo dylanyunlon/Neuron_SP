@@ -715,6 +715,13 @@ def _init_distributed() -> Tuple[int, int, bool]:
     is_dist = world_size > 1
 
     if is_dist:
+        # ── NCCL flight recorder (issue #92) ─────────────────────────────────
+        # Set before init_process_group so the NCCL communicator is created with
+        # the recorder already active.  Keeps the last 1000 operations per rank
+        # in a ring buffer; written to disk automatically on abort/hang.
+        os.environ.setdefault("TORCH_NCCL_TRACE_BUFFER_SIZE", "1000")
+        os.environ.setdefault("TORCH_NCCL_FLIGHT_RECORDER_ENABLED", "1")
+
         if not dist.is_initialized():
             import datetime as _dt
             dist.init_process_group(

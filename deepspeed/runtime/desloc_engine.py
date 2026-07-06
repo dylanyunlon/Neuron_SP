@@ -1584,6 +1584,22 @@ class DesLocEngine:
           - Optimizer + scheduler step
           - Periodic logging and checkpointing
         """
+        # ── NCCL flight recorder / debug env-var check (issue #92) ──────────
+        # Verify that the flight recorder variables are set before any collective
+        # runs.  Using setdefault keeps a value already exported by the launch
+        # script while ensuring a safe fallback when train() is called directly
+        # (e.g. in unit tests or notebooks).
+        _nccl_trace_size = os.environ.setdefault("TORCH_NCCL_TRACE_BUFFER_SIZE", "1000")
+        _nccl_fr_enabled = os.environ.setdefault("TORCH_NCCL_FLIGHT_RECORDER_ENABLED", "1")
+        _nccl_debug      = os.environ.get("NCCL_DEBUG", "WARN")
+        _nccl_async_err  = os.environ.get("TORCH_NCCL_ASYNC_ERROR_HANDLING", "1")
+        logger.info(
+            "[NCCL] flight-recorder: TORCH_NCCL_TRACE_BUFFER_SIZE=%s  "
+            "TORCH_NCCL_FLIGHT_RECORDER_ENABLED=%s  "
+            "NCCL_DEBUG=%s  TORCH_NCCL_ASYNC_ERROR_HANDLING=%s",
+            _nccl_trace_size, _nccl_fr_enabled, _nccl_debug, _nccl_async_err,
+        )
+
         # Rank guard: only rank 0 prints/logs to avoid 5x log spam
         _is_main = (
             not (parallel_state.is_initialized() or dist.is_initialized())
