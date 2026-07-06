@@ -66,7 +66,10 @@ class _ReduceScatterWithFP32AccumulationWorkHandle:
         output_tensor: torch.Tensor,
         world_size: int,
     ) -> None:
-        raise NotImplementedError
+        self.all_to_all_handle = all_to_all_handle
+        self.all_to_all_output_tensor = all_to_all_output_tensor
+        self.output_tensor = output_tensor
+        self.world_size = world_size
 
     def wait(self) -> None:
         """Complete the all-to-all communication and apply FP32 local accumulation.
@@ -76,7 +79,23 @@ class _ReduceScatterWithFP32AccumulationWorkHandle:
           2. Accumulate all_to_all_output_tensor shards in FP32 via torch.sum.
           3. Copy downcasted FP32 result into output_tensor.
         """
-        raise NotImplementedError
+        # 1. Wait for async all-to-all to complete (if it was dispatched asynchronously).
+        if self.all_to_all_handle is not None:
+            self.all_to_all_handle.wait()
+
+        # 2. Local FP32 accumulation: reshape to (world_size, shard_size) then
+        #    sum along dim=0 in float32 for higher-precision gradient accumulation.
+        #    This avoids the precision loss of NCCL's built-in BF16/FP16 reduce.
+        output_tensor_in_fp32 = torch.sum(
+            self.all_to_all_output_tensor.view((self.world_size, -1)),
+            dim=0,
+            dtype=torch.float32,
+        )
+        assert output_tensor_in_fp32.dtype == torch.float32
+
+        # 3. Downcast the FP32 sum back to the original tensor dtype and write
+        #    into output_tensor in-place (copy_ handles dtype conversion).
+        self.output_tensor.copy_(output_tensor_in_fp32)
 
 
 # ---------------------------------------------------------------------------
@@ -102,7 +121,6 @@ def reduce_scatter_with_fp32_accumulation(
       4. Downcast + copy into output_tensor.
 
     Only torch.distributed.ReduceOp.SUM is supported (FP32 sum semantics).
-    Only async_op=False is currently supported; async_op=True returns a work handle.
 
     Args:
         output_tensor: Output tensor for the reduce-scattered shard.
@@ -120,6 +138,52 @@ def reduce_scatter_with_fp32_accumulation(
 
     Raises:
         AssertionError: if op != ReduceOp.SUM, or if input_tensor.numel() % world_size != 0.
-        NotImplementedError: always (skeleton — implementation pending).
     """
-    raise NotImplementedError
+    # Only SUM reduction is supported — FP32 accumulation is a sum operation.
+    assert op == torch.distributed.ReduceOp.SUM, (
+        f"reduce_scatter_with_fp32_accumulation only supports ReduceOp.SUM, got {op}"
+    )
+
+    # Resolve world size from the process group.
+    if group is None:
+        world_size = torch.distributed.get_world_size()
+    else:
+        world_size = group.size()
+
+    # Validate that input tensor is evenly divisible for sharding.
+    assert input_tensor.numel() % world_size == 0, (
+        f"input_tensor.numel()={input_tensor.numel()} must be divisible by "
+        f"world_size={world_size}"
+    )
+
+    # Allocate output tensor for all-to-all (cannot be done in-place).
+    # Same shape and dtype as input_tensor so every rank receives all shards.
+    all_to_all_output_tensor = torch.empty_like(input_tensor)
+
+    # Issue all_to_all_single: each rank sends equal-size chunks to all peers
+    # and receives one chunk from each peer. After this collective, each rank
+    # holds world_size chunks — one per source rank — for its own shard range.
+    all_to_all_handle = torch.distributed.all_to_all_single(
+        output=all_to_all_output_tensor,
+        input=input_tensor,
+        group=group,
+        async_op=async_op,
+    )
+
+    # Construct the work handle that wraps the async communication and the
+    # subsequent FP32 accumulation step.
+    reduce_scatter_handle = _ReduceScatterWithFP32AccumulationWorkHandle(
+        all_to_all_handle,
+        all_to_all_output_tensor,
+        output_tensor,
+        world_size,
+    )
+
+    if async_op:
+        # Return the handle; the caller is responsible for calling .wait()
+        # before reading output_tensor.
+        return reduce_scatter_handle
+    else:
+        # Synchronous path: complete communication and local FP32 accumulation now.
+        reduce_scatter_handle.wait()
+        return None
