@@ -1966,6 +1966,110 @@ class SelfAttention(Attention):
             except ImportError:
                 pass
 
+    # ------------------------------------------------------------------
+    # Attention statistics for DES-LOC profiling
+    # ------------------------------------------------------------------
+
+    def get_attention_statistics(self) -> dict:
+        """Return runtime attention statistics for DES-LOC profiling.
+
+        Collects per-layer attention metrics that the DES-LOC engine uses to:
+          1. Detect attention score explosion (feeds into QK clip scheduler).
+          2. Monitor whether FlashAttention or SDPA is active.
+          3. Track per-tier performance differences (H100 FA3 vs A6000 SDPA).
+
+        Returns:
+            Dict with the following keys (all optional — absent if not populated)::
+
+                {
+                    "layer_number": int,
+                    "desloc_tier": str | None,
+                    "current_max_attn_logits": Tensor | None,  # per-head max
+                    "num_attention_heads_per_partition": int,
+                    "num_query_groups_per_partition": int,
+                    "hidden_size_per_attention_head": int,
+                    "softmax_scale": float | None,
+                    "qk_clip_enabled": bool,
+                    "sequence_parallel": bool,
+                }
+        """
+        core = getattr(self, 'core_attention', None)
+        max_logits = None
+        softmax_scale = None
+        if core is not None:
+            max_logits = getattr(core, 'current_max_attn_logits', None)
+            softmax_scale = getattr(core, 'softmax_scale', None)
+
+        return {
+            "layer_number": self.layer_number,
+            "desloc_tier": getattr(self.config, 'get_layer_tier', lambda x: None)(
+                self.layer_number - 1
+            ),
+            "current_max_attn_logits": max_logits,
+            "num_attention_heads_per_partition": self.num_attention_heads_per_partition,
+            "num_query_groups_per_partition": self.num_query_groups_per_partition,
+            "hidden_size_per_attention_head": self.hidden_size_per_attention_head,
+            "softmax_scale": softmax_scale,
+            "qk_clip_enabled": getattr(self.config, 'qk_clip', False),
+            "sequence_parallel": getattr(self.config, 'sequence_parallel', False),
+        }
+
+    def reset_attention_statistics(self) -> None:
+        """Reset per-step attention statistics.
+
+        Called by the DES-LOC engine at the start of each training step to
+        clear stale values from the previous iteration.  Without this,
+        ``current_max_attn_logits`` from step N-1 would pollute QK clip
+        decisions at step N.
+
+        Only clears statistics that are populated during the forward pass;
+        permanent config attributes (like ``softmax_scale``) are not touched.
+        """
+        core = getattr(self, 'core_attention', None)
+        if core is not None and hasattr(core, 'current_max_attn_logits'):
+            core.current_max_attn_logits = None
+
+    def count_parameters(self, *, exclude_bias: bool = False) -> dict:
+        """Count attention parameters grouped by sub-module.
+
+        Used by the DES-LOC engine for per-tier parameter accounting and
+        by the fVPP scheduler to validate memory budgets before placement.
+
+        Args:
+            exclude_bias: If True, exclude bias terms from the count.
+
+        Returns:
+            Dict mapping sub-module name → parameter count::
+
+                {
+                    "qkv_proj": int,    # Q + K + V projection params
+                    "out_proj": int,    # output projection params
+                    "q_layernorm": int, # QK layernorm params (0 if disabled)
+                    "k_layernorm": int,
+                    "total": int,
+                }
+        """
+        def _count(module, exclude_b: bool) -> int:
+            total = 0
+            for name, p in module.named_parameters():
+                if exclude_b and 'bias' in name:
+                    continue
+                total += p.numel()
+            return total
+
+        qkv = _count(self.linear_qkv, exclude_bias)
+        proj = _count(self.linear_proj, exclude_bias)
+        q_ln = _count(self.q_layernorm, exclude_bias) if self.q_layernorm is not None else 0
+        k_ln = _count(self.k_layernorm, exclude_bias) if self.k_layernorm is not None else 0
+
+        return {
+            "qkv_proj": qkv,
+            "out_proj": proj,
+            "q_layernorm": q_ln,
+            "k_layernorm": k_ln,
+            "total": qkv + proj + q_ln + k_ln,
+        }
+
 
 # ---------------------------------------------------------------------------
 # Cross-attention
