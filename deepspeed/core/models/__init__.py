@@ -369,12 +369,16 @@ class GPTModel(LanguageModule):
             else:
                 seq_len = 0
 
-            # For SP: always use the FULL sequence length.  The attention
-            # module slices freqs by SP rank after all-to-all scatter.
-            # config.max_position_embeddings is the canonical full seq length.
-            max_pos = getattr(self.config, "max_position_embeddings", None)
-            if max_pos is not None and seq_len > 0:
-                seq_len = max(seq_len, max_pos)
+            # For SP: use FULL sequence length because the attention module
+            # slices freqs by SP rank after all-to-all scatter.
+            # When SP is OFF (pure DP or hetero CP), use the ACTUAL input
+            # seq_len — otherwise RoPE freqs shape mismatches the input.
+            # Refs: Megatron-LM #560, verl #2603, TE #552
+            _sp_active = getattr(self, "_sp_active", False)
+            if _sp_active:
+                max_pos = getattr(self.config, "max_position_embeddings", None)
+                if max_pos is not None and seq_len > 0:
+                    seq_len = max(seq_len, max_pos)
 
             rotary_pos_emb = self._rotary_pos_emb(seq_len)
 
