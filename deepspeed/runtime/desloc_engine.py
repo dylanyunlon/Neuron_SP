@@ -1799,8 +1799,21 @@ class DesLocEngine:
 
             class _SPAttentionFn(torch.autograd.Function):
                 @staticmethod
-                def forward(ctx, q, k, v, group, n_heads, T):
-                    # q,k,v: [B, n_heads, T, head_dim]
+                def forward(ctx, q, k, v, group, n_heads, n_kv_heads, T):
+                    # q: [B, n_heads,    T, head_dim]
+                    # k: [B, n_kv_heads, T, head_dim]  (n_kv_heads <= n_heads; GQA/MQA)
+                    # v: [B, n_kv_heads, T, head_dim]
+
+                    # GQA: repeat k/v so they match q's head count before the
+                    # all-to-all.  The A2A scatters heads across ranks, so all
+                    # three tensors must have the same number of heads (n_heads).
+                    # For MHA (n_kv_heads == n_heads) repeat_interleave is a no-op
+                    # (repeats=1) and adds zero overhead.
+                    kv_groups = n_heads // n_kv_heads  # repeats per KV head
+                    if kv_groups > 1:
+                        k = k.repeat_interleave(kv_groups, dim=1)  # [B, n_heads, T, H]
+                        v = v.repeat_interleave(kv_groups, dim=1)  # [B, n_heads, T, H]
+
                     q2 = _raw_a2a(q, scatter_idx=2, gather_idx=1, group=group)
                     k2 = _raw_a2a(k, scatter_idx=2, gather_idx=1, group=group)
                     v2 = _raw_a2a(v, scatter_idx=2, gather_idx=1, group=group)
@@ -1808,10 +1821,14 @@ class DesLocEngine:
                     out3 = _raw_a2a(out2, scatter_idx=1, gather_idx=2, group=group)
                     out3 = out3[:, :n_heads, :T, :]
 
-                    # Save A2A'd tensors for backward (not original q,k,v — saves memory)
+                    # Save A2A'd tensors for backward (not original q,k,v — saves memory).
+                    # k2/v2 here are already expanded to n_heads; we save kv_groups so
+                    # the backward can sum-reduce the gradients back to n_kv_heads.
                     ctx.save_for_backward(q2, k2, v2, out2)
                     ctx.group = group
                     ctx.n_heads = n_heads
+                    ctx.n_kv_heads = n_kv_heads
+                    ctx.kv_groups = kv_groups
                     ctx.T = T
                     # FIX (NCCL hang): compute out3_shape_before_trim analytically
                     # instead of doing a real all-to-all just for .shape.  The extra
@@ -1833,6 +1850,8 @@ class DesLocEngine:
                     q2, k2, v2, out2 = ctx.saved_tensors
                     group = ctx.group
                     n_heads = ctx.n_heads
+                    n_kv_heads = ctx.n_kv_heads
+                    kv_groups = ctx.kv_groups
                     T = ctx.T
                     full_shape = ctx.out3_shape_before_trim
 
@@ -1845,6 +1864,7 @@ class DesLocEngine:
                     d_out2 = _raw_a2a(d_out3, scatter_idx=2, gather_idx=1, group=group)
 
                     # 3. SDPA backward via autograd.grad
+                    # k2/v2 are already expanded to n_heads (from forward's repeat_interleave)
                     with torch.enable_grad():
                         q2g = q2.detach().requires_grad_(True)
                         k2g = k2.detach().requires_grad_(True)
@@ -1860,28 +1880,72 @@ class DesLocEngine:
 
                     # 5. Trim to original input shape [B, n_heads, T, head_dim]
                     dq = dq[:, :n_heads, :T, :]
-                    dk = dk[:, :n_heads, :T, :]
-                    dv = dv[:, :n_heads, :T, :]
+                    dk = dk[:, :n_kv_heads * kv_groups, :T, :]
+                    dv = dv[:, :n_kv_heads * kv_groups, :T, :]
 
-                    return dq, dk, dv, None, None, None
+                    # 6. GQA: sum-reduce the expanded KV gradients back to n_kv_heads.
+                    #    The repeat_interleave in forward replicated each KV head
+                    #    kv_groups times; the corresponding backward is a grouped sum.
+                    if kv_groups > 1:
+                        B_d, _nh, T_d, Hd = dk.shape
+                        dk = dk.reshape(B_d, n_kv_heads, kv_groups, T_d, Hd).sum(dim=2)
+                        dv = dv.reshape(B_d, n_kv_heads, kv_groups, T_d, Hd).sum(dim=2)
+
+                    return dq, dk, dv, None, None, None, None
 
             def _sp_attn_forward(self_attn, x):
                 B, T, C = x.shape
                 n_heads = self_attn.n_heads
                 head_dim = self_attn.head_dim
 
-                qkv = self_attn.qkv(x).reshape(B, T, 3, n_heads, head_dim)
-                q, k, v = qkv.unbind(2)
-                q = q.transpose(1, 2)
-                k = k.transpose(1, 2)
-                v = v.transpose(1, 2)
+                # GQA / MQA detection: some models expose n_kv_heads (or
+                # num_kv_heads) as a separate attribute and use individual
+                # q_proj / k_proj / v_proj instead of a fused qkv projection.
+                # Fall back to n_heads (MHA) when the attribute is absent.
+                n_kv_heads = getattr(
+                    self_attn,
+                    "n_kv_heads",
+                    getattr(self_attn, "num_kv_heads", n_heads),
+                )
+
+                is_gqa = n_kv_heads < n_heads  # True for GQA/MQA; False for MHA
+
+                if is_gqa:
+                    # GQA/MQA models typically expose separate q/k/v projections.
+                    # Try the two most common attribute naming conventions.
+                    if hasattr(self_attn, "q_proj") and hasattr(self_attn, "k_proj"):
+                        q = self_attn.q_proj(x).reshape(B, T, n_heads,    head_dim).transpose(1, 2)
+                        k = self_attn.k_proj(x).reshape(B, T, n_kv_heads, head_dim).transpose(1, 2)
+                        v = self_attn.v_proj(x).reshape(B, T, n_kv_heads, head_dim).transpose(1, 2)
+                    else:
+                        # Fallback: fused projection where the output size encodes
+                        # n_heads*head_dim for Q and n_kv_heads*head_dim for K/V.
+                        q_size = n_heads    * head_dim
+                        kv_size = n_kv_heads * head_dim
+                        qkv_out = self_attn.qkv(x)  # [B, T, q_size + 2*kv_size]
+                        q_raw, k_raw, v_raw = qkv_out.split([q_size, kv_size, kv_size], dim=-1)
+                        q = q_raw.reshape(B, T, n_heads,    head_dim).transpose(1, 2)
+                        k = k_raw.reshape(B, T, n_kv_heads, head_dim).transpose(1, 2)
+                        v = v_raw.reshape(B, T, n_kv_heads, head_dim).transpose(1, 2)
+                else:
+                    # Standard MHA: fused QKV projection → split into equal heads.
+                    qkv = self_attn.qkv(x).reshape(B, T, 3, n_heads, head_dim)
+                    q, k, v = qkv.unbind(2)
+                    q = q.transpose(1, 2)
+                    k = k.transpose(1, 2)
+                    v = v.transpose(1, 2)
 
                 if _sp_size > 1 and dist.is_initialized() and dist.get_world_size() > 1:
                     _rank = dist.get_rank()
                     _gid = _rank // _sp_size
                     _group = sp_dp_registry.get_group(_gid)
-                    out = _SPAttentionFn.apply(q, k, v, _group, n_heads, T)
+                    out = _SPAttentionFn.apply(q, k, v, _group, n_heads, n_kv_heads, T)
                 else:
+                    # Local (non-SP) path: expand KV heads to match Q for SDPA.
+                    if is_gqa:
+                        kv_groups = n_heads // n_kv_heads
+                        k = k.repeat_interleave(kv_groups, dim=1)
+                        v = v.repeat_interleave(kv_groups, dim=1)
                     out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
 
                 return self_attn.proj(out.transpose(1, 2).contiguous().reshape(B, T, C))
