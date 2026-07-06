@@ -760,6 +760,114 @@ void pcie_ring_reduce_step_py(at::Tensor accum_buf,
         (size_t)accum_buf.numel(), sm_version, stream);
 }
 
+
+// ---------------------------------------------------------------------------
+// launch_fused_layernorm_residual_ex binding
+// ---------------------------------------------------------------------------
+
+void fused_layernorm_residual_ex_py(
+    at::Tensor output,
+    at::Tensor residual,
+    at::Tensor input,
+    at::Tensor ln_weight,
+    float      eps,
+    bool       full_ln,
+    int        sm_version,
+    py::object bias_obj,
+    py::object output_fp32_obj)
+{
+    check_bf16(output,   "output");
+    check_bf16(residual, "residual");
+    check_bf16(input,    "input");
+    check_fp32(ln_weight, "ln_weight");
+    TORCH_CHECK(output.dim() == 2, "output must be 2-D");
+    const int batch  = (int)output.size(0);
+    const int hidden = (int)output.size(1);
+    TORCH_CHECK(hidden % 8 == 0, "hidden must be divisible by 8");
+    TORCH_CHECK(residual.sizes() == output.sizes(), "residual/output shape mismatch");
+    TORCH_CHECK(input.sizes()    == output.sizes(), "input/output shape mismatch");
+
+    // Optional bias (BF16 [hidden] or None).
+    const __nv_bfloat16* bias_ptr = nullptr;
+    if (!bias_obj.is_none()) {
+        at::Tensor bias = bias_obj.cast<at::Tensor>();
+        check_bf16(bias, "bias");
+        TORCH_CHECK(bias.numel() == hidden, "bias numel must equal hidden");
+        bias_ptr = reinterpret_cast<const __nv_bfloat16*>(bias.data_ptr<at::BFloat16>());
+    }
+
+    // Optional FP32 output buffer.
+    float* fp32_ptr = nullptr;
+    if (!output_fp32_obj.is_none()) {
+        at::Tensor out32 = output_fp32_obj.cast<at::Tensor>();
+        check_fp32(out32, "output_fp32");
+        TORCH_CHECK(out32.sizes() == output.sizes(), "output_fp32/output shape mismatch");
+        fp32_ptr = out32.data_ptr<float>();
+    }
+
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    launch_fused_layernorm_residual_ex(
+        reinterpret_cast<__nv_bfloat16*>(output.data_ptr<at::BFloat16>()),
+        reinterpret_cast<__nv_bfloat16*>(residual.data_ptr<at::BFloat16>()),
+        reinterpret_cast<const __nv_bfloat16*>(input.data_ptr<at::BFloat16>()),
+        bias_ptr, ln_weight.data_ptr<float>(), fp32_ptr,
+        batch, hidden, eps, full_ln, sm_version, stream);
+}
+
+// ---------------------------------------------------------------------------
+// launch_fused_rope_cacheless binding
+// ---------------------------------------------------------------------------
+
+void fused_rope_cacheless_py(
+    at::Tensor output,
+    at::Tensor input,
+    float      base,
+    int        pos_offset,
+    bool       neox_style,
+    int        sm_version)
+{
+    check_bf16(output, "output");
+    check_bf16(input,  "input");
+    TORCH_CHECK(input.dim() == 4,  "input must be 4-D [B, S, H, D]");
+    TORCH_CHECK(output.dim() == 4, "output must be 4-D [B, S, H, D]");
+    TORCH_CHECK(output.sizes() == input.sizes(), "output/input shape mismatch");
+    const int batch     = (int)input.size(0);
+    const int seq_len   = (int)input.size(1);
+    const int num_heads = (int)input.size(2);
+    const int head_dim  = (int)input.size(3);
+    TORCH_CHECK(head_dim % 2 == 0, "head_dim must be even");
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    launch_fused_rope_cacheless(
+        reinterpret_cast<__nv_bfloat16*>(output.data_ptr<at::BFloat16>()),
+        reinterpret_cast<const __nv_bfloat16*>(input.data_ptr<at::BFloat16>()),
+        batch, seq_len, num_heads, head_dim,
+        base, pos_offset, neox_style, sm_version, stream);
+}
+
+// ---------------------------------------------------------------------------
+// launch_grad_norm_sq_fp8 binding
+// ---------------------------------------------------------------------------
+
+void grad_norm_sq_fp8_py(
+    at::Tensor    grads,
+    at::Tensor    norm_sq_accum,
+    float         fp8_scale,
+    int           sm_version)
+{
+    TORCH_CHECK(grads.scalar_type() == at::ScalarType::Char ||
+                grads.scalar_type() == at::ScalarType::Byte,
+                "grads must be Int8 or Byte for FP8");
+    TORCH_CHECK(grads.is_cuda() && grads.is_contiguous());
+    check_fp32(norm_sq_accum, "norm_sq_accum");
+    TORCH_CHECK(norm_sq_accum.numel() == 1, "norm_sq_accum must be scalar");
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    launch_grad_norm_sq_fp8(
+        reinterpret_cast<const uint8_t*>(grads.data_ptr()),
+        (size_t)grads.numel(),
+        norm_sq_accum.data_ptr<float>(),
+        fp8_scale, sm_version, stream);
+}
+
 // PYBIND11_MODULE
 // ---------------------------------------------------------------------------
 
@@ -1111,6 +1219,65 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           "  sm_version (int): 86, 90, or 120",
           py::arg("accum_buf"),
           py::arg("recv_buf"),
+          py::arg("sm_version") = 86);
+
+
+    // -----------------------------------------------------------------------
+    // Extended LayerNorm + RoPE cacheless + FP8 grad norm
+    // -----------------------------------------------------------------------
+    m.def("fused_layernorm_residual_ex",
+          &fused_layernorm_residual_ex_py,
+          "Extended fused residual + LN: full LN or RMSNorm, optional bias, optional FP32 out.\n"
+          "Args:\n"
+          "  output       (Tensor BF16 [B,H]): LN output\n"
+          "  residual     (Tensor BF16 [B,H]): residual stream (updated in-place)\n"
+          "  input        (Tensor BF16 [B,H]): new contribution\n"
+          "  ln_weight    (Tensor FP32 [H]):   scale\n"
+          "  eps          (float): epsilon\n"
+          "  full_ln      (bool): True=full LayerNorm (Welford), False=RMSNorm\n"
+          "  sm_version   (int): 86, 90, 120\n"
+          "  bias         (Tensor BF16 [H] or None): optional bias\n"
+          "  output_fp32  (Tensor FP32 [B,H] or None): optional FP32 output",
+          py::arg("output"),
+          py::arg("residual"),
+          py::arg("input"),
+          py::arg("ln_weight"),
+          py::arg("eps") = 1e-6f,
+          py::arg("full_ln") = false,
+          py::arg("sm_version") = 86,
+          py::arg("bias") = py::none(),
+          py::arg("output_fp32") = py::none());
+
+    m.def("fused_rope_cacheless",
+          &fused_rope_cacheless_py,
+          "RoPE with on-the-fly sin/cos computation (no precomputed cache).\n"
+          "Use for very long sequences where cache exceeds L2.\n"
+          "Args:\n"
+          "  output     (Tensor BF16 [B,S,H,D])\n"
+          "  input      (Tensor BF16 [B,S,H,D])\n"
+          "  base       (float): RoPE base, default 10000.0\n"
+          "  pos_offset (int): global position offset for packed sequences\n"
+          "  neox_style (bool): True=Llama/NeoX, False=GPT-J interleaved\n"
+          "  sm_version (int): 86, 90, 120",
+          py::arg("output"),
+          py::arg("input"),
+          py::arg("base") = 10000.f,
+          py::arg("pos_offset") = 0,
+          py::arg("neox_style") = true,
+          py::arg("sm_version") = 86);
+
+    m.def("grad_norm_sq_fp8",
+          &grad_norm_sq_fp8_py,
+          "Accumulate gradient L2 norm squared for FP8-E4M3 gradients.\n"
+          "Uses Kahan compensated summation for numerical accuracy.\n"
+          "Args:\n"
+          "  grads          (Tensor Int8/Byte [N]): FP8-E4M3 gradient buffer\n"
+          "  norm_sq_accum  (Tensor FP32 [1]): accumulator (add to, not reset)\n"
+          "  fp8_scale      (float): per-tensor FP8 scale factor\n"
+          "  sm_version     (int): 86, 90, 120",
+          py::arg("grads"),
+          py::arg("norm_sq_accum"),
+          py::arg("fp8_scale") = 1.f,
           py::arg("sm_version") = 86);
 
 

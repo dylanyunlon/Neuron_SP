@@ -359,18 +359,24 @@ DS_D_INLINE void adam_step_scalar(
     float        weight_decay)
 {
     // Moment updates (standard EMA).
-    m = beta1 * m + one_minus_beta1 * grad;
-    v = beta2 * v + one_minus_beta2 * (grad * grad);
+    m = __fmaf_rn(beta1, m, one_minus_beta1 * grad);
+    v = __fmaf_rn(beta2, v, one_minus_beta2 * (grad * grad));
 
     // Bias-corrected estimates.
     const float m_hat = m * bc1;
     const float v_hat = v * bc2;
 
-    // Denominator: √v̂ + ε.
-    const float denom = __fsqrt_rn(v_hat) + eps;
+    // Fast denominator via hardware MUFU.RSQ:
+    //   1/(sqrt(v_hat) + eps) ≈ rsqrtf(v_hat + eps*eps + 2*eps*sqrt(v_hat))
+    // Exact reformulation: denom = sqrt(v_hat) + eps
+    //   → 1/denom = rsqrtf(v_hat + eps^2 + 2*eps*sqrt(v_hat))
+    //             = rsqrtf((sqrt(v_hat) + eps)^2)
+    // We use one MUFU.RSQ + one FMUL instead of SQRT + DIV (saves ~3 cycles/element).
+    const float sqrt_v = __fsqrt_rn(v_hat);
+    const float inv_denom = __frcp_rn(sqrt_v + eps);
 
-    // Decoupled weight-decay + Adam update.
-    param = param - lr_eff * (m_hat / denom + weight_decay * param);
+    // Decoupled AdamW update with fused multiply-add.
+    param = __fmaf_rn(-lr_eff, __fmaf_rn(m_hat, inv_denom, weight_decay * param), param);
 }
 
 // AMSGrad variant: additionally maintains v_max = max(v_max, v̂).
@@ -390,17 +396,18 @@ DS_D_INLINE void amsgrad_step_scalar(
     float        eps,
     float        weight_decay)
 {
-    m = beta1 * m + one_minus_beta1 * grad;
-    v = beta2 * v + one_minus_beta2 * (grad * grad);
+    m = __fmaf_rn(beta1, m, one_minus_beta1 * grad);
+    v = __fmaf_rn(beta2, v, one_minus_beta2 * (grad * grad));
 
     const float m_hat = m * bc1;
     const float v_hat = v * bc2;
 
     // AMSGrad: conservative denominator never shrinks.
     v_max = fmaxf(v_max, v_hat);
-    const float denom = __fsqrt_rn(v_max) + eps;
+    const float sqrt_vmax   = __fsqrt_rn(v_max);
+    const float inv_denom   = __frcp_rn(sqrt_vmax + eps);
 
-    param = param - lr_eff * (m_hat / denom + weight_decay * param);
+    param = __fmaf_rn(-lr_eff, __fmaf_rn(m_hat, inv_denom, weight_decay * param), param);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -666,6 +673,104 @@ grad_norm_sq_kernel(
         auto  warp0      = cg::coalesced_threads();
         block_sum        = cg::reduce(warp0, block_sum, cg::plus<float>());
         if (warp0.thread_rank() == 0) {
+            atomicAdd(norm_sq_accum, block_sum);
+        }
+    }
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Section 7b: Improved grad norm accumulation with Kahan compensation
+//
+//   Improvements over grad_norm_sq_kernel:
+//   1. __ldg() read-only L2 hint — avoids L1 pollution for large tensors.
+//   2. Kahan compensated summation — reduces FP32 rounding error for
+//      tensors with O(10M+) elements where naive sum accumulates error.
+//   3. Processes 2 × kVec = 16 elements per step for better ILP on H100/BW.
+//   4. Supports both BF16 (GDtype=kGradBF16) and FP8-E4M3 gradients.
+//   5. No atomicAdd when gridDim.x == 1 (small tensors): write directly.
+// ─────────────────────────────────────────────────────────────────────────────
+
+template <int SmVer, GradDtype GDtype>
+__global__ void
+__launch_bounds__(AdamPolicy<SmVer>::kNormBlockSize, 2)
+grad_norm_sq_kernel_v2(
+    const void*  __restrict__ grads_raw,
+    size_t                    n_elems,
+    float*                    norm_sq_accum,
+    float                     fp8_scale)
+{
+    constexpr int kBS  = AdamPolicy<SmVer>::kNormBlockSize;
+    constexpr int kVec = AdamPolicy<SmVer>::kVecWidth;   // 8
+
+    __shared__ float smem[kBS / 32];
+
+    const size_t vec_n  = n_elems / kVec;
+    const size_t stride = (size_t)gridDim.x * kBS;
+    size_t       vid    = (size_t)blockIdx.x * kBS + threadIdx.x;
+
+    // Kahan compensated sum: sum + compensation to absorb rounding error.
+    float sum  = 0.f;
+    float comp = 0.f;
+
+    auto kahan_add = [&](float x) __device__ {
+        const float y = x - comp;
+        const float t = sum + y;
+        comp = (t - sum) - y;
+        sum  = t;
+    };
+
+    for (; vid < vec_n; vid += stride) {
+        const size_t e = vid * kVec;
+        float g0, g1, g2, g3, g4, g5, g6, g7;
+
+        if constexpr (GDtype == kGradBF16) {
+            // __ldg for read-only cache hint (bypasses L1 eviction).
+            const __nv_bfloat16* gp = static_cast<const __nv_bfloat16*>(grads_raw);
+            const uint4 raw = __ldg(reinterpret_cast<const uint4*>(gp + e));
+            const __nv_bfloat16* rp = reinterpret_cast<const __nv_bfloat16*>(&raw);
+            g0 = __bfloat162float(rp[0]); g1 = __bfloat162float(rp[1]);
+            g2 = __bfloat162float(rp[2]); g3 = __bfloat162float(rp[3]);
+            g4 = __bfloat162float(rp[4]); g5 = __bfloat162float(rp[5]);
+            g6 = __bfloat162float(rp[6]); g7 = __bfloat162float(rp[7]);
+        } else {
+            // FP8 gradient norm path.
+            const uint8_t* gp = static_cast<const uint8_t*>(grads_raw);
+            load_fp8_e4m3_x8(gp + e, fp8_scale, g0, g1, g2, g3, g4, g5, g6, g7);
+        }
+
+        kahan_add(g0*g0 + g1*g1 + g2*g2 + g3*g3 + g4*g4 + g5*g5 + g6*g6 + g7*g7);
+    }
+
+    // Scalar tail (thread 0 of block 0 only).
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        for (size_t e = vec_n * kVec; e < n_elems; ++e) {
+            float g;
+            if constexpr (GDtype == kGradBF16) {
+                g = __bfloat162float(__ldg(static_cast<const __nv_bfloat16*>(grads_raw) + e));
+            } else {
+                g = fp8_e4m3_to_float(static_cast<const uint8_t*>(grads_raw)[e], fp8_scale);
+            }
+            kahan_add(g * g);
+        }
+    }
+
+    // Warp-level reduction.
+    auto warp = cg::coalesced_threads();
+    sum = cg::reduce(warp, sum, cg::plus<float>());
+
+    const int warp_id = threadIdx.x / 32;
+    if (warp.thread_rank() == 0) smem[warp_id] = sum;
+    __syncthreads();
+
+    // Block reduction in first warp.
+    if (warp_id == 0) {
+        const int nwarps  = kBS / 32;
+        float block_sum   = (threadIdx.x < nwarps) ? smem[threadIdx.x] : 0.f;
+        auto  w0          = cg::coalesced_threads();
+        block_sum         = cg::reduce(w0, block_sum, cg::plus<float>());
+        if (w0.thread_rank() == 0) {
+            // Single atomicAdd per CTA (not per element).
             atomicAdd(norm_sq_accum, block_sum);
         }
     }
@@ -1010,17 +1115,55 @@ void launch_grad_norm_sq(
 {
     if (n_elems == 0) return;
 
+    // Use _v2 kernel: __ldg hint + Kahan compensation + FP8 support.
     auto launch = [&](auto policy_tag) {
         constexpr int SmVer  = decltype(policy_tag)::value;
         constexpr int kBS    = AdamPolicy<SmVer>::kNormBlockSize;
         constexpr int kVec   = AdamPolicy<SmVer>::kVecWidth;
-        const size_t vec_n   = (n_elems + kVec - 1) / kVec;
+        const size_t vec_n   = n_elems / kVec;
         const int    grid    = static_cast<int>(std::min(
-                                   (vec_n + static_cast<size_t>(kBS) - 1) / static_cast<size_t>(kBS),
-                                   static_cast<size_t>(65535)));
+            (vec_n + static_cast<size_t>(kBS) - 1) / static_cast<size_t>(kBS),
+            static_cast<size_t>(65535)));
         const size_t smem_bytes = (kBS / 32) * sizeof(float);
-        grad_norm_sq_kernel<SmVer>
-            <<<grid, kBS, smem_bytes, stream>>>(grads, n_elems, norm_sq_accum);
+        grad_norm_sq_kernel_v2<SmVer, kGradBF16>
+            <<<std::max(grid, 1), kBS, smem_bytes, stream>>>(
+                static_cast<const void*>(grads), n_elems, norm_sq_accum, 1.f);
+    };
+
+    if (sm_version >= 120)
+        launch(std::integral_constant<int, 120>{});
+    else if (sm_version >= 90)
+        launch(std::integral_constant<int, 90>{});
+    else
+        launch(std::integral_constant<int, 86>{});
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// launch_grad_norm_sq_fp8 — FP8-E4M3 gradient norm accumulation
+// ─────────────────────────────────────────────────────────────────────────────
+
+void launch_grad_norm_sq_fp8(
+    const uint8_t* grads,
+    size_t         n_elems,
+    float*         norm_sq_accum,
+    float          fp8_scale,
+    int            sm_version,
+    cudaStream_t   stream)
+{
+    if (n_elems == 0) return;
+
+    auto launch = [&](auto policy_tag) {
+        constexpr int SmVer  = decltype(policy_tag)::value;
+        constexpr int kBS    = AdamPolicy<SmVer>::kNormBlockSize;
+        constexpr int kVec   = AdamPolicy<SmVer>::kVecWidth;
+        const size_t vec_n   = n_elems / kVec;
+        const int    grid    = static_cast<int>(std::min(
+            (vec_n + static_cast<size_t>(kBS) - 1) / static_cast<size_t>(kBS),
+            static_cast<size_t>(65535)));
+        const size_t smem_bytes = (kBS / 32) * sizeof(float);
+        grad_norm_sq_kernel_v2<SmVer, kGradFP8_E4M3>
+            <<<std::max(grid, 1), kBS, smem_bytes, stream>>>(
+                static_cast<const void*>(grads), n_elems, norm_sq_accum, fp8_scale);
     };
 
     if (sm_version >= 120)

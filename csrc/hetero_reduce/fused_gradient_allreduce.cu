@@ -115,17 +115,42 @@ namespace cg = cooperative_groups;
 // Section 1: Compression constants & per-block quantisation granularity
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Number of gradient elements covered by one quantisation scale block.
-// Must be a multiple of kVecWidth (8) and a divisor of typical bucket sizes.
-// 256 elements → 512 B of INT8 data + 4 B scale = 516 B.
-static constexpr int kBlockElems = 256;
-
 // INT8 coding range.
 static constexpr float kINT8Max  = 127.f;
 static constexpr float kINT8Min  = -128.f;
 
 // Vectorised load width (BF16 elements per 128-bit load, matching hetero_reduce)
 static constexpr int kVecWidth   = 8;
+
+// SM-adaptive quantisation block sizes.
+//   SM8.6 (A6000): 256 elements — matches 256-thread blocks, 32B elems/thread
+//   SM9.0 (H100):  512 elements — 256-thread blocks, 64B elems/thread (more
+//     elems per scale block → fewer global scale reads → better arithmetic
+//     intensity on wide HBM3 buses)
+//   SM12.0 (BW):   512 elements — 512-thread blocks, 32B elems/thread
+// All must satisfy: kBlockElems % kVecWidth == 0 AND
+//                   (kBlockElems / kBlockSize) % kVecWidth == 0.
+template <int SmVer> struct CompressPolicy {
+    static constexpr int kBlockElems  = 256;
+    static constexpr int kBlockSize   = KernelPolicy<SmVer>::kBlockSize;
+};
+template <> struct CompressPolicy<90> {
+    static constexpr int kBlockElems  = 512;   // 2× more context per scale
+    static constexpr int kBlockSize   = 256;
+};
+template <> struct CompressPolicy<120> {
+    static constexpr int kBlockElems  = 512;
+    static constexpr int kBlockSize   = 512;
+};
+// Default / SM8.6
+template <> struct CompressPolicy<86> {
+    static constexpr int kBlockElems  = 256;
+    static constexpr int kBlockSize   = 256;
+};
+
+// kBlockElems for n_scale_blocks computation — use 256 as conservative default
+// for the host-side helpers (actual kernel uses CompressPolicy<SmVer>).
+static constexpr int kBlockElems = 256;
 
 // Maximum number of gradient tensors packed inline in constant memory.
 // Reuses the same constant-memory pattern as hetero_reduce.cu.
@@ -295,14 +320,31 @@ fused_compress_kernel(
     const float inv_scale = (scale > 0.f) ? (kINT8Max / scale) : 0.f;
 
     // ── Step 5+6: quantise and write INT8 ──
+    // Stochastic rounding: add uniform noise in [-0.5, 0.5] before rounding.
+    // This eliminates systematic bias that causes gradient underflow for small
+    // gradient values (‖g‖ < scale/127).  The noise is generated from a fast
+    // LCG PRNG seeded by (blockIdx.x, threadIdx.x, n_elems) to avoid
+    // correlation between gradient elements.
+    // Disabled when inv_scale == 0 (all-zero block) to avoid NaN.
+    uint32_t prng_state = (blockIdx.x * 6364136223846793005ULL ^ threadIdx.x * 1442695040888963407ULL)
+                        ^ (uint32_t)(n_elems & 0xFFFFFFFF);
+    auto lcg_rand = [&]() __device__ -> float {
+        // 32-bit LCG: x = a*x + c (mod 2^32), return float in [-0.5, 0.5)
+        prng_state = 1664525u * prng_state + 1013904223u;
+        // Map [0, 2^32) to [-0.5, 0.5)
+        return (float)(int32_t)prng_state * 2.3283064e-10f;  // / 2^32
+    };
+
     if (full) {
 #pragma unroll
         for (int v = 0; v < kVecsPerThread; ++v) {
             int8_t q[kVecWidth];
 #pragma unroll
             for (int k = 0; k < kVecWidth; ++k) {
-                float qf = __float2int_rn(vals[v * kVecWidth + k] * inv_scale);
-                // Clamp to [-128, 127].
+                float scaled = vals[v * kVecWidth + k] * inv_scale;
+                // Stochastic rounding: floor(x + U[0,1)) = round(x + U[-0.5,0.5))
+                float noise = (inv_scale > 0.f) ? lcg_rand() : 0.f;
+                float qf = __float2int_rz(scaled + noise);  // truncate toward zero
                 qf = fmaxf(fminf(qf, kINT8Max), kINT8Min);
                 q[k] = static_cast<int8_t>(qf);
             }
@@ -312,7 +354,9 @@ fused_compress_kernel(
         for (int i = 0; i < kElemsPerThread; ++i) {
             const size_t gidx = my_start + i;
             if (gidx < n_elems) {
-                float qf = __float2int_rn(vals[i] * inv_scale);
+                float scaled = vals[i] * inv_scale;
+                float noise  = (inv_scale > 0.f) ? lcg_rand() : 0.f;
+                float qf     = __float2int_rz(scaled + noise);
                 qf = fmaxf(fminf(qf, kINT8Max), kINT8Min);
                 out_int8[gidx] = static_cast<int8_t>(qf);
             }

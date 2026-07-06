@@ -906,3 +906,107 @@ void launch_grad_norm_sq(
     float*               norm_sq_accum,
     int                  sm_version,
     cudaStream_t         stream);
+
+// ===========================================================================
+// fused_layernorm_residual extended — Welford full LN + optional bias + FP32 out
+// ===========================================================================
+
+/**
+ * launch_fused_layernorm_residual_ex
+ *
+ * Extended version supporting:
+ *   - Full LayerNorm (Welford variance, mean subtraction) OR RMSNorm
+ *   - Optional bias: residual += input + bias (one fused pass)
+ *   - Optional FP32 output: writes normalised activations as FP32 for
+ *     tensor-parallel column layers
+ *
+ * @param output       [out] BF16 LN output [batch, hidden]
+ * @param residual     [in/out] BF16 residual stream [batch, hidden]
+ * @param input        [in]  BF16 new contribution [batch, hidden]
+ * @param bias         [in]  BF16 optional bias [hidden] (nullptr to skip)
+ * @param ln_weight    [in]  FP32 RMSNorm/LN scale [hidden]
+ * @param output_fp32  [out] FP32 LN output [batch, hidden] (nullptr to skip)
+ * @param batch        Batch size
+ * @param hidden       Hidden size (must be divisible by 8)
+ * @param eps          LayerNorm epsilon
+ * @param full_ln      true = full LayerNorm (Welford), false = RMSNorm
+ * @param sm_version   SM version (86, 90, 120)
+ * @param stream       CUDA stream
+ */
+void launch_fused_layernorm_residual_ex(
+    __nv_bfloat16*       output,
+    __nv_bfloat16*       residual,
+    const __nv_bfloat16* input,
+    const __nv_bfloat16* bias,
+    const float*         ln_weight,
+    float*               output_fp32,
+    int                  batch,
+    int                  hidden,
+    float                eps,
+    bool                 full_ln,
+    int                  sm_version,
+    cudaStream_t         stream);
+
+// ===========================================================================
+// fused_rope_hetero cacheless mode
+// ===========================================================================
+
+/**
+ * launch_fused_rope_cacheless
+ *
+ * Applies RoPE by computing sin/cos on-the-fly (no precomputed cache).
+ * Useful for very long sequences where the [S, D/2] cache exceeds L2 capacity.
+ * Slightly higher arithmetic cost than the cached path; use only when cache
+ * memory is unavailable.
+ *
+ * @param output      [out] BF16 output [B, S, H, D]
+ * @param input       [in]  BF16 input  [B, S, H, D]
+ * @param batch       Batch size
+ * @param seq_len     Sequence length
+ * @param num_heads   Number of attention heads
+ * @param head_dim    Head dimension (must be even)
+ * @param base        RoPE base frequency (default 10000.f)
+ * @param pos_offset  Global position offset (for packed sequences)
+ * @param neox_style  true → Llama/NeoX, false → GPT-J interleaved
+ * @param sm_version  SM version (86, 90, 120)
+ * @param stream      CUDA stream
+ */
+void launch_fused_rope_cacheless(
+    __nv_bfloat16*       output,
+    const __nv_bfloat16* input,
+    int                  batch,
+    int                  seq_len,
+    int                  num_heads,
+    int                  head_dim,
+    float                base,
+    int                  pos_offset,
+    bool                 neox_style,
+    int                  sm_version,
+    cudaStream_t         stream);
+
+// ===========================================================================
+// grad_norm_sq — improved version with Kahan compensation + FP8 support
+// ===========================================================================
+
+/**
+ * launch_grad_norm_sq_fp8
+ *
+ * Accumulates ‖g‖² for FP8-E4M3 gradients.  Companion to launch_grad_norm_sq
+ * for BF16 gradients.
+ *
+ * @param grads        [in]  FP8-E4M3 gradient buffer [n_elems bytes]
+ * @param n_elems      Number of gradient elements
+ * @param norm_sq_accum [in/out] FP32 device scalar (caller zeroes before first call)
+ * @param fp8_scale    Per-tensor FP8 scale factor
+ * @param sm_version   SM version (86, 90, 120)
+ * @param stream       CUDA stream
+ */
+void launch_grad_norm_sq_fp8(
+    const uint8_t* grads,
+    size_t         n_elems,
+    float*         norm_sq_accum,
+    float          fp8_scale,
+    int            sm_version,
+    cudaStream_t   stream);
+
+
