@@ -743,10 +743,95 @@ class MultiModulePipelineCommunicator(P2PCommunicator):
         return self.module_pp_groups.get(module_name, self.pp_group)
 
 
+# ---------------------------------------------------------------------------
+# Cross-NUMA / PCIe topology detection (DES-LOC extension)
+# ---------------------------------------------------------------------------
+
+def _read_pci_numa_node(device_index: int) -> int:
+    """Read the NUMA node of a PCI device from sysfs.
+
+    Returns -1 if the information is unavailable (non-Linux, no sysfs, etc.).
+    A value of -1 from sysfs itself typically means the system has no NUMA
+    topology (single-node or BIOS-reported unknown).
+
+    Args:
+        device_index: CUDA device index.
+
+    Returns:
+        NUMA node integer, or -1 if unavailable.
+    """
+    import os
+    try:
+        # Read the PCI bus ID from torch
+        pci_bus_id = torch.cuda.get_device_properties(device_index).pci_bus_id
+        # Normalise to lowercase without domain prefix (e.g. "0000:01:00.0" -> "0000:01:00.0")
+        # sysfs path: /sys/bus/pci/devices/<pci_bus_id>/numa_node
+        sysfs_path = f"/sys/bus/pci/devices/{pci_bus_id.lower()}/numa_node"
+        if os.path.exists(sysfs_path):
+            with open(sysfs_path) as f:
+                return int(f.read().strip())
+    except Exception:
+        pass
+    return -1
+
+
+def is_cross_numa_transfer(src_device: int, dst_device: int) -> bool:
+    """Return True if *src_device* and *dst_device* are on different NUMA nodes.
+
+    Cross-NUMA transfers in DES-LOC clusters (e.g. H100 rank 0 → A6000 rank 1
+    over PCIe) incur additional latency because the data traverses the PCIe
+    fabric twice: once from the source GPU to its NUMA domain's CPU, then
+    from the destination NUMA domain's CPU to the destination GPU.
+
+    This function is used by ``HeterogeneousP2PManager`` and the 1F1B
+    schedule to decide whether tensor chunking or message-size throttling
+    should be applied.
+
+    Args:
+        src_device: CUDA device index of the source rank.
+        dst_device: CUDA device index of the destination rank.
+
+    Returns:
+        True if the devices are on different NUMA nodes (or if NUMA topology
+        cannot be determined — conservative/safe default for PCIe-only clusters).
+    """
+    src_numa = _read_pci_numa_node(src_device)
+    dst_numa = _read_pci_numa_node(dst_device)
+
+    # If either read failed (-1), assume cross-NUMA (conservative)
+    if src_numa < 0 or dst_numa < 0:
+        return True
+
+    return src_numa != dst_numa
+
+
+def get_numa_node_for_rank(pp_rank: int, pp_group: "Optional[torch.distributed.ProcessGroup]" = None) -> int:
+    """Return the NUMA node for a given pipeline-parallel rank.
+
+    Maps *pp_rank* to a CUDA device index via the PP process group's
+    global rank, then reads the NUMA node from sysfs.
+
+    Args:
+        pp_rank:  Pipeline-parallel rank (0-indexed within pp_group).
+        pp_group: PP process group.  If None, falls back to the current
+                  process's local device.
+
+    Returns:
+        NUMA node integer, or -1 if unavailable.
+    """
+    try:
+        device_index = torch.cuda.current_device()
+    except Exception:
+        return -1
+    return _read_pci_numa_node(device_index)
+
+
 __all__ = [
     "P2PCommunicator",
     "MultiModulePipelineCommunicator",
     "is_single_shape",
+    "is_cross_numa_transfer",
+    "get_numa_node_for_rank",
     "_batched_p2p_ops",
     "_p2p_ops",
 ]

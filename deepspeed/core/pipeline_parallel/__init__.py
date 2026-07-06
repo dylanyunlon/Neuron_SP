@@ -39,6 +39,8 @@ Guaranteed export (required by task spec):
 from deepspeed.core.pipeline_parallel.p2p_communication import (
     P2PCommunicator,
     is_single_shape,
+    is_cross_numa_transfer,
+    get_numa_node_for_rank,
     _batched_p2p_ops,
     _p2p_ops,
 )
@@ -82,6 +84,8 @@ __all__ = [
     # P2P communication
     "P2PCommunicator",
     "is_single_shape",
+    "is_cross_numa_transfer",
+    "get_numa_node_for_rank",
     "_batched_p2p_ops",
     "_p2p_ops",
     # Schedule selector
