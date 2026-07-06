@@ -507,6 +507,105 @@ int64_t compute_offload_budget_py(int64_t total_act_bytes,
 }
 
 // ---------------------------------------------------------------------------
+// fused_cross_entropy bindings
+// ---------------------------------------------------------------------------
+
+void fused_ce_forward_py(at::Tensor logits,
+                          at::Tensor targets,
+                          at::Tensor local_max,
+                          at::Tensor local_lse,
+                          at::Tensor local_target_logit,
+                          at::Tensor target_is_local,
+                          int64_t    vocab_offset,
+                          int        sm_version)
+{
+    check_bf16(logits, "logits");
+    TORCH_CHECK(logits.dim() == 2, "logits must be 2-D [batch, local_vocab]");
+    TORCH_CHECK(targets.scalar_type() == at::ScalarType::Long,
+                "targets must be Int64");
+    TORCH_CHECK(targets.is_cuda() && targets.is_contiguous(),
+                "targets must be contiguous CUDA tensor");
+
+    const int batch      = static_cast<int>(logits.size(0));
+    const int local_vocab = static_cast<int>(logits.size(1));
+
+    TORCH_CHECK(targets.numel() == batch,
+                "targets numel must equal batch, got ", targets.numel());
+
+    check_fp32(local_max,          "local_max");
+    check_fp32(local_lse,          "local_lse");
+    check_fp32(local_target_logit, "local_target_logit");
+    check_fp32(target_is_local,    "target_is_local");
+
+    TORCH_CHECK(local_max.numel() >= batch,          "local_max too small");
+    TORCH_CHECK(local_lse.numel() >= batch,          "local_lse too small");
+    TORCH_CHECK(local_target_logit.numel() >= batch, "local_target_logit too small");
+    TORCH_CHECK(target_is_local.numel() >= batch,    "target_is_local too small");
+
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    launch_fused_ce_forward(
+        reinterpret_cast<const __nv_bfloat16*>(logits.data_ptr<at::BFloat16>()),
+        targets.data_ptr<int64_t>(),
+        local_max.data_ptr<float>(),
+        local_lse.data_ptr<float>(),
+        local_target_logit.data_ptr<float>(),
+        target_is_local.data_ptr<float>(),
+        batch, local_vocab,
+        static_cast<int>(vocab_offset),
+        sm_version, stream);
+}
+
+void fused_ce_backward_py(at::Tensor logits,
+                            at::Tensor targets,
+                            at::Tensor global_lse,
+                            at::Tensor local_target_logit,
+                            at::Tensor target_is_local,
+                            at::Tensor losses,
+                            at::Tensor dlogits,
+                            int64_t    vocab_offset,
+                            float      loss_scale,
+                            int        sm_version)
+{
+    check_bf16(logits,  "logits");
+    check_bf16(dlogits, "dlogits");
+    TORCH_CHECK(logits.dim() == 2,  "logits must be 2-D [batch, local_vocab]");
+    TORCH_CHECK(dlogits.dim() == 2, "dlogits must be 2-D [batch, local_vocab]");
+
+    const int batch       = static_cast<int>(logits.size(0));
+    const int local_vocab = static_cast<int>(logits.size(1));
+
+    TORCH_CHECK(dlogits.size(0) == batch && dlogits.size(1) == local_vocab,
+                "dlogits shape must match logits");
+    TORCH_CHECK(targets.scalar_type() == at::ScalarType::Long,
+                "targets must be Int64");
+    TORCH_CHECK(targets.is_cuda() && targets.is_contiguous());
+    TORCH_CHECK(targets.numel() == batch);
+
+    check_fp32(global_lse,         "global_lse");
+    check_fp32(local_target_logit, "local_target_logit");
+    check_fp32(target_is_local,    "target_is_local");
+    check_fp32(losses,             "losses");
+
+    TORCH_CHECK(global_lse.numel() >= batch,         "global_lse too small");
+    TORCH_CHECK(local_target_logit.numel() >= batch, "local_target_logit too small");
+    TORCH_CHECK(target_is_local.numel() >= batch,    "target_is_local too small");
+    TORCH_CHECK(losses.numel() >= batch,             "losses too small");
+
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    launch_fused_ce_backward(
+        reinterpret_cast<const __nv_bfloat16*>(logits.data_ptr<at::BFloat16>()),
+        targets.data_ptr<int64_t>(),
+        global_lse.data_ptr<float>(),
+        local_target_logit.data_ptr<float>(),
+        target_is_local.data_ptr<float>(),
+        losses.data_ptr<float>(),
+        reinterpret_cast<__nv_bfloat16*>(dlogits.data_ptr<at::BFloat16>()),
+        batch, local_vocab,
+        static_cast<int>(vocab_offset),
+        loss_scale, sm_version, stream);
+}
+
+// ---------------------------------------------------------------------------
 // PYBIND11_MODULE
 // ---------------------------------------------------------------------------
 
@@ -569,6 +668,57 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("up_proj"),
           py::arg("ln_weight"),
           py::arg("eps") = 1e-6f,
+          py::arg("sm_version") = 86);
+
+    // -----------------------------------------------------------------------
+    // fused_cross_entropy
+    // -----------------------------------------------------------------------
+    m.def("fused_ce_forward",
+          &fused_ce_forward_py,
+          "Fused cross-entropy forward: compute per-partition local max, LSE,\n"
+          "and target logit for heterogeneous vocab partition.\n"
+          "Args:\n"
+          "  logits             (Tensor BF16 [B, V_local]): local logits\n"
+          "  targets            (Tensor Int64 [B]): global target indices\n"
+          "  local_max          (Tensor FP32 [B]): output local max\n"
+          "  local_lse          (Tensor FP32 [B]): output local log-sum-exp\n"
+          "  local_target_logit (Tensor FP32 [B]): output target logit\n"
+          "  target_is_local    (Tensor FP32 [B]): output ownership mask\n"
+          "  vocab_offset       (int): global start of this partition\n"
+          "  sm_version         (int): 86, 90, or 120",
+          py::arg("logits"),
+          py::arg("targets"),
+          py::arg("local_max"),
+          py::arg("local_lse"),
+          py::arg("local_target_logit"),
+          py::arg("target_is_local"),
+          py::arg("vocab_offset") = 0,
+          py::arg("sm_version") = 86);
+
+    m.def("fused_ce_backward",
+          &fused_ce_backward_py,
+          "Fused cross-entropy backward: given global LSE, produce per-token\n"
+          "losses and BF16 softmax gradients for the local vocab partition.\n"
+          "Args:\n"
+          "  logits             (Tensor BF16 [B, V_local]): local logits\n"
+          "  targets            (Tensor Int64 [B]): global target indices\n"
+          "  global_lse         (Tensor FP32 [B]): global log-sum-exp\n"
+          "  local_target_logit (Tensor FP32 [B]): target logit from forward\n"
+          "  target_is_local    (Tensor FP32 [B]): ownership mask from forward\n"
+          "  losses             (Tensor FP32 [B]): output per-token losses\n"
+          "  dlogits            (Tensor BF16 [B, V_local]): output gradients\n"
+          "  vocab_offset       (int): global start of this partition\n"
+          "  loss_scale         (float): scalar multiplier for loss & grads\n"
+          "  sm_version         (int): 86, 90, or 120",
+          py::arg("logits"),
+          py::arg("targets"),
+          py::arg("global_lse"),
+          py::arg("local_target_logit"),
+          py::arg("target_is_local"),
+          py::arg("losses"),
+          py::arg("dlogits"),
+          py::arg("vocab_offset") = 0,
+          py::arg("loss_scale") = 1.0f,
           py::arg("sm_version") = 86);
 
     // -----------------------------------------------------------------------

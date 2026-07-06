@@ -384,6 +384,86 @@ void launch_dequantise_int8_to_fp16(__nv_bfloat16* output,
                                      cudaStream_t   stream);
 
 // ===========================================================================
+// fused_cross_entropy — Heterogeneous-vocab-partition fused CE loss
+// ===========================================================================
+
+/**
+ * launch_fused_ce_forward
+ *
+ * Computes per-partition statistics for cross-entropy loss over a vocab
+ * partition owned by this GPU tier.  Each block processes one batch row.
+ *
+ * Outputs (all FP32, shape [batch]):
+ *   local_max          — max logit over the local vocab partition
+ *   local_lse          — log-sum-exp over the local partition
+ *   local_target_logit — logit at the target index (0 if not local)
+ *   target_is_local    — 1.0 if this partition owns the target, else 0.0
+ *
+ * @param logits             [in]  BF16 logits [batch, local_vocab]
+ * @param targets            [in]  INT64 global target indices [batch]
+ * @param local_max          [out] FP32 [batch]
+ * @param local_lse          [out] FP32 [batch]
+ * @param local_target_logit [out] FP32 [batch]
+ * @param target_is_local    [out] FP32 [batch]
+ * @param batch              Batch size
+ * @param local_vocab        Size of this tier's vocab partition
+ * @param vocab_offset       Global vocab index where this partition starts
+ * @param sm_version         SM version (86, 90, 120)
+ * @param stream             CUDA stream
+ */
+void launch_fused_ce_forward(const __nv_bfloat16* logits,
+                             const int64_t*       targets,
+                             float*               local_max,
+                             float*               local_lse,
+                             float*               local_target_logit,
+                             float*               target_is_local,
+                             int                  batch,
+                             int                  local_vocab,
+                             int                  vocab_offset,
+                             int                  sm_version,
+                             cudaStream_t         stream);
+
+/**
+ * launch_fused_ce_backward
+ *
+ * Given the global log-sum-exp (computed after allreduce of per-partition
+ * statistics), produces per-token losses and BF16 softmax gradients.
+ *
+ * loss[row] = (global_lse[row] - target_logit[row]) * loss_scale
+ * dlogits[row, v] = (softmax_v - 1{v==target}) * loss_scale
+ *
+ * The loss is written only by the tier that owns the target token;
+ * other tiers write 0 so an allreduce-sum yields the correct total.
+ *
+ * @param logits             [in]  BF16 logits [batch, local_vocab]
+ * @param targets            [in]  INT64 global target indices [batch]
+ * @param global_lse         [in]  FP32 global log-sum-exp [batch]
+ * @param local_target_logit [in]  FP32 per-partition target logit [batch]
+ * @param target_is_local    [in]  FP32 ownership mask [batch]
+ * @param losses             [out] FP32 per-token losses [batch]
+ * @param dlogits            [out] BF16 gradients [batch, local_vocab]
+ * @param batch              Batch size
+ * @param local_vocab        Size of this tier's vocab partition
+ * @param vocab_offset       Global vocab index where this partition starts
+ * @param loss_scale         Scalar to multiply loss & gradients (e.g. 1/batch)
+ * @param sm_version         SM version (86, 90, 120)
+ * @param stream             CUDA stream
+ */
+void launch_fused_ce_backward(const __nv_bfloat16* logits,
+                              const int64_t*       targets,
+                              const float*         global_lse,
+                              const float*         local_target_logit,
+                              const float*         target_is_local,
+                              float*               losses,
+                              __nv_bfloat16*       dlogits,
+                              int                  batch,
+                              int                  local_vocab,
+                              int                  vocab_offset,
+                              float                loss_scale,
+                              int                  sm_version,
+                              cudaStream_t         stream);
+
+// ===========================================================================
 // Additional API — Worker-12 (Opus) additions
 // ===========================================================================
 
