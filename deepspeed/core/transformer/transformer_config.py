@@ -1146,6 +1146,21 @@ class TransformerConfig(ModelParallelConfig):
     """Fallback tier assigned when no keyword matches. One of 'x', 'u', 'v'."""
 
     # ------------------------------------------------------------------
+    # DES-LOC Algorithm 1: Kx/Ku/Kv decomposed sync periods
+    # ------------------------------------------------------------------
+
+    desloc_Kx: int = 32
+    """Parameter sync period (Algorithm 1). 1 = sync every step (standard DDP).
+    Kx > 1 enables local SGD with periodic global sync for weight parameters.
+    Must satisfy Kx <= Ku <= Kv. Default: 32."""
+
+    desloc_Ku: int = 96
+    """First-moment (exp_avg / momentum) sync period. Default: 96."""
+
+    desloc_Kv: int = 192
+    """Second-moment (exp_avg_sq / variance) sync period. Default: 192."""
+
+    # ------------------------------------------------------------------
 
     def __post_init__(self) -> None:
         """Validate and derive fields; mirrors Megatron TransformerConfig.__post_init__."""
