@@ -86,6 +86,8 @@ set(HETERO_REDUCE_SOURCES
     "${HETERO_REDUCE_DIR}/fused_rope_hetero.cu"
     "${HETERO_REDUCE_DIR}/pcie_adaptive_allreduce.cu"
     "${HETERO_REDUCE_DIR}/tier_activation_offload.cu"
+    "${HETERO_REDUCE_DIR}/fused_layernorm_residual.cu"   # #110
+    "${HETERO_REDUCE_DIR}/cross_entropy_tp.cu"            # #110
 )
 
 # ─── Static library target ───────────────────────────────────────────────────

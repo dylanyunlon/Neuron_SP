@@ -447,3 +447,132 @@ void launch_pcie_ring_reduce_step(
     size_t                            chunk_elems,
     int                               sm_version,
     cudaStream_t                      compute_stream);
+
+// ===========================================================================
+// fused_layernorm_residual — addresses #110
+// ===========================================================================
+
+/**
+ * launch_fused_layernorm_residual
+ *
+ * Fused residual addition + RMS LayerNorm kernel.
+ *
+ * For each row i of [batch × hidden]:
+ *   residual_i[j] += input_i[j]
+ *   output_i[j]   = residual_i[j] * ln_weight[j]
+ *                   * rsqrt(mean(residual_i²) + ε)
+ *
+ * The residual stream is updated in-place; the normalized result is written
+ * to a separate output buffer (which may alias residual for single-buffer mode).
+ *
+ * @param output      [out] BF16 LN output [batch, hidden]
+ * @param residual    [in/out] BF16 residual stream [batch, hidden] (updated in-place)
+ * @param input       [in]  BF16 new contribution [batch, hidden]
+ * @param ln_weight   [in]  FP32 RMSNorm scale [hidden]
+ * @param batch       Batch size
+ * @param hidden      Hidden size (must be divisible by 8)
+ * @param eps         RMSNorm epsilon
+ * @param sm_version  SM version of the active device (86, 90, 120)
+ * @param stream      CUDA stream
+ */
+void launch_fused_layernorm_residual(__nv_bfloat16*       output,
+                                      __nv_bfloat16*       residual,
+                                      const __nv_bfloat16* input,
+                                      const float*         ln_weight,
+                                      int                  batch,
+                                      int                  hidden,
+                                      float                eps,
+                                      int                  sm_version,
+                                      cudaStream_t         stream);
+
+// ===========================================================================
+// cross_entropy_tp — Tensor-parallel cross-entropy loss  (addresses #110)
+// ===========================================================================
+
+/**
+ * launch_cross_entropy_tp_forward
+ *
+ * Phase-1 forward pass: compute local (max, sum_exp, label_logit) scalars
+ * for each sample from this TP rank's vocab shard.
+ *
+ * The caller reduces these across TP ranks:
+ *   global_max     = AllReduce_max(local_max)
+ *   global_sum_exp = AllReduce_sum(local_sum_exp * exp(local_max - global_max))
+ *   global_logit   = AllReduce_sum(local_logit)
+ *
+ * @param local_max      [out] FP32 [batch] — max logit in this shard
+ * @param local_sum_exp  [out] FP32 [batch] — Σ exp(logit - local_max)
+ * @param local_logit    [out] FP32 [batch] — logit at label position (0 if not in shard)
+ * @param logits         [in]  BF16 [batch, v_local] — this rank's logit shard
+ * @param labels         [in]  int32 [batch] — global vocab label per sample
+ * @param batch          Batch size
+ * @param v_local        Local vocabulary size (= V / tp_size)
+ * @param shard_offset   Global vocab index of logits[:,0]
+ * @param sm_version     SM version of the active device (86, 90, 120)
+ * @param stream         CUDA stream
+ */
+void launch_cross_entropy_tp_forward(float*               local_max,
+                                      float*               local_sum_exp,
+                                      float*               local_logit,
+                                      const __nv_bfloat16* logits,
+                                      const int*           labels,
+                                      int                  batch,
+                                      int                  v_local,
+                                      int                  shard_offset,
+                                      int                  sm_version,
+                                      cudaStream_t         stream);
+
+/**
+ * launch_cross_entropy_tp_loss
+ *
+ * Phase-2: compute per-sample cross-entropy loss from globally-reduced scalars.
+ *
+ *   loss[i] = log(global_sum_exp[i]) + global_max[i] - global_logit[i]
+ *
+ * @param loss           [out] FP32 [batch] — per-sample CE loss
+ * @param global_max     [in]  FP32 [batch] — globally reduced max
+ * @param global_sum_exp [in]  FP32 [batch] — globally reduced sum of exp
+ * @param global_logit   [in]  FP32 [batch] — globally reduced label logit
+ * @param batch          Batch size
+ * @param stream         CUDA stream
+ */
+void launch_cross_entropy_tp_loss(float*       loss,
+                                   const float* global_max,
+                                   const float* global_sum_exp,
+                                   const float* global_logit,
+                                   int          batch,
+                                   cudaStream_t stream);
+
+/**
+ * launch_cross_entropy_tp_backward
+ *
+ * Backward pass: compute softmax gradient w.r.t. this rank's logit shard.
+ *
+ *   d_logits[row, j] = (softmax(logit)[row,j] -
+ *                       1{shard_offset + j == label[row]}) / batch_size
+ *
+ * Written in-place into d_logits (may alias logits after forward is complete).
+ *
+ * @param d_logits       [out] BF16 [batch, v_local] — gradient output
+ * @param logits         [in]  BF16 [batch, v_local] — forward logit shard
+ * @param labels         [in]  int32 [batch] — global label indices
+ * @param global_max     [in]  FP32 [batch] — globally reduced max per sample
+ * @param log_sum_exp    [in]  FP32 [batch] — log(global_sum_exp) per sample
+ * @param batch          Batch size
+ * @param v_local        Local vocabulary size
+ * @param shard_offset   Global vocab index of logits[:,0]
+ * @param inv_batch      1.f / batch_size (pre-computed by caller)
+ * @param sm_version     SM version of the active device (86, 90, 120)
+ * @param stream         CUDA stream
+ */
+void launch_cross_entropy_tp_backward(__nv_bfloat16*       d_logits,
+                                       const __nv_bfloat16* logits,
+                                       const int*           labels,
+                                       const float*         global_max,
+                                       const float*         log_sum_exp,
+                                       int                  batch,
+                                       int                  v_local,
+                                       int                  shard_offset,
+                                       float                inv_batch,
+                                       int                  sm_version,
+                                       cudaStream_t         stream);

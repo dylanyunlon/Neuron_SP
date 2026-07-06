@@ -507,6 +507,142 @@ int64_t compute_offload_budget_py(int64_t total_act_bytes,
 }
 
 // ---------------------------------------------------------------------------
+// fused_layernorm_residual binding  (#110)
+// ---------------------------------------------------------------------------
+
+void fused_layernorm_residual_py(at::Tensor output,
+                                   at::Tensor residual,
+                                   at::Tensor input,
+                                   at::Tensor ln_weight,
+                                   float      eps,
+                                   int        sm_version)
+{
+    check_bf16(output,   "output");
+    check_bf16(residual, "residual");
+    check_bf16(input,    "input");
+    check_fp32(ln_weight, "ln_weight");
+
+    TORCH_CHECK(output.dim() == 2,   "output must be 2-D [batch, hidden]");
+    TORCH_CHECK(residual.dim() == 2, "residual must be 2-D [batch, hidden]");
+    TORCH_CHECK(input.dim() == 2,    "input must be 2-D [batch, hidden]");
+
+    const int batch  = (int)output.size(0);
+    const int hidden = (int)output.size(1);
+
+    TORCH_CHECK(hidden % 8 == 0,
+                "hidden must be divisible by 8, got ", hidden);
+    TORCH_CHECK(residual.sizes() == output.sizes(), "residual/output shape mismatch");
+    TORCH_CHECK(input.sizes()    == output.sizes(), "input/output shape mismatch");
+    TORCH_CHECK(ln_weight.numel() == hidden,
+                "ln_weight numel must equal hidden, got ", ln_weight.numel());
+
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    launch_fused_layernorm_residual(
+        reinterpret_cast<__nv_bfloat16*>(output.data_ptr<at::BFloat16>()),
+        reinterpret_cast<__nv_bfloat16*>(residual.data_ptr<at::BFloat16>()),
+        reinterpret_cast<const __nv_bfloat16*>(input.data_ptr<at::BFloat16>()),
+        ln_weight.data_ptr<float>(),
+        batch, hidden, eps, sm_version, stream);
+}
+
+// ---------------------------------------------------------------------------
+// cross_entropy_tp bindings  (#110)
+// ---------------------------------------------------------------------------
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor>
+cross_entropy_tp_forward_py(at::Tensor logits,
+                              at::Tensor labels,
+                              int64_t    shard_offset,
+                              int        sm_version)
+{
+    check_bf16(logits, "logits");
+    TORCH_CHECK(logits.dim() == 2, "logits must be 2-D [batch, v_local]");
+    TORCH_CHECK(labels.scalar_type() == at::ScalarType::Int,
+                "labels must be Int32, got ", labels.scalar_type());
+    TORCH_CHECK(labels.is_cuda() && labels.is_contiguous(),
+                "labels must be a contiguous CUDA tensor");
+    TORCH_CHECK(labels.numel() == logits.size(0),
+                "labels numel must equal batch size");
+
+    const int batch   = (int)logits.size(0);
+    const int v_local = (int)logits.size(1);
+
+    TORCH_CHECK(shard_offset >= 0, "shard_offset must be >= 0");
+
+    auto opts = at::TensorOptions().dtype(at::kFloat).device(logits.device());
+    at::Tensor local_max     = at::empty({batch}, opts);
+    at::Tensor local_sum_exp = at::empty({batch}, opts);
+    at::Tensor local_logit   = at::zeros({batch}, opts);  // zeros for non-shard labels
+
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    launch_cross_entropy_tp_forward(
+        local_max.data_ptr<float>(),
+        local_sum_exp.data_ptr<float>(),
+        local_logit.data_ptr<float>(),
+        reinterpret_cast<const __nv_bfloat16*>(logits.data_ptr<at::BFloat16>()),
+        labels.data_ptr<int>(),
+        batch, v_local, (int)shard_offset, sm_version, stream);
+
+    return std::make_tuple(local_max, local_sum_exp, local_logit);
+}
+
+at::Tensor cross_entropy_tp_loss_py(at::Tensor global_max,
+                                     at::Tensor global_sum_exp,
+                                     at::Tensor global_logit)
+{
+    check_fp32(global_max,     "global_max");
+    check_fp32(global_sum_exp, "global_sum_exp");
+    check_fp32(global_logit,   "global_logit");
+    TORCH_CHECK(global_max.numel()     == global_sum_exp.numel(), "shape mismatch");
+    TORCH_CHECK(global_max.numel()     == global_logit.numel(),   "shape mismatch");
+
+    const int batch = (int)global_max.numel();
+    at::Tensor loss = at::empty({batch},
+        at::TensorOptions().dtype(at::kFloat).device(global_max.device()));
+
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    launch_cross_entropy_tp_loss(
+        loss.data_ptr<float>(),
+        global_max.data_ptr<float>(),
+        global_sum_exp.data_ptr<float>(),
+        global_logit.data_ptr<float>(),
+        batch, stream);
+    return loss;
+}
+
+void cross_entropy_tp_backward_py(at::Tensor d_logits,
+                                    at::Tensor logits,
+                                    at::Tensor labels,
+                                    at::Tensor global_max,
+                                    at::Tensor log_sum_exp,
+                                    int64_t    shard_offset,
+                                    float      inv_batch,
+                                    int        sm_version)
+{
+    check_bf16(d_logits,   "d_logits");
+    check_bf16(logits,     "logits");
+    check_fp32(global_max, "global_max");
+    check_fp32(log_sum_exp, "log_sum_exp");
+    TORCH_CHECK(labels.scalar_type() == at::ScalarType::Int,
+                "labels must be Int32");
+    TORCH_CHECK(d_logits.sizes() == logits.sizes(), "d_logits/logits shape mismatch");
+
+    const int batch   = (int)logits.size(0);
+    const int v_local = (int)logits.size(1);
+    TORCH_CHECK(shard_offset >= 0, "shard_offset must be >= 0");
+    TORCH_CHECK(inv_batch > 0.f,   "inv_batch must be > 0");
+
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    launch_cross_entropy_tp_backward(
+        reinterpret_cast<__nv_bfloat16*>(d_logits.data_ptr<at::BFloat16>()),
+        reinterpret_cast<const __nv_bfloat16*>(logits.data_ptr<at::BFloat16>()),
+        labels.data_ptr<int>(),
+        global_max.data_ptr<float>(),
+        log_sum_exp.data_ptr<float>(),
+        batch, v_local, (int)shard_offset, inv_batch, sm_version, stream);
+}
+
+// ---------------------------------------------------------------------------
 // PYBIND11_MODULE
 // ---------------------------------------------------------------------------
 
@@ -713,4 +849,57 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("total_act_bytes"),
           py::arg("vram_free_bytes"),
           py::arg("headroom_frac") = 0.1f);
+    // -----------------------------------------------------------------------
+    // fused_layernorm_residual  (#110)
+    // -----------------------------------------------------------------------
+    m.def("fused_layernorm_residual",
+          &fused_layernorm_residual_py,
+          "Fused residual add + RMS LayerNorm (pre-LN Llama/Mistral style).\n"
+          "residual_i += input_i;  output_i = rmsnorm(residual_i) * weight.\n"
+          "Args:\n"
+          "  output     (Tensor BF16  [B, H]): LN output\n"
+          "  residual   (Tensor BF16  [B, H]): residual stream, updated in-place\n"
+          "  input      (Tensor BF16  [B, H]): new sub-layer contribution\n"
+          "  ln_weight  (Tensor FP32  [H])   : RMSNorm gamma scale\n"
+          "  eps        (float)               : RMSNorm epsilon (default 1e-6)\n"
+          "  sm_version (int)                 : 86, 90, or 120",
+          py::arg("output"),
+          py::arg("residual"),
+          py::arg("input"),
+          py::arg("ln_weight"),
+          py::arg("eps") = 1e-6f,
+          py::arg("sm_version") = 86);
+
+    // -----------------------------------------------------------------------
+    // cross_entropy_tp  (#110)
+    // -----------------------------------------------------------------------
+    m.def("cross_entropy_tp_forward",
+          &cross_entropy_tp_forward_py,
+          "Phase-1 TP cross-entropy: local (max, sum_exp, label_logit).\n"
+          "Returns Tuple[Tensor FP32 [B], Tensor FP32 [B], Tensor FP32 [B]].",
+          py::arg("logits"),
+          py::arg("labels"),
+          py::arg("shard_offset") = 0,
+          py::arg("sm_version") = 86);
+
+    m.def("cross_entropy_tp_loss",
+          &cross_entropy_tp_loss_py,
+          "Phase-2 TP cross-entropy: per-sample CE loss from reduced scalars.\n"
+          "Returns: loss (Tensor FP32 [B])",
+          py::arg("global_max"),
+          py::arg("global_sum_exp"),
+          py::arg("global_logit"));
+
+    m.def("cross_entropy_tp_backward",
+          &cross_entropy_tp_backward_py,
+          "TP cross-entropy backward: softmax gradient w.r.t. local logit shard.",
+          py::arg("d_logits"),
+          py::arg("logits"),
+          py::arg("labels"),
+          py::arg("global_max"),
+          py::arg("log_sum_exp"),
+          py::arg("shard_offset") = 0,
+          py::arg("inv_batch") = 1.f,
+          py::arg("sm_version") = 86);
+
 }
