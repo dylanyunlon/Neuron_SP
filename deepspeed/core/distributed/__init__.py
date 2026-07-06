@@ -82,6 +82,13 @@ from deepspeed.core.distributed.sharded_checkpoint import (
     load_checkpoint,
 )
 
+# Overlapped gradient reduce-scatter for pipeline-parallel stages.
+from deepspeed.core.distributed.overlap_grad_reduce import (
+    OverlapGradReduceManager,
+    PPStageGradReduceScheduler,
+    recommend_pp_stage_bucket_size,
+)
+
 __all__ = [
     # grad_buffer
     "GradBuffer",
@@ -132,4 +139,8 @@ __all__ = [
     "_desloc_sync_optimizer_moments",
     "_update_router_expert_bias",                   # M3981
     "reset_model_temporary_tensors",
+    # overlap_grad_reduce (pipeline-parallel overlapped reduce-scatter)
+    "OverlapGradReduceManager",
+    "PPStageGradReduceScheduler",
+    "recommend_pp_stage_bucket_size",
 ]
