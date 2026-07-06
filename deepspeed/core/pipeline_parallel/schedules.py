@@ -64,6 +64,7 @@ from deepspeed.core.pipeline_parallel.p2p_communication import (
     P2PCommunicator,
     MultiModulePipelineCommunicator,
     is_single_shape,
+    is_cross_numa_transfer,
 )
 
 try:
@@ -1012,7 +1013,11 @@ class HeterogeneousBubbleFiller:
             fast_rank_set=self.fast_ranks,
         )
 
-        # PCIe-aware P2P manager for this cluster layout
+        # PCIe-aware P2P manager for this cluster layout.
+        # Use is_cross_numa_transfer() to determine whether adjacent ranks
+        # are on different NUMA nodes; cross-NUMA links get the conservative
+        # PCIe bandwidth estimate (16 GB/s), intra-NUMA links use NVLink
+        # bandwidth (400 GB/s for fast↔fast, 32 GB/s for fast↔slow intra-NUMA).
         if all_ranks and len(all_ranks) > 1:
             sorted_ranks = sorted(all_ranks)
             pipeline_pairs_bw: Dict[Tuple[int, int], float] = {}
@@ -1020,7 +1025,17 @@ class HeterogeneousBubbleFiller:
                 s, d = sorted_ranks[i], sorted_ranks[i + 1]
                 s_fast = s in self.fast_ranks
                 d_fast = d in self.fast_ranks
-                bw = 400.0 if (s_fast and d_fast) else 16.0
+                # Try to read actual NUMA topology; fall back to tier-based estimate.
+                try:
+                    cross_numa = is_cross_numa_transfer(s, d)
+                except Exception:
+                    cross_numa = not (s_fast and d_fast)  # conservative: assume cross-NUMA for mixed
+                if cross_numa:
+                    bw = 16.0   # PCIe x16 gen4 ~16 GB/s cross-NUMA
+                elif s_fast and d_fast:
+                    bw = 400.0  # H100↔H100 NVLink C2C
+                else:
+                    bw = 32.0   # A6000↔A6000 PCIe intra-NUMA (~2× cross-NUMA due to shared root complex)
                 pipeline_pairs_bw[(s, d)] = bw
                 pipeline_pairs_bw[(d, s)] = bw
             self.p2p_manager = HeterogeneousP2PManager(
