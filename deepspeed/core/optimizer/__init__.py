@@ -824,3 +824,44 @@ __all__ += [
     "clip_qk_grad_norm",
     "clip_qk",
 ]
+
+# ---------------------------------------------------------------------------
+# CUDA graph optimizer wrapper (Megatron optimizer_cuda_graph.py port)
+# ---------------------------------------------------------------------------
+from deepspeed.core.optimizer.optimizer_cuda_graph import (
+    OptimizerCudaGraphWrapper,
+    wrap_optimizer_step,
+)
+
+# ---------------------------------------------------------------------------
+# Emerging optimizer registry (Muon, Lion, SOAP)
+# ---------------------------------------------------------------------------
+from deepspeed.core.optimizer.emerging_optimizers import (
+    EmergingOptimizerEntry,
+    EMERGING_OPTIMIZER_REGISTRY,
+    register_emerging_optimizer,
+    get_emerging_optimizer,
+    list_emerging_optimizers,
+    build_emerging_optimizer,
+    route_params_by_tier,
+)
+
+__all__ += [
+    # CUDA graph wrapper
+    "OptimizerCudaGraphWrapper",
+    "wrap_optimizer_step",
+    # Emerging optimizers
+    "EmergingOptimizerEntry",
+    "EMERGING_OPTIMIZER_REGISTRY",
+    "register_emerging_optimizer",
+    "get_emerging_optimizer",
+    "list_emerging_optimizers",
+    "build_emerging_optimizer",
+    "route_params_by_tier",
+    # get_megatron_optimizer factory (defined inline above)
+    "get_megatron_optimizer",
+    "_get_param_groups",
+    "_get_param_groups_and_buffers",
+    "_build_inner_optimizer",
+    "_wrap_optimizer",
+]
