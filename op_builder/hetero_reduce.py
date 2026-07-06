@@ -13,12 +13,16 @@ class HeteroReduceBuilder(CUDAOpBuilder):
 
     Source files
     ------------
-    * csrc/hetero_reduce/hetero_reduce.cu          — BF16→FP32 fused reduce-scatter
-    * csrc/hetero_reduce/fused_rope_hetero.cu      — RoPE with heterogeneous head counts
-    * csrc/hetero_reduce/pcie_adaptive_allreduce.cu — PCIe-aware bucketed allreduce
-    * csrc/hetero_reduce/fused_swiglu_ln.cu        — fused SwiGLU + RMSNorm
-    * csrc/hetero_reduce/tier_activation_offload.cu — activation checkpoint pack/unpack
-    * csrc/hetero_reduce/binding.cpp               — pybind11 / PyTorch extension glue
+    * csrc/hetero_reduce/hetero_reduce.cu              — BF16→FP32 fused reduce-scatter
+    * csrc/hetero_reduce/fused_rope_hetero.cu          — RoPE with heterogeneous head counts
+    * csrc/hetero_reduce/pcie_adaptive_allreduce.cu    — PCIe-aware bucketed allreduce
+    * csrc/hetero_reduce/fused_swiglu_ln.cu            — fused SwiGLU + RMSNorm
+    * csrc/hetero_reduce/tier_activation_offload.cu    — activation checkpoint pack/unpack
+    * csrc/hetero_reduce/fused_layernorm_residual.cu   — fused RMSNorm + residual add (#110)
+    * csrc/hetero_reduce/cross_entropy_tp.cu           — TP cross-entropy loss (#110)
+    * csrc/hetero_reduce/fused_gradient_allreduce.cu   — INT8 compressed ring allreduce
+    * csrc/hetero_reduce/fused_adam_heterogeneous.cu   — per-tier LR-scaled Adam
+    * csrc/hetero_reduce/binding.cpp                   — pybind11 / PyTorch extension glue
 
     Heterogeneous targets (all PCIe, no NVLink):
       SM 8.6  — RTX A6000  (48 GB VRAM)
@@ -45,6 +49,19 @@ class HeteroReduceBuilder(CUDAOpBuilder):
     op.quantise_bf16_to_int8(output, scales, input)
     op.dequantise_int8_to_bf16(output, input, scales)
     op.compute_offload_budget(total_act_bytes, vram_free_bytes, headroom_frac) -> int
+    op.fused_layernorm_residual(output, residual, input, ln_weight, eps, sm_version)
+    op.cross_entropy_tp_forward(logits, labels, shard_offset, sm_version) -> Tuple[Tensor,Tensor,Tensor]
+    op.cross_entropy_tp_loss(global_max, global_sum_exp, global_logit) -> Tensor
+    op.cross_entropy_tp_backward(d_logits, logits, labels, global_max, log_sum_exp, shard_offset, inv_batch, sm_version)
+    op.fused_gradient_allreduce(grad, int8_staging, scale_staging, ping_int8, pong_int8, ping_scale, pong_scale, rank, world_size, sm_version)
+    op.gradient_compress(out_int8, out_scale, input, sm_version)
+    op.gradient_decompress(output, int8_data, scale_buf, sm_version)
+    op.int8_ring_reduce_step(dst_int8, dst_scale, src_int8, src_scale, sm_version)
+    op.gradient_allreduce_finalise(scale_buf, n_elems, world_size)
+    op.gradient_compress_bytes(n_elems) -> int
+    op.gradient_scale_bytes(n_elems) -> int
+    op.fused_adam_heterogeneous(params, exp_avg, exp_avg_sq, grads, lr_base, lr_scale, beta1, beta2, bc1, bc2, eps, weight_decay, sm_version, master_params)
+    op.hetero_adam_lr_scale(sm_version) -> float
     """
 
     BUILD_VAR = "DS_BUILD_HETERO_REDUCE"
@@ -67,6 +84,11 @@ class HeteroReduceBuilder(CUDAOpBuilder):
             "csrc/hetero_reduce/pcie_adaptive_allreduce.cu",
             "csrc/hetero_reduce/fused_swiglu_ln.cu",
             "csrc/hetero_reduce/tier_activation_offload.cu",
+            # Additional kernels (#110 / #134)
+            "csrc/hetero_reduce/fused_layernorm_residual.cu",
+            "csrc/hetero_reduce/cross_entropy_tp.cu",
+            "csrc/hetero_reduce/fused_gradient_allreduce.cu",
+            "csrc/hetero_reduce/fused_adam_heterogeneous.cu",
         ]
 
     def include_paths(self):

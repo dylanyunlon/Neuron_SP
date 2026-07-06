@@ -680,6 +680,9 @@ void fused_adam_heterogeneous_py(
 float hetero_adam_lr_scale_py(int sm_version)
 {
     return hetero_adam_lr_scale(sm_version);
+}
+
+// ---------------------------------------------------------------------------
 // fused_gradient_allreduce bindings (INT8 compressed allreduce)
 // ---------------------------------------------------------------------------
 
@@ -766,6 +769,101 @@ int64_t gradient_compress_bytes_py(int64_t n_elems)
 int64_t gradient_scale_bytes_py(int64_t n_elems)
 {
     return (int64_t)gradient_scale_bytes((size_t)n_elems);
+}
+
+// ---------------------------------------------------------------------------
+// fused_gradient_allreduce — high-level 3-phase INT8 ring all-reduce
+//
+// Python signature:
+//   fused_gradient_allreduce(grad, int8_staging, scale_staging,
+//                            ping_int8, pong_int8, ping_scale, pong_scale,
+//                            rank, world_size, sm_version,
+//                            transfer_stream_ptr=0, compute_stream_ptr=0)
+//
+// All tensor args must be on the same CUDA device.  The caller pre-allocates
+// the staging / ping-pong INT8 and scale buffers using gradient_compress_bytes()
+// and gradient_scale_bytes().  peer_int8 / peer_scale coordination must be
+// done outside this call (via NCCL, IPC handles, or P2P copies).
+//
+// For single-rank (world_size == 1) the function is a no-op, matching the
+// semantics of a trivial allreduce.
+// ---------------------------------------------------------------------------
+
+void fused_gradient_allreduce_py(
+    at::Tensor  grad,
+    at::Tensor  int8_staging,
+    at::Tensor  scale_staging,
+    at::Tensor  ping_int8,
+    at::Tensor  pong_int8,
+    at::Tensor  ping_scale,
+    at::Tensor  pong_scale,
+    int         rank,
+    int         world_size,
+    int         sm_version)
+{
+    check_bf16(grad,          "grad");
+    check_int8(int8_staging,  "int8_staging");
+    check_fp32(scale_staging, "scale_staging");
+    check_int8(ping_int8,     "ping_int8");
+    check_int8(pong_int8,     "pong_int8");
+    check_fp32(ping_scale,    "ping_scale");
+    check_fp32(pong_scale,    "pong_scale");
+
+    TORCH_CHECK(rank >= 0 && rank < world_size,
+                "rank must be in [0, world_size), got rank=", rank,
+                " world_size=", world_size);
+    TORCH_CHECK(world_size > 0, "world_size must be > 0");
+
+    const size_t n_elems = (size_t)grad.numel();
+    TORCH_CHECK(n_elems > 0, "grad must not be empty");
+
+    // For single-rank, the allreduce is a no-op.
+    if (world_size == 1) return;
+
+    // Verify staging buffer sizes.
+    const size_t req_int8  = gradient_compress_bytes(n_elems);
+    const size_t req_scale = gradient_scale_bytes(n_elems);
+    TORCH_CHECK((size_t)int8_staging.nbytes()  >= req_int8,
+                "int8_staging too small: need ", req_int8, " bytes");
+    TORCH_CHECK((size_t)scale_staging.nbytes() >= req_scale,
+                "scale_staging too small: need ", req_scale, " bytes");
+    TORCH_CHECK((size_t)ping_int8.nbytes()  >= req_int8,  "ping_int8 too small");
+    TORCH_CHECK((size_t)pong_int8.nbytes()  >= req_int8,  "pong_int8 too small");
+    TORCH_CHECK((size_t)ping_scale.nbytes() >= req_scale, "ping_scale too small");
+    TORCH_CHECK((size_t)pong_scale.nbytes() >= req_scale, "pong_scale too small");
+
+    // Peer pointers: for intra-process use the direct device buffers.
+    // In a real multi-process run the caller would exchange IPC handles;
+    // here we expose the single-process (benchmarking / unit-test) path.
+    int8_t* peer_int8_arr[2]  = { reinterpret_cast<int8_t*>(ping_int8.data_ptr<int8_t>()),
+                                   reinterpret_cast<int8_t*>(pong_int8.data_ptr<int8_t>()) };
+    float*  peer_scale_arr[2] = { ping_scale.data_ptr<float>(),
+                                   pong_scale.data_ptr<float>() };
+
+    cudaStream_t transfer_stream = at::cuda::getCurrentCUDAStream();
+    cudaStream_t compute_stream  = at::cuda::getCurrentCUDAStream();
+
+    cudaEvent_t xfer_events[2];
+    TORCH_CHECK(cudaEventCreate(&xfer_events[0]) == cudaSuccess,
+                "cudaEventCreate failed for xfer_events[0]");
+    TORCH_CHECK(cudaEventCreate(&xfer_events[1]) == cudaSuccess,
+                "cudaEventCreate failed for xfer_events[1]");
+
+    launch_fused_gradient_allreduce(
+        reinterpret_cast<__nv_bfloat16*>(grad.data_ptr<at::BFloat16>()),
+        reinterpret_cast<int8_t*>(int8_staging.data_ptr<int8_t>()),
+        scale_staging.data_ptr<float>(),
+        reinterpret_cast<int8_t*>(ping_int8.data_ptr<int8_t>()),
+        reinterpret_cast<int8_t*>(pong_int8.data_ptr<int8_t>()),
+        ping_scale.data_ptr<float>(),
+        pong_scale.data_ptr<float>(),
+        reinterpret_cast<int8_t* const*>(peer_int8_arr),
+        reinterpret_cast<float*  const*>(peer_scale_arr),
+        rank, world_size, n_elems, sm_version,
+        transfer_stream, compute_stream, xfer_events);
+
+    cudaEventDestroy(xfer_events[0]);
+    cudaEventDestroy(xfer_events[1]);
 }
 
 // ---------------------------------------------------------------------------
@@ -924,16 +1022,34 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           "INT8 staging buffer size in bytes for n_elems gradient elements.",
           py::arg("n_elems"));
 
-    m.def("cross_entropy_tp_backward",
-          &cross_entropy_tp_backward_py,
-          "TP cross-entropy backward: softmax gradient w.r.t. local logit shard.",
-          py::arg("d_logits"),
-          py::arg("logits"),
-          py::arg("labels"),
-          py::arg("global_max"),
-          py::arg("log_sum_exp"),
-          py::arg("shard_offset") = 0,
-          py::arg("inv_batch") = 1.f,
+    // ── High-level 3-phase INT8 gradient allreduce ───────────────────────
+    m.def("fused_gradient_allreduce", &fused_gradient_allreduce_py,
+          "High-level 3-phase INT8 ring all-reduce for heterogeneous GPU clusters.\n"
+          "Phase 1: BF16 → INT8 compression.  Phase 2: INT8 ring-reduce.\n"
+          "Phase 3: INT8 → BF16 decompression + averaging.\n"
+          "All staging tensors must be pre-allocated with gradient_compress_bytes()\n"
+          "and gradient_scale_bytes() and reside on the same CUDA device.\n"
+          "\n"
+          "Args:\n"
+          "  grad          (Tensor BF16): gradient to allreduce (updated in-place)\n"
+          "  int8_staging  (Tensor Int8): local INT8 staging buffer\n"
+          "  scale_staging (Tensor FP32): local scale staging buffer\n"
+          "  ping_int8     (Tensor Int8): receive ping buffer\n"
+          "  pong_int8     (Tensor Int8): receive pong buffer\n"
+          "  ping_scale    (Tensor FP32): receive ping scale buffer\n"
+          "  pong_scale    (Tensor FP32): receive pong scale buffer\n"
+          "  rank          (int): this rank in [0, world_size)\n"
+          "  world_size    (int): number of participating GPUs\n"
+          "  sm_version    (int): 86, 90, or 120",
+          py::arg("grad"),
+          py::arg("int8_staging"),
+          py::arg("scale_staging"),
+          py::arg("ping_int8"),
+          py::arg("pong_int8"),
+          py::arg("ping_scale"),
+          py::arg("pong_scale"),
+          py::arg("rank"),
+          py::arg("world_size"),
           py::arg("sm_version") = 86);
 
     // -----------------------------------------------------------------------
