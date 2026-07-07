@@ -957,11 +957,14 @@ def get_grad_norm_fp32_hetero(
         for dc in DeviceClass:
             partial_val = accumulator._partials[dc]
             partial_tensor = torch.tensor([partial_val], dtype=torch.float64, device="cpu")
+            # NCCL backend requires CUDA tensors; move to GPU before allreduce
+            # and bring the result back to CPU for subsequent accumulation.
+            partial_tensor = partial_tensor.cuda()
             if norm_type == float("inf"):
                 dist.all_reduce(partial_tensor, op=dist.ReduceOp.MAX, group=process_group)
             else:
                 dist.all_reduce(partial_tensor, op=dist.ReduceOp.SUM, group=process_group)
-            accumulator._partials[dc] = partial_tensor.item()
+            accumulator._partials[dc] = partial_tensor.cpu().item()
 
     return {
         "anchor_norm": accumulator.partial_norm(DeviceClass.ANCHOR, norm_type),

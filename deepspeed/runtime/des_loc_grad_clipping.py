@@ -501,7 +501,10 @@ def _des_loc_compute_grad_norm(
         total_sq = _compute_norm_on_device(all_grads, accum_device)
 
     # Global all-reduce of squared norm across distributed ranks.
+    # NCCL backend requires CUDA tensors; move to GPU before allreduce.
     if dist.is_available() and dist.is_initialized():
+        if not total_sq.is_cuda:
+            total_sq = total_sq.cuda()
         dist.all_reduce(total_sq, op=dist.ReduceOp.SUM, group=process_group)
 
     total_norm = total_sq.sqrt().item()
