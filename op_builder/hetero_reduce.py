@@ -89,6 +89,8 @@ class HeteroReduceBuilder(CUDAOpBuilder):
             "csrc/hetero_reduce/cross_entropy_tp.cu",
             "csrc/hetero_reduce/fused_gradient_allreduce.cu",
             "csrc/hetero_reduce/fused_adam_heterogeneous.cu",
+            # 5-GPU 2-NUMA heterogeneous ring allreduce (#143)
+            "csrc/hetero_reduce/hetero_ring_allreduce.cu",
         ]
 
     def include_paths(self):
