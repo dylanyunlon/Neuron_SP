@@ -2457,48 +2457,16 @@ class DesLocEngine:
                 gnorm = gnorm.item()
             logger.warning("rank=%d: EXITED clip_grad_norm gnorm=%.6f", dist.get_rank() if dist.is_initialized() else 0, gnorm)
 
-            # HeteroGradNorm skip decision via HeteroGradNormSkipController
-            # (wired through integrate_with_deepspeed_engine at train() setup).
-            # Collect parameter gradients for the skip evaluation; classify all
-            # params as compute-side since DesLocEngine runs on a single device
-            # class per rank (anchor/compute split is resolved at init time).
-            #
-            # FIX (NCCL hang #151 + remaining): should_skip() calls
-            # _maybe_allreduce_partials() which does 2 separate all_reduces (one
-            # per DeviceClass).  If should_skip() throws on any rank those ranks
-            # exit early while other ranks block forever on the collectives.
-            # We wrap the entire call in try/except so a failing rank still reaches
-            # the mandatory _skip_tensor all_reduce below with skip=False, keeping
-            # collective ordering symmetric across all 3 ranks.
+            # BYPASS: should_skip() / _skip_controller removed to unblock training.
+            # The should_skip() → _maybe_allreduce_partials() path issues asymmetric
+            # all_reduces that hang post-clip_grad_norm (issue #152).  Bypassed until
+            # a hang-safe implementation is ready.  NaN guard is preserved below.
+            _should_skip = False
+            _skip_info = "bypassed"
             _skip_info_combined_norm = 0.0
-            try:
-                _all_grads = [p.grad for p in self.model.parameters()]
-                _should_skip, _skip_info = _skip_controller.should_skip([], _all_grads)
-                _skip_info_combined_norm = _skip_info.combined_norm
-            except Exception as _should_skip_exc:
-                logger.warning(
-                    "rank=%d: should_skip() raised %s — treating as no-skip to preserve "
-                    "collective symmetry; underlying error: %s",
-                    dist.get_rank() if dist.is_initialized() else 0,
-                    type(_should_skip_exc).__name__,
-                    _should_skip_exc,
-                )
-                _should_skip = False
 
-            # Broadcast skip decision: allreduce MAX so that if ANY rank wants to
-            # skip (or saw a NaN), ALL ranks skip — keeps optimizer.step() symmetric.
-            # This all_reduce MUST be reached by every rank every step; the
-            # try/except above guarantees that even when should_skip() fails.
+            # Still skip on NaN to avoid corrupting model weights.
             _should_skip = _should_skip or _step_has_nan
-            if dist.is_initialized():
-                _skip_tensor = torch.tensor(
-                    1 if _should_skip else 0,
-                    dtype=torch.int32,
-                    device=torch.device(f"cuda:{torch.cuda.current_device()}"),
-                )
-                dist.all_reduce(_skip_tensor, op=dist.ReduceOp.MAX)
-                _should_skip = _skip_tensor.item() > 0
-            _skip_controller.record_step(skipped=_should_skip, grad_norm=_skip_info_combined_norm)
             if _should_skip:
                 _skip_count += 1
             if _is_main:
