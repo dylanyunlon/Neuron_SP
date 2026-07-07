@@ -799,11 +799,14 @@ class HeteroGradNormSkipController:
         for dc in DeviceClass:
             partial_val = self._accumulator._partials[dc]
             partial_tensor = torch.tensor([partial_val], dtype=torch.float64, device="cpu")
+            # NCCL backend requires CUDA tensors; move to GPU before allreduce
+            # and bring the result back to CPU for subsequent accumulation.
+            partial_tensor = partial_tensor.cuda()
             if norm_type == float("inf"):
                 dist.all_reduce(partial_tensor, op=dist.ReduceOp.MAX, group=self._pg)
             else:
                 dist.all_reduce(partial_tensor, op=dist.ReduceOp.SUM, group=self._pg)
-            self._accumulator._partials[dc] = partial_tensor.item()
+            self._accumulator._partials[dc] = partial_tensor.cpu().item()
 
     @classmethod
     def register(cls, engine) -> None:
