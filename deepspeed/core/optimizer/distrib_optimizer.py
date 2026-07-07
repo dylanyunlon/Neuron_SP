@@ -1453,6 +1453,182 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         return False
 
     # ------------------------------------------------------------------
+    # Gap #3: _copy_model_grads_to_main_grads override
+    # ------------------------------------------------------------------
+    # Megatron's MixedPrecisionOptimizer.prepare_grads() calls this method,
+    # but the parent's implementation iterates self.bf16_model_params /
+    # self.fp32_master_params which are NOT populated in DistributedOptimizer
+    # (it uses flat _fp32_shards instead).
+    #
+    # The distributed path (NCCL reduce-scatter) populates _fp32_grad_shards
+    # directly inside _reduce_scatter_grads(). However, when DDP has already
+    # accumulated gradients into param.main_grad (Megatron's local accumulation
+    # path), prepare_grads() is bypassed and the caller may invoke
+    # _copy_model_grads_to_main_grads() directly. Without this override the
+    # call falls through to the parent NO-OP and Adam sees zero gradients.
+    #
+    # This override performs:
+    #   for each buffer → for each param in the local shard's range
+    #     → copy param.main_grad (or param.grad) slice into _fp32_grad_shards[i]
+    #     → attach the shard as shard_param.grad for the Adam step
+    # ------------------------------------------------------------------
+
+    def _copy_model_grads_to_main_grads(self) -> None:
+        """Copy model param.main_grad slices into FP32 grad shards.
+
+        Called by prepare_grads() on the local-accumulation path (no NCCL
+        reduce-scatter).  On the distributed path, ``_reduce_scatter_grads``
+        populates ``_fp32_grad_shards`` directly from the NCCL output.
+
+        Design
+        ------
+        Each grad buffer maps every model param to a contiguous offset range
+        ``[ps, pe)`` in the flat buffer.  This rank owns the shard range
+        ``[shard_start, shard_end)`` of that buffer.  We copy only the
+        overlapping region, converting BF16 → FP32 in the process.
+
+        After the copy we attach each FP32 grad shard to its corresponding
+        ``_shard_param.grad`` so the Adam step reads it correctly.
+
+        Alignment
+        ---------
+        All copies are contiguous slices — no scatter/gather — so the
+        element-wise BF16→FP32 cast is fully vectorised on CUDA and runs as a
+        single memory-bound kernel.  SM occupancy is irrelevant here
+        (bandwidth bound, not compute bound).
+
+        Warp-level note
+        ---------------
+        torch.Tensor.copy_ with dtype promotion uses CUDA's built-in
+        ``__nv_cvt_bfloat16_to_float`` path (4-wide SIMD on Ampere/Hopper).
+        No shared-memory staging required.
+        """
+        dp_rank: int = self.data_parallel_rank
+
+        for i, (buf, fp32_grad_shard, boundaries) in enumerate(
+            zip(self.param_and_grad_buffers, self._fp32_grad_shards, self._buf_boundaries)
+        ):
+            shard_start, shard_end = boundaries[dp_rank]
+            # Zero the FP32 grad shard before accumulating (handles params
+            # with no grad: they contribute zero, which is correct).
+            fp32_grad_shard.zero_()
+
+            for param, (ps, pe, _) in buf.param_index_map.items():
+                # Determine the overlap between this param's buffer range and
+                # the local shard.  Skip if no overlap.
+                overlap_s = max(ps, shard_start)
+                overlap_e = min(pe, shard_end)
+                if overlap_s >= overlap_e:
+                    continue
+
+                # Resolve the gradient source: prefer .main_grad (Megatron DDP
+                # flat accumulation buffer), fall back to .grad.
+                if hasattr(param, "main_grad") and param.main_grad is not None:
+                    grad_src = param.main_grad.view(-1)
+                elif param.grad is not None:
+                    grad_src = param.grad.view(-1)
+                else:
+                    # No gradient for this param — shard stays zero.
+                    continue
+
+                # Offsets within the FP32 grad shard (rank-local).
+                local_s = overlap_s - shard_start
+                local_e = overlap_e - shard_start
+                # Offsets within the param's own contiguous region.
+                src_s = overlap_s - ps
+                src_e = overlap_e - ps
+
+                # BF16/FP16 → FP32 cast + copy (memory-bound; fully vectorised).
+                fp32_grad_shard[local_s:local_e].copy_(
+                    grad_src[src_s:src_e].float()
+                )
+
+                # Clear source gradient to free memory and avoid double-apply.
+                if hasattr(param, "main_grad") and param.main_grad is not None:
+                    param.main_grad = None
+                else:
+                    param.grad = None
+
+        # Attach the FP32 grad shards to their shard_params so Adam reads them.
+        for shard_param, fp32_grad_shard in zip(self._shard_params, self._fp32_grad_shards):
+            shard_param.grad = fp32_grad_shard
+
+    # ------------------------------------------------------------------
+    # is_stub_optimizer property
+    # ------------------------------------------------------------------
+    # Megatron's ChainedOptimizer.step() and several other places guard
+    # logic on ``optimizer.is_stub_optimizer``. Without this property,
+    # ``getattr(self, 'is_stub_optimizer', False)`` still returns False
+    # (from optimizer.py's default), but having an explicit @property is
+    # cleaner and consistent with the documented class hierarchy.
+
+    @property
+    def is_stub_optimizer(self) -> bool:  # type: ignore[override]
+        """Always False — DistributedOptimizer is a real optimizer."""
+        return False
+
+    # ------------------------------------------------------------------
+    # reload_model_params override
+    # ------------------------------------------------------------------
+    # MixedPrecisionOptimizer.reload_model_params() copies fp32_master_params
+    # back into bf16_model_params — this is a no-op in DistributedOptimizer
+    # because the parameter broadcast is handled by shard_to_model_broadcast().
+    # This override reloads the FP32 shards FROM the current BF16 model params,
+    # which is the correct operation for resume-from-checkpoint / fine-tuning
+    # (you want the checkpoint's weights in the FP32 master copies, not
+    # the randomly-initialised FP32 shards from __init__).
+
+    def reload_model_params(self) -> None:
+        """Reload FP32 shards from current BF16 model params.
+
+        Used at checkpoint resume or fine-tuning initialisation to
+        synchronise the FP32 master weight shards with the BF16 model
+        weights loaded from disk.
+
+        Design
+        ------
+        Iterates every buffer's ``param_index_map``, finds the overlap
+        between each param's buffer range and this rank's shard range, and
+        copies the BF16 weight (converted to FP32) into the corresponding
+        slice of ``_fp32_shards[i]``.
+
+        SM / warp note
+        --------------
+        Element-wise BF16→FP32 cast via ``copy_`` — memory-bound, no shared
+        memory, CUDA's vectorised SIMD path used automatically.
+        """
+        dp_rank: int = self.data_parallel_rank
+
+        for fp32_shard, boundaries, buf in zip(
+            self._fp32_shards, self._buf_boundaries, self.param_and_grad_buffers
+        ):
+            shard_start, shard_end = boundaries[dp_rank]
+
+            for param, (ps, pe, _) in buf.param_index_map.items():
+                overlap_s = max(ps, shard_start)
+                overlap_e = min(pe, shard_end)
+                if overlap_s >= overlap_e:
+                    continue
+
+                local_s = overlap_s - shard_start
+                local_e = overlap_e - shard_start
+                param_s = overlap_s - ps
+                param_e = overlap_e - ps
+
+                # BF16 → FP32 conversion; param.data is a view into the
+                # contiguous buffer so .view(-1) is always safe.
+                fp32_shard[local_s:local_e].copy_(
+                    param.data.view(-1)[param_s:param_e].float()
+                )
+
+        logger.debug(
+            "DistributedOptimizer.reload_model_params: reloaded %d FP32 shards "
+            "from BF16 model params on dp_rank=%d.",
+            len(self._fp32_shards),
+            dp_rank,
+        )
+
+    # ------------------------------------------------------------------
     # DES-LOC moment synchronisation
     # ------------------------------------------------------------------
 
@@ -1877,13 +2053,38 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         - M3811: ``_defer_param_sync`` flag added for FSDP overlap.
         """
         # Gradient clipping on local shard params.
+        # Gap #2 fix: use get_grad_stats_parallel_group() instead of data_parallel_group.
+        # For TP/PP mixed parallelism the correct group for cross-rank norm reduction is
+        # grad_stats_parallel_group (resolves to intra_dist_opt_group when M2456 is active,
+        # otherwise falls back to data_parallel_group). Using data_parallel_group here was
+        # wrong for multi-instance DistOpt setups — norms would be over-reduced.
+        grad_norm: float = 0.0
         if self.config.clip_grad > 0.0:
-            clip_grad_norm(
+            grad_norm = float(clip_grad_norm(
                 parameters=self._shard_params,
                 max_norm=self.config.clip_grad,
                 norm_type=2.0,
-                model_parallel_group=self.data_parallel_group,
+                model_parallel_group=self.get_grad_stats_parallel_group(),
+            ))
+
+        # Gap #1 fix: M4065 grad_norm_skip_threshold — skip the Adam step when the
+        # gradient norm spikes above the configured threshold.  This prevents a single
+        # bad batch from causing divergence (e.g. nan/inf propagation on the next step).
+        # grad_norm_skip_threshold defaults to float('inf'), so existing runs are unaffected
+        # unless the user explicitly sets it in OptimizerConfig.
+        skip_threshold: float = getattr(self.config, 'grad_norm_skip_threshold', float('inf'))
+        if grad_norm > skip_threshold:
+            logger.info(
+                "DistributedOptimizer.step_with_ready_grads: skipping Adam step — "
+                "grad_norm=%.6f > grad_norm_skip_threshold=%.6f (M4065). "
+                "Zero-grading shard params to prevent stale gradients on next step.",
+                grad_norm, skip_threshold,
             )
+            # Zero the grad tensors so they are not re-used on the following step.
+            for sp in self._shard_params:
+                if sp.grad is not None:
+                    sp.grad.zero_()
+            return False
 
         # From Megatron M2356: apply AdamW decoupled weight decay before Adam step.
         self._apply_decoupled_weight_decay()
