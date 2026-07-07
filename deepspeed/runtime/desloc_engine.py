@@ -2453,6 +2453,7 @@ class DesLocEngine:
             gnorm = clip_grad_norm(self.model.parameters(), cfg.grad_clip)
             if torch.is_tensor(gnorm):
                 gnorm = gnorm.item()
+            logger.warning("rank=%d: EXITED clip_grad_norm gnorm=%.6f", dist.get_rank() if dist.is_initialized() else 0, gnorm)
 
             # HeteroGradNorm skip decision via HeteroGradNormSkipController
             # (wired through integrate_with_deepspeed_engine at train() setup).
@@ -2460,17 +2461,32 @@ class DesLocEngine:
             # params as compute-side since DesLocEngine runs on a single device
             # class per rank (anchor/compute split is resolved at init time).
             #
-            # FIX (NCCL hang): should_skip() calls _maybe_allreduce_partials()
-            # which is an allreduce collective.  The skip DECISION must therefore
-            # be identical on all ranks.  We run should_skip() on all ranks (it
-            # is already collective-safe when _pg is set), then broadcast the
-            # boolean result so that any rank-local numeric divergence (e.g. from
-            # FP precision differences between A6000 and H100) cannot cause some
-            # ranks to call optimizer.step() while others do not.
-            _all_grads = [p.grad for p in self.model.parameters()]
-            _should_skip, _skip_info = _skip_controller.should_skip([], _all_grads)
+            # FIX (NCCL hang #151 + remaining): should_skip() calls
+            # _maybe_allreduce_partials() which does 2 separate all_reduces (one
+            # per DeviceClass).  If should_skip() throws on any rank those ranks
+            # exit early while other ranks block forever on the collectives.
+            # We wrap the entire call in try/except so a failing rank still reaches
+            # the mandatory _skip_tensor all_reduce below with skip=False, keeping
+            # collective ordering symmetric across all 3 ranks.
+            _skip_info_combined_norm = 0.0
+            try:
+                _all_grads = [p.grad for p in self.model.parameters()]
+                _should_skip, _skip_info = _skip_controller.should_skip([], _all_grads)
+                _skip_info_combined_norm = _skip_info.combined_norm
+            except Exception as _should_skip_exc:
+                logger.warning(
+                    "rank=%d: should_skip() raised %s — treating as no-skip to preserve "
+                    "collective symmetry; underlying error: %s",
+                    dist.get_rank() if dist.is_initialized() else 0,
+                    type(_should_skip_exc).__name__,
+                    _should_skip_exc,
+                )
+                _should_skip = False
+
             # Broadcast skip decision: allreduce MAX so that if ANY rank wants to
             # skip (or saw a NaN), ALL ranks skip — keeps optimizer.step() symmetric.
+            # This all_reduce MUST be reached by every rank every step; the
+            # try/except above guarantees that even when should_skip() fails.
             _should_skip = _should_skip or _step_has_nan
             if dist.is_initialized():
                 _skip_tensor = torch.tensor(
@@ -2480,14 +2496,14 @@ class DesLocEngine:
                 )
                 dist.all_reduce(_skip_tensor, op=dist.ReduceOp.MAX)
                 _should_skip = _skip_tensor.item() > 0
-            _skip_controller.record_step(skipped=_should_skip, grad_norm=_skip_info.combined_norm)
+            _skip_controller.record_step(skipped=_should_skip, grad_norm=_skip_info_combined_norm)
             if _should_skip:
                 _skip_count += 1
             if _is_main:
                 print(
                     f"[hetero_grad] step={step} loss={step_loss:.4f} grad_norm={gnorm:.6f} "
                     f"skip={_should_skip} total_skips={_skip_count} "
-                    f"ctrl_norm={_skip_info.combined_norm:.6f}"
+                    f"ctrl_norm={_skip_info_combined_norm:.6f}"
                 )
             if not _should_skip:
                 logger.warning("rank=%d: ENTERING optimizer.step", dist.get_rank() if dist.is_initialized() else 0)
