@@ -1938,21 +1938,23 @@ class DesLocEngine:
         # and retain the returned controller to drive should_skip() /
         # record_step() manually inside the loop below.
         _hetero_config = HeteroGradNormConfig()
-        # FIX (NCCL hang): pass the data-parallel process group so that
-        # _maybe_allreduce_partials() inside should_skip() actually performs
-        # the allreduce of partial grad norms across DP ranks.  Without this,
-        # _pg is None and the allreduce is silently skipped, causing ranks to
-        # compute different combined_norm values and therefore diverge on the
-        # skip decision — half the ranks call optimizer.step(), the other half
-        # do not, producing a permanent NCCL deadlock on the next collective.
-        _hetero_pg = (
-            getattr(self, '_ddp_dp_group', None)
-            or (parallel_state.get_data_parallel_group()
-                if parallel_state.is_initialized() else None)
-            or (dist.group.WORLD if dist.is_initialized() else None)
-        )
+        # FIX (post-clip hang #153): _maybe_allreduce_partials() inside
+        # should_skip() issues one all_reduce per DeviceClass (2 total).
+        # When _hetero_pg evaluates differently across ranks (some ranks
+        # resolve a valid pg, others fall back to None), those 2 collectives
+        # are only entered by a subset of ranks while the remainder skip
+        # straight to the _skip_tensor all_reduce below — permanent NCCL hang.
+        #
+        # All thresholds default to inf (feature disabled), so the partial-norm
+        # all_reduces inside should_skip() carry no useful information.
+        # Passing process_group=None disables _maybe_allreduce_partials entirely
+        # and moves the single cross-rank synchronisation point to the
+        # _skip_tensor MAX all_reduce that follows, which is always reached by
+        # every rank unconditionally (guarded by the try/except around
+        # should_skip()).  This keeps collective ordering symmetric at 1
+        # all_reduce per step regardless of how _hetero_pg would have resolved.
         _skip_controller = integrate_with_deepspeed_engine(
-            self, _hetero_config, process_group=_hetero_pg
+            self, _hetero_config, process_group=None
         )
         _skip_count = 0
 
