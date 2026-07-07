@@ -2416,15 +2416,24 @@ def get_inter_distributed_optimizer_instance_group(check_initialized: bool = Tru
 # ---------------------------------------------------------------------------
 
 def get_tier_group(tier_name: str) -> Optional[torch.distributed.ProcessGroup]:
-    """Get the process group for a DES-LOC tier (e.g. 'datacenter', 'professional').
+    """Get the process group for a DES-LOC hardware tier.
+
+    Keys are the lowercase ``GPUTier.value`` strings: ``'a6000'``, ``'h100'``,
+    ``'blackwell'``, ``'unknown'``.  Use :func:`get_tier_group_keys` to enumerate
+    which tiers were actually created for this run.
 
     Returns None if no group was created for the given tier name.
 
     Example::
 
-        tier_grp = get_tier_group('datacenter')
+        tier_grp = get_tier_group('h100')   # H100 intra-tier group
         if tier_grp is not None:
             dist.all_reduce(tensor, group=tier_grp)
+
+        # enumerate all active tiers:
+        for key in get_tier_group_keys():
+            pg = get_tier_group(key)
+            ...
     """
     return _TIER_GROUPS.get(tier_name, None)
 
@@ -2432,6 +2441,22 @@ def get_tier_group(tier_name: str) -> Optional[torch.distributed.ProcessGroup]:
 def get_all_tier_groups() -> Dict[str, torch.distributed.ProcessGroup]:
     """Return a shallow copy of the tier groups dictionary."""
     return dict(_TIER_GROUPS)
+
+
+def get_tier_group_keys() -> List[str]:
+    """Return the sorted list of tier names for which NCCL groups exist.
+
+    Keys are lowercase ``GPUTier.value`` strings, e.g. ``['a6000', 'h100']``.
+    Empty list when tier-aware mode is inactive (no TierMap or desloc_config).
+
+    Useful for iterating over active tiers without hard-coding tier names::
+
+        for tier_name in get_tier_group_keys():
+            pg = get_tier_group(tier_name)
+            ranks = get_tier_ranks(tier_name)
+            logger.info("tier %s: ranks=%s", tier_name, ranks)
+    """
+    return sorted(_TIER_GROUPS.keys())
 
 
 def get_local_tier() -> Optional[TierSpec]:
@@ -2498,7 +2523,12 @@ def get_tier_ranks(tier_name: str) -> List[int]:
 
 def _set_global_memory_buffer() -> None:
     global _GLOBAL_MEMORY_BUFFER
-    assert _GLOBAL_MEMORY_BUFFER is None, "global memory buffer is already initialized"
+    # Idempotent: destroy_model_parallel() clears this, but scaling-law sweeps
+    # may call initialize_model_parallel() multiple times without a full process
+    # restart.  Replacing rather than asserting keeps re-init cycles safe.
+    # (Original Megatron assert is preserved as a debug log.)
+    if _GLOBAL_MEMORY_BUFFER is not None:
+        logger.debug("_set_global_memory_buffer: re-initializing (destroy→re-init cycle)")
     _GLOBAL_MEMORY_BUFFER = GlobalMemoryBuffer()
 
 
