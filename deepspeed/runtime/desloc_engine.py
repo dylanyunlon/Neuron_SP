@@ -1990,12 +1990,9 @@ class DesLocEngine:
 
         _my_rank = dist.get_rank() if dist.is_initialized() else 0
         logger.warning("rank=%d entering training loop (step=%d)", _my_rank, self.global_step)
-        # Barrier here ensures all ranks have finished data loading / init and
-        # are truly entering the loop together before the first collective fires.
-        if dist.is_initialized():
-            dist.barrier()
 
         for step in range(self.global_step, cfg.total_steps):
+            logger.debug("rank=%d for-loop step=%d starting", _my_rank, step)
             # DistributedOptimizer.zero_grad() zeroes its grad_data buffers +
             # shard param grads.  Plain AdamW zero_grad() on the non-ZeRO-3 path.
             self.optimizer.zero_grad(set_to_none=False)
