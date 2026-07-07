@@ -2340,17 +2340,22 @@ class DesLocEngine:
                           dist.get_rank() if dist.is_initialized() else 0,
                           step_loss, _step_has_nan)
             if dist.is_initialized():
-                # All-reduce the NaN flag so every rank agrees before gating any
-                # subsequent NCCL calls (finalize_model_grads, should_skip, etc.).
-                _nan_flag = torch.tensor(
-                    1 if _step_has_nan else 0,
-                    dtype=torch.int32,
-                    device=torch.device(f"cuda:{torch.cuda.current_device()}"),
-                )
-                logger.warning("rank=%d: ENTERING nan_flag allreduce", dist.get_rank())
+                # All-reduce the NaN flag so every rank agrees.
+                # CRITICAL: use torch.distributed.barrier() first to ensure all
+                # ranks have finished their microbatch loops (including any
+                # pending SP/ZeRO collectives on the NCCL stream) before
+                # issuing a new collective.  Without this, cross-stream
+                # dependencies between the NCCL stream and the default stream
+                # cause .item() to deadlock.
+                dist.barrier()
+                _nan_flag = torch.zeros(1, dtype=torch.int32,
+                                        device=torch.device(f"cuda:{torch.cuda.current_device()}"))
+                if _step_has_nan:
+                    _nan_flag.fill_(1)
                 dist.all_reduce(_nan_flag, op=dist.ReduceOp.MAX)
-                logger.warning("rank=%d: EXITED nan_flag allreduce", dist.get_rank())
-                _step_has_nan = _nan_flag.item() > 0
+                # Move to CPU before .item() to avoid default-stream sync on
+                # a tensor that lives on the NCCL stream.
+                _step_has_nan = _nan_flag.cpu().item() > 0
 
             if _step_has_nan:
                 _nan_count = getattr(self, '_nan_count', 0) + 1
