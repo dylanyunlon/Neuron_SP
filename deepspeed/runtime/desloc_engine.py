@@ -2350,11 +2350,7 @@ class DesLocEngine:
                 logger.warning("rank=%d: ENTERING nan_flag allreduce", dist.get_rank())
                 dist.all_reduce(_nan_flag, op=dist.ReduceOp.MAX)
                 logger.warning("rank=%d: EXITED nan_flag allreduce", dist.get_rank())
-                logger.warning("rank=%d: before cuda.synchronize + item()", dist.get_rank())
-                torch.cuda.synchronize()
-                logger.warning("rank=%d: cuda.synchronize done, calling item()", dist.get_rank())
                 _step_has_nan = _nan_flag.item() > 0
-                logger.warning("rank=%d: item() returned, nan=%s", dist.get_rank(), _step_has_nan)
 
             if _step_has_nan:
                 _nan_count = getattr(self, '_nan_count', 0) + 1
