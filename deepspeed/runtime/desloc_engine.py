@@ -2367,16 +2367,6 @@ class DesLocEngine:
             logger.warning("rank=%d: post-microbatch, step_loss=%.4f, nan=%s",
                           dist.get_rank() if dist.is_initialized() else 0,
                           step_loss, _step_has_nan)
-            if dist.is_initialized():
-                # All-reduce the NaN flag so every rank agrees.
-                _nan_flag = torch.zeros(1, dtype=torch.int32,
-                                        device=torch.device(f"cuda:{torch.cuda.current_device()}"))
-                if _step_has_nan:
-                    _nan_flag.fill_(1)
-                dist.all_reduce(_nan_flag, op=dist.ReduceOp.MAX)
-                # Move to CPU before .item() to avoid default-stream sync on
-                # a tensor that lives on the NCCL stream.
-                _step_has_nan = _nan_flag.cpu().item() > 0
 
             if _step_has_nan:
                 _nan_count = getattr(self, '_nan_count', 0) + 1
