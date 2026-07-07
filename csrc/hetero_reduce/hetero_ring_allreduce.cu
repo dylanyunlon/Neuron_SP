@@ -555,6 +555,17 @@ void launch_hetero_ring_reduce_step(
         hetero_ring_reduce_kernel<86><<<grids, bs, 0, stream>>>(
             accum, recv, chunk_elems);
     }
+    // Catch configuration errors (bad grid/block dims, insufficient smem, etc.)
+    // immediately rather than letting them silently corrupt the reduction.
+    {
+        cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            fprintf(stderr,
+                "[hetero_ring_reduce_step] kernel launch failed (SM %d, "
+                "chunk_elems=%zu): %s\n",
+                sm_version, chunk_elems, cudaGetErrorString(err));
+        }
+    }
 }
 
 // Gather-step (all-gather phase): copy recv → output (no addition).
@@ -582,6 +593,15 @@ void launch_hetero_ring_gather_step(
         const int grids = hring_grid_size(chunk_elems, bs, sm_version);
         hetero_ring_gather_kernel<86><<<grids, bs, 0, stream>>>(
             output, recv, chunk_elems);
+    }
+    {
+        cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            fprintf(stderr,
+                "[hetero_ring_gather_step] kernel launch failed (SM %d, "
+                "chunk_elems=%zu): %s\n",
+                sm_version, chunk_elems, cudaGetErrorString(err));
+        }
     }
 }
 

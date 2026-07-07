@@ -359,6 +359,9 @@ at::Tensor pcie_ring_reduce_py(at::Tensor dst,
     check_bf16(src, "src");
     TORCH_CHECK(dst.numel() == src.numel(), "dst/src numel mismatch");
     TORCH_CHECK(dst.numel() % 8 == 0, "numel must be divisible by 8");
+    TORCH_CHECK(dst.numel() > 0, "dst must be non-empty");
+    TORCH_CHECK(dst.device() == src.device(),
+                "dst and src must be on the same CUDA device");
 
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
     launch_pcie_ring_reduce(
@@ -377,6 +380,9 @@ void pcie_allreduce_finalise_py(at::Tensor out,
     check_bf16(src, "src");
     TORCH_CHECK(out.numel() == src.numel(), "out/src numel mismatch");
     TORCH_CHECK(out.numel() % 8 == 0, "numel must be divisible by 8");
+    TORCH_CHECK(out.numel() > 0, "out must be non-empty");
+    TORCH_CHECK(out.device() == src.device(),
+                "out and src must be on the same CUDA device");
     TORCH_CHECK(world_size > 0, "world_size must be > 0");
 
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
@@ -884,6 +890,9 @@ void pcie_ring_reduce_step_py(at::Tensor accum_buf,
                 "accum_buf/recv_buf numel mismatch");
     TORCH_CHECK(accum_buf.numel() % 8 == 0,
                 "numel must be divisible by 8, got ", accum_buf.numel());
+    TORCH_CHECK(accum_buf.numel() > 0, "accum_buf must be non-empty");
+    TORCH_CHECK(accum_buf.device() == recv_buf.device(),
+                "accum_buf and recv_buf must be on the same CUDA device");
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
     launch_pcie_ring_reduce_step(
         reinterpret_cast<__nv_bfloat16*>(accum_buf.data_ptr<at::BFloat16>()),
@@ -1280,6 +1289,9 @@ void pcie_tree_reduce_step_py(at::Tensor accum_buf,
                 "accum_buf/recv_buf numel mismatch");
     TORCH_CHECK(accum_buf.numel() % 8 == 0,
                 "numel must be divisible by 8");
+    TORCH_CHECK(accum_buf.numel() > 0, "accum_buf must be non-empty");
+    TORCH_CHECK(accum_buf.device() == recv_buf.device(),
+                "accum_buf and recv_buf must be on the same CUDA device");
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
     launch_pcie_tree_reduce_step(
         reinterpret_cast<__nv_bfloat16*>(accum_buf.data_ptr<at::BFloat16>()),
@@ -1766,6 +1778,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
               check_bf16(recv_buf,  "recv_buf");
               TORCH_CHECK(accum_buf.numel() == recv_buf.numel(),
                           "accum_buf and recv_buf must have the same number of elements");
+              TORCH_CHECK(accum_buf.numel() > 0, "accum_buf must be non-empty");
+              TORCH_CHECK(accum_buf.device() == recv_buf.device(),
+                          "accum_buf and recv_buf must be on the same CUDA device");
               const size_t n = (size_t)accum_buf.numel();
               cudaStream_t stream = at::cuda::getCurrentCUDAStream();
               launch_hetero_ring_reduce_step(
@@ -1792,6 +1807,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
               check_bf16(recv_buf, "recv_buf");
               TORCH_CHECK(output.numel() == recv_buf.numel(),
                           "output and recv_buf must have the same number of elements");
+              TORCH_CHECK(output.numel() > 0, "output must be non-empty");
+              TORCH_CHECK(output.device() == recv_buf.device(),
+                          "output and recv_buf must be on the same CUDA device");
               const size_t n = (size_t)output.numel();
               cudaStream_t stream = at::cuda::getCurrentCUDAStream();
               launch_hetero_ring_gather_step(

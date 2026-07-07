@@ -658,6 +658,13 @@ void launch_gradient_compress(
         dispatch_compress<90>(out_int8, out_scale, input, n_elems, stream);
     else
         dispatch_compress<86>(out_int8, out_scale, input, n_elems, stream);
+
+    {
+        cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess)
+            fprintf(stderr, "[gradient_compress] kernel launch failed (SM %d, "
+                "n_elems=%zu): %s\n", sm_version, n_elems, cudaGetErrorString(err));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -694,6 +701,13 @@ void launch_int8_ring_reduce_step(
     else
         dispatch_int8_ring_reduce<86>(
             dst_int8, dst_scale, src_int8, src_scale, n_elems, stream);
+
+    {
+        cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess)
+            fprintf(stderr, "[int8_ring_reduce_step] kernel launch failed (SM %d, "
+                "n_elems=%zu): %s\n", sm_version, n_elems, cudaGetErrorString(err));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -724,6 +738,13 @@ void launch_gradient_decompress(
         dispatch_decompress<90>(output, int8_data, scale_buf, n_elems, stream);
     else
         dispatch_decompress<86>(output, int8_data, scale_buf, n_elems, stream);
+
+    {
+        cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess)
+            fprintf(stderr, "[gradient_decompress] kernel launch failed (SM %d, "
+                "n_elems=%zu): %s\n", sm_version, n_elems, cudaGetErrorString(err));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -749,6 +770,13 @@ void launch_gradient_allreduce_finalise(
     const size_t nb    = n_scale_blocks(n_elems);
     const int grid     = (int)std::min((nb + 255) / 256, (size_t)65535);
     scale_blocks_kernel<<<grid, 256, 0, stream>>>(scale_buf, nb, inv_ws);
+    {
+        cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess)
+            fprintf(stderr, "[gradient_allreduce_finalise] kernel launch failed "
+                "(n_elems=%zu, world_size=%d): %s\n",
+                n_elems, world_size, cudaGetErrorString(err));
+    }
 }
 
 // ---------------------------------------------------------------------------

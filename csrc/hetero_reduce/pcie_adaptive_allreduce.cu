@@ -256,6 +256,22 @@ DS_D_INLINE void ar_load8_f32(
     a6 = __bfloat162float(p[6]); a7 = __bfloat162float(p[7]);
 }
 
+// Read-only L2 cache variant: issues LD.GLOBAL.NC.128 (non-coherent) via __ldg.
+// Mirrors hring_ldg8_bf16_as_f32 in hetero_ring_allreduce.cu.
+// Use instead of ar_load8_f32 for read-only (src / recv) buffers.
+DS_D_INLINE void ar_ldg8_f32(
+    const __nv_bfloat16* __restrict__ ptr,
+    float& a0, float& a1, float& a2, float& a3,
+    float& a4, float& a5, float& a6, float& a7)
+{
+    const uint4 r = __ldg(reinterpret_cast<const uint4*>(ptr));
+    const __nv_bfloat16* p = reinterpret_cast<const __nv_bfloat16*>(&r);
+    a0 = __bfloat162float(p[0]); a1 = __bfloat162float(p[1]);
+    a2 = __bfloat162float(p[2]); a3 = __bfloat162float(p[3]);
+    a4 = __bfloat162float(p[4]); a5 = __bfloat162float(p[5]);
+    a6 = __bfloat162float(p[6]); a7 = __bfloat162float(p[7]);
+}
+
 DS_D_INLINE void ar_store8_bf16(
     __nv_bfloat16* __restrict__ ptr,
     float a0, float a1, float a2, float a3,
@@ -308,11 +324,11 @@ pcie_ring_reduce_kernel(
     for (size_t i = tid; i < vec_n; i += stride) {
         const size_t base = i * kARVecWidth;
 
-        // src: read-only L2 cache hint via __ldg
+        // src: read-only L2 cache hint via LD.GLOBAL.NC (ar_ldg8_f32)
         float d0,d1,d2,d3,d4,d5,d6,d7;
         float s0,s1,s2,s3,s4,s5,s6,s7;
         ar_load8_f32(dst + base, d0,d1,d2,d3,d4,d5,d6,d7);
-        ar_load8_f32(__ldg(src + base), s0,s1,s2,s3,s4,s5,s6,s7);
+        ar_ldg8_f32(src + base, s0,s1,s2,s3,s4,s5,s6,s7);
         ar_store8_bf16(dst + base,
             d0+s0, d1+s1, d2+s2, d3+s3,
             d4+s4, d5+s5, d6+s6, d7+s7);
@@ -418,7 +434,7 @@ pcie_ring_reduce_sm120_kernel(
         float d0,d1,d2,d3,d4,d5,d6,d7;
         float s0,s1,s2,s3,s4,s5,s6,s7;
         ar_load8_f32(dst + base, d0,d1,d2,d3,d4,d5,d6,d7);
-        ar_load8_f32(__ldg(src + base), s0,s1,s2,s3,s4,s5,s6,s7);
+        ar_ldg8_f32(src + base, s0,s1,s2,s3,s4,s5,s6,s7);
         ar_store8_bf16(dst + base,
             d0+s0, d1+s1, d2+s2, d3+s3,
             d4+s4, d5+s5, d6+s6, d7+s7);
@@ -467,7 +483,7 @@ pcie_tree_reduce_kernel(
         float d0,d1,d2,d3,d4,d5,d6,d7;
         float s0,s1,s2,s3,s4,s5,s6,s7;
         ar_load8_f32(dst + base, d0,d1,d2,d3,d4,d5,d6,d7);
-        ar_load8_f32(__ldg(src + base), s0,s1,s2,s3,s4,s5,s6,s7);
+        ar_ldg8_f32(src + base, s0,s1,s2,s3,s4,s5,s6,s7);
         ar_store8_bf16(dst + base,
             d0+s0, d1+s1, d2+s2, d3+s3,
             d4+s4, d5+s5, d6+s6, d7+s7);
@@ -502,7 +518,7 @@ pcie_allreduce_finalise_kernel(
     for (size_t i = tid; i < vec_n; i += stride) {
         const size_t base = i * kARVecWidth;
         float a0,a1,a2,a3,a4,a5,a6,a7;
-        ar_load8_f32(__ldg(src + base), a0,a1,a2,a3,a4,a5,a6,a7);
+        ar_ldg8_f32(src + base, a0,a1,a2,a3,a4,a5,a6,a7);
         ar_store8_bf16(out + base,
             a0*inv_world_size, a1*inv_world_size,
             a2*inv_world_size, a3*inv_world_size,
@@ -578,6 +594,10 @@ pcie_gradient_pack_kernel(
 float probe_pcie_bandwidth(int src_device, int dst_device)
 {
     BandwidthCache& entry = g_bw_cache[src_device][dst_device];
+
+    // Return cached result on subsequent calls; bw_gbps == 0.0 means uncached
+    // (g_bw_cache is zero-initialised at file scope).
+    if (entry.bw_gbps > 0.f) return entry.bw_gbps;
 
     void* src_buf = nullptr;
     void* dst_buf = nullptr;
@@ -853,6 +873,13 @@ void launch_pcie_tree_reduce_step(
             <<<std::max(grid,1), kBS, 0, compute_stream>>>(
                 accum_buf, recv_buf, chunk_elems);
     }
+    {
+        cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess)
+            fprintf(stderr, "[pcie_tree_reduce_step] kernel launch failed (SM %d, "
+                "chunk_elems=%zu): %s\n",
+                sm_version, chunk_elems, cudaGetErrorString(err));
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -890,6 +917,13 @@ void launch_pcie_ring_reduce_step(
             <<<std::max(grid,1), kBS, 0, compute_stream>>>(
                 accum_buf, recv_buf, chunk_elems);
     }
+    {
+        cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess)
+            fprintf(stderr, "[pcie_ring_reduce_step] kernel launch failed (SM %d, "
+                "chunk_elems=%zu): %s\n",
+                sm_version, chunk_elems, cudaGetErrorString(err));
+    }
 }
 
 void launch_pcie_gradient_pack(
@@ -926,6 +960,13 @@ void launch_pcie_gradient_pack(
     pcie_gradient_pack_kernel<kPackBS>
         <<<std::max(grid,1), kPackBS, 0, stream>>>(
             bucket, d_chunks, d_prefix, num_chunks, bucket_elems);
+    {
+        cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess)
+            fprintf(stderr, "[pcie_gradient_pack] kernel launch failed "
+                "(num_chunks=%d, bucket_elems=%zu): %s\n",
+                num_chunks, bucket_elems, cudaGetErrorString(err));
+    }
 
     cudaFreeAsync(d_chunks, stream);
     cudaFreeAsync(d_prefix, stream);
@@ -973,5 +1014,12 @@ void launch_pcie_allreduce_finalise(
         pcie_allreduce_finalise_kernel<86>
             <<<std::max(grid,1), kBS, 0, stream>>>(
                 out, src, n_elems, inv_ws);
+    }
+    {
+        cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess)
+            fprintf(stderr, "[pcie_allreduce_finalise] kernel launch failed (SM %d, "
+                "n_elems=%zu): %s\n",
+                sm_version, n_elems, cudaGetErrorString(err));
     }
 }
