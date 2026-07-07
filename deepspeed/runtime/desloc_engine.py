@@ -931,10 +931,32 @@ class DesLocEngine:
         }
 
         # Build layer → device_index mapping from the partition plan.
+        #
+        # ZeRO-3 vs Pipeline distinction matters here:
+        #   ZeRO-3 (ZERO3_HETERO): every rank holds ALL parameters; tier_layer_map
+        #     maps every device_index → full layer list [0..N-1].  Naively iterating
+        #     dict.items() overwrites each layer key on every pass, leaving the LAST
+        #     device_index (iteration order, typically A6000) as the owner of every
+        #     layer — this is the bug that produces "all layers tier=A6000".
+        #     Fix: in ZeRO-3 mode each process owns its OWN device, so map all
+        #     layers to primary_idx (the local rank's CUDA device index).
+        #
+        #   Pipeline 1F1B: tier_layer_map is a true disjoint partition; each
+        #     device_index owns a non-overlapping slice.  The iteration is safe
+        #     and must remain as-is.
         layer_device_map: Dict[int, int] = {}
-        for dev_idx, layer_indices in self.plan.tier_layer_map.items():
-            for li in layer_indices:
-                layer_device_map[li] = dev_idx
+        if self.plan.strategy == PartitionStrategy.ZERO3_HETERO:
+            # ZeRO-3: this rank's activation-checkpoint tier is determined by
+            # the device it is actually running on (primary_idx), not by which
+            # device happens to be last in tier_layer_map iteration order.
+            for li in range(config.num_layers):
+                layer_device_map[li] = primary_idx
+        else:
+            # Pipeline 1F1B (and any future disjoint-partition strategies):
+            # tier_layer_map is a true partition — each entry is exclusive.
+            for dev_idx, layer_indices in self.plan.tier_layer_map.items():
+                for li in layer_indices:
+                    layer_device_map[li] = dev_idx
 
         # Support multiple model backends via unified layer probe.
         block_list = self._get_model_layers()
