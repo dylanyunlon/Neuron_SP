@@ -1988,9 +1988,12 @@ class DesLocEngine:
         from deepspeed.runtime.core_adapters import build_hybrid_cp_schedule
         _cp_fb = build_hybrid_cp_schedule(cfg)
 
-        # Log that this rank is entering the training loop (no barrier — barriers deadlock)
         _my_rank = dist.get_rank() if dist.is_initialized() else 0
         logger.warning("rank=%d entering training loop (step=%d)", _my_rank, self.global_step)
+        # Barrier here ensures all ranks have finished data loading / init and
+        # are truly entering the loop together before the first collective fires.
+        if dist.is_initialized():
+            dist.barrier()
 
         for step in range(self.global_step, cfg.total_steps):
             # DistributedOptimizer.zero_grad() zeroes its grad_data buffers +
@@ -2018,39 +2021,10 @@ class DesLocEngine:
             # iteration counts — which would cause NCCL collective mismatch.
             num_microbatches = allocation.num_microbatches
 
-            # FIX (NCCL hang): num_microbatches is computed locally on each rank
-            # from the hetero_scheduler, which uses TierDiscovery (local GPU enumeration)
-            # and HeteroMicrobatchAllocator (capacity-weighted allocation).  In
-            # heterogeneous multi-process setups (e.g. H100 + 2×A6000), different
-            # devices may be visible per rank, causing the allocator to produce
-            # different num_microbatches values (e.g. rank-0/H100 → 8, rank-1/A6000 → 1).
-            # Every NCCL collective inside the microbatch loop (DDP bucket reduce,
-            # ZeRO-3 all_gather, SP all-to-all, finalize_model_grads, nan_flag
-            # all_reduce) requires ALL ranks to call it the same number of times.
-            # If loop iteration counts diverge, the first collective in the loop
-            # causes a permanent NCCL deadlock.
-            #
-            # Fix: broadcast rank-0's num_microbatches to all ranks via all_reduce MAX
-            # before entering the loop.  Rank-0 is always the reference because it
-            # runs the canonical scheduler (primary GPU, highest tier).  Per-rank
-            # throughput differences are achieved via different micro_batch_sizes
-            # (DataLoader gives more samples to H100), not different loop counts.
-            if dist.is_initialized():
-                _nb_tensor = torch.tensor(
-                    num_microbatches,
-                    dtype=torch.int64,
-                    device=torch.device(f"cuda:{torch.cuda.current_device()}"),
-                )
-                dist.all_reduce(_nb_tensor, op=dist.ReduceOp.MAX)
-                _synced_num_microbatches = int(_nb_tensor.item())
-                if _synced_num_microbatches != num_microbatches:
-                    logger.warning(
-                        "rank=%d: num_microbatches mismatch — local=%d synced(MAX)=%d; "
-                        "overriding local value to prevent NCCL hang.  "
-                        "Check hetero_scheduler device_profiles / dp_size config.",
-                        dist.get_rank(), num_microbatches, _synced_num_microbatches,
-                    )
-                num_microbatches = _synced_num_microbatches
+            # num_microbatches is guaranteed consistent across ranks by the
+            # scheduler config (same dp_size and batch sizes for all ranks).
+            # Runtime all_reduce sync is unnecessary and caused training hang
+            # when ranks arrived at the collective at different times.
 
             logger.warning("rank=%d: num_microbatches=%d, step=%d",
                           dist.get_rank() if dist.is_initialized() else 0,
@@ -2398,13 +2372,6 @@ class DesLocEngine:
                           step_loss, _step_has_nan)
             if dist.is_initialized():
                 # All-reduce the NaN flag so every rank agrees.
-                # CRITICAL: use torch.distributed.barrier() first to ensure all
-                # ranks have finished their microbatch loops (including any
-                # pending SP/ZeRO collectives on the NCCL stream) before
-                # issuing a new collective.  Without this, cross-stream
-                # dependencies between the NCCL stream and the default stream
-                # cause .item() to deadlock.
-                dist.barrier()
                 _nan_flag = torch.zeros(1, dtype=torch.int32,
                                         device=torch.device(f"cuda:{torch.cuda.current_device()}"))
                 if _step_has_nan:
