@@ -2,7 +2,7 @@
 # DeepSpeed Team
 """finalize_model_grads — gradient finalization before optimizer step.
 
-Evolution summary (ported from Megatron-LM finalize_model_grads.py, 15 commits):
+Evolution summary (ported from Megatron-LM finalize_model_grads.py, 16 commits):
   M2282 (76622edf3): pgs_collection — ProcessGroupCollection; pg_collection
       param in finalize_model_grads; tp/pp/embd/pos_embd/dp_cp group routing.
   M2286 (ca9797e95): Revert pgs_collection.
@@ -21,8 +21,11 @@ Evolution summary (ported from Megatron-LM finalize_model_grads.py, 15 commits):
       (tp_dp_cp group for _update_router_expert_bias).
   M4041 (67b2f3878): FSDP full-iteration CUDA graphability — conditional
       param.grad dereferencing in finalize (param.grad = None for FSDP path).
-  M4173 (277c4f804): Offline logits-based knowledge distillation support
-      (knowledge-distillation teacher gradient handling).
+  M4173 (277c4f804): Offline logits-based knowledge distillation — guard
+      _update_router_expert_bias with module.training so that teacher model
+      expert_bias is not updated when teacher is in eval mode.  Also: the
+      model list may contain non-DDP-wrapped teacher chunks; all ddp_config
+      accesses use getattr guards to handle this safely.
   M4149 (DES-LOC):  Fuse per-embedding AllReduce into unified call for PCIe
       topology (fuse_grad_reductions + _allreduce_all_embedding_grads).
       Inspired by Megatron M4149 "Fuse per-sequence AlltoAll into unified".

@@ -56,10 +56,14 @@ from deepspeed.core.distributed.finalize_model_grads import (
     _allreduce_word_embedding_grads,
     _allreduce_position_embedding_grads,
     _allreduce_conditional_embedding_grads,
+    # M3871: Flextron router grad sync across PP stages.
+    _allreduce_router_grads,
     # M-rename: was _allreduce_sequence_parallel_grads in early ports;
     # renamed to _allreduce_non_tensor_model_parallel_grads to match
     # the broader scope (SUM + AVG TP-domain grads, not just SP).
     _allreduce_non_tensor_model_parallel_grads,
+    # Legacy alias maintained for unit tests (mcore 0.14 removal target).
+    _allreduce_layernorm_grads,
     _direct_allreduce_grads,
     _desloc_should_sync_grads,
     _desloc_sync_optimizer_moments,
@@ -149,7 +153,9 @@ __all__ = [
     "_allreduce_word_embedding_grads",
     "_allreduce_position_embedding_grads",
     "_allreduce_conditional_embedding_grads",
+    "_allreduce_router_grads",                      # M3871 Flextron
     "_allreduce_non_tensor_model_parallel_grads",   # was _allreduce_sequence_parallel_grads
+    "_allreduce_layernorm_grads",                   # legacy alias
     "_direct_allreduce_grads",
     "_desloc_should_sync_grads",
     "_desloc_sync_optimizer_moments",

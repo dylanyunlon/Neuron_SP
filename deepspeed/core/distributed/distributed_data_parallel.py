@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # DeepSpeed Team
-"""DistributedDataParallel wrapper with DES-LOC Kx-gated gradient synchronization.
+"""DistributedDataParallel wrapper with DES-LOC Kx/Ku/Kv-gated gradient synchronization.
 
-Evolution summary (ported from Megatron-LM DDP commit history, 24 commits):
+Evolution summary (ported from Megatron-LM DDP commit history, 27 commits):
   M2282 (76622edf3): pgs_collection — ProcessGroupCollection unifying tp/dp_cp/pp/embd.
   M2286 (ca9797e95): Revert pgs_collection.
   M2301 (8c1a3f5df): Replay pgs_collection; add pg_collection support to DDP.
@@ -20,6 +20,7 @@ Evolution summary (ported from Megatron-LM DDP commit history, 24 commits):
   M3146 (36411ddff): Reapply RL offload fix.
   M3442 (f91c4bb37): Fix memory issue in mxfp8 model init.
   M3443 (a2381d800): overlap-param-gather for layer-wise optimizer + unit tests.
+  M3561 (3548385ac): Fix DDP bug with overlap-grad-reduce + num-distributed-optimizer-instances > 1.
   M3616 (c586f6d56): FP32 local gradient accumulation for subset of params.
   M3737 (e1db4a03d): NVFP4 native weights for DDP.
   M3811 (55b8111ad): DDP refactoring — extract param layout into optimizer classmethod;
@@ -30,13 +31,21 @@ Evolution summary (ported from Megatron-LM DDP commit history, 24 commits):
   M4020 (08bad7a48): MXFP8/FP4 post-processing after forced param AG in eval.
   M4036 (88e7ab091): Drain predecessor reduce-scatter at dispatch time
       (previous_grad_reduce_bucket_group linkage).
+  M4041 (67b2f3878): Conditional param.grad dereferencing in backward hook for
+      full-iteration CUDA graph compatibility (cuda_graph_mode config flag).
+  M4163 (1af933d15): Remove duplicate nccl_allocator import (param_and_grad_buffer.py).
 
-DES-LOC extensions:
-  - DistributedDataParallelConfig.allow_skip_grad_sync: enable Kx gating.
-  - finish_grad_sync(force_all_reduce): forwards flag for Kx recovery.
-  - start_grad_sync(skip_sync): gate on Kx step (called by finalize_model_grads).
-  - broadcast_params(): called every Kx step to fix ZeRO-3 shard inconsistency.
-  - no_sync(): context manager for gradient accumulation (multi-microbatch).
+DES-LOC extensions (Algorithm 1 — Kx/Ku/Kv decomposed synchronization):
+  - DistributedDataParallelConfig.allow_skip_grad_sync: enable Kx gating (step-level).
+  - finish_grad_sync(force_all_reduce): forwards Kx recovery flag to bucket groups.
+  - start_grad_sync(skip_sync): gates DP gradient collective on Kx step predicate.
+    On non-Kx steps, gradients accumulate locally; the next Kx step syncs the sum.
+  - broadcast_params(): called every Kx step by desloc_engine to fix ZeRO-3 shard
+    inconsistency that arises from Kx local accumulation steps.
+  - no_sync(): context manager for multi-microbatch gradient accumulation (standard DDP
+    no-sync semantics; orthogonal to Kx gating which operates at step granularity).
+  - finish_param_sync(): DDP-level wrapper waiting on outstanding param all-gathers;
+    absent from upstream Megatron DDP (added here for desloc_engine compatibility).
   - offload_grad_buffers() / restore_grad_buffers(): RL optimizer offload support.
   - Tier-aware gradient bucketing: when a TierMap is available from parallel_state,
     the auto-computed bucket_size is adjusted per GPU hardware tier (A6000 / H100 /

@@ -41,7 +41,10 @@ Evolution summary (ported from Megatron-LM commit history, 32 commits):
       _megatron_fsdp_model ref attachment after DTensor param replacement).
       Our DDP uses predecessor-drain (M4036) + ownership FSM (M3061/M3116)
       instead of FSDP double-buffering; these bugs do not apply.
-  M4163 (1af933d15): Remove duplicate nccl_allocator import.
+  M4163 (1af933d15): Remove duplicate nccl_allocator import. Upstream Megatron
+      imports nccl_allocator at module top-level; we keep lazy try/except import
+      inside ParamAndGradBuffer.__init__ to avoid hard dependency on nccl_allocator
+      when NCCL UB is not in use (nccl_ub=False, which is the default).
 
 DES-LOC extensions:
   - ParamAndGradBucketGroup._skip_sync: gate on Kx steps.
