@@ -1995,6 +1995,41 @@ class DesLocEngine:
             # differences (larger batches on faster GPUs), NOT via different
             # iteration counts — which would cause NCCL collective mismatch.
             num_microbatches = allocation.num_microbatches
+
+            # FIX (NCCL hang): num_microbatches is computed locally on each rank
+            # from the hetero_scheduler, which uses TierDiscovery (local GPU enumeration)
+            # and HeteroMicrobatchAllocator (capacity-weighted allocation).  In
+            # heterogeneous multi-process setups (e.g. H100 + 2×A6000), different
+            # devices may be visible per rank, causing the allocator to produce
+            # different num_microbatches values (e.g. rank-0/H100 → 8, rank-1/A6000 → 1).
+            # Every NCCL collective inside the microbatch loop (DDP bucket reduce,
+            # ZeRO-3 all_gather, SP all-to-all, finalize_model_grads, nan_flag
+            # all_reduce) requires ALL ranks to call it the same number of times.
+            # If loop iteration counts diverge, the first collective in the loop
+            # causes a permanent NCCL deadlock.
+            #
+            # Fix: broadcast rank-0's num_microbatches to all ranks via all_reduce MAX
+            # before entering the loop.  Rank-0 is always the reference because it
+            # runs the canonical scheduler (primary GPU, highest tier).  Per-rank
+            # throughput differences are achieved via different micro_batch_sizes
+            # (DataLoader gives more samples to H100), not different loop counts.
+            if dist.is_initialized():
+                _nb_tensor = torch.tensor(
+                    num_microbatches,
+                    dtype=torch.int64,
+                    device=torch.device(f"cuda:{torch.cuda.current_device()}"),
+                )
+                dist.all_reduce(_nb_tensor, op=dist.ReduceOp.MAX)
+                _synced_num_microbatches = int(_nb_tensor.item())
+                if _synced_num_microbatches != num_microbatches:
+                    logger.warning(
+                        "rank=%d: num_microbatches mismatch — local=%d synced(MAX)=%d; "
+                        "overriding local value to prevent NCCL hang.  "
+                        "Check hetero_scheduler device_profiles / dp_size config.",
+                        dist.get_rank(), num_microbatches, _synced_num_microbatches,
+                    )
+                num_microbatches = _synced_num_microbatches
+
             logger.warning("rank=%d: num_microbatches=%d, step=%d",
                           dist.get_rank() if dist.is_initialized() else 0,
                           num_microbatches, step)
