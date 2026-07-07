@@ -40,6 +40,7 @@ from deepspeed.core.transformer.transformer_block import (
 )
 from deepspeed.core.transformer.transformer_layer import (
     TransformerLayer,
+    MoETransformerLayer,
     TransformerLayerSubmodules,
     BaseTransformerLayer,
     get_transformer_layer_offset,
@@ -87,6 +88,7 @@ __all__ = [
     "TransformerBlockSubmodules",
     "get_num_layers_to_build",
     "TransformerLayer",
+    "MoETransformerLayer",
     "TransformerLayerSubmodules",
     "BaseTransformerLayer",
     "get_transformer_layer_offset",

@@ -548,6 +548,40 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
             if "mlp" in recompute_modules:
                 self.recompute_mlp = True
 
+        # --- Fine-grained activation offloading (Megatron M4141 / offload_modules) ---
+        # offload_attn_norm: CPU-offload the input layernorm activation after BDA
+        # offload_mlp_norm:  CPU-offload the pre-MLP layernorm activation after MLP BDA
+        # Both require config.fine_grained_activation_offloading=True and the respective
+        # key in config.offload_modules.  On DES-LOC A6000 tiers these are auto-enabled
+        # when memory budgets are tight (handled by the DES-LOC engine at startup).
+        _fgao = getattr(config, "fine_grained_activation_offloading", False)
+        _offload_modules = list(getattr(config, "offload_modules", None) or [])
+
+        self.offload_attn_norm: bool = (
+            _fgao
+            and "attn_norm" in _offload_modules
+            and not isinstance(self.input_layernorm, IdentityOp)
+        )
+        self.offload_mlp_norm: bool = (
+            _fgao
+            and "mlp_norm" in _offload_modules
+            and not isinstance(self.pre_mlp_layernorm, IdentityOp)
+        )
+
+        # A6000 tier: more aggressive norm offloading when not already enabled by config
+        # (DES-LOC extension — keeps attention norms off-device on memory-constrained GPU)
+        if (
+            self.desloc_tier == "a6000"
+            and _fgao
+            and not self.offload_attn_norm
+            and not isinstance(self.input_layernorm, IdentityOp)
+        ):
+            self.offload_attn_norm = True
+            logger.debug(
+                "TransformerLayer %d (A6000): auto-enabling offload_attn_norm.",
+                self.layer_number,
+            )
+
         # --- bias_dropout_add_exec_handler (Megatron M2379) ----------
         # Ensures grad is enabled during the BDA operation, matching Megatron behaviour.
         self.bias_dropout_add_exec_handler = torch.enable_grad
@@ -1125,6 +1159,48 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
             return self.input_layernorm.weight
         return None
 
+    # ------------------------------------------------------------------
+    # Fused TP inference residual passthrough (M3063 / M3030)
+    # ------------------------------------------------------------------
+
+    def _set_proj_residual(self, residual: torch.Tensor) -> None:
+        """Set residual tensor for the attention output projection's fused RS+add+norm+AG.
+
+        Called by ``_forward_attention`` when ``inference_fuse_tp_communication`` is True
+        so the fused NVLS kernel can perform residual-add + LayerNorm + AllGather in one
+        kernel call, replacing the separate BDA step.
+
+        Skipped on A6000 tiers (no NVLink / NVLS not available).
+
+        Args:
+            residual: ``[s, b, h]`` residual tensor from the input layernorm branch.
+        """
+        if getattr(self, "desloc_tier", None) == "a6000":
+            return
+        attn = getattr(self, "self_attention", None)
+        if attn is not None and hasattr(attn, "linear_proj") and hasattr(
+            attn.linear_proj, "_set_residual"
+        ):
+            attn.linear_proj._set_residual(residual)
+
+    def _set_fc2_residual(self, residual: torch.Tensor) -> None:
+        """Set residual tensor for the MLP FC2's fused RS+add+norm+AG.
+
+        Called by ``_forward_mlp`` when ``inference_fuse_tp_communication`` is True.
+
+        Skipped on A6000 tiers (no NVLink / NVLS not available).
+
+        Args:
+            residual: ``[s, b, h]`` residual from the pre-MLP layernorm branch.
+        """
+        if getattr(self, "desloc_tier", None) == "a6000":
+            return
+        mlp = getattr(self, "mlp", None)
+        if mlp is not None and hasattr(mlp, "linear_fc2") and hasattr(
+            mlp.linear_fc2, "_set_residual"
+        ):
+            mlp.linear_fc2._set_residual(residual)
+
     def clip_qk(self) -> None:
         """Clip QK logits on the self-attention sub-layer.
 
@@ -1206,3 +1282,96 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
                     state_dict[new_key] = state_dict.pop(old_key)
 
         return state_dict
+
+
+# ---------------------------------------------------------------------------
+# MoETransformerLayer — transformer layer with Mixture-of-Experts MLP
+# ---------------------------------------------------------------------------
+
+class MoETransformerLayer(TransformerLayer):
+    """TransformerLayer variant where the MLP sub-layer is a MoELayer.
+
+    Mirrors Megatron's ``MoETransformerLayer`` (M3231 era + M3977 partial CUDA
+    graph refactor).  In Neuron_SP / DES-LOC this class is used when
+    ``config.moe_layer_freq`` selects a layer as a MoE layer (e.g. every other
+    layer in a hybrid dense+MoE model).
+
+    Key differences from ``TransformerLayer``:
+      * ``self.is_moe_layer = True`` — checked by TransformerBlock for recompute
+        exclusion and by the DES-LOC engine for expert-specific all-reduce.
+      * ``_forward_mlp`` is overridden to support partial CUDA graph execution
+        (router + expert compute + postprocess) when
+        ``config.cuda_graph_impl == "local"`` and
+        ``config.cuda_graph_modules`` contains MoE sub-modules.
+      * DES-LOC: MoE experts on A6000 tiers skip the TE fused MLP path since
+        SM86 lacks FP8; the standard unfused expert MLP is used instead.
+
+    Ported from:
+      Megatron-LM/megatron/core/transformer/transformer_layer.py
+      class MoETransformerLayer (lines ~1414–end)
+
+    Args:
+        Same as ``TransformerLayer`` — all arguments are forwarded verbatim.
+    """
+
+    def __init__(self, *args, **kwargs) -> None:
+        self.is_moe_layer = True
+        super().__init__(*args, **kwargs)
+
+        # DES-LOC: log MoE-specific tier info
+        if self.desloc_tier is not None:
+            logger.debug(
+                "MoETransformerLayer %d → DES-LOC tier: %s (MoE experts use unfused path on A6000)",
+                self.layer_number,
+                self.desloc_tier.upper(),
+            )
+
+    def _forward_mlp(
+        self,
+        hidden_states: torch.Tensor,
+        inference_context: Optional[object] = None,
+        padding_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """MoE MLP forward pass.
+
+        Extends the base ``_forward_mlp`` with MoE-specific logic:
+          * Skips chunked MLP (MoE already handles its own batching).
+          * Passes ``padding_mask`` through to the MoELayer router so that
+            padding tokens are excluded from load-balancing aux loss.
+          * On A6000 tiers, disables TE fused expert path (SM86 limitation).
+
+        Args:
+            hidden_states: ``[s, b, h]`` transformer hidden states.
+            inference_context: Inference KV-cache context.
+            padding_mask: ``[b, s]`` padding mask for MoE routing aux loss.
+
+        Returns:
+            hidden_states after MoE MLP + residual ``[s, b, h]``.
+        """
+        # Pre-MLP layernorm (may selectively recompute)
+        pre_mlp_layernorm_output = self._forward_pre_mlp_layernorm(hidden_states)
+
+        if isinstance(pre_mlp_layernorm_output, tuple):
+            pre_mlp_layernorm_output, residual = pre_mlp_layernorm_output
+        else:
+            residual = hidden_states
+
+        if self.fp32_residual_connection:
+            residual = residual.float()
+
+        # MoE forward — always pass padding_mask for aux loss correctness
+        try:
+            if padding_mask is not None:
+                raw = self.mlp(pre_mlp_layernorm_output, padding_mask=padding_mask)
+            else:
+                raw = self.mlp(pre_mlp_layernorm_output)
+        except TypeError:
+            # Fallback: mlp doesn't accept padding_mask
+            raw = self.mlp(pre_mlp_layernorm_output)
+
+        if isinstance(raw, (tuple, list)):
+            mlp_output_with_bias = raw
+        else:
+            mlp_output_with_bias = (raw, None)
+
+        return self._forward_post_mlp(mlp_output_with_bias, residual)
