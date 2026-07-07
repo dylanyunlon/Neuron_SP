@@ -62,6 +62,11 @@ class HeteroReduceBuilder(CUDAOpBuilder):
     op.gradient_scale_bytes(n_elems) -> int
     op.fused_adam_heterogeneous(params, exp_avg, exp_avg_sq, grads, lr_base, lr_scale, beta1, beta2, bc1, bc2, eps, weight_decay, sm_version, master_params)
     op.hetero_adam_lr_scale(sm_version) -> float
+    op.fused_swiglu_ln_fwd_save(output, rms_inv_out, gate_proj, up_proj, ln_weight, eps, sm_version)
+    op.fused_swiglu_ln_backward(d_gate, d_up, d_ln_weight, d_output, gate_proj, up_proj, ln_weight, rms_inv_buf, eps, sm_version)
+    op.grad_norm_sq(grads, norm_sq_accum, sm_version)
+    op.fused_adamw_amsgrad_heterogeneous(params, exp_avg, exp_avg_sq, exp_avg_sq_max, grads, lr_base, lr_scale, ..., sm_version, master_params)
+    op.pcie_tree_reduce_step(accum_buf, recv_buf, sm_version)
     """
 
     BUILD_VAR = "DS_BUILD_HETERO_REDUCE"

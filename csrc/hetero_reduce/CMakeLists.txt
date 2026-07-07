@@ -155,11 +155,15 @@ target_include_directories(hetero_reduce_kernels PRIVATE
 )
 
 # ─── Optional: enable SM120 async flags for pcie_adaptive_allreduce.cu ───────
+# Note: set_source_files_properties does not support generator expressions in
+# COMPILE_OPTIONS.  Use COMPILE_FLAGS (a plain string) instead so the define
+# is correctly passed to nvcc when building this translation unit.
 if("120" IN_LIST CMAKE_CUDA_ARCHITECTURES)
+    # Convert the list to a space-separated string for COMPILE_FLAGS.
+    string(REPLACE ";" " " _SM120_FLAGS_STR "${HETERO_SM120_EXTRA_FLAGS}")
     set_source_files_properties(
         "${HETERO_REDUCE_DIR}/pcie_adaptive_allreduce.cu"
-        PROPERTIES COMPILE_OPTIONS
-        "$<$<COMPILE_LANGUAGE:CUDA>:${HETERO_SM120_EXTRA_FLAGS}>"
+        PROPERTIES COMPILE_FLAGS "${_SM120_FLAGS_STR}"
     )
 endif()
 

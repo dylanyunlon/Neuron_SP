@@ -999,6 +999,294 @@ void grad_norm_sq_fp8_py(
         fp8_scale, sm_version, stream);
 }
 
+// ---------------------------------------------------------------------------
+// fused_gradient_allreduce bindings  (#146)
+// ---------------------------------------------------------------------------
+
+void gradient_compress_py(at::Tensor output_int8,
+                           at::Tensor output_scale,
+                           at::Tensor input,
+                           int sm_version)
+{
+    TORCH_CHECK(output_int8.scalar_type() == at::ScalarType::Char,
+                "output_int8 must be Int8");
+    TORCH_CHECK(output_int8.is_cuda() && output_int8.is_contiguous());
+    check_fp32(output_scale, "output_scale");
+    check_bf16(input, "input");
+
+    const size_t n_elems = (size_t)input.numel();
+    TORCH_CHECK((size_t)output_int8.numel() >= n_elems,
+                "output_int8 too small");
+    const size_t n_blocks = (n_elems + 255) / 256;
+    TORCH_CHECK((size_t)output_scale.numel() >= n_blocks,
+                "output_scale too small: need ", n_blocks, " got ", output_scale.numel());
+
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    launch_gradient_compress(
+        reinterpret_cast<int8_t*>(output_int8.data_ptr<int8_t>()),
+        output_scale.data_ptr<float>(),
+        reinterpret_cast<const __nv_bfloat16*>(input.data_ptr<at::BFloat16>()),
+        n_elems, sm_version, stream);
+}
+
+void int8_ring_reduce_step_py(at::Tensor dst_int8,
+                                at::Tensor dst_scale,
+                                at::Tensor src_int8,
+                                at::Tensor src_scale,
+                                int sm_version)
+{
+    TORCH_CHECK(dst_int8.scalar_type() == at::ScalarType::Char, "dst_int8 must be Int8");
+    TORCH_CHECK(src_int8.scalar_type() == at::ScalarType::Char, "src_int8 must be Int8");
+    TORCH_CHECK(dst_int8.is_cuda() && dst_int8.is_contiguous());
+    TORCH_CHECK(src_int8.is_cuda() && src_int8.is_contiguous());
+    check_fp32(dst_scale, "dst_scale");
+    check_fp32(src_scale, "src_scale");
+    TORCH_CHECK(dst_int8.numel() == src_int8.numel(), "dst/src int8 numel mismatch");
+    TORCH_CHECK(dst_scale.numel() == src_scale.numel(), "dst/src scale numel mismatch");
+
+    const size_t n_elems = (size_t)dst_int8.numel();
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    launch_int8_ring_reduce_step(
+        reinterpret_cast<int8_t*>(dst_int8.data_ptr<int8_t>()),
+        dst_scale.data_ptr<float>(),
+        reinterpret_cast<const int8_t*>(src_int8.data_ptr<int8_t>()),
+        src_scale.data_ptr<float>(),
+        n_elems, sm_version, stream);
+}
+
+void gradient_decompress_py(at::Tensor output,
+                              at::Tensor int8_data,
+                              at::Tensor scale_buf,
+                              int sm_version)
+{
+    check_bf16(output, "output");
+    TORCH_CHECK(int8_data.scalar_type() == at::ScalarType::Char, "int8_data must be Int8");
+    TORCH_CHECK(int8_data.is_cuda() && int8_data.is_contiguous());
+    check_fp32(scale_buf, "scale_buf");
+    TORCH_CHECK(output.numel() == int8_data.numel(), "output/int8_data numel mismatch");
+
+    const size_t n_elems = (size_t)output.numel();
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    launch_gradient_decompress(
+        reinterpret_cast<__nv_bfloat16*>(output.data_ptr<at::BFloat16>()),
+        reinterpret_cast<const int8_t*>(int8_data.data_ptr<int8_t>()),
+        scale_buf.data_ptr<float>(),
+        n_elems, sm_version, stream);
+}
+
+void gradient_allreduce_finalise_py(at::Tensor scale_buf,
+                                      int64_t n_elems,
+                                      int world_size)
+{
+    check_fp32(scale_buf, "scale_buf");
+    TORCH_CHECK(n_elems > 0, "n_elems must be > 0");
+    TORCH_CHECK(world_size > 0, "world_size must be > 0");
+
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    launch_gradient_allreduce_finalise(
+        scale_buf.data_ptr<float>(),
+        (size_t)n_elems, world_size, stream);
+}
+
+int64_t gradient_compress_bytes_py(int64_t n_elems)
+{
+    return (int64_t)gradient_compress_bytes((size_t)n_elems);
+}
+
+int64_t gradient_scale_bytes_py(int64_t n_elems)
+{
+    return (int64_t)gradient_scale_bytes((size_t)n_elems);
+}
+
+// ---------------------------------------------------------------------------
+// fused_swiglu_ln forward-save & backward bindings  (#146)
+// ---------------------------------------------------------------------------
+
+void fused_swiglu_ln_fwd_save_py(at::Tensor output,
+                                   at::Tensor rms_inv_out,
+                                   at::Tensor gate_proj,
+                                   at::Tensor up_proj,
+                                   at::Tensor ln_weight,
+                                   float eps,
+                                   int sm_version)
+{
+    check_bf16(output,    "output");
+    check_fp32(rms_inv_out, "rms_inv_out");
+    check_bf16(gate_proj, "gate_proj");
+    check_bf16(up_proj,   "up_proj");
+    check_fp32(ln_weight, "ln_weight");
+
+    TORCH_CHECK(output.dim() == 2,    "output must be 2-D [batch, hidden]");
+    TORCH_CHECK(gate_proj.dim() == 2, "gate_proj must be 2-D");
+    TORCH_CHECK(up_proj.dim() == 2,   "up_proj must be 2-D");
+
+    const int batch  = (int)output.size(0);
+    const int hidden = (int)output.size(1);
+    TORCH_CHECK(hidden % 8 == 0, "hidden must be divisible by 8");
+    TORCH_CHECK(gate_proj.size(0) == batch && gate_proj.size(1) == hidden, "gate_proj shape mismatch");
+    TORCH_CHECK(up_proj.size(0) == batch && up_proj.size(1) == hidden, "up_proj shape mismatch");
+    TORCH_CHECK(ln_weight.numel() == hidden, "ln_weight numel must equal hidden");
+    TORCH_CHECK(rms_inv_out.numel() == batch, "rms_inv_out must have numel == batch");
+
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    launch_fused_swiglu_ln_fwd_save(
+        reinterpret_cast<__nv_bfloat16*>(output.data_ptr<at::BFloat16>()),
+        rms_inv_out.data_ptr<float>(),
+        reinterpret_cast<const __nv_bfloat16*>(gate_proj.data_ptr<at::BFloat16>()),
+        reinterpret_cast<const __nv_bfloat16*>(up_proj.data_ptr<at::BFloat16>()),
+        ln_weight.data_ptr<float>(),
+        batch, hidden, eps, sm_version, stream);
+}
+
+void fused_swiglu_ln_backward_py(at::Tensor d_gate,
+                                   at::Tensor d_up,
+                                   at::Tensor d_ln_weight,
+                                   at::Tensor d_output,
+                                   at::Tensor gate_proj,
+                                   at::Tensor up_proj,
+                                   at::Tensor ln_weight,
+                                   at::Tensor rms_inv_buf,
+                                   float eps,
+                                   int sm_version)
+{
+    check_bf16(d_gate,     "d_gate");
+    check_bf16(d_up,       "d_up");
+    check_fp32(d_ln_weight, "d_ln_weight");
+    check_bf16(d_output,   "d_output");
+    check_bf16(gate_proj,  "gate_proj");
+    check_bf16(up_proj,    "up_proj");
+    check_fp32(ln_weight,  "ln_weight");
+    check_fp32(rms_inv_buf, "rms_inv_buf");
+
+    TORCH_CHECK(d_output.dim() == 2, "d_output must be 2-D [batch, hidden]");
+    const int batch  = (int)d_output.size(0);
+    const int hidden = (int)d_output.size(1);
+    TORCH_CHECK(hidden % 8 == 0, "hidden must be divisible by 8");
+    TORCH_CHECK(d_gate.sizes() == d_output.sizes(), "d_gate shape mismatch");
+    TORCH_CHECK(d_up.sizes() == d_output.sizes(), "d_up shape mismatch");
+    TORCH_CHECK(gate_proj.sizes() == d_output.sizes(), "gate_proj shape mismatch");
+    TORCH_CHECK(up_proj.sizes() == d_output.sizes(), "up_proj shape mismatch");
+    TORCH_CHECK(d_ln_weight.numel() == hidden, "d_ln_weight numel must equal hidden");
+    TORCH_CHECK(ln_weight.numel() == hidden, "ln_weight numel must equal hidden");
+    TORCH_CHECK(rms_inv_buf.numel() == batch, "rms_inv_buf numel must equal batch");
+
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    launch_fused_swiglu_ln_backward(
+        reinterpret_cast<__nv_bfloat16*>(d_gate.data_ptr<at::BFloat16>()),
+        reinterpret_cast<__nv_bfloat16*>(d_up.data_ptr<at::BFloat16>()),
+        d_ln_weight.data_ptr<float>(),
+        reinterpret_cast<const __nv_bfloat16*>(d_output.data_ptr<at::BFloat16>()),
+        reinterpret_cast<const __nv_bfloat16*>(gate_proj.data_ptr<at::BFloat16>()),
+        reinterpret_cast<const __nv_bfloat16*>(up_proj.data_ptr<at::BFloat16>()),
+        ln_weight.data_ptr<float>(),
+        rms_inv_buf.data_ptr<float>(),
+        batch, hidden, eps, sm_version, stream);
+}
+
+// ---------------------------------------------------------------------------
+// grad_norm_sq binding  (#146)
+// ---------------------------------------------------------------------------
+
+void grad_norm_sq_py(at::Tensor grads,
+                      at::Tensor norm_sq_accum,
+                      int sm_version)
+{
+    check_bf16(grads, "grads");
+    check_fp32(norm_sq_accum, "norm_sq_accum");
+    TORCH_CHECK(norm_sq_accum.numel() == 1, "norm_sq_accum must be scalar");
+
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    launch_grad_norm_sq(
+        reinterpret_cast<const __nv_bfloat16*>(grads.data_ptr<at::BFloat16>()),
+        (size_t)grads.numel(),
+        norm_sq_accum.data_ptr<float>(),
+        sm_version, stream);
+}
+
+// ---------------------------------------------------------------------------
+// fused_adamw_amsgrad_heterogeneous binding  (#146)
+// ---------------------------------------------------------------------------
+
+void fused_adamw_amsgrad_heterogeneous_py(
+    at::Tensor  params,
+    at::Tensor  exp_avg,
+    at::Tensor  exp_avg_sq,
+    at::Tensor  exp_avg_sq_max,
+    at::Tensor  grads,
+    float       lr_base,
+    float       lr_scale,
+    float       beta1,
+    float       beta2,
+    float       bc1,
+    float       bc2,
+    float       eps,
+    float       weight_decay,
+    float       clip_scale,
+    float       fp8_grad_scale,
+    int         grad_dtype,
+    int         sm_version,
+    at::Tensor  master_params_opt)
+{
+    check_bf16(params,  "params");
+    check_fp32(exp_avg,       "exp_avg");
+    check_fp32(exp_avg_sq,    "exp_avg_sq");
+    check_fp32(exp_avg_sq_max, "exp_avg_sq_max");
+    TORCH_CHECK(grads.is_cuda() && grads.is_contiguous(), "grads must be contiguous CUDA tensor");
+
+    const size_t n_elems = (size_t)params.numel();
+    TORCH_CHECK((size_t)exp_avg.numel()       == n_elems, "exp_avg numel mismatch");
+    TORCH_CHECK((size_t)exp_avg_sq.numel()    == n_elems, "exp_avg_sq numel mismatch");
+    TORCH_CHECK((size_t)exp_avg_sq_max.numel() == n_elems, "exp_avg_sq_max numel mismatch");
+    TORCH_CHECK(lr_base > 0.f, "lr_base must be positive");
+    TORCH_CHECK(lr_scale > 0.f, "lr_scale must be positive");
+    TORCH_CHECK(bc1 > 0.f && bc2 > 0.f, "bias corrections must be positive");
+    TORCH_CHECK(eps > 0.f, "eps must be positive");
+    TORCH_CHECK(clip_scale > 0.f, "clip_scale must be positive");
+
+    float* master_ptr = nullptr;
+    if (master_params_opt.defined() && master_params_opt.numel() > 0) {
+        check_fp32(master_params_opt, "master_params");
+        TORCH_CHECK(master_params_opt.is_contiguous());
+        TORCH_CHECK((size_t)master_params_opt.numel() == n_elems, "master_params numel mismatch");
+        master_ptr = master_params_opt.data_ptr<float>();
+    }
+
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    launch_fused_adamw_amsgrad_heterogeneous(
+        reinterpret_cast<__nv_bfloat16*>(params.data_ptr<at::BFloat16>()),
+        master_ptr,
+        exp_avg.data_ptr<float>(),
+        exp_avg_sq.data_ptr<float>(),
+        exp_avg_sq_max.data_ptr<float>(),
+        grads.data_ptr(),
+        n_elems,
+        lr_base, lr_scale,
+        beta1, beta2, bc1, bc2, eps, weight_decay,
+        clip_scale, fp8_grad_scale, grad_dtype,
+        sm_version, stream);
+}
+
+// ---------------------------------------------------------------------------
+// pcie_tree_reduce_step binding  (#146)
+// ---------------------------------------------------------------------------
+
+void pcie_tree_reduce_step_py(at::Tensor accum_buf,
+                                at::Tensor recv_buf,
+                                int sm_version)
+{
+    check_bf16(accum_buf, "accum_buf");
+    check_bf16(recv_buf,  "recv_buf");
+    TORCH_CHECK(accum_buf.numel() == recv_buf.numel(),
+                "accum_buf/recv_buf numel mismatch");
+    TORCH_CHECK(accum_buf.numel() % 8 == 0,
+                "numel must be divisible by 8");
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    launch_pcie_tree_reduce_step(
+        reinterpret_cast<__nv_bfloat16*>(accum_buf.data_ptr<at::BFloat16>()),
+        reinterpret_cast<const __nv_bfloat16*>(recv_buf.data_ptr<at::BFloat16>()),
+        (size_t)accum_buf.numel(), sm_version, stream);
+}
+
 // PYBIND11_MODULE
 // ---------------------------------------------------------------------------
 
@@ -1551,6 +1839,202 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           "Args:\n"
           "  sm_version (int): 86, 90, or 120\n"
           "Returns: int (thread-block size)",
+          py::arg("sm_version") = 86);
+
+    // -----------------------------------------------------------------------
+    // fused_gradient_allreduce — INT8 compressed ring allreduce  (#146)
+    // -----------------------------------------------------------------------
+    m.def("gradient_compress",
+          &gradient_compress_py,
+          "Compress BF16 gradient to INT8 with per-block FP32 scales.\n"
+          "Block size = 256 elements.\n"
+          "Args:\n"
+          "  output_int8  (Tensor Int8  [N]): compressed output\n"
+          "  output_scale (Tensor FP32  [ceil(N/256)]): per-block scales\n"
+          "  input        (Tensor BF16  [N]): input gradient\n"
+          "  sm_version   (int): 86, 90, or 120",
+          py::arg("output_int8"),
+          py::arg("output_scale"),
+          py::arg("input"),
+          py::arg("sm_version") = 86);
+
+    m.def("int8_ring_reduce_step",
+          &int8_ring_reduce_step_py,
+          "Fused INT8 ring-allreduce accumulation step.\n"
+          "Dequantises dst and src, sums, re-quantises in-place.\n"
+          "Args:\n"
+          "  dst_int8  (Tensor Int8  [N]): accumulator (modified in-place)\n"
+          "  dst_scale (Tensor FP32  [ceil(N/256)]): dst per-block scales\n"
+          "  src_int8  (Tensor Int8  [N]): received chunk from ring peer\n"
+          "  src_scale (Tensor FP32  [ceil(N/256)]): src per-block scales\n"
+          "  sm_version (int): 86, 90, or 120",
+          py::arg("dst_int8"),
+          py::arg("dst_scale"),
+          py::arg("src_int8"),
+          py::arg("src_scale"),
+          py::arg("sm_version") = 86);
+
+    m.def("gradient_decompress",
+          &gradient_decompress_py,
+          "Decompress INT8 + per-block scales back to BF16.\n"
+          "Args:\n"
+          "  output    (Tensor BF16  [N]): decompressed output\n"
+          "  int8_data (Tensor Int8  [N]): compressed data\n"
+          "  scale_buf (Tensor FP32  [ceil(N/256)]): per-block scales\n"
+          "  sm_version (int): 86, 90, or 120",
+          py::arg("output"),
+          py::arg("int8_data"),
+          py::arg("scale_buf"),
+          py::arg("sm_version") = 86);
+
+    m.def("gradient_allreduce_finalise",
+          &gradient_allreduce_finalise_py,
+          "Apply averaging (divide scales by world_size) after ring reduce.\n"
+          "Args:\n"
+          "  scale_buf   (Tensor FP32): per-block scales (modified in-place)\n"
+          "  n_elems     (int): total gradient elements\n"
+          "  world_size  (int): number of participating ranks",
+          py::arg("scale_buf"),
+          py::arg("n_elems"),
+          py::arg("world_size"));
+
+    m.def("gradient_compress_bytes",
+          &gradient_compress_bytes_py,
+          "Return INT8 staging buffer size (bytes) for n_elems gradient elements.\n"
+          "Args:\n"
+          "  n_elems (int): number of BF16 gradient elements\n"
+          "Returns: int (bytes)",
+          py::arg("n_elems"));
+
+    m.def("gradient_scale_bytes",
+          &gradient_scale_bytes_py,
+          "Return per-block scale buffer size (bytes) for n_elems gradient elements.\n"
+          "Args:\n"
+          "  n_elems (int): number of BF16 gradient elements\n"
+          "Returns: int (bytes)",
+          py::arg("n_elems"));
+
+    // -----------------------------------------------------------------------
+    // fused_swiglu_ln forward-save & backward  (#146)
+    // -----------------------------------------------------------------------
+    m.def("fused_swiglu_ln_fwd_save",
+          &fused_swiglu_ln_fwd_save_py,
+          "Forward SwiGLU + RMSNorm, saving rms_inv for backward.\n"
+          "Args:\n"
+          "  output      (Tensor BF16  [B, H]): fused output\n"
+          "  rms_inv_out (Tensor FP32  [B]):    saved 1/rms per row\n"
+          "  gate_proj   (Tensor BF16  [B, H]): gate projection\n"
+          "  up_proj     (Tensor BF16  [B, H]): up projection\n"
+          "  ln_weight   (Tensor FP32  [H]):    RMSNorm scale\n"
+          "  eps         (float): RMSNorm epsilon\n"
+          "  sm_version  (int): 86, 90, or 120",
+          py::arg("output"),
+          py::arg("rms_inv_out"),
+          py::arg("gate_proj"),
+          py::arg("up_proj"),
+          py::arg("ln_weight"),
+          py::arg("eps") = 1e-6f,
+          py::arg("sm_version") = 86);
+
+    m.def("fused_swiglu_ln_backward",
+          &fused_swiglu_ln_backward_py,
+          "Backward pass for fused SwiGLU + RMSNorm.\n"
+          "d_ln_weight must be zeroed before the first call; gradients accumulate\n"
+          "via atomicAdd across the batch.\n"
+          "Args:\n"
+          "  d_gate      (Tensor BF16  [B, H]): gradient w.r.t. gate_proj\n"
+          "  d_up        (Tensor BF16  [B, H]): gradient w.r.t. up_proj\n"
+          "  d_ln_weight (Tensor FP32  [H]):    gradient w.r.t. ln_weight (accumulated)\n"
+          "  d_output    (Tensor BF16  [B, H]): upstream gradient\n"
+          "  gate_proj   (Tensor BF16  [B, H]): saved gate projection from forward\n"
+          "  up_proj     (Tensor BF16  [B, H]): saved up projection from forward\n"
+          "  ln_weight   (Tensor FP32  [H]):    RMSNorm scale\n"
+          "  rms_inv_buf (Tensor FP32  [B]):    saved 1/rms from fwd_save\n"
+          "  eps         (float): RMSNorm epsilon\n"
+          "  sm_version  (int): 86, 90, or 120",
+          py::arg("d_gate"),
+          py::arg("d_up"),
+          py::arg("d_ln_weight"),
+          py::arg("d_output"),
+          py::arg("gate_proj"),
+          py::arg("up_proj"),
+          py::arg("ln_weight"),
+          py::arg("rms_inv_buf"),
+          py::arg("eps") = 1e-6f,
+          py::arg("sm_version") = 86);
+
+    // -----------------------------------------------------------------------
+    // grad_norm_sq — BF16 gradient L2 norm squared  (#146)
+    // -----------------------------------------------------------------------
+    m.def("grad_norm_sq",
+          &grad_norm_sq_py,
+          "Accumulate gradient L2 norm squared for BF16 gradients.\n"
+          "Caller must zero norm_sq_accum before the first call per step.\n"
+          "Args:\n"
+          "  grads         (Tensor BF16 [N]): gradient buffer\n"
+          "  norm_sq_accum (Tensor FP32 [1]): accumulator (add to, not reset)\n"
+          "  sm_version    (int): 86, 90, or 120",
+          py::arg("grads"),
+          py::arg("norm_sq_accum"),
+          py::arg("sm_version") = 86);
+
+    // -----------------------------------------------------------------------
+    // fused_adamw_amsgrad_heterogeneous — AMSGrad + gradient clipping  (#146)
+    // -----------------------------------------------------------------------
+    m.def("fused_adamw_amsgrad_heterogeneous",
+          &fused_adamw_amsgrad_heterogeneous_py,
+          "Fused AdamW with AMSGrad, per-tier LR scaling, gradient clipping,\n"
+          "and optional FP8-E4M3 gradient input.\n"
+          "Args:\n"
+          "  params          (Tensor BF16 [N]): working parameters\n"
+          "  exp_avg         (Tensor FP32 [N]): first moment\n"
+          "  exp_avg_sq      (Tensor FP32 [N]): second moment\n"
+          "  exp_avg_sq_max  (Tensor FP32 [N]): AMSGrad running max of v_hat\n"
+          "  grads           (Tensor [N]): gradients (BF16 or FP8 per grad_dtype)\n"
+          "  lr_base         (float): base learning rate\n"
+          "  lr_scale        (float): per-tier LR multiplier\n"
+          "  beta1           (float): Adam beta1\n"
+          "  beta2           (float): Adam beta2\n"
+          "  bc1             (float): bias-correction-1 = 1/(1-beta1^step)\n"
+          "  bc2             (float): bias-correction-2 = 1/(1-beta2^step)\n"
+          "  eps             (float): Adam epsilon\n"
+          "  weight_decay    (float): decoupled weight-decay\n"
+          "  clip_scale      (float): gradient clip scale, min(1, clip_norm/grad_norm)\n"
+          "  fp8_grad_scale  (float): FP8 per-tensor scale (1.0 for BF16)\n"
+          "  grad_dtype      (int): 0=BF16, 1=FP8-E4M3\n"
+          "  sm_version      (int): 86, 90, or 120\n"
+          "  master_params   (Tensor FP32 [N]): optional FP32 master copy",
+          py::arg("params"),
+          py::arg("exp_avg"),
+          py::arg("exp_avg_sq"),
+          py::arg("exp_avg_sq_max"),
+          py::arg("grads"),
+          py::arg("lr_base"),
+          py::arg("lr_scale"),
+          py::arg("beta1")          = 0.9f,
+          py::arg("beta2")          = 0.999f,
+          py::arg("bc1")            = 1.f,
+          py::arg("bc2")            = 1.f,
+          py::arg("eps")            = 1e-8f,
+          py::arg("weight_decay")   = 0.f,
+          py::arg("clip_scale")     = 1.f,
+          py::arg("fp8_grad_scale") = 1.f,
+          py::arg("grad_dtype")     = 0,
+          py::arg("sm_version")     = 86,
+          py::arg("master_params")  = at::Tensor());
+
+    // -----------------------------------------------------------------------
+    // pcie_tree_reduce_step — tree-topology reduce  (#146)
+    // -----------------------------------------------------------------------
+    m.def("pcie_tree_reduce_step",
+          &pcie_tree_reduce_step_py,
+          "Single tree-topology reduce step: accum_buf += recv_buf (BF16).\n"
+          "Args:\n"
+          "  accum_buf  (Tensor BF16 [N]): local accumulator (modified in-place)\n"
+          "  recv_buf   (Tensor BF16 [N]): received chunk from child node\n"
+          "  sm_version (int): 86, 90, or 120",
+          py::arg("accum_buf"),
+          py::arg("recv_buf"),
           py::arg("sm_version") = 86);
 
 
