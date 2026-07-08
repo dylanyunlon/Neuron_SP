@@ -2477,8 +2477,10 @@ class DesLocEngine:
                 )
             if not _should_skip:
                 logger.warning("rank=%d: ENTERING optimizer.step", dist.get_rank() if dist.is_initialized() else 0)
-                # [DES-LOC HOTFIX] Skip reduce_scatter — causes NCCL hang.
-                # ZeRO-3 grads are already on each rank from backward pass.
+                # Drain all pending NCCL ops (SP allreduce from fwd/bwd)
+                # before AdamW reads param.grad, which triggers implicit sync.
+                torch.cuda.synchronize()
+                logger.warning("rank=%d: cuda.synchronize done, calling AdamW.step()", dist.get_rank() if dist.is_initialized() else 0)
                 self.optimizer.step()
                 self.scheduler.step()
                 logger.warning("rank=%d: EXITED optimizer.step", dist.get_rank() if dist.is_initialized() else 0)
