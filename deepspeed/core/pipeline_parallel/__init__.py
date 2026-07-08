@@ -60,6 +60,7 @@ from deepspeed.core.pipeline_parallel.schedules import (
     forward_backward_pipelining_with_interleaving,
     # DES-LOC heterogeneous schedules
     forward_backward_pipelining_without_interleaving_pp5_heterogeneous,
+    forward_backward_hetero_1f1b,
     # DES-LOC bubble filling (full implementation, replaces stub)
     StageClock,
     AsymmetricClockScheduler,
@@ -151,6 +152,7 @@ __all__ = [
     "forward_backward_pipelining_with_interleaving",
     # DES-LOC heterogeneous schedules
     "forward_backward_pipelining_without_interleaving_pp5_heterogeneous",
+    "forward_backward_hetero_1f1b",
     # DES-LOC bubble filling (full implementation)
     "StageClock",
     "AsymmetricClockScheduler",
