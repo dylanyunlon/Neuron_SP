@@ -58,4 +58,14 @@ Utilities
 
 from .hetero_reduce_op import HeteroReduceOp
 
-__all__ = ["HeteroReduceOp"]
+# Re-export HeteroReduceBuilder so callers can do:
+#   from deepspeed.ops.hetero_reduce import HeteroReduceBuilder
+try:
+    from deepspeed.ops.op_builder.hetero_reduce import HeteroReduceBuilder
+except ImportError:
+    try:
+        from op_builder.hetero_reduce import HeteroReduceBuilder
+    except ImportError:
+        HeteroReduceBuilder = None
+
+__all__ = ["HeteroReduceOp", "HeteroReduceBuilder"]

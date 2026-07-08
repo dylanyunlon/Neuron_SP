@@ -175,6 +175,12 @@ template <int SmVer> struct ARPolicy {
     static constexpr int kBlockSize      = 256;
     static constexpr int kMinBlocksPerSM = 2;
 };
+template <> struct ARPolicy<86> {
+    // A6000: 84 SMs, 48 GB GDDR6X, 6 MB L2.
+    // 256 threads, 2 CTAs/SM — conservative for register headroom.
+    static constexpr int kBlockSize      = 256;
+    static constexpr int kMinBlocksPerSM = 2;
+};
 template <> struct ARPolicy<90> {
     static constexpr int kBlockSize      = 256;
     static constexpr int kMinBlocksPerSM = 4;

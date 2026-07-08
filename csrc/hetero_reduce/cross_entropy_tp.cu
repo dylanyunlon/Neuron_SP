@@ -66,22 +66,22 @@
 // in production it writes to stderr and is a no-op (caller stream stays valid).
 #ifndef DS_LAUNCH_CHECK
 #  ifdef NDEBUG
-#    define DS_LAUNCH_CHECK(stream)                                              \\
-       do {                                                                      \\
-           cudaError_t _e = cudaGetLastError();                                  \\
-           if (_e != cudaSuccess)                                                \\
-               fprintf(stderr, "[hetero_reduce] kernel launch error: %s (%s:%d)\\n",\\
-                       cudaGetErrorString(_e), __FILE__, __LINE__);              \\
+#    define DS_LAUNCH_CHECK(stream)                                              \
+       do {                                                                      \
+           cudaError_t _e = cudaGetLastError();                                  \
+           if (_e != cudaSuccess)                                                \
+               fprintf(stderr, "[hetero_reduce] kernel launch error: %s (%s:%d)\n",\
+                       cudaGetErrorString(_e), __FILE__, __LINE__);              \
        } while (0)
 #  else
-#    define DS_LAUNCH_CHECK(stream)                                              \\
-       do {                                                                      \\
-           cudaError_t _e = cudaGetLastError();                                  \\
-           if (_e != cudaSuccess) {                                              \\
-               fprintf(stderr, "[hetero_reduce] kernel launch error: %s (%s:%d)\\n",\\
-                       cudaGetErrorString(_e), __FILE__, __LINE__);              \\
-               abort();                                                          \\
-           }                                                                     \\
+#    define DS_LAUNCH_CHECK(stream)                                              \
+       do {                                                                      \
+           cudaError_t _e = cudaGetLastError();                                  \
+           if (_e != cudaSuccess) {                                              \
+               fprintf(stderr, "[hetero_reduce] kernel launch error: %s (%s:%d)\n",\
+                       cudaGetErrorString(_e), __FILE__, __LINE__);              \
+               abort();                                                          \
+           }                                                                     \
        } while (0)
 #  endif
 #endif  // DS_LAUNCH_CHECK
