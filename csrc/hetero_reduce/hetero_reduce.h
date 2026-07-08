@@ -1454,3 +1454,95 @@ size_t hetero_ring_max_chunk_bytes();
  * @returns           Thread-block size
  */
 int hetero_ring_sm_block_size(int sm_version);
+
+// ===========================================================================
+// fused_rope_qk — Simultaneous Q+K RoPE for GQA  (issue #23)
+// ===========================================================================
+
+/**
+ * launch_fused_rope_qk
+ *
+ * Applies RoPE to both Q and K in a single kernel launch.
+ * Handles GQA where Q and K have different head counts.
+ *
+ * @param q_output     [out] BF16 rotated Q [B, S, Hq, D]
+ * @param k_output     [out] BF16 rotated K [B, S, Hkv, D]
+ * @param q_input      [in]  BF16 Q input   [B, S, Hq, D]
+ * @param k_input      [in]  BF16 K input   [B, S, Hkv, D]
+ * @param cos_cache    [in]  FP32 [S, D/2] (nullptr for cacheless)
+ * @param sin_cache    [in]  FP32 [S, D/2] (nullptr for cacheless)
+ * @param batch        Batch size
+ * @param seq_len      Sequence length
+ * @param num_heads_q  Q attention heads
+ * @param num_heads_kv K/V attention heads (GQA)
+ * @param head_dim     Head dimension (must be even)
+ * @param neox_style   true → NeoX/Llama, false → GPT-J
+ * @param base         RoPE base frequency (cacheless mode)
+ * @param pos_offset   Position offset (cacheless mode)
+ * @param sm_version   SM version (86, 90, 120)
+ * @param stream       CUDA stream
+ */
+void launch_fused_rope_qk(__nv_bfloat16*       q_output,
+                           __nv_bfloat16*       k_output,
+                           const __nv_bfloat16* q_input,
+                           const __nv_bfloat16* k_input,
+                           const float*         cos_cache,
+                           const float*         sin_cache,
+                           int                  batch,
+                           int                  seq_len,
+                           int                  num_heads_q,
+                           int                  num_heads_kv,
+                           int                  head_dim,
+                           bool                 neox_style,
+                           float                base,
+                           int                  pos_offset,
+                           int                  sm_version,
+                           cudaStream_t         stream);
+
+// ===========================================================================
+// fused_mlp kernels — SwiGLU + pre-LN + residual  (issue #25)
+// ===========================================================================
+
+/**
+ * launch_fused_swiglu
+ *
+ * Single kernel for gate × σ(gate) × up (replaces 3 kernel launches).
+ */
+void launch_fused_swiglu(__nv_bfloat16*       output,
+                          const __nv_bfloat16* gate_proj,
+                          const __nv_bfloat16* up_proj,
+                          int                  batch,
+                          int                  hidden,
+                          int                  sm_version,
+                          cudaStream_t         stream);
+
+/**
+ * launch_fused_pre_ln_attn
+ *
+ * Fused pre-LayerNorm for attention input:
+ *   output = RMSNorm(residual) × ln_weight
+ */
+void launch_fused_pre_ln_attn(__nv_bfloat16*       output,
+                               const __nv_bfloat16* residual,
+                               const float*         ln_weight,
+                               int                  batch,
+                               int                  hidden,
+                               float                eps,
+                               int                  sm_version,
+                               cudaStream_t         stream);
+
+/**
+ * launch_fused_residual_rmsnorm
+ *
+ * Fused residual add + RMSNorm:
+ *   residual += input; output = RMSNorm(residual, ln_weight, eps)
+ */
+void launch_fused_residual_rmsnorm(__nv_bfloat16*       output,
+                                    __nv_bfloat16*       residual,
+                                    const __nv_bfloat16* input,
+                                    const float*         ln_weight,
+                                    int                  batch,
+                                    int                  hidden,
+                                    float                eps,
+                                    int                  sm_version,
+                                    cudaStream_t         stream);
