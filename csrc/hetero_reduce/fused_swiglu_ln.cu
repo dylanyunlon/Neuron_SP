@@ -897,3 +897,278 @@ void launch_fused_swiglu_ln_backward(
     else if (sm_version >=  90) { DISPATCH_BWD( 90); }
     else                        { DISPATCH_BWD( 86); }
 }
+
+// ===========================================================================
+// Issue #25 — Additional fused MLP kernels (swiglu-only, pre-LN, residual-RMSNorm)
+// ===========================================================================
+//
+// Three lightweight kernels that complement the full fused_swiglu_ln_kernel:
+//
+//  1. launch_fused_swiglu     — gate × σ(gate) × up, BF16 in/out, no LN
+//     Use when the caller does LayerNorm separately (e.g. pre-LN before MLP).
+//
+//  2. launch_fused_pre_ln_attn — RMSNorm(residual) × ln_weight, BF16 in/out
+//     Pre-LayerNorm for attention input (residual stream not modified).
+//
+//  3. launch_fused_residual_rmsnorm — residual += input; out = RMSNorm(residual)
+//     Post-attention residual addition + normalisation in one pass.
+//
+// All three follow the SwiGLUPolicy<SmVer> block-size and use the same
+// warp-butterfly block_reduce_sum already defined above for the full kernel.
+// ===========================================================================
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Kernel 1: SwiGLU only (no LayerNorm)
+// Grid: (batch,)  Block: Policy::kBlockSize
+// ─────────────────────────────────────────────────────────────────────────────
+
+template <int SmVer>
+__global__ void
+__launch_bounds__(SwiGLUPolicy<SmVer>::kBlockSize,
+                  SwiGLUPolicy<SmVer>::kMinBlocksPerSM)
+swiglu_only_kernel(
+    __nv_bfloat16* __restrict__       output,
+    const __nv_bfloat16* __restrict__ gate_proj,
+    const __nv_bfloat16* __restrict__ up_proj,
+    int hidden)
+{
+    using P = SwiGLUPolicy<SmVer>;
+    constexpr int kVec = P::kVecWidth;   // 8
+    constexpr int kBS  = P::kBlockSize;
+
+    const int row = blockIdx.x;
+    const __nv_bfloat16* g_row = gate_proj + (size_t)row * hidden;
+    const __nv_bfloat16* u_row = up_proj   + (size_t)row * hidden;
+          __nv_bfloat16* o_row = output    + (size_t)row * hidden;
+
+    for (int col = (int)threadIdx.x * kVec; col < hidden; col += kBS * kVec) {
+        const uint4 g_raw = *reinterpret_cast<const uint4*>(g_row + col);
+        const uint4 u_raw = *reinterpret_cast<const uint4*>(u_row + col);
+        const __nv_bfloat16* gp = reinterpret_cast<const __nv_bfloat16*>(&g_raw);
+        const __nv_bfloat16* up = reinterpret_cast<const __nv_bfloat16*>(&u_raw);
+
+        __nv_bfloat16 out_buf[kVec];
+        #pragma unroll
+        for (int v = 0; v < kVec; ++v)
+            out_buf[v] = __float2bfloat16(
+                swiglu(__bfloat162float(gp[v]), __bfloat162float(up[v])));
+
+        *reinterpret_cast<uint4*>(o_row + col) =
+            *reinterpret_cast<const uint4*>(out_buf);
+    }
+}
+
+void launch_fused_swiglu(
+    __nv_bfloat16*       output,
+    const __nv_bfloat16* gate_proj,
+    const __nv_bfloat16* up_proj,
+    int                  batch,
+    int                  hidden,
+    int                  sm_version,
+    cudaStream_t         stream)
+{
+    if (batch <= 0 || hidden <= 0) return;
+    if (sm_version >= 120)
+        swiglu_only_kernel<120><<<batch, SwiGLUPolicy<120>::kBlockSize, 0, stream>>>(
+            output, gate_proj, up_proj, hidden);
+    else if (sm_version >= 90)
+        swiglu_only_kernel<90><<<batch, SwiGLUPolicy<90>::kBlockSize, 0, stream>>>(
+            output, gate_proj, up_proj, hidden);
+    else
+        swiglu_only_kernel<86><<<batch, SwiGLUPolicy<86>::kBlockSize, 0, stream>>>(
+            output, gate_proj, up_proj, hidden);
+    DS_LAUNCH_CHECK(stream);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Kernel 2: Pre-LayerNorm for attention input
+//   output[j] = residual[j] * ln_weight[j] * rsqrt(mean(residual²) + ε)
+//   residual stream is NOT modified.
+// Grid: (batch,)  Block: Policy::kBlockSize
+// ─────────────────────────────────────────────────────────────────────────────
+
+template <int SmVer>
+__global__ void
+__launch_bounds__(SwiGLUPolicy<SmVer>::kBlockSize,
+                  SwiGLUPolicy<SmVer>::kMinBlocksPerSM)
+pre_ln_attn_kernel(
+    __nv_bfloat16* __restrict__       output,
+    const __nv_bfloat16* __restrict__ residual,
+    const float*          __restrict__ ln_weight,
+    int   hidden,
+    float eps)
+{
+    using P = SwiGLUPolicy<SmVer>;
+    constexpr int kVec      = P::kVecWidth;
+    constexpr int kBS       = P::kBlockSize;
+    constexpr int kMaxWarps = P::kMaxWarps;
+
+    __shared__ float smem_warps[kMaxWarps];
+    cg::thread_block blk = cg::this_thread_block();
+
+    const int row = blockIdx.x;
+    const __nv_bfloat16* r_row = residual + (size_t)row * hidden;
+          __nv_bfloat16* o_row = output   + (size_t)row * hidden;
+
+    // Pass 1: accumulate squared sum for RMS denominator.
+    float thread_sq = 0.f;
+    for (int col = (int)threadIdx.x * kVec; col < hidden; col += kBS * kVec) {
+        const uint4 r_raw = __ldg(reinterpret_cast<const uint4*>(r_row + col));
+        const __nv_bfloat16* rp = reinterpret_cast<const __nv_bfloat16*>(&r_raw);
+        #pragma unroll
+        for (int v = 0; v < kVec; ++v) {
+            float rv = __bfloat162float(rp[v]);
+            thread_sq += rv * rv;
+        }
+    }
+
+    float sq_sum  = block_reduce_sum<SwiGLUPolicy<SmVer>::kBlockSize>(
+                        thread_sq, smem_warps, blk);
+    float rms_inv = rsqrtf(sq_sum / (float)hidden + eps);
+
+    // Pass 2: apply RMSNorm weights and write output.
+    for (int col = (int)threadIdx.x * kVec; col < hidden; col += kBS * kVec) {
+        const uint4 r_raw = __ldg(reinterpret_cast<const uint4*>(r_row + col));
+        const __nv_bfloat16* rp = reinterpret_cast<const __nv_bfloat16*>(&r_raw);
+
+        __nv_bfloat16 out_buf[kVec];
+        #pragma unroll
+        for (int v = 0; v < kVec; ++v) {
+            float w = __ldg(ln_weight + col + v);
+            out_buf[v] = __float2bfloat16(
+                __bfloat162float(rp[v]) * rms_inv * w);
+        }
+        *reinterpret_cast<uint4*>(o_row + col) =
+            *reinterpret_cast<const uint4*>(out_buf);
+    }
+}
+
+void launch_fused_pre_ln_attn(
+    __nv_bfloat16*       output,
+    const __nv_bfloat16* residual,
+    const float*         ln_weight,
+    int                  batch,
+    int                  hidden,
+    float                eps,
+    int                  sm_version,
+    cudaStream_t         stream)
+{
+    if (batch <= 0 || hidden <= 0) return;
+    if (sm_version >= 120)
+        pre_ln_attn_kernel<120><<<batch, SwiGLUPolicy<120>::kBlockSize, 0, stream>>>(
+            output, residual, ln_weight, hidden, eps);
+    else if (sm_version >= 90)
+        pre_ln_attn_kernel<90><<<batch, SwiGLUPolicy<90>::kBlockSize, 0, stream>>>(
+            output, residual, ln_weight, hidden, eps);
+    else
+        pre_ln_attn_kernel<86><<<batch, SwiGLUPolicy<86>::kBlockSize, 0, stream>>>(
+            output, residual, ln_weight, hidden, eps);
+    DS_LAUNCH_CHECK(stream);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Kernel 3: Fused residual add + RMSNorm
+//   residual[j] += input[j]           (in-place)
+//   output[j]   = residual[j] * ln_weight[j] * rsqrt(mean(residual²) + ε)
+//
+// Single-pass: store residual sums in registers, apply LN in second pass.
+// Grid: (batch,)  Block: Policy::kBlockSize
+// ─────────────────────────────────────────────────────────────────────────────
+
+template <int SmVer>
+__global__ void
+__launch_bounds__(SwiGLUPolicy<SmVer>::kBlockSize,
+                  SwiGLUPolicy<SmVer>::kMinBlocksPerSM)
+residual_rmsnorm_kernel(
+    __nv_bfloat16* __restrict__       output,
+    __nv_bfloat16* __restrict__       residual,   // updated in-place
+    const __nv_bfloat16* __restrict__ input,
+    const float*          __restrict__ ln_weight,
+    int   hidden,
+    float eps)
+{
+    using P = SwiGLUPolicy<SmVer>;
+    constexpr int kVec      = P::kVecWidth;
+    constexpr int kBS       = P::kBlockSize;
+    constexpr int kMaxWarps = P::kMaxWarps;
+    constexpr int kMaxIter  = P::kRegBudgetPerThread / kVec;
+
+    __shared__ float smem_warps[kMaxWarps];
+    cg::thread_block blk = cg::this_thread_block();
+
+    const int row = blockIdx.x;
+    __nv_bfloat16* r_row = residual + (size_t)row * hidden;
+    const __nv_bfloat16* i_row = input    + (size_t)row * hidden;
+    __nv_bfloat16* o_row = output   + (size_t)row * hidden;
+
+    // Pass 1: residual += input; accumulate sq_sum in registers.
+    float reg_res[kMaxIter * kVec];
+    float thread_sq = 0.f;
+    int n_iter = 0;
+
+    for (int col = (int)threadIdx.x * kVec; col < hidden;
+         col += kBS * kVec, ++n_iter) {
+
+        const uint4 r_raw = *reinterpret_cast<const uint4*>(r_row + col);
+        const uint4 i_raw = *reinterpret_cast<const uint4*>(i_row + col);
+        const __nv_bfloat16* rp = reinterpret_cast<const __nv_bfloat16*>(&r_raw);
+        const __nv_bfloat16* ip = reinterpret_cast<const __nv_bfloat16*>(&i_raw);
+
+        __nv_bfloat16 updated[kVec];
+        const int base = n_iter * kVec;
+        #pragma unroll
+        for (int v = 0; v < kVec; ++v) {
+            float rv = __bfloat162float(rp[v]) + __bfloat162float(ip[v]);
+            updated[v]         = __float2bfloat16(rv);
+            reg_res[base + v]  = rv;
+            thread_sq         += rv * rv;
+        }
+        // Write updated residual in-place.
+        *reinterpret_cast<uint4*>(r_row + col) =
+            *reinterpret_cast<const uint4*>(updated);
+    }
+
+    float sq_sum  = block_reduce_sum<SwiGLUPolicy<SmVer>::kBlockSize>(
+                        thread_sq, smem_warps, blk);
+    float rms_inv = rsqrtf(sq_sum / (float)hidden + eps);
+
+    // Pass 2: normalise from registers — zero extra DRAM reads.
+    n_iter = 0;
+    for (int col = (int)threadIdx.x * kVec; col < hidden;
+         col += kBS * kVec, ++n_iter) {
+
+        const int base = n_iter * kVec;
+        __nv_bfloat16 out_buf[kVec];
+        #pragma unroll
+        for (int v = 0; v < kVec; ++v) {
+            float w = __ldg(ln_weight + col + v);
+            out_buf[v] = __float2bfloat16(reg_res[base + v] * rms_inv * w);
+        }
+        *reinterpret_cast<uint4*>(o_row + col) =
+            *reinterpret_cast<const uint4*>(out_buf);
+    }
+}
+
+void launch_fused_residual_rmsnorm(
+    __nv_bfloat16*       output,
+    __nv_bfloat16*       residual,
+    const __nv_bfloat16* input,
+    const float*         ln_weight,
+    int                  batch,
+    int                  hidden,
+    float                eps,
+    int                  sm_version,
+    cudaStream_t         stream)
+{
+    if (batch <= 0 || hidden <= 0) return;
+    if (sm_version >= 120)
+        residual_rmsnorm_kernel<120><<<batch, SwiGLUPolicy<120>::kBlockSize, 0, stream>>>(
+            output, residual, input, ln_weight, hidden, eps);
+    else if (sm_version >= 90)
+        residual_rmsnorm_kernel<90><<<batch, SwiGLUPolicy<90>::kBlockSize, 0, stream>>>(
+            output, residual, input, ln_weight, hidden, eps);
+    else
+        residual_rmsnorm_kernel<86><<<batch, SwiGLUPolicy<86>::kBlockSize, 0, stream>>>(
+            output, residual, input, ln_weight, hidden, eps);
+    DS_LAUNCH_CHECK(stream);
+}
