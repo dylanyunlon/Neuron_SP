@@ -1218,6 +1218,117 @@ void launch_grad_norm_sq_fp8(
     cudaStream_t   stream);
 
 
+// ===========================================================================
+// pcie_adaptive_allreduce — adaptive bucketing  (issue #24)
+// ===========================================================================
+
+/**
+ * AdaptiveBucketIndex — device-side scatter descriptor for one gradient region.
+ *
+ * Used by launch_pcie_adaptive_unpack to scatter a received flat bucket buffer
+ * back to destination gradient tensor pointers.
+ *
+ * Fields:
+ *   dst      — device pointer to the target gradient tensor region.
+ *   src_off  — element offset within the received flat bucket.
+ *   n_elems  — BF16 elements to copy from bucket[src_off] → dst[0..n_elems).
+ */
+struct AdaptiveBucketIndex {
+    __nv_bfloat16* dst;
+    size_t         src_off;
+    size_t         n_elems;
+};
+
+/**
+ * BucketPlan — host-side result of pcie_adaptive_bucket_plan().
+ *
+ * Per-rank adaptive bucket sizes are derived from probed PCIe BW so that
+ * each ring edge transfers a chunk sized to fill ~kTargetOverlapMs ms of
+ * PCIe bandwidth, preventing fast intra-NUMA links from stalling on the same
+ * chunk size as slow cross-NUMA links.
+ */
+struct BucketPlan {
+    static constexpr int kMaxRanks  = 64;
+    static constexpr int kMaxChunks = 1024;
+
+    int    world_size;
+    size_t bucket_sizes  [kMaxRanks];   // bytes per rank's send bucket
+    size_t bucket_offsets[kMaxRanks];   // prefix-sum of bucket_sizes (flat buf)
+    int    chunk_bucket  [kMaxChunks];  // chunk c → assigned rank index
+    int    num_chunks;
+};
+
+/**
+ * pcie_adaptive_bucket_plan
+ *
+ * Probes PCIe BW for each ring edge and assigns gradient chunks to per-rank
+ * send buckets proportional to measured bandwidth (greedy bin-packing).
+ *
+ * @param plan        [out] Populated BucketPlan
+ * @param chunks      [in]  Gradient chunk descriptors, length num_chunks
+ * @param num_chunks  Number of gradient chunks (≤ BucketPlan::kMaxChunks)
+ * @param device_ids  CUDA device ordinals per rank, length world_size
+ * @param world_size  Number of participating ranks (≤ BucketPlan::kMaxRanks)
+ */
+void pcie_adaptive_bucket_plan(
+    BucketPlan*          plan,
+    const PcieGradChunk* chunks,
+    int                  num_chunks,
+    const int*           device_ids,
+    int                  world_size);
+
+/**
+ * launch_pcie_adaptive_unpack
+ *
+ * Scatters a received flat bucket buffer back to gradient tensor regions.
+ * Inverse of launch_pcie_gradient_pack; dispatches
+ * pcie_adaptive_unpack_kernel with binary-search scatter indexing.
+ *
+ * @param bucket       [in]  Received flat BF16 bucket [total_elems]
+ * @param index        [in]  Host scatter index array (num_entries entries)
+ * @param num_entries  Number of AdaptiveBucketIndex entries
+ * @param total_elems  Total BF16 elements (= Σ index[i].n_elems)
+ * @param sm_version   SM version for block-size selection
+ * @param stream       CUDA stream
+ */
+void launch_pcie_adaptive_unpack(
+    const __nv_bfloat16*       bucket,
+    const AdaptiveBucketIndex* index,
+    int                        num_entries,
+    size_t                     total_elems,
+    int                        sm_version,
+    cudaStream_t               stream);
+
+/**
+ * tma_block_load_smem_bytes
+ *
+ * Returns the shared-memory bytes consumed per CTA by the TMA tile buffer
+ * in tma_ring_reduce_sm90_kernel.  Use for occupancy analysis / smem checks.
+ */
+size_t tma_block_load_smem_bytes();
+
+/**
+ * launch_tma_hetero_reduce_step
+ *
+ * TMA-accelerated ring-reduce step for SM9.0+ (issue #72).
+ * Loads src_buf into shared memory via cp.async.bulk.tensor (TMA), then
+ * accumulates dst += src in FP32 with BF16 I/O.
+ *
+ * Falls back to launch_pcie_ring_reduce_step on SM < 9.0 or CUDA < 12.
+ *
+ * @param accum_buf      [in/out] BF16 local accumulator [chunk_elems]
+ * @param src_buf        [in]     BF16 peer bucket [chunk_elems]
+ * @param chunk_elems    Number of BF16 elements (divisible by 8)
+ * @param sm_version     SM version (86, 90, 120)
+ * @param compute_stream CUDA stream
+ */
+void launch_tma_hetero_reduce_step(
+    __nv_bfloat16* __restrict__       accum_buf,
+    const __nv_bfloat16* __restrict__ src_buf,
+    size_t                            chunk_elems,
+    int                               sm_version,
+    cudaStream_t                      compute_stream);
+
 // pcie_adaptive_allreduce — NUMA-aware topology-aware dispatch  (issue #138)
 // ===========================================================================
 

@@ -1062,3 +1062,618 @@ void launch_pcie_allreduce_finalise(
                 sm_version, n_elems, cudaGetErrorString(err));
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Section 14: PCIe-aware adaptive bucketing  (issue #24)
+//
+// Problem: a flat ring allreduce packs all gradient chunks into uniform-size
+// buckets, ignoring that different PCIe links have different bandwidths.
+// Slow cross-NUMA links stall the ring when they must transfer the same bucket
+// size as faster intra-NUMA links.
+//
+// Solution: per-rank adaptive bucket sizing.
+//   1. For each (src_rank, dst_rank) ring edge, probe_pcie_bandwidth() gives
+//      measured BW.  compute_adaptive_chunk_size() maps BW → chunk bytes.
+//   2. pcie_adaptive_bucket_plan() assigns each gradient chunk to a bucket
+//      slot, respecting per-edge chunk limits.  It outputs:
+//        • BucketPlan::bucket_sizes[rank] — bytes for this rank's send bucket.
+//        • BucketPlan::chunk_to_bucket[]  — which bucket each gradient chunk
+//          belongs to, for device-side gather/scatter.
+//        • BucketPlan::bucket_offsets[]   — prefix-sum of bucket_sizes for
+//          flat buffer addressing.
+//   3. The device-side adaptive unpack kernel pcie_adaptive_unpack_kernel()
+//      scatters a received flat bucket back to gradient tensor offsets using
+//      a compact index table (AdaptiveBucketIndex), avoiding a second
+//      pcie_gradient_pack_kernel launch on the receive side.
+//
+// Kernel: pcie_adaptive_unpack_kernel
+//   Inverse of pcie_gradient_pack_kernel: for each (dst_ptr, src_offset,
+//   length) entry in the index table, copies bucket[src_offset..+length] to
+//   dst_ptr[0..length-1] using 128-bit vectorised stores.
+//
+// Host API: pcie_adaptive_bucket_plan / launch_pcie_adaptive_unpack
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Maximum gradient chunks supported per bucket plan.
+static constexpr int kMaxGradChunks = 1024;
+
+// Maximum participating ranks for a bucket plan.
+static constexpr int kMaxBucketRanks = 64;
+
+/**
+ * AdaptiveBucketIndex — device-side scatter descriptor for one bucket entry.
+ *
+ * After a bucket is received from a ring peer, the unpack kernel reads this
+ * table to scatter contiguous bucket regions back to the destination gradient
+ * tensor pointers.
+ *
+ *   dst       — device pointer to the target gradient tensor region.
+ *   src_off   — byte offset within the received flat bucket buffer.
+ *   n_elems   — BF16 elements to copy from bucket[src_off] → dst[0..].
+ */
+struct AdaptiveBucketIndex {
+    __nv_bfloat16* dst;      // destination gradient tensor pointer (device)
+    size_t         src_off;  // element offset within the flat bucket
+    size_t         n_elems;  // number of BF16 elements
+};
+
+/**
+ * BucketPlan — host-side result from pcie_adaptive_bucket_plan().
+ *
+ * All arrays are indexed by rank [0, world_size).
+ * chunk_bucket[c] gives the rank whose send bucket gradient chunk c belongs to.
+ */
+struct BucketPlan {
+    static constexpr int kMaxRanks  = kMaxBucketRanks;
+    static constexpr int kMaxChunks = kMaxGradChunks;
+
+    int    world_size;
+    size_t bucket_sizes  [kMaxRanks];   // bytes per rank's send bucket
+    size_t bucket_offsets[kMaxRanks];   // prefix-sum of bucket_sizes (flat buf)
+    int    chunk_bucket  [kMaxChunks];  // chunk c → assigned rank
+    int    num_chunks;
+};
+
+// ── Device kernel: scatter flat bucket → gradient tensor regions ──────────────
+//
+// Each thread handles kARVecWidth BF16 elements (128-bit vector store).
+// index[i].{dst, src_off, n_elems} covers at most one contiguous gradient
+// region; entries are sorted by src_off so accesses to `bucket` are coalesced.
+//
+// Launch: 1D grid over total bucket elements / kARVecWidth.
+// Shared memory: none.  Register pressure: ~10 regs per thread.
+
+template <int kBlockSize>
+__global__ void __launch_bounds__(kBlockSize, 2)
+pcie_adaptive_unpack_kernel(
+    const __nv_bfloat16* __restrict__      bucket,
+    const AdaptiveBucketIndex* __restrict__ index,
+    const size_t* __restrict__              prefix_ends,  // [num_entries]
+    int    num_entries,
+    size_t total_elems)
+{
+    const size_t tid    = (size_t)blockIdx.x * kBlockSize + threadIdx.x;
+    const size_t stride = (size_t)gridDim.x  * kBlockSize;
+
+    for (size_t i = tid; i < total_elems / kARVecWidth; i += stride) {
+        const size_t elem_base = i * kARVecWidth;
+
+        // Binary search: find entry whose range covers elem_base.
+        int lo = 0, hi = num_entries - 1, ei = 0;
+        while (lo <= hi) {
+            int mid = (lo + hi) >> 1;
+            if (prefix_ends[mid] <= elem_base)
+                lo = mid + 1;
+            else { ei = mid; hi = mid - 1; }
+        }
+
+        const size_t entry_start = (ei == 0) ? 0 : prefix_ends[ei - 1];
+        const size_t within      = elem_base - entry_start;
+        const size_t src_base    = index[ei].src_off + within;
+
+        // 128-bit copy: bucket[src_base..+8] → dst[within..+8]
+        *reinterpret_cast<uint4*>(index[ei].dst + within) =
+            *reinterpret_cast<const uint4*>(bucket + src_base);
+    }
+
+    // Scalar tail (thread 0 handles residual elements not in vec loop)
+    if (tid == 0) {
+        const size_t vec_start = (total_elems / kARVecWidth) * kARVecWidth;
+        size_t cum = 0;
+        for (int e_idx = 0; e_idx < num_entries && cum < total_elems; ++e_idx) {
+            const size_t entry_end = cum + index[e_idx].n_elems;
+            for (size_t e = vec_start; e < total_elems && e < entry_end; ++e)
+                index[e_idx].dst[e - cum] = bucket[index[e_idx].src_off + (e - cum)];
+            cum = entry_end;
+        }
+    }
+}
+
+// ── Host: adaptive bucket plan ────────────────────────────────────────────────
+
+/**
+ * pcie_adaptive_bucket_plan
+ *
+ * Assigns gradient chunks to per-rank send buckets proportional to the
+ * measured PCIe bandwidth on each ring edge.
+ *
+ * Algorithm:
+ *   For each rank r in [0, world_size):
+ *     bw[r] = probe_pcie_bandwidth(device_ids[r], device_ids[(r+1) % ws])
+ *     bucket_bytes[r] = compute_adaptive_chunk_size(bw[r])
+ *
+ *   Chunks are assigned round-robin to ranks in decreasing bucket-size order
+ *   (greedy bin-packing approximation), capped so each chunk fits within
+ *   bucket_bytes[rank] without fragmenting a 128-bit boundary.
+ *
+ * @param plan        [out] Populated BucketPlan
+ * @param chunks      [in]  Gradient chunk descriptors (num_chunks entries)
+ * @param num_chunks  Number of gradient chunks
+ * @param device_ids  CUDA device ordinals for each rank, length world_size
+ * @param world_size  Number of participating ranks
+ */
+void pcie_adaptive_bucket_plan(
+    BucketPlan*          plan,
+    const PcieGradChunk* chunks,
+    int                  num_chunks,
+    const int*           device_ids,
+    int                  world_size)
+{
+    if (!plan || !chunks || !device_ids
+        || num_chunks <= 0 || world_size <= 0
+        || world_size > BucketPlan::kMaxRanks
+        || num_chunks > BucketPlan::kMaxChunks) {
+        fprintf(stderr, "[pcie_adaptive_bucket_plan] invalid arguments\n");
+        return;
+    }
+
+    plan->world_size = world_size;
+    plan->num_chunks = num_chunks;
+
+    // ── Step 1: probe per-edge BW and derive target bucket sizes ──────────
+    size_t bw_chunk_bytes[BucketPlan::kMaxRanks] = {};
+    for (int r = 0; r < world_size; ++r) {
+        const int src_dev = device_ids[r];
+        const int dst_dev = device_ids[(r + 1) % world_size];
+        const float bw = probe_pcie_bandwidth(src_dev, dst_dev);
+        bw_chunk_bytes[r] = compute_adaptive_chunk_size(bw);
+    }
+
+    // ── Step 2: greedy assignment of chunks to ranks ──────────────────────
+    // Track fill level (bytes) per rank's bucket.
+    size_t fill[BucketPlan::kMaxRanks] = {};
+    for (int r = 0; r < world_size; ++r)
+        fill[r] = 0;
+
+    for (int c = 0; c < num_chunks; ++c) {
+        const size_t chunk_bytes = chunks[c].length * sizeof(__nv_bfloat16);
+
+        // Find the rank with the most remaining capacity that can hold chunk c.
+        int best_rank = -1;
+        size_t best_room = 0;
+
+        for (int r = 0; r < world_size; ++r) {
+            const size_t cap  = bw_chunk_bytes[r];
+            const size_t room = (fill[r] < cap) ? (cap - fill[r]) : 0;
+            if (room >= chunk_bytes && room > best_room) {
+                best_room = room;
+                best_rank = r;
+            }
+        }
+
+        if (best_rank < 0) {
+            // No rank can fit this chunk without overflow — assign to the
+            // rank with the largest bucket limit (spillover allowed; the
+            // actual transfer will span multiple ring steps).
+            best_rank = 0;
+            for (int r = 1; r < world_size; ++r)
+                if (bw_chunk_bytes[r] > bw_chunk_bytes[best_rank])
+                    best_rank = r;
+        }
+
+        plan->chunk_bucket[c] = best_rank;
+        fill[best_rank] += chunk_bytes;
+    }
+
+    // ── Step 3: finalise bucket sizes (actual fill, aligned to kChunkAlign) ─
+    for (int r = 0; r < world_size; ++r) {
+        size_t sz = fill[r];
+        // Round up to kChunkAlign (= 8 × sizeof(BF16) = 16 bytes).
+        sz = ((sz + kChunkAlign - 1) / kChunkAlign) * kChunkAlign;
+        plan->bucket_sizes[r] = sz;
+    }
+
+    // ── Step 4: prefix-sum of bucket sizes for flat buffer layout ─────────
+    size_t cum = 0;
+    for (int r = 0; r < world_size; ++r) {
+        plan->bucket_offsets[r] = cum;
+        cum += plan->bucket_sizes[r];
+    }
+}
+
+/**
+ * launch_pcie_adaptive_unpack
+ *
+ * Scatters a flat received bucket buffer back to gradient tensor regions.
+ * Called on the receive side after a ring transfer completes, replacing a
+ * separate pcie_gradient_pack_kernel invocation.
+ *
+ * @param bucket        [in]  Flat BF16 bucket received from ring peer [total_elems]
+ * @param index         [in]  Host-side scatter index array (num_entries entries)
+ * @param num_entries   Number of AdaptiveBucketIndex entries
+ * @param total_elems   Total BF16 elements in bucket (sum of index[].n_elems)
+ * @param sm_version    SM version for block-size selection
+ * @param stream        CUDA stream
+ */
+void launch_pcie_adaptive_unpack(
+    const __nv_bfloat16*       bucket,
+    const AdaptiveBucketIndex* index,
+    int                        num_entries,
+    size_t                     total_elems,
+    int                        sm_version,
+    cudaStream_t               stream)
+{
+    if (!bucket || !index || num_entries <= 0 || total_elems == 0) return;
+
+    constexpr int kUnpackBS = 256;
+
+    // Build device-side index and prefix-end arrays.
+    AdaptiveBucketIndex* d_index  = nullptr;
+    size_t*              d_prefix = nullptr;
+    cudaMallocAsync(&d_index,  num_entries * sizeof(AdaptiveBucketIndex), stream);
+    cudaMallocAsync(&d_prefix, num_entries * sizeof(size_t), stream);
+
+    cudaMemcpyAsync(d_index, index, num_entries * sizeof(AdaptiveBucketIndex),
+                    cudaMemcpyHostToDevice, stream);
+
+    // Build host prefix-end array: prefix_ends[i] = Σ_{j≤i} index[j].n_elems
+    size_t* h_prefix = new size_t[num_entries];
+    size_t  cum = 0;
+    for (int i = 0; i < num_entries; ++i) {
+        cum += index[i].n_elems;
+        h_prefix[i] = cum;
+    }
+    cudaMemcpyAsync(d_prefix, h_prefix, num_entries * sizeof(size_t),
+                    cudaMemcpyHostToDevice, stream);
+    delete[] h_prefix;
+
+    const size_t vec_elems = total_elems / kARVecWidth;
+    const int grid = (int)std::min(
+        (vec_elems + kUnpackBS - 1) / kUnpackBS, (size_t)65535);
+
+    pcie_adaptive_unpack_kernel<kUnpackBS>
+        <<<std::max(grid, 1), kUnpackBS, 0, stream>>>(
+            bucket, d_index, d_prefix, num_entries, total_elems);
+    {
+        cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess)
+            fprintf(stderr, "[pcie_adaptive_unpack] kernel launch failed "
+                "(num_entries=%d, total_elems=%zu): %s\n",
+                num_entries, total_elems, cudaGetErrorString(err));
+    }
+
+    cudaFreeAsync(d_index,  stream);
+    cudaFreeAsync(d_prefix, stream);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Section 15: TMA-based BlockLoadToShared for SM9.0+  (issue #72)
+//
+// SM9.0 (H100) and SM12.0 (Blackwell) support Tensor Memory Accelerator (TMA)
+// operations: cp.async.bulk.tensor with a CUTensorMap descriptor.  TMA moves
+// an entire tile of global memory into shared memory in one instruction,
+// freeing all threads in the CTA to overlap arithmetic with the transfer.
+//
+// This section provides:
+//   tma_block_load_smem_bytes()          — smem bytes needed for the tile
+//   tma_block_load_to_shared_sm90()      — __device__ wrapper (SM9.0+)
+//   launch_tma_block_load_reduce_sm90()  — fused load+reduce step kernel
+//   launch_tma_hetero_reduce_step()      — public dispatch function
+//
+// ═══════════════════════════════════════════════════════════════════════
+// TMA DESCRIPTOR SETUP  (host side)
+// ═══════════════════════════════════════════════════════════════════════
+//
+// cuTensorMapEncodeTiled fills a CUtensorMap with:
+//   • global shape + stride (the full gradient tensor)
+//   • box shape = {kTmaTileElems} (the per-CTA tile in BF16 elements)
+//   • swizzle = CU_TENSOR_MAP_SWIZZLE_128B for 128-byte swizzle
+//   • interleave = CU_TENSOR_MAP_INTERLEAVE_NONE (contiguous layout)
+//
+// The kernel issues cp.async.bulk.tensor.1d.shared::cluster.global with
+// a mbar (mbarrier) for completion synchronization.  After mbar_wait,
+// all smem elements are valid and the CTA reads them for reduction.
+//
+// ═══════════════════════════════════════════════════════════════════════
+// KERNEL DESIGN
+// ═══════════════════════════════════════════════════════════════════════
+//
+// tma_ring_reduce_sm90_kernel<kBS>:
+//   • Each CTA processes kTmaTileElems BF16 elements of the src bucket.
+//   • Thread 0 issues cp.async.bulk to load src tile into smem.
+//   • All threads spin on mbar until transfer completes.
+//   • All threads load 8 elements from smem (128-bit), load 8 from dst
+//     (read-write), accumulate in FP32, store back to dst (BF16).
+//   • No extra shared memory beyond the tile buffer is needed.
+//   • Works on SM9.0 (H100) and SM12.0 (Blackwell).
+//
+// ═══════════════════════════════════════════════════════════════════════
+// FALLBACK
+// ═══════════════════════════════════════════════════════════════════════
+//
+// When __CUDA_ARCH__ < 900 or CUDA < 12.0, the kernel falls back to the
+// existing pcie_ring_reduce_kernel (plain __ldg path) which is already
+// correct for SM8.6 and toolchains without TMA support.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// TMA tile size in BF16 elements per CTA: 4 KiB / 2 bytes = 2048 elements.
+// Must be a multiple of kARVecWidth and fit in shared memory (SM9.0 has
+// 228 KB smem/SM; 4 KiB per CTA leaves ample room for 4+ CTAs/SM).
+static constexpr int kTmaTileElems = 2048;   // 4 KiB of BF16
+
+// Shared memory bytes for one TMA tile buffer.
+// Exposed as a public helper so callers can check smem budgets.
+size_t tma_block_load_smem_bytes() {
+    return kTmaTileElems * sizeof(__nv_bfloat16);
+}
+
+// ── Device function: issue TMA bulk async load into shared memory ─────────────
+//
+// Called by exactly one thread per CTA (typically threadIdx.x == 0).
+// Issues cp.async.bulk.tensor.1d.shared::cluster.global [addr], [tmap], {coord}
+// and initialises the mbarrier for the tile transfer.
+//
+// Inline PTX:
+//   cp.async.bulk.tensor.1d.shared::cluster.global [dst], [tmap], {x},
+//       [mbar];
+//   mbarrier.arrive.expect_tx.shared::cta.b64 [mbar], bytes;
+//
+// Defined only for SM9.0+ to avoid PTX errors on older arches.
+
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900 && __CUDACC_VER_MAJOR__ >= 12
+
+DS_D_INLINE void tma_block_load_to_shared(
+    __nv_bfloat16* __restrict__ smem_dst,
+    const CUtensorMap*          tmap,
+    int                         x_coord,   // tile index in the 1-D tensor
+    uint64_t* __restrict__      mbar)      // shared-memory mbarrier
+{
+    // Initialise mbarrier for one expected transaction of kTmaTileElems * 2 bytes.
+    asm volatile(
+        "mbarrier.init.shared::cta.b64 [%0], 1;\n"
+        :: "r"(static_cast<uint32_t>(__cvta_generic_to_shared(mbar)))
+    );
+
+    // Expect tx: signals how many bytes the TMA will deliver.
+    asm volatile(
+        "mbarrier.arrive.expect_tx.shared::cta.b64 [%0], %1;\n"
+        :: "r"(static_cast<uint32_t>(__cvta_generic_to_shared(mbar))),
+           "r"(static_cast<uint32_t>(kTmaTileElems * sizeof(__nv_bfloat16)))
+    );
+
+    // Issue TMA 1-D bulk copy: global tmap[x_coord] → smem_dst.
+    asm volatile(
+        "cp.async.bulk.tensor.1d.shared::cluster.global"
+        " [%0], [%1, {%2}], [%3];\n"
+        :: "r"(static_cast<uint32_t>(__cvta_generic_to_shared(smem_dst))),
+           "l"(tmap),
+           "r"(x_coord),
+           "r"(static_cast<uint32_t>(__cvta_generic_to_shared(mbar)))
+    );
+}
+
+DS_D_INLINE void tma_mbar_wait(uint64_t* __restrict__ mbar, uint32_t phase)
+{
+    // Spin until the mbarrier transitions to the expected phase.
+    asm volatile(
+        "{\n"
+        ".reg .pred p;\n"
+        "LAB_WAIT:\n"
+        "mbarrier.try_wait.parity.shared::cta.b64 p, [%0], %1;\n"
+        "@!p bra LAB_WAIT;\n"
+        "}\n"
+        :: "r"(static_cast<uint32_t>(__cvta_generic_to_shared(mbar))),
+           "r"(phase)
+    );
+}
+
+#endif  // __CUDA_ARCH__ >= 900
+
+// ── TMA ring-reduce kernel (SM9.0+) ──────────────────────────────────────────
+//
+// Grid:  one CTA per kTmaTileElems-element tile of the input.
+// Block: kBS threads.
+//
+// Phase A (thread 0):  tma_block_load_to_shared(smem, tmap, tile_coord, mbar)
+// Sync:  tma_mbar_wait(mbar, 0)
+// Phase B (all threads): vectorised accumulate dst[tile] += smem[tile] (FP32)
+
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900 && __CUDACC_VER_MAJOR__ >= 12
+
+template <int kBS>
+__global__ void __launch_bounds__(kBS, 4)
+tma_ring_reduce_sm90_kernel(
+    __nv_bfloat16* __restrict__       dst,
+    const CUtensorMap*                src_tmap,   // TMA descriptor for src bucket
+    size_t                            n_elems)
+{
+    // Shared memory layout: [smem_tile | mbar (8 bytes, 8-byte aligned)]
+    __shared__ __align__(128) __nv_bfloat16 smem_tile[kTmaTileElems];
+    __shared__ __align__(8)   uint64_t      mbar;
+
+    const int   tile_idx   = blockIdx.x;
+    const size_t tile_base  = (size_t)tile_idx * kTmaTileElems;
+    if (tile_base >= n_elems) return;
+
+    const size_t tile_elems = min((size_t)kTmaTileElems, n_elems - tile_base);
+
+    // ── Phase A: TMA issue (thread 0 only) ───────────────────────────────
+    if (threadIdx.x == 0) {
+        tma_block_load_to_shared(smem_tile, src_tmap, tile_idx, &mbar);
+    }
+    __syncthreads();
+
+    // ── Wait for TMA completion (all threads spin on mbarrier) ───────────
+    // Only thread 0 polled mbar; others use __syncthreads to observe barrier.
+    // Use a single thread to wait, then syncthreads to propagate completion.
+    if (threadIdx.x == 0) {
+        tma_mbar_wait(&mbar, 0);
+    }
+    __syncthreads();   // smem_tile is now fully populated
+
+    // ── Phase B: vectorised accumulate dst[tile_base+i] += smem_tile[i] ──
+    const size_t vec_tile = tile_elems / kARVecWidth;
+
+    for (int t = (int)threadIdx.x; t < (int)vec_tile; t += kBS) {
+        const int base = t * kARVecWidth;
+        float d0,d1,d2,d3,d4,d5,d6,d7;
+        float s0,s1,s2,s3,s4,s5,s6,s7;
+        ar_load8_f32(dst  + tile_base + base, d0,d1,d2,d3,d4,d5,d6,d7);
+        ar_load8_f32(smem_tile        + base, s0,s1,s2,s3,s4,s5,s6,s7);
+        ar_store8_bf16(dst + tile_base + base,
+            d0+s0, d1+s1, d2+s2, d3+s3,
+            d4+s4, d5+s5, d6+s6, d7+s7);
+    }
+
+    // Scalar tail within the tile (thread 0 only)
+    if (threadIdx.x == 0) {
+        for (size_t e = vec_tile * kARVecWidth; e < tile_elems; ++e) {
+            float d = __bfloat162float(dst[tile_base + e]);
+            float s = __bfloat162float(smem_tile[e]);
+            dst[tile_base + e] = __float2bfloat16(d + s);
+        }
+    }
+}
+
+#endif  // __CUDA_ARCH__ >= 900
+
+// ── Host: TMA descriptor construction helper ──────────────────────────────────
+//
+// Wraps cuTensorMapEncodeTiled for 1-D BF16 tensors.
+// Returns cudaSuccess on success; the CUtensorMap is populated in *tmap_out.
+// The caller owns the CUtensorMap (stack or device-pinned; no CUDA allocation).
+
+static cudaError_t build_tma_descriptor_bf16_1d(
+    CUtensorMap*             tmap_out,
+    const __nv_bfloat16*     global_ptr,
+    size_t                   n_elems)
+{
+#if CUDA_VERSION >= 12000
+    // 1-D tensor: global shape = [n_elems], element size = 2 bytes (BF16).
+    const uint64_t global_dim[1]    = { n_elems };
+    const uint64_t global_stride[1] = { sizeof(__nv_bfloat16) };  // byte stride
+    // Box (tile) shape: kTmaTileElems elements per CTA.
+    const uint32_t box_dim[1]       = { (uint32_t)kTmaTileElems };
+    // Element stride: 1 (contiguous).
+    const uint32_t elem_stride[1]   = { 1 };
+
+    CUresult res = cuTensorMapEncodeTiled(
+        tmap_out,
+        CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
+        /*tensorRank=*/   1,
+        /*globalAddress=*/(void*)global_ptr,
+        global_dim,
+        global_stride + 1,   // stride array starts at dim 1 (skip outermost)
+        box_dim,
+        elem_stride,
+        CU_TENSOR_MAP_INTERLEAVE_NONE,
+        CU_TENSOR_MAP_SWIZZLE_NONE,
+        CU_TENSOR_MAP_L2_PROMOTION_L2_128B,
+        CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+
+    if (res != CUDA_SUCCESS) {
+        const char* err_str = nullptr;
+        cuGetErrorString(res, &err_str);
+        fprintf(stderr, "[build_tma_descriptor_bf16_1d] cuTensorMapEncodeTiled "
+            "failed: %s\n", err_str ? err_str : "unknown");
+        return cudaErrorUnknown;
+    }
+    return cudaSuccess;
+#else
+    (void)tmap_out; (void)global_ptr; (void)n_elems;
+    fprintf(stderr, "[build_tma_descriptor_bf16_1d] TMA requires CUDA >= 12.0\n");
+    return cudaErrorNotSupported;
+#endif
+}
+
+// ── Public dispatch: TMA-accelerated hetero reduce step ──────────────────────
+
+/**
+ * launch_tma_hetero_reduce_step
+ *
+ * Fused TMA BlockLoadToShared + accumulate step for SM9.0+ devices.
+ * On SM < 9.0 or CUDA < 12: falls back to launch_pcie_ring_reduce_step.
+ *
+ * @param accum_buf      [in/out] BF16 local accumulator [chunk_elems]
+ * @param src_buf        [in]     BF16 incoming peer bucket [chunk_elems]
+ * @param chunk_elems    Number of BF16 elements (must be divisible by kARVecWidth)
+ * @param sm_version     SM version of the active device (86, 90, 120)
+ * @param compute_stream CUDA stream for kernel launch
+ */
+void launch_tma_hetero_reduce_step(
+    __nv_bfloat16* __restrict__       accum_buf,
+    const __nv_bfloat16* __restrict__ src_buf,
+    size_t                            chunk_elems,
+    int                               sm_version,
+    cudaStream_t                      compute_stream)
+{
+#if CUDA_VERSION >= 12000
+    // SM9.0+ path: build TMA descriptor and launch TMA kernel.
+    if (sm_version >= 90) {
+        CUtensorMap tmap;
+        if (build_tma_descriptor_bf16_1d(&tmap, src_buf, chunk_elems)
+                != cudaSuccess) {
+            // Descriptor build failed — fall through to non-TMA path.
+            goto fallback;
+        }
+
+        // Copy the TMA descriptor to device-accessible memory.
+        // CUtensorMap is 128 bytes; we allocate it in device memory so the
+        // kernel can access it via a raw pointer.
+        CUtensorMap* d_tmap = nullptr;
+        cudaMallocAsync(&d_tmap, sizeof(CUtensorMap), compute_stream);
+        cudaMemcpyAsync(d_tmap, &tmap, sizeof(CUtensorMap),
+                        cudaMemcpyHostToDevice, compute_stream);
+
+        // Grid: one CTA per tile.
+        const int n_tiles = (int)((chunk_elems + kTmaTileElems - 1) / kTmaTileElems);
+        const int grid    = std::min(n_tiles, 65535);
+
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+        // This code path is only reached at runtime on SM9.0+ devices;
+        // the kernel itself is compiled with --generate-code arch=compute_90.
+        if (sm_version >= 120) {
+            tma_ring_reduce_sm90_kernel<512>
+                <<<grid, 512, 0, compute_stream>>>(
+                    accum_buf, d_tmap, chunk_elems);
+        } else {
+            tma_ring_reduce_sm90_kernel<256>
+                <<<grid, 256, 0, compute_stream>>>(
+                    accum_buf, d_tmap, chunk_elems);
+        }
+#else
+        // Compiled without SM9.0 arch: still schedule the kernel; CUDA driver
+        // will select the appropriate code object at launch time.
+        tma_ring_reduce_sm90_kernel<256>
+            <<<grid, 256, 0, compute_stream>>>(
+                accum_buf, d_tmap, chunk_elems);
+#endif
+
+        {
+            cudaError_t err = cudaGetLastError();
+            if (err != cudaSuccess)
+                fprintf(stderr,
+                    "[launch_tma_hetero_reduce_step] TMA kernel launch failed "
+                    "(SM %d, chunk_elems=%zu): %s\n",
+                    sm_version, chunk_elems, cudaGetErrorString(err));
+        }
+        cudaFreeAsync(d_tmap, compute_stream);
+        return;
+    }
+#endif  // CUDA_VERSION >= 12000
+
+fallback:
+    // SM8.6 or CUDA < 12: plain __ldg ring-reduce step.
+    launch_pcie_ring_reduce_step(accum_buf, src_buf, chunk_elems,
+                                 sm_version, compute_stream);
+}
