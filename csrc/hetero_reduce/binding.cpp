@@ -788,6 +788,66 @@ void cross_entropy_tp_backward_hetero_py(
 // fused_adam_heterogeneous bindings
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Issue #124: TP-aware fused cross-entropy completions — binding helpers
+// ---------------------------------------------------------------------------
+
+// cross_entropy_tp_log_finalise_py
+//   Converts global_sum_exp → log(global_sum_exp) in-place.
+//   Call after AllReduce_sum(local_sum_exp) → global_sum_exp.
+void cross_entropy_tp_log_finalise_py(at::Tensor global_sum_exp)
+{
+    check_fp32(global_sum_exp, "global_sum_exp");
+    TORCH_CHECK(global_sum_exp.is_cuda() && global_sum_exp.is_contiguous(),
+                "global_sum_exp must be a contiguous CUDA tensor");
+    const int batch = (int)global_sum_exp.numel();
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    launch_cross_entropy_tp_log_finalise(
+        global_sum_exp.data_ptr<float>(), batch, stream);
+}
+
+// cross_entropy_tp_forward_with_log_py
+//   Returns (local_max, local_sum_exp, local_log_sum, local_logit).
+//   For tp_size=1, local_log_sum is already usable as log_sum_exp for backward.
+//   For tp_size > 1, AllReduce then call cross_entropy_tp_log_finalise.
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+cross_entropy_tp_forward_with_log_py(at::Tensor logits,
+                                      at::Tensor labels,
+                                      int64_t    shard_offset,
+                                      int        sm_version)
+{
+    check_bf16(logits, "logits");
+    TORCH_CHECK(logits.dim() == 2, "logits must be 2-D [batch, v_local]");
+    TORCH_CHECK(labels.scalar_type() == at::ScalarType::Int,
+                "labels must be Int32, got ", labels.scalar_type());
+    TORCH_CHECK(labels.is_cuda() && labels.is_contiguous(),
+                "labels must be a contiguous CUDA tensor");
+    TORCH_CHECK(labels.numel() == logits.size(0),
+                "labels numel must equal batch size");
+    TORCH_CHECK(shard_offset >= 0, "shard_offset must be >= 0");
+
+    const int batch   = (int)logits.size(0);
+    const int v_local = (int)logits.size(1);
+
+    auto opts = at::TensorOptions().dtype(at::kFloat).device(logits.device());
+    at::Tensor local_max     = at::empty({batch}, opts);
+    at::Tensor local_sum_exp = at::empty({batch}, opts);
+    at::Tensor local_log_sum = at::empty({batch}, opts);
+    at::Tensor local_logit   = at::zeros({batch}, opts);
+
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    launch_cross_entropy_tp_forward_with_log(
+        local_max.data_ptr<float>(),
+        local_sum_exp.data_ptr<float>(),
+        local_log_sum.data_ptr<float>(),
+        local_logit.data_ptr<float>(),
+        reinterpret_cast<const __nv_bfloat16*>(logits.data_ptr<at::BFloat16>()),
+        labels.data_ptr<int>(),
+        batch, v_local, (int)shard_offset, sm_version, stream);
+
+    return std::make_tuple(local_max, local_sum_exp, local_log_sum, local_logit);
+}
+
 void fused_adam_heterogeneous_py(
     at::Tensor  params,
     at::Tensor  exp_avg,
@@ -1611,6 +1671,35 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("shard_offset") = 0,
           py::arg("inv_batch") = 1.f,
           py::arg("sm_version") = 86);
+
+    // -----------------------------------------------------------------------
+    // Issue #124: TP-aware fused cross-entropy completions
+    // -----------------------------------------------------------------------
+
+    m.def("cross_entropy_tp_log_finalise",
+          &cross_entropy_tp_log_finalise_py,
+          "Issue #124: Convert global_sum_exp → log(global_sum_exp) in-place.\n"
+          "Call AFTER AllReduce_sum(local_sum_exp) → global_sum_exp, before\n"
+          "passing log_sum_exp to cross_entropy_tp_backward.\n"
+          "Args:\n"
+          "  global_sum_exp (Tensor FP32 [batch]): allreduced sum_exp, modified in-place",
+          py::arg("global_sum_exp"));
+
+    m.def("cross_entropy_tp_forward_with_log",
+          &cross_entropy_tp_forward_with_log_py,
+          "Issue #124: Forward pass that also writes log(local_sum_exp).\n"
+          "Returns (local_max, local_sum_exp, local_log_sum, local_logit).\n"
+          "  local_log_sum is valid directly for tp_size=1 (no AllReduce needed).\n"
+          "  For tp_size > 1: AllReduce sum_exp then call cross_entropy_tp_log_finalise.\n"
+          "Args:\n"
+          "  logits        (Tensor BF16  [batch, v_local]): this rank's logit shard\n"
+          "  labels        (Tensor Int32 [batch]):           global vocab label indices\n"
+          "  shard_offset  (int): first global vocab index owned by this rank\n"
+          "  sm_version    (int): 86, 90, or 120",
+          py::arg("logits"),
+          py::arg("labels"),
+          py::arg("shard_offset") = 0,
+          py::arg("sm_version")   = 86);
 
     // -----------------------------------------------------------------------
     // fused_adam_heterogeneous — per-tier LR-scaled Adam for A6000/H100/Blackwell

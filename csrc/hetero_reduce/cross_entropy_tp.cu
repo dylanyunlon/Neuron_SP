@@ -806,3 +806,214 @@ void launch_cross_entropy_tp_backward_hetero(
     DS_LAUNCH_CHECK(stream);
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Section 8: Issue #124 — TP-aware fused cross-entropy completions
+//
+// Three additions to complete the TP cross-entropy pipeline:
+//
+//  8a. cross_entropy_tp_log_finalise_kernel
+//      Takes the raw global_sum_exp (output of AllReduce across TP ranks) and
+//      writes log(global_sum_exp) back in-place. Required before the backward
+//      pass, which expects log_sum_exp not sum_exp.
+//      One thread per sample. Grid = ⌈batch / 256⌉. No shared memory.
+//
+//  8b. launch_cross_entropy_tp_log_finalise (host wrapper)
+//
+//  8c. cross_entropy_tp_forward_with_log_kernel
+//      Variant of the forward kernel that additionally writes log(local_sum_exp)
+//      to a separate output buffer.  Avoids an extra kernel launch for callers
+//      that want to compute the log in-place before the AllReduce.
+//      Same block sizes / warp-butterfly as the base forward kernel (SmVer
+//      template).
+//
+//  8d. launch_cross_entropy_tp_forward_with_log (host wrapper)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ── Section 8a: log finalise kernel ─────────────────────────────────────────
+//
+// After AllReduce_sum(local_sum_exp) → global_sum_exp on the host, the
+// backward kernel expects log_sum_exp = log(global_sum_exp).  Computing this
+// in a tiny dedicated kernel avoids polluting the forward or loss kernels with
+// an extra write and keeps the data flow explicit.
+//
+// In-place: reads global_sum_exp[i], writes log(global_sum_exp[i]) to the
+// same address.  Safe because each thread operates on a disjoint element.
+//
+// Guard: clamps input to ≥ FLT_MIN before taking the log to avoid -Inf for
+// degenerate batches (e.g. a row of all -inf logits after masking).
+
+static constexpr int kLogFinaliseBlockSize = 256;
+
+__global__ void cross_entropy_tp_log_finalise_kernel(
+    float* __restrict__ sum_exp,   // [batch] — in/out: sum_exp → log(sum_exp)
+    int                 batch)
+{
+    const int i = blockIdx.x * kLogFinaliseBlockSize + threadIdx.x;
+    if (i >= batch) return;
+    // Clamp to FLT_MIN to avoid log(0) = -inf in degenerate cases.
+    const float s = fmaxf(__ldg(sum_exp + i), FLT_MIN);
+    sum_exp[i] = __logf(s);
+}
+
+void launch_cross_entropy_tp_log_finalise(
+    float*       global_sum_exp,   // [batch] device buffer — modified in-place
+    int          batch,
+    cudaStream_t stream)
+{
+    if (batch <= 0) return;
+    const int grid = (batch + kLogFinaliseBlockSize - 1) / kLogFinaliseBlockSize;
+    cross_entropy_tp_log_finalise_kernel
+        <<<std::max(grid, 1), kLogFinaliseBlockSize, 0, stream>>>(
+            global_sum_exp, batch);
+    DS_LAUNCH_CHECK(stream);
+}
+
+// ── Section 8b: forward-with-log kernel ─────────────────────────────────────
+//
+// Produces FOUR outputs per batch row:
+//   local_max      (FP32)  — for AllReduce_max across TP ranks
+//   local_sum_exp  (FP32)  — for AllReduce_sum across TP ranks
+//   local_log_sum  (FP32)  — log(local_sum_exp), useful for single-rank debug
+//   local_logit    (FP32)  — label logit for AllReduce_sum across TP ranks
+//
+// The local_log_sum output is only valid BEFORE the cross-rank AllReduce;
+// the caller must recompute log after the AllReduce is done.  This buffer is
+// provided for single-rank (tp_size=1) fast paths where AllReduce is a no-op
+// and the log can be used directly.
+//
+// Implementation:  identical inner loop to cross_entropy_tp_forward_kernel,
+// with an additional write of __logf(acc.s) after the block reduction.
+// We reuse smem_m[0] (already broadcast from block_reduce_max_sum) to avoid
+// extra shared memory.
+
+template <int SmVer>
+__global__ void
+__launch_bounds__(CETPPolicy<SmVer>::kBlockSize,
+                  CETPPolicy<SmVer>::kMinBlocksPerSM)
+cross_entropy_tp_forward_with_log_kernel(
+    float*                            local_max,
+    float*                            local_sum_exp,
+    float*                            local_log_sum,    // NEW: log(local_sum_exp)
+    float*                            local_logit,
+    const __nv_bfloat16* __restrict__ logits,
+    const int*           __restrict__ labels,
+    int                               shard_offset,
+    int                               v_local)
+{
+    using Policy = CETPPolicy<SmVer>;
+    constexpr int kVec      = Policy::kVecBF16;
+    constexpr int kBS       = Policy::kBlockSize;
+    constexpr int kMaxWarps = kBS / hw_warp_size;
+
+    __shared__ float smem_m[kMaxWarps];
+    __shared__ float smem_s[kMaxWarps];
+
+    cg::thread_block blk = cg::this_thread_block();
+
+    const int row   = blockIdx.x;
+    const int label = __ldg(labels + row);
+
+    const bool label_in_shard = (label >= shard_offset) &&
+                                 (label <  shard_offset + v_local);
+    const int  local_label    = label - shard_offset;
+
+    const __nv_bfloat16* __restrict__ row_ptr = logits + (size_t)row * v_local;
+
+    MaxSumPair acc = { -FLT_MAX, 0.f };
+    float label_logit_val = 0.f;
+
+    for (int col = (int)threadIdx.x * kVec; col < v_local; col += kBS * kVec) {
+        if (col + kVec <= v_local) {
+            const uint4 raw = __ldg(reinterpret_cast<const uint4*>(row_ptr + col));
+            const __nv_bfloat16* lp = reinterpret_cast<const __nv_bfloat16*>(&raw);
+            #pragma unroll
+            for (int v = 0; v < kVec; ++v) {
+                const float x = __bfloat162float(lp[v]);
+                acc = merge_max_sum(acc, { x, 1.f });
+                if (label_in_shard && (col + v) == local_label)
+                    label_logit_val = x;
+            }
+        } else {
+            for (int v = 0; v < kVec && col + v < v_local; ++v) {
+                const float x = __bfloat162float(__ldg(row_ptr + col + v));
+                acc = merge_max_sum(acc, { x, 1.f });
+                if (label_in_shard && (col + v) == local_label)
+                    label_logit_val = x;
+            }
+        }
+    }
+
+    // Block-level (max, sum_exp) reduction.
+    acc = block_reduce_max_sum<kBS>(acc, smem_m, smem_s, blk);
+
+    // Label logit block reduction.
+    const int lane    = threadIdx.x % hw_warp_size;
+    const int warp_id = threadIdx.x / hw_warp_size;
+
+    float lv = label_logit_val;
+    #pragma unroll
+    for (int mask = 16; mask > 0; mask >>= 1)
+        lv += __shfl_xor_sync(0xffffffff, lv, mask);
+
+    if (lane == 0) smem_m[warp_id] = lv;
+    blk.sync();
+
+    float block_label_logit = (threadIdx.x < kMaxWarps) ? smem_m[threadIdx.x] : 0.f;
+    if (warp_id == 0) {
+        #pragma unroll
+        for (int mask = 16; mask > 0; mask >>= 1)
+            block_label_logit += __shfl_xor_sync(0xffffffff, block_label_logit, mask);
+    }
+    if (threadIdx.x == 0) smem_m[0] = block_label_logit;
+    blk.sync();
+    block_label_logit = smem_m[0];
+
+    // Write all four outputs (thread 0 only).
+    if (threadIdx.x == 0) {
+        local_max    [row] = acc.m;
+        local_sum_exp[row] = acc.s;
+        // log(sum_exp) is valid only for tp_size=1 (no cross-rank AllReduce needed).
+        // For tp_size > 1, caller must re-run log AFTER AllReduce_sum(sum_exp).
+        local_log_sum[row] = __logf(fmaxf(acc.s, FLT_MIN));
+        local_logit  [row] = block_label_logit;
+    }
+}
+
+void launch_cross_entropy_tp_forward_with_log(
+    float*               local_max,
+    float*               local_sum_exp,
+    float*               local_log_sum,    // extra output: log(local_sum_exp)
+    float*               local_logit,
+    const __nv_bfloat16* logits,
+    const int*           labels,
+    int                  batch,
+    int                  v_local,
+    int                  shard_offset,
+    int                  sm_version,
+    cudaStream_t         stream)
+{
+    if (batch <= 0) return;
+    if (sm_version >= 120) {
+        using P = CETPPolicy<120>;
+        cross_entropy_tp_forward_with_log_kernel<120>
+            <<<batch, P::kBlockSize, 0, stream>>>(
+                local_max, local_sum_exp, local_log_sum, local_logit,
+                logits, labels, shard_offset, v_local);
+        DS_LAUNCH_CHECK(stream);
+    } else if (sm_version >= 90) {
+        using P = CETPPolicy<90>;
+        cross_entropy_tp_forward_with_log_kernel<90>
+            <<<batch, P::kBlockSize, 0, stream>>>(
+                local_max, local_sum_exp, local_log_sum, local_logit,
+                logits, labels, shard_offset, v_local);
+        DS_LAUNCH_CHECK(stream);
+    } else {
+        using P = CETPPolicy<86>;
+        cross_entropy_tp_forward_with_log_kernel<86>
+            <<<batch, P::kBlockSize, 0, stream>>>(
+                local_max, local_sum_exp, local_log_sum, local_logit,
+                logits, labels, shard_offset, v_local);
+        DS_LAUNCH_CHECK(stream);
+    }
+}

@@ -321,6 +321,38 @@ class HeteroReduceOp:
             d_logits, logits, labels, global_max, log_sum_exp,
             shard_offset, inv_batch, sm_version)
 
+    # Issue #124: TP-aware fused cross-entropy completions
+    def cross_entropy_tp_log_finalise(self, global_sum_exp: torch.Tensor) -> None:
+        """Issue #124: In-place log(global_sum_exp) → log_sum_exp for backward.
+
+        Call AFTER dist.all_reduce(local_sum_exp, op=sum) to produce the
+        log_sum_exp tensor required by cross_entropy_tp_backward.
+
+        Args:
+            global_sum_exp: FP32 Tensor [batch], modified in-place.
+        """
+        _load_module().cross_entropy_tp_log_finalise(global_sum_exp)
+
+    def cross_entropy_tp_forward_with_log(
+        self,
+        logits: torch.Tensor,
+        labels: torch.Tensor,
+        shard_offset: int = 0,
+        sm_version: int = 86,
+    ):
+        """Issue #124: Forward pass returning (max, sum_exp, log_sum, logit).
+
+        Returns a 4-tuple:
+            local_max      (FP32 [batch]) — AllReduce_max across TP ranks
+            local_sum_exp  (FP32 [batch]) — AllReduce_sum across TP ranks
+            local_log_sum  (FP32 [batch]) — log(local_sum_exp); valid for
+                           tp_size=1 without further AllReduce.  For tp>1:
+                           AllReduce sum_exp, then call cross_entropy_tp_log_finalise.
+            local_logit    (FP32 [batch]) — AllReduce_sum across TP ranks
+        """
+        return _load_module().cross_entropy_tp_forward_with_log(
+            logits, labels, shard_offset, sm_version)
+
     def compute_hetero_vocab_partition(self, sm_versions: list, vocab_size: int) -> list:
         """Compute per-rank VocabPartition for non-uniform TP vocab split."""
         return _load_module().compute_hetero_vocab_partition(sm_versions, vocab_size)

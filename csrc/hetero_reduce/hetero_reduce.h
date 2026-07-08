@@ -1546,3 +1546,58 @@ void launch_fused_residual_rmsnorm(__nv_bfloat16*       output,
                                     float                eps,
                                     int                  sm_version,
                                     cudaStream_t         stream);
+
+// ---------------------------------------------------------------------------
+// Issue #124: TP-aware fused cross-entropy completions
+// ---------------------------------------------------------------------------
+
+/**
+ * launch_cross_entropy_tp_log_finalise
+ *
+ * Computes log(global_sum_exp[i]) in-place for i in [0, batch).
+ * Call this AFTER dist.all_reduce(local_sum_exp, op=SUM) to convert the
+ * global sum_exp into the log_sum_exp required by the backward kernel.
+ *
+ * @param global_sum_exp  [in/out] FP32 device buffer [batch], modified in-place
+ * @param batch           Number of samples
+ * @param stream          CUDA stream
+ */
+void launch_cross_entropy_tp_log_finalise(
+    float*       global_sum_exp,
+    int          batch,
+    cudaStream_t stream);
+
+/**
+ * launch_cross_entropy_tp_forward_with_log
+ *
+ * Forward kernel that writes four output buffers per row:
+ *   local_max      — for AllReduce_max across TP ranks
+ *   local_sum_exp  — for AllReduce_sum across TP ranks
+ *   local_log_sum  — log(local_sum_exp); valid directly for tp_size=1,
+ *                    must be recomputed after AllReduce for tp_size > 1.
+ *   local_logit    — label logit; for AllReduce_sum across TP ranks.
+ *
+ * @param local_max      [out] FP32 [batch]
+ * @param local_sum_exp  [out] FP32 [batch]
+ * @param local_log_sum  [out] FP32 [batch] — log of local partial sum
+ * @param local_logit    [out] FP32 [batch]
+ * @param logits         [in]  BF16 [batch × v_local]
+ * @param labels         [in]  Int32 [batch] — global vocab indices
+ * @param batch          Batch size (= grid dim)
+ * @param v_local        Vocab shard width on this rank
+ * @param shard_offset   First global vocab index on this rank
+ * @param sm_version     86, 90, or 120
+ * @param stream         CUDA stream
+ */
+void launch_cross_entropy_tp_forward_with_log(
+    float*               local_max,
+    float*               local_sum_exp,
+    float*               local_log_sum,
+    float*               local_logit,
+    const __nv_bfloat16* logits,
+    const int*           labels,
+    int                  batch,
+    int                  v_local,
+    int                  shard_offset,
+    int                  sm_version,
+    cudaStream_t         stream);
