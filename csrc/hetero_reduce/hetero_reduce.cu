@@ -52,9 +52,9 @@
  *    and after the intra-warp reduce (Stage 1) lane-0 performs a single
  *    128-bit BF16 store.  Zero intermediate DRAM traffic.
  *
- * 5. CONSTANT-MEMORY POINTER ARRAY + DEVICE-MEMORY FALLBACK
- *    ≤ 32 input pointers → __constant__ c_input_ptrs (zero malloc latency)
- *    > 32 inputs → cudaMallocAsync device pointer array
+ * 5. DEVICE-MEMORY POINTER ARRAY
+ *    All calls use cudaMallocAsync (pooled, O(ns) at steady state).
+ *    The old __constant__ c_input_ptrs path is fully removed (#143).
  *
  * ═══════════════════════════════════════════════════════════════════════
  */
@@ -66,6 +66,7 @@
 #include <cooperative_groups/reduce.h>
 #include <cstdint>
 #include <algorithm>
+#include <cstdlib>
 
 #include "hetero_reduce.h"
 #include "ds_kernel_utils.h"
@@ -153,18 +154,10 @@ template <> struct KernelPolicy<120> {
 // ─────────────────────────────────────────────────────────────────────────────
 // Section 2: Pointer array storage
 //
-// BUG-FIX (#143): __constant__ c_input_ptrs was module-global; concurrent
-// stream calls on the same device would race on cudaMemcpyToSymbolAsync,
-// silently corrupting the pointer array seen by kernels on either stream.
-// Fix: always allocate a per-call device buffer via cudaMallocAsync (pooled,
-// async, essentially free at steady state).  The UseConstMem template path
-// is retained but permanently set to false to keep kernel ISA unchanged.
+// All kernels use per-call device pointer arrays allocated via cudaMallocAsync
+// (pooled, O(ns) at steady state).  The old __constant__ c_input_ptrs path
+// had a stream-race hazard (#143) and has been fully removed.
 // ─────────────────────────────────────────────────────────────────────────────
-
-static constexpr int kMaxInlinePointers = 32;  // retained for API compat
-
-// __constant__ c_input_ptrs removed — stream-race hazard; see Section 2 note.
-// Kernels compiled with UseConstMem=false use the d_inputs device argument.
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Section 3: 128-bit vectorised load/store helpers
@@ -255,15 +248,13 @@ DS_D_INLINE float warp_reduce_sum_cg(float val)
 //
 //   Template parameters:
 //     SmVer        : SM version → selects KernelPolicy (incl. kWarpWidth)
-//     UseConstMem  : true  → read pointers from __constant__ c_input_ptrs
-//                    false → read pointers from d_inputs device argument
 //
 //   __launch_bounds__ derived from KernelPolicy (not hard-coded).
 //
 //   Shared memory: none required (warp shuffle needs no smem).
 // ─────────────────────────────────────────────────────────────────────────────
 
-template <int SmVer, bool UseConstMem>
+template <int SmVer>
 __global__ void
 __launch_bounds__(KernelPolicy<SmVer>::kBlockSize, KernelPolicy<SmVer>::kMinBlocksPerSM)
 hetero_reduce_scatter_kernel(
@@ -291,13 +282,8 @@ hetero_reduce_scatter_kernel(
         // Stage 0: each lane accumulates its subset of tensors.
         float2 a0={0.f,0.f}, a1={0.f,0.f}, a2={0.f,0.f}, a3={0.f,0.f};
 
-        if constexpr (UseConstMem) {
-            for (int t = lane; t < num_tensors; t += kWarp)
-                bf16x8_accumulate(c_input_ptrs[t] + gelem, a0, a1, a2, a3);
-        } else {
-            for (int t = lane; t < num_tensors; t += kWarp)
-                bf16x8_accumulate(d_inputs[t] + gelem, a0, a1, a2, a3);
-        }
+        for (int t = lane; t < num_tensors; t += kWarp)
+            bf16x8_accumulate(d_inputs[t] + gelem, a0, a1, a2, a3);
 
         // Stage 1: #137 — __shfl_xor_sync butterfly, kWarpWidth driven by
         // KernelPolicy<SmVer>::kWarpWidth (compile-time SM dispatch).
@@ -323,13 +309,8 @@ hetero_reduce_scatter_kernel(
         for (size_t e = scalar_start; e < shard_count; ++e) {
             float acc = 0.f;
             const size_t gidx = shard_offset + e;
-            if constexpr (UseConstMem) {
-                for (int t = 0; t < num_tensors; ++t)
-                    acc += __bfloat162float(c_input_ptrs[t][gidx]);
-            } else {
-                for (int t = 0; t < num_tensors; ++t)
-                    acc += __bfloat162float(d_inputs[t][gidx]);
-            }
+            for (int t = 0; t < num_tensors; ++t)
+                acc += __bfloat162float(d_inputs[t][gidx]);
             output[e] = __float2bfloat16(acc);
         }
     }
@@ -349,7 +330,6 @@ hetero_reduce_scatter_kernel(
 //   enough that a single warp covers only a few vector iterations.
 // ─────────────────────────────────────────────────────────────────────────────
 
-template <bool UseConstMem>
 __global__ void __launch_bounds__(256, 4)
 hetero_reduce_scatter_warp_coop(
     __nv_bfloat16* __restrict__              output,
@@ -372,7 +352,7 @@ hetero_reduce_scatter_warp_coop(
         float2 a0={0.f,0.f}, a1={0.f,0.f}, a2={0.f,0.f}, a3={0.f,0.f};
 
         for (int t = lane; t < num_tensors; t += hw_warp_size) {
-            const __nv_bfloat16* src = UseConstMem ? c_input_ptrs[t] : d_inputs[t];
+            const __nv_bfloat16* src = d_inputs[t];
             bf16x8_accumulate(src + gidx, a0, a1, a2, a3);
         }
 
@@ -400,7 +380,7 @@ hetero_reduce_scatter_warp_coop(
 //   __shfl_down butterfly → lane-0 single store.  No atomics.
 // ─────────────────────────────────────────────────────────────────────────────
 
-template <int SmVer, bool UseConstMem>
+template <int SmVer>
 __global__ void
 __launch_bounds__(KernelPolicy<SmVer>::kBlockSize, KernelPolicy<SmVer>::kMinBlocksPerSM)
 fused_bf16_reduce_kernel(
@@ -425,13 +405,8 @@ fused_bf16_reduce_kernel(
         // Stage 0: each lane accumulates its tensor subset.
         float2 a0={0.f,0.f}, a1={0.f,0.f}, a2={0.f,0.f}, a3={0.f,0.f};
 
-        if constexpr (UseConstMem) {
-            for (int t = lane; t < num_tensors; t += kWarp)
-                bf16x8_accumulate(c_input_ptrs[t] + base, a0, a1, a2, a3);
-        } else {
-            for (int t = lane; t < num_tensors; t += kWarp)
-                bf16x8_accumulate(d_inputs[t] + base, a0, a1, a2, a3);
-        }
+        for (int t = lane; t < num_tensors; t += kWarp)
+            bf16x8_accumulate(d_inputs[t] + base, a0, a1, a2, a3);
 
         // Stage 1: #137 — __shfl_xor_sync butterfly, width from KernelPolicy.
         a0.x = warp_reduce_sum_shfl<kWarp>(a0.x);
@@ -452,13 +427,8 @@ fused_bf16_reduce_kernel(
     if (warp_g == 0 && lane == 0) {
         for (size_t e = vec_n * kVec; e < n_elems; ++e) {
             float acc = 0.f;
-            if constexpr (UseConstMem) {
-                for (int t = 0; t < num_tensors; ++t)
-                    acc += __bfloat162float(c_input_ptrs[t][e]);
-            } else {
-                for (int t = 0; t < num_tensors; ++t)
-                    acc += __bfloat162float(d_inputs[t][e]);
-            }
+            for (int t = 0; t < num_tensors; ++t)
+                acc += __bfloat162float(d_inputs[t][e]);
             output[e] = __float2bfloat16(acc);
         }
     }
@@ -493,7 +463,6 @@ template <int SmVer>
 static void dispatch_reduce_scatter(
     __nv_bfloat16* output,
     const __nv_bfloat16** d_inputs,
-    bool use_const,
     int num_tensors,
     size_t shard_offset, size_t shard_count,
     cudaStream_t stream)
@@ -507,15 +476,9 @@ static void dispatch_reduce_scatter(
         const size_t warps_needed = (vec_count + 0) / 1;
         const int grid = (int)std::min(
             (warps_needed * hw_warp_size + 255UL) / 256UL, (size_t)65535);
-        if (use_const)
-            hetero_reduce_scatter_warp_coop<true>
-                <<<std::max(grid,1), 256, 0, stream>>>(
-                    output, nullptr, num_tensors, shard_offset, shard_count);
-    DS_LAUNCH_CHECK(stream);
-        else
-            hetero_reduce_scatter_warp_coop<false>
-                <<<std::max(grid,1), 256, 0, stream>>>(
-                    output, d_inputs, num_tensors, shard_offset, shard_count);
+        hetero_reduce_scatter_warp_coop
+            <<<std::max(grid,1), 256, 0, stream>>>(
+                output, d_inputs, num_tensors, shard_offset, shard_count);
     DS_LAUNCH_CHECK(stream);
         return;
     }
@@ -529,15 +492,9 @@ static void dispatch_reduce_scatter(
         (vec_count + warps_per_block - 1) / warps_per_block,
         (size_t)65535);
 
-    if (use_const)
-        hetero_reduce_scatter_kernel<SmVer, true>
-            <<<std::max(grid,1), Policy::kBlockSize, 0, stream>>>(
-                output, nullptr, num_tensors, shard_offset, shard_count);
-    DS_LAUNCH_CHECK(stream);
-    else
-        hetero_reduce_scatter_kernel<SmVer, false>
-            <<<std::max(grid,1), Policy::kBlockSize, 0, stream>>>(
-                output, d_inputs, num_tensors, shard_offset, shard_count);
+    hetero_reduce_scatter_kernel<SmVer>
+        <<<std::max(grid,1), Policy::kBlockSize, 0, stream>>>(
+            output, d_inputs, num_tensors, shard_offset, shard_count);
     DS_LAUNCH_CHECK(stream);
 }
 
@@ -554,7 +511,6 @@ void launch_fused_bf16_reduce(
     cudaStream_t                stream)
 {
     const __nv_bfloat16** d_inputs = setup_input_ptrs(inputs, num_tensors, stream);
-    const bool use_const = false;  // BUG-FIX (#143): const-mem path disabled; always device ptr
 
     auto launch = [&]<int SmVer>() {
         using Policy = KernelPolicy<SmVer>;
@@ -564,15 +520,9 @@ void launch_fused_bf16_reduce(
         const int grid = (int)std::min(
             (vec_n + warps_per_block - 1) / warps_per_block,
             (size_t)65535);
-        if (use_const)
-            fused_bf16_reduce_kernel<SmVer, true>
-                <<<std::max(grid,1), Policy::kBlockSize, 0, stream>>>(
-                    output, nullptr, num_tensors, n_elems);
-    DS_LAUNCH_CHECK(stream);
-        else
-            fused_bf16_reduce_kernel<SmVer, false>
-                <<<std::max(grid,1), Policy::kBlockSize, 0, stream>>>(
-                    output, d_inputs, num_tensors, n_elems);
+        fused_bf16_reduce_kernel<SmVer>
+            <<<std::max(grid,1), Policy::kBlockSize, 0, stream>>>(
+                output, d_inputs, num_tensors, n_elems);
     DS_LAUNCH_CHECK(stream);
     };
 
@@ -583,11 +533,33 @@ void launch_fused_bf16_reduce(
     if (d_inputs) cudaFreeAsync(d_inputs, stream);
 }
 
+// tier_weight: default values reflect measured throughput ratios
+// (Blackwell:H100:A6000 ≈ 4:3:1 on PCIe).  Override at runtime via
+// environment variables when actual bandwidth ratios differ:
+//   HETERO_WEIGHT_SM120=<int>   (default 4, Blackwell)
+//   HETERO_WEIGHT_SM90=<int>    (default 3, H100)
+//   HETERO_WEIGHT_SM86=<int>    (default 1, A6000 / generic)
+// Example: HETERO_WEIGHT_SM120=6 HETERO_WEIGHT_SM90=3 HETERO_WEIGHT_SM86=1
+// Values are read once per process and cached.
 static int tier_weight(int sm_version)
 {
-    if (sm_version >= 120) return 4;   // Blackwell
-    if (sm_version >= 90)  return 3;   // H100
-    return 1;                          // A6000
+    // Read env-var overrides once (thread-safe: written before first kernel launch).
+    static const int kW120 = []() {
+        const char* e = std::getenv("HETERO_WEIGHT_SM120");
+        return (e && *e) ? std::atoi(e) : 4;
+    }();
+    static const int kW90 = []() {
+        const char* e = std::getenv("HETERO_WEIGHT_SM90");
+        return (e && *e) ? std::atoi(e) : 3;
+    }();
+    static const int kW86 = []() {
+        const char* e = std::getenv("HETERO_WEIGHT_SM86");
+        return (e && *e) ? std::atoi(e) : 1;
+    }();
+
+    if (sm_version >= 120) return kW120;   // Blackwell
+    if (sm_version >= 90)  return kW90;    // H100
+    return kW86;                           // A6000 / generic
 }
 
 void compute_hetero_shard_ranges(
@@ -639,16 +611,14 @@ void launch_hetero_reduce_scatter(
     if (shard_count == 0) return;
 
     const __nv_bfloat16** d_inputs = setup_input_ptrs(inputs, num_tensors, stream);
-    const bool use_const = false;  // BUG-FIX (#143): const-mem path disabled; always device ptr
-
     if      (sm_version >= 120)
-        dispatch_reduce_scatter<120>(output, d_inputs, use_const,
+        dispatch_reduce_scatter<120>(output, d_inputs,
             num_tensors, shard_offset, shard_count, stream);
     else if (sm_version >= 90)
-        dispatch_reduce_scatter<90>(output, d_inputs, use_const,
+        dispatch_reduce_scatter<90>(output, d_inputs,
             num_tensors, shard_offset, shard_count, stream);
     else
-        dispatch_reduce_scatter<86>(output, d_inputs, use_const,
+        dispatch_reduce_scatter<86>(output, d_inputs,
             num_tensors, shard_offset, shard_count, stream);
 
     if (d_inputs) cudaFreeAsync(d_inputs, stream);
