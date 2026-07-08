@@ -78,6 +78,11 @@ from deepspeed.core.distributed.param_and_grad_buffer import (
     partition_buckets,
     compute_tier_bucket_sizes,
 )
+from deepspeed.core.distributed.tier_aware_bucketing import (
+    build_tier_aware_config_from_ddp_config,
+    attach_tier_aware_config_to_bucket_groups,
+    get_local_sm_version as _get_local_sm_version,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -689,6 +694,38 @@ class DistributedDataParallel(nn.Module):
             force_single_bucket_group=disable_bucketing,
             reduce_scatter_with_fp32_accumulation=ddp_config.reduce_scatter_with_fp32_accumulation,
         )
+
+        # ------------------------------------------------------------------
+        # Issue #35: attach tier-aware fused gradient allreduce config.
+        #
+        # build_tier_aware_config_from_ddp_config() returns a
+        # TierAwareBucketingConfig when the cluster has a TierMap (heterogeneous
+        # GPU topology) or when use_pcie_aware_overlap is set.  The config is
+        # then attached to every bucket group so that start_grad_sync can call
+        # the C++ fused_gradient_allreduce / hetero_reduce_scatter kernels
+        # (fused_gradient_allreduce.cu) as the primary collective path.
+        #
+        # When the config is None (homogeneous NVLink cluster or the TierMap is
+        # not available), all tier-aware behaviour is silently skipped and the
+        # standard torch.distributed path is used unchanged.
+        # ------------------------------------------------------------------
+        _tier_cfg = build_tier_aware_config_from_ddp_config(ddp_config)
+        if _tier_cfg is not None:
+            _sm_version = _get_local_sm_version(
+                getattr(ddp_config, 'sm_version_override', 0)
+            )
+            all_bucket_groups = self.bucket_groups + self.expert_parallel_bucket_groups
+            attach_tier_aware_config_to_bucket_groups(
+                all_bucket_groups, _tier_cfg, sm_version_override=_sm_version
+            )
+            logger.info(
+                "DES-LOC tier-aware fused gradient allreduce attached to %d "
+                "bucket groups (SM %d, fused_ar=%s, fused_rs=%s).",
+                len(all_bucket_groups),
+                _sm_version,
+                _tier_cfg.use_fused_gradient_allreduce,
+                _tier_cfg.use_fused_reduce_scatter,
+            )
 
         # ------------------------------------------------------------------
         # Multi-DistOpt: assign inter-instance group + communication stream (M3561).

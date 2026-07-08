@@ -86,6 +86,21 @@ from deepspeed.core.distributed.sharded_checkpoint import (
     load_checkpoint,
 )
 
+# Issue #35: tier-aware gradient bucketing with C++ fused kernel dispatch.
+from deepspeed.core.distributed.tier_aware_bucketing import (
+    TierAwareBucketingConfig,
+    get_local_sm_version,
+    get_local_tier_name,
+    tier_bucket_multiplier,
+    fused_allreduce_bucket,
+    fused_reduce_scatter_bucket,
+    TierAwareGradSyncMixin,
+    attach_tier_aware_config_to_bucket_groups,
+    build_tier_aware_config_from_ddp_config,
+    recommend_bucket_size_for_tier,
+    dp_group_min_bucket_size,
+)
+
 # Overlapped gradient reduce-scatter for pipeline-parallel stages.
 from deepspeed.core.distributed.overlap_grad_reduce import (
     OverlapGradReduceManager,
@@ -161,6 +176,18 @@ __all__ = [
     "_desloc_sync_optimizer_moments",
     "_update_router_expert_bias",                   # M3981
     "reset_model_temporary_tensors",
+    # tier_aware_bucketing (Issue #35: DDP + gradient sync + tier-aware bucketing)
+    "TierAwareBucketingConfig",
+    "get_local_sm_version",
+    "get_local_tier_name",
+    "tier_bucket_multiplier",
+    "fused_allreduce_bucket",
+    "fused_reduce_scatter_bucket",
+    "TierAwareGradSyncMixin",
+    "attach_tier_aware_config_to_bucket_groups",
+    "build_tier_aware_config_from_ddp_config",
+    "recommend_bucket_size_for_tier",
+    "dp_group_min_bucket_size",
     # overlap_grad_reduce (pipeline-parallel overlapped reduce-scatter)
     "OverlapGradReduceManager",
     "PPStageGradReduceScheduler",

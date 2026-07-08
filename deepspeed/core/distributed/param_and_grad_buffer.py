@@ -85,6 +85,25 @@ from torch.distributed import _coalescing_manager
 import deepspeed.core.parallel_state as parallel_state
 from deepspeed.core.model_parallel_config import ModelParallelConfig
 
+# ---------------------------------------------------------------------------
+# Tier-aware fused gradient allreduce (Issue #35)
+# Imported lazily so the module is usable without the hetero_reduce extension.
+# ---------------------------------------------------------------------------
+try:
+    from deepspeed.core.distributed.tier_aware_bucketing import (  # noqa: F401
+        fused_allreduce_bucket as _fused_allreduce_bucket,
+        fused_reduce_scatter_bucket as _fused_reduce_scatter_bucket,
+        get_local_sm_version as _get_local_sm_version,
+        TierAwareBucketingConfig as _TierAwareBucketingConfig,
+    )
+    _TIER_AWARE_AVAILABLE = True
+except ImportError:
+    _TIER_AWARE_AVAILABLE = False
+    _fused_allreduce_bucket = None
+    _fused_reduce_scatter_bucket = None
+    _get_local_sm_version = None
+    _TierAwareBucketingConfig = None
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -454,6 +473,13 @@ class ParamAndGradBucketGroup:
 
         # DES-LOC: gate on Kx steps.
         self._skip_sync: bool = False
+
+        # Issue #35: tier-aware fused gradient allreduce (C++ kernel path).
+        # Set by DistributedDataParallel.__init__ via attach_tier_aware_config
+        # after bucket groups are created.  None = use standard torch.distributed.
+        self._tier_aware_config = None
+        # Cached SM version of the local GPU; resolved once and reused.
+        self._local_sm_version: int = 86
 
         # Insight I5: buffer ownership FSM (Megatron M3061/M3116)
         # Track which consumer owns the shared flat buffer so that param-AG
@@ -847,6 +873,110 @@ class ParamAndGradBucketGroup:
         # DES-LOC clusters (A6000+H100+Blackwell, no NVLink): set megatron_fsdp_grad_comm_dtype=bfloat16.
         _grad_comm_dtype = getattr(getattr(self, 'ddp_config', None), 'megatron_fsdp_grad_comm_dtype', None)
 
+        # ------------------------------------------------------------------
+        # Issue #35: tier-aware fused gradient allreduce (C++ kernel path).
+        #
+        # When a TierAwareBucketingConfig is attached and the fused kernel
+        # is available, attempt to handle the collective here via the
+        # INT8-compressed ring allreduce (fused_gradient_allreduce.cu) for
+        # the all-reduce path, or hetero_reduce_scatter for the DistOpt path.
+        #
+        # The fused path is:
+        #   - Synchronous only (async_op=False).  Async dispatch is left to
+        #     the standard NCCL path below, which has proper handle tracking.
+        #   - BF16-only.  FP32/FP16 grad buffers fall through to the standard
+        #     path unconditionally.
+        #   - Only applied when force_all_reduce=False (respects DistOpt mode).
+        #
+        # If the fused kernel handles ALL buckets successfully we skip the
+        # standard NCCL path entirely and set grad_reduce_handle=None.
+        # If any bucket falls back, we let the standard path handle all of
+        # them (to avoid partial application that would leave the gradient in
+        # an inconsistent state across buckets).
+        # ------------------------------------------------------------------
+        _use_fused_kernel = (
+            _TIER_AWARE_AVAILABLE
+            and self._tier_aware_config is not None
+            and self._tier_aware_config.enabled
+            and not async_op                      # synchronous only
+            and not force_all_reduce              # respect DistOpt mode
+            and num_instances == 1                # single DistOpt instance
+        )
+        if _use_fused_kernel:
+            _all_fused = True
+            _sm = self._local_sm_version
+            _cfg = self._tier_aware_config
+            for idx, bucket in enumerate(self.buckets):
+                # Apply gradient scaling in-place before the kernel
+                # (mirrors the standard path below).
+                if bucket.gradient_scaling_factor != 1.0:
+                    bucket.grad_data.mul_(bucket.gradient_scaling_factor)
+
+                if use_dist_opt and not force_all_reduce:
+                    # Distribute-optimizer reduce-scatter path.
+                    if self.cached_grad_buffer_shard_list[idx] is None:
+                        self.cached_grad_buffer_shard_list[idx] = shard_buffer(
+                            bucket.grad_data,
+                            self.intra_distributed_optimizer_instance_size,
+                        )
+                    local_view = self.cached_grad_buffer_shard_list[idx][
+                        self.intra_distributed_optimizer_instance_rank
+                    ]
+                    shard_count = local_view.numel()
+                    # Compute the element offset of this shard in the full
+                    # grad_data tensor.
+                    shard_offset = bucket.offset + (
+                        self.intra_distributed_optimizer_instance_rank * shard_count
+                    )
+                    applied = _fused_reduce_scatter_bucket(
+                        bucket.grad_data,
+                        local_view,
+                        shard_offset=shard_offset,
+                        shard_count=shard_count,
+                        group=communication_group,
+                        sm_version=_sm,
+                        config=_cfg,
+                    )
+                else:
+                    # All-reduce path.
+                    applied = _fused_allreduce_bucket(
+                        bucket.grad_data,
+                        group=communication_group,
+                        sm_version=_sm,
+                        min_elems=_cfg.fused_ar_min_elems,
+                        config=_cfg,
+                    )
+
+                if not applied:
+                    _all_fused = False
+                    # Undo in-place scaling so the standard path below
+                    # can re-apply it correctly.
+                    if bucket.gradient_scaling_factor != 1.0:
+                        bucket.grad_data.div_(bucket.gradient_scaling_factor)
+                    break   # exit the loop; standard path handles all buckets
+
+            if _all_fused:
+                # All buckets handled by the fused C++ kernel.
+                # Mark as non-async (no handle to wait on).
+                self.grad_reduce_handle = None
+                if not overlap:
+                    self._copy_back_extra_main_grads()
+                self.grad_reduce_finished = True
+                # Insight I5: buffer ownership FSM.
+                self._buffer_ownership = BufferOwnership.FREE
+                return   # early exit — skip the standard NCCL path below
+
+            # At least one bucket fell back; undo scaling for all already-
+            # processed buckets so the standard path below can proceed from
+            # the original unscaled grad_data.
+            for idx2 in range(idx + 1):
+                bkt = self.buckets[idx2]
+                if bkt.gradient_scaling_factor != 1.0:
+                    bkt.grad_data.div_(bkt.gradient_scaling_factor)
+
+        # ------------------------------------------------------------------
+        # Standard NCCL path (all_reduce or reduce_scatter_tensor).
+        # ------------------------------------------------------------------
         # Coalesce all buckets in this group into a single NCCL call.
         grad_reduce_handle = None
         with stream_context, _coalescing_manager(communication_group, async_ops=async_op) as cm:
