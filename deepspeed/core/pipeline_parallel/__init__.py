@@ -80,6 +80,52 @@ from deepspeed.core.pipeline_parallel.schedules import (
     set_pipeline_layer_split,
 )
 
+# ---------------------------------------------------------------------------
+# utils re-exports
+# ---------------------------------------------------------------------------
+from deepspeed.core.pipeline_parallel.utils import (
+    # PP stage predicates
+    is_pp_first_stage,
+    is_pp_last_stage,
+    is_vp_first_stage,
+    is_vp_last_stage,
+    # Rank lookup
+    get_pp_first_rank,
+    get_pp_last_rank,
+    get_pp_next_rank,
+    get_pp_prev_rank,
+    # Tensor utilities
+    make_viewless,
+    # Fine-grained scheduling
+    NoopScheduleNode,
+    ScheduleNode,
+    AbstractSchedulePlan,
+    # Stream management
+    set_streams,
+    get_comp_stream,
+    get_comm_stream,
+    # DES-LOC tier helpers
+    get_tier_for_rank,
+    tier_priority_stream,
+)
+
+# ---------------------------------------------------------------------------
+# bridge_communicator re-exports
+# ---------------------------------------------------------------------------
+from deepspeed.core.pipeline_parallel.bridge_communicator import (
+    BridgeCommunicator,
+    CommRole,
+    RankCommInfo,
+)
+
+# ---------------------------------------------------------------------------
+# multimodule_communicator re-exports
+# ---------------------------------------------------------------------------
+from deepspeed.core.pipeline_parallel.multimodule_communicator import (
+    MultiModulePipelineCommunicator,
+    RankModuleInfo,
+)
+
 __all__ = [
     # P2P communication
     "P2PCommunicator",
@@ -110,11 +156,36 @@ __all__ = [
     "PP5_DESLOC_SLOW_RANKS",
     "make_pp5_bubble_filler",
     "make_pp5_p2p_manager",
-    # Utilities
+    # Utilities (from schedules.py)
     "get_tensor_shapes",
     "deallocate_output_tensor",
     "custom_backward",
     "get_num_microbatches",
     "get_pipeline_model_parallel_rank_for_layer",
     "set_pipeline_layer_split",
+    # Utilities (from utils.py)
+    "is_pp_first_stage",
+    "is_pp_last_stage",
+    "is_vp_first_stage",
+    "is_vp_last_stage",
+    "get_pp_first_rank",
+    "get_pp_last_rank",
+    "get_pp_next_rank",
+    "get_pp_prev_rank",
+    "make_viewless",
+    "NoopScheduleNode",
+    "ScheduleNode",
+    "AbstractSchedulePlan",
+    "set_streams",
+    "get_comp_stream",
+    "get_comm_stream",
+    "get_tier_for_rank",
+    "tier_priority_stream",
+    # Bridge communicator
+    "BridgeCommunicator",
+    "CommRole",
+    "RankCommInfo",
+    # Multi-module communicator
+    "MultiModulePipelineCommunicator",
+    "RankModuleInfo",
 ]

@@ -4,13 +4,16 @@
 
 This package mirrors the structure of Megatron-LM's
 ``megatron/core/tensor_parallel/`` and re-exports all public symbols from
-the three sub-modules:
+the six sub-modules:
 
-* ``layers.py``   — VocabParallelEmbedding, ColumnParallelLinear,
-                    RowParallelLinear, TP attribute helpers
-* ``random.py``   — CudaRNGStatesTracker, checkpoint, model_parallel_cuda_manual_seed
-* ``mappings.py`` — scatter/gather/reduce region functions,
-                    split_tensor_into_1d_equal_chunks, gather_split_1d_tensor
+* ``layers.py``        — VocabParallelEmbedding, ColumnParallelLinear,
+                         RowParallelLinear, TP attribute helpers
+* ``random.py``        — CudaRNGStatesTracker, checkpoint, model_parallel_cuda_manual_seed
+* ``mappings.py``      — scatter/gather/reduce region functions,
+                         split_tensor_into_1d_equal_chunks, gather_split_1d_tensor
+* ``cross_entropy.py`` — vocab_parallel_cross_entropy, VocabParallelCrossEntropy
+* ``data.py``          — broadcast_data for TP-group data distribution
+* ``utils.py``         — VocabUtility, split_tensor_along_last_dim, gather helpers
 """
 
 from __future__ import annotations
@@ -67,6 +70,30 @@ from deepspeed.core.tensor_parallel.mappings import (
     split_tensor_into_1d_equal_chunks,
 )
 
+# ---------------------------------------------------------------------------
+# cross_entropy.py
+# ---------------------------------------------------------------------------
+from deepspeed.core.tensor_parallel.cross_entropy import (
+    VocabParallelCrossEntropy,
+    vocab_parallel_cross_entropy,
+)
+
+# ---------------------------------------------------------------------------
+# data.py
+# ---------------------------------------------------------------------------
+from deepspeed.core.tensor_parallel.data import (
+    broadcast_data,
+)
+
+# ---------------------------------------------------------------------------
+# utils.py
+# ---------------------------------------------------------------------------
+from deepspeed.core.tensor_parallel.utils import (
+    VocabUtility,
+    split_tensor_along_last_dim,
+    split_tensor_along_last_dim_hetero,
+)
+
 __all__ = [
     # layers.py
     "ColumnParallelLinear",
@@ -105,4 +132,13 @@ __all__ = [
     "scatter_to_sequence_parallel_region",
     "scatter_to_tensor_model_parallel_region",
     "split_tensor_into_1d_equal_chunks",
+    # cross_entropy.py
+    "VocabParallelCrossEntropy",
+    "vocab_parallel_cross_entropy",
+    # data.py
+    "broadcast_data",
+    # utils.py
+    "VocabUtility",
+    "split_tensor_along_last_dim",
+    "split_tensor_along_last_dim_hetero",
 ]
