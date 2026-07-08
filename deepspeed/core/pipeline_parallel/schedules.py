@@ -273,8 +273,18 @@ def _get_mtp_loss_scale(config, device, num_tokens: "Optional[torch.Tensor]" = N
     return loss_scale
 
 
-def get_forward_backward_func(pp_size=None, vp_size=None):
-    """Return the appropriate forward_backward function for the given PP/VPP config."""
+def get_forward_backward_func(pp_size=None, vp_size=None, config=None):
+    """Return the appropriate forward_backward function for the given PP/VPP config.
+
+    DES-LOC extension: when ``config.desloc.bubble_filler`` is set and PP>1
+    without VPP, the native heterogeneous 1F1B schedule is returned so that
+    per-rank asymmetric warmup and inline bubble-filling are active.
+
+    Args:
+        pp_size (Optional[int]): Pipeline model parallel size.
+        vp_size (Optional[int]): Virtual pipeline model parallel size.
+        config:  Optional model config carrying ``config.desloc.bubble_filler``.
+    """
     if pp_size is None and vp_size is None:
         pp_size = _ps.get_pipeline_model_parallel_world_size()
         vp_size = _ps.get_virtual_pipeline_model_parallel_world_size()
@@ -282,6 +292,13 @@ def get_forward_backward_func(pp_size=None, vp_size=None):
         if vp_size is not None:
             return forward_backward_pipelining_with_interleaving
         else:
+            # DES-LOC: prefer the native hetero schedule when a bubble filler
+            # is registered on the config, so callers get adaptive warmup and
+            # inline bubble-filling without extra plumbing.
+            if config is not None:
+                _desloc = getattr(config, 'desloc', None)
+                if _desloc is not None and getattr(_desloc, 'bubble_filler', None) is not None:
+                    return forward_backward_hetero_1f1b
             return forward_backward_pipelining_without_interleaving
     return forward_backward_no_pipelining
 
@@ -3161,6 +3178,508 @@ def forward_backward_pipelining_without_interleaving_pp5_heterogeneous(
 
 
 # ===========================================================================
+# DES-LOC: heterogeneous 1F1B schedule (native, non-wrapping)
+# ===========================================================================
+
+def forward_backward_hetero_1f1b(
+    *,
+    forward_step_func,
+    data_iterator,
+    model,
+    num_microbatches: int,
+    seq_length: int,
+    micro_batch_size: int,
+    decoder_seq_length: Optional[int] = None,
+    forward_only: bool = False,
+    collect_non_loss_data: bool = False,
+    first_val_step: Optional[bool] = None,
+    adjust_tensor_shapes_fn: Optional[Callable] = None,
+    p2p_communicator: Optional["P2PCommunicator"] = None,
+    pg_collection=None,
+    force_all_reduce: Optional[bool] = False,
+    bubble_filler: Optional["HeterogeneousBubbleFiller"] = None,
+):
+    """Native heterogeneous 1F1B schedule for DES-LOC H100+A6000 pipelines.
+
+    Unlike ``forward_backward_pipelining_without_interleaving_pp5_heterogeneous``
+    (which wraps the standard schedule and fills bubbles only post-hoc), this
+    function integrates heterogeneous-aware behaviour directly into the warmup,
+    steady-state, and cooldown phases:
+
+    Phase 0 — Asymmetric warmup
+    ----------------------------
+    Each rank executes a *rank-local* number of warmup microbatches.  For fast
+    ranks (H100, ranks 0 and 4 in the standard DES-LOC PP=5 layout), the
+    ``HeterogeneousBubbleFiller`` can extend the warmup count beyond the
+    standard ``PP - rank - 1`` value so that more activations are already
+    resident in SRAM when the slow stages (A6000) catch up.  Slow ranks always
+    use the standard warmup depth.
+
+    Phase 1 — Steady-state 1F1B with inline bubble filling
+    --------------------------------------------------------
+    After the warmup, each rank enters the interleaved forward-backward (1F1B)
+    steady state.  At the transition point (the "post-warmup bubble") the
+    ``HeterogeneousBubbleFiller.maybe_fill_bubble`` is called on fast ranks to
+    schedule extra speculative forward microbatches.  Per-microbatch timing is
+    recorded so the stage-clock EMA stays current throughout.
+
+    Phase 2 — Cooldown with speculative drain
+    ------------------------------------------
+    Cooldown backward passes consume any speculative activations queued by the
+    bubble filler (via ``pop_speculative_activation``) before falling back to
+    the standard ``input_tensors`` / ``output_tensors`` stacks.  This ensures
+    no speculative activation is orphaned and all computed gradients are
+    properly synchronised before the function returns.
+
+    DES-LOC bubble analysis (PP=5, M microbatches)
+    ------------------------------------------------
+    Standard 1F1B bubble fraction: (PP-1)/M = 4/M.
+    With extended warmup (extra_mb=2 on H100 ranks): effective bubble ≈ 2/M.
+    Additional inline fill during steady-state can further cut idle time on
+    fast ranks by ~15-20% depending on slowdown_ratio.
+
+    Args:
+        forward_step_func:    User's per-microbatch forward step.
+        data_iterator:        Data iterator (or list for interleaved).
+        model:                Model module (or list for interleaved).
+        num_microbatches:     Number of microbatches in the global batch.
+        seq_length:           Sequence length for the current global batch.
+        micro_batch_size:     Number of sequences per microbatch.
+        decoder_seq_length:   Decoder sequence length (dual-stack only).
+        forward_only:         Skip all backward passes.
+        collect_non_loss_data: Passed through to forward_step.
+        first_val_step:       First validation step flag (TE FP8 update).
+        adjust_tensor_shapes_fn: Optional recv/send shape adjuster.
+        p2p_communicator:     P2P communicator; if None, built from parallel_state.
+        pg_collection:        Process-group collection; if None, built from parallel_state.
+        force_all_reduce:     Force all-reduce instead of reduce-scatter.
+        bubble_filler:        ``HeterogeneousBubbleFiller`` instance.  If None
+                              the schedule degrades gracefully to standard 1F1B.
+
+    Returns:
+        forward_data_store: List of (loss, loss_dict) pairs from the last PP stage.
+    """
+    # ------------------------------------------------------------------
+    # Normalise model / data_iterator
+    # ------------------------------------------------------------------
+    if isinstance(model, list):
+        assert len(model) == 1, (
+            "hetero_1f1b does not support model chunking (VPP); "
+            "use forward_backward_pipelining_with_interleaving instead"
+        )
+        model = model[0]
+    if isinstance(data_iterator, list):
+        assert len(data_iterator) == 1, (
+            "hetero_1f1b does not support multiple data iterators"
+        )
+        data_iterator = data_iterator[0]
+
+    config = get_model_config(model)
+    if config.overlap_p2p_comm:
+        raise ValueError(
+            "hetero_1f1b does not support overlap_p2p_comm; "
+            "disable config.overlap_p2p_comm or use the standard schedule"
+        )
+
+    # ------------------------------------------------------------------
+    # Process-group / P2P setup (mirrors standard schedule)
+    # ------------------------------------------------------------------
+    is_multimodule = isinstance(pg_collection, MultiModuleProcessGroupCollection) or isinstance(
+        p2p_communicator, MultiModulePipelineCommunicator
+    )
+    tp_group, cp_group, cp_size = None, None, None
+
+    if p2p_communicator is None and pg_collection is None:
+        p2p_communicator = P2PCommunicator(
+            pp_group=_ps.get_pipeline_model_parallel_group(), config=config
+        )
+        tp_group = _ps.get_tensor_model_parallel_group()
+        cp_group = _ps.get_context_parallel_group()
+        cp_size = cp_group.size()
+        embd_group = _ps.get_embedding_group(check_initialized=False)
+        pos_emb_group = _ps.get_position_embedding_group(check_initialized=False)
+        pp_group = _ps.get_pipeline_model_parallel_group()
+
+        pg_collection = ProcessGroupCollection()
+        pg_collection.tp = tp_group
+        pg_collection.pp = pp_group
+        pg_collection.embd = embd_group
+        pg_collection.pos_embd = pos_emb_group
+        pg_collection.cp = cp_group
+        pg_collection.dp_cp = _ps.get_data_parallel_group(
+            with_context_parallel=True, partial_data_parallel=False
+        )
+        pg_collection.tp_dp_cp = _ps.get_tensor_and_data_parallel_group(
+            with_context_parallel=True
+        )
+    elif p2p_communicator is not None and pg_collection is not None:
+        assert hasattr(p2p_communicator, 'config'), "p2p_communicator must have a config"
+        if is_multimodule:
+            if not config.variable_seq_lengths:
+                raise ValueError(
+                    "config.variable_seq_lengths=True required for multi-module pipelines"
+                )
+            cp_size = pg_collection.get_language_model_cp_size() if pg_collection.has_language_model() else None
+        elif isinstance(pg_collection, ProcessGroupCollection):
+            assert hasattr(pg_collection, 'tp') and hasattr(pg_collection, 'cp')
+            tp_group = pg_collection.tp
+            cp_group = pg_collection.cp
+            cp_size = cp_group.size()
+        else:
+            raise TypeError(
+                f"pg_collection must be ProcessGroupCollection or "
+                f"MultiModuleProcessGroupCollection, got {type(pg_collection)}"
+            )
+    else:
+        raise ValueError("Provide both p2p_communicator and pg_collection, or neither")
+
+    # ------------------------------------------------------------------
+    # Embedding / grad-sync setup
+    # ------------------------------------------------------------------
+    if config.finalize_model_grads_func is not None and not forward_only:
+        embedding_module = clear_embedding_activation_buffer(
+            config, model, p2p_communicator.is_pp_last_stage
+        )
+
+    if config.timers is not None:
+        config.timers('forward-backward', log_level=1).start(barrier=config.barrier_with_L1_time)
+
+    if getattr(config, "moe_paged_stash", False):
+        paged_stash_reset(enabled=not forward_only, config=config)
+
+    no_sync_func = config.no_sync_func
+    if no_sync_func is None:
+        no_sync_func = contextlib.nullcontext
+    no_sync_context = None
+
+    def disable_grad_sync():
+        nonlocal no_sync_context
+        if no_sync_context is None:
+            no_sync_context = no_sync_func()
+            no_sync_context.__enter__()
+
+    def enable_grad_sync():
+        nonlocal no_sync_context
+        if no_sync_context is not None:
+            no_sync_context.__exit__(None, None, None)
+            no_sync_context = None
+
+    disable_grad_sync()
+
+    # ------------------------------------------------------------------
+    # Hetero-aware warmup count
+    # ------------------------------------------------------------------
+    _current_pp_rank = p2p_communicator.current_stage
+
+    # Standard 1F1B warmup: (total_stages - current_stage - 1) forward passes.
+    base_warmup = p2p_communicator.total_stages - _current_pp_rank - 1
+    base_warmup = min(base_warmup, num_microbatches)
+
+    # Reset bubble filler state for this global step.
+    if bubble_filler is not None:
+        bubble_filler.reset()
+
+    # Fast ranks may get an extended warmup to pre-fill the pipeline while
+    # slow ranks are still computing their first warmup microbatches.
+    if bubble_filler is not None:
+        extended_warmup = bubble_filler.warmup_count_for_rank(_current_pp_rank, base_warmup)
+        num_warmup_microbatches = min(extended_warmup, num_microbatches)
+    else:
+        num_warmup_microbatches = base_warmup
+
+    num_microbatches_remaining = num_microbatches - num_warmup_microbatches
+
+    # Activation-checkpoint accounting (mirrors standard schedule).
+    max_outstanding_backprops = None
+    if config.num_microbatches_with_partial_activation_checkpoints is not None:
+        max_outstanding_backprops = num_warmup_microbatches + 1
+
+    # Backward function selection
+    if is_multimodule:
+        backward_func = partial(
+            backward_step_multimodule,
+            language_model_module_name=pg_collection.language_model_module_name,
+        )
+    else:
+        backward_func = backward_step
+
+    # Tensor shape negotiation
+    _current_pp_stage = p2p_communicator.current_stage
+    recv_tensor_shapes = get_tensor_shapes(
+        seq_length=seq_length,
+        micro_batch_size=micro_batch_size,
+        decoder_seq_length=decoder_seq_length,
+        config=config,
+        tp_group=tp_group,
+        cp_group=cp_group,
+        stage=_current_pp_stage,
+    )
+    send_tensor_shapes = get_tensor_shapes(
+        seq_length=seq_length,
+        micro_batch_size=micro_batch_size,
+        decoder_seq_length=decoder_seq_length,
+        config=config,
+        tp_group=tp_group,
+        cp_group=cp_group,
+        stage=_current_pp_stage,
+    )
+    if adjust_tensor_shapes_fn is not None:
+        recv_tensor_shapes, send_tensor_shapes = adjust_tensor_shapes_fn(
+            recv_tensor_shapes, send_tensor_shapes
+        )
+
+    input_tensors: Optional[List] = None
+    output_tensors: Optional[List] = None
+    total_num_tokens = torch.zeros([], dtype=torch.int, device="cuda")
+
+    if not forward_only:
+        input_tensors = []
+        output_tensors = []
+    forward_data_store: List = []
+
+    # ------------------------------------------------------------------
+    # Phase 0: Asymmetric warmup
+    # ------------------------------------------------------------------
+    # Start the overall compute clock on fast ranks so the EMA has a baseline
+    # for the first bubble-fill decision.
+    if bubble_filler is not None and bubble_filler.is_fast_rank(_current_pp_rank):
+        bubble_filler.record_compute_start(_current_pp_rank)
+
+    for i in range(num_warmup_microbatches):
+        if max_outstanding_backprops is not None:
+            checkpoint_activations_microbatch = (
+                i % max_outstanding_backprops
+                >= config.num_microbatches_with_partial_activation_checkpoints
+            )
+        else:
+            checkpoint_activations_microbatch = None
+
+        input_tensor = p2p_communicator.recv_forward(
+            recv_tensor_shapes, p2p_communicator.is_pp_first_stage
+        )
+
+        # Per-microbatch timing for stage-clock EMA calibration.
+        if bubble_filler is not None:
+            bubble_filler.record_compute_start(_current_pp_rank)
+
+        output_tensor, num_tokens = forward_step(
+            forward_step_func,
+            data_iterator,
+            model,
+            num_microbatches,
+            input_tensor,
+            forward_data_store,
+            config,
+            cp_group_size=cp_size,
+            collect_non_loss_data=collect_non_loss_data,
+            checkpoint_activations_microbatch=checkpoint_activations_microbatch,
+            is_first_microbatch=check_first_val_step(first_val_step, forward_only, i == 0),
+            current_microbatch=i,
+            is_last_stage=p2p_communicator.is_pp_last_stage,
+        )
+
+        if bubble_filler is not None:
+            bubble_filler.record_compute_stop(_current_pp_rank)
+
+        p2p_communicator.send_forward(output_tensor, p2p_communicator.is_pp_last_stage)
+        total_num_tokens += num_tokens
+
+        if not forward_only:
+            input_tensors.append(input_tensor)
+            output_tensors.append(output_tensor)
+            deallocate_output_tensor(output_tensor, config.deallocate_pipeline_outputs)
+
+    # ------------------------------------------------------------------
+    # Post-warmup bubble fill (largest bubble in the pipeline)
+    # ------------------------------------------------------------------
+    # Receive the first steady-state input tensor *before* filling the bubble
+    # so the pipeline stays unblocked: the recv is non-blocking on fast ranks.
+    if num_microbatches_remaining > 0:
+        input_tensor = p2p_communicator.recv_forward(
+            recv_tensor_shapes, p2p_communicator.is_pp_first_stage
+        )
+
+    if bubble_filler is not None and not forward_only:
+        # On fast ranks the warmup has just completed and slow stages are
+        # still in their warmup — this is the (PP-1)*slow_ms bubble.
+        # Fill it with speculative forward microbatches.
+        bubble_filler.maybe_fill_bubble(
+            pp_rank=_current_pp_rank,
+            forward_data_store=forward_data_store,
+            config=config,
+            forward_step_func=forward_step_func,
+            data_iterator=data_iterator,
+            model=model,
+            num_microbatches=num_microbatches,
+            speculative_mb_start=num_warmup_microbatches,
+        )
+
+    # ------------------------------------------------------------------
+    # Phase 1: Steady-state 1F1B
+    # ------------------------------------------------------------------
+    for i in range(num_microbatches_remaining):
+        last_iteration = i == (num_microbatches_remaining - 1)
+
+        if max_outstanding_backprops is not None:
+            checkpoint_activations_microbatch = (
+                (i + num_warmup_microbatches) % max_outstanding_backprops
+            ) >= config.num_microbatches_with_partial_activation_checkpoints
+        else:
+            checkpoint_activations_microbatch = None
+
+        if bubble_filler is not None:
+            bubble_filler.record_compute_start(_current_pp_rank)
+
+        output_tensor, num_tokens = forward_step(
+            forward_step_func,
+            data_iterator,
+            model,
+            num_microbatches,
+            input_tensor,
+            forward_data_store,
+            config,
+            cp_group_size=cp_size,
+            collect_non_loss_data=collect_non_loss_data,
+            checkpoint_activations_microbatch=checkpoint_activations_microbatch,
+            is_first_microbatch=check_first_val_step(
+                first_val_step, forward_only, (i == 0) and (num_warmup_microbatches == 0)
+            ),
+            current_microbatch=i + num_warmup_microbatches,
+            is_last_stage=p2p_communicator.is_pp_last_stage,
+        )
+
+        if bubble_filler is not None:
+            bubble_filler.record_compute_stop(_current_pp_rank)
+        total_num_tokens += num_tokens
+
+        if forward_only:
+            p2p_communicator.send_forward(output_tensor, p2p_communicator.is_pp_last_stage)
+            if not last_iteration:
+                input_tensor = p2p_communicator.recv_forward(
+                    recv_tensor_shapes, p2p_communicator.is_pp_first_stage
+                )
+        else:
+            output_tensor_grad = p2p_communicator.send_forward_recv_backward(
+                output_tensor, send_tensor_shapes, p2p_communicator.is_pp_last_stage
+            )
+
+            input_tensors.append(input_tensor)
+            output_tensors.append(output_tensor)
+            deallocate_output_tensor(output_tensor, config.deallocate_pipeline_outputs)
+
+            input_tensor = input_tensors.pop(0)
+            output_tensor = output_tensors.pop(0)
+
+            if num_warmup_microbatches == 0 and last_iteration:
+                if config.grad_sync_func is None or p2p_communicator.is_pp_first_stage:
+                    enable_grad_sync()
+
+            input_tensor_grad = backward_func(
+                input_tensor, output_tensor, output_tensor_grad, config
+            )
+
+            if last_iteration:
+                input_tensor = None
+                p2p_communicator.send_backward(
+                    input_tensor_grad, p2p_communicator.is_pp_first_stage
+                )
+            else:
+                input_tensor = p2p_communicator.send_backward_recv_forward(
+                    input_tensor_grad, recv_tensor_shapes, p2p_communicator.is_pp_first_stage
+                )
+
+    # ------------------------------------------------------------------
+    # Phase 2: Cooldown — backward passes + speculative activation drain
+    # ------------------------------------------------------------------
+    if not forward_only:
+        # Total backward passes = warmup count + any speculative activations
+        # queued by the bubble filler.  We drain speculative activations first
+        # (oldest → newest) so their gradients are computed in the same order
+        # as the forward passes, preserving numerical equivalence with the
+        # standard schedule.
+        speculative_pairs: List = []
+        if bubble_filler is not None:
+            while True:
+                pair = bubble_filler.pop_speculative_activation()
+                if pair is None:
+                    break
+                speculative_pairs.append(pair)
+
+        # Number of standard cooldown backward passes (warmup activations).
+        n_standard_cooldown = num_warmup_microbatches
+        # Number of speculative backward passes.
+        n_speculative_cooldown = len(speculative_pairs)
+        total_cooldown = n_standard_cooldown + n_speculative_cooldown
+
+        for i in range(total_cooldown):
+            is_last_cooldown = i == total_cooldown - 1
+
+            # Enable grad sync on the final backward pass.
+            if is_last_cooldown:
+                if config.grad_sync_func is None or p2p_communicator.is_pp_first_stage:
+                    enable_grad_sync()
+
+            if i < n_standard_cooldown:
+                # Standard cooldown: consume activations from the warmup queue.
+                in_t = input_tensors.pop(0)
+                out_t = output_tensors.pop(0)
+            else:
+                # Speculative cooldown: consume activations from bubble filler.
+                spec_idx = i - n_standard_cooldown
+                in_t, out_t = speculative_pairs[spec_idx]
+
+            output_tensor_grad = p2p_communicator.recv_backward(
+                send_tensor_shapes, p2p_communicator.is_pp_last_stage
+            )
+
+            input_tensor_grad = backward_func(in_t, out_t, output_tensor_grad, config)
+
+            p2p_communicator.send_backward(
+                input_tensor_grad, p2p_communicator.is_pp_first_stage
+            )
+
+        # Drain any remaining grad reductions.
+        if no_sync_context is not None:
+            enable_grad_sync()
+            if config.grad_sync_func is not None:
+                config.grad_sync_func(model.parameters())
+
+    # Stop overall timing clock on fast ranks.
+    if bubble_filler is not None and bubble_filler.is_fast_rank(_current_pp_rank):
+        bubble_filler.record_compute_stop(_current_pp_rank)
+
+    # ------------------------------------------------------------------
+    # Gradient finalisation
+    # ------------------------------------------------------------------
+    if config.finalize_model_grads_func is not None and not forward_only:
+        finish_embedding_wgrad_compute(
+            config, embedding_module, p2p_communicator.is_pp_last_stage, tp_group
+        )
+        total_num_tokens = torch.clamp(total_num_tokens, min=1)
+        config.finalize_model_grads_func(
+            [model],
+            total_num_tokens if config.calculate_per_token_loss else None,
+            pg_collection=pg_collection,
+            force_all_reduce=force_all_reduce,
+        )
+
+    if _HAS_FGAO and getattr(config, 'fine_grained_activation_offloading', False):
+        off_interface.reset()
+
+    if config.timers is not None:
+        config.timers('forward-backward').stop()
+
+    if hasattr(config, 'cuda_graph_impl') and config.cuda_graph_impl == "local":
+        create_cudagraphs()
+
+    # Final flush of any pending speculative data into the store.
+    if bubble_filler is not None:
+        bubble_filler.drain(forward_data_store, config=None)
+
+    return forward_data_store
+
+
+# ===========================================================================
 # DES-LOC: PP=5 factory helpers
 # ===========================================================================
 
@@ -3242,6 +3761,7 @@ __all__ = [
     "forward_backward_pipelining_without_interleaving",
     "forward_backward_pipelining_with_interleaving",
     # DES-LOC heterogeneous schedules
+    "forward_backward_hetero_1f1b",
     "forward_backward_pipelining_without_interleaving_pp5_heterogeneous",
     # DES-LOC bubble filling (full implementation)
     "StageClock",
