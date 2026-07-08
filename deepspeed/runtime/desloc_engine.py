@@ -2477,9 +2477,13 @@ class DesLocEngine:
                 )
             if not _should_skip:
                 logger.warning("rank=%d: ENTERING optimizer.step", dist.get_rank() if dist.is_initialized() else 0)
+                if self._dist_optimizer is not None:
+                    self._dist_optimizer.reduce_scatter_grads()
                 self.optimizer.step()
                 self.scheduler.step()
                 logger.warning("rank=%d: EXITED optimizer.step", dist.get_rank() if dist.is_initialized() else 0)
+                if self._dist_optimizer is not None:
+                    self._dist_optimizer.all_gather_params()
 
                 # --- DES-LOC: Algorithm 1 — Kx/Ku/Kv conditional sync ---
                 _is_Kx = (step + 1) % self.desloc_Kx == 0
