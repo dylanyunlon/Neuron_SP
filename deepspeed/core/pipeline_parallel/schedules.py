@@ -484,42 +484,68 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, config):
 
 
 def backward_step_multimodule(
-    input_tensor, output_tensor, output_tensor_grad, config, language_model_module_name,
-):
-    """Backward step for multi-module pipelines (M3544). Dict-keyed tensors."""
-    def _unwrap(tensor):
+    input_tensor: Dict[str, torch.Tensor],
+    output_tensor: Union[torch.Tensor, Dict[str, torch.Tensor]],
+    output_tensor_grad: Optional[Dict[str, torch.Tensor]],
+    config,
+    language_model_module_name: str,
+) -> Dict[str, torch.Tensor]:
+    """Backward step for multi-module pipelines (M3544). Dict-keyed tensors.
+
+    In multi-module pipelines, tensors are organised as dictionaries with
+    module names as keys.  Each module's backward pass is performed
+    independently.  Mirrors Megatron backward_step_multimodule exactly,
+    including the _unwrap_single_tensor_list helper (renamed from _unwrap in
+    the original DES-LOC port to match upstream naming for easier diffing).
+    """
+
+    def _unwrap_single_tensor_list(tensor):
         if isinstance(tensor, list):
-            assert len(tensor) == 1
+            assert len(tensor) == 1, "expected a single tensor for multimodule backward"
             return tensor[0]
         return tensor
 
+    # Retain gradients on all input tensors.
     for module_name, tensor in input_tensor.items():
-        if isinstance(tensor, list): tensor = tensor[0]
-        if tensor is not None: tensor.retain_grad()
+        if isinstance(tensor, list):
+            tensor = tensor[0]
+        if tensor is not None:
+            tensor.retain_grad()
 
+    # Last stage: output_tensor is a scalar loss from the language model.
+    # Associate it with the language_model_module_name.
     if not isinstance(output_tensor, dict):
         output_tensor = {language_model_module_name: output_tensor}
+
+    # Handle output_tensor_grad: None (last stage) or dict (intermediate stages).
     if not output_tensor_grad:
         output_tensor_grad = {key: None for key in output_tensor.keys()}
 
+    # Apply grad scaling if needed (for last stage only).
     for module_name in output_tensor.keys():
-        otg = _unwrap(output_tensor_grad[module_name])
-        if otg is None and config.grad_scale_func is not None:
+        output_tensor_grad_module = _unwrap_single_tensor_list(output_tensor_grad[module_name])
+        if output_tensor_grad_module is None and config.grad_scale_func is not None:
             output_tensor[module_name] = config.grad_scale_func(output_tensor[module_name])
 
+    # Perform backward pass for each module.
     for module_name in output_tensor.keys():
-        ot = _unwrap(output_tensor[module_name])
-        otg = _unwrap(output_tensor_grad[module_name])
+        ot = _unwrap_single_tensor_list(output_tensor[module_name])
+        otg = _unwrap_single_tensor_list(output_tensor_grad[module_name])
         if ot is not None and ot.requires_grad:
             if config.deallocate_pipeline_outputs:
                 custom_backward(ot, otg)
             else:
                 torch.autograd.backward(ot, grad_tensors=otg)
 
+    # Collect gradients for input tensors.
     input_tensor_grad = {}
     for module_name, tensor in input_tensor.items():
-        if isinstance(tensor, list): tensor = tensor[0]
-        input_tensor_grad[module_name] = None if tensor is None else tensor.grad
+        if isinstance(tensor, list):
+            tensor = tensor[0]
+        if tensor is None:
+            input_tensor_grad[module_name] = None
+        else:
+            input_tensor_grad[module_name] = tensor.grad
     return input_tensor_grad
 
 
