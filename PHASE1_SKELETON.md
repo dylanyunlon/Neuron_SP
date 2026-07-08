@@ -57,15 +57,44 @@ dist_opt_adapter.py, pp_schedule_adapter.py, desloc_sync_policy.py
 **Contract**: `HeteroBridge.install(engine)` → configures all tier-aware behavior.
 **Integration**: `desloc_engine.py` calls `HeteroBridge.install()` during init.
 
+## Megatron Commit Ranges (frozen — sub-Claudes read these)
+
+| Module | Megatron Path | Commits | First Hash | Last Hash |
+|--------|---------------|---------|------------|-----------|
+| A: parallel_state | `megatron/core/parallel_state.py` | 15 | `21d78fe4` | `a44b1e3a` |
+| B: distributed | `megatron/core/distributed/` | 133 | `3ad81103` | `b8ec6c9d` |
+| C: optimizer | `megatron/core/optimizer/` | 67 | `b1f4fb11` | `6d4e7bef` |
+| D: transformer | `megatron/core/transformer/` | 287 | `786b524c` | `bc0de523` |
+| E: pipeline_parallel | `megatron/core/pipeline_parallel/` | 52 | `e483368b` | `ed19724e` |
+| F: tensor_parallel | `megatron/core/tensor_parallel/` | 38 | `9170b347` | `501588c0` |
+
+## C++/CUDA Integration Gap (Issue #155)
+
+**11,497 lines of CUDA in `csrc/hetero_reduce/` are NOT wired into the training path.**
+
+| Kernel | Lines | Wired? | Target |
+|--------|-------|--------|--------|
+| `hetero_reduce.cu` | ~1800 | ❌ | `desloc_engine.py` gradient sync |
+| `fused_gradient_allreduce.cu` | ~900 | ❌ | `finalize_model_grads` |
+| `fused_swiglu_ln.cu` | ~1200 | ❌ | `transformer/mlp.py` |
+| `cross_entropy_tp.cu` | ~800 | ❌ | loss computation |
+| `fused_rope_hetero.cu` | ~700 | ❌ | `transformer/attention.py` |
+| `fused_adam_heterogeneous.cu` | ~1000 | ❌ | `optimizer/distrib_optimizer.py` |
+| `pcie_adaptive_allreduce.cu` | ~1500 | ❌ | `distributed/` allreduce |
+| `hetero_ring_allreduce.cu` | ~1200 | ❌ | fallback for PCIe mesh |
+| `tier_activation_offload.cu` | ~1100 | ❌ | activation checkpointing |
+| `fused_layernorm_residual.cu` | ~800 | ❌ | `transformer/transformer_layer.py` |
+
 ## Dispatch Plan
 
 Each module = 1 sub-Claude conversation. The sub-Claude:
-1. Clones the repo in its container
-2. Reads ALL commits touching that module (`git log --all -- <paths>`)
-3. Reads the Megatron-LM reference implementation
-4. Produces a COMPLETE, importable subsystem (not stubs)
-5. Verifies with `python -c "from deepspeed.core.X import Y"` 
-6. Does NOT push (manager pushes after review)
+1. Clones the repo: `git clone https://github.com/dylanyunlon/Neuron_SP.git`
+2. Reads ALL Megatron commits: `cd Neuron_SP/Megatron-LM && git log --oneline -- <path>`
+3. Reads existing deepspeed/core/ code AND the CUDA kernels in csrc/
+4. Produces a COMPLETE, importable subsystem — NOT stubs, NOT 30-line patches
+5. Wires CUDA kernels where applicable (fused ops replace PyTorch fallbacks)
+6. Pushes directly to main: `git push origin main`
+7. Does NOT create new branches, v2/v3 suffixes, or port files
 
 ## API Contract (frozen — sub-Claudes implement against this)
 
