@@ -420,3 +420,162 @@ void launch_dequantise_int8_to_fp16(
         output, input, scales, n_elems);
     DS_LAUNCH_CHECK(stream);
 }
+
+// ===========================================================================
+// Issue #22 — Tier-aware host-pinned offload / prefetch pipeline
+// ===========================================================================
+//
+// launch_tier_offload_to_host
+// ----------------------------
+// Packs activations into a flat BF16 device buffer (device-side gather kernel),
+// optionally quantises to INT8 to halve PCIe traffic, then asynchronously DMA's
+// the buffer to pre-allocated host pinned memory on a dedicated transfer stream.
+//
+// Double-buffering model (caller owns two pinned buffers ping/pong):
+//   Step 1 (compute_stream): activation_pack_kernel  → d_flat_device
+//   Step 2 (compute_stream): [optional] quantise_bf16_to_int8_kernel → d_int8, d_scales
+//   Step 3 (transfer_stream): cudaMemcpyAsync(pinned_host ← d_flat/d_int8, ...)
+//
+// The caller records an event on transfer_stream after this call to synchronise
+// before reusing the device staging buffer.
+//
+// launch_tier_prefetch_from_host
+// --------------------------------
+// Reverse of offload: DMA pinned host → device staging buffer (transfer_stream),
+// then scatter via activation_unpack_kernel (compute_stream).
+// The caller inserts an event-wait on compute_stream after the DMA completes.
+//
+// Parameters common to both:
+//   @param d_staging_bf16   [device] BF16 staging buffer [num_tensors * tensor_elems]
+//   @param d_int8_buf       [device] INT8 staging buffer (may be nullptr to skip quant)
+//   @param d_scale_buf      [device] FP32 scale buffer   [ceil(n_elems / 128)]
+//   @param h_pinned         [host pinned] destination/source for PCIe transfer
+//   @param inputs/outputs   activation tensor device pointers (host array, copied to device)
+//   @param num_tensors      number of activation tensors
+//   @param tensor_elems     elements per tensor (divisible by 8)
+//   @param use_int8         if true, quantise/dequantise to halve PCIe bytes
+//   @param sm_version       SM version (86, 90, 120)
+//   @param compute_stream   CUDA stream for pack/unpack kernels
+//   @param transfer_stream  CUDA stream for cudaMemcpyAsync (should be separate)
+//   @param pack_done_event  [out] event recorded on compute_stream after pack kernel
+//   @param xfer_done_event  [out] event recorded on transfer_stream after DMA
+
+void launch_tier_offload_to_host(
+    __nv_bfloat16*              d_staging_bf16,   // device flat buffer
+    int8_t*                     d_int8_buf,       // device INT8 buf (or nullptr)
+    float*                      d_scale_buf,      // device scale buf (or nullptr)
+    void*                       h_pinned,         // host pinned destination
+    const __nv_bfloat16* const* inputs,           // host array of device ptrs
+    int                         num_tensors,
+    size_t                      tensor_elems,
+    bool                        use_int8,
+    int                         sm_version,
+    cudaStream_t                compute_stream,
+    cudaStream_t                transfer_stream,
+    cudaEvent_t                 pack_done_event,
+    cudaEvent_t                 xfer_done_event)
+{
+    if (num_tensors <= 0 || tensor_elems == 0) return;
+
+    const size_t n_elems = (size_t)num_tensors * tensor_elems;
+
+    // ── Step 1: device-side gather (pack kernel) ─────────────────────────────
+    launch_activation_pack(d_staging_bf16, inputs, num_tensors,
+                           tensor_elems, sm_version, compute_stream);
+
+    // Record event so transfer_stream can wait for pack to finish.
+    cudaEventRecord(pack_done_event, compute_stream);
+
+    // transfer_stream waits for pack kernel before DMA.
+    cudaStreamWaitEvent(transfer_stream, pack_done_event, 0);
+
+    if (use_int8 && d_int8_buf != nullptr && d_scale_buf != nullptr) {
+        // ── Step 2a: quantise BF16 → INT8 on compute_stream ─────────────────
+        // We reuse compute_stream for quant kernel (it already serialised pack).
+        const size_t n_tiles = (n_elems + kQuantTileSize - 1) / kQuantTileSize;
+        quantise_bf16_to_int8_kernel<<<(int)std::min(n_tiles, (size_t)65535),
+                                       32, 0, compute_stream>>>(
+            d_int8_buf, d_scale_buf, d_staging_bf16, n_elems);
+        DS_LAUNCH_CHECK(compute_stream);
+
+        // Let transfer_stream also wait for quant kernel.
+        cudaEventRecord(pack_done_event, compute_stream);
+        cudaStreamWaitEvent(transfer_stream, pack_done_event, 0);
+
+        // ── Step 2b: DMA INT8 → host pinned (halved PCIe traffic) ────────────
+        cudaMemcpyAsync(h_pinned, d_int8_buf, n_elems * sizeof(int8_t),
+                        cudaMemcpyDeviceToHost, transfer_stream);
+
+        // Also DMA scales (needed for dequantisation on prefetch).
+        const size_t n_tiles_final = (n_elems + kQuantTileSize - 1) / kQuantTileSize;
+        cudaMemcpyAsync(static_cast<int8_t*>(h_pinned) + n_elems,
+                        d_scale_buf, n_tiles_final * sizeof(float),
+                        cudaMemcpyDeviceToHost, transfer_stream);
+    } else {
+        // ── Step 2: DMA BF16 → host pinned ───────────────────────────────────
+        cudaMemcpyAsync(h_pinned, d_staging_bf16,
+                        n_elems * sizeof(__nv_bfloat16),
+                        cudaMemcpyDeviceToHost, transfer_stream);
+    }
+
+    // Record event so caller can wait for DMA completion.
+    cudaEventRecord(xfer_done_event, transfer_stream);
+}
+
+void launch_tier_prefetch_from_host(
+    __nv_bfloat16* const*  outputs,            // host array of device ptrs
+    __nv_bfloat16*         d_staging_bf16,     // device flat staging buffer
+    int8_t*                d_int8_buf,         // device INT8 buf (or nullptr)
+    float*                 d_scale_buf,        // device scale buf (or nullptr)
+    const void*            h_pinned,           // host pinned source
+    int                    num_tensors,
+    size_t                 tensor_elems,
+    bool                   use_int8,
+    int                    sm_version,
+    cudaStream_t           compute_stream,
+    cudaStream_t           transfer_stream,
+    cudaEvent_t            xfer_done_event,
+    cudaEvent_t            unpack_ready_event)
+{
+    if (num_tensors <= 0 || tensor_elems == 0) return;
+
+    const size_t n_elems = (size_t)num_tensors * tensor_elems;
+
+    if (use_int8 && d_int8_buf != nullptr && d_scale_buf != nullptr) {
+        // ── Step 1: DMA INT8 + scales → device on transfer_stream ────────────
+        const size_t n_tiles = (n_elems + kQuantTileSize - 1) / kQuantTileSize;
+        cudaMemcpyAsync(d_int8_buf, h_pinned,
+                        n_elems * sizeof(int8_t),
+                        cudaMemcpyHostToDevice, transfer_stream);
+        cudaMemcpyAsync(d_scale_buf,
+                        static_cast<const int8_t*>(h_pinned) + n_elems,
+                        n_tiles * sizeof(float),
+                        cudaMemcpyHostToDevice, transfer_stream);
+
+        cudaEventRecord(xfer_done_event, transfer_stream);
+
+        // compute_stream waits for DMA to finish before dequant kernel.
+        cudaStreamWaitEvent(compute_stream, xfer_done_event, 0);
+
+        // ── Step 2: dequantise INT8 → BF16 flat buffer ───────────────────────
+        dequantise_int8_to_bf16_kernel<<<(int)std::min(n_tiles, (size_t)65535),
+                                         32, 0, compute_stream>>>(
+            d_staging_bf16, d_int8_buf, d_scale_buf, n_elems);
+        DS_LAUNCH_CHECK(compute_stream);
+    } else {
+        // ── Step 1: DMA BF16 → device staging buffer ─────────────────────────
+        cudaMemcpyAsync(d_staging_bf16, h_pinned,
+                        n_elems * sizeof(__nv_bfloat16),
+                        cudaMemcpyHostToDevice, transfer_stream);
+
+        cudaEventRecord(xfer_done_event, transfer_stream);
+        cudaStreamWaitEvent(compute_stream, xfer_done_event, 0);
+    }
+
+    // ── Step 3: device-side scatter (unpack kernel) ───────────────────────────
+    launch_activation_unpack(outputs, d_staging_bf16, num_tensors,
+                             tensor_elems, sm_version, compute_stream);
+
+    // Notify caller that activations are ready in device tensors.
+    cudaEventRecord(unpack_ready_event, compute_stream);
+}
