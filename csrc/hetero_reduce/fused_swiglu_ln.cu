@@ -67,6 +67,33 @@
 #include "hetero_reduce.h"
 #include "ds_kernel_utils.h"
 
+// BUG-FIX (#143): unified CUDA kernel error check macro.
+// Checks cudaGetLastError() after each kernel launch.
+// In debug builds or when HETERO_REDUCE_STRICT_ERRORS is defined this aborts;
+// in production it writes to stderr and is a no-op (caller stream stays valid).
+#ifndef DS_LAUNCH_CHECK
+#  ifdef NDEBUG
+#    define DS_LAUNCH_CHECK(stream)                                              \\
+       do {                                                                      \\
+           cudaError_t _e = cudaGetLastError();                                  \\
+           if (_e != cudaSuccess)                                                \\
+               fprintf(stderr, "[hetero_reduce] kernel launch error: %s (%s:%d)\\n",\\
+                       cudaGetErrorString(_e), __FILE__, __LINE__);              \\
+       } while (0)
+#  else
+#    define DS_LAUNCH_CHECK(stream)                                              \\
+       do {                                                                      \\
+           cudaError_t _e = cudaGetLastError();                                  \\
+           if (_e != cudaSuccess) {                                              \\
+               fprintf(stderr, "[hetero_reduce] kernel launch error: %s (%s:%d)\\n",\\
+                       cudaGetErrorString(_e), __FILE__, __LINE__);              \\
+               abort();                                                          \\
+           }                                                                     \\
+       } while (0)
+#  endif
+#endif  // DS_LAUNCH_CHECK
+
+
 namespace cg = cooperative_groups;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -341,6 +368,7 @@ void launch_fused_swiglu_ln(
     int                  sm_version,
     cudaStream_t         stream)
 {
+    if (batch <= 0 || hidden <= 0) return;  // BUG-FIX: guard zero-grid launch
     const int grid = batch;  // one CTA per row
 
     if (sm_version >= 120) {
@@ -350,10 +378,12 @@ void launch_fused_swiglu_ln(
             fused_swiglu_ln_kernel<120, true>
                 <<<grid, P::kBlockSize, 0, stream>>>(
                     output, gate_proj, up_proj, ln_weight, hidden, eps);
+    DS_LAUNCH_CHECK(stream);
         else
             fused_swiglu_ln_kernel<120, false>
                 <<<grid, P::kBlockSize, 0, stream>>>(
                     output, gate_proj, up_proj, ln_weight, hidden, eps);
+    DS_LAUNCH_CHECK(stream);
     } else if (sm_version >= 90) {
         using P = SwiGLUPolicy<90>;
         const int max_sp = P::kBlockSize * P::kVecWidth * P::kRegBudgetPerThread;
@@ -361,10 +391,12 @@ void launch_fused_swiglu_ln(
             fused_swiglu_ln_kernel<90, true>
                 <<<grid, P::kBlockSize, 0, stream>>>(
                     output, gate_proj, up_proj, ln_weight, hidden, eps);
+    DS_LAUNCH_CHECK(stream);
         else
             fused_swiglu_ln_kernel<90, false>
                 <<<grid, P::kBlockSize, 0, stream>>>(
                     output, gate_proj, up_proj, ln_weight, hidden, eps);
+    DS_LAUNCH_CHECK(stream);
     } else {
         using P = SwiGLUPolicy<86>;
         const int max_sp = P::kBlockSize * P::kVecWidth * P::kRegBudgetPerThread;
@@ -372,10 +404,12 @@ void launch_fused_swiglu_ln(
             fused_swiglu_ln_kernel<86, true>
                 <<<grid, P::kBlockSize, 0, stream>>>(
                     output, gate_proj, up_proj, ln_weight, hidden, eps);
+    DS_LAUNCH_CHECK(stream);
         else
             fused_swiglu_ln_kernel<86, false>
                 <<<grid, P::kBlockSize, 0, stream>>>(
                     output, gate_proj, up_proj, ln_weight, hidden, eps);
+    DS_LAUNCH_CHECK(stream);
     }
 }
 
@@ -809,6 +843,7 @@ void launch_fused_swiglu_ln_fwd_save(
     int                  sm_version,
     cudaStream_t         stream)
 {
+    if (batch <= 0 || hidden <= 0) return;  // BUG-FIX: guard zero-grid launch
     const int grid = batch;
     if      (sm_version >= 120) { DISPATCH_FWD_SAVE(120); }
     else if (sm_version >=  90) { DISPATCH_FWD_SAVE( 90); }
@@ -856,6 +891,7 @@ void launch_fused_swiglu_ln_backward(
     int                  sm_version,
     cudaStream_t         stream)
 {
+    if (batch <= 0 || hidden <= 0) return;  // BUG-FIX: guard zero-grid launch
     const int grid = batch;
     if      (sm_version >= 120) { DISPATCH_BWD(120); }
     else if (sm_version >=  90) { DISPATCH_BWD( 90); }

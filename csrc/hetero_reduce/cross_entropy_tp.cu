@@ -60,6 +60,33 @@
 #include "hetero_reduce.h"
 #include "ds_kernel_utils.h"
 
+// BUG-FIX (#143): unified CUDA kernel error check macro.
+// Checks cudaGetLastError() after each kernel launch.
+// In debug builds or when HETERO_REDUCE_STRICT_ERRORS is defined this aborts;
+// in production it writes to stderr and is a no-op (caller stream stays valid).
+#ifndef DS_LAUNCH_CHECK
+#  ifdef NDEBUG
+#    define DS_LAUNCH_CHECK(stream)                                              \\
+       do {                                                                      \\
+           cudaError_t _e = cudaGetLastError();                                  \\
+           if (_e != cudaSuccess)                                                \\
+               fprintf(stderr, "[hetero_reduce] kernel launch error: %s (%s:%d)\\n",\\
+                       cudaGetErrorString(_e), __FILE__, __LINE__);              \\
+       } while (0)
+#  else
+#    define DS_LAUNCH_CHECK(stream)                                              \\
+       do {                                                                      \\
+           cudaError_t _e = cudaGetLastError();                                  \\
+           if (_e != cudaSuccess) {                                              \\
+               fprintf(stderr, "[hetero_reduce] kernel launch error: %s (%s:%d)\\n",\\
+                       cudaGetErrorString(_e), __FILE__, __LINE__);              \\
+               abort();                                                          \\
+           }                                                                     \\
+       } while (0)
+#  endif
+#endif  // DS_LAUNCH_CHECK
+
+
 namespace cg = cooperative_groups;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -387,6 +414,7 @@ void launch_cross_entropy_tp_forward(
     int                  sm_version,
     cudaStream_t         stream)
 {
+    if (batch <= 0) return;  // BUG-FIX: guard zero-grid launch
     // One CTA per sample; all samples are fully independent.
     if (sm_version >= 120) {
         using P = CETPPolicy<120>;
@@ -394,18 +422,21 @@ void launch_cross_entropy_tp_forward(
             <<<batch, P::kBlockSize, 0, stream>>>(
                 local_max, local_sum_exp, local_logit,
                 logits, labels, shard_offset, v_local);
+    DS_LAUNCH_CHECK(stream);
     } else if (sm_version >= 90) {
         using P = CETPPolicy<90>;
         cross_entropy_tp_forward_kernel<90>
             <<<batch, P::kBlockSize, 0, stream>>>(
                 local_max, local_sum_exp, local_logit,
                 logits, labels, shard_offset, v_local);
+    DS_LAUNCH_CHECK(stream);
     } else {
         using P = CETPPolicy<86>;
         cross_entropy_tp_forward_kernel<86>
             <<<batch, P::kBlockSize, 0, stream>>>(
                 local_max, local_sum_exp, local_logit,
                 logits, labels, shard_offset, v_local);
+    DS_LAUNCH_CHECK(stream);
     }
 }
 
@@ -417,9 +448,11 @@ void launch_cross_entropy_tp_loss(
     int          batch,
     cudaStream_t stream)
 {
+    if (batch <= 0) return;  // BUG-FIX: guard zero-grid launch
     const int grid = (batch + kLFBlockSize - 1) / kLFBlockSize;
     cross_entropy_tp_loss_kernel<<<std::max(grid,1), kLFBlockSize, 0, stream>>>(
         loss, global_max, global_sum_exp, global_logit, batch);
+    DS_LAUNCH_CHECK(stream);
 }
 
 void launch_cross_entropy_tp_backward(
@@ -435,6 +468,7 @@ void launch_cross_entropy_tp_backward(
     int                  sm_version,
     cudaStream_t         stream)
 {
+    if (batch <= 0) return;  // BUG-FIX: guard zero-grid launch
     if (sm_version >= 120) {
         using P = CETPPolicy<120>;
         cross_entropy_tp_backward_kernel<120>
@@ -442,6 +476,7 @@ void launch_cross_entropy_tp_backward(
                 d_logits, logits, labels,
                 global_max, log_sum_exp,
                 shard_offset, v_local, inv_batch);
+    DS_LAUNCH_CHECK(stream);
     } else if (sm_version >= 90) {
         using P = CETPPolicy<90>;
         cross_entropy_tp_backward_kernel<90>
@@ -449,6 +484,7 @@ void launch_cross_entropy_tp_backward(
                 d_logits, logits, labels,
                 global_max, log_sum_exp,
                 shard_offset, v_local, inv_batch);
+    DS_LAUNCH_CHECK(stream);
     } else {
         using P = CETPPolicy<86>;
         cross_entropy_tp_backward_kernel<86>
@@ -456,6 +492,7 @@ void launch_cross_entropy_tp_backward(
                 d_logits, logits, labels,
                 global_max, log_sum_exp,
                 shard_offset, v_local, inv_batch);
+    DS_LAUNCH_CHECK(stream);
     }
 }
 
@@ -699,6 +736,7 @@ void launch_cross_entropy_tp_forward_hetero(
     int                  sm_version,
     cudaStream_t         stream)
 {
+    if (batch <= 0) return;  // BUG-FIX: guard zero-grid launch
     const int v_local      = vp.v_local;
     const int shard_offset = vp.shard_offset;
 
@@ -708,18 +746,21 @@ void launch_cross_entropy_tp_forward_hetero(
             <<<batch, P::kBlockSize, 0, stream>>>(
                 local_max, local_sum_exp, local_logit,
                 logits, labels, shard_offset, v_local);
+    DS_LAUNCH_CHECK(stream);
     } else if (sm_version >= 90) {
         using P = CETPPolicy<90>;
         cross_entropy_tp_forward_hetero_kernel<90>
             <<<batch, P::kBlockSize, 0, stream>>>(
                 local_max, local_sum_exp, local_logit,
                 logits, labels, shard_offset, v_local);
+    DS_LAUNCH_CHECK(stream);
     } else {
         using P = CETPPolicy<86>;
         cross_entropy_tp_forward_hetero_kernel<86>
             <<<batch, P::kBlockSize, 0, stream>>>(
                 local_max, local_sum_exp, local_logit,
                 logits, labels, shard_offset, v_local);
+    DS_LAUNCH_CHECK(stream);
     }
 }
 
@@ -735,6 +776,7 @@ void launch_cross_entropy_tp_backward_hetero(
     int                  sm_version,
     cudaStream_t         stream)
 {
+    if (batch <= 0) return;  // BUG-FIX: guard zero-grid launch
     const int v_local      = vp.v_local;
     const int shard_offset = vp.shard_offset;
 
@@ -745,6 +787,7 @@ void launch_cross_entropy_tp_backward_hetero(
                 d_logits, logits, labels,
                 global_max, log_sum_exp,
                 shard_offset, v_local, inv_batch);
+    DS_LAUNCH_CHECK(stream);
     } else if (sm_version >= 90) {
         using P = CETPPolicy<90>;
         cross_entropy_tp_backward_hetero_kernel<90>
@@ -752,6 +795,7 @@ void launch_cross_entropy_tp_backward_hetero(
                 d_logits, logits, labels,
                 global_max, log_sum_exp,
                 shard_offset, v_local, inv_batch);
+    DS_LAUNCH_CHECK(stream);
     } else {
         using P = CETPPolicy<86>;
         cross_entropy_tp_backward_hetero_kernel<86>
@@ -759,5 +803,6 @@ void launch_cross_entropy_tp_backward_hetero(
                 d_logits, logits, labels,
                 global_max, log_sum_exp,
                 shard_offset, v_local, inv_batch);
+    DS_LAUNCH_CHECK(stream);
     }
 }

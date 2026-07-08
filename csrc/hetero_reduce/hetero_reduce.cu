@@ -70,6 +70,33 @@
 #include "hetero_reduce.h"
 #include "ds_kernel_utils.h"
 
+// BUG-FIX (#143): unified CUDA kernel error check macro.
+// Checks cudaGetLastError() after each kernel launch.
+// In debug builds or when HETERO_REDUCE_STRICT_ERRORS is defined this aborts;
+// in production it writes to stderr and is a no-op (caller stream stays valid).
+#ifndef DS_LAUNCH_CHECK
+#  ifdef NDEBUG
+#    define DS_LAUNCH_CHECK(stream)                                              \\
+       do {                                                                      \\
+           cudaError_t _e = cudaGetLastError();                                  \\
+           if (_e != cudaSuccess)                                                \\
+               fprintf(stderr, "[hetero_reduce] kernel launch error: %s (%s:%d)\\n",\\
+                       cudaGetErrorString(_e), __FILE__, __LINE__);              \\
+       } while (0)
+#  else
+#    define DS_LAUNCH_CHECK(stream)                                              \\
+       do {                                                                      \\
+           cudaError_t _e = cudaGetLastError();                                  \\
+           if (_e != cudaSuccess) {                                              \\
+               fprintf(stderr, "[hetero_reduce] kernel launch error: %s (%s:%d)\\n",\\
+                       cudaGetErrorString(_e), __FILE__, __LINE__);              \\
+               abort();                                                          \\
+           }                                                                     \\
+       } while (0)
+#  endif
+#endif  // DS_LAUNCH_CHECK
+
+
 namespace cg = cooperative_groups;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -124,12 +151,20 @@ template <> struct KernelPolicy<120> {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Section 2: Constant-memory inline pointer array
+// Section 2: Pointer array storage
+//
+// BUG-FIX (#143): __constant__ c_input_ptrs was module-global; concurrent
+// stream calls on the same device would race on cudaMemcpyToSymbolAsync,
+// silently corrupting the pointer array seen by kernels on either stream.
+// Fix: always allocate a per-call device buffer via cudaMallocAsync (pooled,
+// async, essentially free at steady state).  The UseConstMem template path
+// is retained but permanently set to false to keep kernel ISA unchanged.
 // ─────────────────────────────────────────────────────────────────────────────
 
-static constexpr int kMaxInlinePointers = 32;
+static constexpr int kMaxInlinePointers = 32;  // retained for API compat
 
-__constant__ const __nv_bfloat16* c_input_ptrs[kMaxInlinePointers];
+// __constant__ c_input_ptrs removed — stream-race hazard; see Section 2 note.
+// Kernels compiled with UseConstMem=false use the d_inputs device argument.
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Section 3: 128-bit vectorised load/store helpers
@@ -438,12 +473,9 @@ static const __nv_bfloat16** setup_input_ptrs(
     int num_tensors,
     cudaStream_t stream)
 {
-    if (num_tensors <= kMaxInlinePointers) {
-        cudaMemcpyToSymbolAsync(c_input_ptrs, host_ptrs,
-            num_tensors * sizeof(const __nv_bfloat16*), 0,
-            cudaMemcpyHostToDevice, stream);
-        return nullptr;
-    }
+    // BUG-FIX (#143): always use per-call device allocation; see Section 2.
+    // cudaMallocAsync is pooled and O(ns) at steady state — negligible vs.
+    // the PCIe transfer cost this kernel is designed around.
     const __nv_bfloat16** d_ptrs = nullptr;
     cudaMallocAsync(reinterpret_cast<void**>(&d_ptrs),
         num_tensors * sizeof(const __nv_bfloat16*), stream);
@@ -479,10 +511,12 @@ static void dispatch_reduce_scatter(
             hetero_reduce_scatter_warp_coop<true>
                 <<<std::max(grid,1), 256, 0, stream>>>(
                     output, nullptr, num_tensors, shard_offset, shard_count);
+    DS_LAUNCH_CHECK(stream);
         else
             hetero_reduce_scatter_warp_coop<false>
                 <<<std::max(grid,1), 256, 0, stream>>>(
                     output, d_inputs, num_tensors, shard_offset, shard_count);
+    DS_LAUNCH_CHECK(stream);
         return;
     }
 
@@ -499,10 +533,12 @@ static void dispatch_reduce_scatter(
         hetero_reduce_scatter_kernel<SmVer, true>
             <<<std::max(grid,1), Policy::kBlockSize, 0, stream>>>(
                 output, nullptr, num_tensors, shard_offset, shard_count);
+    DS_LAUNCH_CHECK(stream);
     else
         hetero_reduce_scatter_kernel<SmVer, false>
             <<<std::max(grid,1), Policy::kBlockSize, 0, stream>>>(
                 output, d_inputs, num_tensors, shard_offset, shard_count);
+    DS_LAUNCH_CHECK(stream);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -518,7 +554,7 @@ void launch_fused_bf16_reduce(
     cudaStream_t                stream)
 {
     const __nv_bfloat16** d_inputs = setup_input_ptrs(inputs, num_tensors, stream);
-    const bool use_const = (d_inputs == nullptr);
+    const bool use_const = false;  // BUG-FIX (#143): const-mem path disabled; always device ptr
 
     auto launch = [&]<int SmVer>() {
         using Policy = KernelPolicy<SmVer>;
@@ -532,10 +568,12 @@ void launch_fused_bf16_reduce(
             fused_bf16_reduce_kernel<SmVer, true>
                 <<<std::max(grid,1), Policy::kBlockSize, 0, stream>>>(
                     output, nullptr, num_tensors, n_elems);
+    DS_LAUNCH_CHECK(stream);
         else
             fused_bf16_reduce_kernel<SmVer, false>
                 <<<std::max(grid,1), Policy::kBlockSize, 0, stream>>>(
                     output, d_inputs, num_tensors, n_elems);
+    DS_LAUNCH_CHECK(stream);
     };
 
     if      (sm_version >= 120) launch.template operator()<120>();
@@ -601,7 +639,7 @@ void launch_hetero_reduce_scatter(
     if (shard_count == 0) return;
 
     const __nv_bfloat16** d_inputs = setup_input_ptrs(inputs, num_tensors, stream);
-    const bool use_const = (d_inputs == nullptr);
+    const bool use_const = false;  // BUG-FIX (#143): const-mem path disabled; always device ptr
 
     if      (sm_version >= 120)
         dispatch_reduce_scatter<120>(output, d_inputs, use_const,

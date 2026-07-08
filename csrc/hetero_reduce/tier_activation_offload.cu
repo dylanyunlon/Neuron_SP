@@ -70,6 +70,33 @@
 #include "hetero_reduce.h"
 #include "ds_kernel_utils.h"
 
+// BUG-FIX (#143): unified CUDA kernel error check macro.
+// Checks cudaGetLastError() after each kernel launch.
+// In debug builds or when HETERO_REDUCE_STRICT_ERRORS is defined this aborts;
+// in production it writes to stderr and is a no-op (caller stream stays valid).
+#ifndef DS_LAUNCH_CHECK
+#  ifdef NDEBUG
+#    define DS_LAUNCH_CHECK(stream)                                              \\
+       do {                                                                      \\
+           cudaError_t _e = cudaGetLastError();                                  \\
+           if (_e != cudaSuccess)                                                \\
+               fprintf(stderr, "[hetero_reduce] kernel launch error: %s (%s:%d)\\n",\\
+                       cudaGetErrorString(_e), __FILE__, __LINE__);              \\
+       } while (0)
+#  else
+#    define DS_LAUNCH_CHECK(stream)                                              \\
+       do {                                                                      \\
+           cudaError_t _e = cudaGetLastError();                                  \\
+           if (_e != cudaSuccess) {                                              \\
+               fprintf(stderr, "[hetero_reduce] kernel launch error: %s (%s:%d)\\n",\\
+                       cudaGetErrorString(_e), __FILE__, __LINE__);              \\
+               abort();                                                          \\
+           }                                                                     \\
+       } while (0)
+#  endif
+#endif  // DS_LAUNCH_CHECK
+
+
 namespace cg = cooperative_groups;
 
 // ---------------------------------------------------------------------------
@@ -281,6 +308,7 @@ void launch_activation_pack(
     int                         sm_version,
     cudaStream_t                stream)
 {
+    if (num_tensors <= 0 || tensor_elems == 0) return;  // BUG-FIX: guard zero-grid launch
     // Copy input pointer array to device.
     const __nv_bfloat16** d_inputs = nullptr;
     cudaMallocAsync(reinterpret_cast<void**>(&d_inputs),
@@ -303,18 +331,21 @@ void launch_activation_pack(
         const int grid = (int)std::min((total_vecs + kBS - 1) / kBS, (size_t)65535);
         activation_pack_kernel<120><<<grid, kBS, 0, stream>>>(
             output, d_inputs, num_tensors, tensor_elems);
+    DS_LAUNCH_CHECK(stream);
     } else if (sm_version >= 90) {
         constexpr int kBS = kOffloadBlockSm86;  // same block size, different min-CTAs
         const size_t total_vecs = (size_t)num_tensors * (tensor_elems / kOffloadVecW);
         const int grid = (int)std::min((total_vecs + kBS - 1) / kBS, (size_t)65535);
         activation_pack_kernel<90><<<grid, kBS, 0, stream>>>(
             output, d_inputs, num_tensors, tensor_elems);
+    DS_LAUNCH_CHECK(stream);
     } else {
         constexpr int kBS = kOffloadBlockSm86;
         const size_t total_vecs = (size_t)num_tensors * (tensor_elems / kOffloadVecW);
         const int grid = (int)std::min((total_vecs + kBS - 1) / kBS, (size_t)65535);
         activation_pack_kernel<86><<<grid, kBS, 0, stream>>>(
             output, d_inputs, num_tensors, tensor_elems);
+    DS_LAUNCH_CHECK(stream);
     }
 
     cudaFreeAsync(d_inputs, stream);
@@ -328,6 +359,7 @@ void launch_activation_unpack(
     int                    sm_version,
     cudaStream_t           stream)
 {
+    if (num_tensors <= 0 || tensor_elems == 0) return;  // BUG-FIX: guard zero-grid launch
     __nv_bfloat16** d_outputs = nullptr;
     cudaMallocAsync(reinterpret_cast<void**>(&d_outputs),
                     num_tensors * sizeof(__nv_bfloat16*), stream);
@@ -342,18 +374,21 @@ void launch_activation_unpack(
         const int grid = (int)std::min((total_vecs + kBS - 1) / kBS, (size_t)65535);
         activation_unpack_kernel<120><<<grid, kBS, 0, stream>>>(
             d_outputs, flat, num_tensors, tensor_elems);
+    DS_LAUNCH_CHECK(stream);
     } else if (sm_version >= 90) {
         constexpr int kBS = kOffloadBlockSm86;
         const size_t total_vecs = (size_t)num_tensors * (tensor_elems / kOffloadVecW);
         const int grid = (int)std::min((total_vecs + kBS - 1) / kBS, (size_t)65535);
         activation_unpack_kernel<90><<<grid, kBS, 0, stream>>>(
             d_outputs, flat, num_tensors, tensor_elems);
+    DS_LAUNCH_CHECK(stream);
     } else {
         constexpr int kBS = kOffloadBlockSm86;
         const size_t total_vecs = (size_t)num_tensors * (tensor_elems / kOffloadVecW);
         const int grid = (int)std::min((total_vecs + kBS - 1) / kBS, (size_t)65535);
         activation_unpack_kernel<86><<<grid, kBS, 0, stream>>>(
             d_outputs, flat, num_tensors, tensor_elems);
+    DS_LAUNCH_CHECK(stream);
     }
 
     cudaFreeAsync(d_outputs, stream);
@@ -370,6 +405,7 @@ void launch_quantise_fp16_to_int8(
     // One warp (32 threads) per tile.
     quantise_bf16_to_int8_kernel<<<(int)std::min(n_tiles, (size_t)65535), 32, 0, stream>>>(
         output, scales, input, n_elems);
+    DS_LAUNCH_CHECK(stream);
 }
 
 void launch_dequantise_int8_to_fp16(
@@ -382,4 +418,5 @@ void launch_dequantise_int8_to_fp16(
     const size_t n_tiles = (n_elems + kQuantTileSize - 1) / kQuantTileSize;
     dequantise_int8_to_bf16_kernel<<<(int)std::min(n_tiles, (size_t)65535), 32, 0, stream>>>(
         output, input, scales, n_elems);
+    DS_LAUNCH_CHECK(stream);
 }

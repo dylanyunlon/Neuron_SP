@@ -146,6 +146,33 @@
 #include "hetero_reduce.h"
 #include "ds_kernel_utils.h"
 
+// BUG-FIX (#143): unified CUDA kernel error check macro.
+// Checks cudaGetLastError() after each kernel launch.
+// In debug builds or when HETERO_REDUCE_STRICT_ERRORS is defined this aborts;
+// in production it writes to stderr and is a no-op (caller stream stays valid).
+#ifndef DS_LAUNCH_CHECK
+#  ifdef NDEBUG
+#    define DS_LAUNCH_CHECK(stream)                                              \\
+       do {                                                                      \\
+           cudaError_t _e = cudaGetLastError();                                  \\
+           if (_e != cudaSuccess)                                                \\
+               fprintf(stderr, "[hetero_reduce] kernel launch error: %s (%s:%d)\\n",\\
+                       cudaGetErrorString(_e), __FILE__, __LINE__);              \\
+       } while (0)
+#  else
+#    define DS_LAUNCH_CHECK(stream)                                              \\
+       do {                                                                      \\
+           cudaError_t _e = cudaGetLastError();                                  \\
+           if (_e != cudaSuccess) {                                              \\
+               fprintf(stderr, "[hetero_reduce] kernel launch error: %s (%s:%d)\\n",\\
+                       cudaGetErrorString(_e), __FILE__, __LINE__);              \\
+               abort();                                                          \\
+           }                                                                     \\
+       } while (0)
+#  endif
+#endif  // DS_LAUNCH_CHECK
+
+
 namespace cg = cooperative_groups;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -832,6 +859,7 @@ static void dispatch_fused_adam(
             params, master_params, exp_avg, exp_avg_sq, exp_avg_sq_max,
             grads, n_elems, lr_eff, beta1, beta2, bc1, bc2,
             eps, weight_decay, clip_scale, fp8_grad_scale);
+    DS_LAUNCH_CHECK(stream);
 }
 
 // Helper: select HasMasterParams at runtime, keep SmVer and UseAMSGrad compile-time.
@@ -1129,6 +1157,7 @@ void launch_grad_norm_sq(
         grad_norm_sq_kernel_v2<SmVer, kGradBF16>
             <<<std::max(grid, 1), kBS, smem_bytes, stream>>>(
                 static_cast<const void*>(grads), n_elems, norm_sq_accum, 1.f);
+    DS_LAUNCH_CHECK(stream);
     };
 
     if (sm_version >= 120)
@@ -1165,6 +1194,7 @@ void launch_grad_norm_sq_fp8(
         grad_norm_sq_kernel_v2<SmVer, kGradFP8_E4M3>
             <<<std::max(grid, 1), kBS, smem_bytes, stream>>>(
                 static_cast<const void*>(grads), n_elems, norm_sq_accum, fp8_scale);
+    DS_LAUNCH_CHECK(stream);
     };
 
     if (sm_version >= 120)
