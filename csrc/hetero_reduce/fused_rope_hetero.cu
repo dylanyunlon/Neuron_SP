@@ -581,3 +581,201 @@ void launch_fused_rope_cacheless(
                     output, input, batch, seq_len, num_heads, head_dim, base, pos_offset);
     }
 }
+
+// ===========================================================================
+// Issue #23 — launch_fused_rope_qk: simultaneous Q + K RoPE for GQA
+// ===========================================================================
+//
+// Grouped-Query Attention (GQA, Ainslie et al. 2023) uses Hq query heads and
+// Hkv key/value heads where Hkv < Hq and Hq % Hkv == 0.  Standard RoPE
+// applies the same rotation to both; the position-dependent sin/cos cache is
+// shared between Q and K because head_dim D is the same.
+//
+// Kernel design
+// ─────────────
+// Grid:  (max(Hq,Hkv) * batch, seq_len, 2)
+//   gridDim.z = 0 → Q sub-kernel  (Hq heads per batch)
+//   gridDim.z = 1 → K sub-kernel  (Hkv heads per batch)
+//
+// This lets both Q and K execute in a single kernel launch with full GPU
+// occupancy — no serialisation between the two tensors.  Each CTA checks
+// gridDim.z and branches into the appropriate head-count / row-offset math.
+//
+// For cacheless mode (cos_cache == nullptr) sin/cos are computed on-the-fly
+// using the rope_inv_freq helper, identical to fused_rope_cacheless_kernel.
+//
+// SM specialisation: RoPEPolicy<SmVer> drives __launch_bounds__ exactly as
+// in the existing neox/gptj/cacheless kernels.
+// ===========================================================================
+
+template <int SmVer, bool kNeoxStyle, bool kCacheless>
+__global__ void
+__launch_bounds__(RoPEPolicy<SmVer>::kBlockSize, RoPEPolicy<SmVer>::kMinBlocksPerSM)
+fused_rope_qk_kernel(
+    __nv_bfloat16* __restrict__       q_output,   // [B, S, Hq,  D]
+    __nv_bfloat16* __restrict__       k_output,   // [B, S, Hkv, D]
+    const __nv_bfloat16* __restrict__ q_input,
+    const __nv_bfloat16* __restrict__ k_input,
+    const float* __restrict__         cos_cache,  // [S, D/2] or nullptr
+    const float* __restrict__         sin_cache,  // [S, D/2] or nullptr
+    int   batch,
+    int   seq_len,
+    int   num_heads_q,
+    int   num_heads_kv,
+    int   head_dim,
+    float base,
+    int   pos_offset)
+{
+    constexpr int kBS    = RoPEPolicy<SmVer>::kBlockSize;
+    constexpr int kPairs = RoPEPolicy<SmVer>::kPairs;  // 4
+
+    // gridDim.z selects Q (0) or K (1).
+    const bool is_k    = (blockIdx.z == 1);
+    const int  nh      = is_k ? num_heads_kv : num_heads_q;
+    const int  bh_idx  = blockIdx.x;
+    const int  seq_idx = blockIdx.y;
+
+    // Guard: the grid is sized for max(Hq, Hkv); out-of-range heads are no-ops.
+    if (bh_idx >= batch * nh || seq_idx >= seq_len) return;
+
+    const int b       = bh_idx / nh;
+    const int h       = bh_idx % nh;
+    const int half_dim = head_dim / 2;
+
+    // Row pointers into the appropriate tensor.
+    const size_t row_off = ((size_t)b * seq_len + seq_idx) * nh * head_dim
+                           + (size_t)h * head_dim;
+
+    const __nv_bfloat16* in_row  = (is_k ? k_input  : q_input)  + row_off;
+          __nv_bfloat16* out_row = (is_k ? k_output : q_output)  + row_off;
+
+    // cos/sin pointers (shared between Q and K — same D).
+    const float* cos_row = nullptr;
+    const float* sin_row = nullptr;
+    if constexpr (!kCacheless) {
+        cos_row = cos_cache + (size_t)seq_idx * half_dim;
+        sin_row = sin_cache + (size_t)seq_idx * half_dim;
+    }
+
+    const float pos = (float)(seq_idx + pos_offset);
+
+    // Main rotation loop — kPairs pairs per thread per step.
+    for (int k0 = (int)threadIdx.x * kPairs; k0 < half_dim; k0 += kBS * kPairs) {
+        const int remaining = half_dim - k0;
+        const int n = (remaining >= kPairs) ? kPairs : remaining;
+
+        float xv[kPairs], yv[kPairs], c[kPairs], s[kPairs];
+        float xp[kPairs], yp[kPairs];
+
+        #pragma unroll
+        for (int i = 0; i < kPairs; ++i) {
+            if (i >= n) continue;
+            const int k = k0 + i;
+
+            // Load cos/sin — cached or compute on-the-fly.
+            if constexpr (kCacheless) {
+                float inv_f = rope_inv_freq(k, half_dim * 2, base);
+                fast_sincosf(pos * inv_f, &s[i], &c[i]);
+            } else {
+                c[i] = __ldg(cos_row + k);
+                s[i] = __ldg(sin_row + k);
+            }
+
+            // Load x, y from appropriate positions (NeoX vs GPT-J).
+            if constexpr (kNeoxStyle) {
+                xv[i] = __bfloat162float(__ldg(in_row + k));
+                yv[i] = __bfloat162float(__ldg(in_row + k + half_dim));
+            } else {
+                xv[i] = __bfloat162float(__ldg(in_row + 2 * k));
+                yv[i] = __bfloat162float(__ldg(in_row + 2 * k + 1));
+            }
+        }
+
+        // Rotate all pairs.
+        #pragma unroll
+        for (int i = 0; i < kPairs; ++i)
+            if (i < n) rotate_pair_fma(xv[i], yv[i], s[i], c[i], xp[i], yp[i]);
+
+        // Store.
+        #pragma unroll
+        for (int i = 0; i < kPairs; ++i) {
+            if (i >= n) continue;
+            const int k = k0 + i;
+            if constexpr (kNeoxStyle) {
+                out_row[k]            = __float2bfloat16(xp[i]);
+                out_row[k + half_dim] = __float2bfloat16(yp[i]);
+            } else {
+                out_row[2 * k]     = __float2bfloat16(xp[i]);
+                out_row[2 * k + 1] = __float2bfloat16(yp[i]);
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Host-side launch wrapper
+// ---------------------------------------------------------------------------
+
+void launch_fused_rope_qk(
+    __nv_bfloat16*       q_output,
+    __nv_bfloat16*       k_output,
+    const __nv_bfloat16* q_input,
+    const __nv_bfloat16* k_input,
+    const float*         cos_cache,
+    const float*         sin_cache,
+    int                  batch,
+    int                  seq_len,
+    int                  num_heads_q,
+    int                  num_heads_kv,
+    int                  head_dim,
+    bool                 neox_style,
+    float                base,
+    int                  pos_offset,
+    int                  sm_version,
+    cudaStream_t         stream)
+{
+    if (batch <= 0 || seq_len <= 0) return;
+
+    // Grid: x = batch * max(Hq, Hkv), y = seq_len, z = 2 (Q=0, K=1).
+    // Each CTA reads gridDim.z to determine which tensor it handles.
+    const int max_heads = (num_heads_q > num_heads_kv) ? num_heads_q : num_heads_kv;
+    dim3 grid(batch * max_heads, seq_len, 2);
+
+    const bool cacheless = (cos_cache == nullptr || sin_cache == nullptr);
+
+    // Macro to reduce the 2^3 = 8-way dispatch (SmVer × neox × cacheless).
+#define DISPATCH_QK(SmV)                                                         \
+    do {                                                                          \
+        constexpr int kBS = RoPEPolicy<SmV>::kBlockSize;                         \
+        if (neox_style && !cacheless)                                             \
+            fused_rope_qk_kernel<SmV, true,  false><<<grid, kBS, 0, stream>>>(   \
+                q_output, k_output, q_input, k_input,                            \
+                cos_cache, sin_cache,                                             \
+                batch, seq_len, num_heads_q, num_heads_kv,                       \
+                head_dim, base, pos_offset);                                      \
+        else if (!neox_style && !cacheless)                                       \
+            fused_rope_qk_kernel<SmV, false, false><<<grid, kBS, 0, stream>>>(   \
+                q_output, k_output, q_input, k_input,                            \
+                cos_cache, sin_cache,                                             \
+                batch, seq_len, num_heads_q, num_heads_kv,                       \
+                head_dim, base, pos_offset);                                      \
+        else if (neox_style && cacheless)                                         \
+            fused_rope_qk_kernel<SmV, true,  true> <<<grid, kBS, 0, stream>>>(   \
+                q_output, k_output, q_input, k_input,                            \
+                nullptr, nullptr,                                                  \
+                batch, seq_len, num_heads_q, num_heads_kv,                       \
+                head_dim, base, pos_offset);                                      \
+        else                                                                      \
+            fused_rope_qk_kernel<SmV, false, true> <<<grid, kBS, 0, stream>>>(   \
+                q_output, k_output, q_input, k_input,                            \
+                nullptr, nullptr,                                                  \
+                batch, seq_len, num_heads_q, num_heads_kv,                       \
+                head_dim, base, pos_offset);                                      \
+    } while (0)
+
+    if (sm_version >= 120)      { DISPATCH_QK(120); }
+    else if (sm_version >= 90)  { DISPATCH_QK(90);  }
+    else                        { DISPATCH_QK(86);  }
+
+#undef DISPATCH_QK
+}
