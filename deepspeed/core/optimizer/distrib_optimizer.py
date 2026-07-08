@@ -2578,6 +2578,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         cls,
         param_and_grad_buffer: "ParamAndGradBuffer",
         bucket_index: int,
+        shard_boundaries: Optional[List[Tuple[int, int]]] = None,
     ) -> Dict:
         """Build per-bucket param-range info for the calling DP rank.
 
@@ -2586,14 +2587,22 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         buffer size.  We assume the buffer numel is divisible by the DP world
         size (ensured by _compute_hetero_shard_boundaries padding).
 
-        In heterogeneous mode the shard sizes differ across ranks; we compute
-        the local shard range from ``_buf_boundaries`` if available, otherwise
-        fall back to equal-slice math.
+        In heterogeneous mode the shard sizes differ across ranks; callers
+        should pass the pre-computed ``shard_boundaries`` list (one
+        ``(start, end)`` pair per DP rank, as returned by
+        :func:`_compute_hetero_shard_boundaries`) so that this method uses
+        the correct, possibly unequal, slice for the local rank.  When
+        ``shard_boundaries`` is ``None`` (or has the wrong length) the method
+        falls back to equal-slice arithmetic for backward compatibility.
 
         Args:
             param_and_grad_buffer: The ParamAndGradBuffer to process.
             bucket_index: Ignored (always 0 in our flat design), kept for
                 API compatibility with Megatron callers.
+            shard_boundaries: Optional per-rank ``(start, end)`` pairs
+                produced by :func:`_compute_hetero_shard_boundaries`.
+                Supply this when ``heterogeneous_shard_sizing=True`` so that
+                the returned param ranges match the actual (unequal) shards.
 
         Returns:
             Dict with key ``"param_map"`` → per-param Range dicts.
@@ -2609,12 +2618,21 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             dp_world = parallel_state.safe_get_world_size()
 
         gbuf_size = param_and_grad_buffer.grad_data.numel()
-        # Equal-slice shard boundaries (het-sizing not applicable here since
-        # the buffer object doesn't carry tier info; callers that need hetero
-        # sizing should use _build_shards() directly).
-        shard_size = (gbuf_size + dp_world - 1) // dp_world
-        gbuf_world_start = dp_rank * shard_size
-        gbuf_world_end = min(gbuf_size, gbuf_world_start + shard_size)
+
+        if shard_boundaries is not None and len(shard_boundaries) == dp_world:
+            # Hetero-aware path: use the caller-supplied per-rank boundaries.
+            # This ensures that when heterogeneous_shard_sizing=True the param
+            # ranges returned here are consistent with _build_shards() output
+            # (which also uses _compute_hetero_shard_boundaries).
+            gbuf_world_start, gbuf_world_end = shard_boundaries[dp_rank]
+        else:
+            # Homogeneous fallback: equal-slice math (original behaviour).
+            # Triggered when shard_boundaries is None (caller doesn't have
+            # tier info) or has unexpected length.
+            shard_size = (gbuf_size + dp_world - 1) // dp_world
+            gbuf_world_start = dp_rank * shard_size
+            gbuf_world_end = min(gbuf_size, gbuf_world_start + shard_size)
+
         gbuf_world_range = Range(gbuf_world_start, gbuf_world_end)
 
         param_range_map = cls._build_model_gbuf_param_range_map(
@@ -2629,6 +2647,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
     def _build_gbuf_range_map(
         cls,
         param_and_grad_buffer: "ParamAndGradBuffer",
+        shard_boundaries: Optional[List[Tuple[int, int]]] = None,
     ) -> Dict:
         """Build dtype-keyed mapping from params to their grad-buffer shard ranges.
 
@@ -2638,6 +2657,11 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
         Args:
             param_and_grad_buffer: Buffer to map.
+            shard_boundaries: Optional per-rank ``(start, end)`` pairs from
+                :func:`_compute_hetero_shard_boundaries`.  When provided,
+                the inner :meth:`_build_model_gbuf_range` call uses the
+                correct heterogeneous slice for the local rank instead of
+                falling back to equal-slice arithmetic.
 
         Returns:
             Dict of shape ``{(param_dtype, grad_dtype): [range_dict]}``.
@@ -2654,7 +2678,11 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
         return {
             (param_dtype, grad_dtype): [
-                cls._build_model_gbuf_range(param_and_grad_buffer, bucket_index=0)
+                cls._build_model_gbuf_range(
+                    param_and_grad_buffer,
+                    bucket_index=0,
+                    shard_boundaries=shard_boundaries,
+                )
             ]
         }
 
