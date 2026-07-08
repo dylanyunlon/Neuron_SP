@@ -184,13 +184,14 @@ template <> struct AdamPolicy<120> {
     static constexpr int kNormBlockSize  = 512;
 };
 
-// Generic fallback (forward-compatible with future SM versions).
-template <int SmVer> struct AdamPolicy {
-    static constexpr int kBlockSize      = 256;
-    static constexpr int kMinBlocksPerSM = 2;
-    static constexpr int kVecWidth       = 8;
-    static constexpr int kNormBlockSize  = 256;
-};
+// NOTE: The forward declaration `template <int SmVer> struct AdamPolicy;`
+// above serves as the primary template.  Specialisations for 86/90/120 follow.
+// A second primary-template body here would be an ODR violation in C++17;
+// instead we rely on the compiler's built-in error for unknown SmVer values at
+// the call sites (static_assert or hard error on incomplete type).
+// If you need a catch-all fallback for future architectures, add a new explicit
+// specialisation (e.g. template<> struct AdamPolicy<130> { ... };) rather than
+// re-opening the primary template.
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Section 2: Gradient dtype tag

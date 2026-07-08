@@ -299,10 +299,11 @@ hetero_ring_reduce_kernel(
             // this template is left ready for bucket-reduce extensions.
             d0+=s0; d1+=s1; d2+=s2; d3+=s3;
             d4+=s4; d5+=s5; d6+=s6; d7+=s7;
+            // Each warp-cooperative slot owns a *disjoint* wv; no reduction
+            // across lanes is needed — all lanes computed the same sum
+            // (each read the same 8 elements of accum and recv).  A single
+            // lane-0 store is sufficient and avoids 32× write amplification.
             if (lane == 0)
-                hring_store8_f32_as_bf16(accum + base,
-                    d0,d1,d2,d3,d4,d5,d6,d7);
-            else
                 hring_store8_f32_as_bf16(accum + base,
                     d0,d1,d2,d3,d4,d5,d6,d7);
         }

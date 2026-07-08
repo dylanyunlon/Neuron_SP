@@ -148,9 +148,11 @@ template <> struct CompressPolicy<86> {
     static constexpr int kBlockSize   = 256;
 };
 
-// kBlockElems for n_scale_blocks computation — use 256 as conservative default
-// for the host-side helpers (actual kernel uses CompressPolicy<SmVer>).
-static constexpr int kBlockElems = 256;
+// kBlockElems for n_scale_blocks computation on the host side.
+// The *smallest* policy value (SM8.6 / generic = 256) is used as the conservative
+// default so callers that don't know the SM version still allocate enough scale
+// slots.  Kernel-side always uses CompressPolicy<SmVer>::kBlockElems.
+static constexpr int kBlockElems = 256;  // == CompressPolicy<86>::kBlockElems (min)
 
 // Maximum number of gradient tensors packed inline in constant memory.
 // Reuses the same constant-memory pattern as hetero_reduce.cu.
@@ -242,21 +244,24 @@ DS_D_INLINE void store_int8x8(
 
 template <int SmVer>
 __global__ void
-__launch_bounds__(KernelPolicy<SmVer>::kBlockSize, KernelPolicy<SmVer>::kMinBlocksPerSM)
+__launch_bounds__(CompressPolicy<SmVer>::kBlockSize, KernelPolicy<SmVer>::kMinBlocksPerSM)
 fused_compress_kernel(
     int8_t* __restrict__              out_int8,    // [n_elems]
-    float*  __restrict__              out_scale,   // [ceil(n_elems / kBlockElems)]
+    float*  __restrict__              out_scale,   // [ceil(n_elems / CompressPolicy<SmVer>::kBlockElems)]
     const __nv_bfloat16* __restrict__ input,       // [n_elems]  BF16
     size_t                            n_elems)
 {
-    using Policy     = KernelPolicy<SmVer>;
-    constexpr int kBS = Policy::kBlockSize;
+    // Use CompressPolicy for per-block element count AND block size to keep them
+    // consistent.  KernelPolicy only drives the min-CTAs-per-SM hint.
+    using CPolicy    = CompressPolicy<SmVer>;
+    constexpr int kBS            = CPolicy::kBlockSize;
+    constexpr int kPerBlockElems = CPolicy::kBlockElems;
 
-    // Each block owns exactly kBlockElems elements.
-    // Elements per thread = kBlockElems / kBS.
-    static_assert(kBlockElems % kBS == 0,
+    // Each block owns exactly kPerBlockElems elements.
+    // Elements per thread = kPerBlockElems / kBS.
+    static_assert(kPerBlockElems % kBS == 0,
                   "kBlockElems must be divisible by block size");
-    constexpr int kElemsPerThread = kBlockElems / kBS;
+    constexpr int kElemsPerThread = kPerBlockElems / kBS;
     static_assert(kElemsPerThread % kVecWidth == 0,
                   "kElemsPerThread must be divisible by kVecWidth");
     constexpr int kVecsPerThread  = kElemsPerThread / kVecWidth;
@@ -271,11 +276,11 @@ fused_compress_kernel(
         float                             bcast_scale;  // reused after reduce
     } smem;
 
-    const size_t block_start = (size_t)blockIdx.x * kBlockElems;
+    const size_t block_start = (size_t)blockIdx.x * kPerBlockElems;
     if (block_start >= n_elems) return;
 
     const size_t my_start = block_start + (size_t)threadIdx.x * kElemsPerThread;
-    const bool   full     = (block_start + kBlockElems <= n_elems);
+    const bool   full     = (block_start + kPerBlockElems <= n_elems);
 
     // ── Step 1+2: load BF16 values, compute thread-local max |x| ──
     float vals[kElemsPerThread];
@@ -384,7 +389,7 @@ fused_compress_kernel(
 
 template <int SmVer>
 __global__ void
-__launch_bounds__(KernelPolicy<SmVer>::kBlockSize, KernelPolicy<SmVer>::kMinBlocksPerSM)
+__launch_bounds__(CompressPolicy<SmVer>::kBlockSize, KernelPolicy<SmVer>::kMinBlocksPerSM)
 fused_int8_ring_reduce_kernel(
     int8_t* __restrict__       dst_int8,   // [n_elems] in/out
     float*  __restrict__       dst_scale,  // [n_scale_blocks] in/out
@@ -392,12 +397,13 @@ fused_int8_ring_reduce_kernel(
     const float*  __restrict__ src_scale,  // [n_scale_blocks] received from peer
     size_t                     n_elems)
 {
-    using Policy     = KernelPolicy<SmVer>;
-    constexpr int kBS = Policy::kBlockSize;
+    using CPolicy    = CompressPolicy<SmVer>;
+    constexpr int kBS            = CPolicy::kBlockSize;
+    constexpr int kPerBlockElems = CPolicy::kBlockElems;
 
-    // Each CUDA block handles kBlockElems elements, matching compress granularity.
-    static_assert(kBlockElems % kBS == 0);
-    constexpr int kElemsPerThread = kBlockElems / kBS;
+    // Each CUDA block handles kPerBlockElems elements, matching compress granularity.
+    static_assert(kPerBlockElems % kBS == 0);
+    constexpr int kElemsPerThread = kPerBlockElems / kBS;
     static_assert(kElemsPerThread % kVecWidth == 0);
     constexpr int kVecsPerThread  = kElemsPerThread / kVecWidth;
 
@@ -407,7 +413,7 @@ fused_int8_ring_reduce_kernel(
         float bcast_new_scale;
     } smem;
 
-    const size_t block_start = (size_t)blockIdx.x * kBlockElems;
+    const size_t block_start = (size_t)blockIdx.x * kPerBlockElems;
     if (block_start >= n_elems) return;
 
     const float s_dst = dst_scale[blockIdx.x];
@@ -416,7 +422,7 @@ fused_int8_ring_reduce_kernel(
     const float dq_src = s_src / kINT8Max;
 
     const size_t my_start = block_start + (size_t)threadIdx.x * kElemsPerThread;
-    const bool   full     = (block_start + kBlockElems <= n_elems);
+    const bool   full     = (block_start + kPerBlockElems <= n_elems);
 
     // ── Load, dequantise, sum, find thread-local max ──
     float sums[kElemsPerThread];
@@ -498,29 +504,30 @@ fused_int8_ring_reduce_kernel(
 
 template <int SmVer>
 __global__ void
-__launch_bounds__(KernelPolicy<SmVer>::kBlockSize, KernelPolicy<SmVer>::kMinBlocksPerSM)
+__launch_bounds__(CompressPolicy<SmVer>::kBlockSize, KernelPolicy<SmVer>::kMinBlocksPerSM)
 fused_decompress_kernel(
     __nv_bfloat16* __restrict__  output,     // [n_elems] BF16 out
     const int8_t*  __restrict__  int8_data,  // [n_elems]
-    const float*   __restrict__  scale_buf,  // [ceil(n_elems / kBlockElems)]
+    const float*   __restrict__  scale_buf,  // [ceil(n_elems / CompressPolicy<SmVer>::kBlockElems)]
     size_t                       n_elems)
 {
-    using Policy     = KernelPolicy<SmVer>;
-    constexpr int kBS = Policy::kBlockSize;
+    using CPolicy    = CompressPolicy<SmVer>;
+    constexpr int kBS            = CPolicy::kBlockSize;
+    constexpr int kPerBlockElems = CPolicy::kBlockElems;
 
-    static_assert(kBlockElems % kBS == 0);
-    constexpr int kElemsPerThread = kBlockElems / kBS;
+    static_assert(kPerBlockElems % kBS == 0);
+    constexpr int kElemsPerThread = kPerBlockElems / kBS;
     static_assert(kElemsPerThread % kVecWidth == 0);
     constexpr int kVecsPerThread  = kElemsPerThread / kVecWidth;
 
-    const size_t block_start = (size_t)blockIdx.x * kBlockElems;
+    const size_t block_start = (size_t)blockIdx.x * kPerBlockElems;
     if (block_start >= n_elems) return;
 
     const float scale   = scale_buf[blockIdx.x];
     const float dq_fact = scale / kINT8Max;   // x̂ = q × dq_fact
 
     const size_t my_start = block_start + (size_t)threadIdx.x * kElemsPerThread;
-    const bool   full     = (block_start + kBlockElems <= n_elems);
+    const bool   full     = (block_start + kPerBlockElems <= n_elems);
 
     if (full) {
 #pragma unroll
@@ -580,6 +587,21 @@ static inline int compress_grid(size_t n_elems)
     return (int)std::min(n_scale_blocks(n_elems), (size_t)65535);
 }
 
+// SM-aware n_scale_blocks: uses the actual CompressPolicy<SmVer>::kBlockElems for
+// the grid size, not the global kBlockElems=256 conservative fallback.
+template <int SmVer>
+static inline size_t n_scale_blocks_sm(size_t n_elems)
+{
+    constexpr int kBE = CompressPolicy<SmVer>::kBlockElems;
+    return (n_elems + kBE - 1) / kBE;
+}
+
+template <int SmVer>
+static inline int compress_grid_sm(size_t n_elems)
+{
+    return (int)std::min(n_scale_blocks_sm<SmVer>(n_elems), (size_t)65535);
+}
+
 template <int SmVer>
 static void dispatch_compress(
     int8_t*                     out_int8,
@@ -588,10 +610,9 @@ static void dispatch_compress(
     size_t                      n_elems,
     cudaStream_t                stream)
 {
-    using Policy = KernelPolicy<SmVer>;
-    const int grid = compress_grid(n_elems);
+    const int grid = compress_grid_sm<SmVer>(n_elems);
     fused_compress_kernel<SmVer>
-        <<<grid, Policy::kBlockSize, 0, stream>>>(
+        <<<grid, CompressPolicy<SmVer>::kBlockSize, 0, stream>>>(
             out_int8, out_scale, input, n_elems);
 }
 
@@ -604,10 +625,9 @@ static void dispatch_int8_ring_reduce(
     size_t        n_elems,
     cudaStream_t  stream)
 {
-    using Policy = KernelPolicy<SmVer>;
-    const int grid = compress_grid(n_elems);
+    const int grid = compress_grid_sm<SmVer>(n_elems);
     fused_int8_ring_reduce_kernel<SmVer>
-        <<<grid, Policy::kBlockSize, 0, stream>>>(
+        <<<grid, CompressPolicy<SmVer>::kBlockSize, 0, stream>>>(
             dst_int8, dst_scale, src_int8, src_scale, n_elems);
 }
 
@@ -619,10 +639,9 @@ static void dispatch_decompress(
     size_t          n_elems,
     cudaStream_t    stream)
 {
-    using Policy = KernelPolicy<SmVer>;
-    const int grid = compress_grid(n_elems);
+    const int grid = compress_grid_sm<SmVer>(n_elems);
     fused_decompress_kernel<SmVer>
-        <<<grid, Policy::kBlockSize, 0, stream>>>(
+        <<<grid, CompressPolicy<SmVer>::kBlockSize, 0, stream>>>(
             output, int8_data, scale_buf, n_elems);
 }
 

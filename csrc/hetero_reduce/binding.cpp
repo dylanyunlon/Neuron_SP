@@ -41,10 +41,15 @@
 
 #include <ATen/cuda/CUDAContext.h>
 #include <torch/extension.h>
+#include <pybind11/pybind11.h>
+#include <pybind11/stl.h>
 #include <vector>
 #include <stdexcept>
 
 #include "hetero_reduce.h"
+
+// Alias for concise use throughout this file.
+namespace py = pybind11;
 
 // ---------------------------------------------------------------------------
 // Helpers
