@@ -2434,7 +2434,7 @@ class DesLocEngine:
                     config=ModelParallelConfig(),
                     num_tokens=None,
                     skip_grad_sync=_fmg_skip_sync,
-                    force_all_reduce=self._dist_optimizer is not None and not _step_has_nan,
+                    force_all_reduce=False,  # dist_optimizer handles reduce_scatter internally
                     pg_collection=_fmg_pg,
                 )
             except Exception as _fmg_exc:  # noqa: BLE001
@@ -2477,15 +2477,14 @@ class DesLocEngine:
                 )
             if not _should_skip:
                 logger.warning("rank=%d: ENTERING optimizer.step", dist.get_rank() if dist.is_initialized() else 0)
-                # Drain all pending NCCL ops (SP allreduce from fwd/bwd)
-                # before AdamW reads param.grad, which triggers implicit sync.
-                torch.cuda.synchronize()
-                logger.warning("rank=%d: cuda.synchronize done, calling AdamW.step()", dist.get_rank() if dist.is_initialized() else 0)
-                self.optimizer.step()
+                if self._dist_optimizer is not None:
+                    # ZeRO-3 path: dist_optimizer handles reduce_scatter → Adam → all_gather
+                    self._dist_optimizer.step()
+                else:
+                    # Non-ZeRO-3 fallback: local AdamW on full model
+                    self.optimizer.step()
                 self.scheduler.step()
                 logger.warning("rank=%d: EXITED optimizer.step", dist.get_rank() if dist.is_initialized() else 0)
-                # [DES-LOC HOTFIX] Skip all_gather — will re-enable after step 0 works.
-                pass
 
                 # --- DES-LOC: Algorithm 1 — Kx/Ku/Kv conditional sync ---
                 _is_Kx = (step + 1) % self.desloc_Kx == 0
