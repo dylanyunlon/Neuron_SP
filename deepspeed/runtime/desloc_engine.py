@@ -2467,6 +2467,33 @@ class DesLocEngine:
 
             # Still skip on NaN to avoid corrupting model weights.
             _should_skip = _should_skip or _step_has_nan
+
+            # --- FIX #154: make skip decision collective across all DP ranks ---
+            # _should_skip derives from _step_has_nan which is computed locally
+            # (each rank checks its own loss).  On heterogeneous hardware (mixed
+            # A6000 + H100) numerical differences can cause one rank to see NaN
+            # while others don't.  If rank-0 enters optimizer.step() (which calls
+            # reduce_scatter_tensor, a collective) but rank-1 skips, NCCL deadlocks.
+            #
+            # Fix: all-reduce the skip flag so ALL ranks agree.  If ANY rank wants
+            # to skip, every rank skips — but every rank still participates in the
+            # NCCL collectives (reduce_scatter + all-gather) with zero contribution
+            # to avoid the collective mismatch that causes the hang.
+            if dist.is_initialized():
+                _skip_tensor = torch.tensor(
+                    [1.0 if _should_skip else 0.0],
+                    dtype=torch.float32,
+                    device=torch.cuda.current_device(),
+                )
+                _skip_dp_group = (
+                    parallel_state.get_data_parallel_group()
+                    if parallel_state.is_initialized()
+                    else None
+                )
+                dist.all_reduce(_skip_tensor, op=dist.ReduceOp.MAX, group=_skip_dp_group)
+                _should_skip = _skip_tensor.item() > 0.5
+                del _skip_tensor
+
             if _should_skip:
                 _skip_count += 1
             if _is_main:
@@ -2475,17 +2502,46 @@ class DesLocEngine:
                     f"skip={_should_skip} total_skips={_skip_count} "
                     f"ctrl_norm={_skip_info_combined_norm:.6f}"
                 )
-            if not _should_skip:
-                logger.warning("rank=%d: ENTERING optimizer.step", dist.get_rank() if dist.is_initialized() else 0)
-                if self._dist_optimizer is not None:
-                    # ZeRO-3 path: dist_optimizer handles reduce_scatter → Adam → all_gather
-                    self._dist_optimizer.step()
-                else:
-                    # Non-ZeRO-3 fallback: local AdamW on full model
-                    self.optimizer.step()
-                self.scheduler.step()
-                logger.warning("rank=%d: EXITED optimizer.step", dist.get_rank() if dist.is_initialized() else 0)
 
+            # --- FIX #154 (cont.): collective-safe optimizer step ---
+            # The distributed optimizer's step() calls two NCCL collectives:
+            #   1. prepare_grads() → _reduce_scatter_grads() — reduce_scatter_tensor
+            #   2. step_with_ready_grads() → start_param_sync() → shard_to_model_broadcast() — all_reduce
+            # ALL ranks must enter both, even when skipping the Adam update.
+            #
+            # When skipping: call prepare_grads() (reduce_scatter with whatever
+            # grads are present — they'll be discarded) and start_param_sync()
+            # (all-gather with unchanged shard values), but skip Adam + scheduler.
+            if self._dist_optimizer is not None:
+                # ZeRO-3 path: always enter reduce_scatter (collective #1)
+                logger.warning("rank=%d: ENTERING optimizer prepare_grads (skip=%s)",
+                               dist.get_rank() if dist.is_initialized() else 0, _should_skip)
+                self._dist_optimizer.prepare_grads()
+
+                if not _should_skip:
+                    # Normal path: Adam update on FP32 shards
+                    logger.warning("rank=%d: ENTERING optimizer step_with_ready_grads", dist.get_rank() if dist.is_initialized() else 0)
+                    self._dist_optimizer.step_with_ready_grads()
+                    self.scheduler.step()
+                    logger.warning("rank=%d: EXITED optimizer step_with_ready_grads", dist.get_rank() if dist.is_initialized() else 0)
+                else:
+                    # Skip path: zero grad shards so Adam state isn't corrupted,
+                    # but still enter the all-gather (collective #2) so all ranks
+                    # participate and NCCL doesn't deadlock.
+                    logger.warning("rank=%d: SKIPPING Adam update, entering param sync (collective-safe)",
+                                   dist.get_rank() if dist.is_initialized() else 0)
+                    for sp in self._dist_optimizer._shard_params:
+                        if sp.grad is not None:
+                            sp.grad.zero_()
+                    self._dist_optimizer.start_param_sync(force_sync=True)
+            elif not _should_skip:
+                # Non-ZeRO-3 fallback: local AdamW on full model
+                logger.warning("rank=%d: ENTERING optimizer.step (local)", dist.get_rank() if dist.is_initialized() else 0)
+                self.optimizer.step()
+                self.scheduler.step()
+                logger.warning("rank=%d: EXITED optimizer.step (local)", dist.get_rank() if dist.is_initialized() else 0)
+
+            if not _should_skip:
                 # --- DES-LOC: Algorithm 1 — Kx/Ku/Kv conditional sync ---
                 _is_Kx = (step + 1) % self.desloc_Kx == 0
                 _is_Ku = (step + 1) % self.desloc_Ku == 0
