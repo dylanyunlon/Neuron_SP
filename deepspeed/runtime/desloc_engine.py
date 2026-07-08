@@ -2485,12 +2485,39 @@ class DesLocEngine:
                     dtype=torch.float32,
                     device=torch.cuda.current_device(),
                 )
-                _skip_dp_group = (
-                    parallel_state.get_data_parallel_group()
-                    if parallel_state.is_initialized()
-                    else None
+                # FIX #155 (SP=3, DP=1 hang): use the same group as the optimizer
+                # collectives (prepare_grads → reduce_scatter_tensor and
+                # shard_to_model_broadcast → all_reduce).
+                #
+                # Root cause: with SP=3, DP=1, parallel_state.get_data_parallel_group()
+                # returns a size-1 group per rank — a trivial NOOP.  The skip decision
+                # is never propagated across SP ranks.  If rank-0 sees NaN loss and sets
+                # _should_skip=True, ranks 1 and 2 are unaware and enter
+                # prepare_grads() which calls reduce_scatter_tensor on the full optimizer
+                # group (size=3).  Rank-0 meanwhile skips to start_param_sync(), which
+                # calls all_reduce on the same group.  Different ops on the same NCCL
+                # communicator → collective mismatch → permanent deadlock.
+                #
+                # Fix: all-reduce _skip_tensor over self._dist_optimizer.data_parallel_group
+                # (the exact group that the optimizer collectives use), so the skip
+                # decision is consistent across every rank that will enter those ops.
+                # Fall back to DP group (parallel_state) → WORLD for non-dist-optimizer paths.
+                if self._dist_optimizer is not None:
+                    _skip_opt_group = self._dist_optimizer.data_parallel_group
+                elif parallel_state.is_initialized():
+                    _skip_opt_group = parallel_state.get_data_parallel_group()
+                else:
+                    _skip_opt_group = None  # WORLD
+                _skip_group_size = (
+                    dist.get_world_size(group=_skip_opt_group)
+                    if _skip_opt_group is not None
+                    else dist.get_world_size()
                 )
-                dist.all_reduce(_skip_tensor, op=dist.ReduceOp.MAX, group=_skip_dp_group)
+                logger.warning(
+                    "rank=%d: _skip_tensor all_reduce group_size=%d (fix #155)",
+                    dist.get_rank(), _skip_group_size,
+                )
+                dist.all_reduce(_skip_tensor, op=dist.ReduceOp.MAX, group=_skip_opt_group)
                 _should_skip = _skip_tensor.item() > 0.5
                 del _skip_tensor
 
