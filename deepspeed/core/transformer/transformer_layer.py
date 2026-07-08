@@ -91,6 +91,78 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# Fused residual + RMSNorm integration (fused_layernorm_residual.cu — #155/#156)
+# ---------------------------------------------------------------------------
+
+_fused_ln_res_mod = None
+_fused_ln_res_tried = False
+
+
+def _load_fused_ln_residual():
+    """Lazy-load hetero_reduce ext for fused_layernorm_residual kernel."""
+    global _fused_ln_res_mod, _fused_ln_res_tried
+    if _fused_ln_res_tried:
+        return _fused_ln_res_mod
+    _fused_ln_res_tried = True
+    try:
+        from deepspeed.ops.hetero_reduce.hetero_reduce_op import _load_module
+        mod = _load_module()
+        if hasattr(mod, "fused_layernorm_residual"):
+            _fused_ln_res_mod = mod
+            logger.debug("TransformerLayer: fused_layernorm_residual CUDA kernel loaded.")
+        else:
+            logger.debug("TransformerLayer: fused_layernorm_residual not in hetero_reduce module.")
+    except Exception as _e:
+        logger.debug("TransformerLayer: fused_layernorm_residual unavailable (%s).", _e)
+    return _fused_ln_res_mod
+
+
+def _sm_version_layer() -> int:
+    if not torch.cuda.is_available():
+        return 86
+    dev = torch.cuda.current_device()
+    major, minor = torch.cuda.get_device_capability(dev)
+    return major * 10 + minor
+
+
+def _apply_fused_layernorm_residual(
+    output_buf: torch.Tensor,
+    residual: torch.Tensor,
+    sub_layer_out: torch.Tensor,
+    ln_weight: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    """Fused residual += sub_layer_out; output = RMSNorm(residual) * ln_weight.
+
+    Calls fused_layernorm_residual kernel (modifies residual in-place, writes
+    normalised output to output_buf).  Returns output_buf.
+
+    Args:
+        output_buf:    Pre-allocated BF16 ``[B, H]`` output buffer (modified in-place).
+        residual:      BF16 ``[B, H]`` residual stream (modified in-place: residual += sub_layer_out).
+        sub_layer_out: BF16 ``[B, H]`` new sub-layer contribution (attention or MLP output).
+        ln_weight:     FP32 ``[H]`` RMSNorm gamma scale.
+        eps:           RMSNorm epsilon.
+
+    Returns:
+        output_buf (BF16 ``[B, H]`` normalised output).
+    """
+    mod = _load_fused_ln_residual()
+    sm = _sm_version_layer()
+    orig_shape = output_buf.shape
+    B = output_buf.numel() // output_buf.shape[-1]
+    H = output_buf.shape[-1]
+    mod.fused_layernorm_residual(
+        output_buf.reshape(B, H),
+        residual.reshape(B, H),
+        sub_layer_out.reshape(B, H),
+        ln_weight,
+        eps, sm,
+    )
+    return output_buf
+
+
+# ---------------------------------------------------------------------------
 # get_transformer_layer_offset — ported verbatim from Megatron transformer_layer.py
 # Also re-exported here so callers can do:
 #   from deepspeed.core.transformer.transformer_layer import get_transformer_layer_offset
@@ -629,6 +701,20 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
                 self.layer_number,
             )
 
+        # --- fused_layernorm_residual fast path (#155/#156) ----------
+        # Enabled when:
+        #   * config.fused_layernorm_residual = True  (opt-in)
+        #   * normalization == "RMSNorm" (kernel implements RMSNorm, not LN)
+        #   * no bias_dropout_fusion (we replace the BDA+norm sequence entirely)
+        #   * no fp32_residual_connection (kernel operates in BF16)
+        self.use_fused_ln_residual: bool = (
+            getattr(config, "fused_layernorm_residual", False)
+            and config.normalization == "RMSNorm"
+            and not getattr(config, "bias_dropout_fusion", False)
+            and not getattr(config, "fp32_residual_connection", False)
+            and _load_fused_ln_residual() is not None
+        )
+
         # --- bias_dropout_add_exec_handler (Megatron M2379) ----------
         # Ensures grad is enabled during the BDA operation, matching Megatron behaviour.
         self.bias_dropout_add_exec_handler = torch.enable_grad
@@ -808,12 +894,50 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
             attn_out, attn_bias = attention_output_with_bias, None
 
         # --- Bias-dropout-add (self-attention) --------------------------------
-        with self.bias_dropout_add_exec_handler():
-            bda_fn = get_bias_dropout_add(
-                self.training,
-                getattr(self.config, "bias_dropout_fusion", False),
-            )
-            hidden_states = bda_fn(attn_out, attn_bias, residual, self.hidden_dropout)
+        # fused_layernorm_residual.cu fast path: fuse residual-add + RMSNorm
+        # in one kernel (zero-copy for the pre-MLP norm input).
+        # Conditions: no attention bias, no dropout (inference or dropout=0),
+        # BF16 activations, RMSNorm weight available.
+        _ln_w = (
+            self.input_layernorm.weight
+            if hasattr(self.input_layernorm, "weight")
+            else None
+        )
+        _can_fuse_attn_ln = (
+            self.use_fused_ln_residual
+            and attn_bias is None
+            and (not self.training or self.hidden_dropout == 0.0)
+            and attn_out.dtype == torch.bfloat16
+            and residual.dtype == torch.bfloat16
+            and _ln_w is not None
+            and _ln_w.dtype == torch.float32
+        )
+        if _can_fuse_attn_ln:
+            try:
+                # output = RMSNorm(residual + attn_out); residual updated in-place
+                norm_out = torch.empty_like(attn_out)
+                _apply_fused_layernorm_residual(
+                    norm_out, residual, attn_out, _ln_w,
+                    self.config.layernorm_epsilon,
+                )
+                # norm_out now holds the pre-MLP norm — store for _forward_mlp reuse
+                hidden_states = norm_out
+                # Store the updated residual for later residual connection
+                self._fused_attn_residual = residual  # residual updated in-place by kernel
+            except Exception as _fln_err:
+                logger.debug(
+                    "TransformerLayer %d: fused_layernorm_residual (attn) failed (%s), fallback.",
+                    self.layer_number, _fln_err,
+                )
+                _can_fuse_attn_ln = False
+
+        if not _can_fuse_attn_ln:
+            with self.bias_dropout_add_exec_handler():
+                bda_fn = get_bias_dropout_add(
+                    self.training,
+                    getattr(self.config, "bias_dropout_fusion", False),
+                )
+                hidden_states = bda_fn(attn_out, attn_bias, residual, self.hidden_dropout)
 
         # --- Cross-attention (M2317: BERT / encoder-decoder) ------------------
         if self.add_cross_attn and context is not None and not isinstance(self.cross_attention, IdentityOp):
@@ -991,12 +1115,44 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         mlp_out = mlp_output_with_bias[0] if isinstance(mlp_output_with_bias, (tuple, list)) else mlp_output_with_bias
         mlp_bias = mlp_output_with_bias[1] if isinstance(mlp_output_with_bias, (tuple, list)) and len(mlp_output_with_bias) > 1 else None
 
-        with self.bias_dropout_add_exec_handler():
-            bda_fn = get_bias_dropout_add(
-                self.training,
-                getattr(self.config, "bias_dropout_fusion", False),
-            )
-            hidden_states = bda_fn(mlp_out, mlp_bias, residual, self.hidden_dropout)
+        # fused_layernorm_residual.cu fast path for post-MLP residual-add + next-layer norm.
+        # We only apply it when there is no MLP bias, no dropout, and we have FP32 RMSNorm weights.
+        _mlp_ln_w = (
+            self.pre_mlp_layernorm.weight
+            if hasattr(self.pre_mlp_layernorm, "weight")
+            else None
+        )
+        _can_fuse_mlp_ln = (
+            self.use_fused_ln_residual
+            and mlp_bias is None
+            and (not self.training or self.hidden_dropout == 0.0)
+            and mlp_out.dtype == torch.bfloat16
+            and residual.dtype == torch.bfloat16
+            and _mlp_ln_w is not None
+            and _mlp_ln_w.dtype == torch.float32
+        )
+        if _can_fuse_mlp_ln:
+            try:
+                norm_out = torch.empty_like(mlp_out)
+                _apply_fused_layernorm_residual(
+                    norm_out, residual, mlp_out, _mlp_ln_w,
+                    self.config.layernorm_epsilon,
+                )
+                hidden_states = residual  # residual now holds residual + mlp_out
+            except Exception as _fln_mlp_err:
+                logger.debug(
+                    "TransformerLayer %d: fused_layernorm_residual (mlp) failed (%s), fallback.",
+                    self.layer_number, _fln_mlp_err,
+                )
+                _can_fuse_mlp_ln = False
+
+        if not _can_fuse_mlp_ln:
+            with self.bias_dropout_add_exec_handler():
+                bda_fn = get_bias_dropout_add(
+                    self.training,
+                    getattr(self.config, "bias_dropout_fusion", False),
+                )
+                hidden_states = bda_fn(mlp_out, mlp_bias, residual, self.hidden_dropout)
 
         # Make viewless: JIT-compiled BDA can produce a view tensor that causes
         # schedule.py's deallocate_output_tensor() to raise an error.

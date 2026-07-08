@@ -218,6 +218,82 @@ def _yarn_get_concentration_factor_from_config(config) -> float:
 # Lazy parallel-state helpers (safe when dist not initialised)
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Fused RoPE hetero integration (fused_rope_hetero.cu — addresses #155)
+# ---------------------------------------------------------------------------
+
+_hetero_reduce_mod = None
+_hetero_reduce_tried = False
+
+
+def _load_hetero_reduce():
+    """Lazy-load the hetero_reduce CUDA extension (compiled from csrc/hetero_reduce/)."""
+    global _hetero_reduce_mod, _hetero_reduce_tried
+    if _hetero_reduce_tried:
+        return _hetero_reduce_mod
+    _hetero_reduce_tried = True
+    try:
+        from deepspeed.ops.hetero_reduce.hetero_reduce_op import _load_module
+        _hetero_reduce_mod = _load_module()
+        logger.debug("attention: hetero_reduce CUDA extension loaded (fused_rope_hetero).")
+    except Exception as _e:
+        logger.debug("attention: hetero_reduce unavailable (%s). Falling back to Python RoPE.", _e)
+        _hetero_reduce_mod = None
+    return _hetero_reduce_mod
+
+
+def _sm_version_attn() -> int:
+    """Return SM version for the current CUDA device (86, 90, 120, …)."""
+    if not torch.cuda.is_available():
+        return 86
+    dev = torch.cuda.current_device()
+    major, minor = torch.cuda.get_device_capability(dev)
+    return major * 10 + minor
+
+
+def _apply_fused_rope_hetero(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    cos_cache: torch.Tensor,
+    sin_cache: torch.Tensor,
+    neox_style: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply fused_rope_hetero.cu kernel to Q and K tensors.
+
+    The kernel operates on layout ``[B, S, H, D]`` (BSHD), so we permute
+    from the Megatron ``[S, B, H, D]`` (SBHD) convention and back.
+
+    Args:
+        query:     ``[S, B, H, D]`` query tensor (BF16).
+        key:       ``[S, B, H, D]`` key tensor (BF16).
+        cos_cache: ``[S, D/2]`` cosine table (FP32).
+        sin_cache: ``[S, D/2]`` sine table (FP32).
+        neox_style: True for Llama/NeoX rotation; False for GPT-J interleaved.
+
+    Returns:
+        ``(query_rot, key_rot)`` in ``[S, B, H, D]`` layout.
+    """
+    mod = _load_hetero_reduce()
+    if mod is None or not hasattr(mod, "fused_rope_hetero"):
+        raise RuntimeError("fused_rope_hetero kernel not available")
+
+    sm = _sm_version_attn()
+
+    # SBHD → BSHD (contiguous needed by kernel)
+    q_bshd = query.permute(1, 0, 2, 3).contiguous()
+    k_bshd = key.permute(1, 0, 2, 3).contiguous()
+
+    # Allocate output buffers
+    q_out = torch.empty_like(q_bshd)
+    k_out = torch.empty_like(k_bshd)
+
+    mod.fused_rope_hetero(q_out, q_bshd, cos_cache, sin_cache, neox_style, sm)
+    mod.fused_rope_hetero(k_out, k_bshd, cos_cache, sin_cache, neox_style, sm)
+
+    # BSHD → SBHD
+    return q_out.permute(1, 0, 2, 3), k_out.permute(1, 0, 2, 3)
+
+
 def _get_sp_world_size() -> int:
     try:
         from deepspeed.core.parallel_state import get_sequence_parallel_world_size
@@ -1445,6 +1521,11 @@ class Attention(MegatronModule, ABC):
 
         # ------------------------------------------------------------------
         # Rotary position embeddings (YaRN mscale M2380)
+        # fused_rope_hetero.cu fast path (#155): when query/key are BF16 and
+        # the freqs are pre-split cos/sin caches (FP32 [S, D/2]), delegate to
+        # the CUDA kernel for vectorised pair-load RoPE with SM-conditional
+        # warp tiling.  Falls back to the Python path on any exception so that
+        # correctness is never compromised.
         # ------------------------------------------------------------------
         if rotary_pos_emb is not None and not (
             getattr(self.config, "flash_decode", False) and inference_context is not None
@@ -1453,9 +1534,6 @@ class Attention(MegatronModule, ABC):
             from deepspeed.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
 
             # Slice raw freqs by SP rank after all-to-all scatter.
-            # _RotaryEmbedding returns [s, 1, 1, dim] raw freqs (not cos/sin).
-            # After SP scatter query/key have seq = full_seq / sp_size,
-            # so we slice freqs dim-0 to the local segment for this SP rank.
             if use_sp:
                 sp_rank = dist.get_rank(sp_group)
                 sp_world = dist.get_world_size(sp_group)
@@ -1471,13 +1549,46 @@ class Attention(MegatronModule, ABC):
                     k_pos_emb = k_pos_emb[start : start + local_seq]
 
             mscale = self._yarn_concentration_factor  # cached at construction (M4013 perf)
-            # M4090: multi_latent_attention (old kwarg name) is now
-            # mla_rotary_interleaved in rope_utils.apply_rotary_pos_emb.
-            # Pass it explicitly so DSA/MLA layers get correct interleaving
-            # even after the upstream Megatron removed the old kwarg.
             mla_rotary_interleaved = bool(
                 getattr(self.config, "multi_latent_attention", False)
             )
+
+            # --- fused_rope_hetero.cu fast path (#155) ---
+            # Conditions: BF16 tensors, matching Q/K freq tables, no MLA interleave,
+            # no YaRN mscale boost (mscale==1.0), freqs are cos/sin caches [S, D/2].
+            _fused_rope_ok = (
+                query.dtype == torch.bfloat16
+                and key.dtype == torch.bfloat16
+                and not mla_rotary_interleaved
+                and abs(mscale - 1.0) < 1e-6
+                and q_pos_emb is not None
+                and k_pos_emb is not None
+                and q_pos_emb.shape == k_pos_emb.shape
+                # Heuristic: cos/sin caches are FP32 and have shape [S, D/2]
+                # (2-D, not 4-D raw freqs [S,1,1,D]).  Raw freqs are 4-D and
+                # require the full Python RoPE path.
+                and q_pos_emb.dim() == 2
+                and q_pos_emb.dtype == torch.float32
+            )
+            if _fused_rope_ok:
+                _neox = not getattr(self.config, "rotary_interleaved", False)
+                try:
+                    query, key = _apply_fused_rope_hetero(
+                        query, key,
+                        cos_cache=q_pos_emb,
+                        sin_cache=k_pos_emb,
+                        neox_style=_neox,
+                    )
+                    # Skip the Python path below
+                    q_pos_emb = k_pos_emb = None
+                except Exception as _rope_err:
+                    logger.debug(
+                        "SelfAttention layer %d: fused_rope_hetero failed (%s), "
+                        "falling back to Python RoPE.",
+                        self.layer_number, _rope_err,
+                    )
+
+            # Python RoPE fallback (used when fused kernel unavailable or skipped)
             if q_pos_emb is not None:
                 query = apply_rotary_pos_emb(
                     query, q_pos_emb, config=self.config,

@@ -70,6 +70,133 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# Fused SwiGLU + RMSNorm integration (fused_swiglu_ln.cu — addresses #156)
+# ---------------------------------------------------------------------------
+
+_swiglu_ln_mod = None
+_swiglu_ln_tried = False
+
+
+def _load_swiglu_ln_mod():
+    """Lazy-load hetero_reduce CUDA ext for fused_swiglu_ln kernel."""
+    global _swiglu_ln_mod, _swiglu_ln_tried
+    if _swiglu_ln_tried:
+        return _swiglu_ln_mod
+    _swiglu_ln_tried = True
+    try:
+        from deepspeed.ops.hetero_reduce.hetero_reduce_op import _load_module
+        mod = _load_module()
+        if hasattr(mod, "fused_swiglu_ln"):
+            _swiglu_ln_mod = mod
+            logger.debug("MLP: fused_swiglu_ln CUDA kernel loaded (#156).")
+        else:
+            logger.debug("MLP: fused_swiglu_ln not found in hetero_reduce module.")
+    except Exception as _e:
+        logger.debug("MLP: fused_swiglu_ln unavailable (%s). Using Python path.", _e)
+    return _swiglu_ln_mod
+
+
+def _sm_version_mlp() -> int:
+    if not torch.cuda.is_available():
+        return 86
+    dev = torch.cuda.current_device()
+    major, minor = torch.cuda.get_device_capability(dev)
+    return major * 10 + minor
+
+
+class _FusedSwiGLULNFunction(torch.autograd.Function):
+    """Autograd wrapper for fused SwiGLU + RMSNorm forward+backward (#156).
+
+    Uses ``fused_swiglu_ln_fwd_save`` to save ``rms_inv`` for the backward
+    pass, and ``fused_swiglu_ln_backward`` to compute gradients w.r.t.
+    ``gate_proj``, ``up_proj``, and ``ln_weight`` in a single fused kernel.
+
+    All inputs must be contiguous BF16 (gate/up/output) or FP32 (ln_weight).
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        gate_proj: torch.Tensor,
+        up_proj: torch.Tensor,
+        ln_weight: torch.Tensor,
+        eps: float,
+        sm: int,
+    ) -> torch.Tensor:
+        mod = _load_swiglu_ln_mod()
+        assert mod is not None
+        B, H = gate_proj.shape
+        output = torch.empty_like(gate_proj)
+        rms_inv = torch.empty(B, dtype=torch.float32, device=gate_proj.device)
+        mod.fused_swiglu_ln_fwd_save(
+            output, rms_inv,
+            gate_proj, up_proj, ln_weight,
+            eps, sm,
+        )
+        ctx.save_for_backward(gate_proj, up_proj, ln_weight, rms_inv)
+        ctx.eps = eps
+        ctx.sm = sm
+        return output
+
+    @staticmethod
+    def backward(ctx, d_output: torch.Tensor):
+        gate_proj, up_proj, ln_weight, rms_inv = ctx.saved_tensors
+        mod = _load_swiglu_ln_mod()
+        assert mod is not None
+        H = gate_proj.shape[1]
+        d_gate = torch.empty_like(gate_proj)
+        d_up = torch.empty_like(up_proj)
+        d_ln_weight = torch.zeros(H, dtype=torch.float32, device=gate_proj.device)
+        mod.fused_swiglu_ln_backward(
+            d_gate, d_up, d_ln_weight,
+            d_output.contiguous(),
+            gate_proj, up_proj, ln_weight, rms_inv,
+            ctx.eps, ctx.sm,
+        )
+        return d_gate, d_up, d_ln_weight, None, None
+
+
+def _fused_swiglu_ln(
+    gate_proj: torch.Tensor,
+    up_proj: torch.Tensor,
+    ln_weight: torch.Tensor,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """Apply fused SwiGLU + RMSNorm with autograd support.
+
+    Falls back to the inference-only ``fused_swiglu_ln`` kernel when not in
+    training mode (avoids allocating the ``rms_inv`` save buffer).
+
+    Args:
+        gate_proj: BF16 ``[B, H]`` gate projection output from fc1.
+        up_proj:   BF16 ``[B, H]`` up projection output from fc1.
+        ln_weight: FP32 ``[H]`` RMSNorm scale (gamma).
+        eps:       RMSNorm epsilon.
+
+    Returns:
+        BF16 ``[B, H]`` fused SwiGLU + RMSNorm output.
+    """
+    sm = _sm_version_mlp()
+    mod = _load_swiglu_ln_mod()
+    if mod is None:
+        raise RuntimeError("fused_swiglu_ln kernel not available")
+
+    gate = gate_proj.contiguous()
+    up = up_proj.contiguous()
+    w = ln_weight.contiguous()
+
+    if gate.requires_grad or up.requires_grad or w.requires_grad:
+        # Training path: use fwd_save + backward autograd function
+        if hasattr(mod, "fused_swiglu_ln_fwd_save") and hasattr(mod, "fused_swiglu_ln_backward"):
+            return _FusedSwiGLULNFunction.apply(gate, up, w, eps, sm)
+
+    # Inference path (or no fwd_save available): forward-only kernel
+    output = torch.empty_like(gate)
+    mod.fused_swiglu_ln(output, gate, up, w, eps, sm)
+    return output
+
+
+# ---------------------------------------------------------------------------
 # Lazy parallel-state helpers (safe when dist not initialised)
 # ---------------------------------------------------------------------------
 
@@ -693,6 +820,44 @@ class MLP(MegatronModule):
         """
         use_te_activation = getattr(self.config, "use_te_activation_func", False)
         bias_act_fusion = getattr(self.config, "bias_activation_fusion", False)
+
+        # --- fused_swiglu_ln.cu fast path (#156) ---
+        # Conditions:
+        #   * SwiGLU activation (gated_linear_unit=True, activation_func=silu)
+        #   * BF16 input (kernel requirement)
+        #   * No per_token_scale (MoE routing scale not supported in kernel)
+        #   * No bias (kernel takes gate/up separately, not concatenated+bias)
+        #   * RMSNorm weight available on the pre-MLP layernorm for this MLP
+        #     (config.normalization == "RMSNorm" and config.fused_swiglu_ln enabled)
+        _use_fused_swiglu_ln = (
+            getattr(self.config, "fused_swiglu_ln", False)
+            and self.config.gated_linear_unit
+            and self.activation_func is F.silu
+            and not use_te_activation
+            and per_token_scale is None
+            and bias is None
+            and x.dtype == torch.bfloat16
+            and _load_swiglu_ln_mod() is not None
+        )
+        if _use_fused_swiglu_ln:
+            # x layout: [..., 2 * ffn_per_tp] where first half=gate, second=up
+            gate_half, up_half = torch.chunk(x, 2, dim=-1)
+            # Reshape to [B, H] (flatten leading dims)
+            orig_shape = gate_half.shape
+            B_flat = gate_half.numel() // gate_half.shape[-1]
+            H = gate_half.shape[-1]
+            gate_2d = gate_half.reshape(B_flat, H)
+            up_2d = up_half.reshape(B_flat, H)
+            ln_w = getattr(self, "_fused_swiglu_ln_weight", None)
+            if ln_w is not None and ln_w.shape[0] == H:
+                try:
+                    out_2d = _fused_swiglu_ln(gate_2d, up_2d, ln_w, eps=self.config.layernorm_epsilon)
+                    return out_2d.reshape(*orig_shape)
+                except Exception as _fswg_err:
+                    logger.debug(
+                        "MLP layer %d: fused_swiglu_ln failed (%s), falling back.",
+                        self.layer_number, _fswg_err,
+                    )
 
         if use_te_activation:
             if bias is not None:
