@@ -911,3 +911,298 @@ int hetero_ring_sm_block_size(int sm_version)
     if (sm_version >= 90)  return HRingPolicy<90>::kBlockSize;
     return                        HRingPolicy<86>::kBlockSize;
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Section 15: TMA BlockLoadToShared for SM9.0+  (issue #72)
+//
+// Adds a TMA-accelerated reduce step to the hetero_ring_allreduce kernel path.
+// For SM9.0 (H100) and SM12.0 (Blackwell), cp.async.bulk.tensor loads an
+// entire kTmaHRingTileElems-element BF16 tile from global memory directly into
+// shared memory in a single hardware transaction, with mbarrier completion
+// signaling.  This eliminates the per-thread ldg() loop for the recv buffer,
+// reducing instruction overhead and improving MIO utilization.
+//
+// Design:
+//   kTmaHRingTileElems = 2048  (4 KiB BF16; matches pcie_adaptive_allreduce)
+//
+//   hetero_ring_reduce_tma_sm90_kernel<kBS>:
+//     Grid:  ceil(n_elems / kTmaHRingTileElems) CTAs
+//     Block: kBS threads (256 for SM9.0, 512 for SM12.0)
+//
+//     Phase A — thread 0: mbarrier init + cp.async.bulk.tensor issue
+//     Sync   — __syncthreads() after thread-0 issues mbar arrive_expect_tx
+//     Wait   — thread 0 polls mbar; __syncthreads() propagates to all threads
+//     Phase B — all threads: vectorised accum[tile] += smem[tile] (FP32)
+//
+//   launch_hetero_ring_reduce_tma_step():
+//     Host dispatch: builds CUtensorMap for recv, launches TMA kernel.
+//     Falls back to hetero_ring_reduce_sm120_kernel on CUDA < 12.
+//
+// Shared memory per CTA: kTmaHRingTileElems × 2 bytes = 4 KiB (tile buffer)
+//                      + 8 bytes (mbarrier) = 4108 bytes total.
+// With 228 KB smem/SM and 256 threads/block on H100, up to 55 CTAs can reside
+// per SM (occupancy-limited by registers long before smem).
+//
+// References:
+//   PTX ISA 8.5 §9.7.13: cp.async.bulk.tensor
+//   CUDA Programming Guide §K.4: Tensor Memory Accelerator
+//   NVIDIA H100 Architecture Whitepaper §3.2: TMA Engine
+// ─────────────────────────────────────────────────────────────────────────────
+
+#if CUDA_VERSION >= 12000
+#include <cuda.h>   // CUtensorMap, cuTensorMapEncodeTiled
+#endif
+
+// Tile size for TMA bulk load in hetero ring (matches pcie_adaptive_allreduce).
+static constexpr int kTmaHRingTileElems = 2048;  // 4 KiB of BF16
+
+// ── Device helpers: mbarrier init, TMA issue, mbarrier wait ──────────────────
+// Compiled only when targeting SM9.0+ with CUDA 12+.
+
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900 && __CUDACC_VER_MAJOR__ >= 12
+
+// Initialise a shared-memory mbarrier for one arriving transaction.
+__device__ __forceinline__
+void hring_tma_mbar_init(uint64_t* __restrict__ mbar)
+{
+    asm volatile(
+        "mbarrier.init.shared::cta.b64 [%0], 1;\n"
+        :: "r"(static_cast<uint32_t>(__cvta_generic_to_shared(mbar)))
+    );
+}
+
+// Signal the mbarrier with the expected byte count of the TMA transfer.
+__device__ __forceinline__
+void hring_tma_mbar_expect_tx(uint64_t* __restrict__ mbar, uint32_t tx_bytes)
+{
+    asm volatile(
+        "mbarrier.arrive.expect_tx.shared::cta.b64 [%0], %1;\n"
+        :: "r"(static_cast<uint32_t>(__cvta_generic_to_shared(mbar))),
+           "r"(tx_bytes)
+    );
+}
+
+// Issue a 1-D TMA bulk copy from global (via tmap[x_coord]) → smem_dst.
+__device__ __forceinline__
+void hring_tma_issue_1d(
+    __nv_bfloat16* __restrict__ smem_dst,
+    const CUtensorMap*          tmap,
+    int                         x_coord,
+    uint64_t* __restrict__      mbar)
+{
+    asm volatile(
+        "cp.async.bulk.tensor.1d.shared::cluster.global"
+        " [%0], [%1, {%2}], [%3];\n"
+        :: "r"(static_cast<uint32_t>(__cvta_generic_to_shared(smem_dst))),
+           "l"(tmap),
+           "r"(x_coord),
+           "r"(static_cast<uint32_t>(__cvta_generic_to_shared(mbar)))
+    );
+}
+
+// Spin-wait on the mbarrier until phase `phase` completes.
+__device__ __forceinline__
+void hring_tma_mbar_wait(uint64_t* __restrict__ mbar, uint32_t phase)
+{
+    asm volatile(
+        "{\n"
+        ".reg .pred p;\n"
+        "LAB_HRING_WAIT_%=:\n"
+        "mbarrier.try_wait.parity.shared::cta.b64 p, [%0], %1;\n"
+        "@!p bra LAB_HRING_WAIT_%=;\n"
+        "}\n"
+        :: "r"(static_cast<uint32_t>(__cvta_generic_to_shared(mbar))),
+           "r"(phase)
+        : "memory"
+    );
+}
+
+// ── TMA reduce kernel ─────────────────────────────────────────────────────────
+
+template <int kBS>
+__global__ void __launch_bounds__(kBS, 4)
+hetero_ring_reduce_tma_sm90_kernel(
+    __nv_bfloat16* __restrict__       accum,
+    const CUtensorMap*                recv_tmap,   // TMA descriptor for recv buf
+    size_t                            n_elems)
+{
+    // Shared memory: tile buffer (kTmaHRingTileElems × BF16) + mbarrier (8 B).
+    __shared__ __align__(128) __nv_bfloat16 smem_tile[kTmaHRingTileElems];
+    __shared__ __align__(8)   uint64_t      mbar;
+
+    const int    tile_idx   = blockIdx.x;
+    const size_t tile_base  = (size_t)tile_idx * kTmaHRingTileElems;
+    if (tile_base >= n_elems) return;
+
+    const size_t tile_elems = min((size_t)kTmaHRingTileElems, n_elems - tile_base);
+    const uint32_t tx_bytes = (uint32_t)(tile_elems * sizeof(__nv_bfloat16));
+
+    // ── Phase A: thread 0 sets up mbarrier and issues TMA ────────────────
+    if (threadIdx.x == 0) {
+        hring_tma_mbar_init(&mbar);
+        hring_tma_mbar_expect_tx(&mbar, tx_bytes);
+        hring_tma_issue_1d(smem_tile, recv_tmap, tile_idx, &mbar);
+    }
+    // Ensure mbarrier is initialised before any thread tries to wait.
+    // __syncthreads() also serialises wrt the cp.async.bulk issue.
+    __syncthreads();
+
+    // ── Wait: thread 0 polls mbarrier; __syncthreads propagates ──────────
+    if (threadIdx.x == 0) {
+        hring_tma_mbar_wait(&mbar, /*phase=*/0);
+    }
+    __syncthreads();   // smem_tile is now fully populated
+
+    // ── Phase B: vectorised accumulate accum[tile_base+i] += smem_tile[i] ─
+    const size_t vec_tile = tile_elems / kVecWidth;
+
+    for (int t = (int)threadIdx.x; t < (int)vec_tile; t += kBS) {
+        const size_t base = (size_t)t * kVecWidth;
+        float d0,d1,d2,d3,d4,d5,d6,d7;
+        float s0,s1,s2,s3,s4,s5,s6,s7;
+        hring_load8_bf16_as_f32(accum + tile_base + base, d0,d1,d2,d3,d4,d5,d6,d7);
+        hring_load8_bf16_as_f32(smem_tile          + base, s0,s1,s2,s3,s4,s5,s6,s7);
+        hring_store8_f32_as_bf16(accum + tile_base + base,
+            d0+s0, d1+s1, d2+s2, d3+s3,
+            d4+s4, d5+s5, d6+s6, d7+s7);
+    }
+
+    // Scalar tail within tile (thread 0 only)
+    if (threadIdx.x == 0) {
+        for (size_t e = vec_tile * kVecWidth; e < tile_elems; ++e) {
+            float d = __bfloat162float(accum[tile_base + e]);
+            float s = __bfloat162float(smem_tile[e]);
+            accum[tile_base + e] = __float2bfloat16(d + s);
+        }
+    }
+}
+
+#endif  // __CUDA_ARCH__ >= 900 && CUDA >= 12
+
+// ── Host: TMA descriptor builder for 1-D BF16 tensors ────────────────────────
+
+#if CUDA_VERSION >= 12000
+static cudaError_t hring_build_tma_1d(
+    CUtensorMap*             tmap,
+    const __nv_bfloat16*     global_ptr,
+    size_t                   n_elems)
+{
+    const uint64_t global_dim[1]    = { n_elems };
+    const uint64_t global_stride[1] = { sizeof(__nv_bfloat16) };
+    const uint32_t box_dim[1]       = { (uint32_t)kTmaHRingTileElems };
+    const uint32_t elem_stride[1]   = { 1 };
+
+    CUresult res = cuTensorMapEncodeTiled(
+        tmap,
+        CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
+        /*tensorRank=*/1,
+        /*globalAddress=*/(void*)global_ptr,
+        global_dim,
+        global_stride + 1,   // innermost stride (skip outermost in 1-D)
+        box_dim,
+        elem_stride,
+        CU_TENSOR_MAP_INTERLEAVE_NONE,
+        CU_TENSOR_MAP_SWIZZLE_NONE,
+        CU_TENSOR_MAP_L2_PROMOTION_L2_128B,
+        CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+
+    if (res != CUDA_SUCCESS) {
+        const char* s = nullptr;
+        cuGetErrorString(res, &s);
+        fprintf(stderr,
+            "[hring_build_tma_1d] cuTensorMapEncodeTiled failed: %s\n",
+            s ? s : "unknown");
+        return cudaErrorUnknown;
+    }
+    return cudaSuccess;
+}
+#endif  // CUDA_VERSION >= 12000
+
+// ── Public dispatch: TMA-accelerated hetero ring reduce step ──────────────────
+
+/**
+ * launch_hetero_ring_reduce_tma_step
+ *
+ * TMA BlockLoadToShared variant of launch_hetero_ring_reduce_step.
+ * On SM9.0/SM12.0 with CUDA 12+: uses cp.async.bulk.tensor to load the recv
+ * buffer tile-by-tile into shared memory, then accumulates with accum in FP32.
+ * On SM < 9.0 or CUDA < 12: falls back to launch_hetero_ring_reduce_step.
+ *
+ * @param accum       [in/out] BF16 accumulator [chunk_elems]
+ * @param recv        [in]     BF16 received chunk from ring peer [chunk_elems]
+ * @param chunk_elems Number of BF16 elements (divisible by kVecWidth=8)
+ * @param sm_version  SM version (86, 90, 120)
+ * @param stream      CUDA compute stream
+ */
+void launch_hetero_ring_reduce_tma_step(
+    __nv_bfloat16* __restrict__       accum,
+    const __nv_bfloat16* __restrict__ recv,
+    size_t                            chunk_elems,
+    int                               sm_version,
+    cudaStream_t                      stream)
+{
+#if CUDA_VERSION >= 12000
+    if (sm_version >= 90) {
+        CUtensorMap tmap;
+        if (hring_build_tma_1d(&tmap, recv, chunk_elems) != cudaSuccess) {
+            // Descriptor build failed — fall through to non-TMA path.
+            goto fallback;
+        }
+
+        // Copy TMA descriptor to device memory (128 bytes).
+        CUtensorMap* d_tmap = nullptr;
+        if (cudaMallocAsync(&d_tmap, sizeof(CUtensorMap), stream) != cudaSuccess)
+            goto fallback;
+        cudaMemcpyAsync(d_tmap, &tmap, sizeof(CUtensorMap),
+                        cudaMemcpyHostToDevice, stream);
+
+        // Grid: one CTA per tile, capped at 65535.
+        const int n_tiles = (int)((chunk_elems + kTmaHRingTileElems - 1)
+                                  / kTmaHRingTileElems);
+        const int grid    = std::min(n_tiles, 65535);
+
+        if (sm_version >= 120) {
+            constexpr int kBS = HRingPolicy<120>::kBlockSize;  // 512
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+            hetero_ring_reduce_tma_sm90_kernel<kBS>
+                <<<std::max(grid, 1), kBS, 0, stream>>>(
+                    accum, d_tmap, chunk_elems);
+#else
+            // Fallback instantiation when compiled without SM9.0 arch flag.
+            hetero_ring_reduce_tma_sm90_kernel<256>
+                <<<std::max(grid, 1), 256, 0, stream>>>(
+                    accum, d_tmap, chunk_elems);
+            (void)kBS;
+#endif
+        } else {
+            // SM9.0 (H100): 256 threads.
+            constexpr int kBS = HRingPolicy<90>::kBlockSize;   // 256
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+            hetero_ring_reduce_tma_sm90_kernel<kBS>
+                <<<std::max(grid, 1), kBS, 0, stream>>>(
+                    accum, d_tmap, chunk_elems);
+#else
+            hetero_ring_reduce_tma_sm90_kernel<256>
+                <<<std::max(grid, 1), 256, 0, stream>>>(
+                    accum, d_tmap, chunk_elems);
+            (void)kBS;
+#endif
+        }
+
+        {
+            cudaError_t err = cudaGetLastError();
+            if (err != cudaSuccess)
+                fprintf(stderr,
+                    "[launch_hetero_ring_reduce_tma_step] kernel launch failed "
+                    "(SM %d, chunk_elems=%zu): %s\n",
+                    sm_version, chunk_elems, cudaGetErrorString(err));
+        }
+        cudaFreeAsync(d_tmap, stream);
+        return;
+    }
+#endif  // CUDA_VERSION >= 12000
+
+fallback:
+    // SM8.6 or CUDA < 12: existing cp.async or __ldg path.
+    launch_hetero_ring_reduce_step(accum, recv, chunk_elems, sm_version, stream);
+}

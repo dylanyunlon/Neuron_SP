@@ -1540,6 +1540,35 @@ void launch_hetero_ring_allreduce(
     cudaEvent_t             xfer_done[2]);
 
 /**
+ * launch_hetero_ring_reduce_tma_step  (issue #72)
+ *
+ * TMA-accelerated BlockLoadToShared variant of launch_hetero_ring_reduce_step.
+ * On SM9.0+ with CUDA 12+, loads recv into shared memory via
+ * cp.async.bulk.tensor (CUtensorMap, 1-D BF16, kTmaHRingTileElems elements
+ * per tile), then accumulates accum[i] += smem[i] in FP32 with BF16 I/O.
+ *
+ * Advantages over cp.async.cg (SM12.0 path) and __ldg (SM8.6/9.0 path):
+ *   • Single instruction per tile (vs. per-element LD in cp.async.cg)
+ *   • Hardware TMA engine handles addressing and coalescing
+ *   • mbarrier completion gives exact synchronisation with zero polling overhead
+ *     once the transfer completes
+ *
+ * Falls back to launch_hetero_ring_reduce_step on SM < 9.0 or CUDA < 12.
+ *
+ * @param accum       [in/out] BF16 local accumulator [chunk_elems]
+ * @param recv        [in]     BF16 received peer chunk [chunk_elems]
+ * @param chunk_elems Number of BF16 elements (divisible by 8)
+ * @param sm_version  SM version of the active device (86, 90, 120)
+ * @param stream      CUDA compute stream
+ */
+void launch_hetero_ring_reduce_tma_step(
+    __nv_bfloat16* __restrict__       accum,
+    const __nv_bfloat16* __restrict__ recv,
+    size_t                            chunk_elems,
+    int                               sm_version,
+    cudaStream_t                      stream);
+
+/**
  * hetero_ring_intra_numa_chunk_bytes / hetero_ring_cross_numa_chunk_bytes
  *
  * Returns the bandwidth-aware chunk size constants for buffer sizing.
