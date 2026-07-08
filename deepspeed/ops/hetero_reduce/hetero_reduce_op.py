@@ -350,6 +350,143 @@ class HeteroReduceOp:
         return _load_module().compute_offload_budget(total_act_bytes, vram_free_bytes, headroom_frac)
 
     # -----------------------------------------------------------------------
+    # Fused gradient allreduce (INT8-compressed ring, #146)
+    # -----------------------------------------------------------------------
+
+    def gradient_compress(self,
+                           output_int8: torch.Tensor,
+                           output_scale: torch.Tensor,
+                           input: torch.Tensor,
+                           sm_version: int = 86) -> None:
+        """Compress a BF16 gradient tensor to INT8 with per-block FP32 scales.
+
+        Parameters
+        ----------
+        output_int8  : Int8  CUDA tensor ``[N]``   — compressed output (written in-place).
+        output_scale : FP32  CUDA tensor ``[ceil(N/256)]`` — per-block ℓ∞/127 scales.
+        input        : BF16  CUDA tensor ``[N]``   — source gradient.
+        sm_version   : SM version of active device (86, 90, 120).
+        """
+        _load_module().gradient_compress(output_int8, output_scale, input, sm_version)
+
+    def int8_ring_reduce_step(self,
+                               dst_int8: torch.Tensor,
+                               dst_scale: torch.Tensor,
+                               src_int8: torch.Tensor,
+                               src_scale: torch.Tensor,
+                               sm_version: int = 86) -> None:
+        """One ring-allreduce accumulation step: fused INT8 dequant + sum + re-quant.
+
+        dst_int8/dst_scale are modified in-place to hold the accumulated result
+        after absorbing src_int8/src_scale.  The rescaled sum is stored back as
+        INT8 so compression is maintained across all ring steps.
+
+        Parameters
+        ----------
+        dst_int8  : Int8 CUDA tensor ``[N]`` — accumulator, modified in-place.
+        dst_scale : FP32 CUDA tensor ``[ceil(N/256)]`` — per-block scales for dst.
+        src_int8  : Int8 CUDA tensor ``[N]`` — received chunk from ring predecessor.
+        src_scale : FP32 CUDA tensor ``[ceil(N/256)]`` — per-block scales for src.
+        sm_version: SM version of active device (86, 90, 120).
+        """
+        _load_module().int8_ring_reduce_step(dst_int8, dst_scale, src_int8, src_scale, sm_version)
+
+    def gradient_decompress(self,
+                             output: torch.Tensor,
+                             int8_data: torch.Tensor,
+                             scale_buf: torch.Tensor,
+                             sm_version: int = 86) -> None:
+        """Decompress INT8 + per-block FP32 scales back to BF16.
+
+        Parameters
+        ----------
+        output   : BF16  CUDA tensor ``[N]`` — decompressed gradient (written in-place).
+        int8_data: Int8  CUDA tensor ``[N]`` — compressed INT8 values.
+        scale_buf: FP32  CUDA tensor ``[ceil(N/256)]`` — per-block ℓ∞/127 scales.
+        sm_version: SM version (86, 90, 120).
+        """
+        _load_module().gradient_decompress(output, int8_data, scale_buf, sm_version)
+
+    def gradient_allreduce_finalise(self,
+                                     scale_buf: torch.Tensor,
+                                     n_elems: int,
+                                     world_size: int) -> None:
+        """Divide per-block scales by world_size after the ring reduce completes.
+
+        Must be called once on each rank after the reduce-scatter + gather
+        phases so that the decompressed gradient is correctly averaged.
+
+        Parameters
+        ----------
+        scale_buf  : FP32 CUDA tensor ``[ceil(n_elems/256)]`` — scales (modified in-place).
+        n_elems    : int — total number of BF16 gradient elements.
+        world_size : int — number of participating ranks.
+        """
+        _load_module().gradient_allreduce_finalise(scale_buf, n_elems, world_size)
+
+    def gradient_compress_bytes(self, n_elems: int) -> int:
+        """Return the INT8 staging buffer size in bytes for *n_elems* BF16 elements."""
+        return _load_module().gradient_compress_bytes(n_elems)
+
+    def gradient_scale_bytes(self, n_elems: int) -> int:
+        """Return the per-block FP32 scale buffer size in bytes for *n_elems* elements."""
+        return _load_module().gradient_scale_bytes(n_elems)
+
+    def fused_gradient_allreduce(self,
+                                  grad: torch.Tensor,
+                                  group: 'torch.distributed.ProcessGroup',
+                                  sm_version: int = 86) -> None:
+        """High-level helper: INT8-compressed ring allreduce of a single BF16 gradient.
+
+        Allocates staging buffers, runs compress → ring-reduce → finalise →
+        decompress in sequence.  For multi-tensor callers prefer the lower-level
+        ``gradient_compress / int8_ring_reduce_step / gradient_decompress`` API
+        to amortise buffer allocation across gradient tensors.
+
+        Parameters
+        ----------
+        grad       : BF16 CUDA tensor of arbitrary shape (treated as flat).
+        group      : process group for dist.send/recv during the ring steps.
+        sm_version : SM version of active device (86, 90, 120).
+        """
+        import torch.distributed as dist
+
+        world_size = dist.get_world_size(group=group)
+        if world_size <= 1:
+            return  # nothing to reduce
+
+        flat = grad.view(-1)
+        n = flat.numel()
+        device = flat.device
+
+        int8_self = torch.empty(n, dtype=torch.int8, device=device)
+        scale_self = torch.empty((n + 255) // 256, dtype=torch.float32, device=device)
+        int8_recv = torch.empty(n, dtype=torch.int8, device=device)
+        scale_recv = torch.empty_like(scale_self)
+
+        # Phase 1: compress local gradient
+        self.gradient_compress(int8_self, scale_self, flat, sm_version)
+
+        rank = dist.get_rank(group=group)
+        # Ring reduce-scatter: (world_size - 1) steps
+        for step in range(world_size - 1):
+            send_to = (rank + 1) % world_size
+            recv_from = (rank - 1) % world_size
+            send_req_data = dist.isend(int8_self, dst=send_to, group=group, tag=step * 2)
+            send_req_scale = dist.isend(scale_self, dst=send_to, group=group, tag=step * 2 + 1)
+            dist.recv(int8_recv, src=recv_from, group=group, tag=step * 2)
+            dist.recv(scale_recv, src=recv_from, group=group, tag=step * 2 + 1)
+            send_req_data.wait()
+            send_req_scale.wait()
+            self.int8_ring_reduce_step(int8_self, scale_self, int8_recv, scale_recv, sm_version)
+
+        # Finalise: divide scales by world_size
+        self.gradient_allreduce_finalise(scale_self, n, world_size)
+
+        # Phase 3: decompress back to BF16 in-place
+        self.gradient_decompress(flat, int8_self, scale_self, sm_version)
+
+    # -----------------------------------------------------------------------
     # Utility
     # -----------------------------------------------------------------------
     def hetero_bucket_size_elems(self, sm_version: int = 86) -> int:

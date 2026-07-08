@@ -988,11 +988,58 @@ def _desloc_sync_optimizer_moments(
 # Direct all-reduce fallback (non-DDP model chunks)
 # ---------------------------------------------------------------------------
 
+def _get_sm_version() -> int:
+    """Return the SM version of the current CUDA device (e.g. 86, 90, 120)."""
+    try:
+        major, minor = torch.cuda.get_device_capability()
+        return major * 10 + minor
+    except Exception:
+        return 86  # safe default: A6000 / RTX 3090
+
+
+def _try_hetero_allreduce(
+    coalesced: torch.Tensor,
+    dp_group: "torch.distributed.ProcessGroup",
+    dp_ws: int,
+) -> bool:
+    """Attempt fused INT8-compressed ring allreduce via HeteroReduceOp.
+
+    Returns True on success, False if the kernel is unavailable (e.g. not yet
+    compiled), allowing the caller to fall back to plain torch.distributed.all_reduce.
+
+    The fused path (fused_gradient_allreduce.cu) compresses BF16 gradients to
+    INT8 before each ring step, cutting PCIe traffic 2× vs. BF16 and 4× vs.
+    FP32.  This is particularly important for the PCIe-constrained heterogeneous
+    topology (A6000 × 2 + H100-NVL × 1, PCIe 4.0 × 16) targeted by Neuron_SP.
+
+    The fallback path divides by dp_ws after the standard all_reduce.
+    """
+    if not coalesced.is_cuda:
+        return False
+    if coalesced.dtype != torch.bfloat16:
+        # Kernel only supports BF16; cast would lose precision, so fall back.
+        return False
+    try:
+        from deepspeed.ops.hetero_reduce import HeteroReduceOp
+        op = HeteroReduceOp()
+        sm_version = _get_sm_version()
+        op.fused_gradient_allreduce(coalesced, dp_group, sm_version)
+        return True
+    except Exception:
+        # Kernel not compiled yet or unavailable — caller uses plain all_reduce.
+        return False
+
+
 def _direct_allreduce_grads(
     model_chunk: nn.Module,
     config: ModelParallelConfig,
 ) -> None:
-    """Fallback: directly all-reduce grads on a raw nn.Module without DDP buffer."""
+    """Directly all-reduce grads on a raw nn.Module without DDP buffer.
+
+    Uses the fused INT8-compressed ring allreduce (fused_gradient_allreduce.cu)
+    when available (BF16 gradients, CUDA tensors).  Falls back to the standard
+    ``torch.distributed.all_reduce`` path otherwise.
+    """
     if not parallel_state.is_initialized():
         return
     try:
@@ -1017,8 +1064,12 @@ def _direct_allreduce_grads(
 
     dp_ws = torch.distributed.get_world_size(group=dp_group)
     coalesced = _flatten_dense_tensors(grads)
-    torch.distributed.all_reduce(coalesced, group=dp_group)
-    coalesced.div_(dp_ws)
+
+    # Prefer fused INT8-compressed ring allreduce for PCIe-topology savings.
+    if not _try_hetero_allreduce(coalesced, dp_group, dp_ws):
+        torch.distributed.all_reduce(coalesced, group=dp_group)
+        coalesced.div_(dp_ws)
+
     for buf, synced in zip(grads, _unflatten_dense_tensors(coalesced, grads)):
         buf.copy_(synced)
 
