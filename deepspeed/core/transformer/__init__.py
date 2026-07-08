@@ -43,6 +43,8 @@ from deepspeed.core.transformer.transformer_layer import (
     MoETransformerLayer,
     TransformerLayerSubmodules,
     BaseTransformerLayer,
+    MlpInterface,
+    MlpBuilder,
     get_transformer_layer_offset,
     annotate_desloc_tiers,
 )
@@ -51,7 +53,13 @@ from deepspeed.core.transformer.attention import (
     SelfAttention,
     DotProductAttention,
 )
-from deepspeed.core.transformer.mlp import MLP
+from deepspeed.core.transformer.mlp import (
+    MLP,
+    MLPSubmodules,
+    TEActivationFunctionInterface,
+    TEActivationFunctionBuilder,
+    apply_swiglu_sharded_factory,
+)
 from deepspeed.core.transformer.module import MegatronModule
 from deepspeed.core.transformer.multi_latent_attention import (
     MultiLatentAttention,
@@ -93,12 +101,18 @@ __all__ = [
     "BaseTransformerLayer",
     "get_transformer_layer_offset",
     "annotate_desloc_tiers",
+    "MlpInterface",
+    "MlpBuilder",
     # Attention
     "Attention",
     "SelfAttention",
     "DotProductAttention",
     # MLP
     "MLP",
+    "MLPSubmodules",
+    "TEActivationFunctionInterface",
+    "TEActivationFunctionBuilder",
+    "apply_swiglu_sharded_factory",
     # Base
     "MegatronModule",
     # Multi-Latent Attention (MLA / DeepSeek)

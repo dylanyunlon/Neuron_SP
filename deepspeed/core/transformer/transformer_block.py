@@ -827,6 +827,51 @@ class TransformerBlock(MegatronModule):
         )
 
     # ------------------------------------------------------------------
+    # Layer access helpers (Megatron API compat — M3977)
+    # ------------------------------------------------------------------
+
+    def build_layer(self, layer_spec, layer_number: int, **kwargs):
+        """Build a single transformer layer from a spec (Megatron API compat).
+
+        This is the public-facing method that Megatron's ``TransformerBlock``
+        uses internally.  In the deepspeed port, the actual construction is
+        handled by ``_build_layers`` / ``_build_single_layer``; this method
+        exists for callers that expect the Megatron interface.
+
+        Args:
+            layer_spec: The submodule spec for the layer.
+            layer_number: 1-based local layer index.
+            **kwargs: Extra kwargs forwarded to the layer constructor.
+
+        Returns:
+            A ``TransformerLayer`` (or ``MoETransformerLayer``) instance.
+        """
+        from .transformer_layer import TransformerLayer
+        from .spec_utils import build_module
+
+        if hasattr(layer_spec, 'module'):
+            return build_module(layer_spec, config=self.config,
+                                layer_number=layer_number, **kwargs)
+        return TransformerLayer(
+            config=self.config, layer_number=layer_number, **kwargs
+        )
+
+    def _get_layer(self, layer_number: int):
+        """Get a layer by its 0-based local index (Megatron API compat).
+
+        Megatron's ``TransformerBlock.forward`` uses ``self._get_layer(i)``
+        to iterate over layers.  In the deepspeed port, ``self.layers`` is
+        a standard ``nn.ModuleList`` so indexing works directly.
+
+        Args:
+            layer_number: 0-based local layer index.
+
+        Returns:
+            The ``TransformerLayer`` at the given local index.
+        """
+        return self.layers[layer_number]
+
+    # ------------------------------------------------------------------
     # Pipeline-parallel helpers
     # ------------------------------------------------------------------
 

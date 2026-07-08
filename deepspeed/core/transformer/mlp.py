@@ -190,6 +190,30 @@ def _bias_quick_geglu_impl(
 # Protocol interfaces (M3253: replace ModuleSpec with Protocols)
 # ---------------------------------------------------------------------------
 
+class TEActivationFunctionInterface(Protocol):
+    """Interface for activation_function module in MLP.
+
+    Ported from Megatron-LM mlp.py — defines the contract for TE-based
+    activation function modules (e.g. TE's SwiGLU / GeGLU fused kernels).
+    """
+
+    def forward(self, input_: torch.Tensor, /) -> torch.Tensor:
+        """Forward method for activation_function module."""
+        ...
+
+
+class TEActivationFunctionBuilder(Protocol):
+    """Protocol for activation_function module in MLP.
+
+    Ported from Megatron-LM mlp.py — builder callable for TE activation
+    function modules.
+    """
+
+    def __call__(self, *, config: TransformerConfig) -> TEActivationFunctionInterface:
+        """Builds an activation function module for MLP."""
+        ...
+
+
 class LinearFc1Interface(Protocol):
     """Interface for linear_fc1 module in MLP."""
 
@@ -965,8 +989,12 @@ def _apply_swiglu_sharded_factory(
     When the loaded checkpoint has a different TP degree, the gate and up
     halves can be sharded independently and then re-interleaved.
 
-    This is a simplified version of Megatron's ShardedTensorFactory that
-    records the split metadata in the key name.
+    This implementation mirrors Megatron's ``apply_swiglu_sharded_factory``
+    (M4000 era).  When Megatron's ``ShardedTensorFactory`` is available (i.e.
+    running within the Megatron dist-checkpoint framework), it constructs the
+    full factory object so that the checkpoint can be saved/loaded across
+    different TP sizes.  When running standalone (plain PyTorch tensors), it
+    returns the tensor unchanged because cross-TP resharding is not needed.
 
     Args:
         original_tensor: The state dict tensor (plain or ShardedTensor).
@@ -974,9 +1002,77 @@ def _apply_swiglu_sharded_factory(
         singleton_local_shards: Whether to use singleton shard format.
 
     Returns:
-        A dict with two entries (gate, up) instead of one.
+        A ShardedTensorFactory (Megatron path) or the original tensor (fallback).
     """
-    # For native PyTorch tensors just return them unchanged; the more complex
-    # ShardedTensorFactory logic only applies in Megatron's dist-checkpoint
-    # framework.  Here we just mark the intent.
-    return original_tensor
+    # Try to use Megatron's dist-checkpoint infrastructure for full cross-TP
+    # checkpoint portability.
+    try:
+        from megatron.core.dist_checkpointing import ShardedTensor
+        from megatron.core.dist_checkpointing.mapping import (
+            ReplicaId,
+            ShardedTensorFactory,
+        )
+        from megatron.core.transformer.utils import cat_with_oom_fallback
+
+        swiglu_shard_axis = 0
+        prepend_axis_num = len(sharded_offsets)
+        original_shape = original_tensor.local_shape
+        local_axis_size = original_shape[swiglu_shard_axis]
+        assert (
+            original_tensor.global_offset[swiglu_shard_axis + prepend_axis_num]
+            % local_axis_size == 0
+        )
+        rank_offset = (
+            original_tensor.global_offset[swiglu_shard_axis + prepend_axis_num]
+            // local_axis_size
+        )
+        axis_frag = original_tensor.axis_fragmentations[
+            swiglu_shard_axis + prepend_axis_num
+        ]
+
+        @torch.no_grad()
+        def sh_ten_build_fn(key, t, replica_id, flattened_range):
+            if singleton_local_shards:
+                offset_w = (swiglu_shard_axis + prepend_axis_num, rank_offset, axis_frag)
+                offset_v = (swiglu_shard_axis + prepend_axis_num, rank_offset, axis_frag)
+                w_key = f'{key}_w'
+                v_key = f'{key}_v'
+            else:
+                offset_w = (swiglu_shard_axis + prepend_axis_num, rank_offset, axis_frag * 2)
+                offset_v = (
+                    swiglu_shard_axis + prepend_axis_num,
+                    rank_offset + axis_frag,
+                    axis_frag * 2,
+                )
+                w_key = key
+                v_key = key
+
+            tensor_w, tensor_v = torch.chunk(t, 2, dim=swiglu_shard_axis)
+            return [
+                ShardedTensor.from_rank_offsets(
+                    w_key, tensor_w, *sharded_offsets, offset_w,
+                    replica_id=replica_id, prepend_axis_num=prepend_axis_num,
+                ),
+                ShardedTensor.from_rank_offsets(
+                    v_key, tensor_v, *sharded_offsets, offset_v,
+                    replica_id=replica_id, prepend_axis_num=prepend_axis_num,
+                ),
+            ]
+
+        return ShardedTensorFactory(
+            original_tensor.key,
+            original_tensor.data,
+            sh_ten_build_fn,
+            cat_with_oom_fallback,
+            original_tensor.replica_id,
+            flattened_range=original_tensor.flattened_range,
+        )
+    except (ImportError, AttributeError):
+        # Running without Megatron's dist-checkpoint framework — return
+        # the tensor unchanged.  Cross-TP checkpoint resharding is not
+        # supported in this mode; the user must use matching TP sizes.
+        return original_tensor
+
+
+# Megatron-compatible public name (M4000)
+apply_swiglu_sharded_factory = _apply_swiglu_sharded_factory

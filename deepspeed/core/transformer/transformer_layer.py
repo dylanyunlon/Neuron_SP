@@ -362,6 +362,47 @@ def _build_norm(config: TransformerConfig, hidden_size: Optional[int] = None) ->
 
 
 # ---------------------------------------------------------------------------
+# MLP interface / builder protocols (M3926 — Megatron API compat)
+# ---------------------------------------------------------------------------
+
+class MlpInterface:
+    """Interface for MLP implementations in the transformer layer.
+
+    Any MLP module used inside ``TransformerLayer`` must implement this
+    interface (duck-typing is sufficient; inheriting is not required).
+    Ported from Megatron-LM ``transformer_layer.py`` M3926.
+    """
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        /,
+        *,
+        intermediate_tensors: Optional[Tuple[torch.Tensor, ...]] = None,
+        padding_mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Forward method for the MLP interface."""
+        ...
+
+
+class MlpBuilder:
+    """MLP builder protocol for building MLPs in the transformer layer.
+
+    Ported from Megatron-LM ``transformer_layer.py`` M3926.
+    """
+
+    def __call__(
+        self,
+        *,
+        config: TransformerConfig,
+        pg_collection: object,
+        is_mtp_layer: bool,
+        name: Optional[str] = None,
+    ) -> MlpInterface:
+        ...
+
+
+# ---------------------------------------------------------------------------
 # TransformerLayerSubmodules — Megatron spec-based submodule configuration
 # ---------------------------------------------------------------------------
 
@@ -1239,6 +1280,62 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
             pass
 
     # ------------------------------------------------------------------
+    # CUDA graph stubs (Megatron API compat — M2906 / M3977)
+    # ------------------------------------------------------------------
+    # These are no-ops or raise in the deepspeed port because the TE-based
+    # CUDA graph infrastructure is not available.  They exist so that
+    # Megatron-compatible callers (TransformerBlock, schedules.py) can call
+    # them without ImportError.
+
+    def create_mcore_cudagraph_manager(self, config: TransformerConfig) -> None:
+        """Register the transformer layer for CUDA graphs (no-op in DS port).
+
+        Megatron's ``CudaGraphManager`` is TE-specific.  In DES-LOC we use
+        PyTorch-native ``torch.cuda.CUDAGraph`` when needed, managed by the
+        DES-LOC engine rather than per-layer managers.
+        """
+        pass
+
+    def _should_call_local_cudagraph(self, *args, **kwargs) -> bool:
+        """Whether to use local (per-layer) CUDA graphs for this forward call.
+
+        Always returns False in the deepspeed port — CUDA graph capture is
+        handled at the block / engine level.
+        """
+        return False
+
+    @staticmethod
+    def _get_layer_offset(config: TransformerConfig) -> int:
+        """Deprecated: please use ``get_transformer_layer_offset`` instead."""
+        import warnings
+        warnings.warn(
+            "TransformerLayer._get_layer_offset is deprecated. "
+            "Please use get_transformer_layer_offset instead."
+        )
+        return get_transformer_layer_offset(config)
+
+    def get_layer_static_inputs(
+        self, seq_length: int, micro_batch_size: int
+    ) -> Dict[str, torch.Tensor]:
+        """Get static inputs for CUDA graph capture (Megatron M2404 compat).
+
+        Returns a dict with at minimum the hidden_states buffer.
+        """
+        hidden_size = self.config.hidden_size
+        device = next(self.parameters()).device if len(list(self.parameters())) > 0 else "cpu"
+        static_inputs: Dict[str, torch.Tensor] = {
+            "hidden_states": torch.zeros(
+                seq_length, micro_batch_size, hidden_size,
+                device=device, dtype=torch.float16,
+            ),
+        }
+        return static_inputs
+
+    def _get_submodules_under_cudagraphs(self) -> List:
+        """Return submodules covered by CUDA graphs (empty in DS port)."""
+        return []
+
+    # ------------------------------------------------------------------
     # Sharded state dict (M2317 / pipeline checkpointing)
     # ------------------------------------------------------------------
 
@@ -1331,6 +1428,22 @@ class MoETransformerLayer(TransformerLayer):
                 self.layer_number,
                 self.desloc_tier.upper(),
             )
+
+    def transition_cudagraph_scope(self, mode: str) -> None:
+        """Transition between full-layer and partial CUDA graph capture.
+
+        Megatron API compat stub — in the DES-LOC port, CUDA graph management
+        is handled externally by the engine, not per-layer.
+
+        Args:
+            mode: 'full' for inference (full-layer capture) or 'partial' for
+                training (router + postprocess captured, expert dispatch eager).
+        """
+        pass
+
+    def create_mcore_cudagraph_manager(self, config: TransformerConfig) -> None:
+        """Initialise CUDA graph manager(s) for MoE (no-op in DS port)."""
+        pass
 
     def _forward_mlp(
         self,
