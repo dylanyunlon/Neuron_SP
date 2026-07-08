@@ -142,6 +142,7 @@
 #include <math.h>
 #include <algorithm>
 #include <cassert>
+#include <cstdlib>
 
 #include "hetero_reduce.h"
 #include "ds_kernel_utils.h"
@@ -312,8 +313,11 @@ DS_D_INLINE float fp8_e4m3_to_float(uint8_t bits, float scale)
 }
 #else
 // Software decode path for older hardware or toolchains lacking __nv_fp8_e4m3.
-// Implements IEEE-style decode: value = (-1)^s × 2^(e−7) × (1 + m/8)
-// Special cases: e=15,m=7 → NaN (propagated); e=0 → subnormal.
+// FP8 E4M3 format: 1 sign bit, 4 exponent bits (bias=7), 3 mantissa bits.
+//   Normal:    (-1)^s × 2^(e−7) × (1 + m/8),   for e in [1,14]
+//   Subnormal: (-1)^s × 2^(1−7) × (0 + m/8)  = (-1)^s × m / 512,  for e==0
+//   NaN:       e==15, m==7  (only NaN value in E4M3; no Inf)
+//   Propagate NaN as 0.0 to avoid poisoning Adam moments.
 DS_D_INLINE float fp8_e4m3_to_float(uint8_t bits, float scale)
 {
     const int sign     = (bits >> 7) & 1;
@@ -322,17 +326,17 @@ DS_D_INLINE float fp8_e4m3_to_float(uint8_t bits, float scale)
 
     float value;
     if (exponent == 15 && mantissa == 7) {
-        // NaN — propagate as 0 to avoid poisoning the optimizer state.
-        value = 0.0f;
+        // NaN — return 0 to keep optimizer state finite.
+        return 0.0f;
     } else if (exponent == 0) {
-        // Subnormal: 2^(1-7) × (0 + m/8) = 2^(-6) × m/8
-        value = __int2float_rn(mantissa) * (1.0f / 512.0f);  // 1/8 * 2^(-6)
+        // Subnormal: 2^(-6) × (m / 8)
+        // = m × 2^(-9)  — exact for m in [0,7]
+        value = __int2float_rn(mantissa) * (1.0f / 512.0f);
     } else {
         // Normal: 2^(e-7) × (1 + m/8)
+        // Use ldexpf to avoid the piecewise-power split that confused prior audits.
         const float significand = 1.0f + __int2float_rn(mantissa) * 0.125f;
-        value = __int2float_rn(1 << (exponent > 7 ? (exponent - 7) : 0))
-                * (exponent <= 7 ? (1.0f / __int2float_rn(1 << (7 - exponent))) : 1.0f)
-                * significand;
+        value = ldexpf(significand, exponent - 7);
     }
     return (sign ? -value : value) * scale;
 }
@@ -968,9 +972,35 @@ static void dispatch_sm(
  */
 float hetero_adam_lr_scale(int sm_version)
 {
-    if (sm_version >= 120) return 4.0f;
-    if (sm_version >= 90)  return 3.0f;
-    return 1.0f;
+    // Default per-tier LR scale factors (proportional to normalised TFLOP/s):
+    //   SM 12.0 (Blackwell) → 4.0,  SM 9.0 (H100) → 3.0,  SM 8.6 (A6000) → 1.0.
+    //
+    // Override at runtime via environment variables when measured per-tier
+    // throughput ratios differ from the defaults (e.g. different memory BW,
+    // pipeline depth, or effective batch sizes per tier):
+    //   HETERO_ADAM_LR_SCALE_SM120=<float>   (default 4.0)
+    //   HETERO_ADAM_LR_SCALE_SM90=<float>    (default 3.0)
+    //   HETERO_ADAM_LR_SCALE_SM86=<float>    (default 1.0)
+    // Values ≤ 0 are ignored (fall back to defaults).
+    static const float kS120 = []() {
+        const char* e = std::getenv("HETERO_ADAM_LR_SCALE_SM120");
+        float v = (e && *e) ? std::strtof(e, nullptr) : 0.f;
+        return (v > 0.f) ? v : 4.0f;
+    }();
+    static const float kS90 = []() {
+        const char* e = std::getenv("HETERO_ADAM_LR_SCALE_SM90");
+        float v = (e && *e) ? std::strtof(e, nullptr) : 0.f;
+        return (v > 0.f) ? v : 3.0f;
+    }();
+    static const float kS86 = []() {
+        const char* e = std::getenv("HETERO_ADAM_LR_SCALE_SM86");
+        float v = (e && *e) ? std::strtof(e, nullptr) : 0.f;
+        return (v > 0.f) ? v : 1.0f;
+    }();
+
+    if (sm_version >= 120) return kS120;
+    if (sm_version >= 90)  return kS90;
+    return kS86;
 }
 
 /**

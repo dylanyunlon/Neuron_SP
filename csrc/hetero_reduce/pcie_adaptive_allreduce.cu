@@ -108,6 +108,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cmath>
+#include <cstdlib>
 
 // CUDA pipeline for cp.async (SM8.0+)
 #if __CUDACC_VER_MAJOR__ >= 11 && __CUDA_ARCH__ >= 800
@@ -595,63 +596,79 @@ float probe_pcie_bandwidth(int src_device, int dst_device)
 {
     BandwidthCache& entry = g_bw_cache[src_device][dst_device];
 
-    // Return cached result on subsequent calls; bw_gbps == 0.0 means uncached
-    // (g_bw_cache is zero-initialised at file scope).
+    // Return cached result on subsequent calls; bw_gbps == 0.0 means uncached.
+    // Re-check after potential concurrent write: if another thread raced us and
+    // already filled the cache by the time we enter, use that value.
+    // (CUDA serialises host-side CUDA API calls within a process, so this is safe
+    // without a mutex under the assumption that probes are issued from a single
+    // orchestrator thread before any training streams are launched.)
     if (entry.bw_gbps > 0.f) return entry.bw_gbps;
 
     void* src_buf = nullptr;
     void* dst_buf = nullptr;
+    cudaEvent_t   ev_start = nullptr, ev_stop = nullptr;
+    cudaStream_t  probe_stream = nullptr;
+    float         bw_gbps = -1.f;  // -1 = probe failed
 
+    // ── Allocate resources (all errors are fatal for the probe) ──
     cudaSetDevice(src_device);
-    if (cudaMalloc(&src_buf, kProbeSizeBytes) != cudaSuccess) return 8.f;
-    cudaMemset(src_buf, 0, kProbeSizeBytes);
+    if (cudaMalloc(&src_buf, kProbeSizeBytes) != cudaSuccess) goto cleanup;
+    if (cudaMemset(src_buf, 0, kProbeSizeBytes) != cudaSuccess) goto cleanup;
 
     cudaSetDevice(dst_device);
-    if (cudaMalloc(&dst_buf, kProbeSizeBytes) != cudaSuccess) {
-        cudaSetDevice(src_device);
-        cudaFree(src_buf);
+    if (cudaMalloc(&dst_buf, kProbeSizeBytes) != cudaSuccess) goto cleanup;
+
+    cudaSetDevice(src_device);
+    if (cudaEventCreate(&ev_start) != cudaSuccess) goto cleanup;
+    if (cudaEventCreate(&ev_stop)  != cudaSuccess) goto cleanup;
+    if (cudaStreamCreate(&probe_stream) != cudaSuccess) goto cleanup;
+
+    {
+        // Warm-up: prime PCIe TLB entries and fill dst L2 cache.
+        if (cudaMemcpyPeerAsync(dst_buf, dst_device, src_buf, src_device,
+                                kProbeSizeBytes, probe_stream) != cudaSuccess) goto cleanup;
+        if (cudaStreamSynchronize(probe_stream) != cudaSuccess) goto cleanup;
+
+        // Timed transfer: record start/stop events around a single peer copy.
+        if (cudaEventRecord(ev_start, probe_stream) != cudaSuccess) goto cleanup;
+        if (cudaMemcpyPeerAsync(dst_buf, dst_device, src_buf, src_device,
+                                kProbeSizeBytes, probe_stream) != cudaSuccess) goto cleanup;
+        if (cudaEventRecord(ev_stop, probe_stream) != cudaSuccess) goto cleanup;
+        if (cudaStreamSynchronize(probe_stream) != cudaSuccess) goto cleanup;
+
+        float elapsed_ms = 0.f;
+        if (cudaEventElapsedTime(&elapsed_ms, ev_start, ev_stop) != cudaSuccess
+            || elapsed_ms <= 0.f) goto cleanup;
+
+        // Unidirectional bandwidth (bytes/s → GB/s).
+        bw_gbps = (float)kProbeSizeBytes / (elapsed_ms * 1e-3f) / 1e9f;
+    }
+
+cleanup:
+    // Destroy resources in reverse-allocation order; ignore errors during cleanup.
+    if (probe_stream) { cudaStreamDestroy(probe_stream); probe_stream = nullptr; }
+    if (ev_stop)      { cudaEventDestroy(ev_stop);  ev_stop  = nullptr; }
+    if (ev_start)     { cudaEventDestroy(ev_start); ev_start = nullptr; }
+    if (src_buf) { cudaSetDevice(src_device); cudaFree(src_buf); src_buf = nullptr; }
+    if (dst_buf) { cudaSetDevice(dst_device); cudaFree(dst_buf); dst_buf = nullptr; }
+    cudaSetDevice(src_device);
+
+    if (bw_gbps > 0.f) {
+        // Double-check cache race: write only if still uncached (concurrent call may have won).
+        if (entry.bw_gbps <= 0.f) {
+            entry.bw_gbps    = bw_gbps;
+            entry.step_count = 0;
+        }
+    } else {
+        // Probe failed — emit a warning; do NOT cache so the next call can retry.
+        fprintf(stderr,
+            "[probe_pcie_bandwidth] WARNING: probe from device %d to %d failed; "
+            "falling back to 8 GB/s default (likely PCIe peer access not enabled).\n",
+            src_device, dst_device);
         return 8.f;
     }
 
-    cudaSetDevice(src_device);
-    cudaEvent_t ev_start, ev_stop;
-    cudaEventCreate(&ev_start);
-    cudaEventCreate(&ev_stop);
-
-    cudaStream_t probe_stream;
-    cudaStreamCreate(&probe_stream);
-
-    // Warm-up to prime PCIe TLB entries.
-    cudaMemcpyPeerAsync(dst_buf, dst_device, src_buf, src_device,
-                        kProbeSizeBytes, probe_stream);
-    cudaStreamSynchronize(probe_stream);
-
-    // Timed transfer.
-    cudaEventRecord(ev_start, probe_stream);
-    cudaMemcpyPeerAsync(dst_buf, dst_device, src_buf, src_device,
-                        kProbeSizeBytes, probe_stream);
-    cudaEventRecord(ev_stop, probe_stream);
-    cudaStreamSynchronize(probe_stream);
-
-    float elapsed_ms = 0.f;
-    cudaEventElapsedTime(&elapsed_ms, ev_start, ev_stop);
-
-    float bw_gbps = (elapsed_ms > 0.f)
-        ? (float)kProbeSizeBytes / (elapsed_ms * 1e-3f) / 1e9f
-        : 8.f;
-
-    entry.bw_gbps   = bw_gbps;
-    entry.step_count = 0;
-
-    cudaEventDestroy(ev_start);
-    cudaEventDestroy(ev_stop);
-    cudaStreamDestroy(probe_stream);
-    cudaFree(src_buf);
-    cudaSetDevice(dst_device);
-    cudaFree(dst_buf);
-    cudaSetDevice(src_device);
-
-    return bw_gbps;
+    return entry.bw_gbps;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -660,10 +677,32 @@ float probe_pcie_bandwidth(int src_device, int dst_device)
 
 size_t compute_adaptive_chunk_size(float pcie_bw_gbps)
 {
+    // Chunk size = bandwidth × target_overlap_time.
+    // This ensures ~kTargetOverlapMs ms of PCIe transfer is hidden per ring step.
     float chunk_f = pcie_bw_gbps * 1e9f * kTargetOverlapMs * 1e-3f;
     size_t raw = (size_t)chunk_f;
     raw = (raw / kChunkAlign) * kChunkAlign;
-    raw = std::max(raw, kMinChunkBytes);
+
+    // PCIe Gen5 floor: when measured bandwidth ≥ 28 GB/s (≈ unidirectional Gen5
+    // x16 theoretical 32 GB/s minus overhead), raise the minimum chunk to 8 MB.
+    // Gen4 x16 peaks at ~16 GB/s unidirectional so 28 GB/s is a safe threshold.
+    // Override via NEURON_PCIE_MIN_CHUNK_MB (bytes, rounded to kChunkAlign).
+    static const size_t kEffMinChunkBytes = []() -> size_t {
+        const char* env = std::getenv("NEURON_PCIE_MIN_CHUNK_MB");
+        if (env && *env) {
+            size_t mb = (size_t)std::atol(env);
+            if (mb > 0) return ((mb << 20) / kChunkAlign) * kChunkAlign;
+        }
+        return 0;  // 0 = not set; select dynamically below
+    }();
+
+    size_t min_chunk = kMinChunkBytes;  // default: 1 MB (Gen4-appropriate)
+    if (pcie_bw_gbps >= 28.f)
+        min_chunk = 8ULL << 20;         // 8 MB floor for Gen5 x16
+    if (kEffMinChunkBytes > 0)
+        min_chunk = kEffMinChunkBytes;  // env-var takes precedence
+
+    raw = std::max(raw, min_chunk);
     raw = std::min(raw, kMaxChunkBytes);
     return raw;
 }
