@@ -74,6 +74,12 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
+# DES-LOC requirement: use deepspeed.comm instead of torch.distributed
+try:
+    import deepspeed.comm as dist
+except ImportError:
+    import torch.distributed as dist  # type: ignore[no-redef]
+
 from deepspeed.core.transformer.module import MegatronModule
 from deepspeed.core.transformer.transformer_config import TransformerConfig
 from deepspeed.core.transformer.transformer_layer import (

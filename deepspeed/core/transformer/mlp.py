@@ -60,6 +60,12 @@ import torch.nn.functional as F
 from deepspeed.core.transformer.module import MegatronModule
 from deepspeed.core.transformer.transformer_config import TransformerConfig
 
+# DES-LOC requirement: use deepspeed.comm instead of torch.distributed
+try:
+    import deepspeed.comm as dist
+except ImportError:
+    import torch.distributed as dist  # type: ignore[no-redef]
+
 logger = logging.getLogger(__name__)
 
 
@@ -774,7 +780,7 @@ class MLP(MegatronModule):
             tp_group = _get_tp_group()
         tp_size = _get_tp_world_size()
         if tp_size > 1 and tp_group is not None:
-            torch.distributed.all_reduce(output, group=tp_group)
+            dist.all_reduce(output, group=tp_group)
 
         # MoE: if bias present and expert, add to output directly
         if per_token_scale is not None and output_bias is not None:

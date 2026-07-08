@@ -270,6 +270,12 @@ def _get_tp_rank() -> int:
 # Base MegatronModule
 # ---------------------------------------------------------------------------
 
+# DES-LOC requirement: use deepspeed.comm instead of torch.distributed
+try:
+    import deepspeed.comm as dist
+except ImportError:
+    import torch.distributed as dist  # type: ignore[no-redef]
+
 from deepspeed.core.transformer.module import MegatronModule  # noqa: E402
 
 
@@ -1451,8 +1457,8 @@ class Attention(MegatronModule, ABC):
             # After SP scatter query/key have seq = full_seq / sp_size,
             # so we slice freqs dim-0 to the local segment for this SP rank.
             if use_sp:
-                sp_rank = torch.distributed.get_rank(sp_group)
-                sp_world = torch.distributed.get_world_size(sp_group)
+                sp_rank = dist.get_rank(sp_group)
+                sp_world = dist.get_world_size(sp_group)
                 if q_pos_emb is not None and q_pos_emb.shape[0] > query.shape[0]:
                     full_seq = q_pos_emb.shape[0]
                     local_seq = full_seq // sp_world
@@ -1543,7 +1549,7 @@ class Attention(MegatronModule, ABC):
             if tp_size > 1:
                 tp_group = _get_tp_group()
                 if tp_group is not None:
-                    torch.distributed.all_reduce(output, group=tp_group)
+                    dist.all_reduce(output, group=tp_group)
 
         # AutoSP A2A gather: seq → seq/sp, hidden/sp → hidden
         if use_sp:
@@ -1600,7 +1606,7 @@ class Attention(MegatronModule, ABC):
 
         out_list = [torch.empty_like(inp[0]) for _ in range(sp_size)]
         in_list = list(inp.unbind(0))
-        torch.distributed.all_to_all(out_list, in_list, group=sp_group)
+        dist.all_to_all(out_list, in_list, group=sp_group)
 
         out = torch.stack(out_list, dim=0)            # [sp, sc, b, h/sp]
         out = out.permute(1, 0, 2, 3).reshape(
@@ -1630,7 +1636,7 @@ class Attention(MegatronModule, ABC):
 
         inp_list = list(ctx.unbind(1))
         out_list = [torch.empty_like(inp_list[0]) for _ in range(sp_size)]
-        torch.distributed.all_to_all(out_list, inp_list, group=sp_group)
+        dist.all_to_all(out_list, inp_list, group=sp_group)
 
         out = torch.stack(out_list, dim=1)
         out = out.permute(0, 2, 1, 3).reshape(
@@ -2078,7 +2084,7 @@ class SelfAttention(Attention):
         rank = get_data_parallel_rank()
         dp_list = [torch.empty_like(inputs) for _ in range(get_data_parallel_world_size())]
         dp_list[rank] = inputs
-        torch.distributed.all_gather(dp_list, inputs, group=get_data_parallel_group())
+        dist.all_gather(dp_list, inputs, group=get_data_parallel_group())
         for i, dp in enumerate(dp_list):
             q_w, q_b, k_w, k_b = torch.unbind(dp)
             _compare([q_w, q_b, k_w, k_b],
@@ -2091,7 +2097,7 @@ class SelfAttention(Attention):
         rank = get_tensor_model_parallel_rank()
         tp_list = [torch.empty_like(inputs) for _ in range(get_tensor_model_parallel_world_size())]
         tp_list[rank] = inputs
-        torch.distributed.all_gather(tp_list, inputs, group=get_tensor_model_parallel_group())
+        dist.all_gather(tp_list, inputs, group=get_tensor_model_parallel_group())
         for i, tp in enumerate(tp_list):
             q_w, q_b, k_w, k_b = torch.unbind(tp)
             _compare([q_w, q_b, k_w, k_b],

@@ -81,6 +81,12 @@ from .mlp import MLP
 from .identity_op import IdentityFuncOp, IdentityOp
 from .spec_utils import ModuleSpec, build_module
 
+# DES-LOC requirement: use deepspeed.comm instead of torch.distributed
+try:
+    import deepspeed.comm as dist
+except ImportError:
+    import torch.distributed as dist  # type: ignore[no-redef]
+
 logger = logging.getLogger(__name__)
 
 
