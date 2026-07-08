@@ -94,6 +94,32 @@ from deepspeed.core.tensor_parallel.utils import (
     split_tensor_along_last_dim_hetero,
 )
 
+# ---------------------------------------------------------------------------
+# DES-LOC heterogeneous TP extensions (from layers.py)
+# ---------------------------------------------------------------------------
+from deepspeed.core.tensor_parallel.layers import (
+    get_hetero_tp_partition_sizes,
+    get_hetero_tp_partition_range,
+    HeteroTPInfo,
+)
+
+# ---------------------------------------------------------------------------
+# DES-LOC heterogeneous collective extensions (from mappings.py)
+# ---------------------------------------------------------------------------
+from deepspeed.core.tensor_parallel.mappings import (
+    hetero_reduce_from_tensor_model_parallel_region,
+    hetero_all_gather_from_tensor_parallel_region,
+    hetero_reduce_scatter_to_sequence_parallel_region,
+)
+
+# ---------------------------------------------------------------------------
+# DES-LOC heterogeneous RNG extensions (from random.py)
+# ---------------------------------------------------------------------------
+from deepspeed.core.tensor_parallel.random import (
+    model_parallel_cuda_manual_seed_hetero,
+    get_tier_rng_tracker_name,
+)
+
 __all__ = [
     # layers.py
     "ColumnParallelLinear",
@@ -141,4 +167,15 @@ __all__ = [
     "VocabUtility",
     "split_tensor_along_last_dim",
     "split_tensor_along_last_dim_hetero",
+    # DES-LOC heterogeneous TP extensions
+    "get_hetero_tp_partition_sizes",
+    "get_hetero_tp_partition_range",
+    "HeteroTPInfo",
+    # DES-LOC heterogeneous collective extensions
+    "hetero_reduce_from_tensor_model_parallel_region",
+    "hetero_all_gather_from_tensor_parallel_region",
+    "hetero_reduce_scatter_to_sequence_parallel_region",
+    # DES-LOC heterogeneous RNG extensions
+    "model_parallel_cuda_manual_seed_hetero",
+    "get_tier_rng_tracker_name",
 ]

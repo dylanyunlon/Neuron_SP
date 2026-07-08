@@ -494,3 +494,110 @@ def get_comp_stream() -> torch.cuda.Stream:
 def get_comm_stream() -> Optional[torch.cuda.Stream]:
     """Return the communication stream (lazily created by :func:`set_streams`)."""
     return _COMM_STREAM
+
+
+# ===========================================================================
+# DES-LOC: Tier-proportional stage assignment + stage micro-batch sizing
+# ===========================================================================
+
+def get_pp_stage_compute_factor(
+    pp_rank: int,
+    config=None,
+) -> float:
+    """Return relative compute speed factor for a PP stage.
+
+    Factor of 1.0 = slowest tier.  H100 (312 bf16 TFLOPS) vs A6000
+    (77.4 bf16 TFLOPS) gives factor ≈ 4.03 for H100, 1.0 for A6000.
+    """
+    desloc = getattr(config, "desloc", None) if config is not None else None
+    if desloc is None or not getattr(desloc, "enabled", False) or not desloc.tiers:
+        return 1.0
+    import os
+    try:
+        local_rank = int(os.environ.get("LOCAL_RANK", pp_rank))
+    except (ValueError, TypeError):
+        local_rank = pp_rank
+    tier = desloc.get_tier_for_gpu(local_rank)
+    if tier is None:
+        return 1.0
+    min_tflops = min(t.bf16_tflops for t in desloc.tiers)
+    if min_tflops <= 0:
+        return 1.0
+    return tier.bf16_tflops / min_tflops
+
+
+def is_fast_stage(pp_rank: int, config=None, threshold: float = 1.5) -> bool:
+    """True if the PP rank is on a "fast" GPU tier (factor >= threshold)."""
+    return get_pp_stage_compute_factor(pp_rank, config) >= threshold
+
+
+def is_slow_stage(pp_rank: int, config=None, threshold: float = 1.5) -> bool:
+    """True if the PP rank is on a "slow" GPU tier."""
+    return not is_fast_stage(pp_rank, config, threshold)
+
+
+def optimal_pp_stage_assignment(
+    num_layers: int,
+    pp_size: int,
+    config=None,
+) -> "list[int]":
+    """Compute optimal layer-to-stage assignment for heterogeneous PP.
+
+    Fast GPUs get proportionally more layers so that wall-clock time
+    per stage is balanced.  Uses BF16 TFLOPS as throughput proxy:
+
+        layers_i = round(num_layers * tflops_i / sum(tflops))
+
+    Returns list of length pp_size with per-stage layer counts.
+    """
+    if pp_size <= 0:
+        return []
+    factors = [get_pp_stage_compute_factor(r, config) for r in range(pp_size)]
+    total_factor = sum(factors)
+    if total_factor <= 0 or all(f == factors[0] for f in factors):
+        base = num_layers // pp_size
+        remainder = num_layers % pp_size
+        return [base + (1 if r < remainder else 0) for r in range(pp_size)]
+    raw = [num_layers * f / total_factor for f in factors]
+    assignment = [max(1, round(r)) for r in raw]
+    diff = num_layers - sum(assignment)
+    if diff > 0:
+        indices = sorted(range(pp_size), key=lambda i: factors[i], reverse=True)
+        for i in range(diff):
+            assignment[indices[i % pp_size]] += 1
+    elif diff < 0:
+        indices = sorted(range(pp_size), key=lambda i: factors[i])
+        for i in range(-diff):
+            if assignment[indices[i % pp_size]] > 1:
+                assignment[indices[i % pp_size]] -= 1
+    return assignment
+
+
+def get_pp_stage_micro_batch_size(
+    pp_rank: int,
+    default_micro_batch_size: int,
+    config=None,
+) -> int:
+    """Return per-stage micro-batch size, accounting for tier VRAM capacity.
+
+    Slow-VRAM stages (A6000, 48 GB) may need smaller micro-batch sizes
+    than fast-VRAM stages (H100, 80 GB) to fit activations.
+    """
+    if config is None:
+        return default_micro_batch_size
+    desloc = getattr(config, "desloc", None)
+    if desloc is None or not getattr(desloc, "enabled", False):
+        return default_micro_batch_size
+    per_tier = getattr(desloc, "micro_batch_per_tier", {})
+    import os
+    try:
+        local_rank = int(os.environ.get("LOCAL_RANK", pp_rank))
+    except (ValueError, TypeError):
+        local_rank = pp_rank
+    tier = desloc.get_tier_for_gpu(local_rank)
+    if tier is not None and tier.tier_type.value in per_tier:
+        return per_tier[tier.tier_type.value]
+    per_stage = getattr(config, "per_stage_micro_batch_sizes", None)
+    if per_stage is not None and pp_rank < len(per_stage):
+        return per_stage[pp_rank]
+    return default_micro_batch_size

@@ -373,3 +373,117 @@ class _ReduceScatterToSequenceParallelRegion(torch.autograd.Function):
         chunks = [torch.empty_like(grad_output) for _ in range(world_size)]
         torch.distributed.all_gather(chunks, grad_output, group=group)
         return torch.cat(chunks, dim=0)
+
+
+# ===========================================================================
+# DES-LOC extensions for heterogeneous tensor parallelism
+# ===========================================================================
+
+def hetero_reduce_from_tensor_model_parallel_region(
+    input_: torch.Tensor,
+    group: "Optional[torch.distributed.ProcessGroup]" = None,
+) -> torch.Tensor:
+    """All-reduce across TP ranks (DES-LOC extension point).
+
+    Since each TP rank computes Y_i = X * A_i^T for its partition of A,
+    the sum is numerically identical regardless of partition sizes—no
+    weighting is needed.  This function exists as a future extension
+    point for PCIe-aware bucketing and tier-priority scheduling.
+
+    Args:
+        input_: Tensor to reduce.
+        group:  TP process group.
+
+    Returns:
+        All-reduced tensor.
+    """
+    if group is None:
+        group = _get_tp_group()
+    if group is None or torch.distributed.get_world_size(group=group) <= 1:
+        return input_
+    torch.distributed.all_reduce(input_, group=group)
+    return input_
+
+
+def hetero_all_gather_from_tensor_parallel_region(
+    input_: torch.Tensor,
+    partition_sizes: "Optional[list]" = None,
+    group: "Optional[torch.distributed.ProcessGroup]" = None,
+) -> torch.Tensor:
+    """All-gather across TP ranks, supporting variable-size partitions.
+
+    Standard all-gather assumes equal shard sizes.  In DES-LOC hetero TP,
+    ranks may hold shards of different sizes.
+
+    Args:
+        input_:          Local shard tensor.
+        partition_sizes: Per-rank partition sizes along the gather dim.
+                         If None, assumes uniform sizes.
+        group:           TP process group.
+
+    Returns:
+        Gathered tensor with full size along the last dimension.
+    """
+    if group is None:
+        group = _get_tp_group()
+    if group is None:
+        return input_
+
+    world_size = torch.distributed.get_world_size(group=group)
+    if world_size <= 1:
+        return input_
+
+    # Uniform fast path
+    if partition_sizes is None or len(set(partition_sizes)) <= 1:
+        return gather_from_tensor_model_parallel_region(input_, group=group)
+
+    # Variable-size all-gather
+    last_dim = input_.dim() - 1
+    recv_tensors = []
+    for sz in partition_sizes:
+        shape = list(input_.shape)
+        shape[last_dim] = sz
+        recv_tensors.append(torch.empty(shape, dtype=input_.dtype, device=input_.device))
+
+    torch.distributed.all_gather(recv_tensors, input_.contiguous(), group=group)
+    return torch.cat(recv_tensors, dim=last_dim)
+
+
+def hetero_reduce_scatter_to_sequence_parallel_region(
+    input_: torch.Tensor,
+    partition_sizes: "Optional[list]" = None,
+    group: "Optional[torch.distributed.ProcessGroup]" = None,
+) -> torch.Tensor:
+    """Reduce-scatter with support for variable sequence partitions.
+
+    In DES-LOC clusters the sequence dimension may be split unevenly
+    across TP ranks.  Falls back to all-reduce + slice for variable sizes.
+
+    Args:
+        input_:          Input tensor.
+        partition_sizes: Per-rank partition sizes along dim 0 (sequence).
+        group:           TP process group.
+
+    Returns:
+        Local shard of the reduced tensor.
+    """
+    if group is None:
+        group = _get_tp_group()
+    if group is None:
+        return input_
+
+    world_size = torch.distributed.get_world_size(group=group)
+    if world_size <= 1:
+        return input_
+
+    # Uniform fast path
+    if partition_sizes is None or len(set(partition_sizes)) <= 1:
+        return reduce_scatter_to_sequence_parallel_region(input_, group=group)
+
+    # Variable-size: all-reduce then extract local slice
+    rank = torch.distributed.get_rank(group=group)
+    input_ = input_.contiguous()
+    torch.distributed.all_reduce(input_, group=group)
+    start = sum(partition_sizes[:rank])
+    end = start + partition_sizes[rank]
+    return input_[start:end].contiguous()

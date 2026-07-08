@@ -107,6 +107,12 @@ from deepspeed.core.pipeline_parallel.utils import (
     # DES-LOC tier helpers
     get_tier_for_rank,
     tier_priority_stream,
+    # DES-LOC stage assignment + micro-batch sizing
+    get_pp_stage_compute_factor,
+    is_fast_stage,
+    is_slow_stage,
+    optimal_pp_stage_assignment,
+    get_pp_stage_micro_batch_size,
 )
 
 # ---------------------------------------------------------------------------
@@ -181,6 +187,11 @@ __all__ = [
     "get_comm_stream",
     "get_tier_for_rank",
     "tier_priority_stream",
+    "get_pp_stage_compute_factor",
+    "is_fast_stage",
+    "is_slow_stage",
+    "optimal_pp_stage_assignment",
+    "get_pp_stage_micro_batch_size",
     # Bridge communicator
     "BridgeCommunicator",
     "CommRole",

@@ -1752,3 +1752,129 @@ class _CopyToModelParallelRegion(torch.autograd.Function):
         if group is not None and torch.distributed.get_world_size(group=group) > 1:
             torch.distributed.all_reduce(grad_output, group=group)
         return grad_output, None
+
+
+# ===========================================================================
+# DES-LOC extensions for heterogeneous tensor parallelism
+# ===========================================================================
+
+def get_hetero_tp_partition_sizes(
+    total_size: int,
+    tp_group: "Optional[torch.distributed.ProcessGroup]" = None,
+    config=None,
+) -> "List[int]":
+    """Compute per-rank TP partition sizes proportional to GPU compute power.
+
+    In homogeneous clusters every rank gets ``ceil(total_size / tp_world_size)``
+    columns.  In DES-LOC clusters, fast GPUs (H100) get proportionally more
+    columns than slow GPUs (A6000), weighted by BF16 TFLOPS:
+
+        cols_i = round(total_size * tflops_i / sum(tflops))
+
+    Args:
+        total_size: Full output dimension (e.g. num_heads * head_dim).
+        tp_group:   TP process group.
+        config:     ModelParallelConfig with ``config.desloc.tiers``.
+
+    Returns:
+        List of per-rank partition sizes (length = tp_world_size).
+    """
+    group = _resolve_tp_group(tp_group)
+    world_size = _pg_world_size(group)
+
+    if world_size <= 1:
+        return [total_size]
+
+    desloc = getattr(config, "desloc", None) if config is not None else None
+    if desloc is None or not getattr(desloc, "enabled", False) or not desloc.tiers:
+        per_rank = _padded_partition_size(total_size, world_size)
+        return [per_rank] * world_size
+
+    import os
+    tflops_list = []
+    for r in range(world_size):
+        try:
+            base = int(os.environ.get("LOCAL_RANK", "0"))
+        except (ValueError, TypeError):
+            base = 0
+        gpu_idx = base + r
+        tier = desloc.get_tier_for_gpu(gpu_idx)
+        tflops_list.append(tier.bf16_tflops if tier is not None else 77.4)
+
+    total_tflops = sum(tflops_list)
+    if total_tflops <= 0:
+        per_rank = _padded_partition_size(total_size, world_size)
+        return [per_rank] * world_size
+
+    raw = [total_size * t / total_tflops for t in tflops_list]
+    sizes = [max(1, round(r)) for r in raw]
+
+    diff = total_size - sum(sizes)
+    if diff > 0:
+        indices = sorted(range(world_size), key=lambda i: tflops_list[i], reverse=True)
+        for i in range(diff):
+            sizes[indices[i % world_size]] += 1
+    elif diff < 0:
+        indices = sorted(range(world_size), key=lambda i: tflops_list[i])
+        for i in range(-diff):
+            if sizes[indices[i % world_size]] > 1:
+                sizes[indices[i % world_size]] -= 1
+
+    return sizes
+
+
+def get_hetero_tp_partition_range(
+    total_size: int,
+    tp_rank: int,
+    tp_group: "Optional[torch.distributed.ProcessGroup]" = None,
+    config=None,
+) -> "Tuple[int, int]":
+    """Return (start, end) column range for a rank under heterogeneous TP.
+
+    Args:
+        total_size: Full output dimension.
+        tp_rank:    Rank within TP group.
+        tp_group:   TP process group.
+        config:     ModelParallelConfig.
+
+    Returns:
+        (start_col, end_col) where end_col is exclusive.
+    """
+    sizes = get_hetero_tp_partition_sizes(total_size, tp_group, config)
+    start = sum(sizes[:tp_rank])
+    end = start + sizes[tp_rank]
+    return start, min(end, total_size)
+
+
+class HeteroTPInfo:
+    """Cached heterogeneous TP partition info for a layer.
+
+    Avoids recomputing partition sizes on every forward pass.
+    Create one per layer and query ``partition_size``, ``start_col``, ``end_col``.
+    """
+
+    def __init__(
+        self,
+        total_size: int,
+        tp_group: "Optional[torch.distributed.ProcessGroup]" = None,
+        config=None,
+    ):
+        self.total_size = total_size
+        self.tp_group = _resolve_tp_group(tp_group)
+        self.world_size = _pg_world_size(self.tp_group)
+        self.rank = _pg_rank(self.tp_group)
+        self.sizes = get_hetero_tp_partition_sizes(
+            total_size, self.tp_group, config
+        )
+        self.start_col = sum(self.sizes[:self.rank])
+        self.end_col = min(self.start_col + self.sizes[self.rank], total_size)
+        self.partition_size = self.sizes[self.rank]
+        self.is_heterogeneous = len(set(self.sizes)) > 1
+
+    def real_cols(self) -> int:
+        """Number of real (non-padding) columns on this rank."""
+        return self.end_col - self.start_col
+
+    def has_padding(self) -> bool:
+        """True if this rank has dummy padding columns."""
+        return self.real_cols() < self.partition_size

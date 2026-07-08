@@ -995,3 +995,57 @@ class CheckpointWithoutOutput:
             output.untyped_storage().resize_(0)
         if hook_tensor.requires_grad:
             hook_tensor.register_hook(self._recompute)
+
+
+# ===========================================================================
+# DES-LOC extensions for heterogeneous RNG management
+# ===========================================================================
+
+def model_parallel_cuda_manual_seed_hetero(
+    seed: int,
+    config=None,
+) -> None:
+    """Seed TP-parallel RNG states with tier-aware salt.
+
+    In DES-LOC clusters, different GPU tiers may process different numbers
+    of attention heads.  To ensure reproducible weight initialisation
+    across tiers, each tier gets a deterministic salt:
+
+        effective_seed = seed + tier_type.value * 7919
+
+    Args:
+        seed:   Base random seed.
+        config: ModelParallelConfig with ``config.desloc.tiers``.
+    """
+    import os
+
+    tier_salt = 0
+    desloc = getattr(config, "desloc", None) if config is not None else None
+    if desloc is not None and getattr(desloc, "enabled", False):
+        try:
+            local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        except (ValueError, TypeError):
+            local_rank = 0
+        tier = desloc.get_tier_for_gpu(local_rank)
+        if tier is not None:
+            tier_salt = tier.tier_type.value * 7919
+
+    model_parallel_cuda_manual_seed(seed + tier_salt)
+
+
+def get_tier_rng_tracker_name(tier_type=None) -> str:
+    """Return a unique RNG tracker name for a DES-LOC tier.
+
+    Allows each tier to maintain an independent RNG state for
+    operations that should differ across tiers (e.g. dropout masks
+    on different partition sizes).
+
+    Args:
+        tier_type: TierType enum value, or None for the default tracker.
+
+    Returns:
+        String name for the RNG tracker.
+    """
+    if tier_type is None:
+        return "model-parallel-rng"
+    return f"tier-{tier_type.value}-rng"
