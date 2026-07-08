@@ -2366,7 +2366,30 @@ class DesLocEngine:
             # identical on all ranks, then fall through to the shared code paths
             # (which are now all gated on _step_has_nan rather than `continue`).
             _step_has_nan = not math.isfinite(step_loss)
-            logger.warning("rank=%d: post-microbatch, step_loss=%.4f, nan=%s",
+            # --- FIX #197: make NaN flag collective BEFORE any conditional
+            # collective (finalize_model_grads, _skip_tensor allreduce, etc.).
+            # _step_has_nan was rank-local; on a Kx step, if rank 0 saw NaN
+            # and rank 1 did not, _fmg_skip_sync differed across ranks,
+            # causing finalize_model_grads to issue an allreduce on some ranks
+            # but not others → NCCL ALLREDUCE hang at SeqNum=3 (NumelIn=1).
+            # Fix: allreduce the NaN flag here so every downstream conditional
+            # that gates a collective uses an identical value on all ranks.
+            if dist.is_initialized():
+                _nan_tensor = torch.tensor(
+                    [1.0 if _step_has_nan else 0.0],
+                    dtype=torch.float32,
+                    device=torch.cuda.current_device(),
+                )
+                if self._dist_optimizer is not None:
+                    _nan_group = self._dist_optimizer.data_parallel_group
+                elif parallel_state.is_initialized():
+                    _nan_group = parallel_state.get_data_parallel_group()
+                else:
+                    _nan_group = None  # WORLD
+                dist.all_reduce(_nan_tensor, op=dist.ReduceOp.MAX, group=_nan_group)
+                _step_has_nan = _nan_tensor.item() > 0.5
+                del _nan_tensor
+            logger.warning("rank=%d: post-microbatch, step_loss=%.4f, nan=%s (collective)",
                           dist.get_rank() if dist.is_initialized() else 0,
                           step_loss, _step_has_nan)
 
@@ -2424,6 +2447,8 @@ class DesLocEngine:
                 _fmg_model = [self._core_ddp if self._core_ddp is not None else self.model]
                 # On NaN steps force skip_grad_sync=True: avoids sending garbage
                 # gradients across ranks while still completing the collective.
+                # _step_has_nan is collective (fix #197) so _fmg_skip_sync is
+                # identical on all ranks — no more asymmetric collectives.
                 _fmg_skip_sync = (not _is_Kx_sync) or _step_has_nan
                 logger.warning("rank=%d: ENTERING finalize_model_grads (Kx=%s, nan=%s, skip=%s, force_ar=%s)",
                     dist.get_rank() if dist.is_initialized() else 0,
