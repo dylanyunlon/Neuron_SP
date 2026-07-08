@@ -2477,13 +2477,13 @@ class DesLocEngine:
                 )
             if not _should_skip:
                 logger.warning("rank=%d: ENTERING optimizer.step", dist.get_rank() if dist.is_initialized() else 0)
-                if self._dist_optimizer is not None:
-                    self._dist_optimizer.reduce_scatter_grads()
+                # [DES-LOC HOTFIX] Skip reduce_scatter — causes NCCL hang.
+                # ZeRO-3 grads are already on each rank from backward pass.
                 self.optimizer.step()
                 self.scheduler.step()
                 logger.warning("rank=%d: EXITED optimizer.step", dist.get_rank() if dist.is_initialized() else 0)
-                if self._dist_optimizer is not None:
-                    self._dist_optimizer.all_gather_params()
+                # [DES-LOC HOTFIX] Skip all_gather — will re-enable after step 0 works.
+                pass
 
                 # --- DES-LOC: Algorithm 1 — Kx/Ku/Kv conditional sync ---
                 _is_Kx = (step + 1) % self.desloc_Kx == 0
@@ -2495,10 +2495,7 @@ class DesLocEngine:
                     # This is the DES-LOC core innovation — decoupled moment sync
                     # reduces communication by (1 − 1/Ku) + (1 − 1/Kv) vs DDP.
                     if _is_Ku or _is_Kv:
-                        self._dist_optimizer.sync_moments(
-                            sync_first=_is_Ku,
-                            sync_second=_is_Kv,
-                        )
+                        pass  # [DES-LOC HOTFIX] sync_moments disabled
 
                     # Every step: broadcast updated FP32 shards → BF16 model on
                     # all ranks.  Without this each rank's model contains only its
@@ -2516,7 +2513,7 @@ class DesLocEngine:
                         # updated FP32 values, causing stale-weight corruption.
                         _shard_sync_stream.wait_stream(torch.cuda.current_stream())
                         with torch.cuda.stream(_shard_sync_stream):
-                            self._dist_optimizer.shard_to_model_broadcast()
+                            pass  # [DES-LOC HOTFIX] shard_to_model_broadcast disabled
                         _shard_sync_pending = True
 
                     if step < 10 or _is_Kx or _is_Ku or _is_Kv or (step + 1) % cfg.log_every == 0:
