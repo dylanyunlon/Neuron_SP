@@ -229,6 +229,17 @@ def install(
     )
     optimizer = adapter.build()  # never raises — has internal fallback
 
+    # ── 3b. Barrier: all ranks must complete build() before any rank
+    # proceeds to engine.model.to(device) and train().  Without this,
+    # the fastest rank (H100, no JIT) reaches train() and starts ZeRO-3
+    # collectives while slower ranks (A6000, DeepSpeedCPUAdam JIT) are
+    # still in build(), causing NCCL collective asymmetry → deadlock.
+    import torch.distributed as _dist
+    if _dist.is_initialized():
+        logger.info("[hetero_bridge] barrier after adapter.build() — waiting for all ranks")
+        _dist.barrier()
+        logger.info("[hetero_bridge] barrier passed — all ranks ready")
+
     # ── 4. Attach to engine ────────────────────────────────────────────
     engine.optimizer = adapter
     engine._hetero_bridge_adapter = adapter

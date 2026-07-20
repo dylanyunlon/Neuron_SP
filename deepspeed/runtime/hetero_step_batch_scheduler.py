@@ -430,71 +430,70 @@ class HeteroMicrobatchAllocator:
         )
 
     def allocate(self, global_batch_size: int) -> MicrobatchAllocation:
-        """根据全局批量大小和设备容量权重分配微批。
+        """Allocate microbatches with UNIFORM loop count across all devices.
 
-        算法:
-        1. 计算每个设备按权重应承载的微批数（浮点）。
-        2. 向下取整并补偿余数到权重最高的设备。
-        3. 验证总和等于 num_microbatches。
+        Design principle: all ranks MUST execute the same number of forward/
+        backward calls because each call triggers ZeRO-3 all_gather collectives
+        that require symmetric participation.  Throughput differences between
+        GPU tiers are expressed via per-device micro_batch_size, NOT via
+        different loop counts.
 
-        DES-LOC 约束：H100 NVL 的 per_device_microbatch_size 可以翻倍，
-        从而在相同微批数下处理更多样本，提升 PCIe 互联效率（减少同步次数）。
+        Algorithm:
+          1. num_microbatches = global_batch_size // (sum of per-device mbs)
+             where per-device mbs is proportional to capacity_weight.
+          2. Every device runs num_microbatches iterations.
+          3. H100 processes more samples per iteration (larger mbs),
+             A6000 processes fewer (smaller mbs).
 
         Args:
-            global_batch_size: 当前全局批量大小。
+            global_batch_size: Current global batch size.
 
         Returns:
-            MicrobatchAllocation 实例，包含每设备分配方案。
-
-        Raises:
-            ValueError: 若全局批量大小无法被设备总数整除（异构情况下检查更宽松）。
+            MicrobatchAllocation with uniform num_microbatches for ALL ranks.
         """
         n_devices = len(self.device_profiles)
         if n_devices == 0:
-            raise ValueError("设备配置列表为空。")
+            raise ValueError("Device profile list is empty.")
 
-        # 估算总微批数（全局批/设备数/base_mbs，向上取整保留余量）
-        effective_dp = n_devices
-        if global_batch_size % (effective_dp * self.base_micro_batch_size) == 0:
-            num_microbatches = global_batch_size // (effective_dp * self.base_micro_batch_size)
+        # Compute per-device micro_batch_size proportional to capacity_weight.
+        # Floor each to at least 1; the base is self.base_micro_batch_size
+        # for the weakest device (weight=1.0).
+        min_weight = min(p.capacity_weight for p in self.device_profiles)
+        per_device_mbs: Dict[int, int] = {}
+        for p in self.device_profiles:
+            ratio = p.capacity_weight / max(min_weight, 1e-6)
+            mbs = max(1, int(self.base_micro_batch_size * ratio))
+            # Cap at device max
+            mbs = min(mbs, p.max_micro_batch_size)
+            per_device_mbs[p.device_id] = mbs
+
+        # Total samples per one round of forward across all devices
+        samples_per_round = sum(per_device_mbs.values())
+
+        # num_microbatches: how many rounds to reach global_batch_size
+        # UNIFORM across all ranks — this is the key invariant.
+        if samples_per_round > 0 and global_batch_size >= samples_per_round:
+            num_microbatches = max(1, global_batch_size // samples_per_round)
         else:
-            # 异构 fallback：至少每设备 1 个微批
-            num_microbatches = max(1, global_batch_size // (effective_dp * self.base_micro_batch_size))
-            logger.warning(
-                "全局批量大小 %d 无法被 effective_dp=%d * base_mbs=%d 整除，"
-                "使用 num_microbatches=%d（可能造成轻微负载不均）。",
-                global_batch_size, effective_dp, self.base_micro_batch_size, num_microbatches,
-            )
+            num_microbatches = max(1, global_batch_size // max(n_devices, 1))
 
-        # 按权重分配
-        per_device: Dict[int, int] = {}
-        allocated = 0
-        for i, profile in enumerate(self.device_profiles):
-            if i < len(self.device_profiles) - 1:
-                share = int(num_microbatches * profile.capacity_weight / self._total_weight)
-                share = max(1, share)
-            else:
-                # 最后一个设备承担余量
-                share = num_microbatches - allocated
-                share = max(1, share)
-            per_device[profile.device_id] = share
-            allocated += share
+        # per_device_assignment: every device does num_microbatches iterations
+        # (same count), but with different micro_batch_size.
+        per_device: Dict[int, int] = {
+            p.device_id: num_microbatches for p in self.device_profiles
+        }
 
         logger.debug(
-            "微批分配: gbs=%d, num_mb=%d, per_device=%s",
-            global_batch_size, num_microbatches, per_device,
+            "Microbatch allocation (uniform loop): gbs=%d, num_mb=%d, "
+            "per_device_mbs=%s, samples_per_round=%d",
+            global_batch_size, num_microbatches, per_device_mbs, samples_per_round,
         )
-
-        # per_rank_microbatches mirrors per_device_assignment.
-        # In a single-node heterogeneous setup device_id == dist rank, so
-        # train() can do a direct lookup: allocation.per_rank_microbatches[rank].
-        per_rank = dict(per_device)  # shallow copy; keys are device_id == rank
 
         return MicrobatchAllocation(
             global_batch_size=global_batch_size,
             num_microbatches=num_microbatches,
             per_device_assignment=per_device,
-            per_rank_microbatches=per_rank,
+            per_rank_microbatches={p.device_id: num_microbatches for p in self.device_profiles},
             loc_cache_hint=False,
         )
 

@@ -123,6 +123,111 @@ _CHECKPOINT_DIR = Path("checkpoints")
 
 
 # ---------------------------------------------------------------------------
+# Training-loop profiler: measures real CUDA time for every phase of a step.
+#
+# Not a toy benchmark — this lives inside the actual training loop and
+# records wall-clock + CUDA-event timings for:
+#   - data fetch + H2D transfer
+#   - forward pass (per microbatch)
+#   - backward pass (per microbatch)
+#   - finalize_model_grads (allreduce, Kx-gated)
+#   - clip_grad_norm
+#   - optimizer step (prepare_grads reduce_scatter + Adam + param broadcast)
+#   - DES-LOC Kx/Ku/Kv sync overhead
+#   - CUDA memory snapshots (allocated, reserved, peak)
+#
+# Results are dumped as JSON every `log_every` steps for offline analysis.
+# ---------------------------------------------------------------------------
+class StepProfiler:
+    """Lightweight CUDA-event profiler embedded in the training loop."""
+
+    def __init__(self, device: torch.device, enabled: bool = True):
+        self.device = device
+        self.enabled = enabled and device.type == "cuda"
+        self._events: Dict[str, Tuple[torch.cuda.Event, torch.cuda.Event]] = {}
+        self._wall: Dict[str, float] = {}
+        self._wall_starts: Dict[str, float] = {}
+        self._step_records: list = []
+        self._current: Dict[str, float] = {}
+        self._mem_snapshots: Dict[str, Dict[str, float]] = {}
+
+    def begin(self, name: str) -> None:
+        if not self.enabled:
+            return
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record(torch.cuda.current_stream(self.device))
+        self._events[name] = (start, end)
+        self._wall_starts[name] = time.time()
+
+    def end(self, name: str) -> None:
+        if not self.enabled or name not in self._events:
+            return
+        start, end_ev = self._events[name]
+        end_ev.record(torch.cuda.current_stream(self.device))
+        self._wall[name] = time.time() - self._wall_starts.pop(name, time.time())
+
+    def snap_memory(self, tag: str) -> None:
+        if not self.enabled:
+            return
+        self._mem_snapshots[tag] = {
+            "allocated_MB": torch.cuda.memory_allocated(self.device) / (1 << 20),
+            "reserved_MB": torch.cuda.memory_reserved(self.device) / (1 << 20),
+            "max_allocated_MB": torch.cuda.max_memory_allocated(self.device) / (1 << 20),
+        }
+
+    def finish_step(self, step: int, extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Synchronize all events, collect timings, reset for next step."""
+        if not self.enabled:
+            return {}
+        torch.cuda.synchronize(self.device)
+        record: Dict[str, Any] = {"step": step}
+        for name, (start, end_ev) in self._events.items():
+            try:
+                cuda_ms = start.elapsed_time(end_ev)
+            except RuntimeError:
+                cuda_ms = -1.0
+            record[f"{name}_cuda_ms"] = round(cuda_ms, 3)
+            if name in self._wall:
+                record[f"{name}_wall_ms"] = round(self._wall[name] * 1000, 3)
+        record["memory"] = dict(self._mem_snapshots)
+        if extra:
+            record.update(extra)
+        self._step_records.append(record)
+        self._events.clear()
+        self._wall.clear()
+        self._wall_starts.clear()
+        self._mem_snapshots.clear()
+        self._current.clear()
+        return record
+
+    def dump_json(self, path: str) -> None:
+        """Write all collected records to a JSON file."""
+        import json
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w") as f:
+            json.dump(self._step_records, f, indent=2, default=str)
+        logger.info("[StepProfiler] dumped %d records → %s", len(self._step_records), path)
+
+    def summary(self, last_n: int = 10) -> str:
+        """Human-readable summary of the last N steps."""
+        if not self._step_records:
+            return "[StepProfiler] no records"
+        records = self._step_records[-last_n:]
+        # Collect all cuda_ms keys
+        keys = sorted({k for r in records for k in r if k.endswith("_cuda_ms")})
+        lines = [f"{'phase':<35} {'mean_ms':>9} {'min_ms':>9} {'max_ms':>9}"]
+        lines.append("-" * 66)
+        for k in keys:
+            vals = [r[k] for r in records if k in r and r[k] >= 0]
+            if vals:
+                lines.append(
+                    f"{k:<35} {sum(vals)/len(vals):>9.2f} {min(vals):>9.2f} {max(vals):>9.2f}"
+                )
+        return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # Enums
 # ---------------------------------------------------------------------------
 # ── Config types extracted to desloc_config.py ─────────────────────
@@ -1663,6 +1768,16 @@ class DesLocEngine:
         logger.info("Training start: %d steps, grad_accum=%d",
                     cfg.total_steps, self.grad_accum)
 
+        # --- StepProfiler: real CUDA-event instrumentation ---
+        _profile_enabled = os.environ.get("NEURON_SP_PROFILE", "1").strip() == "1"
+        _local_dev = torch.device(f"cuda:{torch.cuda.current_device()}")
+        _profiler = StepProfiler(device=_local_dev, enabled=_profile_enabled)
+        _profile_rank = dist.get_rank() if dist.is_initialized() else 0
+        if _profile_enabled and _is_main:
+            logger.info("[StepProfiler] ENABLED on rank %d, device %s", _profile_rank, _local_dev)
+            # Reset peak memory stats for clean measurement
+            torch.cuda.reset_peak_memory_stats(_local_dev)
+
         # --- ZeRO-3 model GPU materialisation ---
         # DistributedOptimizer holds FP32 shards; the full BF16 model must
         # also live on GPU for forward/backward.  ZeRO3ForwardHook.register()
@@ -2020,11 +2135,6 @@ class DesLocEngine:
             # iteration counts — which would cause NCCL collective mismatch.
             num_microbatches = allocation.num_microbatches
 
-            # num_microbatches is guaranteed consistent across ranks by the
-            # scheduler config (same dp_size and batch sizes for all ranks).
-            # Runtime all_reduce sync is unnecessary and caused training hang
-            # when ranks arrived at the collective at different times.
-
             logger.warning("rank=%d: num_microbatches=%d, step=%d",
                           dist.get_rank() if dist.is_initialized() else 0,
                           num_microbatches, step)
@@ -2157,6 +2267,8 @@ class DesLocEngine:
                 # _pp_p2p_comm failed to initialise, guaranteeing full fallback.
                 # ---------------------------------------------------------------
                 for micro in range(num_microbatches):
+                    # --- [PROFILE] data_fetch ---
+                    _profiler.begin(f"data_fetch_mb{micro}")
                     # --- Data fetch: capacity-weighted CP token split ---
                     # Pure DP: every rank fetches independently, then applies
                     # hetero CP slice so H100 gets more tokens, A6000 fewer.
@@ -2321,12 +2433,21 @@ class DesLocEngine:
                                 else _nullctx()
                             )
                             _dbg_rank = dist.get_rank() if dist.is_initialized() else 0
+                            _profiler.end(f"data_fetch_mb{micro}")
+                            _profiler.snap_memory(f"pre_fwd_mb{micro}")
+
+                            # --- [PROFILE] forward ---
+                            _profiler.begin(f"forward_mb{micro}")
                             logger.warning("rank=%d: before forward (step=%d micro=%d)", _dbg_rank, step, micro)
                             with _offload_ctx:
                                 loss, scaled_loss = self.forward(
                                     input_ids, labels, num_microbatches=num_microbatches,
                                 )
+                            _profiler.end(f"forward_mb{micro}")
                             logger.warning("rank=%d: after forward (step=%d micro=%d)", _dbg_rank, step, micro)
+
+                            _profiler.snap_memory(f"post_fwd_mb{micro}")
+
                             # Commit offload group: flush any pending D2H transfers
                             # for this micro-batch before backward begins.
                             if getattr(self, "_activation_offload_iface", None) is not None:
@@ -2347,8 +2468,13 @@ class DesLocEngine:
                                     # Tensor: divide by num_microbatches to match
                                     # the main-loss scale convention.
                                     scaled_loss = scaled_loss + _aux / max(num_microbatches, 1)
+
+                            # --- [PROFILE] backward ---
+                            _profiler.begin(f"backward_mb{micro}")
                             logger.warning("rank=%d: before backward (step=%d micro=%d)", _dbg_rank, step, micro)
                             scaled_loss.backward()
+                            _profiler.end(f"backward_mb{micro}")
+                            _profiler.snap_memory(f"post_bwd_mb{micro}")
                             logger.warning("rank=%d: after backward (step=%d micro=%d)", _dbg_rank, step, micro)
                             # --- HeteroFP32GradAccumManager: accumulate (standard path) ---
                             # Promote BF16 param.grad into FP32 main_grad accumulators
@@ -2431,6 +2557,8 @@ class DesLocEngine:
             # participation.  On NaN steps we pass skip_grad_sync=True so that no
             # gradient data is actually transferred; the call becomes a collective
             # no-op at the NCCL level but still keeps all ranks in lock-step.
+            # --- [PROFILE] finalize_model_grads ---
+            _profiler.begin("finalize_grads")
             logger.warning("rank=%d: about to enter finalize_model_grads block", dist.get_rank() if dist.is_initialized() else 0)
             _is_Kx_sync = _is_Kx_sync_pre
             try:
@@ -2472,14 +2600,18 @@ class DesLocEngine:
                 logger.warning("rank=%d: EXITED finalize_model_grads OK",
                     dist.get_rank() if dist.is_initialized() else 0)
 
+            _profiler.end("finalize_grads")
+
             # Gradient clipping — unified via core clip_grad_norm on all paths.
             # finalize_model_grads has already all-reduced grads; clip globally.
             # core clip_grad_norm avoids host/device sync and handles model-parallel
             # norm reduction — replaces torch.nn.utils.clip_grad_norm_ (M2335).
+            _profiler.begin("clip_grad_norm")
             logger.warning("rank=%d: ENTERING clip_grad_norm", dist.get_rank() if dist.is_initialized() else 0)
             gnorm = clip_grad_norm(self.model.parameters(), cfg.grad_clip)
             if torch.is_tensor(gnorm):
                 gnorm = gnorm.item()
+            _profiler.end("clip_grad_norm")
             logger.warning("rank=%d: EXITED clip_grad_norm gnorm=%.6f", dist.get_rank() if dist.is_initialized() else 0, gnorm)
 
             # BYPASS: should_skip() / _skip_controller removed to unblock training.
@@ -2566,15 +2698,19 @@ class DesLocEngine:
             # (all-gather with unchanged shard values), but skip Adam + scheduler.
             if self._dist_optimizer is not None:
                 # ZeRO-3 path: always enter reduce_scatter (collective #1)
+                _profiler.begin("optim_prepare_grads")
                 logger.warning("rank=%d: ENTERING optimizer prepare_grads (skip=%s)",
                                dist.get_rank() if dist.is_initialized() else 0, _should_skip)
                 self._dist_optimizer.prepare_grads()
+                _profiler.end("optim_prepare_grads")
 
                 if not _should_skip:
                     # Normal path: Adam update on FP32 shards
+                    _profiler.begin("optim_adam_step")
                     logger.warning("rank=%d: ENTERING optimizer step_with_ready_grads", dist.get_rank() if dist.is_initialized() else 0)
                     self._dist_optimizer.step_with_ready_grads()
                     self.scheduler.step()
+                    _profiler.end("optim_adam_step")
                     logger.warning("rank=%d: EXITED optimizer step_with_ready_grads", dist.get_rank() if dist.is_initialized() else 0)
                 else:
                     # Skip path: zero grad shards so Adam state isn't corrupted,
@@ -2588,13 +2724,18 @@ class DesLocEngine:
                     self._dist_optimizer.start_param_sync(force_sync=True)
             elif not _should_skip:
                 # Non-ZeRO-3 fallback: local AdamW on full model
+                _profiler.begin("optim_adam_step")
                 logger.warning("rank=%d: ENTERING optimizer.step (local)", dist.get_rank() if dist.is_initialized() else 0)
                 self.optimizer.step()
                 self.scheduler.step()
+                _profiler.end("optim_adam_step")
                 logger.warning("rank=%d: EXITED optimizer.step (local)", dist.get_rank() if dist.is_initialized() else 0)
+
+            _profiler.snap_memory("post_optim")
 
             if not _should_skip:
                 # --- DES-LOC: Algorithm 1 — Kx/Ku/Kv conditional sync ---
+                _profiler.begin("desloc_sync")
                 _is_Kx = (step + 1) % self.desloc_Kx == 0
                 _is_Ku = (step + 1) % self.desloc_Ku == 0
                 _is_Kv = (step + 1) % self.desloc_Kv == 0
@@ -2633,6 +2774,24 @@ class DesLocEngine:
                             "SYNC" if _is_Ku else "skip",
                             "SYNC" if _is_Kv else "skip",
                         )
+
+            if not _should_skip:
+                _profiler.end("desloc_sync")
+
+            # --- [PROFILE] finish step: collect all CUDA event timings ---
+            _step_profile = _profiler.finish_step(
+                step=step,
+                extra={
+                    "is_Kx_step": (step + 1) % self.desloc_Kx == 0,
+                    "is_Ku_step": (step + 1) % self.desloc_Ku == 0,
+                    "is_Kv_step": (step + 1) % self.desloc_Kv == 0,
+                    "num_microbatches": num_microbatches,
+                    "loss": step_loss,
+                    "grad_norm": gnorm,
+                    "skipped": _should_skip,
+                    "rank": _profile_rank,
+                },
+            )
 
             # Accounting
             self.global_step = step + 1
@@ -2692,6 +2851,27 @@ class DesLocEngine:
                     self.tokens_seen / 1e6,
                     _mfu,
                 )
+
+                # --- [PROFILE] print summary and dump JSON ---
+                if _is_main and _profile_enabled:
+                    _prof_summary = _profiler.summary(last_n=cfg.log_every)
+                    logger.info(
+                        "\n[StepProfiler] step %d (last %d steps):\n%s",
+                        self.global_step, cfg.log_every, _prof_summary,
+                    )
+                    _prof_dir = f"logs/profile_rank{_profile_rank}"
+                    _profiler.dump_json(
+                        f"{_prof_dir}/steps_{self.global_step - cfg.log_every + 1}_to_{self.global_step}.json"
+                    )
+                    # Also dump per-phase averages to W&B if available
+                    if _wb_run is not None:
+                        _prof_recs = _profiler._step_records[-cfg.log_every:]
+                        _prof_keys = [k for k in _prof_recs[-1] if k.endswith("_cuda_ms")]
+                        for pk in _prof_keys:
+                            _pvals = [r[pk] for r in _prof_recs if pk in r and r[pk] >= 0]
+                            if _pvals:
+                                _wb_run.log({f"profile/{pk}": sum(_pvals) / len(_pvals)}, step=self.global_step)
+
                 # --- W&B / TensorBoard metrics (rank 0 only) ---
                 if _is_main and (_wb_run is not None or _tb_writer is not None):
                     # GPU allocated memory per visible device (up to 5 GPUs)
@@ -2817,6 +2997,17 @@ class DesLocEngine:
             self.tokens_seen / 1e6,
             self.tokens_seen / max(total_time, 1.0),
         )
+        # --- [PROFILE] Final dump ---
+        if _profile_enabled:
+            _prof_dir = f"logs/profile_rank{_profile_rank}"
+            _profiler.dump_json(f"{_prof_dir}/all_steps.json")
+            if _is_main:
+                logger.info(
+                    "\n[StepProfiler] FINAL SUMMARY (all %d steps):\n%s",
+                    len(_profiler._step_records),
+                    _profiler.summary(last_n=min(50, len(_profiler._step_records))),
+                )
+
         # Flush and close logging backends (rank 0 only)
         if _is_main:
             if _wb_run is not None:
