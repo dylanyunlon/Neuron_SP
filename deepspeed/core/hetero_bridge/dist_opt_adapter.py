@@ -115,6 +115,19 @@ def _build_inner_optimizer(
         # A6000 (49 GB VRAM).  Without CPU-offloaded optimizer states the
         # A6000 will OOM on any model > 3B params.  If this import fails,
         # the operator must compile with DS_BUILD_CPU_ADAM=1.
+        #
+        # JIT race mitigation: DeepSpeedCPUAdam triggers ninja JIT compilation
+        # of the cpu_adam C++ extension on first import.  The launch script
+        # pre-builds this (DS_BUILD_CPU_ADAM=1) so all ranks find the cached
+        # .so.  If pre-build was skipped, the torch.utils.cpp_extension lock
+        # file serializes concurrent builds — it just takes longer.
+        logger.info(
+            "[rank %d] Loading DeepSpeedCPUAdam (VRAM=%.1f GB < %.0f GB). "
+            "If this hangs, pre-build with: DS_BUILD_CPU_ADAM=1 python -c "
+            "'from deepspeed.ops.op_builder import CPUAdamBuilder; "
+            "CPUAdamBuilder().load()'",
+            rank, vram_gb, _CPU_OFFLOAD_VRAM_THRESHOLD_GB,
+        )
         from deepspeed.ops.adam import DeepSpeedCPUAdam
         opt = DeepSpeedCPUAdam(
             params,

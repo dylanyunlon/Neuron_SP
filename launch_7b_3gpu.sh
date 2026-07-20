@@ -29,6 +29,11 @@ export OMP_NUM_THREADS=8
 export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,max_split_size_mb:256
 
+# Pin CUDA arch list to SM8.6 (A6000) + SM9.0 (H100).
+# Without this, nvcc sees all GPUs (including Blackwell SM120) and tries to
+# compile for SM120 which PyTorch cu124 doesn't support → silent hang.
+export TORCH_CUDA_ARCH_LIST="8.6;9.0"
+
 # ── AutoSP kill-switch ────────────────────────────────────────────────────────
 # PCIe-only topology (H100 + 2×A6000, no NVLink): Ulysses SP=3 all-to-all
 # collectives deadlock inside model.forward() at step 0.  Force DP-only mode
@@ -44,6 +49,53 @@ export NEURON_SP_DISABLE_AUTOSP=${NEURON_SP_DISABLE_AUTOSP:-0}
 # layer during forward.  Useful for pinpointing the exact layer that hangs
 # when SP is re-enabled.  Off by default (adds barrier overhead).
 export NEURON_SP_LAYER_LOG=${NEURON_SP_LAYER_LOG:-0}
+
+# ── Pre-build DeepSpeed CPU Adam C++ extension ──────────────────────────────
+# A6000 ranks use DeepSpeedCPUAdam which JIT-compiles csrc/adam/cpu_adam.cpp.
+# Problem: CPUAdamBuilder inherits from CUDAOpBuilder, so jit_load() passes
+# with_cuda=True and clears TORCH_CUDA_ARCH_LIST.  nvcc 13.0 (system) then
+# auto-detects ALL GPUs including Blackwell SM120, which PyTorch cu124 can't
+# compile for → silent hang.
+#
+# Fix: compile directly via torch.utils.cpp_extension.load(with_cuda=False).
+# cpu_adam is pure C++ (no .cu files) — it never needed nvcc.
+echo "Pre-building DeepSpeed CPU Adam extension (CPU-only, no nvcc)..."
+python -c "
+import os, sys, torch
+from torch.utils.cpp_extension import load
+
+# csrc/ lives at the project root, not under deepspeed/
+project_root = os.path.dirname(os.path.abspath('launch_7b_3gpu.sh'))
+sources = [
+    os.path.join(project_root, 'csrc', 'adam', 'cpu_adam.cpp'),
+    os.path.join(project_root, 'csrc', 'adam', 'cpu_adam_impl.cpp'),
+]
+includes = [os.path.join(project_root, 'csrc', 'includes')]
+
+# Verify files exist
+for s in sources:
+    if not os.path.isfile(s):
+        raise FileNotFoundError(f'Source not found: {s}')
+
+# Detect CPU SIMD flags
+simd = '-mavx512f -mavx512dq' if 'avx512' in open('/proc/cpuinfo').read() else '-mavx2'
+cxx_args = ['-O3', '-fopenmp', '-std=c++17', simd]
+
+print(f'  sources: {[os.path.basename(s) for s in sources]}')
+print(f'  SIMD: {simd}')
+sys.stdout.flush()
+
+op = load(
+    name='cpu_adam',
+    sources=sources,
+    extra_include_paths=includes,
+    extra_cflags=cxx_args,
+    extra_ldflags=['-fopenmp'],
+    with_cuda=False,
+    verbose=True,
+)
+print(f'  cpu_adam pre-built OK: {type(op)}')
+" 2>&1 || echo "  WARNING: cpu_adam pre-build failed; will JIT on first use (may be slow)"
 
 EXTRA_ARGS=("$@")
 

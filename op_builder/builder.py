@@ -569,6 +569,14 @@ class OpBuilder(ABC):
 
         if isinstance(self, CUDAOpBuilder) and not self.is_rocm_pytorch():
             self.build_for_cpu = not torch.cuda.is_available()
+            # TorchCPUOpBuilder subclasses (e.g. CPUAdamBuilder) are pure C++
+            # ops with no .cu sources.  They should NEVER be compiled with
+            # nvcc — doing so causes hangs when the system CUDA toolkit version
+            # (e.g. 13.0) is newer than PyTorch's (cu124) and nvcc auto-detects
+            # unsupported GPU architectures like Blackwell SM120.
+            # Force build_for_cpu=True so with_cuda=False at line 613.
+            if isinstance(self, TorchCPUOpBuilder):
+                self.build_for_cpu = True
 
         self.jit_mode = True
         from torch.utils.cpp_extension import load
