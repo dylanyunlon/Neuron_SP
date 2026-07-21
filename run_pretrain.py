@@ -1257,6 +1257,37 @@ def run_desloc(args: argparse.Namespace) -> None:
         getattr(tc, 'micro_batch_size_per_gpu', 'default'),
     )
 
+    # ── Runtime config query: ask claude-hk-config for optimal parameters ──
+    # Rank 0 collects the hardware environment, sends it to a sub-Claude,
+    # and gets back concrete numbers. Other ranks receive via broadcast.
+    # Disabled by NEURON_SP_NO_RUNTIME_QUERY=1. Falls back to defaults on failure.
+    try:
+        from deepspeed.runtime.runtime_config_query import (
+            query_runtime_config, apply_overrides,
+        )
+        _n_params = sum(
+            cfg.get("hidden_size", 4096) ** 2 * 4  # rough per-layer param estimate
+            for _ in range(cfg.get("num_layers", 32))
+        ) + cfg.get("vocab_size", 32000) * cfg.get("hidden_size", 4096)
+        _overrides = query_runtime_config(
+            model_params=_n_params,
+            num_layers=cfg["num_layers"],
+            hidden_size=cfg["hidden_size"],
+            num_heads=cfg["num_heads"],
+            seq_len=args.seq_len,
+            vocab_size=cfg["vocab_size"],
+            target_batch_size=args.batch_size,
+            target_steps=args.steps,
+            gradient_checkpointing=getattr(args, "gradient_checkpointing", False),
+        )
+        if _overrides:
+            apply_overrides(tc, _overrides)
+            logger.info("runtime_config_query applied %d overrides", len(_overrides))
+        else:
+            logger.info("runtime_config_query returned no overrides; using defaults")
+    except Exception as _rcq_err:
+        logger.info("runtime_config_query unavailable (%s); using defaults", _rcq_err)
+
     # Seed CUDA RNG tracker BEFORE model creation.
     # GPTModel.__init__ (via TransformerLayer) calls CudaRNGStatesTracker.fork()
     # which requires 'model-parallel-rng' to be registered. Without this,

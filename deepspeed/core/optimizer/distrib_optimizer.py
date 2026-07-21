@@ -1677,6 +1677,41 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
     # ------------------------------------------------------------------
 
     @torch.no_grad()
+    def write_shard_to_model_local(self) -> None:
+        """Write this rank's FP32 shard to model BF16 — NO cross-rank broadcast.
+
+        DES-LOC non-Kx steps: each rank updates only its own portion of the
+        model from the local optimizer state.  The model becomes inconsistent
+        across ranks (each has only its shard updated), but this is correct
+        because the next forward pass uses the local model, and cross-rank
+        sync happens at the next Kx step via shard_to_model_broadcast().
+
+        This is the distrib_optimizer equivalent of
+        zero3_hetero_shard._write_shard_to_model() from the baseline path.
+        No NCCL calls, no staging buffers — just local FP32→BF16 copy.
+        """
+        dp_rank = self.data_parallel_rank
+        for fp32_shard, boundaries, buf in zip(
+                self._fp32_shards,
+                self._buf_boundaries,
+                self.param_and_grad_buffers,
+        ):
+            shard_start, shard_end = boundaries[dp_rank]
+            for param, (ps, pe, _) in buf.param_index_map.items():
+                owned_start = max(ps, shard_start)
+                owned_end = min(pe, shard_end)
+                if owned_end <= owned_start:
+                    continue
+                p_lo = owned_start - ps
+                p_hi = owned_end - ps
+                s_lo = owned_start - shard_start
+                s_hi = owned_end - shard_start
+                with torch.no_grad():
+                    src = fp32_shard[s_lo:s_hi].to(dtype=param.dtype)
+                    if src.device != param.device:
+                        src = src.to(device=param.device, non_blocking=True)
+                    param.data.view(-1)[p_lo:p_hi].copy_(src)
+
     def shard_to_model_broadcast(self) -> None:
         """Write local FP32 shard to BF16 model and broadcast to all ranks.
 
@@ -1773,66 +1808,132 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         # ----------------------------------------------------------------
         # Step 3: for each bucket, build flat BF16 buffer, fill owned slices,
         # all_reduce(SUM), scatter back to model params, refresh FP32 shards.
+        #
+        # Two paths: CPU-offload (A6000) and GPU-only (H100).
+        # CPU-offload path uses a pinned staging buffer to batch all PCIe
+        # transfers into exactly 2 per bucket (1 H2D + 1 D2H), instead of
+        # per-param synchronous copies that were causing 7x slowdown.
         # ----------------------------------------------------------------
         for bucket in buckets:
             total_bucket_elems: int = sum(pe - ps for _, ps, pe, *_ in bucket)
-            # Infer device from the first entry (all params in a training run
-            # live on the same device within a DP rank).
+
+            # flat buffer always on CUDA for NCCL all_reduce.
             _dev = bucket[0][6]
+            if not (isinstance(_dev, torch.device) and _dev.type == "cuda"):
+                _dev = torch.device(f"cuda:{torch.cuda.current_device()}")
             flat = torch.zeros(total_bucket_elems, dtype=torch.bfloat16,
                                device=_dev)
 
-            # Fill: this rank writes its owned portion into flat; rest = 0.
-            offset: int = 0
-            for param, ps, pe, shard_start, shard_end, fp32_shard, _device in bucket:
-                numel = pe - ps
+            # Detect CPU-offload: check if fp32_shard is on CPU.
+            # All params in a bucket share the same device (same DP rank),
+            # so checking the first entry suffices.
+            first_fp32_shard = bucket[0][5]
+            cpu_offload = first_fp32_shard.device.type == "cpu"
 
-                # Intersection of [ps, pe) with this rank's shard [shard_start, shard_end)
-                owned_start = max(ps, shard_start)
-                owned_end   = min(pe, shard_end)
-                if owned_end > owned_start:
-                    # Position inside the param tensor (buffer-local)
-                    p_lo = owned_start - ps
-                    p_hi = owned_end   - ps
-                    # Position inside the FP32 shard (shard-local)
-                    s_lo = owned_start - shard_start
-                    s_hi = owned_end   - shard_start
-                    # Write FP32 shard slice (cast to BF16) into the bucket buffer.
-                    flat[offset + p_lo:offset + p_hi].copy_(
-                        fp32_shard[s_lo:s_hi].bfloat16()
-                    )
+            if cpu_offload:
+                # ----------------------------------------------------------
+                # CPU-offload path: assemble staging buffer on CPU, then
+                # do ONE H2D transfer for the whole bucket.
+                # ----------------------------------------------------------
+                staging_cpu = torch.zeros(total_bucket_elems,
+                                          dtype=torch.bfloat16,
+                                          pin_memory=True)
 
-                offset += numel
+                # Fill owned positions in the CPU staging buffer (no PCIe).
+                offset: int = 0
+                for param, ps, pe, shard_start, shard_end, fp32_shard, _device in bucket:
+                    numel = pe - ps
+                    owned_start = max(ps, shard_start)
+                    owned_end   = min(pe, shard_end)
+                    if owned_end > owned_start:
+                        p_lo = owned_start - ps
+                        p_hi = owned_end   - ps
+                        s_lo = owned_start - shard_start
+                        s_hi = owned_end   - shard_start
+                        # Pure CPU copy: FP32→BF16, no PCIe.
+                        staging_cpu[offset + p_lo:offset + p_hi].copy_(
+                            fp32_shard[s_lo:s_hi].bfloat16()
+                        )
+                    offset += numel
 
-            # ONE all_reduce for the entire bucket — reduces NCCL call count
-            # from O(num_buffers) to O(total_bytes / BUCKET_BYTES).
-            torch.distributed.all_reduce(
-                flat,
-                op=torch.distributed.ReduceOp.SUM,
-                group=self.data_parallel_group,
-            )
+                # ONE H2D transfer for the entire bucket.
+                flat.copy_(staging_cpu, non_blocking=True)
+                torch.cuda.synchronize()  # ensure GPU sees data before NCCL
 
-            # Scatter bucket back to model param tensors and refresh FP32 shard.
-            offset = 0
-            for param, ps, pe, shard_start, shard_end, fp32_shard, _device in bucket:
-                numel = pe - ps
-                param_slice = flat[offset:offset + numel]
+                # NCCL all_reduce on CUDA (one call per bucket).
+                torch.distributed.all_reduce(
+                    flat,
+                    op=torch.distributed.ReduceOp.SUM,
+                    group=self.data_parallel_group,
+                )
 
-                # Update model BF16 param in-place.
-                param.data.view(-1).copy_(param_slice)
+                # ONE D2H transfer: bring the all_reduced result back to CPU.
+                result_cpu = staging_cpu  # reuse pinned buffer
+                result_cpu.copy_(flat, non_blocking=True)
+                torch.cuda.synchronize()  # ensure CPU sees data before scatter
 
-                # Refresh the FP32 shard for the owned slice so the master
-                # weights stay consistent with the all_reduced result.
-                owned_start = max(ps, shard_start)
-                owned_end   = min(pe, shard_end)
-                if owned_end > owned_start:
-                    p_lo = owned_start - ps
-                    p_hi = owned_end   - ps
-                    s_lo = owned_start - shard_start
-                    s_hi = owned_end   - shard_start
-                    fp32_shard[s_lo:s_hi].copy_(param_slice[p_lo:p_hi].float())
+                # Scatter: update model BF16 params (on GPU) and fp32_shards
+                # (on CPU) from the result buffers.
+                offset = 0
+                for param, ps, pe, shard_start, shard_end, fp32_shard, _device in bucket:
+                    numel = pe - ps
+                    # Model param lives on GPU — copy from CUDA flat directly.
+                    param.data.view(-1).copy_(flat[offset:offset + numel])
 
-                offset += numel
+                    # Refresh CPU fp32_shard from the pinned CPU result buffer.
+                    owned_start = max(ps, shard_start)
+                    owned_end   = min(pe, shard_end)
+                    if owned_end > owned_start:
+                        p_lo = owned_start - ps
+                        p_hi = owned_end   - ps
+                        s_lo = owned_start - shard_start
+                        s_hi = owned_end   - shard_start
+                        # Pure CPU copy: BF16→FP32, no PCIe.
+                        fp32_shard[s_lo:s_hi].copy_(
+                            result_cpu[offset + p_lo:offset + p_hi].float()
+                        )
+                    offset += numel
+
+            else:
+                # ----------------------------------------------------------
+                # GPU-only path: fp32_shard is already on CUDA.
+                # Behaviour identical to original code; no staging needed.
+                # ----------------------------------------------------------
+                offset: int = 0
+                for param, ps, pe, shard_start, shard_end, fp32_shard, _device in bucket:
+                    numel = pe - ps
+                    owned_start = max(ps, shard_start)
+                    owned_end   = min(pe, shard_end)
+                    if owned_end > owned_start:
+                        p_lo = owned_start - ps
+                        p_hi = owned_end   - ps
+                        s_lo = owned_start - shard_start
+                        s_hi = owned_end   - shard_start
+                        flat[offset + p_lo:offset + p_hi].copy_(
+                            fp32_shard[s_lo:s_hi].bfloat16()
+                        )
+                    offset += numel
+
+                torch.distributed.all_reduce(
+                    flat,
+                    op=torch.distributed.ReduceOp.SUM,
+                    group=self.data_parallel_group,
+                )
+
+                offset = 0
+                for param, ps, pe, shard_start, shard_end, fp32_shard, _device in bucket:
+                    numel = pe - ps
+                    param_slice = flat[offset:offset + numel]
+                    param.data.view(-1).copy_(param_slice)
+                    owned_start = max(ps, shard_start)
+                    owned_end   = min(pe, shard_end)
+                    if owned_end > owned_start:
+                        p_lo = owned_start - ps
+                        p_hi = owned_end   - ps
+                        s_lo = owned_start - shard_start
+                        s_hi = owned_end   - shard_start
+                        fp32_shard[s_lo:s_hi].copy_(param_slice[p_lo:p_hi].float())
+                    offset += numel
 
     # ------------------------------------------------------------------
     # Zero grad

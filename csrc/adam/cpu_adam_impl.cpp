@@ -272,7 +272,10 @@ int ds_adam_step(int optimizer_id,
 
 // Per-optimizer prefetch state (keyed by optimizer_id).
 // Initialised lazily on first call; destroyed by destroy_adam_optimizer.
+// Only available when CUDA headers are present (PrefetchState uses CUDA APIs).
+#if CPU_ADAM_TIER_HAS_CUDA
 static std::unordered_map<int, std::unique_ptr<PrefetchState>> s_prefetch_states;
+#endif
 
 int ds_adam_step_tier(int optimizer_id,
                       size_t step,
@@ -322,8 +325,11 @@ int ds_adam_step_tier(int optimizer_id,
 
     // ── 5. Async prefetch path ─────────────────────────────────────────────
     // Only applies when gradients live on a CUDA device AND prefetch is enabled.
+    // PrefetchState requires CUDA runtime APIs (cudaHostAlloc, cudaMemcpyAsync, etc.)
+    // so this entire block is guarded.
     const bool grads_on_gpu = grads_c.is_cuda();
 
+#if CPU_ADAM_TIER_HAS_CUDA
     if (enable_prefetch && grads_on_gpu) {
         // Lazy-init PrefetchState for this optimizer.
         auto& pf_ptr = s_prefetch_states[optimizer_id];
@@ -386,6 +392,7 @@ int ds_adam_step_tier(int optimizer_id,
         }
         // Fall through to synchronous path if prefetch init failed.
     }
+#endif  // CPU_ADAM_TIER_HAS_CUDA
 
     // ── 6. Synchronous fallback (no prefetch or params already on CPU) ──────
     // If grads are on GPU without prefetch, we must pull them first.

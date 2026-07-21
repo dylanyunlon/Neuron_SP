@@ -751,17 +751,65 @@ def clip_grad_norm(
     # ------------------------------------------------------------------
     # Step 2: Compute global gradient norm
     # ------------------------------------------------------------------
-    grads: List[torch.Tensor] = []
-    for p in parameters:
-        g = _get_grad(p, use_decoupled_grad=use_decoupled_grad)
-        if g is not None:
-            grads.append(g.detach().float())
+    # Memory-efficient path: compute norm incrementally (one grad at a time)
+    # instead of collecting all FP32 grads into a list.  On A6000 (47 GB)
+    # the full-model BF16 + ZeRO-3 shard + activations already consume
+    # ~46 GB; collecting all grads as FP32 would require an extra ~10 GB
+    # peak allocation, causing OOM.  The incremental path needs only ~170 MB
+    # (one parameter's FP32 grad) at any time.
+    _norm_type_f = float(norm_type)
+    device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 
-    total_norm = get_grad_norm_fp32(
-        grads,
-        norm_type=norm_type,
-        grad_stats_parallel_group=grad_stats_parallel_group,
-    )
+    if _norm_type_f == float('inf'):
+        # Infinity norm: running max, no list accumulation needed.
+        total_norm_val = torch.tensor(0.0, device=device, dtype=torch.float32)
+        for p in parameters:
+            g = _get_grad(p, use_decoupled_grad=use_decoupled_grad)
+            if g is not None:
+                g_max = g.detach().float().abs().max()
+                total_norm_val = torch.maximum(total_norm_val, g_max)
+        total_norm_val = total_norm_val.unsqueeze(0)
+        if grad_stats_parallel_group is not None and torch.distributed.is_initialized():
+            torch.distributed.all_reduce(
+                total_norm_val,
+                op=torch.distributed.ReduceOp.MAX,
+                group=grad_stats_parallel_group,
+            )
+        total_norm = total_norm_val.squeeze(0)
+    elif _norm_type_f == 2.0:
+        # L2 norm: accumulate squared norms incrementally.
+        total_norm_sq = torch.tensor(0.0, device=device, dtype=torch.float32)
+        for p in parameters:
+            g = _get_grad(p, use_decoupled_grad=use_decoupled_grad)
+            if g is not None:
+                g_fp32 = g.detach().float()
+                total_norm_sq = total_norm_sq + g_fp32.norm(2.0).square()
+                del g_fp32  # free immediately
+        total_norm_sq = total_norm_sq.unsqueeze(0)
+        if grad_stats_parallel_group is not None and torch.distributed.is_initialized():
+            torch.distributed.all_reduce(
+                total_norm_sq,
+                op=torch.distributed.ReduceOp.SUM,
+                group=grad_stats_parallel_group,
+            )
+        total_norm = total_norm_sq.squeeze(0).sqrt()
+    else:
+        # General Lp norm: accumulate p-th powers incrementally.
+        total_norm_p = torch.tensor(0.0, device=device, dtype=torch.float32)
+        for p_param in parameters:
+            g = _get_grad(p_param, use_decoupled_grad=use_decoupled_grad)
+            if g is not None:
+                g_fp32 = g.detach().float()
+                total_norm_p = total_norm_p + g_fp32.norm(_norm_type_f).pow(_norm_type_f)
+                del g_fp32
+        total_norm_p = total_norm_p.unsqueeze(0)
+        if grad_stats_parallel_group is not None and torch.distributed.is_initialized():
+            torch.distributed.all_reduce(
+                total_norm_p,
+                op=torch.distributed.ReduceOp.SUM,
+                group=grad_stats_parallel_group,
+            )
+        total_norm = total_norm_p.squeeze(0).pow(1.0 / _norm_type_f)
 
     # Update EMA tracker if provided (DES-LOC M4309)
     if norm_ema is not None:

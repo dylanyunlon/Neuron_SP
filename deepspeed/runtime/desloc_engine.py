@@ -2705,13 +2705,33 @@ class DesLocEngine:
                 _profiler.end("optim_prepare_grads")
 
                 if not _should_skip:
-                    # Normal path: Adam update on FP32 shards
+                    # ── DES-LOC async optimizer: non-Kx steps skip NCCL broadcast ──
+                    # On non-Kx steps, each rank does a LOCAL Adam update + local
+                    # FP32→BF16 write.  No cross-rank sync — this is the core of
+                    # DES-LOC's decomposed synchronization.  H100 doesn't wait for
+                    # A6000's slow CPUAdam to finish because there's no NCCL barrier.
+                    # On Kx steps, the full shard_to_model_broadcast runs to reconcile
+                    # all ranks' model weights.
+                    _is_Kx_this_step = (step + 1) % self.desloc_Kx == 0
+
+                    # Tell step_with_ready_grads to skip its internal broadcast
+                    self._dist_optimizer._defer_param_sync = not _is_Kx_this_step
+
                     _profiler.begin("optim_adam_step")
-                    logger.warning("rank=%d: ENTERING optimizer step_with_ready_grads", dist.get_rank() if dist.is_initialized() else 0)
+                    logger.warning("rank=%d: ENTERING optimizer step_with_ready_grads (Kx=%s)",
+                                   dist.get_rank() if dist.is_initialized() else 0, _is_Kx_this_step)
                     self._dist_optimizer.step_with_ready_grads()
                     self.scheduler.step()
                     _profiler.end("optim_adam_step")
                     logger.warning("rank=%d: EXITED optimizer step_with_ready_grads", dist.get_rank() if dist.is_initialized() else 0)
+
+                    # Non-Kx step: local write only (no NCCL, no waiting)
+                    if not _is_Kx_this_step:
+                        self._dist_optimizer.write_shard_to_model_local()
+                    # Kx step: step_with_ready_grads already did the full broadcast
+
+                    # Reset the flag
+                    self._dist_optimizer._defer_param_sync = False
                 else:
                     # Skip path: zero grad shards so Adam state isn't corrupted,
                     # but still enter the all-gather (collective #2) so all ranks

@@ -46,7 +46,35 @@
 
 #pragma once
 
+// ---------------------------------------------------------------------------
+// CUDA availability guard.  When compiled with with_cuda=False (pure C++
+// CPU Adam path), cuda_runtime.h is not on the include path.  We detect
+// this via __CUDACC__ (nvcc) or the presence of CUDA_VERSION (set by
+// cuda_runtime.h when it has been included transitively).  If neither is
+// defined, we provide lightweight stubs for the types and functions used
+// below so that the enums, constants, and CPU-only code paths compile.
+// The CUDA-dependent structs (PrefetchState) and functions
+// (detect_sm_version) are guarded out entirely in CPU-only mode.
+// ---------------------------------------------------------------------------
+// __has_include is C++17 and supported by GCC 5+, Clang 3.0+, MSVC 2015u2+.
+// Guard it for maximum portability.
+#ifdef __has_include
+#define _CPU_ADAM_CHECK_CUDA_HDR __has_include(<cuda_runtime.h>)
+#else
+#define _CPU_ADAM_CHECK_CUDA_HDR 0
+#endif
+#if defined(__CUDACC__) || defined(CUDA_VERSION) || _CPU_ADAM_CHECK_CUDA_HDR
+#define CPU_ADAM_TIER_HAS_CUDA 1
 #include <cuda_runtime.h>
+#else
+#define CPU_ADAM_TIER_HAS_CUDA 0
+// Minimal stubs so enums and constants compile without CUDA headers.
+typedef int   cudaError_t;
+typedef void* cudaEvent_t;
+typedef void* cudaStream_t;
+static constexpr int cudaSuccess = 0;
+#endif
+
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -101,6 +129,7 @@ inline AdamOffloadStrategy tier_to_strategy(GpuTier tier)
 // Detect SM version of the current (or specified) CUDA device.
 // Returns 0 on failure (no CUDA device, or CUDA not available).
 // ─────────────────────────────────────────────────────────────────────────────
+#if CPU_ADAM_TIER_HAS_CUDA
 inline int detect_sm_version(int device_id = -1)
 {
     int dev = device_id;
@@ -111,11 +140,16 @@ inline int detect_sm_version(int device_id = -1)
     if (cudaGetDeviceProperties(&prop, dev) != cudaSuccess) return 0;
     return prop.major * 10 + prop.minor;  // e.g. SM 9.0 → 90
 }
+#else
+inline int detect_sm_version(int /*device_id*/ = -1) { return 0; }
+#endif
 
 // ─────────────────────────────────────────────────────────────────────────────
 // PrefetchState: double-buffered pinned memory + events for async D2H
 // Used by SM 8.6 (CPU_OFFLOAD) and SM 9.0 (HYBRID) paths.
+// Only available when CUDA headers are present.
 // ─────────────────────────────────────────────────────────────────────────────
+#if CPU_ADAM_TIER_HAS_CUDA
 struct PrefetchState {
     // Pinned host buffers (ping / pong).
     void*        buf[2]         = {nullptr, nullptr};
@@ -215,6 +249,7 @@ struct PrefetchState {
 
     void flip_phase() { phase ^= 1; }
 };
+#endif  // CPU_ADAM_TIER_HAS_CUDA
 
 // ─────────────────────────────────────────────────────────────────────────────
 // TierAwareAdamConfig: bundled config passed into tier-dispatching entry point
