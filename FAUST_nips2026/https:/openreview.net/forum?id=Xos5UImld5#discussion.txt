@@ -1,0 +1,132 @@
+Official Review of Submission15696 by Reviewer W6az
+Official Reviewby Reviewer W6az26 Jun 2026, 19:15 (modified: 23 Jul 2026, 22:56)Program Chairs, Senior Area Chairs, Area Chairs, Reviewers Submitted, Authors, Reviewer W6azRevisions
+Summary:
+This work addresses the fundamental challenge of reducing communication overhead in distributed foundation model training while preserving convergence and training quality. The paper presents FAUST, a system that integrates compiler-level sequence parallelism (SP), asynchronous multi-timescale synchronization of optimizer states, staggered synchronization frequencies for parameters, first moments, and second moments, together with a convergence analysis that provides theoretical justification for the proposed synchronization schedule. The key idea is that optimizer states evolve on different timescales and therefore do not require synchronization at the same frequency. Specifically, FAUST synchronizes model parameters every 
+ iterations, first moments every 3
+ iterations, and second moments every 6
+ iterations, while compiler-generated sequence parallelism handles the mandatory intra-step communication. Experiments are conducted on GPT-style language models with up to approximately 1.3 billion parameters and compare FAUST against DDP, Local Adam, and several recent communication-efficient training methods.
+
+Contribution Type: General: Most submissions will fall into this type.
+Strengths And Weaknesses:
+Strengths:
+
+The integration of compiler-level graph rewriting, sequence parallelism, optimizer-state synchronization, and runtime scheduling is more comprehensive than in many previous works. Rather than introducing yet another optimizer, the paper presents an end-to-end distributed training system that jointly optimizes multiple aspects of the training pipeline.
+Unlike many systems papers, the authors provide a convergence analysis for staggered synchronization frequencies. Although I have concerns about the rigor of the analysis, the inclusion of a theoretical component is a notable strength.
+The compiler implementation appears to be substantial, incorporating FX graph rewriting, shape propagation, activation checkpointing, and sequence-parallel graph transformations. Implementing and integrating these components likely required considerable engineering effort.
+Weaknesses:
+
+The primary novelty of this paper lies in assigning different synchronization frequencies to different optimizer states. Although this is a practical and useful idea, it appears to represent an engineering refinement rather than a fundamentally new algorithmic contribution. Likewise, the compiler integration primarily demonstrates strong system engineering rather than introducing a new conceptual framework.
+Many of the theoretical claims appear to rely on assumptions that are specifically tailored to FAUST rather than being generally applicable (e.g., Assumption 3.2 on sequence-parallel variance decomposition, Assumption 3.3 on Lyapunov-based heterogeneity decomposition, half-life weighting, and probabilistic synchronization equivalence). This makes it difficult to assess the generality and practical significance of the theoretical guarantees.
+Several assumptions are introduced without sufficient justification. For example, the claim that the variance is reduced by a factor of 1/P is treated almost as a theorem, even though it depends critically on statistical independence assumptions that generally do not hold in transformer attention.
+Additionally, the Lyapunov decomposition appears to be custom-designed for the proof. While the convergence theorem is mathematically sophisticated, it remains unclear whether it offers a substantive theoretical advance beyond existing analyses of Local Adam or merely repackages them under stronger and more specialized assumptions.
+Several important baselines are missing or only partially discussed, including ZeRO communication variants, FSDP variants, newer asynchronous distributed optimizers, and recent methods for reducing optimizer-state communication. Consequently, the paper does not convincingly establish the empirical position of FAUST relative to the current state of the art.
+Quality: 3: good
+Clarity: 2: not good
+Significance: 3: good
+Originality: 3: good
+Questions:
+Why are 
+ = 3
+ and 
+ = 6
+ chosen as the synchronization frequencies? Have you explored alternative ratios or adaptive synchronization schedules?
+The convergence proof relies heavily on Assumptions 3.2 and 3.3. How realistic are these assumptions in the context of transformer pretraining?
+Can you provide empirical evidence validating the claimed variance reduction achieved by sequence parallelism?
+Does the stability of the exponential moving averages (EMAs) persist under aggressive learning-rate decay or warm restarts?
+What additional GPU memory overhead is incurred by maintaining asynchronous optimizer-state buffers?
+How much of the reported speedup is attributable to sequence parallelism itself, as opposed to the staggered synchronization strategy?
+Can the synchronization schedule be learned or adapted automatically instead of being manually specified?
+Limitations:
+The paper discusses several directions for future work but does not sufficiently acknowledge important practical limitations. These include evaluation on relatively modest-scale models, reliance on simulated bandwidth experiments for many of the headline communication results, the heuristic selection of synchronization frequencies, dependence on strong theoretical assumptions, limited evaluation across different optimizers, and limited discussion of deployment complexity in heterogeneous cluster environments.
+
+Rating: 3: Borderline reject: Technically solid paper where reasons to reject, e.g., limited evaluation, outweigh reasons to accept, e.g., good evaluation. Please use sparingly.
+Confidence: 4: You are confident in your assessment, but not absolutely certain. It is unlikely, but not impossible, that you did not understand some parts of the submission or that you are unfamiliar with some pieces of related work.
+Ethical Concerns: NO or VERY MINOR ethics concerns only
+Paper Formatting Concerns:
+The manuscript appears to be consistent with the NeurIPS formatting guidelines.
+
+Code Of Conduct Acknowledgement: Yes
+Responsible Reviewing Acknowledgement: Yes
+Add:
+Official Review of Submission15696 by Reviewer pxxL
+Official Reviewby Reviewer pxxL25 Jun 2026, 22:34 (modified: 23 Jul 2026, 22:56)Program Chairs, Senior Area Chairs, Area Chairs, Reviewers Submitted, Authors, Reviewer pxxLRevisions
+Summary:
+FAUST is a training framework for LLMs that lowers comms overhead by merging the benefits of sequence parallelism with a structured approach to reducing optimizer state exchange (less frequent, tiered sync). The work claims to cut communication overhead by up to 303x vs DDP. It achieves this with a perplexity gap of 4.6% and even dropping wall clock time by around 27%. FAUST’s core contribution is as a orchestrated LLM training framework that combines sequence parallelism with independently staggered synchronization.
+
+Contribution Type: General: Most submissions will fall into this type.
+Strengths And Weaknesses:
+The strongest positives about this work include:
+
+motivation/problem statement is excellent. I'm fully onboard with the need for this work.
+Approach is a blend of systems and optimization improvements -- I believe that more works need to dig into the gains possible when combining these two directions for efficiency improvments. So this work contributes in highlighting what can be done for works of these kinds.
+Claims of very strong performance are exciting if they are sufficiently supported by the experiments and comparisons.
+The issues I would point out are:
+
+there appears to be a large difference in the reported top-line performance gains, and those that are reported in the practical experiments (btw -- DES-LOC paper doesn't seem to be cleanly found in the references). what i mean here is that in the abstract gains of 303x are mentioned and various very high improvements. however, when looking at the practical experiments we see improvments that are far less, and these quoted gains are typically with respect to DDP. while the sentences are technically correct in the paper, i believe there are more appropriate wordings to describe the observed results and to include comparisons against methods of its kind in some of these comparisons.
+
+the analysis presents some strong assumptions -- for instance, SP-structured noise, tier-decomposed descent, and Lyapunov-decaying heterogeneity. To me it doesn't appear the evidence for all of these assumptions being correct and always holding in various settings are consistently strong.
+
+Quality: 3: good
+Clarity: 3: good
+Significance: 3: good
+Originality: 3: good
+Questions:
+How should the headline 303× improvement be interpreted relative to the much smaller measured end-to-end gains? The paper reports 1.23× throughput at 1.3B scale, 1.5–2.4× projected wall-clock gains in Table 1, and 9.42× in the measured 10 Gbps experiment.
+
+Can the authors provide empirical evidence that the main theoretical assumptions hold during LLM training?
+
+Limitations:
+The largest speedups appear to arise in modeled or highly bandwidth-constrained settings, while the practical end-to-end gains on the evaluated systems are more modest.
+
+Most training experiments use IID data across sites.
+
+There is a large gap between the convergence theory studies and the implementation.
+
+Rating: 5: Accept: Technically solid paper, with high potential value on at least one sub-area of AI or moderate-to-high impact on more than one area of AI, with good-to-excellent evaluation, resources, reproducibility, and no unaddressed ethical considerations.
+Confidence: 4: You are confident in your assessment, but not absolutely certain. It is unlikely, but not impossible, that you did not understand some parts of the submission or that you are unfamiliar with some pieces of related work.
+Ethical Concerns: NO or VERY MINOR ethics concerns only
+Paper Formatting Concerns:
+Nothing specific
+
+Code Of Conduct Acknowledgement: Yes
+Responsible Reviewing Acknowledgement: Yes
+Add:
+Official Review of Submission15696 by Reviewer A2WR
+Official Reviewby Reviewer A2WR15 Jun 2026, 12:06 (modified: 23 Jul 2026, 22:56)Program Chairs, Senior Area Chairs, Area Chairs, Reviewers Submitted, Authors, Reviewer A2WRRevisions
+Summary:
+In this paper, the authors proposes FAUST, which has two main components: (1) compile-time sequence-parallel graph rewriting aimed to speed up training on long-context data, and (2) tiered runtime synchronization which assigns different averaging periods for different optimizer states based on their different half-lives. FAUST also has a collective fense to ensure the communications for DP and SP do not interfere with each other. Convergence analysis and experiment results are provided to showcase the theoretical and empirical effectiveness of FAUST.
+
+Contribution Type: General: Most submissions will fall into this type.
+Strengths And Weaknesses:
+Strengths:
+
+Lifting sequence parallel into Pytorch’s compiler tasks is useful in practice.
+The collective fence is also a good engineering idea to safely combining DP with SP for efficient long-context model training.
+The paper has serious theoretical analysis.
+Weaknesses:
+
+The main concern I have is the overclaim of the contributions of the paper, as many contributions authors mentioned in the abstract and the paper are actually from the DES-LOC paper [1]. For example, DES-LOC already proposed independent synchronization periods for different optimizer states and used half-life argument to state that the states with high beta values change slowly, so they can be synchronized less often. Therefore, I feel like the contribution of this paper is over-claimed as it is more like an incremental work on top of DES-LOC in the engineering aspect (SP optimization and fencing). This concern significantly impacts my current decision of reject for this paper. [Side note: Even worse, the DES-LOC paper, though mentioned many times in the paper, is not even included in the reference list of the paper. (The DES-LOC is accepted at ICLR and was on Arxiv 2025, so there is no reason that it’s not available for citation during the NeurIPS submission.)]
+The description of the experiment results are confusing and misleading. In the abstract the authors mentioned “experiments on language models up to 1.3B parameters”, also, in the first paragraph of Section 4, they mentioned the architecture are listed in Table 4, which only contains models up to 1.3B, but in the paper, the authors mentioned model sizes of 1.7B (e.g, lines 205 and 209), 700M (line 214). In addition, Table 1 mentioned model sizes of 1B/7B/13B - what are these models? With these, why do the authors state “up to 1.3B”? Also, in contribution 2, the authors mentioned, “On a 700M model, …, (Figure 1)”, but the caption of Figure 1 mentioned the model size is 1.3B. All of these results and experiment settings are so messed up, which significantly confused the readers.
+Another very misleading overclaim is the speed up. In line 1388-1389 (Appendix F.2), the authors mentioned that “The 170x number reported in the main text refers to communication volume reduction, not the wall-clock speedup”, therefore, the 303x number (which is translated from 170x with an additional 1.78x per-step speedup at line 251) is also the comm vol reduction. However, in the main text, the authors mentioned that as a speedup, this is a very misleading inconsistency and flaw of the paper.
+[1] Iacob, Alex, Lorenzo Sani, Mher Safaryan, Paris Giampouras, Samuel Horváth, Andrej Jovanovic, Meghdad Kurmanji et al. "Des-loc: Desynced low communication adaptive optimizers for training foundation models." arXiv preprint arXiv:2505.22549 (2025).
+
+Quality: 1: poor
+Clarity: 1: poor
+Significance: 3: good
+Originality: 2: not good
+Questions:
+Could the authors clearly state the contributions of FAUST on top of DES-LOC and cite it properly?
+Could the authors better describe the experiment results?
+Could the authors clarify the differences between the reduction in communication volume and speed up when showing the experiment results?
+Overall, I believe the paper contains some good core ideas, but it is very clear that the paper is prepared in a rush, as indicated by the weaknesses mentioned above, which significantly reduce the soundness of the paper to the audience. There are other parts in the paper indicating the same thing when I skimmed through the Appendix, for example, Appendix C1 and C2 are almost the same with same titles. Therefore, I strongly suggest authors to carefully review the paper overall to improve its clearness, consistency, and persuasiveness.
+Limitations:
+Yes.
+
+Rating: 2: Reject: For instance, a paper with technical flaws, weak evaluation, inadequate reproducibility and incompletely addressed ethical considerations.
+Confidence: 3: You are fairly confident in your assessment. It is possible that you did not understand some parts of the submission or that you are unfamiliar with some pieces of related work. Math/other details were not carefully checked.
+Ethical Concerns: NO or VERY MINOR ethics concerns only
+Paper Formatting Concerns:
+N/A.
+
+Code Of Conduct Acknowledgement: Yes
+Responsible Reviewing Acknowledgement: Yes
