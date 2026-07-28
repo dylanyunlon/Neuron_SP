@@ -67,3 +67,11 @@ venv
 ## Claude HK dispatcher
 .claude-hk-config/
 submodel_response_*.txt
+*.aux
+*.fls
+*.fdb_latexmk
+*.log
+*.pdf
+*.out
+*.toc
+*.synctex.gz
