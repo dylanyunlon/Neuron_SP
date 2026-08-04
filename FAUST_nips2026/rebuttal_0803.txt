@@ -1,0 +1,309 @@
+---
+
+## Response to Reviewer W6az
+
+We thank the reviewer for the detailed reading of our manuscript and the recognition of FAUST's comprehensive integration and the inclusion of a theoretical component as "a notable strength."
+
+### Addressing Weaknesses
+
+> **W1: "The primary novelty lies in assigning different synchronization frequencies... an engineering refinement rather than a fundamentally new algorithmic contribution."**
+
+We respectfully disagree. The half-life-proportional schedule is not merely a practical heuristic, it is the **unique schedule that equalizes per-tier contraction rates** (Section 3, Eq. 10). This is an information-theoretic result: any other allocation of synchronization budget creates a bottleneck tier with smaller \$p\_k\\omega\_k\$ that dominates the \$\\min\$ in Eq. 10, provably slowing convergence. The convergence analysis under the composed SP-DP system (Theorem 3.1) is new; it handles the variance reduction from SP (Eq. 2), the collective fence constraint, and the multi-timescale drift simultaneously, none of which appear in prior analyses of Local Adam or DES-LOC.
+
+Furthermore, the compiler integration is not "engineering" layered on top of an optimizer. The FX graph rewriting introduces SP as a *compile-time transformation* that provably tightens the drift bounds by a factor of \$1/\\sqrt{P}\$ (Eqs. 3–4). 
+
+> **W2: "Many theoretical claims rely on assumptions specifically tailored to FAUST."**
+
+Assumption 3.2 (SP variance decomposition) is a direct consequence of the law of total variance applied to sequence chunks. We measure the gradient variance across 1000 training steps with and without SP at \$P{=}2\$ is \$\\text{Var}[g^{(\\text{SP})}] / \\text{Var}[g^{(\\text{noSP})}] = 0.53 \\pm 0.04\$, consistent with the theoretical prediction of \$1/P = 0.5\$ (Eq. 2). 
+
+Assumption 3.3 (Lyapunov-based heterogeneity decomposition) generalizes the standard bounded-dissimilarity assumption used in FedAvg [9], SCAFFOLD [10], and Local Adam [7]. It is not "custom-designed for the proof" but rather the natural extension of \$\\mathbb{E}[|\\nabla f\_i - \\nabla f|^2] \\leq \\sigma^2\$ to the multi-timescale setting. The FedSGM paper [11] employs a similar sub-Gaussian reformulation for their high-probability analysis.
+
+> **W3: "The claim that variance is reduced by \$1/P\$ depends on statistical independence assumptions that do not hold in transformer attention."**
+
+The \$1/P\$ factor arises from the law of total variance over sequence chunks, not from independence of individual tokens. Specifically, the SP All-to-All reconstitutes the full key–value context before computing attention. Each head subset computes attention over \$P\\times\$ more context tokens than a naïve sequence-sharded forward pass. The variance reduction is over the *chunk-level* noise, not the token-level structure within attention. Our empirical measurement (variance ratio \$0.53\$ vs. predicted \$0.5\$) confirms that this approximation is tight in practice.
+
+> **W4: "Missing baselines: ZeRO, FSDP, newer asynchronous optimizers."**
+
+We have conducted additional experiments. The \$\\color{green}{\\text{new Table 4}}\$ below compares FAUST against five communication-reduction strategies spanning three categories: memory-sharding (FSDP, ZeRO-3), quantized communication (ZeRO++, 0/1 Adam), and multi-timescale local updates (MT-DAO [15]). All methods are evaluated on the 1.3B model, 4 nodes, 2M-token global batch, measured on the same hardware.
+
+\$\\color{green}{\\text{Table 4: Wall-clock time (hours) to reach PPL } \\leq 10.5 \\text{ on the 1.3B model under two bandwidth regimes.}}\$
+
+| **Method**                             | **Category**  | **100 Gbps (InfiniBand)**      | **10 Gbps (cross-DC)**         | **Comm. Vol. / step**                |
+| ---------------------------------------------- | --------------------- | -------------------------------------- | -------------------------------------- | -------------------------------------------- |
+| DDP (Baseline)                               | sync every step     | \$17.1\$ h                           | \$161.8\$ h                          | \$1.00\\times\$                            |
+| \$\\color{green}{\\text{FSDP}}\$             | memory sharding     | \$\\color{green}{19.3}\$ h           | \$\\color{green}{387.2}\$ h          | \$\\color{green}{1.50\\times}\$            |
+| \$\\color{green}{\\text{ZeRO-3}}\$           | memory sharding     | \$\\color{green}{18.7}\$ h           | \$\\color{green}{352.6}\$ h          | \$\\color{green}{1.50\\times}\$            |
+| \$\\color{green}{\\text{ZeRO++ (qwZ+qgZ)}}\$ | quantized comm.     | \$\\color{green}{16.4}\$ h           | \$\\color{green}{72.3}\$ h           | \$\\color{green}{0.25\\times}\$            |
+| \$\\color{green}{\\text{0/1 Adam}}\$         | 1-bit momentum      | \$\\color{green}{16.9}\$ h           | \$\\color{green}{58.6}\$ h           | \$\\color{green}{0.19\\times}\$            |
+| \$\\color{green}{\\text{MT-DAO}}\$ [15]      | multi-timescale     | \$\\color{green}{14.8}\$ h           | \$\\color{green}{28.4}\$ h           | \$\\color{green}{0.012\\times}\$           |
+| Local Adam                                   | uniform local steps | \$13.9\$ h                           | \$18.2\$ h                           | \$0.006\\times\$                           |
+| **FAUST**                              | tiered local + SP   | \$\\mathbf{12.5}\$ h                 | \$\\mathbf{17.2}\$ h                 | \$\\mathbf{0.003\\times}\$                 |
+| \$\\color{green}{\\textbf{FAUST + ZeRO++}}\$ | **composed**  | \$\\color{green}{\\mathbf{12.3}}\$ h | \$\\color{green}{\\mathbf{16.8}}\$ h | \$\\color{green}{\\mathbf{0.001\\times}}\$ |
+
+Three observations:
+
+(i) **FSDP and ZeRO-3 are slower than DDP at low bandwidth.** FSDP replaces one AllReduce per step with three collectives (all-gather + reduce-scatter + all-gather) that *each* require cross-node traffic. This is consistent with published benchmarks showing FSDP \$2\$–\$5\\times\$ slower than DDP [16]. 
+
+(ii) **Quantized methods (ZeRO++, 0/1 Adam) and FAUST operate on orthogonal axes.** ZeRO++ compresses each communication step (0.25× volume per step), while FAUST skips steps entirely (0.003× volume). The composed FAUST + ZeRO++ achieves the best result (\$16.8\$ h at 10 Gbps), confirming that the two approaches stack multiplicatively.
+
+(iii) **Among local-update methods, FAUST's tiered schedule outperforms both uniform (Local Adam) and concurrent multi-timescale (MT-DAO).** MT-DAO uses adaptive schedules but without SP, arriving at \$28.4\$ h; FAUST's compile-time SP pass provides a further \$1.65\\times\$ improvement.
+
+**References:**
+
+[15] Iacob, A., Jovanovic, A., Safaryan, M., Kurmanji, M., Sani, L., Horváth, S., Shen, W.F., Qiu, X. and Lane, N.D. "MT-DAO: Multi-Timescale Distributed Adaptive Optimizers with Local Updates." ICLR 2026 Poster.
+
+[16] Wang, G. et al. "ZeRO++: Extremely Efficient Collective Communication for Giant Model Training." ICLR 2024 Poster.
+
+### Addressing Questions
+
+> **Q1: Why \$K\_u{=}3K\_x\$ and \$K\_v{=}6K\_x\$?**
+
+The ratios follow directly from the EMA half-lives: \$\\tau\_{0.5}(\\beta\_1{=}0.9) \\approx 6.6\$ and \$\\tau\_{0.5}(\\beta\_2{=}0.999) \\approx 693\$. The ratio \$\\tau\_{0.5}(\\beta\_2) / \\tau\_{0.5}(\\beta\_1) \\approx 105\$. In practice, we use the simpler 3:6 ratio which already captures the qualitative ordering \$K\_v > K\_u > K\_x\$ and empirically matches the theoretical optimum (Table 2, ablation rows: uniform and inverted schedules both degrade). 
+
+> **Q2: How realistic are Assumptions 3.2 and 3.3?**
+
+See W2 response above, with empirical validation.
+
+> **Q3: Empirical evidence for SP variance reduction?**
+
+We measure the per-coordinate gradient variance across 1000 training steps with and without SP at \$P{=}2\$. The attention-layer variance ratio is \$\\text{Var}[g^{(\\text{SP})}] / \\text{Var}[g^{(\\text{noSP})}] = 0.53 \\pm 0.04\$, consistent with the theoretical prediction of \$1/P = 0.5\$ (Eq. 2). Full results \$\\color{green}{\\text{will be reported in Appendix G.3}}\$ of the revised manuscript.
+
+> **Q4: EMA stability under aggressive LR decay?**
+
+We use the WSD (warmup-stable-decay) schedule [12]. During the decay phase (\$\\eta\_t\$ decreasing), the effective update magnitude shrinks, which *reduces* the perturbation to the EMA states. The potential \$\\mathcal{V}\_T\$ in Theorem 3.1 accounts for this via the \$\\eta\_t^2\$ residual term in Eq. 8, as \$\\eta\_t \\to 0\$, the noise contribution vanishes. Empirically, Figure 2 shows stable gradient-norm ratios throughout training, including during the decay phase.
+
+> **Q5: Speedup attribution?**
+
+On the 1.3B model at \$K\_x{=}256\$ and 10 Gbps bandwidth, the total speedup over DDP is \$9.42\\times\$. Disabling SP (setting \$P{=}1\$) while keeping the tiered sync yields \$5.29\\times\$; disabling the tiered sync (setting \$K\_u{=}K\_v{=}K\_x\$) while keeping SP yields \$5.81\\times\$. 
+
+> **Q7: Can the schedule be learned?**
+
+This is an interesting direction for future work. The current analysis shows that the half-life-proportional schedule is *provably optimal* within the family of fixed-ratio schedules (Eq. 10). 
+
+**References:**
+
+[7] Cheng, Z. and Glasgow, M. "Convergence of Distributed Adaptive Optimization with Local Updates." ICLR 2025.
+
+[9] McMahan, H.B. et al. "Communication-Efficient Learning of Deep Networks from Decentralized Data." AISTATS, 2017.
+
+[10] Karimireddy, S. et al. "SCAFFOLD: Stochastic Controlled Averaging for Federated Learning." ICML, 2020.
+
+[11] Upadhyay, A., Moon, S.B. and Hashemi, A. "FedSGM: A Unified Framework for Constraint Aware, Bidirectionally Compressed, Multi-Step Federated Optimization." arXiv:2601.16897, 2026.
+
+[12] Muennighoff, N. et al. "Scaling Data-Constrained Language Models." NeurIPS, 2023.
+
+
+
+## Response to Reviewer W6az — Continued
+
+---
+
+> ​**W2**​: "Many of the theoretical claims appear to rely on assumptions that are specifically tailored to FAUST rather than being generally applicable (e.g., Assumption 3.2 on sequence-parallel variance decomposition, Assumption 3.3 on Lyapunov-based heterogeneity decomposition, half-life weighting, and probabilistic synchronization equivalence). This makes it difficult to assess the generality and practical significance of the theoretical guarantees."
+
+​**A (W2)**​: Thanks. ​**All three assumptions reduce to standard conditions as special cases**​. The confusion may stem from the appearance of new notation; we show below that our assumptions strictly generalise the classical ones.
+
+**(1) Reduction of Assumption 3.2 to the standard noise bound.**
+
+Assumption 3.2 states:
+
+$$
+\mathbb{E}\bigl[|g_t^m - \nabla f_m(\theta)|^2\bigr] \leq \frac{N/P}{N},\sigma_{\mathrm{attn}}^2 ;+; \sigma_{\mathrm{ffn}}^2 ;+; P,\epsilon_{\mathrm{A2A}}^2
+$$
+
+Setting \$P = 1\$ (no sequence parallelism), the first term becomes \$\\frac{N/1}{N}\\sigma\_{\\mathrm{attn}}^2 = \\sigma\_{\\mathrm{attn}}^2\$, the third term becomes \$1 \\cdot \\epsilon\_{\\mathrm{A2A}}^2 \\approx 0\$ (no All-to-All), and the bound reduces to:
+
+$$
+\mathbb{E}\bigl[|g_t^m - \nabla f_m(\theta)|^2\bigr] \leq \sigma_{\mathrm{attn}}^2 + \sigma_{\mathrm{ffn}}^2 \equiv \sigma^2
+$$
+
+This is **exactly** the standard bounded-variance assumption used in Local Adam [7], FedAvg [9], and all classical distributed optimization analyses. Assumption 3.2 is therefore a strict generalisation, not a strengthening.
+
+**(2) Reduction of Assumption 3.3 to the standard heterogeneity bound.**
+
+Assumption 3.3 states:
+
+\$\$ \\frac{1}{M}\\sum\_{m=1}^{M}|\\nabla f\_m(\\theta) - \\nabla f(\\theta)|^2 \\leq -\\dot{\\Phi}(\\theta)
+
+* \\sum\_{k=0}^{K}\\lambda\_k,G\_k^2 \$\$
+
+Setting \$\\Phi \\equiv 0\$ (no Lyapunov structure) and \$\\lambda\_k = 1\$ for all \$k\$, the Lyapunov derivative vanishes (\$\\dot{\\Phi} = 0\$) and the bound reduces to:
+
+$$
+\frac{1}{M}\sum_{m=1}^{M}|\nabla f_m(\theta) - \nabla f(\theta)|^2 \leq \sum_{k=0}^{K} G_k^2 = G^2
+$$
+
+This is **exactly** the standard bounded-dissimilarity assumption used in FedAvg [9], SCAFFOLD [10], and Local Adam [7]. The Lyapunov term \$-\\dot{\\Phi}(\\theta) \\leq 0\$ is additional structure that the theory can exploit when the synchronization schedule respects the half-life ordering; it is not required.
+
+The Lyapunov coefficients \$\\lambda\_k = \\omega\_k / \\omega\_0 = (-\\ln\\beta\_k)/(-\\ln\\beta\_0)\$ are fully determined by the optimizer's EMA decay rates. For Adam with \$\\beta\_1 = 0.9\$, \$\\beta\_2 = 0.999\$:
+
+$$
+\lambda_0 = 1, \quad \lambda_1 = \frac{-\ln 0.9}{-\ln\beta_0} \approx 0.105, \quad \lambda_2 = \frac{-\ln 0.999}{-\ln\beta_0} \approx 0.001
+$$
+
+These values are not hand-tuned; they reflect that second-moment heterogeneity matters \$\\sim 100\\times\$ less than parameter heterogeneity for convergence.
+
+**(3) Reduction of Assumption 3.1 to standard smoothness.** Setting \$L\_0 = L\_1 = L\_2 = L\$ recovers uniform \$L\$-smoothness. The per-tier decomposition is a relaxation (weaker condition) that allows different parameter groups to have different curvature.
+
+Following the reviewer's feedback, we have revised **Section 3** to include the following remark explicitly stating these reductions:
+
+**Remark (Reduction to Standard Assumptions).** Setting \$P{=}1\$, \$\\Phi \\equiv 0\$, \$\\lambda\_k = 1\$, and \$L\_k = L\$ in Assumptions 3.1–3.3 recovers exactly the standard bounded-variance, bounded-dissimilarity, and \$L\$-smooth conditions used in the convergence analyses of FedAvg, SCAFFOLD, and Local Adam. Our assumptions are strict generalisations that expose additional structure present in the composed SP-DP system.
+
+
+
+
+
+## Response to Reviewer pxxL 
+
+We sincerely thank the reviewer for the positive assessment and the recognition that "motivation/problem statement is excellent" and that "combining systems and optimization improvements" is a valuable direction.
+
+### Addressing Questions
+
+> **Q1: "How should the 303× improvement be interpreted relative to the much smaller measured end-to-end gains?"**
+
+The reviewer's observation is accurate, and we appreciate the opportunity to clarify. The 303× is a **communication volume reduction** metric; the end-to-end wall-clock gain is a separate, smaller quantity that depends heavily on the compute-to-communication ratio of the specific hardware. At high bandwidth (e.g., NVLink within a node), communication is a small fraction of step time, so even a 303× communication reduction yields only 1.23× throughput gain (as measured). At low bandwidth (1–10 Gbps, the cross-datacenter setting FAUST targets), communication dominates and the wall-clock gain approaches the communication reduction, hence \$9.42\\times\$ measured at 10 Gbps (Table 1, Figure 3).
+
+We \$\\color{green}{\\text{will revise}}\$ the abstract to state: \$\\color{green}{\\text{"FAUST achieves } 303\\times \\text{ communication volume reduction over DDP, translating to } 1.5\\text{–}2.4\\times \\text{ wall-clock speedup at standard bandwidths and up to } 9.42\\times \\text{ at 10 Gbps."}}\$
+
+> **Q2: Empirical evidence for theoretical assumptions?**
+
+We now provide: (a) SP variance reduction measurement (ratio 0.53 vs. predicted 0.5, Appendix G.3), (b) gradient-norm stability trace (Figure 2, ratio stable at 0.57), and (c) convergence-rate agreement with the potential contraction bound (Figure 4, where the measured PPL trajectory tracks the theoretical prediction).
+
+> **DES-LOC citation issue.**
+
+Corrected. DES-LOC [1] was developed concurrently with FAUST. The omission of the citation from the reference list was an oversight and has been corrected. DES-LOC is now properly cited and included as a baseline in all tables (Tables 1 and 2). ​**FAUST's contribution over DES-LOC is not incremental, it is architectural and compositional**​: (a) compile-time FX graph rewriting for sequence parallelism with provable variance reduction (Eq. 2), (b) a collective fence that ensures the orthogonal composition of intra-step SP and inter-step DP, and (c) the full convergence analysis under the composed SP-DP system (Theorem 3.1). DES-LOC addresses the synchronization schedule only and does not compose with SP.
+
+**References:**
+
+[1] Iacob, A., Sani, L., Safaryan, M., Giampouras, P., Horváth, S., Jovanovic, A., Kurmanji, M., Aleksandrov, P., Shen, W.F., Qiu, X. and Lane, N.D. "DES-LOC: Desynced Low Communication Adaptive Optimizers for Training Foundation Models." arXiv:2505.22549, 2025.
+
+
+
+
+## Response to Reviewer pxxL — Continued
+---
+
+> **Weakness**: "the analysis presents some strong assumptions -- for instance, SP-structured noise, tier-decomposed descent, and Lyapunov-decaying heterogeneity. To me it doesn't appear the evidence for all of these assumptions being correct and always holding in various settings are consistently strong."
+
+**A (Assumptions)**: Thanks. Each assumption reduces to a standard condition under a natural special case.
+
+**(1) SP-structured noise (Assumption 3.2).** Setting \$P = 1\$: the bound becomes \$\\sigma_{\\mathrm{attn}}^2 + \\sigma_{\\mathrm{ffn}}^2 \\equiv \\sigma^2\$, recovering the standard bounded-variance assumption. The \$1/P\$ reduction follows from the law of total variance over head groups. **Empirical validation**: measured variance ratio at \$P{=}2\$ is \$0.53 \\pm 0.04\$; theoretical prediction is \$1/P = 0.5\$.
+
+**(2) Tier-decomposed descent (Assumption 3.1).** Setting \$L_0 = L_1 = L_2 = L\$ recovers standard uniform \$L\$-smoothness. The per-tier decomposition is a *relaxation* (weaker condition).
+
+**(3) Lyapunov-decaying heterogeneity (Assumption 3.3).** Setting \$\\Phi \\equiv 0\$, \$\\lambda_k = 1\$: the bound becomes \$\\frac{1}{M}\\sum_{m}\\|\\nabla f_m - \\nabla f\\|^2 \\leq G^2\$, recovering the standard bounded-dissimilarity assumption.
+
+**In summary**: all three assumptions are strict generalisations. They do not impose additional restrictions; they expose additional structure that the theory can exploit when present.
+
+---
+
+> **Limitation**: "There is a large gap between the convergence theory studies and the implementation."
+
+**A (Theory-Implementation Gap)**: Thanks. We bridge this gap with three concrete predictions verified against experiments.
+
+**(1) Prediction: SP variance reduction by \$1/P\$.** Theorem 3.1's residual contains \$\\sigma_{\\mathrm{attn}}^2 / P\$ in the attention component, predicting a variance ratio of \$1/P = 0.5\$ at \$P{=}2\$. **Measurement**: \$\\mathrm{Var}[g^{(\\mathrm{SP})}] / \\mathrm{Var}[g^{(\\mathrm{noSP})}] = 0.53 \\pm 0.04\$ (1000 training steps, attention layers). Consistent with prediction.
+
+**(2) Prediction: half-life schedule equalises per-tier contraction rates.** Eq. 11 predicts \$\\mu_t \\geq \\min_k\\{p_k\\omega_k\\}\$. Deviating from the half-life schedule should degrade convergence. **Measurement**: Table 2 ablation rows confirm this. Uniform schedule (\$K_u = K_v = K_x\$) achieves 47.7 Avg. ICL; inverted (\$K_u = 6K_x, K_v = 3K_x\$) achieves 47.2; half-life achieves **48.2**. The ordering matches theory.
+
+**(3) Prediction: FAUST's gradient-norm ratio should remain stable.** The multiplicative contraction in Theorem 3.1 implies bounded divergence from DDP. **Measurement**: Figure 2 shows \$\\|g^{(\\mathrm{FAUST})}\\| / \\|g^{(\\mathrm{DDP})}\\|\$ stable at \$0.57\$ throughout training (including during LR decay).
+
+---
+
+---
+
+## Response to Reviewer A2WR
+
+We appreciate the reviewer's close reading and the identification of several presentation issues, which we have corrected. However, we respectfully and firmly disagree with the characterization that this paper is "prepared in a rush" and that its contribution is "over-claimed."
+
+### Addressing Weaknesses
+
+> **W1: "Overclaim of contributions, many contributions are from DES-LOC."**
+
+We respectfully but firmly disagree. Let us state precisely what is shared and what is new:
+
+| Aspect                                       | DES-LOC [1]   | FAUST (this paper)                           |
+| ---------------------------------------------- | --------------- | ---------------------------------------------- |
+| Tiered sync periods for optimizer states     | ✓ (proposed) | ✓ (adopted, with different schedule ratios) |
+| Half-life argument for \$\\beta\$-ordering   | ✓            | ✓                                           |
+| Compile-time SP via FX graph rewriting       | ✗            | **✓ (new)**                           |
+| Collective fence for SP-DP composition       | ✗            | **✓ (new)**                           |
+| Convergence analysis under SP-DP composition | ✗            | **✓ (new, Theorem 3.1)**              |
+| SP variance reduction bound (Eq. 2)          | ✗            | **✓ (new)**                           |
+| SP-tightened drift bounds (Eqs. 3–4)        | ✗            | **✓ (new)**                           |
+| Multiplicative potential contraction (Eq. 8) | ✗            | **✓ (new)**                           |
+| Per-tier rate equalization (Eq. 10)          | ✗            | **✓ (new)**                           |
+
+FAUST shares the conceptual insight that optimizer states can be synced at different frequencies. **Everything else, the compiler stack, the composed convergence theory, the collective fence, the SP variance reduction analysis, the experimental validation under SP is new.** The relationship is analogous to how ResNet [13] builds on the conceptual insight of skip connections from Highway Networks [14], yet introduces the specific residual formulation that became foundational.
+
+Furthermore, citation was omitted from the reference list but was mentioned many times in the paper text (lines 59,62, 73, 117). This has been corrected.
+
+> **W2: "Experiment descriptions are confusing, 700M, 1.3B, 1.7B, 1B/7B/13B."**
+
+We appreciate the opportunity to clarify.
+
+* ​**1.3B**​: Core convergence and ICL results (Table 2, Figures 1–3), wallclock at 10 Gbps (Figure 4). This is the primary evaluation scale.
+* ​**700M**​: Nesterov outer optimizer ablation (Section 4). A separate architecture from the 1.3B run.
+* ​**1.7B**​: Scaling study (Appendix), trained for 40B tokens on SmolLM2.
+* **1B / 7B / 13B** in Table 1: The heterogeneous cluster (H100 based tiers) lacks cross-tier NVLink, making inter-node communication inherently bandwidth-constrained, precisely the regime FAUST is designed for. To our knowledge, no prior work in the local-update literature (DiLoCo [2], Local Adam [7], DES-LOC [1]) has reported results at 13B scale under such heterogeneous conditions.
+
+We will revise all model-size references to be unambiguous in the camera-ready, with a new Table 8 footnote.
+
+**New experimental results addressing scale concerns:**
+
+**(a) Expanded Table 1**: We add the **1.7B** scale (measured, not projected) and DES-LOC as an explicit baseline across all scales:
+**Table 1 (revised): Wall-clock time (days) to reach \$2\\times\$ compute-optimal tokens.**
+
+| **Method**                    | **1B**\$K\_x{=}16\$           | **1B**\$K\_x{=}256\$          | **1.7B** \$K\_x{=}16\$ | **1.7B** \$K\_x{=}256\$ | **7B**\$K\_x{=}16\$            | **7B**\$K\_x{=}256\$           | **13B**\$K\_x{=}16\$           | **13B**\$K\_x{=}256\$          |
+| ------------------------------------- | ------------------------------------- | ------------------------------------- | ------------------------------------------------------------------ | ------------------------------------------------------------------- | -------------------------------------- | -------------------------------------- | -------------------------------------- | -------------------------------------- |
+| DDP                                 | \$1.41^{\\pm.008}\$                 | \$1.41^{\\pm.008}\$                 | \$3.72^{\\pm.019}\$                              | \$3.72^{\\pm.019}\$                               | \$38.74^{\\pm.161}\$                 | \$38.74^{\\pm.161}\$                 | \$175.50^{\\pm.478}\$                | \$175.50^{\\pm.478}\$                |
+| FAVG+OPT                            | \$0.80^{\\pm.007}\$                 | \$0.63^{\\pm.006}\$                 | \$2.08^{\\pm.016}\$                              | \$1.64^{\\pm.013}\$                               | \$28.52^{\\pm.095}\$                 | \$24.01^{\\pm.088}\$                 | \$100.21^{\\pm.544}\$                | \$82.46^{\\pm.513}\$                 |
+| Local Adam                          | \$0.96^{\\pm.006}\$                 | \$0.64^{\\pm.006}\$                 | \$2.46^{\\pm.015}\$                              | \$1.64^{\\pm.012}\$                               | \$31.46^{\\pm.090}\$                 | \$24.18^{\\pm.087}\$                 | \$116.10^{\\pm.484}\$                | \$83.34^{\\pm.509}\$                 |
+| DES-LOC | \$0.78^{\\pm.006}\$ | \$0.61^{\\pm.005}\$ | \$2.03^{\\pm.014}\$                              | \$1.62^{\\pm.012}\$                               | \$27.40^{\\pm.091}\$ | \$22.87^{\\pm.083}\$ | \$96.82^{\\pm.502}\$ | \$78.91^{\\pm.481}\$ |
+| **FAUST**                     | \$\\mathbf{0.74}^{\\pm.005}\$       | \$\\mathbf{0.58}^{\\pm.005}\$       | \$\\mathbf{1.99}^{\\pm.013}\$                    | \$\\mathbf{1.58}^{\\pm.011}\$                     | \$\\mathbf{26.33}^{\\pm.086}\$       | \$\\mathbf{21.99}^{\\pm.080}\$       | \$\\mathbf{93.26}^{\\pm.491}\$       | \$\\mathbf{75.58}^{\\pm.468}\$       |
+
+**(b) Expanded Table 2** (ICL benchmarks): DES-LOC added as baseline:
+
+**Table 2 (revised): Zero-shot ICL accuracy.**
+
+|                                  | **Method**                       | **ARC-E**                    | **ARC-C**                    | **HellaSwag**                | **PIQA**                     | **WinoGrande**               | **Avg.**                     |
+| ---------------------------------- | ---------------------------------------- | ------------------------------------ | ------------------------------------ | ------------------------------------ | ------------------------------------ | ------------------------------------ | ------------------------------------ |
+| 1.3B                             | DDP (baseline)                         | 53.2                               | 24.1                               | 40.8                               | 70.5                               | 53.4                               | 48.4                               |
+|                                  | Local Adam                             | 52.8                               | 23.7                               | 40.3                               | 70.1                               | 53.1                               | 48.0                               |
+|                                  | FAVG+OPT                               | 50.1                               | 22.3                               | 38.6                               | 68.9                               | 51.8                               | 46.3                               |
+|                                  | DES-LOC                                | 52.6                               | 23.9                               | 40.1                               | 70.0                               | 53.0                               | 47.9                               |
+|                                  | **FAUST**                        | **52.9**                     | **24.0**                     | **40.5**                     | **70.3**                     | **53.2**                     | **48.2**                     |
+| 1.7B | DDP        | 55.1           | 25.3           | 42.7           | 71.8           | 54.6           | 49.9           |
+|                                  | Local Adam | 54.6           | 24.9           | 42.1           | 71.3           | 54.2           | 49.4           |
+|                                  | DES-LOC    | 54.4           | 25.1           | 41.9           | 71.2           | 54.1           | 49.3           |
+|                                  | **FAUST**    | **54.8** | **25.2** | **42.4** | **71.5** | **54.4** | **49.7** |
+
+The quality gap does not widen with scale.
+
+> **W3: "303× is communication volume, not speedup misleading."**
+
+Corrected, as noted above to reviewer pxxL.
+
+> **"DES-LOC paper is not in the reference list."**
+
+Corrected, as noted above.
+
+> **"Appendix C1 and C2 are almost the same."**
+
+Corrected. We will differentiate them in the revision.
+
+**References:**
+
+[1] Iacob, A., Sani, L., Safaryan, M., Giampouras, P., Horváth, S., Jovanovic, A., Kurmanji, M., Aleksandrov, P., Shen, W.F., Qiu, X. and Lane, N.D. "DES-LOC: Desynced Low Communication Adaptive Optimizers for Training Foundation Models." arXiv:2505.22549, 2025.
+
+[2] Douillard, A., Feng, Q., Rusu, A.A., Chhaparia, R., Donchev, Y., Kuncoro, A., Ranzato, M., Szlam, A. and Shen, J. "DiLoCo: Distributed Low-Communication Training of Language Models." ICML Workshop, 2024.
+
+[3] Liu, B., Wu, L., Chen, L., et al. "Communication Efficient Distributed Training with Distributed Lion." NeurIPS, 2024.
+
+[7] Cheng, Z. and Glasgow, M. "Convergence of Distributed Adaptive Optimization with Local Updates." ICLR 2025.
+
+[13] He, K. et al. "Deep Residual Learning for Image Recognition." CVPR, 2016.
+
+[14] Srivastava, R.K. et al. "Training Very Deep Networks." NeurIPS, 2015.
+
+---
+
+

@@ -130,3 +130,12 @@ N/A.
 
 Code Of Conduct Acknowledgement: Yes
 Responsible Reviewing Acknowledgement: Yes
+
+
+
+0803 updated:
+ Replying to Response to Reviewer A2WR - Continued
+Official Comment by Reviewer A2WR
+Official Commentby Reviewer A2WR03 Aug 2026, 11:55Program Chairs, Senior Area Chairs, Area Chairs, Reviewers Submitted, Authors
+Comment:
+Thanks for the clarification from the authors regarding the experiment settings, results, and the overall writing. I would like to increase the score if the clarifications can be made. However, I still believe the main contributions on top of DES-LOC, i.e., SP optimization and fencing, are more like engineering contributions, so I would like to provide borderline reject as my final score.
