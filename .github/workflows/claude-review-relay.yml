@@ -1,0 +1,113 @@
+name: Claude Review Relay
+on:
+  workflow_dispatch:
+    inputs:
+      gist_id:
+        description: Gist ID with review request
+        required: true
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch diff from Gist
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api "/gists/${{ inputs.gist_id }}" --jq '.files["diff.patch"].content' > /tmp/diff.txt
+          gh api "/gists/${{ inputs.gist_id }}" --jq '.files["review_request.json"].content' > /tmp/req.json
+          echo "Diff: $(wc -c < /tmp/diff.txt) bytes"
+
+      - name: Create conversation and send review
+        env:
+          COOKIE: ${{ secrets.AIMONKEY_COOKIE }}
+        run: |
+          ORG="80008ad8-c3c8-4f47-b1a1-ca77c382bff2"
+          BASE="https://c.aimonkey.plus/api/organizations/${ORG}"
+
+          # Create conversation
+          CONV=$(curl -sf -X POST "${BASE}/chat_conversations" \
+            -H 'content-type: application/json' \
+            -H 'anthropic-client-platform: web_claude_ai' \
+            -H "origin: https://c.aimonkey.plus" \
+            -b "${COOKIE}" \
+            -d '{"name":"","model":"claude-sonnet-4-20250514","include_conversation_preferences":true}')
+          CONV_ID=$(echo "$CONV" | jq -r '.uuid')
+          echo "Conversation: $CONV_ID"
+
+          # Build review prompt
+          PROMPT=$(cat /tmp/req.json | jq -r '.prompt')
+          DIFF=$(cat /tmp/diff.txt)
+
+          # Send to aimonkey (SSE stream → collect text)
+          python3 - "$CONV_ID" "$ORG" <<'PYSCRIPT'
+import json, sys, os, urllib.request
+
+conv_id = sys.argv[1]
+org_id = sys.argv[2]
+cookie = os.environ["COOKIE"]
+
+with open("/tmp/req.json") as f:
+    prompt = json.load(f)["prompt"]
+with open("/tmp/diff.txt") as f:
+    diff = f.read()
+
+msg = prompt + "\n\n```diff\n" + diff + "\n```"
+
+body = json.dumps({
+    "prompt": msg,
+    "timezone": "Asia/Shanghai",
+    "locale": "en-US",
+    "model": "claude-sonnet-4-20250514",
+    "tools": [], "attachments": [], "files": [],
+    "sync_sources": [], "rendering_mode": "messages",
+}).encode()
+
+url = f"https://c.aimonkey.plus/api/organizations/{org_id}/chat_conversations/{conv_id}/completion"
+req = urllib.request.Request(url, data=body, headers={
+    "content-type": "application/json",
+    "accept": "text/event-stream",
+    "anthropic-client-platform": "web_claude_ai",
+    "origin": "https://c.aimonkey.plus",
+    "Cookie": cookie,
+})
+
+resp = urllib.request.urlopen(req, timeout=120)
+full = ""
+for line in resp:
+    line = line.decode("utf-8", errors="replace").strip()
+    if line.startswith("data: "):
+        d = line[6:]
+        if d == "[DONE]":
+            break
+        try:
+            ev = json.loads(d)
+            if ev.get("type") == "content_block_delta":
+                t = ev.get("delta", {}).get("text", "")
+                full += t
+        except json.JSONDecodeError:
+            pass
+
+with open("/tmp/review.md", "w") as f:
+    f.write(full)
+print(f"Review collected: {len(full)} chars")
+PYSCRIPT
+
+      - name: Write result back to Gist
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          REVIEW=$(cat /tmp/review.md)
+          python3 -c "
+          import json, os
+          review = open('/tmp/review.md').read()
+          result = json.dumps({'status':'completed'})
+          payload = json.dumps({'files':{'review_request.json':{'content':result},'review_result.md':{'content':review}}})
+          print(payload)
+          " > /tmp/gist_update.json
+
+          gh api --method PATCH "/gists/${{ inputs.gist_id }}" --input /tmp/gist_update.json
+          echo "Result written to Gist"
