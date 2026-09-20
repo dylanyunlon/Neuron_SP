@@ -58,6 +58,11 @@ from deepspeed.core.distributed import (
     DistributedDataParallelConfig as CoreDDPConfig,
     finalize_model_grads,
 )
+from deepspeed.core.distributed.collective_contract import (
+    CollectiveContract,
+    build_step_contract,
+    log_contract_summary,
+)
 
 # ---------------------------------------------------------------------------
 # desloc_checkpointing: save_checkpoint/load_checkpoint extracted into a
@@ -2108,8 +2113,34 @@ class DesLocEngine:
         _my_rank = dist.get_rank() if dist.is_initialized() else 0
         logger.warning("rank=%d entering training loop (step=%d)", _my_rank, self.global_step)
 
+        # --- CollectiveContract config (fix #589) ---
+        # Enable contract verification via env var (default: enabled in debug,
+        # disabled in production for zero overhead).
+        _contract_enabled = os.environ.get(
+            "NEURON_SP_COLLECTIVE_CONTRACT", "1"
+        ).strip() == "1"
+        if _contract_enabled and _is_main:
+            logger.info(
+                "[CollectiveContract] ENABLED — enforcing NCCL collective "
+                "symmetry across all ranks (set NEURON_SP_COLLECTIVE_CONTRACT=0 "
+                "to disable)."
+            )
+
         for step in range(self.global_step, cfg.total_steps):
             logger.debug("rank=%d for-loop step=%d starting", _my_rank, step)
+
+            # --- CollectiveContract: build the per-step contract (fix #589) ---
+            # Declares the exact NCCL collective sequence for this step.
+            # All ranks build the same contract because the plan depends only
+            # on step number and config (which are identical across ranks).
+            _contract = build_step_contract(
+                step=step,
+                config=self.config,
+                has_dist_optimizer=self._dist_optimizer is not None,
+                rank=_my_rank,
+            )
+            _contract.enabled = _contract_enabled
+
             # DistributedOptimizer.zero_grad() zeroes its grad_data buffers +
             # shard param grads.  Plain AdamW zero_grad() on the non-ZeRO-3 path.
             self.optimizer.zero_grad(set_to_none=False)
@@ -2512,7 +2543,9 @@ class DesLocEngine:
                     _nan_group = parallel_state.get_data_parallel_group()
                 else:
                     _nan_group = None  # WORLD
-                dist.all_reduce(_nan_tensor, op=dist.ReduceOp.MAX, group=_nan_group)
+                # CollectiveContract guard: nan_flag_allreduce (fix #589)
+                with _contract.guard("nan_flag_allreduce"):
+                    dist.all_reduce(_nan_tensor, op=dist.ReduceOp.MAX, group=_nan_group)
                 _step_has_nan = _nan_tensor.item() > 0.5
                 del _nan_tensor
             logger.warning("rank=%d: post-microbatch, step_loss=%.4f, nan=%s (collective)",
@@ -2589,6 +2622,7 @@ class DesLocEngine:
                     skip_grad_sync=_fmg_skip_sync,
                     force_all_reduce=False,  # dist_optimizer handles reduce_scatter internally
                     pg_collection=_fmg_pg,
+                    collective_contract=_contract,  # fix #589: contract-aware grad sync
                 )
             except Exception as _fmg_exc:  # noqa: BLE001
                 logger.warning(
@@ -2608,7 +2642,10 @@ class DesLocEngine:
             # norm reduction — replaces torch.nn.utils.clip_grad_norm_ (M2335).
             _profiler.begin("clip_grad_norm")
             logger.warning("rank=%d: ENTERING clip_grad_norm", dist.get_rank() if dist.is_initialized() else 0)
-            gnorm = clip_grad_norm(self.model.parameters(), cfg.grad_clip)
+            gnorm = clip_grad_norm(
+                self.model.parameters(), cfg.grad_clip,
+                collective_contract=_contract,  # fix #589: contract-aware norm allreduce
+            )
             if torch.is_tensor(gnorm):
                 gnorm = gnorm.item()
             _profiler.end("clip_grad_norm")
@@ -2674,7 +2711,9 @@ class DesLocEngine:
                     "rank=%d: _skip_tensor all_reduce group_size=%d (fix #155)",
                     dist.get_rank(), _skip_group_size,
                 )
-                dist.all_reduce(_skip_tensor, op=dist.ReduceOp.MAX, group=_skip_opt_group)
+                # CollectiveContract guard: skip_flag_allreduce (fix #589)
+                with _contract.guard("skip_flag_allreduce"):
+                    dist.all_reduce(_skip_tensor, op=dist.ReduceOp.MAX, group=_skip_opt_group)
                 _should_skip = _skip_tensor.item() > 0.5
                 del _skip_tensor
 
@@ -2701,47 +2740,53 @@ class DesLocEngine:
                 _profiler.begin("optim_prepare_grads")
                 logger.warning("rank=%d: ENTERING optimizer prepare_grads (skip=%s)",
                                dist.get_rank() if dist.is_initialized() else 0, _should_skip)
-                self._dist_optimizer.prepare_grads()
+                # CollectiveContract guard: prepare_grads_rs (fix #589)
+                with _contract.guard("prepare_grads_rs"):
+                    self._dist_optimizer.prepare_grads()
                 _profiler.end("optim_prepare_grads")
 
-                if not _should_skip:
-                    # ── DES-LOC async optimizer: non-Kx steps skip NCCL broadcast ──
-                    # On non-Kx steps, each rank does a LOCAL Adam update + local
-                    # FP32→BF16 write.  No cross-rank sync — this is the core of
-                    # DES-LOC's decomposed synchronization.  H100 doesn't wait for
-                    # A6000's slow CPUAdam to finish because there's no NCCL barrier.
-                    # On Kx steps, the full shard_to_model_broadcast runs to reconcile
-                    # all ranks' model weights.
-                    _is_Kx_this_step = (step + 1) % self.desloc_Kx == 0
+                # CollectiveContract guard: param_sync (fix #589)
+                # Both branches (skip and non-skip) enter the same contract
+                # entry so the collective sequence is identical on all ranks.
+                with _contract.guard("param_sync"):
+                    if not _should_skip:
+                        # ── DES-LOC async optimizer: non-Kx steps skip NCCL broadcast ──
+                        # On non-Kx steps, each rank does a LOCAL Adam update + local
+                        # FP32→BF16 write.  No cross-rank sync — this is the core of
+                        # DES-LOC's decomposed synchronization.  H100 doesn't wait for
+                        # A6000's slow CPUAdam to finish because there's no NCCL barrier.
+                        # On Kx steps, the full shard_to_model_broadcast runs to reconcile
+                        # all ranks' model weights.
+                        _is_Kx_this_step = (step + 1) % self.desloc_Kx == 0
 
-                    # Tell step_with_ready_grads to skip its internal broadcast
-                    self._dist_optimizer._defer_param_sync = not _is_Kx_this_step
+                        # Tell step_with_ready_grads to skip its internal broadcast
+                        self._dist_optimizer._defer_param_sync = not _is_Kx_this_step
 
-                    _profiler.begin("optim_adam_step")
-                    logger.warning("rank=%d: ENTERING optimizer step_with_ready_grads (Kx=%s)",
-                                   dist.get_rank() if dist.is_initialized() else 0, _is_Kx_this_step)
-                    self._dist_optimizer.step_with_ready_grads()
-                    self.scheduler.step()
-                    _profiler.end("optim_adam_step")
-                    logger.warning("rank=%d: EXITED optimizer step_with_ready_grads", dist.get_rank() if dist.is_initialized() else 0)
+                        _profiler.begin("optim_adam_step")
+                        logger.warning("rank=%d: ENTERING optimizer step_with_ready_grads (Kx=%s)",
+                                       dist.get_rank() if dist.is_initialized() else 0, _is_Kx_this_step)
+                        self._dist_optimizer.step_with_ready_grads()
+                        self.scheduler.step()
+                        _profiler.end("optim_adam_step")
+                        logger.warning("rank=%d: EXITED optimizer step_with_ready_grads", dist.get_rank() if dist.is_initialized() else 0)
 
-                    # Non-Kx step: local write only (no NCCL, no waiting)
-                    if not _is_Kx_this_step:
-                        self._dist_optimizer.write_shard_to_model_local()
-                    # Kx step: step_with_ready_grads already did the full broadcast
+                        # Non-Kx step: local write only (no NCCL, no waiting)
+                        if not _is_Kx_this_step:
+                            self._dist_optimizer.write_shard_to_model_local()
+                        # Kx step: step_with_ready_grads already did the full broadcast
 
-                    # Reset the flag
-                    self._dist_optimizer._defer_param_sync = False
-                else:
-                    # Skip path: zero grad shards so Adam state isn't corrupted,
-                    # but still enter the all-gather (collective #2) so all ranks
-                    # participate and NCCL doesn't deadlock.
-                    logger.warning("rank=%d: SKIPPING Adam update, entering param sync (collective-safe)",
-                                   dist.get_rank() if dist.is_initialized() else 0)
-                    for sp in self._dist_optimizer._shard_params:
-                        if sp.grad is not None:
-                            sp.grad.zero_()
-                    self._dist_optimizer.start_param_sync(force_sync=True)
+                        # Reset the flag
+                        self._dist_optimizer._defer_param_sync = False
+                    else:
+                        # Skip path: zero grad shards so Adam state isn't corrupted,
+                        # but still enter the all-gather (collective #2) so all ranks
+                        # participate and NCCL doesn't deadlock.
+                        logger.warning("rank=%d: SKIPPING Adam update, entering param sync (collective-safe)",
+                                       dist.get_rank() if dist.is_initialized() else 0)
+                        for sp in self._dist_optimizer._shard_params:
+                            if sp.grad is not None:
+                                sp.grad.zero_()
+                        self._dist_optimizer.start_param_sync(force_sync=True)
             elif not _should_skip:
                 # Non-ZeRO-3 fallback: local AdamW on full model
                 _profiler.begin("optim_adam_step")
@@ -2797,6 +2842,17 @@ class DesLocEngine:
 
             if not _should_skip:
                 _profiler.end("desloc_sync")
+
+            # --- CollectiveContract: assert all planned collectives executed (fix #589) ---
+            try:
+                _contract.assert_complete()
+            except RuntimeError as _cc_exc:
+                logger.error(
+                    "[CollectiveContract] INCOMPLETE at step %d: %s",
+                    step, _cc_exc,
+                )
+            if step < 5 and _is_main and _contract_enabled:
+                log_contract_summary(_contract)
 
             # --- [PROFILE] finish step: collect all CUDA event timings ---
             _step_profile = _profiler.finish_step(
