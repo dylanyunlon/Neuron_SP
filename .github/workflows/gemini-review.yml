@@ -9,6 +9,7 @@ name: Gemini Code Assist Review
 permissions:
   contents: read
   pull-requests: write
+  issues: write
 
 jobs:
   review:
@@ -18,25 +19,41 @@ jobs:
        github.event.issue.pull_request &&
        contains(github.event.comment.body, '/gemini review'))
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
-      - name: Get PR number
-        id: pr
-        run: |
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            echo "number=${{ github.event.pull_request.number }}" >> "$GITHUB_OUTPUT"
-          else
-            echo "number=${{ github.event.issue.number }}" >> "$GITHUB_OUTPUT"
-          fi
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
 
-      - name: Run Gemini review
+      - name: Start Gemini API shim
         env:
           AIMONKEY_COOKIE: ${{ secrets.AIMONKEY_COOKIE }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
-          PR_NUMBER: ${{ steps.pr.outputs.number }}
         run: |
           pip install -q requests
-          python3 .github/scripts/review_bot.py
+          nohup python3 .github/scripts/gemini_shim.py 8765 &
+          sleep 2
+          echo "Shim running on :8765"
+
+      - name: Clone and patch gemini-review-bot
+        run: |
+          git clone --depth=1 https://github.com/jgunnink/gemini-review-bot.git /tmp/grb
+          cd /tmp/grb && npm ci --omit=dev
+
+          # Patch: inject httpOptions.baseUrl into GoogleGenAI constructor
+          sed -i 's|new GoogleGenAI({ apiKey, vertexai: useVertex })|new GoogleGenAI({ apiKey, vertexai: useVertex, httpOptions: { baseUrl: process.env.GEMINI_SHIM_URL || undefined } })|g' src/gemini.ts
+          echo "Patched gemini.ts:"
+          grep -n "new GoogleGenAI" src/gemini.ts
+
+      - name: Run patched review bot
+        env:
+          INPUT_GEMINI_API_KEY: "shim-routed"
+          INPUT_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_MODEL: "gemini-flash-latest"
+          INPUT_INSTRUCTIONS: ""
+          INPUT_CONFIG_PATH: ".github/gemini-review.yml"
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GEMINI_SHIM_URL: "http://127.0.0.1:8765"
+        working-directory: /tmp/grb
+        run: node --experimental-strip-types src/index.ts
