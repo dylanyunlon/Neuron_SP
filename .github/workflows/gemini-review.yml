@@ -36,24 +36,27 @@ jobs:
           sleep 2
           echo "Shim running on :8765"
 
-      - name: Clone and patch gemini-review-bot
+      - name: Download and patch gemini-review-bot
         run: |
-          git clone --depth=1 https://github.com/jgunnink/gemini-review-bot.git /tmp/grb
-          cd /tmp/grb && npm ci --omit=dev
+          mkdir -p /tmp/grb
+          curl -sL https://github.com/jgunnink/gemini-review-bot/archive/refs/heads/main.tar.gz | tar -xz -C /tmp/grb --strip-components=1
+          cd /tmp/grb
+          npm ci --omit=dev 2>&1 | tail -3
 
           # Patch: inject httpOptions.baseUrl into GoogleGenAI constructor
-          sed -i 's|new GoogleGenAI({ apiKey, vertexai: useVertex })|new GoogleGenAI({ apiKey, vertexai: useVertex, httpOptions: { baseUrl: process.env.GEMINI_SHIM_URL || undefined } })|g' src/gemini.ts
-          echo "Patched gemini.ts:"
-          grep -n "new GoogleGenAI" src/gemini.ts
+          sed -i 's|new GoogleGenAI({ apiKey, vertexai: useVertex })|new GoogleGenAI({ apiKey, vertexai: useVertex, httpOptions: { baseUrl: process.env.GEMINI_SHIM_URL \|\| undefined } })|g' src/gemini.ts
+          echo "Patched lines:"
+          grep -n "GoogleGenAI" src/gemini.ts
 
-      - name: Run patched review bot
+      - name: Run review bot
         env:
-          INPUT_GEMINI_API_KEY: "shim-routed"
+          INPUT_GEMINI_API_KEY: "shim-routed-via-aimonkey"
           INPUT_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           INPUT_MODEL: "gemini-flash-latest"
-          INPUT_INSTRUCTIONS: ""
+          INPUT_INSTRUCTIONS: "Focus on NCCL collective symmetry, deadlock risks, and test coverage for this distributed training engine."
           INPUT_CONFIG_PATH: ".github/gemini-review.yml"
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GEMINI_SHIM_URL: "http://127.0.0.1:8765"
+          GITHUB_EVENT_PATH: ${{ github.event_path }}
         working-directory: /tmp/grb
         run: node --experimental-strip-types src/index.ts
