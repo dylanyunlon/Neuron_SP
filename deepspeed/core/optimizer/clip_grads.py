@@ -703,6 +703,7 @@ def clip_grad_norm(
     qk_config: Optional["QKClipConfig"] = None,
     named_params: Optional[List[Tuple[str, torch.nn.Parameter]]] = None,
     norm_ema: Optional["GradNormEMA"] = None,
+    collective_contract: Optional[object] = None,
 ) -> torch.Tensor:
     """Clip gradient norm across model-parallel ranks.
 
@@ -751,6 +752,17 @@ def clip_grad_norm(
     # ------------------------------------------------------------------
     # Step 2: Compute global gradient norm
     # ------------------------------------------------------------------
+    # CollectiveContract integration (fix #589): the norm all-reduce inside
+    # this block is tracked by the contract so that all ranks must enter it.
+    # The guard is a no-op when collective_contract is None (non-contract path).
+    _cc_guard = (
+        collective_contract.guard("clip_grad_norm_allreduce")
+        if collective_contract is not None and hasattr(collective_contract, 'guard')
+        and getattr(collective_contract, 'enabled', False)
+        else __import__("contextlib").nullcontext()
+    )
+    _cc_guard.__enter__()
+
     # Memory-efficient path: compute norm incrementally (one grad at a time)
     # instead of collecting all FP32 grads into a list.  On A6000 (47 GB)
     # the full-model BF16 + ZeRO-3 shard + activations already consume
@@ -841,6 +853,9 @@ def clip_grad_norm(
             total_norm=total_norm,
             use_decoupled_grad=use_decoupled_grad,
         )
+
+    # Close contract guard for clip_grad_norm_allreduce.
+    _cc_guard.__exit__(None, None, None)
 
     return total_norm
 
