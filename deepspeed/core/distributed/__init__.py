@@ -16,6 +16,15 @@ from deepspeed.core.distributed.grad_buffer import (
     build_grad_buffer_registry,
 )
 
+from deepspeed.core.distributed.collective_contract import (
+    CollectiveContract,
+    CollectiveOp,
+    ContractEntry,
+    ContractViolation,
+    build_step_contract,
+    log_contract_summary,
+)
+
 from deepspeed.core.distributed.bucket_aware_grad_sync import (
     pcie_overlap_trigger_elems,
     pcie_bucket_size,
@@ -202,4 +211,11 @@ __all__ = [
     "AsyncParamSyncManager",
     "async_param_sync_context",
     "build_vpp_param_sync_manager",
+    # collective_contract (fix #589: enforce NCCL collective symmetry)
+    "CollectiveContract",
+    "CollectiveOp",
+    "ContractEntry",
+    "ContractViolation",
+    "build_step_contract",
+    "log_contract_summary",
 ]

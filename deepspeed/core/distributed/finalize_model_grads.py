@@ -56,9 +56,13 @@ Public API:
 
 from __future__ import annotations
 
+import contextlib
 import logging
 from functools import partial
 from typing import Callable, Dict, List, Optional, Union
+
+# Nullcontext shim (Python 3.7+ contextlib.nullcontext)
+_nullcontext = contextlib.nullcontext
 
 import torch
 import torch.nn as nn
@@ -68,6 +72,12 @@ import deepspeed.core.parallel_state as parallel_state
 from deepspeed.core.model_parallel_config import ModelParallelConfig
 from deepspeed.core.desloc_config import DesLocConfig
 from deepspeed.core.distributed.distributed_data_parallel import DistributedDataParallel
+
+# Lazy import to avoid circular dependency; used only for type annotation.
+try:
+    from deepspeed.core.distributed.collective_contract import CollectiveContract
+except ImportError:
+    CollectiveContract = None  # type: ignore[misc,assignment]
 
 logger = logging.getLogger(__name__)
 
@@ -1088,6 +1098,7 @@ def finalize_model_grads(
     *,
     desloc_step: Optional[int] = None,
     desloc_config: Optional[DesLocConfig] = None,
+    collective_contract: Optional['CollectiveContract'] = None,
 ) -> None:
     """Finalize model gradients before optimizer step.
 
@@ -1204,23 +1215,36 @@ def finalize_model_grads(
     # 1. Main DP all-reduce / reduce-scatter across data-parallel ranks.
     #    On non-Kx steps (skip_grad_sync=True) we forward the skip flag
     #    into finish_grad_sync so each DDP module maintains correct state.
+    #
+    #    CollectiveContract integration (fix #589): the contract guard
+    #    ensures this block is ALWAYS entered by all ranks, regardless of
+    #    skip_grad_sync — the skip flag only controls the NCCL payload,
+    #    not whether we participate.  Without this, rank A entering
+    #    finish_grad_sync while rank B skips causes an NCCL hang.
     # ------------------------------------------------------------------
     if config is not None and getattr(config, 'timers', None) is not None:
         config.timers('all-grads-sync', log_level=1).start(
             barrier=getattr(config, 'barrier_with_L1_time', False)
         )
 
-    for model_chunk in model:
-        if isinstance(model_chunk, DistributedDataParallel):
-            if skip_grad_sync:
-                for bg in (
-                    model_chunk.bucket_groups + model_chunk.expert_parallel_bucket_groups
-                ):
-                    bg._skip_sync = True
-            model_chunk.finish_grad_sync(force_all_reduce=force_all_reduce)
-        else:
-            if not skip_grad_sync:
-                _direct_allreduce_grads(model_chunk, config)
+    # Contract guard: log that we entered the DP allreduce block.
+    _contract_ctx = (
+        collective_contract.guard("finalize_model_grads")
+        if collective_contract is not None and collective_contract.enabled
+        else _nullcontext()
+    )
+    with _contract_ctx:
+        for model_chunk in model:
+            if isinstance(model_chunk, DistributedDataParallel):
+                if skip_grad_sync:
+                    for bg in (
+                        model_chunk.bucket_groups + model_chunk.expert_parallel_bucket_groups
+                    ):
+                        bg._skip_sync = True
+                model_chunk.finish_grad_sync(force_all_reduce=force_all_reduce)
+            else:
+                if not skip_grad_sync:
+                    _direct_allreduce_grads(model_chunk, config)
 
     if config is not None and getattr(config, 'timers', None) is not None:
         config.timers('all-grads-sync').stop()
