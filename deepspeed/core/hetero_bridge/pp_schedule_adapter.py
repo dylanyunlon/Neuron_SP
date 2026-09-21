@@ -181,6 +181,20 @@ class PPScheduleAdapter:
 
         world_size = self.tier_map.world_size
 
+        # M592: warn if microbatches < pipeline stages (deadlock risk).
+        # The centralized guard emits a structured warning and logs it.
+        try:
+            from deepspeed.runtime.pipe.pipeline_stall_guard import (
+                warn_microbatch_underflow,
+            )
+            warn_microbatch_underflow(
+                num_microbatches, world_size,
+                context="PPScheduleAdapter.forward_backward",
+            )
+        except ImportError:
+            # Guard module not available — fall through silently.
+            pass
+
         # Default forward_step_func for tests / single-stage use.
         if forward_step_func is None:
             def forward_step_func(data_iter, m):
