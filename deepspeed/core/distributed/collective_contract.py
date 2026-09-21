@@ -61,10 +61,11 @@ class ContractViolation(RuntimeError):
     """Raised when ranks disagree on the collective sequence.
 
     Attributes:
-        step:       Training step where the mismatch was detected.
-        local_seq:  This rank's planned sequence.
-        remote_seq: The sequence received from the mismatched rank.
-        rank:       Local rank id.
+        step:        Training step where the mismatch was detected.
+        local_seq:   This rank's planned sequence.
+        remote_seq:  The sequence received from the mismatched rank.
+        rank:        Local rank id.
+        remote_rank: Remote rank where the mismatch was found (-1 if unknown).
     """
 
     def __init__(
@@ -73,17 +74,36 @@ class ContractViolation(RuntimeError):
         local_seq: Sequence[str],
         remote_seq: Sequence[str],
         rank: int,
+        remote_rank: int = -1,
     ) -> None:
         self.step = step
         self.local_seq = list(local_seq)
         self.remote_seq = list(remote_seq)
         self.rank = rank
+        self.remote_rank = remote_rank
         super().__init__(
             f"CollectiveContract violation at step {step} on rank {rank}: "
             f"local sequence has {len(local_seq)} ops "
             f"({', '.join(local_seq[:5])}{'…' if len(local_seq) > 5 else ''}), "
             f"remote sequence has {len(remote_seq)} ops "
             f"({', '.join(remote_seq[:5])}{'…' if len(remote_seq) > 5 else ''})."
+        )
+
+    def detailed_report(self) -> str:
+        """Return a human-readable multi-line violation report.
+
+        Includes a side-by-side diff showing exactly where the planned
+        collective sequences diverge.
+        """
+        from deepspeed.core.distributed.contract_diagnostics import (
+            format_violation_report,
+        )
+        return format_violation_report(
+            step=self.step,
+            rank=self.rank,
+            local_seq=self.local_seq,
+            remote_seq=self.remote_seq,
+            remote_rank=self.remote_rank,
         )
 
 
@@ -196,6 +216,34 @@ class CollectiveContract:
         self._active_guard: Optional[str] = None
         self._verified: bool = False
 
+    def __repr__(self) -> str:
+        return (
+            f"CollectiveContract(step={self.step}, rank={self.rank}, "
+            f"planned={self.planned_count}, executed={len(self._executed)}, "
+            f"Kx={self.is_Kx}, Ku={self.is_Ku}, Kv={self.is_Kv}, "
+            f"enabled={self.enabled})"
+        )
+
+    def reset(self, *, clear_plan: bool = False) -> None:
+        """Reset execution state so the contract can be re-verified and re-run.
+
+        By default keeps the planned sequence intact and clears only the
+        execution log, verified flag, active guard, and sequence counter.
+        Pass ``clear_plan=True`` to also discard the planned sequence,
+        allowing a fresh ``plan()`` cycle.
+
+        Args:
+            clear_plan: If True, also clear the planned sequence and
+                        reset the sequence counter.  Default False
+                        (replay mode: plan stays, execution resets).
+        """
+        self._executed.clear()
+        self._active_guard = None
+        self._verified = False
+        if clear_plan:
+            self._planned.clear()
+            self._seq_counter = 0
+
     # ------------------------------------------------------------------
     # Planning API
     # ------------------------------------------------------------------
@@ -273,6 +321,37 @@ class CollectiveContract:
     # Verification API
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    _VERIFY_MAX_LEN: int = 4096
+
+    def _encode_planned_sequence(self) -> Tuple[bytes, int]:
+        """Encode planned sequence for allgather and validate length.
+
+        Returns:
+            (encoded_bytes, max_len) tuple.
+
+        Raises:
+            RuntimeError: If the encoded sequence exceeds the buffer size.
+                This prevents silent truncation in verify().
+        """
+        local_seq_str = "|".join(self.planned_sequence)
+        max_len = self._VERIFY_MAX_LEN
+        encoded = local_seq_str.encode("utf-8")
+        if len(encoded) >= max_len:
+            raise RuntimeError(
+                f"CollectiveContract: planned sequence too long for verify() "
+                f"({len(encoded)} >= {max_len} bytes, {self.planned_count} ops). "
+                f"Increase _VERIFY_MAX_LEN or reduce collective name lengths."
+            )
+        return encoded, max_len
+
+    # ------------------------------------------------------------------
+    # Verification API
+    # ------------------------------------------------------------------
+
     def verify(
         self,
         process_group: Optional[dist.ProcessGroup] = None,
@@ -308,11 +387,8 @@ class CollectiveContract:
             self._verified = True
             return True
 
-        # Encode planned sequence as a single string
-        local_seq_str = "|".join(self.planned_sequence)
-        # Pad to fixed length for allgather
-        max_len = 4096  # generous upper bound
-        encoded = local_seq_str.encode("utf-8")[:max_len]
+        # Encode planned sequence and validate length
+        encoded, max_len = self._encode_planned_sequence()
         padded = encoded + b"\x00" * (max_len - len(encoded))
 
         local_tensor = torch.frombuffer(bytearray(padded), dtype=torch.uint8).cuda()
@@ -327,12 +403,18 @@ class CollectiveContract:
             remote_seq = remote_str.split("|") if remote_str else []
 
             if remote_seq != self.planned_sequence:
-                raise ContractViolation(
+                violation = ContractViolation(
                     step=self.step,
                     local_seq=self.planned_sequence,
                     remote_seq=remote_seq,
                     rank=self.rank,
+                    remote_rank=remote_rank,
                 )
+                logger.error(
+                    "CollectiveContract VIOLATION detected:\n%s",
+                    violation.detailed_report(),
+                )
+                raise violation
 
         self._verified = True
         logger.debug(

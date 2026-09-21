@@ -1,0 +1,13 @@
+═══ CollectiveContract Violation Report ═══
+  Step:        0
+  Local rank:  0
+  Remote rank: 1
+  Local ops:   4
+  Remote ops:  3
+
+  Sequence diff (← local | remote →):
+    [✓]   1: nan_flag_allreduce                | nan_flag_allreduce
+    [✓]   2: finalize_model_grads              | finalize_model_grads
+    [✓]   3: clip_grad_norm_allreduce           | clip_grad_norm_allreduce
+    [✗]   4: skip_flag_allreduce               | <missing>
+═══ End of Report ═══

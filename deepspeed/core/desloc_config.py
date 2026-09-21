@@ -69,6 +69,25 @@ class DesLocConfig:
     def is_kv_step(self, step: int) -> bool:
         return step % self.kv == 0
 
+    def contract_sync_periods(self) -> Dict[str, int]:
+        """Return the Kx/Ku/Kv sync periods as a dict (for CollectiveContract).
+
+        The dict keys match the attribute names used by CollectiveContract
+        for Kx/Ku/Kv resolution from a DesLocConfig instance.
+        """
+        return {"kx": self.kx, "ku": self.ku, "kv": self.kv}
+
+    def sync_status_str(self, step: int) -> str:
+        """Return a human-readable sync status string for *step*.
+
+        Example: ``"Kx=SYNC Ku=skip Kv=skip"`` for a Kx step.
+        """
+        return (
+            f"Kx={'SYNC' if self.is_kx_step(step) else 'skip'} "
+            f"Ku={'SYNC' if self.is_ku_step(step) else 'skip'} "
+            f"Kv={'SYNC' if self.is_kv_step(step) else 'skip'}"
+        )
+
     def get_tier_for_gpu(self, gpu_index: int) -> Optional[TierSpec]:
         for tier in self.tiers:
             if gpu_index in tier.gpu_indices:

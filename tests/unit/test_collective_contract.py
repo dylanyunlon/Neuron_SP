@@ -509,3 +509,224 @@ class TestFullStepSimulation:
         with pytest.raises(RuntimeError, match="collective order mismatch"):
             with c.guard("clip_grad_norm_allreduce"):
                 pass
+
+
+# ---------------------------------------------------------------------------
+# Test: Multi-step simulation
+# ---------------------------------------------------------------------------
+
+class TestMultiStepSimulation:
+    """Simulate multiple consecutive training steps end-to-end."""
+
+    def test_three_consecutive_dp_only_steps(self):
+        """Three back-to-back DP-only steps, all 4 collectives each."""
+        cfg = _make_engine_config(kx=2, ku=4, kv=8)
+        for step in range(3):
+            c = build_step_contract(step=step, config=cfg, has_dist_optimizer=False)
+            for name in c.planned_sequence:
+                with c.guard(name):
+                    pass
+            c.assert_complete()
+
+    def test_five_consecutive_dist_optimizer_steps(self):
+        """Five back-to-back dist-optimizer steps, all 6 collectives each."""
+        cfg = _make_engine_config(kx=2, ku=4, kv=8)
+        for step in range(5):
+            c = build_step_contract(step=step, config=cfg, has_dist_optimizer=True)
+            for name in c.planned_sequence:
+                with c.guard(name):
+                    pass
+            c.assert_complete()
+
+    def test_kx_flags_alternate_across_steps(self):
+        """Verify Kx/Ku/Kv flags flip correctly as step advances."""
+        cfg = _make_engine_config(kx=2, ku=4, kv=8)
+        # step 0 → step+1=1 → Kx=False
+        c0 = build_step_contract(step=0, config=cfg)
+        assert c0.is_Kx is False
+        # step 1 → step+1=2 → Kx=True (2%2==0)
+        c1 = build_step_contract(step=1, config=cfg)
+        assert c1.is_Kx is True
+        # step 3 → step+1=4 → Kx=True, Ku=True (4%4==0)
+        c3 = build_step_contract(step=3, config=cfg)
+        assert c3.is_Kx is True
+        assert c3.is_Ku is True
+
+
+# ---------------------------------------------------------------------------
+# Test: Boundary conditions
+# ---------------------------------------------------------------------------
+
+class TestBoundaryConditions:
+    """Edge cases: Kx=1, step=0, very large step numbers."""
+
+    def test_kx_equals_one_every_step_syncs(self):
+        """When Kx=Ku=Kv=1, every step is a sync step."""
+        cfg = _make_engine_config(kx=1, ku=1, kv=1)
+        for step in range(5):
+            c = CollectiveContract(step=step, config=cfg, rank=0)
+            assert c.is_Kx is True
+            assert c.is_Ku is True
+            assert c.is_Kv is True
+
+    def test_step_zero(self):
+        """Step 0 is always valid — Kx=True when Kx divides (0+1)."""
+        cfg = _make_engine_config(kx=1, ku=1, kv=1)
+        c = build_step_contract(step=0, config=cfg)
+        assert c.step == 0
+        assert c.is_Kx is True
+
+    def test_large_step_number(self):
+        """Very large step number does not overflow or error."""
+        cfg = _make_engine_config(kx=32, ku=96, kv=192)
+        c = build_step_contract(step=1_000_000, config=cfg)
+        # (1000000+1) % 32 = 1000001 % 32 = 17 ≠ 0, so Kx=False
+        assert c.is_Kx is False
+        # Ensure no crash on large numbers
+        for name in c.planned_sequence:
+            with c.guard(name):
+                pass
+        c.assert_complete()
+
+
+# ---------------------------------------------------------------------------
+# Test: execute() args/kwargs forwarding
+# ---------------------------------------------------------------------------
+
+class TestExecuteArgsForwarding:
+    """Test that execute() correctly forwards *args and **kwargs."""
+
+    def test_positional_args_forwarded(self):
+        c = CollectiveContract(step=0, rank=0)
+        c.plan("op_a", CollectiveOp.ALL_REDUCE)
+        result = c.execute("op_a", lambda x, y: x + y, 3, 4)
+        assert result == 7
+
+    def test_keyword_args_forwarded(self):
+        c = CollectiveContract(step=0, rank=0)
+        c.plan("op_a", CollectiveOp.ALL_REDUCE)
+        result = c.execute("op_a", lambda x, y=10: x * y, 5, y=3)
+        assert result == 15
+
+    def test_mixed_args_and_kwargs(self):
+        c = CollectiveContract(step=0, rank=0)
+        c.plan("op_a", CollectiveOp.ALL_REDUCE)
+        def fn(a, b, *, c=0):
+            return a + b + c
+        result = c.execute("op_a", fn, 1, 2, c=10)
+        assert result == 13
+
+    def test_execute_return_value_preserved(self):
+        c = CollectiveContract(step=0, rank=0)
+        c.plan("op_a", CollectiveOp.ALL_REDUCE)
+        result = c.execute("op_a", lambda: {"key": "value"})
+        assert result == {"key": "value"}
+
+
+# ---------------------------------------------------------------------------
+# Test: Snapshot verification against golden files
+# ---------------------------------------------------------------------------
+
+class TestSnapshotVerification:
+    """Verify the planned sequence matches the golden snapshot."""
+
+    def test_dp_only_sequence_matches_snapshot(self):
+        import json, os
+        snap_path = os.path.join(
+            os.path.dirname(__file__), "__snapshots__",
+            "collective_contract_sequence.json",
+        )
+        if not os.path.exists(snap_path):
+            pytest.skip("Snapshot file not found")
+        with open(snap_path) as f:
+            snap = json.load(f)
+
+        cfg = _make_engine_config()
+        c = build_step_contract(step=0, config=cfg, has_dist_optimizer=False)
+        assert c.planned_sequence == snap["dp_only"]
+
+    def test_dist_optimizer_sequence_matches_snapshot(self):
+        import json, os
+        snap_path = os.path.join(
+            os.path.dirname(__file__), "__snapshots__",
+            "collective_contract_sequence.json",
+        )
+        if not os.path.exists(snap_path):
+            pytest.skip("Snapshot file not found")
+        with open(snap_path) as f:
+            snap = json.load(f)
+
+        cfg = _make_engine_config()
+        c = build_step_contract(step=0, config=cfg, has_dist_optimizer=True)
+        assert c.planned_sequence == snap["dist_optimizer"]
+
+
+# ---------------------------------------------------------------------------
+# Test: verify() truncation guard
+# ---------------------------------------------------------------------------
+
+class TestVerifyTruncationGuard:
+    """Ensure verify() raises when the planned sequence exceeds buffer size.
+
+    After BUG 1 review feedback: verify() short-circuits in non-distributed
+    mode, so we test _encode_planned_sequence() directly which is the
+    extracted, independently testable encoding+validation path.
+    """
+
+    def test_encode_raises_on_oversized_sequence(self):
+        """_encode_planned_sequence() must raise when encoding >= 4096 bytes."""
+        c = CollectiveContract(step=0, rank=0)
+        for i in range(250):
+            c.plan(f"very_long_collective_name_number_{i:05d}", CollectiveOp.ALL_REDUCE)
+
+        with pytest.raises(RuntimeError, match="too long"):
+            c._encode_planned_sequence()
+
+    def test_encode_succeeds_for_normal_sequence(self):
+        """Normal 6-op sequence should encode fine."""
+        c = CollectiveContract(step=0, rank=0)
+        for name in ["nan_flag_allreduce", "finalize_model_grads",
+                      "clip_grad_norm_allreduce", "skip_flag_allreduce",
+                      "prepare_grads_rs", "param_sync"]:
+            c.plan(name, CollectiveOp.ALL_REDUCE)
+
+        encoded, max_len = c._encode_planned_sequence()
+        assert len(encoded) < max_len
+        assert b"nan_flag_allreduce" in encoded
+
+
+# ---------------------------------------------------------------------------
+# Test: reset() with clear_plan
+# ---------------------------------------------------------------------------
+
+class TestResetClearPlan:
+    """Ensure reset(clear_plan=True) allows a fresh plan() cycle."""
+
+    def test_clear_plan_resets_everything(self):
+        c = CollectiveContract(step=0, rank=0)
+        c.plan("op_a", CollectiveOp.ALL_REDUCE)
+        c.plan("op_b", CollectiveOp.ALL_REDUCE)
+        with c.guard("op_a"): pass
+        with c.guard("op_b"): pass
+
+        c.reset(clear_plan=True)
+        assert c.planned_count == 0
+        assert c._seq_counter == 0
+
+        # Now plan fresh ops
+        c.plan("op_new", CollectiveOp.ALL_REDUCE)
+        assert c.planned_count == 1
+        assert c.planned_sequence == ["op_new"]
+        with c.guard("op_new"): pass
+        c.assert_complete()
+
+    def test_default_reset_preserves_plan_for_replay(self):
+        c = CollectiveContract(step=0, rank=0)
+        c.plan("op_a", CollectiveOp.ALL_REDUCE)
+        with c.guard("op_a"): pass
+
+        c.reset()  # default: clear_plan=False
+        assert c.planned_count == 1  # plan preserved
+        assert c.planned_sequence == ["op_a"]
+        with c.guard("op_a"): pass
+        c.assert_complete()

@@ -85,3 +85,25 @@ def pytest_fixture_setup(fixturedef, request):
     if getattr(fixturedef.func, "is_dist_fixture", False):
         dist_fixture_class = fixturedef.func()
         dist_fixture_class(request)
+
+
+# ---------------------------------------------------------------------------
+# CollectiveContract fixtures (fix #589)
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def contract_config():
+    """Return a minimal config for CollectiveContract tests."""
+    import types
+    cfg = types.SimpleNamespace()
+    cfg.desloc_Kx = 32
+    cfg.desloc_Ku = 96
+    cfg.desloc_Kv = 192
+    return cfg
+
+
+@pytest.fixture
+def step_trace_log():
+    """Return a fresh StepTraceLog for diagnostic tests."""
+    from deepspeed.core.distributed.contract_diagnostics import StepTraceLog
+    return StepTraceLog(maxlen=64)
