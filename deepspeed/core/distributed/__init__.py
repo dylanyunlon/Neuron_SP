@@ -25,6 +25,14 @@ from deepspeed.core.distributed.collective_contract import (
     log_contract_summary,
 )
 
+from deepspeed.core.distributed.contract_diagnostics import (
+    format_violation_report,
+    diff_sequences,
+    validate_call_sites,
+    StepTrace,
+    StepTraceLog,
+)
+
 from deepspeed.core.distributed.bucket_aware_grad_sync import (
     pcie_overlap_trigger_elems,
     pcie_bucket_size,
@@ -218,4 +226,10 @@ __all__ = [
     "ContractViolation",
     "build_step_contract",
     "log_contract_summary",
+    # contract_diagnostics (fix #589: diagnostic tooling)
+    "format_violation_report",
+    "diff_sequences",
+    "validate_call_sites",
+    "StepTrace",
+    "StepTraceLog",
 ]

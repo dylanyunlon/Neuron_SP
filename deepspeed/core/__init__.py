@@ -52,6 +52,10 @@ _LAZY_SUBMODULES = {
     "finalize_model_grads": "deepspeed.core.distributed",
     "ParamAndGradBuffer": "deepspeed.core.distributed",
     "ParamAndGradBucketGroup": "deepspeed.core.distributed",
+    # CollectiveContract (fix #589: NCCL collective symmetry enforcement)
+    "CollectiveContract": "deepspeed.core.distributed",
+    "build_step_contract": "deepspeed.core.distributed",
+    "ContractViolation": "deepspeed.core.distributed",
 }
 
 

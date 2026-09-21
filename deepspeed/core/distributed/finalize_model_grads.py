@@ -1228,12 +1228,23 @@ def finalize_model_grads(
         )
 
     # Contract guard: log that we entered the DP allreduce block.
+    # FIX #589: the contract guard ensures this block is ALWAYS entered by
+    # all ranks, regardless of skip_grad_sync.  The skip flag only controls
+    # the NCCL payload, not whether we participate.  Without this, rank A
+    # entering finish_grad_sync while rank B skips causes an NCCL hang.
     _contract_ctx = (
         collective_contract.guard("finalize_model_grads")
         if collective_contract is not None and collective_contract.enabled
         else _nullcontext()
     )
     with _contract_ctx:
+        logger.debug(
+            "[finalize_model_grads] entering DP allreduce block "
+            "(skip_grad_sync=%s, force_all_reduce=%s, model_chunks=%d, "
+            "contract=%s)",
+            skip_grad_sync, force_all_reduce, len(model),
+            repr(collective_contract) if collective_contract is not None else "None",
+        )
         for model_chunk in model:
             if isinstance(model_chunk, DistributedDataParallel):
                 if skip_grad_sync:

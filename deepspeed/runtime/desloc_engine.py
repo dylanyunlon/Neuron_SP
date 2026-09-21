@@ -63,6 +63,10 @@ from deepspeed.core.distributed.collective_contract import (
     build_step_contract,
     log_contract_summary,
 )
+from deepspeed.core.distributed.contract_diagnostics import (
+    StepTrace,
+    StepTraceLog,
+)
 
 # ---------------------------------------------------------------------------
 # desloc_checkpointing: save_checkpoint/load_checkpoint extracted into a
@@ -2119,11 +2123,20 @@ class DesLocEngine:
         _contract_enabled = os.environ.get(
             "NEURON_SP_COLLECTIVE_CONTRACT", "1"
         ).strip() == "1"
+        # Preflight verification: check that all ranks agree on the planned
+        # sequence BEFORE any NCCL collective fires.  Controlled by env var
+        # because the verify() call itself is a collective (all_gather).
+        _contract_verify = os.environ.get(
+            "NEURON_SP_CONTRACT_VERIFY", "0"
+        ).strip() == "1"
+        # StepTraceLog: ring buffer of recent contract traces for post-mortem
+        # analysis when an NCCL hang occurs (fix #589 diagnostic tooling).
+        _trace_log = StepTraceLog(maxlen=128)
         if _contract_enabled and _is_main:
             logger.info(
                 "[CollectiveContract] ENABLED — enforcing NCCL collective "
                 "symmetry across all ranks (set NEURON_SP_COLLECTIVE_CONTRACT=0 "
-                "to disable)."
+                "to disable, NEURON_SP_CONTRACT_VERIFY=1 to enable preflight)."
             )
 
         for step in range(self.global_step, cfg.total_steps):
@@ -2140,6 +2153,21 @@ class DesLocEngine:
                 rank=_my_rank,
             )
             _contract.enabled = _contract_enabled
+
+            # --- CollectiveContract: preflight verify (fix #589) ---
+            # On the first few steps (or when explicitly enabled), verify
+            # that all ranks planned the same collective sequence BEFORE
+            # any collective fires.  This catches misconfiguration early
+            # instead of waiting for a 30-minute NCCL timeout.
+            if _contract_enabled and _contract_verify and step < 5:
+                try:
+                    _dp_grp = getattr(self, '_ddp_dp_group', None)
+                    _contract.verify(process_group=_dp_grp)
+                except Exception as _verify_exc:
+                    logger.error(
+                        "[CollectiveContract] preflight verify FAILED at step %d: %s",
+                        step, _verify_exc,
+                    )
 
             # DistributedOptimizer.zero_grad() zeroes its grad_data buffers +
             # shard param grads.  Plain AdamW zero_grad() on the non-ZeRO-3 path.
@@ -2853,6 +2881,21 @@ class DesLocEngine:
                 )
             if step < 5 and _is_main and _contract_enabled:
                 log_contract_summary(_contract)
+
+            # --- CollectiveContract: record StepTrace for post-mortem (fix #589) ---
+            if _contract_enabled:
+                _trace_log.record(StepTrace.from_contract(_contract))
+                if step > 0 and step % 1000 == 0 and _is_main:
+                    _tl_summary = _trace_log.summary()
+                    _incomplete = _trace_log.incomplete_steps()
+                    if _incomplete:
+                        logger.warning(
+                            "[CollectiveContract] trace summary: %d steps, "
+                            "%d incomplete (steps: %s)",
+                            _tl_summary["total_steps"],
+                            _tl_summary["incomplete_steps"],
+                            [t.step for t in _incomplete[:5]],
+                        )
 
             # --- [PROFILE] finish step: collect all CUDA event timings ---
             _step_profile = _profiler.finish_step(

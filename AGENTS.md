@@ -87,3 +87,18 @@ The Edit tool has a hidden auto-formatter that silently changes quotes, whitespa
 - Each sub-Claude owns a module end-to-end: clone → read history → design → implement → test → push.
 - Sub-Claudes iterate in their own containers until `python -c "import ..."` succeeds.
 - Sub-Claudes push directly to main. No branches, no v2/v3 suffixes.
+
+### CollectiveContract architecture (fix #589)
+
+The NCCL collective symmetry enforcement layer lives in `deepspeed/core/distributed/`:
+
+- **`collective_contract.py`** — `CollectiveContract`, `ContractViolation`, `build_step_contract()`.
+  Every training step builds a contract declaring the exact NCCL collective sequence.
+  Conditional collectives become unconditional (NOOP payload when skipped).
+- **`contract_diagnostics.py`** — `format_violation_report()`, `diff_sequences()`,
+  `validate_call_sites()`, `StepTrace`, `StepTraceLog`. Runtime analysis and
+  post-mortem tooling.
+- **`desloc_engine.py`** — uses `build_step_contract()` + `.guard("name")` around
+  every collective call. Enable preflight verify with `NEURON_SP_CONTRACT_VERIFY=1`.
+- **Tests**: `tests/unit/test_collective_contract.py`, `tests/unit/test_contract_diagnostics.py`,
+  golden snapshots in `tests/unit/__snapshots__/`.
