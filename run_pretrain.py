@@ -1017,7 +1017,11 @@ def run_standalone(args: argparse.Namespace) -> None:
         print("-" * 60)
 
     for step in range(start_step, args.steps + 1):
-        input_ids, labels = next(data)
+        batch = next(data)
+        if isinstance(batch, dict):
+            input_ids, labels = batch["tokens"], batch["labels"]
+        else:
+            input_ids, labels = batch
 
         optimizer.zero_grad(set_to_none=True)
         with torch.autocast(device_type=device.type, dtype=dtype, enabled=(device.type == "cuda")):
