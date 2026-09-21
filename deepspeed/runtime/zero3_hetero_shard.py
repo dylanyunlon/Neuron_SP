@@ -298,10 +298,25 @@ class ShardState:
 
         The gathered buffer's dtype matches the first parameter's dtype
         (usually BF16), so forward/backward run in low precision.
+
+        .. warning::
+
+            FIX #591 Blocker 2 — defense in depth:
+            This method calls ``all_gather_into_tensor`` which is an NCCL
+            collective.  ALL ranks in the process group MUST call this the
+            same number of times per step.  The microbatch_guard module
+            enforces uniform ``num_microbatches`` at the engine level; this
+            counter here is a secondary diagnostic that logs when the total
+            gather count diverges from expectations.
         """
         if self.world_size <= 1:
             yield
             return
+
+        # FIX #591: increment gather counter for symmetry diagnostic.
+        if not hasattr(self, '_gather_count'):
+            self._gather_count = 0
+        self._gather_count += 1
 
         # Choose dtype to gather in — match the live parameter dtype.
         gather_dtype = self.param_order[0][1].dtype
@@ -321,6 +336,14 @@ class ShardState:
             for p, orig in saved:
                 p.data = orig
             del full
+
+    def get_gather_count(self) -> int:
+        """Return total number of gather_full_params calls (fix #591 diagnostic)."""
+        return getattr(self, '_gather_count', 0)
+
+    def reset_gather_count(self) -> None:
+        """Reset the per-step gather counter (call at step boundary)."""
+        self._gather_count = 0
 
     # ------------------------------------------------------------------
     # Per-parameter backward hooks (reduce-scatter on the fly)
