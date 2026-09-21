@@ -33,6 +33,13 @@ from deepspeed.core.distributed.contract_diagnostics import (
     StepTraceLog,
 )
 
+# Issue #591: embedding grad-sync guard — prevent asymmetric NCCL collectives.
+from deepspeed.core.distributed.embedding_guard import (
+    EmbeddingGradSyncConfig,
+    validate_embedding_sync_flags,
+    safe_model_parallel_config,
+)
+
 from deepspeed.core.distributed.bucket_aware_grad_sync import (
     pcie_overlap_trigger_elems,
     pcie_bucket_size,
@@ -232,4 +239,8 @@ __all__ = [
     "validate_call_sites",
     "StepTrace",
     "StepTraceLog",
+    # embedding_guard (fix #591: prevent asymmetric embedding allreduce)
+    "EmbeddingGradSyncConfig",
+    "validate_embedding_sync_flags",
+    "safe_model_parallel_config",
 ]
