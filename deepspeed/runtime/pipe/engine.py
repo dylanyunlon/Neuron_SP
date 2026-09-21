@@ -1741,6 +1741,8 @@ def m592_forward_backward_pipelining_without_interleaving(
                 forward_step_func, data_iterator, model, input_tensor, losses_reduced)
             # M592: barrier gated by centralized measure_pipeline_stall flag.
             if i == (num_warmup_microbatches - 1) and measure_pipeline_stall:
+                # Defense-in-depth: sanitizer re-checks in case outer guard
+                # is refactored away in a future change.
                 timer_name = sanitize_timer_name(
                     'forward-pipeline-stall', measure_stall=measure_pipeline_stall
                 )
@@ -1754,8 +1756,10 @@ def m592_forward_backward_pipelining_without_interleaving(
             input_tensors.append(input_tensor)
             output_tensors.append(output_tensor)
 
-        # M592: second barrier path — also gated by centralized flag.
+        # M592: second barrier path, also gated by centralized flag.
         if num_warmup_microbatches == 0 and measure_pipeline_stall:
+            # Defense-in-depth: sanitizer re-checks in case outer guard
+            # is refactored away in a future change.
             timer_name = sanitize_timer_name(
                 'forward-pipeline-stall', measure_stall=measure_pipeline_stall
             )

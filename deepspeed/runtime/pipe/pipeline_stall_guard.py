@@ -58,6 +58,9 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Barrier operations that MUST NOT be executed when
 # num_microbatches < pipeline_parallel_world_size.
+#
+# Enumerated via: grep -rn 'pipeline-stall' deepspeed/ Megatron-LM/
+# Last verified: 2026-09-21 (4 unique barrier timer names found)
 BLOCKED_BARRIER_CONDITIONS: frozenset = frozenset({
     "forward-pipeline-stall",
     "backward-pipeline-stall",
@@ -65,12 +68,11 @@ BLOCKED_BARRIER_CONDITIONS: frozenset = frozenset({
     "pipeline-stall-cooldown-start",
 })
 
-# Sensitive timer names that should be masked in user-facing logs
-# when running in degraded (undersaturated) mode.
-_SENSITIVE_TIMER_NAMES = frozenset({
-    "forward-pipeline-stall",
-    "backward-pipeline-stall",
-})
+# Timer names that should be filtered by sanitize_timer_name() when stall
+# measurement is disabled. Equal to BLOCKED_BARRIER_CONDITIONS because any
+# timer guarding a barrier that cannot fire should also be blocked from
+# start/stop calls to avoid corrupting timer bookkeeping.
+_SENSITIVE_TIMER_NAMES = BLOCKED_BARRIER_CONDITIONS
 
 
 # ---------------------------------------------------------------------------

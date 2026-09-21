@@ -9,12 +9,12 @@ from .topology import ProcessTopology
 from .alibi import ALiBiEmbedding, build_alibi_bias, get_alibi_slopes
 # M592: centralized pipeline stall guard (deadlock prevention)
 from .pipeline_stall_guard import (
-    should_measure_pipeline_stall,
-    sanitize_schedule_params,
-    ScheduleParams,
-    warn_microbatch_underflow,
-    PipelineStallGuard,
-    validate_schedule_no_deadlock,
-    sanitize_timer_name,
     BLOCKED_BARRIER_CONDITIONS,
+    PipelineStallGuard,
+    ScheduleParams,
+    sanitize_schedule_params,
+    sanitize_timer_name,
+    should_measure_pipeline_stall,
+    validate_schedule_no_deadlock,
+    warn_microbatch_underflow,
 )

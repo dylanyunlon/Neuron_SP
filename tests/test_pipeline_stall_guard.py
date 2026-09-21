@@ -1,6 +1,12 @@
 """
 Comprehensive tests for issue #592: pipeline stall guard.
 
+Note: this file uses importlib direct-import to bypass the heavy
+deepspeed/__init__.py chain (which pulls in torch, NCCL, etc).
+The project conftest.py also imports torch, so run with --noconftest:
+
+    python -m pytest tests/test_pipeline_stall_guard.py -v --noconftest
+
 Tests the centralized pipeline deadlock prevention module
 (deepspeed.runtime.pipe.pipeline_stall_guard) that prevents
 barrier deadlocks when num_microbatches < pipeline_parallel_world_size.
@@ -369,6 +375,8 @@ class TestSanitizeTimerName:
         """Blocked timer names should return None when stall is disabled."""
         assert sanitize_timer_name("forward-pipeline-stall", measure_stall=False) is None
         assert sanitize_timer_name("backward-pipeline-stall", measure_stall=False) is None
+        assert sanitize_timer_name("pipeline-stall-warmup-end", measure_stall=False) is None
+        assert sanitize_timer_name("pipeline-stall-cooldown-start", measure_stall=False) is None
 
     def test_blocked_timer_stall_enabled(self):
         """Blocked timer names should pass through when stall is enabled."""
