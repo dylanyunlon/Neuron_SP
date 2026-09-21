@@ -369,3 +369,34 @@ class TrainingConfig:
 
     activation_func_type: str = "swiglu"
     """Expert activation function: 'swiglu' (default, matches LLaMA/Mixtral) or 'gelu'."""
+
+    # --- Runtime-query shard weights (issue #590) ---
+    # Populated by runtime_config_query.apply_overrides() when claude-hk-config
+    # returns shard_weights based on *available* VRAM (not total VRAM).
+    # DesLocEngine.__init__ reads these with priority over the legacy
+    # vram_weights_from_tiers() path that uses total VRAM.
+    #
+    # Wiring (AST call chain, 6 functions across 4 modules):
+    #   run_pretrain.py:1272  → query_runtime_config()
+    #     → collect_environment() → _build_prompt() → _call_claude_hk()
+    #     → _parse_response() → _validate()
+    #   run_pretrain.py:1284  → apply_overrides(tc, overrides)
+    #     → setattr(tc, "shard_weights", [...])
+    #     → setattr(tc, "shard_weights_source", "runtime_query")
+    #   desloc_engine.py:530  → resolve_shard_weights(config, tiers, ws)
+    #     → reads config.shard_weights with priority
+    #   → ShardState.build(model, rank, ws, device, vram_weights=weights)
+
+    shard_weights: Optional[List[float]] = None
+    """Per-GPU ZeRO-3 shard weights from runtime_config_query.
+    Based on *available* VRAM (free_vram_gb) rather than total VRAM.
+    Length must equal world_size. None = fall back to tier discovery or even split."""
+
+    cpu_offload_optimizer: Optional[List[bool]] = None
+    """Per-GPU CPU optimizer offload decisions from runtime_config_query.
+    A6000 GPUs typically get True (offload Adam m/v to CPU, freeing ~13 GB).
+    Length must equal world_size. None = use existing heuristic."""
+
+    shard_weights_source: Optional[str] = None
+    """Diagnostic field: records how shard_weights were determined.
+    One of 'runtime_query', 'vram_discovery', 'even_split', or None."""
