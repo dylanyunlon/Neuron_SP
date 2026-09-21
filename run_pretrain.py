@@ -1283,6 +1283,18 @@ def run_desloc(args: argparse.Namespace) -> None:
         if _overrides:
             apply_overrides(tc, _overrides)
             logger.info("runtime_config_query applied %d overrides", len(_overrides))
+            # Issue #590: log shard_weights provenance for diagnostics
+            if "shard_weights" in _overrides:
+                logger.info(
+                    "runtime_config_query shard_weights=%s "
+                    "(based on available VRAM, not total)",
+                    _overrides["shard_weights"],
+                )
+            if "cpu_offload_optimizer" in _overrides:
+                logger.info(
+                    "runtime_config_query cpu_offload_optimizer=%s",
+                    _overrides["cpu_offload_optimizer"],
+                )
         else:
             logger.info("runtime_config_query returned no overrides; using defaults")
     except Exception as _rcq_err:
