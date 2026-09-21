@@ -2131,7 +2131,9 @@ class DesLocEngine:
         ).strip() == "1"
         # StepTraceLog: ring buffer of recent contract traces for post-mortem
         # analysis when an NCCL hang occurs (fix #589 diagnostic tooling).
-        _trace_log = StepTraceLog(maxlen=128)
+        # Configurable via NEURON_SP_TRACE_MAXLEN (default 128).
+        _trace_maxlen = int(os.environ.get("NEURON_SP_TRACE_MAXLEN", "128"))
+        _trace_log = StepTraceLog(maxlen=_trace_maxlen)
         if _contract_enabled and _is_main:
             logger.info(
                 "[CollectiveContract] ENABLED — enforcing NCCL collective "
@@ -2155,11 +2157,13 @@ class DesLocEngine:
             _contract.enabled = _contract_enabled
 
             # --- CollectiveContract: preflight verify (fix #589) ---
-            # On the first few steps (or when explicitly enabled), verify
-            # that all ranks planned the same collective sequence BEFORE
-            # any collective fires.  This catches misconfiguration early
-            # instead of waiting for a 30-minute NCCL timeout.
-            if _contract_enabled and _contract_verify and step < 5:
+            # Verify on the first few steps AND the first Kx sync step,
+            # so the Kx-specific collective sequence also gets checked.
+            # With Kx=32 the first 5 steps only cover non-Kx plans;
+            # extending to max(desloc_Kx, 5)+1 ensures at least one Kx
+            # step is verified before falling silent.
+            _verify_limit = max(self.desloc_Kx, 5) + 1
+            if _contract_enabled and _contract_verify and step < _verify_limit:
                 try:
                     _dp_grp = getattr(self, '_ddp_dp_group', None)
                     _contract.verify(process_group=_dp_grp)

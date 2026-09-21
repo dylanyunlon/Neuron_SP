@@ -44,6 +44,7 @@ Public API
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import math
 import warnings
@@ -760,7 +761,6 @@ def clip_grad_norm(
     # which leaked the context on exceptions.  Refactored to use proper
     # contextlib.ExitStack so the guard is always cleanly exited, even if
     # the norm computation or clipping raises.
-    import contextlib
     _cc_ctx = (
         collective_contract.guard("clip_grad_norm_allreduce")
         if collective_contract is not None and hasattr(collective_contract, 'guard')

@@ -351,7 +351,13 @@ class CollectiveContract:
         local_seq_str = "|".join(self.planned_sequence)
         # Pad to fixed length for allgather
         max_len = 4096  # generous upper bound
-        encoded = local_seq_str.encode("utf-8")[:max_len]
+        encoded = local_seq_str.encode("utf-8")
+        if len(encoded) >= max_len:
+            raise RuntimeError(
+                f"CollectiveContract: planned sequence too long for verify() "
+                f"({len(encoded)} >= {max_len} bytes, {self.planned_count} ops). "
+                f"Increase max_len or reduce collective name lengths."
+            )
         padded = encoded + b"\x00" * (max_len - len(encoded))
 
         local_tensor = torch.frombuffer(bytearray(padded), dtype=torch.uint8).cuda()
