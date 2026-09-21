@@ -30,6 +30,13 @@ from ..activation_checkpointing import checkpointing as ds_checkpointing
 from .module import PipelineModule, PipelineError
 from . import p2p
 from . import schedule
+from .pipeline_stall_guard import (
+    should_measure_pipeline_stall,
+    sanitize_schedule_params,
+    warn_microbatch_underflow,
+    PipelineStallGuard,
+    sanitize_timer_name,
+)
 
 TARGET_ID = -2
 LOG_STAGE = -2
@@ -1691,9 +1698,18 @@ def desloc_interleaved_kx_warmup(ns, nm, num_model_chunks=1,
 def m592_forward_backward_pipelining_without_interleaving(
         forward_step_func, data_iterator, model, optimizer, timers, forward_only, config=None):
     """Non-interleaved 1F1B schedule with pipeline-stall measurement guarded
-    by measure_pipeline_stall so we never deadlock when the number of
-    microbatches is smaller than the pipeline-parallel world size."""
-    logging.debug('[M592]')
+    by the centralized PipelineStallGuard so we never deadlock when the number
+    of microbatches is smaller than the pipeline-parallel world size.
+
+    Issue #592 fix: replaced 3 inline ``measure_pipeline_stall`` conditionals
+    with the centralized ``PipelineStallGuard`` context manager that:
+      1. Computes warmup / steady-state splits via ``sanitize_schedule_params``.
+      2. Gates barrier calls on ``params.measure_pipeline_stall``.
+      3. Emits structured warnings when undersaturated.
+      4. Filters timer names via ``sanitize_timer_name`` to prevent
+         timer bookkeeping corruption when barriers are skipped.
+    """
+    logging.debug('[M592] m592_forward_backward_pipelining_without_interleaving: enter')
     import torch
     from megatron import get_num_microbatches, get_timers, mpu, p2p_communication
     timers = get_timers()
@@ -1702,76 +1718,94 @@ def m592_forward_backward_pipelining_without_interleaving(
     model = model[0]
 
     num_microbatches = get_num_microbatches()
-    num_warmup_microbatches = (
-        mpu.get_pipeline_model_parallel_world_size() -
-        mpu.get_pipeline_model_parallel_rank() - 1)
-    num_warmup_microbatches = min(num_warmup_microbatches, num_microbatches)
-    num_microbatches_remaining = num_microbatches - num_warmup_microbatches
+    pp_world_size = mpu.get_pipeline_model_parallel_world_size()
+    pp_rank = mpu.get_pipeline_model_parallel_rank()
 
-    # Measure pipeline stall only if there are enough microbatches
-    # to have every worker in a warmup and steady state phase.
-    measure_pipeline_stall = (
-        get_num_microbatches() >= mpu.get_pipeline_model_parallel_world_size())
+    # M592 fix: use centralized guard for all schedule parameter computation
+    # and barrier gating, replacing the 3 separate inline conditionals.
+    with PipelineStallGuard(
+        num_microbatches, pp_world_size, pp_rank,
+        context="m592_forward_backward_pipelining_without_interleaving",
+    ) as params:
+        num_warmup_microbatches = params.num_warmup_microbatches
+        num_microbatches_remaining = params.num_microbatches_remaining
+        measure_pipeline_stall = params.measure_pipeline_stall
 
-    input_tensors = []
-    output_tensors = []
-    losses_reduced = []
+        input_tensors = []
+        output_tensors = []
+        losses_reduced = []
 
-    for i in range(num_warmup_microbatches):
-        input_tensor = p2p_communication.recv_forward(timers)
-        output_tensor = forward_step(
-            forward_step_func, data_iterator, model, input_tensor, losses_reduced)
-        # Barrier before first receive to measure forward stall.
-        if i == (num_warmup_microbatches - 1) and measure_pipeline_stall:
-            timers('forward-pipeline-stall').start()
-            torch.distributed.barrier(group=mpu.get_pipeline_model_parallel_group())
-            timers('forward-pipeline-stall').stop()
-        p2p_communication.send_forward(output_tensor, timers)
-        input_tensors.append(input_tensor)
-        output_tensors.append(output_tensor)
-
-    # Barrier before first receive to measure forward stall.
-    if num_warmup_microbatches == 0 and measure_pipeline_stall:
-        timers('forward-pipeline-stall').start()
-        torch.distributed.barrier(group=mpu.get_pipeline_model_parallel_group())
-        timers('forward-pipeline-stall').stop()
-
-    if num_microbatches_remaining > 0:
-        input_tensor = p2p_communication.recv_forward(timers)
-
-    for i in range(num_microbatches_remaining):
-        last_iteration = (i == (num_microbatches_remaining - 1))
-        output_tensor = forward_step(
-            forward_step_func, data_iterator, model, input_tensor, losses_reduced)
-        if forward_only:
-            p2p_communication.send_forward(output_tensor, timers)
-        else:
-            output_tensor_grad = p2p_communication.send_forward_recv_backward(
-                output_tensor, timers)
-        input_tensors.append(input_tensor)
-        output_tensors.append(output_tensor)
-        if forward_only:
-            if not last_iteration:
-                input_tensor = p2p_communication.recv_forward(timers)
-        else:
-            input_tensor, output_tensor = input_tensors.pop(0), output_tensors.pop(0)
-            input_tensor_grad = backward_step(
-                optimizer, input_tensor, output_tensor, output_tensor_grad)
-            if last_iteration:
-                input_tensor = None
-                p2p_communication.send_backward(input_tensor_grad, timers)
-            else:
-                input_tensor = p2p_communication.send_backward_recv_forward(
-                    input_tensor_grad, timers)
-
-    if not forward_only:
         for i in range(num_warmup_microbatches):
-            input_tensor = input_tensors.pop(0)
-            output_tensor = output_tensors.pop(0)
-            output_tensor_grad = p2p_communication.recv_backward(timers)
-            input_tensor_grad = backward_step(
-                optimizer, input_tensor, output_tensor, output_tensor_grad)
-            p2p_communication.send_backward(input_tensor_grad, timers)
+            input_tensor = p2p_communication.recv_forward(timers)
+            output_tensor = forward_step(
+                forward_step_func, data_iterator, model, input_tensor, losses_reduced)
+            # M592: barrier gated by centralized measure_pipeline_stall flag.
+            if i == (num_warmup_microbatches - 1) and measure_pipeline_stall:
+                # Defense-in-depth: sanitizer re-checks in case outer guard
+                # is refactored away in a future change.
+                timer_name = sanitize_timer_name(
+                    'forward-pipeline-stall', measure_stall=measure_pipeline_stall
+                )
+                if timer_name is not None:
+                    timers(timer_name).start()
+                    torch.distributed.barrier(
+                        group=mpu.get_pipeline_model_parallel_group()
+                    )
+                    timers(timer_name).stop()
+            p2p_communication.send_forward(output_tensor, timers)
+            input_tensors.append(input_tensor)
+            output_tensors.append(output_tensor)
+
+        # M592: second barrier path, also gated by centralized flag.
+        if num_warmup_microbatches == 0 and measure_pipeline_stall:
+            # Defense-in-depth: sanitizer re-checks in case outer guard
+            # is refactored away in a future change.
+            timer_name = sanitize_timer_name(
+                'forward-pipeline-stall', measure_stall=measure_pipeline_stall
+            )
+            if timer_name is not None:
+                timers(timer_name).start()
+                torch.distributed.barrier(
+                    group=mpu.get_pipeline_model_parallel_group()
+                )
+                timers(timer_name).stop()
+
+        if num_microbatches_remaining > 0:
+            input_tensor = p2p_communication.recv_forward(timers)
+
+        for i in range(num_microbatches_remaining):
+            last_iteration = (i == (num_microbatches_remaining - 1))
+            output_tensor = forward_step(
+                forward_step_func, data_iterator, model, input_tensor, losses_reduced)
+            if forward_only:
+                p2p_communication.send_forward(output_tensor, timers)
+            else:
+                output_tensor_grad = p2p_communication.send_forward_recv_backward(
+                    output_tensor, timers)
+            input_tensors.append(input_tensor)
+            output_tensors.append(output_tensor)
+            if forward_only:
+                if not last_iteration:
+                    input_tensor = p2p_communication.recv_forward(timers)
+            else:
+                input_tensor, output_tensor = input_tensors.pop(0), output_tensors.pop(0)
+                input_tensor_grad = backward_step(
+                    optimizer, input_tensor, output_tensor, output_tensor_grad)
+                if last_iteration:
+                    input_tensor = None
+                    p2p_communication.send_backward(input_tensor_grad, timers)
+                else:
+                    input_tensor = p2p_communication.send_backward_recv_forward(
+                        input_tensor_grad, timers)
+
+        if not forward_only:
+            for i in range(num_warmup_microbatches):
+                input_tensor = input_tensors.pop(0)
+                output_tensor = output_tensors.pop(0)
+                output_tensor_grad = p2p_communication.recv_backward(timers)
+                input_tensor_grad = backward_step(
+                    optimizer, input_tensor, output_tensor, output_tensor_grad)
+                p2p_communication.send_backward(input_tensor_grad, timers)
 
     # M1860: Only finalize grads when config.finalize_model_grads_func is set.
     if config is not None and config.finalize_model_grads_func is not None and not forward_only:

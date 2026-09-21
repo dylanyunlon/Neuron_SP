@@ -5,6 +5,7 @@ import logging
 # DeepSpeed Team
 
 from ..utils import call_to_str
+from .pipeline_stall_guard import should_measure_pipeline_stall
 
 from abc import ABC, abstractmethod
 
@@ -348,11 +349,16 @@ class InterleavedTrainSchedule(PipeSchedule):
 
         self._num_remaining = num_mb_total - self._num_warmup
 
-        # Measure pipeline stall only if there are enough microbatches
-        # to have every worker in a warmup and steady state phase.
-        self.measure_pipeline_stall = self.micro_batches >= self.stages
+        # M592: use centralized predicate to determine if stall barriers are safe.
+        # Before this fix, the condition was inlined and could diverge from the
+        # engine.py / schedules.py copies, leading to mismatched barrier participation.
+        self.measure_pipeline_stall = should_measure_pipeline_stall(
+            self.micro_batches, self.stages
+        )
 
-        logging.debug('[M592]')
+        logging.debug('[M592] InterleavedTrainSchedule: measure_pipeline_stall=%s '
+                       '(mb=%d, stages=%d)', self.measure_pipeline_stall,
+                       self.micro_batches, self.stages)
         print(
             f"[InterleavedTrainSchedule] stage={stage_id}/{stages} "
             f"chunks={num_model_chunks} mb_total={num_mb_total} "
