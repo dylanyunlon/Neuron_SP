@@ -272,6 +272,26 @@ class MicrobatchAllocation:
     per_rank_microbatches: Dict[int, int] = field(default_factory=dict)
     loc_cache_hint: bool = False
 
+    def assert_uniform(self) -> None:
+        """Assert that all ranks receive the same num_microbatches.
+
+        FIX #591 Blocker 2: ZeRO-3 all_gather_into_tensor requires all
+        ranks to call forward() the same number of times.  This assertion
+        catches scheduler bugs early, before the deadlock.
+
+        Raises:
+            AssertionError: If per_rank_microbatches has non-uniform values.
+        """
+        if not self.per_rank_microbatches:
+            return
+        counts = set(self.per_rank_microbatches.values())
+        assert len(counts) <= 1, (
+            f"[MicrobatchAllocation] non-uniform num_microbatches across ranks: "
+            f"{self.per_rank_microbatches}. This WILL cause ZeRO-3 "
+            f"all_gather_into_tensor deadlock. Use "
+            f"broadcast_uniform_microbatch_count() to fix."
+        )
+
 
 # ---------------------------------------------------------------------------
 # 调度字符串解析工具（对应 Megatron 的 _parse_numeric_value 和 _parse_schedule）

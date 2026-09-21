@@ -2204,7 +2204,36 @@ class DesLocEngine:
             # Heterogeneous throughput is achieved via per-rank micro_batch_size
             # differences (larger batches on faster GPUs), NOT via different
             # iteration counts — which would cause NCCL collective mismatch.
-            num_microbatches = allocation.num_microbatches
+            _local_num_microbatches = allocation.num_microbatches
+
+            # --- FIX #591 Blocker 2: enforce uniform num_microbatches ---
+            # Even though HeteroMicrobatchAllocator.allocate() is designed to
+            # return uniform counts, edge cases (scheduler bugs, checkpoint
+            # resume with different DP sizes, batch_schedule step boundaries)
+            # can cause per-rank divergence.  A single rank with fewer
+            # iterations means fewer all_gather_into_tensor calls in
+            # gather_full_params → NCCL deadlock.
+            #
+            # Fix: all-reduce MAX across all ranks.  Ranks with fewer real
+            # microbatches run zero-loss dummy batches (forward+backward with
+            # loss *= 0) for the remaining iterations, keeping ZeRO-3
+            # all_gather participation symmetric.
+            from deepspeed.runtime.microbatch_guard import (
+                broadcast_uniform_microbatch_count,
+                log_microbatch_guard_stats,
+            )
+            _mb_guard_group = (
+                self._dist_optimizer.data_parallel_group
+                if self._dist_optimizer is not None
+                else None
+            )
+            num_microbatches = broadcast_uniform_microbatch_count(
+                _local_num_microbatches, group=_mb_guard_group,
+            )
+            if step < 5:
+                log_microbatch_guard_stats(
+                    step, _local_num_microbatches, num_microbatches, _my_rank,
+                )
 
             logger.warning("rank=%d: num_microbatches=%d, step=%d",
                           dist.get_rank() if dist.is_initialized() else 0,
@@ -2636,7 +2665,7 @@ class DesLocEngine:
             _is_Kx_sync = _is_Kx_sync_pre
             try:
                 import types as _types  # noqa: PLC0415
-                from deepspeed.core.model_parallel_config import ModelParallelConfig  # noqa: PLC0415
+                from deepspeed.core.distributed.embedding_guard import safe_model_parallel_config  # noqa: PLC0415
                 _dp_grp = getattr(self, '_ddp_dp_group', None)
                 _fmg_pg = _types.SimpleNamespace(
                     tp=None,
@@ -2655,9 +2684,16 @@ class DesLocEngine:
                     dist.get_rank() if dist.is_initialized() else 0,
                     _is_Kx_sync, _step_has_nan, _fmg_skip_sync,
                     self._dist_optimizer is not None and not _step_has_nan)
+                # FIX #591 Blocker 3: use safe_model_parallel_config() which
+                # explicitly disables share_embeddings_and_output_weights and
+                # other conditional-collective flags.  A bare ModelParallelConfig()
+                # left these at default (False) but did NOT set has_cond_embedder
+                # or sequence_parallel, which could be overridden by model
+                # inspection inside finalize_model_grads → _allreduce_all_embedding_grads.
+                _fmg_config = safe_model_parallel_config()
                 finalize_model_grads(
                     model=_fmg_model,
-                    config=ModelParallelConfig(),
+                    config=_fmg_config,
                     num_tokens=None,
                     skip_grad_sync=_fmg_skip_sync,
                     force_all_reduce=False,  # dist_optimizer handles reduce_scatter internally
