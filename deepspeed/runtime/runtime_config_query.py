@@ -539,8 +539,46 @@ def apply_overrides(config: Any, overrides: Dict[str, Any]) -> None:
 
     Only sets attributes that exist on the config or are in _EXPECTED_FIELDS.
     Logs each override for traceability.
+
+    Special handling for ``shard_weights`` (issue #590):
+      - Normalises integers to float (JSON often returns int for round numbers).
+      - Rejects non-positive or non-numeric elements.
+      - Sets ``config.shard_weights_source = "runtime_query"`` so the engine
+        can log provenance.
+
+    Special handling for ``cpu_offload_optimizer``:
+      - Normalises elements to bool (JSON 0/1 → False/True).
     """
     for key, val in overrides.items():
+        # -- shard_weights: normalise & mark source (issue #590) ------------
+        if key == "shard_weights" and isinstance(val, list):
+            try:
+                val = [float(w) for w in val]
+            except (TypeError, ValueError) as exc:
+                logger.warning(
+                    "[runtime_config] shard_weights contains non-numeric "
+                    "element, skipping: %s", exc,
+                )
+                continue
+            if any(w <= 0 for w in val):
+                logger.warning(
+                    "[runtime_config] shard_weights has non-positive value "
+                    "%s, skipping entire field", val,
+                )
+                continue
+            old = getattr(config, key, "<unset>")
+            setattr(config, key, val)
+            setattr(config, "shard_weights_source", "runtime_query")
+            logger.info(
+                "[runtime_config] override: shard_weights = %s "
+                "(source=runtime_query, was %s)", val, old,
+            )
+            continue
+
+        # -- cpu_offload_optimizer: normalise to bool -----------------------
+        if key == "cpu_offload_optimizer" and isinstance(val, list):
+            val = [bool(v) for v in val]
+
         old = getattr(config, key, "<unset>")
         setattr(config, key, val)
         logger.info("[runtime_config] override: %s = %s (was %s)", key, val, old)
