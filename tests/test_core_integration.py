@@ -472,10 +472,10 @@ def test_shard_weights_wiring_integration():
         "desloc_discovery must log free VRAM in discovery output (issue #590)"
     )
 
-    print("✅ Issue #590 shard_weights wiring integration checks passed.")
+    print("PASS: Issue #590 shard_weights wiring integration checks passed.")
 
 
 if __name__ == "__main__":
     test_engine_has_training_config()
     test_shard_weights_wiring_integration()
-    print("\n✅ All core integration tests passed.")
+    print("\nAll core integration tests passed.")
