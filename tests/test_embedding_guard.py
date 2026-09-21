@@ -15,30 +15,55 @@ Test matrix:
 import importlib.util
 import os
 import sys
+import types
 
 import pytest
 
 # Direct-import to bypass the heavy deepspeed/__init__.py chain.
-# embedding_guard.py needs torch + torch.distributed + ModelParallelConfig.
-# We pre-load the dependency chain manually to avoid pulling in the
-# full deepspeed runtime (cpuinfo, tqdm, pydantic, msgpack, etc.).
+# We pre-load the minimal dependency chain manually:
+#   desloc_config.py (pure dataclass, no deps)
+#   -> model_parallel_config.py (needs desloc_config + torch)
+#   -> embedding_guard.py (needs model_parallel_config + torch.distributed)
 
 _BASE = os.path.join(os.path.dirname(__file__), "..")
 
-# Ensure deepspeed.core subpackages are importable
-if _BASE not in sys.path:
-    sys.path.insert(0, _BASE)
 
-# Load just the two modules in the dependency chain
-_eg_path = os.path.join(_BASE, "deepspeed", "core", "distributed", "embedding_guard.py")
-_eg_spec = importlib.util.spec_from_file_location(
-    "deepspeed.core.distributed.embedding_guard", _eg_path,
-    submodule_search_locations=[],
+def _direct_load(module_fqn: str, file_path: str):
+    """Load a single .py file and register it in sys.modules."""
+    # Ensure parent packages exist as namespace stubs
+    parts = module_fqn.split(".")
+    for i in range(1, len(parts)):
+        parent = ".".join(parts[:i])
+        if parent not in sys.modules:
+            pkg = types.ModuleType(parent)
+            pkg.__path__ = [os.path.join(_BASE, *parts[:i])]
+            pkg.__package__ = parent
+            sys.modules[parent] = pkg
+
+    spec = importlib.util.spec_from_file_location(module_fqn, file_path)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[module_fqn] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+# 1. desloc_config (pure dataclass, zero external deps)
+_direct_load(
+    "deepspeed.core.desloc_config",
+    os.path.join(_BASE, "deepspeed", "core", "desloc_config.py"),
 )
-_eg_mod = importlib.util.module_from_spec(_eg_spec)
-# Pre-register so internal relative imports resolve
-sys.modules["deepspeed.core.distributed.embedding_guard"] = _eg_mod
-_eg_spec.loader.exec_module(_eg_mod)
+
+# 2. model_parallel_config (needs desloc_config + torch)
+_direct_load(
+    "deepspeed.core.model_parallel_config",
+    os.path.join(_BASE, "deepspeed", "core", "model_parallel_config.py"),
+)
+
+# 3. embedding_guard (the module under test)
+_eg_mod = _direct_load(
+    "deepspeed.core.distributed.embedding_guard",
+    os.path.join(_BASE, "deepspeed", "core", "distributed", "embedding_guard.py"),
+)
 
 EmbeddingGradSyncConfig = _eg_mod.EmbeddingGradSyncConfig
 safe_model_parallel_config = _eg_mod.safe_model_parallel_config

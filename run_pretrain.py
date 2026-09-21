@@ -596,7 +596,7 @@ def get_eval_micro_batch_size(
 ) -> int:
     """Compute an eval micro-batch size scaled to the current GPU's compute tier.
 
-    H100-class and Blackwell GPUs receive 2× the training batch during eval
+    H100-class and Blackwell GPUs receive 2x the training batch during eval
     (they have spare capacity since eval has no backward pass).  A6000-class
     GPUs receive the training batch unchanged (PCIe bandwidth-limited).
     Older GPUs receive a conservative half-batch to avoid OOM.
@@ -637,7 +637,7 @@ def get_eval_micro_batch_size(
 
     eval_bs = max(1, train_micro_batch_size * scale)
     logger.debug(
-        "I12 eval_micro_batch_size: gpu=%s sm=%d.%d  train_bs=%d -> eval_bs=%d (scale=%d×)",
+        "I12 eval_micro_batch_size: gpu=%s sm=%d.%d  train_bs=%d -> eval_bs=%d (scale=%dx)",
         props.name, props.major, props.minor, train_micro_batch_size, eval_bs, scale,
     )
     return eval_bs

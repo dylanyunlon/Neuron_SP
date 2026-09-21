@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# launch_7b_3gpu.sh , ags1 3-GPU DES-LOC 7B pretrain (H100 + 2×A6000)
+# launch_7b_3gpu.sh , ags1 3-GPU DES-LOC 7B pretrain (H100 + 2xA6000)
 #
 # Blackwell RTX PRO 6000 (SM120) excluded: PyTorch 2.7.1+cu118 only supports up to SM90.
 # Upgrade to PyTorch cu126+ to enable Blackwell. Until then, train on 3 GPUs:
@@ -18,7 +18,7 @@ mkdir -p logs
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 LOG="logs/7b_pretrain_3gpu_${TIMESTAMP}.log"
 
-# Only H100 + 2×A6000 (skip Blackwell SM120)
+# Only H100 + 2xA6000 (skip Blackwell SM120)
 export CUDA_VISIBLE_DEVICES=2,3,4
 export NCCL_P2P_DISABLE=1
 export NCCL_IB_DISABLE=1
@@ -35,7 +35,7 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,max_split_size_mb:256
 export TORCH_CUDA_ARCH_LIST="8.6;9.0"
 
 # -- AutoSP kill-switch --------------------------------------------------------
-# PCIe-only topology (H100 + 2×A6000, no NVLink): Ulysses SP=3 all-to-all
+# PCIe-only topology (H100 + 2xA6000, no NVLink): Ulysses SP=3 all-to-all
 # collectives deadlock inside model.forward() at step 0.  Force DP-only mode
 # until the all-to-all / process-group wiring is fixed for heterogeneous PCIe.
 #
@@ -100,7 +100,7 @@ print(f'  cpu_adam pre-built OK: {type(op)}')
 EXTRA_ARGS=("$@")
 
 if [[ " ${EXTRA_ARGS[*]:-} " == *" --dry-run "* ]]; then
-    echo "=== DRY RUN (3-GPU: H100 + 2×A6000) ==="
+    echo "=== DRY RUN (3-GPU: H100 + 2xA6000) ==="
     nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader -i 2,3,4 2>/dev/null
     EXTRA_ARGS=("${EXTRA_ARGS[@]/--dry-run/}" --steps 3 --log-every 1 --save-every 0)
 fi
@@ -115,7 +115,7 @@ if [[ " ${EXTRA_ARGS[*]:-} " == *" --gate "* ]]; then
     echo "=== GATE MODE (issue #591): 100 steps, log-every 1, no save ==="
 fi
 
-echo "=== Neuron_SP 7B DES-LOC (3-GPU: H100+2×A6000) ==="
+echo "=== Neuron_SP 7B DES-LOC (3-GPU: H100+2xA6000) ==="
 echo "Log: $LOG"
 echo "GPUs: $CUDA_VISIBLE_DEVICES"
 echo "Note: Blackwell GPUs excluded (PyTorch cu118 < SM120). Upgrade to cu126+ for 5-GPU."
