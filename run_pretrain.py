@@ -854,13 +854,16 @@ def run_standalone(args: argparse.Namespace) -> None:
     # For single-GPU: model IS the raw module.
     raw_model = model.module if (is_dist and not use_fsdp) else model
 
-    # VRAM-adaptive optimizer: CPUAdam for A6000 (≤47GB), GPU AdamW for H100.
+    # VRAM-adaptive optimizer: CPUAdam for A6000 (<=47GB), GPU AdamW for H100.
     # Ref: DeepSpeed #4527, Megatron PR #2811, Issue #3.
-    _local_vram_gb = torch.cuda.get_device_properties(device).total_memory / (1 << 30)
+    if torch.cuda.is_available():
+        _local_vram_gb = torch.cuda.get_device_properties(device).total_memory / (1 << 30)
+    else:
+        _local_vram_gb = 0.0
     _optim_params = model.parameters() if use_fsdp else raw_model.parameters()
 
-    if _local_vram_gb < 50.0 and not use_fsdp:
-        # A6000 path: move params to CPU, use DeepSpeedCPUAdam
+    if _local_vram_gb < 50.0 and not use_fsdp and torch.cuda.is_available():
+        # A6000 path: GPU present but small VRAM, offload optimizer to CPU
         try:
             from deepspeed.ops.adam import DeepSpeedCPUAdam
             _cpu_params = []
@@ -873,8 +876,8 @@ def run_standalone(args: argparse.Namespace) -> None:
                 eps=1e-8, weight_decay=0.1, adamw_mode=True,
             )
             logger.info("Standalone optimizer: DeepSpeedCPUAdam (VRAM=%.1fGB < 50GB)", _local_vram_gb)
-        except ImportError:
-            # Fallback: gradient checkpointing should have freed enough memory
+        except (ImportError, RuntimeError):
+            # Fallback: CPUAdam unavailable or JIT compile failed
             optimizer = AdamW(
                 model.parameters() if use_fsdp else raw_model.parameters(),
                 lr=3e-4, betas=(0.9, 0.95), eps=1e-8, weight_decay=0.1,
@@ -1014,7 +1017,11 @@ def run_standalone(args: argparse.Namespace) -> None:
         print("-" * 60)
 
     for step in range(start_step, args.steps + 1):
-        input_ids, labels = next(data)
+        batch = next(data)
+        if isinstance(batch, dict):
+            input_ids, labels = batch["tokens"], batch["labels"]
+        else:
+            input_ids, labels = batch
 
         optimizer.zero_grad(set_to_none=True)
         with torch.autocast(device_type=device.type, dtype=dtype, enabled=(device.type == "cuda")):
@@ -1128,7 +1135,7 @@ def run_standalone(args: argparse.Namespace) -> None:
             assert final_loss < initial_10 + 0.5, (
                 f"Loss did not decrease: initial={initial_10:.4f}, final={final_loss:.4f}"
             )
-            logger.info("[PASS]  Loss decreased , training loop verified.")
+            logger.info("Loss decreased, training loop verified.")
 
     # ------------------------------------------- cleanup loggers (rank 0 only)
     if is_main:
@@ -1244,6 +1251,15 @@ def run_desloc(args: argparse.Namespace) -> None:
         tc.activation_checkpointing = _train_yaml["activation_checkpointing"]
     if "checkpoint_activations_granularity" in _train_yaml:
         tc.checkpoint_activations_granularity = _train_yaml["checkpoint_activations_granularity"]
+    # Issue #590: YAML can also pre-set shard_weights (e.g. from a previous
+    # runtime_config_query result baked into the config for reproducibility).
+    if "shard_weights" in _train_yaml:
+        tc.shard_weights = [float(w) for w in _train_yaml["shard_weights"]]
+        tc.shard_weights_source = "yaml"
+        logger.info("YAML shard_weights=%s (source=yaml)", tc.shard_weights)
+    if "cpu_offload_optimizer" in _train_yaml:
+        tc.cpu_offload_optimizer = [bool(v) for v in _train_yaml["cpu_offload_optimizer"]]
+        logger.info("YAML cpu_offload_optimizer=%s", tc.cpu_offload_optimizer)
     # Stage overrides (Blackwell Kx/Ku/Kv)
     if "stage_overrides" in _desloc_yaml:
         setattr(tc, "desloc_stage_overrides", _desloc_yaml["stage_overrides"])
@@ -1283,6 +1299,18 @@ def run_desloc(args: argparse.Namespace) -> None:
         if _overrides:
             apply_overrides(tc, _overrides)
             logger.info("runtime_config_query applied %d overrides", len(_overrides))
+            # Issue #590: log shard_weights provenance for diagnostics
+            if "shard_weights" in _overrides:
+                logger.info(
+                    "runtime_config_query shard_weights=%s "
+                    "(based on available VRAM, not total)",
+                    _overrides["shard_weights"],
+                )
+            if "cpu_offload_optimizer" in _overrides:
+                logger.info(
+                    "runtime_config_query cpu_offload_optimizer=%s",
+                    _overrides["cpu_offload_optimizer"],
+                )
         else:
             logger.info("runtime_config_query returned no overrides; using defaults")
     except Exception as _rcq_err:

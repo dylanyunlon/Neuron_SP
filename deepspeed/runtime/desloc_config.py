@@ -139,7 +139,7 @@ class TrainingConfig:
     # values directly instead of computing from multipliers.  The fallback
     # `micro_batch_size` (above) is still used as the base for any device
     # not listed here and for consistency_check arithmetic.
-    # Example (5-GPU ags1): [2, 8, 16, 2, 8]  → A6000:2, BW:8, H100:16, A6000:2, BW:8
+    # Example (5-GPU ags1): [2, 8, 16, 2, 8]  -> A6000:2, BW:8, H100:16, A6000:2, BW:8
     micro_batch_size_per_gpu: Optional[List[int]] = None
     grad_accum_steps: int = 8
     max_lr: float = 3e-4
@@ -177,30 +177,30 @@ class TrainingConfig:
     # Format: "0:32 90B:64 180B:128" (THRESHOLD:BATCH_SIZE, token or sample units)
     # If None, scheduler uses a single constant entry based on global_batch_size
     batch_schedule: Optional[str] = None
-    # If provided, schedule thresholds are interpreted as token counts (÷ seq_len → samples)
+    # If provided, schedule thresholds are interpreted as token counts (÷ seq_len -> samples)
     batch_schedule_seq_length: Optional[int] = None
 
     # Activation checkpointing config.
     # activation_checkpointing: master on/off switch.
-    #   Defaults True — required for seq_len≥4096 on A6000 (48 GB VRAM).
+    #   Defaults True ,  required for seq_len≥4096 on A6000 (48 GB VRAM).
     #   Set False explicitly only on H100-only clusters where VRAM is plentiful.
     # checkpoint_activations_granularity: "full" (every layer) or "selective" (every other layer).
     # Per-tier policy applied in DesLocEngine.__init__ (overrides granularity):
-    #   A6000 (48 GB, SM 8.6)  → FULL checkpoint   (wrap every TransformerBlock)
-    #   H100  (96 GB, SM 9.x)  → SELECTIVE ckpt    (wrap every other TransformerBlock)
-    #   RTX_PRO_6000_BW (96 GB)→ SELECTIVE ckpt    (same as H100)
+    #   A6000 (48 GB, SM 8.6)  -> FULL checkpoint   (wrap every TransformerBlock)
+    #   H100  (96 GB, SM 9.x)  -> SELECTIVE ckpt    (wrap every other TransformerBlock)
+    #   RTX_PRO_6000_BW (96 GB)-> SELECTIVE ckpt    (same as H100)
     # References: PipeDream runtime.py enable_recompute per-stage flag;
     #             HetSeq controller.py OOM guard at line 282.
     activation_checkpointing: bool = True
     checkpoint_activations_granularity: str = "full"  # "full" | "selective"
 
     # Fine-grained CPU activation offload (A6000 only).
-    # Wired via core_adapters.maybe_enable_activation_offload() → PipelineOffloadManager.
+    # Wired via core_adapters.maybe_enable_activation_offload() -> PipelineOffloadManager.
     # On A6000 PCIe (32 GB/s BW) offload is only worth it for cheap-to-transfer
     # tensors (embeddings, small residuals); attention scores are faster to recompute.
     # use_activation_offload: opt-in master switch (default False; safe on H100 clusters).
     # activation_offload_min_size: minimum tensor element count to offload to pinned CPU.
-    #   Default 1 M elements ≈ 4 MB at fp32 / 2 MB at bf16 — skips small weight-grad tensors.
+    #   Default 1 M elements ≈ 4 MB at fp32 / 2 MB at bf16 ,  skips small weight-grad tensors.
     # activation_offload_max_inflight: max concurrent D2H transfers per group name.
     #   None = unlimited; 4 is a safe cap for A6000 PCIe to avoid BW saturation.
     use_activation_offload: bool = False
@@ -252,7 +252,7 @@ class TrainingConfig:
     0=off, 1=moderate (every step boundary), 2=aggressive (every micro-step).
     From Megatron M2833 (PR #2306).
     On DES-LOC A6000×2 (48 GB, PCIe) memory fragmentation is a key failure
-    mode under long training runs — level 1 or 2 is recommended when OOM
+    mode under long training runs ,  level 1 or 2 is recommended when OOM
     errors occur in the middle of a run rather than at startup."""
 
     decrease_batch_size_if_needed: bool = False
@@ -323,7 +323,7 @@ class TrainingConfig:
     # --- MoE (Mixture-of-Experts) subsystem ---
     # Wired via deepspeed/runtime/core_adapters.py::build_moe_adapter().
     # When use_moe=False (default) the MoE path is completely skipped and
-    # all models remain dense — no overhead.
+    # all models remain dense ,  no overhead.
 
     use_moe: bool = False
     """Replace every moe_layer_freq-th TransformerBlock MLP with a MoELayer
@@ -365,7 +365,38 @@ class TrainingConfig:
     """Log per-expert token-utilisation statistics every this many steps."""
 
     ffn_hidden_size: Optional[int] = None
-    """Expert intermediate (FFN) hidden size. None → defaults to hidden_size * 4."""
+    """Expert intermediate (FFN) hidden size. None -> defaults to hidden_size * 4."""
 
     activation_func_type: str = "swiglu"
     """Expert activation function: 'swiglu' (default, matches LLaMA/Mixtral) or 'gelu'."""
+
+    # --- Runtime-query shard weights (issue #590) ---
+    # Populated by runtime_config_query.apply_overrides() when claude-hk-config
+    # returns shard_weights based on *available* VRAM (not total VRAM).
+    # DesLocEngine.__init__ reads these with priority over the legacy
+    # vram_weights_from_tiers() path that uses total VRAM.
+    #
+    # Wiring (AST call chain, 6 functions across 4 modules):
+    #   run_pretrain.py:1272  -> query_runtime_config()
+    #     -> collect_environment() -> _build_prompt() -> _call_claude_hk()
+    #     -> _parse_response() -> _validate()
+    #   run_pretrain.py:1284  -> apply_overrides(tc, overrides)
+    #     -> setattr(tc, "shard_weights", [...])
+    #     -> setattr(tc, "shard_weights_source", "runtime_query")
+    #   desloc_engine.py:530  -> resolve_shard_weights(config, tiers, ws)
+    #     -> reads config.shard_weights with priority
+    #   -> ShardState.build(model, rank, ws, device, vram_weights=weights)
+
+    shard_weights: Optional[List[float]] = None
+    """Per-GPU ZeRO-3 shard weights from runtime_config_query.
+    Based on *available* VRAM (free_vram_gb) rather than total VRAM.
+    Length must equal world_size. None = fall back to tier discovery or even split."""
+
+    cpu_offload_optimizer: Optional[List[bool]] = None
+    """Per-GPU CPU optimizer offload decisions from runtime_config_query.
+    A6000 GPUs typically get True (offload Adam m/v to CPU, freeing ~13 GB).
+    Length must equal world_size. None = use existing heuristic."""
+
+    shard_weights_source: Optional[str] = None
+    """Diagnostic field: records how shard_weights were determined.
+    One of 'runtime_query', 'vram_discovery', 'even_split', or None."""

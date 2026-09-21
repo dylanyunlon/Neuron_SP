@@ -99,6 +99,12 @@ class PartitionSolver:
 
         throughput = self._estimate_zero3_throughput(micro_bs, grad_accum)
 
+        # Issue #590: surface shard_weights source in plan notes so the
+        # operator can trace whether the engine will use runtime_query,
+        # discovery, or even_split weights.
+        _sw_source = getattr(cfg, "shard_weights_source", None) or "pending"
+        _sw_vals = getattr(cfg, "shard_weights", None)
+
         return PartitionPlan(
             strategy=PartitionStrategy.ZERO3_HETERO,
             tier_layer_map=tier_layer_map,
@@ -108,7 +114,8 @@ class PartitionSolver:
             notes=(
                 f"ZeRO-3 hetero: grad_accum={cfg.grad_accum_steps}, "
                 f"per-device micro_bs={dict(sorted(micro_bs.items()))} "
-                f"(source={'yaml' if cfg.micro_batch_size_per_gpu else 'tflops_multiplier'})"
+                f"(source={'yaml' if cfg.micro_batch_size_per_gpu else 'tflops_multiplier'}), "
+                f"shard_weights_source={_sw_source}"
             ),
         )
 

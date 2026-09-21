@@ -56,7 +56,17 @@ class TierDiscovery:
             try:
                 spec = self._inspect_device(idx, numa_map)
                 specs.append(spec)
-                logger.info("  %s", spec)
+                # Issue #590: log free VRAM alongside total so operators can
+                # verify that resolve_shard_weights sees realistic free values.
+                _util_pct = (
+                    100.0 * (1 - spec.free_mem_gb / spec.total_mem_gb)
+                    if spec.total_mem_gb > 0 else 0.0
+                )
+                logger.info(
+                    "  [GPU %d] %s  total=%.1fGB  free=%.1fGB (%.0f%% used)",
+                    idx, spec.name, spec.total_mem_gb, spec.free_mem_gb,
+                    _util_pct,
+                )
             except Exception as exc:  # noqa: BLE001
                 logger.error("Failed to inspect GPU %d: %s", idx, exc)
 

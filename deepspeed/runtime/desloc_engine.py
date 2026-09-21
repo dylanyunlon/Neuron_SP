@@ -433,8 +433,12 @@ class DesLocEngine:
         else:
             self.model = model
 
-        _local_device = torch.device(f"cuda:{torch.cuda.current_device()}")
-        _local_mem_gb = torch.cuda.get_device_properties(_local_device).total_memory / (1 << 30)
+        if torch.cuda.is_available():
+            _local_device = torch.device(f"cuda:{torch.cuda.current_device()}")
+            _local_mem_gb = torch.cuda.get_device_properties(_local_device).total_memory / (1 << 30)
+        else:
+            _local_device = torch.device("cpu")
+            _local_mem_gb = 0.0
         self._use_fsdp = False  # Neuron_SP native ZeRO-3, no FSDP
 
         # Model stays in BF16 on CPU , ZeRO-3 ShardState holds FP32 master
@@ -495,6 +499,10 @@ class DesLocEngine:
         else:
             logger.info("MLA disabled (use_mla=False); standard attention kept.")
 
+        # Issue #590: diagnostics summary before shard init
+        from deepspeed.runtime.core_adapters import log_config_diagnostics  # noqa: PLC0415
+        log_config_diagnostics(config)
+
         # --- Phase 4b: ZeRO-3 heterogeneous parameter sharding ---
         # Uses the original zero3_hetero_shard.ShardState which was working
         # at baseline 3faf8420. Each rank keeps a VRAM-proportional FP32
@@ -519,13 +527,17 @@ class DesLocEngine:
             try:
                 from deepspeed.runtime.zero3_hetero_shard import (
                     ShardState as _ShardState,
-                    vram_weights_from_tiers as _vram_weights_from_tiers,
+                    resolve_shard_weights as _resolve_shard_weights,
                 )
-                _weights = _vram_weights_from_tiers(self.tiers) if getattr(
-                    self, "tiers", None
-                ) else None
-                if _weights and len(_weights) != _ws:
-                    _weights = None
+                # Issue #590: centralized weight resolution with priority:
+                #   runtime_query > free_vram > total_vram > even_split
+                _weights, _weights_source = _resolve_shard_weights(
+                    config=config,
+                    tiers=getattr(self, "tiers", None),
+                    world_size=_ws,
+                )
+                config.shard_weights_source = _weights_source
+
                 self.param_shard_state = _ShardState.build(
                     model=self.model,
                     rank=_rk,
@@ -541,12 +553,17 @@ class DesLocEngine:
                     assert _shard_total >= _orig_total, (
                         f"shard total {_shard_total} < orig {_orig_total}"
                     )
+                    # Acceptance criteria (issue #590)
+                    logger.info(
+                        "[zero3] shard_weights source: %s", _weights_source,
+                    )
                     logger.info(
                         "[zero3] Sharding active: %d ranks, local=%d, "
-                        "total=%d (orig=%d, pad=%d)",
+                        "total=%d (orig=%d, pad=%d), weights=%s",
                         _ws, self.param_shard.numel(),
                         _shard_total, _orig_total,
                         self.param_shard_state.pad,
+                        _weights,
                     )
             except Exception as _shard_exc:  # noqa: BLE001
                 logger.warning(
