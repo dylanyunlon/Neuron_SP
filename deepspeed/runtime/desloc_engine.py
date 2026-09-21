@@ -495,6 +495,10 @@ class DesLocEngine:
         else:
             logger.info("MLA disabled (use_mla=False); standard attention kept.")
 
+        # Issue #590: diagnostics summary before shard init
+        from deepspeed.runtime.core_adapters import log_config_diagnostics  # noqa: PLC0415
+        log_config_diagnostics(config)
+
         # --- Phase 4b: ZeRO-3 heterogeneous parameter sharding ---
         # Uses the original zero3_hetero_shard.ShardState which was working
         # at baseline 3faf8420. Each rank keeps a VRAM-proportional FP32
