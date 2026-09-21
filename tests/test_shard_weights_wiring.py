@@ -25,6 +25,7 @@ Run:
 from __future__ import annotations
 
 import sys
+import types
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -32,6 +33,27 @@ import pytest
 
 REPO_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(REPO_ROOT))
+
+# ---------------------------------------------------------------------------
+# Stub deepspeed top-level package so __init__.py (which drags in apex,
+# cpuinfo, tqdm, regex …) is never executed.  Mirrors test_engine_dry_run.py.
+# ---------------------------------------------------------------------------
+def _stub_deepspeed() -> None:
+    if "deepspeed" in sys.modules and hasattr(sys.modules["deepspeed"], "__path__"):
+        return
+    ds = types.ModuleType("deepspeed")
+    ds.__path__ = [str(REPO_ROOT / "deepspeed")]
+    ds.__package__ = "deepspeed"
+    sys.modules["deepspeed"] = ds
+
+    ds_rt = types.ModuleType("deepspeed.runtime")
+    ds_rt.__path__ = [str(REPO_ROOT / "deepspeed" / "runtime")]
+    ds_rt.__package__ = "deepspeed.runtime"
+    sys.modules["deepspeed.runtime"] = ds_rt
+    ds.runtime = ds_rt  # type: ignore[attr-defined]
+
+
+_stub_deepspeed()
 
 from deepspeed.runtime.zero3_hetero_shard import (
     vram_weights_from_tiers,
