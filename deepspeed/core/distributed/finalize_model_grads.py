@@ -1293,12 +1293,35 @@ def finalize_model_grads(
     #    M4149 (DES-LOC): fuse word + position embedding AllReduce into one
     #    collective when both live on the same process group, cutting PCIe
     #    launch overhead from 2× to 1× for these small tensors.
+    #
+    #    FIX #591 Blocker 3: guard against asymmetric embedding allreduce.
+    #    _allreduce_all_embedding_grads internally checks share_embeddings
+    #    via _get_shared_word_embedding_weight, which inspects model attrs.
+    #    If model attrs differ across ranks (e.g. share_embeddings_and_output_weights
+    #    only set on rank 0), some ranks fire the allreduce while others skip
+    #    it → NCCL deadlock.  We add an explicit guard: when config explicitly
+    #    sets share_embeddings_and_output_weights=False AND PP=1, skip the
+    #    entire embedding allreduce path to guarantee symmetry.
     # ------------------------------------------------------------------
+    _skip_embedding_allreduce = (
+        config is not None
+        and getattr(config, 'share_embeddings_and_output_weights', None) is False
+        and get_pg_size(pp_group) <= 1
+        and not getattr(config, 'has_cond_embedder', False)
+        and getattr(config, 'mtp_num_layers', None) in (None, 0)
+    )
     if config is not None and getattr(config, 'timers', None) is not None:
         config.timers('embedding-grads-all-reduce', log_level=1).start(
             barrier=getattr(config, 'barrier_with_L1_time', False)
         )
-    _allreduce_all_embedding_grads(model, config, embd_group, pos_emb_group, pp_group)
+    if not _skip_embedding_allreduce:
+        _allreduce_all_embedding_grads(model, config, embd_group, pos_emb_group, pp_group)
+    else:
+        logger.debug(
+            "[finalize_model_grads] skipping embedding allreduce: "
+            "share_embeddings=False, PP=1, no cond_embedder, no MTP "
+            "(fix #591 Blocker 3 — prevents asymmetric NCCL collective)"
+        )
     if config is not None and getattr(config, 'timers', None) is not None:
         config.timers('embedding-grads-all-reduce').stop()
 

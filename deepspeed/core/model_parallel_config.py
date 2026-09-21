@@ -72,6 +72,16 @@ class ModelParallelConfig:
     # --- Determinism ---
     deterministic_mode: bool = False
 
+    # --- Embedding weight sharing (fix #591 Blocker 3) ---
+    # When True, word-embedding and output-projection weights are tied,
+    # requiring an allreduce across the first and last PP stages to keep
+    # embedding gradients in sync.  Set explicitly to False for DES-LOC
+    # gate runs (PP=1, no weight tying) to prevent asymmetric NCCL
+    # collectives when some ranks derive a different value from model
+    # inspection.  When None, finalize_model_grads falls through to
+    # model-attribute inspection (legacy behaviour).
+    share_embeddings_and_output_weights: Optional[bool] = False
+
     # --- DES-LOC (heterogeneous training) ---
     desloc: Optional[DesLocConfig] = None
 
