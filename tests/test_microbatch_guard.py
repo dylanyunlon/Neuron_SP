@@ -12,14 +12,26 @@ Test matrix:
   - log_microbatch_guard_stats: stats dict shape
 """
 
+import importlib.util
+import os
+import sys
+
 import pytest
 import torch
 
-from deepspeed.runtime.microbatch_guard import (
-    PaddedMicrobatchIterator,
-    broadcast_uniform_microbatch_count,
-    log_microbatch_guard_stats,
+# Direct-import to bypass the heavy deepspeed/__init__.py chain
+# (cpuinfo, tqdm, pydantic, msgpack, einops, regex).
+# The module under test only needs torch + torch.distributed.
+_MODULE_PATH = os.path.join(
+    os.path.dirname(__file__), "..", "deepspeed", "runtime", "microbatch_guard.py"
 )
+_spec = importlib.util.spec_from_file_location("microbatch_guard", _MODULE_PATH)
+_mod = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_mod)
+
+broadcast_uniform_microbatch_count = _mod.broadcast_uniform_microbatch_count
+PaddedMicrobatchIterator = _mod.PaddedMicrobatchIterator
+log_microbatch_guard_stats = _mod.log_microbatch_guard_stats
 
 
 class TestBroadcastUniformMicrobatchCount:

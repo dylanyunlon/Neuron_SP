@@ -285,12 +285,13 @@ class MicrobatchAllocation:
         if not self.per_rank_microbatches:
             return
         counts = set(self.per_rank_microbatches.values())
-        assert len(counts) <= 1, (
-            f"[MicrobatchAllocation] non-uniform num_microbatches across ranks: "
-            f"{self.per_rank_microbatches}. This WILL cause ZeRO-3 "
-            f"all_gather_into_tensor deadlock. Use "
-            f"broadcast_uniform_microbatch_count() to fix."
-        )
+        if len(counts) > 1:
+            raise RuntimeError(
+                f"[MicrobatchAllocation] non-uniform num_microbatches across ranks: "
+                f"{self.per_rank_microbatches}. This will cause ZeRO-3 "
+                f"all_gather_into_tensor deadlock. Use "
+                f"broadcast_uniform_microbatch_count() to fix."
+            )
 
 
 # ---------------------------------------------------------------------------

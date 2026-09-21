@@ -101,6 +101,9 @@ class ShardState:
     # synchronisation which is incompatible with heterogeneous
     # microbatch counts.
     cpu_param_data: Dict[str, torch.Tensor] = field(default_factory=dict)
+    # Per-step gather_full_params call counter (fix #591 diagnostic).
+    # Initialized here to avoid hasattr overhead in the hot path.
+    _gather_count: int = 0
 
     # ------------------------------------------------------------------
     # Constructors
@@ -314,8 +317,6 @@ class ShardState:
             return
 
         # FIX #591: increment gather counter for symmetry diagnostic.
-        if not hasattr(self, '_gather_count'):
-            self._gather_count = 0
         self._gather_count += 1
 
         # Choose dtype to gather in , match the live parameter dtype.

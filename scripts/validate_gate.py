@@ -100,7 +100,7 @@ class GateReport:
 # Matches lines like:
 #   step=   100 | loss=8.1234 | lr=3.00e-04 | grad_norm=12.345 | tok/s=  1234 | ...
 _STEP_RE = re.compile(
-    r"step=\s*(\d+)\s*\|\s*loss=([\d.]+)"
+    r"step=\s*(\d+)\s*\|\s*loss=([\d.eE+-]+)"
 )
 
 # Matches rank step logs: rank=0: num_microbatches=1, step=5

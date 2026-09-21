@@ -47,6 +47,10 @@ def broadcast_uniform_microbatch_count(
 ) -> int:
     """All-reduce local num_microbatches to the MAX across all ranks.
 
+    MAX (not MIN) because NCCL collectives inside gather_full_params()
+    require ALL ranks to participate.  Skipping microbatches on the fast
+    rank would re-introduce the asymmetry deadlock this guard prevents.
+
     Every rank MUST call this with the same process group so the collective
     is symmetric.  The returned value is guaranteed identical on all ranks.
 

@@ -114,6 +114,7 @@ def validate_embedding_sync_flags(
     if group is not None:
         src_rank = dist.get_global_rank(group, 0)
     else:
+        # group=None -> WORLD group, global rank 0 is always group-local rank 0.
         src_rank = 0
 
     dist.broadcast(flags, src=src_rank, group=group)

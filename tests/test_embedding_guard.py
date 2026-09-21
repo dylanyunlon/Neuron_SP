@@ -12,13 +12,37 @@ Test matrix:
   - safe_model_parallel_config share_embeddings explicitly False
 """
 
+import importlib.util
+import os
+import sys
+
 import pytest
 
-from deepspeed.core.distributed.embedding_guard import (
-    EmbeddingGradSyncConfig,
-    safe_model_parallel_config,
-    validate_embedding_sync_flags,
+# Direct-import to bypass the heavy deepspeed/__init__.py chain.
+# embedding_guard.py needs torch + torch.distributed + ModelParallelConfig.
+# We pre-load the dependency chain manually to avoid pulling in the
+# full deepspeed runtime (cpuinfo, tqdm, pydantic, msgpack, etc.).
+
+_BASE = os.path.join(os.path.dirname(__file__), "..")
+
+# Ensure deepspeed.core subpackages are importable
+if _BASE not in sys.path:
+    sys.path.insert(0, _BASE)
+
+# Load just the two modules in the dependency chain
+_eg_path = os.path.join(_BASE, "deepspeed", "core", "distributed", "embedding_guard.py")
+_eg_spec = importlib.util.spec_from_file_location(
+    "deepspeed.core.distributed.embedding_guard", _eg_path,
+    submodule_search_locations=[],
 )
+_eg_mod = importlib.util.module_from_spec(_eg_spec)
+# Pre-register so internal relative imports resolve
+sys.modules["deepspeed.core.distributed.embedding_guard"] = _eg_mod
+_eg_spec.loader.exec_module(_eg_mod)
+
+EmbeddingGradSyncConfig = _eg_mod.EmbeddingGradSyncConfig
+safe_model_parallel_config = _eg_mod.safe_model_parallel_config
+validate_embedding_sync_flags = _eg_mod.validate_embedding_sync_flags
 
 
 class TestEmbeddingGradSyncConfig:
