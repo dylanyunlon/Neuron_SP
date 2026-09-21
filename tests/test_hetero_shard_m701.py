@@ -1,7 +1,7 @@
 """
-DES-LOC M701 — hetero_shard_ratio unit test
+DES-LOC M701 ,  hetero_shard_ratio unit test
 Simulates: 2x A6000 (49GB) + 1x H100 (96GB)
-Ratio: [1.0, 1.0, 2.0]  →  A6000s each ~25%, H100 ~50%
+Ratio: [1.0, 1.0, 2.0]  ->  A6000s each ~25%, H100 ~50%
 
 Run: python tests/test_hetero_shard_m701.py
 """
@@ -158,7 +158,7 @@ def test_remainder_distribution():
     print("  PASS: all totals accounted for")
 
 
-# ── Issue #590 — free VRAM and resolve tests ──────────────────────────────
+# ── Issue #590 ,  free VRAM and resolve tests ──────────────────────────────
 
 def test_free_vram_weights():
     """Verify free_vram_weights_from_tiers uses free_mem_gb not total."""
@@ -228,7 +228,7 @@ if __name__ == "__main__":
     test_gradient_consistency()
     test_remainder_distribution()
     print()
-    print("=== Issue #590 — free VRAM and resolve tests ===")
+    print("=== Issue #590 ,  free VRAM and resolve tests ===")
     test_free_vram_weights()
     test_resolve_priority_chain()
     print("\n✅ All M701 hetero_shard_ratio tests passed.")

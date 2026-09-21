@@ -1,5 +1,5 @@
 """
-runtime_config_query.py — Ask claude-hk-config for training parameters at runtime.
+runtime_config_query.py ,  Ask claude-hk-config for training parameters at runtime.
 
 Instead of hardcoding memory budgets and heuristics for every GPU combination,
 this module:
@@ -271,7 +271,7 @@ def _call_claude_hk(prompt: str, timeout: int = 120, max_retries: int = 5) -> Op
 
     Handles the claude.hk.cn rate limit (HTTP 429 / permission_error /
     "频率过快" / "reached the limit") by retrying with exponential backoff.
-    The backoff schedule is 10s, 20s, 40s, 60s, 90s — matching the typical
+    The backoff schedule is 10s, 20s, 40s, 60s, 90s ,  matching the typical
     rate-limit window recovery on shared-cookie deployments.
 
     A fresh conversation is used on each retry (claude_hk_chat.sh creates a
@@ -307,7 +307,7 @@ def _call_claude_hk(prompt: str, timeout: int = 120, max_retries: int = 5) -> Op
                 "[runtime_config] attempt %d/%d timed out (%ds)",
                 attempt + 1, max_retries, timeout,
             )
-            # Timeout is not a rate limit — don't retry, just give up
+            # Timeout is not a rate limit ,  don't retry, just give up
             return None
         except Exception as e:
             logger.warning("[runtime_config] attempt %d/%d error: %s", attempt + 1, max_retries, e)
@@ -323,7 +323,7 @@ def _call_claude_hk(prompt: str, timeout: int = 120, max_retries: int = 5) -> Op
         if is_rate_limited:
             backoff = _BACKOFF_SCHEDULE[min(attempt, len(_BACKOFF_SCHEDULE) - 1)]
             logger.warning(
-                "[runtime_config] 429/rate-limit on attempt %d/%d — "
+                "[runtime_config] 429/rate-limit on attempt %d/%d ,  "
                 "backoff %ds before retry (new conversation)",
                 attempt + 1, max_retries, backoff,
             )
@@ -547,7 +547,7 @@ def apply_overrides(config: Any, overrides: Dict[str, Any]) -> None:
         can log provenance.
 
     Special handling for ``cpu_offload_optimizer``:
-      - Normalises elements to bool (JSON 0/1 → False/True).
+      - Normalises elements to bool (JSON 0/1 -> False/True).
     """
     for key, val in overrides.items():
         # -- shard_weights: normalise & mark source (issue #590) ------------

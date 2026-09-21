@@ -35,7 +35,7 @@ def build_core_scheduler(
     build_warmup_cosine_scheduler (torch LambdaLR).
 
     The OptimizerParamScheduler supports WSD decay, per-tier LR multipliers,
-    and weight decay scheduling — features the LambdaLR path lacks.
+    and weight decay scheduling ,  features the LambdaLR path lacks.
     """
     if not getattr(config, "use_core_scheduler", False):
         return None
@@ -162,7 +162,7 @@ class BridgeToP2PWrapper:
         send_forward(tensor) / recv_forward() -> Tensor
         send_backward(tensor) / recv_backward() -> Tensor
 
-    Mapping: src_device < dst_device ⇒ forward direction (lower stage → higher stage).
+    Mapping: src_device < dst_device ⇒ forward direction (lower stage -> higher stage).
              src_device > dst_device ⇒ backward direction.
              src_device == dst_device ⇒ local copy, no bridge needed.
     """
@@ -180,7 +180,7 @@ class BridgeToP2PWrapper:
     ) -> "torch.Tensor":
         import torch
 
-        # Cache hit → skip transfer
+        # Cache hit -> skip transfer
         if cache_key is not None and self._cache is not None:
             cached = self._cache.get(cache_key)
             if cached is not None:
@@ -357,7 +357,7 @@ def build_hybrid_cp_schedule(
                     loss = _model(input_ids, labels)
                 else:
                     loss = _model(input_ids)
-                # Scalar loss → 0-dim tensor; token count ≈ sequence length
+                # Scalar loss -> 0-dim tensor; token count ≈ sequence length
                 if not isinstance(loss, tuple):
                     loss_t = loss if isinstance(loss, type(loss)) and hasattr(loss, "shape") else loss
                 else:
@@ -414,9 +414,9 @@ def maybe_enable_activation_offload(
     * ``config.use_activation_offload`` must be True (opt-in flag).
     * ``tier_type`` drives the tier check:
         - PROFESSIONAL / CONSUMER  (≤ ~49 GB VRAM, e.g. A6000, RTX 4090)
-          → offload **enabled** – GPU memory is scarce.
+          -> offload **enabled** – GPU memory is scarce.
         - DATACENTER (H100, A100, ≥ 80 GB VRAM)
-          → offload **skipped** – ample VRAM, adding PCIe traffic hurts MFU.
+          -> offload **skipped** – ample VRAM, adding PCIe traffic hurts MFU.
       When *tier_type* is None the adapter falls back to interrogating
       ``torch.cuda.get_device_properties`` directly.
 
@@ -503,7 +503,7 @@ def maybe_enable_activation_offload(
 
 
 # ---------------------------------------------------------------------------
-# 7. MoE adapter — wire deepspeed/core/transformer/moe/ into the engine
+# 7. MoE adapter ,  wire deepspeed/core/transformer/moe/ into the engine
 # ---------------------------------------------------------------------------
 
 class MoEAdapter:
@@ -511,17 +511,17 @@ class MoEAdapter:
 
     Responsibilities
     ----------------
-    * **patch_model** — replace the dense ``MLP`` sub-module in every
+    * **patch_model** ,  replace the dense ``MLP`` sub-module in every
       TransformerBlock with an ``MoELayer`` according to the engine config.
       Only every ``moe_layer_freq``-th block gets MoE (default: every block
       when freq=1).  Layers owned by H100 (high-VRAM) tiers always get MoE;
       A6000 layers only get MoE when ``moe_on_all_tiers=True``.
 
-    * **collect_aux_loss** — walk all ``MoELayer`` instances in the model and
+    * **collect_aux_loss** ,  walk all ``MoELayer`` instances in the model and
       sum their router auxiliary losses into a single scalar.  Called once per
       micro-batch backward so the aux loss participates in the gradient graph.
 
-    * **log_utilization** — emit per-expert token-count statistics at the
+    * **log_utilization** ,  emit per-expert token-count statistics at the
       requested logging cadence (gated by ``moe_log_every``).
 
     Config keys recognised in ``TrainingConfig`` (all optional):
@@ -545,7 +545,7 @@ class MoEAdapter:
     # ------------------------------------------------------------------
     # Internal: build a synthetic config object the MoELayer / TopKRouter
     # constructors understand.  They only need attribute access, so a
-    # simple namespace is enough — no dataclass or TypedDict required.
+    # simple namespace is enough ,  no dataclass or TypedDict required.
     # ------------------------------------------------------------------
     def _make_moe_config(self) -> Any:
         """Return an attribute namespace with all fields MoELayer expects."""
@@ -584,7 +584,7 @@ class MoEAdapter:
         freq: int = getattr(cfg, "moe_layer_freq", 1)
         on_all_tiers: bool = getattr(cfg, "moe_on_all_tiers", True)
 
-        # Build device-index → TierClass lookup from discovered tiers so we
+        # Build device-index -> TierClass lookup from discovered tiers so we
         # can skip MoE on memory-constrained A6000 tiers when requested.
         tier_values: dict = {}
         for spec in self.tiers:
@@ -612,7 +612,7 @@ class MoEAdapter:
                 tier_name = tier_values.get(dev_idx, "UNKNOWN")
                 if "A6000" in tier_name:
                     logger.debug(
-                        "MoEAdapter: layer %d on A6000 — skipped (moe_on_all_tiers=False)",
+                        "MoEAdapter: layer %d on A6000 ,  skipped (moe_on_all_tiers=False)",
                         layer_idx,
                     )
                     continue
@@ -625,7 +625,7 @@ class MoEAdapter:
                 target_attr = "ffn"
             else:
                 logger.debug(
-                    "MoEAdapter: layer %d has no .mlp/.ffn — cannot convert",
+                    "MoEAdapter: layer %d has no .mlp/.ffn ,  cannot convert",
                     layer_idx,
                 )
                 continue
@@ -713,7 +713,7 @@ def build_moe_adapter(
 
     Gate flag
     ---------
-    ``config.use_moe: bool`` — master on/off switch.  When False (default),
+    ``config.use_moe: bool`` ,  master on/off switch.  When False (default),
     this function is a no-op and returns ``None`` so the rest of the engine
     is completely unaffected.
 
@@ -772,11 +772,11 @@ class _LightweightMLA(object):
 
     Architecture summary
     --------------------
-    Queries      : x → W_q_down (hidden → q_lora_rank) → W_q_up (→ n_heads * head_dim)
-    Keys/Values  : x → W_kv_down (hidden → kv_lora_rank) →
-                       W_k_up  (→ n_heads * head_dim)
-                       W_v_up  (→ n_heads * v_head_dim)
-    Output       : concat(head_outputs) → W_proj (n_heads * v_head_dim → hidden)
+    Queries      : x -> W_q_down (hidden -> q_lora_rank) -> W_q_up (-> n_heads * head_dim)
+    Keys/Values  : x -> W_kv_down (hidden -> kv_lora_rank) ->
+                       W_k_up  (-> n_heads * head_dim)
+                       W_v_up  (-> n_heads * v_head_dim)
+    Output       : concat(head_outputs) -> W_proj (n_heads * v_head_dim -> hidden)
 
     RoPE is *not* applied here; the MiniTransformer does not use positional
     embeddings in its smoke-test configuration.  Add a rotary layer before
@@ -804,17 +804,17 @@ class _LightweightMLA(object):
                 self.head_dim  = head_dim
                 self.v_head_dim = v_head_dim
 
-                # Q low-rank path: hidden → q_lora_rank → n_heads * head_dim
+                # Q low-rank path: hidden -> q_lora_rank -> n_heads * head_dim
                 self.w_q_down = nn.Linear(hidden, q_lora_rank, bias=False)
                 self.w_q_up   = nn.Linear(q_lora_rank, n_heads * head_dim, bias=False)
 
-                # KV shared down-projection: hidden → kv_lora_rank (the "latent")
+                # KV shared down-projection: hidden -> kv_lora_rank (the "latent")
                 self.w_kv_down = nn.Linear(hidden, kv_lora_rank, bias=False)
                 # K up-projection from latent
                 self.w_k_up   = nn.Linear(kv_lora_rank, n_heads * head_dim, bias=False)
                 # V up-projection from latent
                 self.w_v_up   = nn.Linear(kv_lora_rank, n_heads * v_head_dim, bias=False)
-                # Output projection: concat of all V heads → hidden
+                # Output projection: concat of all V heads -> hidden
                 self.proj      = nn.Linear(n_heads * v_head_dim, hidden, bias=False)
 
             def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -843,12 +843,12 @@ class MLAAdapter:
 
     Responsibilities
     ----------------
-    * **patch_model** — replace the ``CausalSelfAttention`` (``.attn``) in
+    * **patch_model** ,  replace the ``CausalSelfAttention`` (``.attn``) in
       every TransformerBlock with a :class:`_LightweightMLA` module.
       Only every ``mla_layer_freq``-th block is converted (default: every
       block when freq=1).
 
-    * **log_info** — emit a one-line summary of the conversion.
+    * **log_info** ,  emit a one-line summary of the conversion.
 
     Config keys recognised in ``TrainingConfig`` (all optional):
         use_mla             bool  – master on/off switch (default False)
@@ -899,7 +899,7 @@ class MLAAdapter:
 
             if not hasattr(block, "attn"):
                 logger.debug(
-                    "MLAAdapter: layer %d has no .attn — cannot convert", layer_idx
+                    "MLAAdapter: layer %d has no .attn ,  cannot convert", layer_idx
                 )
                 continue
 
@@ -914,7 +914,7 @@ class MLAAdapter:
                 n_heads = getattr(existing_attn, "n_heads", 1)
             else:
                 logger.debug(
-                    "MLAAdapter: layer %d .attn has unknown shape — skipping",
+                    "MLAAdapter: layer %d .attn has unknown shape ,  skipping",
                     layer_idx,
                 )
                 continue
@@ -969,7 +969,7 @@ def build_mla_adapter(
 
     Gate flag
     ---------
-    ``config.use_mla: bool`` — master on/off switch.  When False (default),
+    ``config.use_mla: bool`` ,  master on/off switch.  When False (default),
     this function is a no-op and returns ``None`` so the rest of the engine
     is completely unaffected.
 
@@ -1037,7 +1037,7 @@ def log_config_diagnostics(config: object) -> None:
         )
     else:
         logger.info(
-            "[diagnostics] shard_weights=None (source=%s) — will use "
+            "[diagnostics] shard_weights=None (source=%s) ,  will use "
             "even split or tier discovery at engine init", src,
         )
 
@@ -1049,5 +1049,5 @@ def log_config_diagnostics(config: object) -> None:
         )
     else:
         logger.info(
-            "[diagnostics] cpu_offload_optimizer=None — using defaults"
+            "[diagnostics] cpu_offload_optimizer=None ,  using defaults"
         )

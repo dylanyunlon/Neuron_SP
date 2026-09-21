@@ -1,20 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
 # DeepSpeed Team / Neuron_SP
 """
-Issue #590 — unit tests for the heterogeneous shard weight wiring.
+Issue #590 ,  unit tests for the heterogeneous shard weight wiring.
 
 Tests the full pipeline:
 
-  run_pretrain.py → query_runtime_config()
-    → apply_overrides(tc, overrides)
-      → tc.shard_weights = [...]
-      → tc.shard_weights_source = "runtime_query"
-  desloc_engine.py → resolve_shard_weights(config, tiers, ws)
-    → priority 1: config.shard_weights  (runtime_query)
-    → priority 2: free_vram_weights_from_tiers(tiers)
-    → priority 3: vram_weights_from_tiers(tiers)
-    → priority 4: None  (even_split)
-  → ShardState.build(model, rank, ws, device, vram_weights=weights)
+  run_pretrain.py -> query_runtime_config()
+    -> apply_overrides(tc, overrides)
+      -> tc.shard_weights = [...]
+      -> tc.shard_weights_source = "runtime_query"
+  desloc_engine.py -> resolve_shard_weights(config, tiers, ws)
+    -> priority 1: config.shard_weights  (runtime_query)
+    -> priority 2: free_vram_weights_from_tiers(tiers)
+    -> priority 3: vram_weights_from_tiers(tiers)
+    -> priority 4: None  (even_split)
+  -> ShardState.build(model, rank, ws, device, vram_weights=weights)
 
 AST call chain depth: 6 functions in 4 modules.
 
@@ -98,7 +98,7 @@ class TestResolveShardWeights:
         tiers = [FakeTier(0, 48, 0), FakeTier(1, 48, 0), FakeTier(2, 96, 0)]
         w, src = resolve_shard_weights(cfg, tiers, 3)
         assert src == "vram_discovery"
-        # free=0 → uses total-2.0
+        # free=0 -> uses total-2.0
         assert w == [46.0, 46.0, 94.0]
 
     def test_priority4_even_split(self):
@@ -272,7 +272,7 @@ class TestParseResponse:
 # ── end-to-end wiring simulation ──────────────────────────────────────────
 
 class TestEndToEnd:
-    """Simulate the full query → apply → resolve pipeline."""
+    """Simulate the full query -> apply -> resolve pipeline."""
 
     def test_runtime_query_path(self):
         cfg = TrainingConfig()
@@ -289,7 +289,7 @@ class TestEndToEnd:
         assert w == [45.0, 45.0, 91.0]
 
     def test_fallback_when_query_fails(self):
-        cfg = TrainingConfig()  # no overrides → query failure
+        cfg = TrainingConfig()  # no overrides -> query failure
         tiers = [FakeTier(0, 48, 45), FakeTier(1, 48, 44.5), FakeTier(2, 96, 91)]
         w, src = resolve_shard_weights(cfg, tiers, 3)
         assert src == "vram_discovery"
