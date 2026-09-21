@@ -17,7 +17,7 @@ Design notes
   that we can scatter / gather back into the right ``nn.Parameter``.
 
 * ``gather_full_params(module)`` is a context manager that materializes
-  the full FP32 → BF16 buffer via ``dist.all_gather_into_tensor`` and
+  the full FP32 -> BF16 buffer via ``dist.all_gather_into_tensor`` and
   rewrites the storage of every parameter to view into that buffer for
   the duration of the ``with`` block. On exit the storage is released.
 
@@ -97,10 +97,13 @@ class ShardState:
     pad: int = 0
     # CPU-pinned full BF16 copy of each param, keyed by param name.
     # Used by forward/backward hooks to reconstruct full params on GPU
-    # via H2D copy instead of NCCL all-gather — avoids cross-rank
+    # via H2D copy instead of NCCL all-gather , avoids cross-rank
     # synchronisation which is incompatible with heterogeneous
     # microbatch counts.
     cpu_param_data: Dict[str, torch.Tensor] = field(default_factory=dict)
+    # Per-step gather_full_params call counter (fix #591 diagnostic).
+    # Initialized here to avoid hasattr overhead in the hot path.
+    _gather_count: int = 0
 
     # ------------------------------------------------------------------
     # Constructors
@@ -117,7 +120,7 @@ class ShardState:
         """
         Build the sharding plan for ``model``.
 
-        Returns ``None`` when ``world_size <= 1`` (no sharding needed —
+        Returns ``None`` when ``world_size <= 1`` (no sharding needed ,
         backward-compatible single-GPU path).
 
         Args:
@@ -171,7 +174,7 @@ class ShardState:
             pad = total_numel - raw_total
             shard_sizes = [shard_size] * world_size
 
-        # Cumulative offsets — useful both for indexing and for
+        # Cumulative offsets , useful both for indexing and for
         # interpreting the layout after all-gather.
         shard_offsets: List[int] = [0]
         for s in shard_sizes:
@@ -298,12 +301,25 @@ class ShardState:
 
         The gathered buffer's dtype matches the first parameter's dtype
         (usually BF16), so forward/backward run in low precision.
+
+        .. warning::
+
+            FIX #591 Blocker 2 , defense in depth:
+            This method calls ``all_gather_into_tensor`` which is an NCCL
+            collective.  ALL ranks in the process group MUST call this the
+            same number of times per step.  The microbatch_guard module
+            enforces uniform ``num_microbatches`` at the engine level; this
+            counter here is a secondary diagnostic that logs when the total
+            gather count diverges from expectations.
         """
         if self.world_size <= 1:
             yield
             return
 
-        # Choose dtype to gather in — match the live parameter dtype.
+        # FIX #591: increment gather counter for symmetry diagnostic.
+        self._gather_count += 1
+
+        # Choose dtype to gather in , match the live parameter dtype.
         gather_dtype = self.param_order[0][1].dtype
 
         full = self._build_full_buffer(gather_dtype)
@@ -321,6 +337,14 @@ class ShardState:
             for p, orig in saved:
                 p.data = orig
             del full
+
+    def get_gather_count(self) -> int:
+        """Return total number of gather_full_params calls (fix #591 diagnostic)."""
+        return getattr(self, '_gather_count', 0)
+
+    def reset_gather_count(self) -> None:
+        """Reset the per-step gather counter (call at step boundary)."""
+        self._gather_count = 0
 
     # ------------------------------------------------------------------
     # Per-parameter backward hooks (reduce-scatter on the fly)
@@ -348,7 +372,7 @@ class ShardState:
           * When ``fp32_grad_manager`` is supplied, the shard is also
             accumulated into the corresponding FP32 ``main_grad`` slice
             (if one exists for this parameter) so the existing
-            three-tier precision policy still applies — the only
+            three-tier precision policy still applies , the only
             difference from the unsharded path is that ``main_grad`` now
             only ever sees its rank-local slice of the gradient.
 
@@ -405,7 +429,7 @@ class ShardState:
                     param.grad = None
                     return
 
-                # Fallback: local SGD — extract shard slice directly
+                # Fallback: local SGD , extract shard slice directly
                 flat = grad.detach().reshape(-1)
                 if _shard_end > _shard_start:
                     # Map from param-local flat indices to our shard window
@@ -459,7 +483,7 @@ class ShardState:
                             # slice; the remaining entries are owned by
                             # other ranks and stay zero on this rank.
                             mg_flat[p_lo:p_hi].add_(local_grad.float())
-                        # Any other shape mismatch is ignored — the
+                        # Any other shape mismatch is ignored , the
                         # manager's own accumulate()/after_backward()
                         # path will still run on whatever it owns.
 
@@ -513,7 +537,7 @@ class ShardState:
                 s_hi = g_end - lo
                 full_param_grad[p_lo:p_hi].copy_(g[s_lo:s_hi].float())
 
-            # All-reduce across ranks — all ranks have the same param layout
+            # All-reduce across ranks , all ranks have the same param layout
             dist.all_reduce(full_param_grad, op=dist.ReduceOp.SUM)
             full_param_grad.div_(self.world_size)
 
@@ -604,7 +628,7 @@ class ShardState:
                 self.param_shard.grad[s_start:s_start + take].copy_(grad_flat[:take])
 
     def _write_shard_to_model(self) -> None:
-        """Write this rank's FP32 shard to model BF16 — NO cross-rank broadcast.
+        """Write this rank's FP32 shard to model BF16 , NO cross-rank broadcast.
 
         DES-LOC non-Kx steps: each rank updates its own portion of the model
         from the local optimizer state. The model becomes inconsistent across
@@ -673,7 +697,7 @@ class ShardState:
         lo = self.shard_offsets[self.rank]
         hi = self.shard_offsets[self.rank + 1]
 
-        BUCKET_BYTES = 2 * 1024 * 1024 * 1024  # 2 GB — fits A6000 (5 GB free)
+        BUCKET_BYTES = 2 * 1024 * 1024 * 1024  # 2 GB , fits A6000 (5 GB free)
         bucket_elems = BUCKET_BYTES // 2   # BF16 = 2 bytes
 
         # Collect params into buckets by cumulative size
@@ -732,7 +756,7 @@ class ShardState:
     ) -> "torch.cuda.Stream":
         """Write local shard + broadcast to sync full model across ranks.
 
-        Local FP32→BF16 copies run on *stream*. The broadcast (NCCL) runs
+        Local FP32->BF16 copies run on *stream*. The broadcast (NCCL) runs
         on the default stream after waiting for copies to finish.
         """
         if not torch.cuda.is_available():
@@ -792,7 +816,7 @@ class ZeRO3ForwardHook:
         Adam m+v    (FP32) : ~24 GB  (H100) / ~12 GB (A6000)
         full model  (BF16) : ~12 GB  (both)
         activations        :  ~5 GB  (H100) / ~3 GB  (A6000)
-        ──────────────────────────────────────────────────────
+        ------------------------------------------------------
         total              : ~65 GB / 93 GB  (H100)  OK
                            : ~39 GB / 47 GB  (A6000) OK
 
@@ -835,7 +859,7 @@ class ZeRO3ForwardHook:
         return 1
 
     def remove(self) -> None:
-        """No-op — no hooks were installed."""
+        """No-op , no hooks were installed."""
         self._handles.clear()
 
 
@@ -881,7 +905,7 @@ def vram_weights_from_tiers(tiers: Sequence[object]) -> List[float]:
 
 
 # ---------------------------------------------------------------------------
-# GradBucketManager — Megatron-style bucketed grad sync for ZeRO-3
+# GradBucketManager , Megatron-style bucketed grad sync for ZeRO-3
 # ---------------------------------------------------------------------------
 class GradBucketManager:
     """Bucketed gradient all_reduce following upstream _ParamAndGradBucketGroup.
@@ -908,7 +932,7 @@ class GradBucketManager:
 
         # Assign params to buckets in forward order (backward fires reverse)
         self.buckets = []       # list of dicts: {buffer, params, pending, handle}
-        self._param_bucket = {} # name → bucket_index
+        self._param_bucket = {} # name -> bucket_index
 
         current_bucket_params = []
         current_size = 0
@@ -943,7 +967,7 @@ class GradBucketManager:
         self.buckets.append({
             'buffer': None,         # lazy FP32 flat buffer
             'total_size': total_size,
-            'offsets': offsets,      # name → (start, end) within bucket
+            'offsets': offsets,      # name -> (start, end) within bucket
             'pending': len(params), # count of params not yet received
             'handle': None,         # async all_reduce handle
             'names': [n for n, _ in params],
@@ -968,7 +992,7 @@ class GradBucketManager:
         lo = ss.shard_offsets[ss.rank]
         hi = ss.shard_offsets[ss.rank + 1]
 
-        # In-place all_reduce — zero extra memory
+        # In-place all_reduce , zero extra memory
         if self.world_size > 1 and dist.is_initialized():
             dist.all_reduce(param_grad, op=dist.ReduceOp.SUM)
 
@@ -987,13 +1011,13 @@ class GradBucketManager:
                 flat[p_lo:p_hi].to(dtype=torch.float32))
 
     def start_grad_sync(self):
-        """No-op — all_reduce happens inline in on_grad_ready."""
+        """No-op , all_reduce happens inline in on_grad_ready."""
         pass
 
     def finish_grad_sync(self):
-        """No-op — all_reduce happens inline in on_grad_ready."""
+        """No-op , all_reduce happens inline in on_grad_ready."""
         pass
 
     def reset(self):
-        """No-op — no state to reset."""
+        """No-op , no state to reset."""
         pass

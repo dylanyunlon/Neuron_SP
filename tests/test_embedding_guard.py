@@ -1,0 +1,198 @@
+"""
+Unit tests for deepspeed.core.distributed.embedding_guard.
+
+Tests the embedding grad-sync guard (fix #591 Blocker 3) without
+requiring a real distributed environment.
+
+Test matrix:
+  - EmbeddingGradSyncConfig defaults
+  - validate_embedding_sync_flags non-distributed passthrough
+  - safe_model_parallel_config default safety flags
+  - safe_model_parallel_config with overrides
+  - safe_model_parallel_config share_embeddings explicitly False
+"""
+
+import importlib.util
+import os
+import sys
+import types
+
+import pytest
+
+# Direct-import to bypass the heavy deepspeed/__init__.py chain.
+# We pre-load the minimal dependency chain manually:
+#   desloc_config.py (pure dataclass, no deps)
+#   -> model_parallel_config.py (needs desloc_config + torch)
+#   -> embedding_guard.py (needs model_parallel_config + torch.distributed)
+
+_BASE = os.path.join(os.path.dirname(__file__), "..")
+
+
+def _direct_load(module_fqn: str, file_path: str):
+    """Load a single .py file and register it in sys.modules."""
+    # Ensure parent packages exist as namespace stubs
+    parts = module_fqn.split(".")
+    for i in range(1, len(parts)):
+        parent = ".".join(parts[:i])
+        if parent not in sys.modules:
+            pkg = types.ModuleType(parent)
+            pkg.__path__ = [os.path.join(_BASE, *parts[:i])]
+            pkg.__package__ = parent
+            sys.modules[parent] = pkg
+
+    spec = importlib.util.spec_from_file_location(module_fqn, file_path)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[module_fqn] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+# 1. desloc_config (pure dataclass, zero external deps)
+_direct_load(
+    "deepspeed.core.desloc_config",
+    os.path.join(_BASE, "deepspeed", "core", "desloc_config.py"),
+)
+
+# 2. model_parallel_config (needs desloc_config + torch)
+_direct_load(
+    "deepspeed.core.model_parallel_config",
+    os.path.join(_BASE, "deepspeed", "core", "model_parallel_config.py"),
+)
+
+# 3. embedding_guard (the module under test)
+_eg_mod = _direct_load(
+    "deepspeed.core.distributed.embedding_guard",
+    os.path.join(_BASE, "deepspeed", "core", "distributed", "embedding_guard.py"),
+)
+
+EmbeddingGradSyncConfig = _eg_mod.EmbeddingGradSyncConfig
+safe_model_parallel_config = _eg_mod.safe_model_parallel_config
+validate_embedding_sync_flags = _eg_mod.validate_embedding_sync_flags
+
+
+class TestEmbeddingGradSyncConfig:
+    """Tests for EmbeddingGradSyncConfig dataclass."""
+
+    def test_defaults(self):
+        cfg = EmbeddingGradSyncConfig()
+        assert cfg.share_embeddings_and_output_weights is False
+        assert cfg.has_position_embeddings is False
+        assert cfg.has_cond_embedder is False
+        assert cfg.validated is False
+
+    def test_explicit_true(self):
+        cfg = EmbeddingGradSyncConfig(
+            share_embeddings_and_output_weights=True,
+            has_position_embeddings=True,
+            validated=True,
+        )
+        assert cfg.share_embeddings_and_output_weights is True
+        assert cfg.validated is True
+
+
+class TestValidateEmbeddingSyncFlags:
+    """Tests for validate_embedding_sync_flags (non-distributed)."""
+
+    def test_non_distributed_passthrough(self):
+        """Without torch.distributed, should return input flags unchanged."""
+        result = validate_embedding_sync_flags(
+            share_embeddings=True,
+            has_position_embeddings=False,
+            has_cond_embedder=True,
+        )
+        assert result.share_embeddings_and_output_weights is True
+        assert result.has_position_embeddings is False
+        assert result.has_cond_embedder is True
+        assert result.validated is True
+
+    def test_all_false(self):
+        result = validate_embedding_sync_flags(
+            share_embeddings=False,
+            has_position_embeddings=False,
+            has_cond_embedder=False,
+        )
+        assert result.share_embeddings_and_output_weights is False
+        assert result.validated is True
+
+
+class TestSafeModelParallelConfig:
+    """Tests for safe_model_parallel_config."""
+
+    def test_default_safety_flags(self):
+        """Default config should have all safety flags set correctly."""
+        cfg = safe_model_parallel_config()
+        # Sequence parallel disabled (prevents conditional TP allreduce)
+        assert cfg.sequence_parallel is False
+        # Pipeline parallel size 1 (no PP stages -> no embedding cross-PP allreduce)
+        assert cfg.pipeline_model_parallel_size == 1
+        # TP size 1 (no tensor parallelism)
+        assert cfg.tensor_model_parallel_size == 1
+        # share_embeddings explicitly False
+        assert cfg.share_embeddings_and_output_weights is False
+
+    def test_override_hidden_size(self):
+        """Should accept overrides for non-safety fields."""
+        cfg = safe_model_parallel_config(hidden_size=2048)
+        assert cfg.hidden_size == 2048
+        # Safety flags still intact
+        assert cfg.sequence_parallel is False
+
+    def test_override_safety_flag(self):
+        """Overrides should work even for safety flags (user knows best)."""
+        cfg = safe_model_parallel_config(sequence_parallel=True)
+        assert cfg.sequence_parallel is True
+
+    def test_share_embeddings_field_exists(self):
+        """The config must have share_embeddings_and_output_weights."""
+        cfg = safe_model_parallel_config()
+        assert hasattr(cfg, "share_embeddings_and_output_weights")
+        assert cfg.share_embeddings_and_output_weights is False
+
+    def test_returns_model_parallel_config(self):
+        """Return type should be ModelParallelConfig."""
+        from deepspeed.core.model_parallel_config import ModelParallelConfig
+        cfg = safe_model_parallel_config()
+        assert isinstance(cfg, ModelParallelConfig)
+
+
+class TestFinalizeModelGradsEmbeddingGuard:
+    """Test that the embedding guard prevents conditional allreduce asymmetry.
+
+    These tests verify the guard logic WITHOUT calling NCCL, by checking
+    that the config flags finalize_model_grads reads are set to values
+    that either fire on ALL ranks or fire on NONE.
+    """
+
+    def test_gate_config_skips_word_embedding_allreduce(self):
+        """With share_embeddings=False and PP=1, word embedding allreduce should be skipped."""
+        cfg = safe_model_parallel_config()
+        # The guard condition in finalize_model_grads.py:
+        #   _skip_embedding_allreduce = (
+        #       config.share_embeddings_and_output_weights is False
+        #       and PP <= 1
+        #       and not has_cond_embedder
+        #       and mtp_num_layers in (None, 0)
+        #   )
+        skip = (
+            getattr(cfg, 'share_embeddings_and_output_weights', None) is False
+            and cfg.pipeline_model_parallel_size <= 1
+            and not getattr(cfg, 'has_cond_embedder', False)
+            and getattr(cfg, 'mtp_num_layers', None) in (None, 0)
+        )
+        assert skip is True, (
+            "Gate config should cause finalize_model_grads to skip "
+            "embedding allreduce (prevents asymmetric NCCL)"
+        )
+
+    def test_pp_gt1_does_not_skip(self):
+        """With PP>1, embedding allreduce should NOT be skipped."""
+        cfg = safe_model_parallel_config(pipeline_model_parallel_size=2)
+        skip = (
+            getattr(cfg, 'share_embeddings_and_output_weights', None) is False
+            and cfg.pipeline_model_parallel_size <= 1
+        )
+        assert skip is False
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])

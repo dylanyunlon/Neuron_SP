@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # DeepSpeed Team
-"""Model parallelism configuration — base config for all core modules."""
+"""Model parallelism configuration , base config for all core modules."""
 
 from __future__ import annotations
 
@@ -72,6 +72,16 @@ class ModelParallelConfig:
     # --- Determinism ---
     deterministic_mode: bool = False
 
+    # --- Embedding weight sharing (fix #591 Blocker 3) ---
+    # When True, word-embedding and output-projection weights are tied,
+    # requiring an allreduce across the first and last PP stages to keep
+    # embedding gradients in sync.  Set explicitly to False for DES-LOC
+    # gate runs (PP=1, no weight tying) to prevent asymmetric NCCL
+    # collectives when some ranks derive a different value from model
+    # inspection.  When None, finalize_model_grads falls through to
+    # model-attribute inspection (legacy behaviour).
+    share_embeddings_and_output_weights: Optional[bool] = False
+
     # --- DES-LOC (heterogeneous training) ---
     desloc: Optional[DesLocConfig] = None
 
@@ -99,7 +109,7 @@ class ModelParallelConfig:
     # Pipeline-parallel communication fields (required by pipeline_parallel/)
     # ---------------------------------------------------------------------------
 
-    # Dtype used for pipeline activation tensors (None → use params_dtype)
+    # Dtype used for pipeline activation tensors (None -> use params_dtype)
     pipeline_dtype: "Optional[torch.dtype]" = None
 
     # Model hidden dimension (needed by get_tensor_shapes)
@@ -112,7 +122,7 @@ class ModelParallelConfig:
     # Ring-exchange P2P (alternative to batch_isend_irecv for some backends)
     use_ring_exchange_p2p: bool = False
 
-    # Variable sequence lengths — enables dynamic shape negotiation in P2P
+    # Variable sequence lengths , enables dynamic shape negotiation in P2P
     variable_seq_lengths: bool = False
 
     # Overlap P2P comm with compute in VPP schedule
@@ -143,7 +153,7 @@ class ModelParallelConfig:
     # Multi-token prediction layers (MTP)
     mtp_num_layers: Optional[int] = None
 
-    # MTP standalone mode — shape negotiation on standalone MTP stage (M3009)
+    # MTP standalone mode , shape negotiation on standalone MTP stage (M3009)
     mtp_standalone: bool = False
 
     # CUDA graph implementation ("local" | None)
@@ -173,7 +183,7 @@ class ModelParallelConfig:
     fine_grained_activation_offloading: bool = False
 
     # ---------------------------------------------------------------------------
-    # Heterogeneous pipeline (DES-LOC PP=5) — per-stage micro_batch_size
+    # Heterogeneous pipeline (DES-LOC PP=5) , per-stage micro_batch_size
     # ---------------------------------------------------------------------------
     # When set, each pipeline stage i uses hetero_micro_batch_sizes[i] instead
     # of the global micro_batch_size.  This allows fast stages (H100) to process

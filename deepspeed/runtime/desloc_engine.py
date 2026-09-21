@@ -33,7 +33,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
-# GradScaler removed — BF16 does not need loss scaling
+# GradScaler removed , BF16 does not need loss scaling
 # clip_grad_norm_ replaced by core implementation: avoids host/device sync,
 # computes norm across model-parallel group (Megatron M2335 pattern).
 from deepspeed.core.optimizer.clip_grads import clip_grad_norm
@@ -119,7 +119,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # NOTE: All deepspeed.runtime.hetero_* and deepspeed.checkpoint.hetero_*
 # imports have been made lazy (imported inside __init__ / methods) to avoid
-# triggering deepspeed/__init__.py → apex dependency at module import time.
+# triggering deepspeed/__init__.py -> apex dependency at module import time.
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
@@ -134,7 +134,7 @@ _CHECKPOINT_DIR = Path("checkpoints")
 # ---------------------------------------------------------------------------
 # Training-loop profiler: measures real CUDA time for every phase of a step.
 #
-# Not a toy benchmark — this lives inside the actual training loop and
+# Not a toy benchmark , this lives inside the actual training loop and
 # records wall-clock + CUDA-event timings for:
 #   - data fetch + H2D transfer
 #   - forward pass (per microbatch)
@@ -216,7 +216,7 @@ class StepProfiler:
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         with open(path, "w") as f:
             json.dump(self._step_records, f, indent=2, default=str)
-        logger.info("[StepProfiler] dumped %d records → %s", len(self._step_records), path)
+        logger.info("[StepProfiler] dumped %d records -> %s", len(self._step_records), path)
 
     def summary(self, last_n: int = 10) -> str:
         """Human-readable summary of the last N steps."""
@@ -239,7 +239,7 @@ class StepProfiler:
 # ---------------------------------------------------------------------------
 # Enums
 # ---------------------------------------------------------------------------
-# ── Config types extracted to desloc_config.py ─────────────────────
+# -- Config types extracted to desloc_config.py ---------------------
 from deepspeed.runtime.desloc_config import (  # noqa: E402
     PartitionStrategy,
     TierClass,
@@ -267,9 +267,9 @@ class DesLocEngine:
     DES-LOC Heterogeneous Training Engine.
 
     Orchestrates the full pretraining pipeline on a mixed-GPU cluster:
-      1. TierDiscovery  — enumerates and classifies GPUs
-      2. HeteroRegistry — loads all hetero_*.py extension modules
-      3. PartitionSolver — selects optimal partition strategy
+      1. TierDiscovery  , enumerates and classifies GPUs
+      2. HeteroRegistry , loads all hetero_*.py extension modules
+      3. PartitionSolver , selects optimal partition strategy
       4. Model & Optimizer initialization on the primary device
       5. Training loop with real forward/backward/step
       6. Checkpoint save / load
@@ -298,7 +298,7 @@ class DesLocEngine:
         # ------------------------------------------------------------------
         # Lazy imports: hetero_* modules are imported here (inside __init__)
         # so that merely importing desloc_engine does NOT trigger the
-        # deepspeed/__init__.py → apex dependency chain.
+        # deepspeed/__init__.py -> apex dependency chain.
         # ------------------------------------------------------------------
         from deepspeed.runtime.hetero_gdn_selective_recompute import (  # noqa: PLC0415
             build_neuron_sp_config,
@@ -387,7 +387,7 @@ class DesLocEngine:
         }
 
         logger.info("=" * 70)
-        logger.info("DES-LOC Engine initializing — Neuron_SP / production build")
+        logger.info("DES-LOC Engine initializing , Neuron_SP / production build")
         logger.info("=" * 70)
 
         # --- Phase 1: GPU discovery ---
@@ -419,7 +419,7 @@ class DesLocEngine:
         self.plan = solver.solve()
         logger.info("Partition plan: %s", self.plan.strategy)
         for dev_idx, layers in self.plan.tier_layer_map.items():
-            logger.info("  GPU%d → %d layers, grad_accum=%d, micro_bs=%d",
+            logger.info("  GPU%d -> %d layers, grad_accum=%d, micro_bs=%d",
                         dev_idx,
                         len(layers),
                         self.plan.grad_accum_steps.get(dev_idx, 1),
@@ -437,7 +437,7 @@ class DesLocEngine:
         _local_mem_gb = torch.cuda.get_device_properties(_local_device).total_memory / (1 << 30)
         self._use_fsdp = False  # Neuron_SP native ZeRO-3, no FSDP
 
-        # Model stays in BF16 on CPU — ZeRO-3 ShardState holds FP32 master
+        # Model stays in BF16 on CPU , ZeRO-3 ShardState holds FP32 master
         # copy per-rank on GPU; forward uses gather_full_params() to
         # materialize full BF16 params layer-by-layer on demand.
         self.model = self.model.to(dtype=_DEFAULT_DTYPE)
@@ -560,12 +560,12 @@ class DesLocEngine:
         # hetero_bridge entrypoint that:
         #   1. Discovers GPU tiers (TierMap.discover)
         #   2. Plans VRAM-proportional fp32 shards (HeteroShardPlanner.plan)
-        #   3. Builds per-rank optimizer — CPUAdam on A6000, fused AdamW on H100/Blackwell
+        #   3. Builds per-rank optimizer , CPUAdam on A6000, fused AdamW on H100/Blackwell
         #      (DistOptAdapter.build)
         #   4. Attaches adapter to self.optimizer / self._dist_optimizer
         #
         # NO FALLBACK: hetero_bridge is the production path.  If it fails,
-        # we crash — silent degradation to plain AdamW caused weeks of
+        # we crash , silent degradation to plain AdamW caused weeks of
         # wasted training with wrong convergence (issue #13, no-fallback policy).
         from deepspeed.core.hetero_bridge import engine_integration as _hb_ei
         _hb_ei.install(
@@ -574,11 +574,11 @@ class DesLocEngine:
             betas=(config.beta1, config.beta2),
             weight_decay=config.weight_decay,
         )
-        logger.info("[hetero_bridge] Phase 5: install() succeeded — "
+        logger.info("[hetero_bridge] Phase 5: install() succeeded , "
                     "optimizer=%s, _cpu_offload=%s",
                     type(self.optimizer).__name__, self._cpu_offload_optim)
-        if False:  # dead code — fallback removed per no-fallback policy
-            # ── Legacy fallback path (original Phase 5 behaviour) ─────────
+        if False:  # dead code , fallback removed per no-fallback policy
+            # -- Legacy fallback path (original Phase 5 behaviour) ---------
             _local_vram_gb = torch.cuda.get_device_properties(
                 _local_device
             ).total_memory / (1 << 30)
@@ -607,7 +607,7 @@ class DesLocEngine:
                         fp32_optimizer_states=True,
                     )
                     self._optim_type = "DeepSpeedCPUAdam"
-                    if False:  # dead code — fallback removed per no-fallback policy
+                    if False:  # dead code , fallback removed per no-fallback policy
                         self.optimizer = AdamW(
                             [_shard_cpu],
                             lr=config.max_lr,
@@ -642,12 +642,12 @@ class DesLocEngine:
                 self._optim_type = "AdamW(full-replica)"
                 self._cpu_offload_optim = False
         # LRScheduler requires a torch.optim.Optimizer instance.
-        # Unwrap chain: DistOptAdapter._opt → DistributedOptimizer.optimizer → AdamW
+        # Unwrap chain: DistOptAdapter._opt -> DistributedOptimizer.optimizer -> AdamW
         _sched_opt = self.optimizer
-        # Level 1: DistOptAdapter → DistributedOptimizer
+        # Level 1: DistOptAdapter -> DistributedOptimizer
         if hasattr(_sched_opt, '_opt') and _sched_opt._opt is not None:
             _sched_opt = _sched_opt._opt
-        # Level 2: DistributedOptimizer → torch.optim.AdamW
+        # Level 2: DistributedOptimizer -> torch.optim.AdamW
         if hasattr(_sched_opt, 'optimizer') and hasattr(_sched_opt.optimizer, 'param_groups'):
             _sched_opt = _sched_opt.optimizer
         self.scheduler = build_warmup_cosine_scheduler(
@@ -804,9 +804,9 @@ class DesLocEngine:
         # more microbatches to H100/Blackwell and fewer to A6000.
         #
         # Multipliers (conservative, ~1/3 of true TFLOPS ratio):
-        #   H100 NVL 835 TFLOPS → weight 8.0
-        #   Blackwell ~300 TFLOPS (est.) → weight 4.0
-        #   A6000 38.7 TFLOPS → weight 1.0
+        #   H100 NVL 835 TFLOPS -> weight 8.0
+        #   Blackwell ~300 TFLOPS (est.) -> weight 4.0
+        #   A6000 38.7 TFLOPS -> weight 1.0
         _TIER_WEIGHT: Dict[TierClass, float] = {
             TierClass.H100:            8.0,
             TierClass.RTX_PRO_6000_BW: 4.0,
@@ -818,7 +818,7 @@ class DesLocEngine:
             for spec in self.tiers:
                 weight = _TIER_WEIGHT.get(spec.tier, 1.0)
                 # max_micro_batch_size: use explicit per-gpu yaml value if available,
-                # otherwise derive from weight (H100→16, Blackwell→8, A6000→2)
+                # otherwise derive from weight (H100->16, Blackwell->8, A6000->2)
                 if (config.micro_batch_size_per_gpu is not None
                         and spec.device_index < len(config.micro_batch_size_per_gpu)):
                     max_mbs = config.micro_batch_size_per_gpu[spec.device_index]
@@ -877,7 +877,7 @@ class DesLocEngine:
         self._start_time = time.time()
 
         # --- DES-LOC: Decomposed Local SGD sync periods ---
-        # Ref: Algorithm 1 — Kx for params, Ku for m1 (exp_avg), Kv for m2 (exp_avg_sq)
+        # Ref: Algorithm 1 , Kx for params, Ku for m1 (exp_avg), Kv for m2 (exp_avg_sq)
         # Kx=1 means standard DDP (sync every step). Kx>1 means local SGD with
         # periodic sync. Must satisfy Kx <= Ku <= Kv.
         # Config source: deepspeed/runtime/config.py line 801-806
@@ -887,7 +887,7 @@ class DesLocEngine:
         assert self.desloc_Kx <= self.desloc_Ku <= self.desloc_Kv, \
             f"DES-LOC requires Kx <= Ku <= Kv, got {self.desloc_Kx}/{self.desloc_Ku}/{self.desloc_Kv}"
         logger.info(
-            "DES-LOC sync periods: Kx=%d (params), Ku=%d (m1), Kv=%d (m2) — "
+            "DES-LOC sync periods: Kx=%d (params), Ku=%d (m1), Kv=%d (m2) , "
             "comm reduction %.1fx vs DDP",
             self.desloc_Kx, self.desloc_Ku, self.desloc_Kv,
             3.0 / (1.0/self.desloc_Kx + 1.0/self.desloc_Ku + 1.0/self.desloc_Kv),
@@ -943,7 +943,7 @@ class DesLocEngine:
 
         # CPU-staging thread pool: used by save_checkpoint to push payload to
         # the locality-cache ramdisk (/dev/shm) without blocking the training
-        # loop.  One worker is sufficient — saves are sequential per rank and
+        # loop.  One worker is sufficient , saves are sequential per rank and
         # we want to avoid saturating the PCIe bus with concurrent H2H copies.
         self._cpu_stage_executor: concurrent.futures.ThreadPoolExecutor = (
             concurrent.futures.ThreadPoolExecutor(
@@ -966,8 +966,8 @@ class DesLocEngine:
                 "  save_dir            : %s\n"
                 "  load_dir            : %s\n"
                 "  locality_cache_dir  : %s  (max %.0f GB)\n"
-                "  cache_device        : %d   CACHE policy → async=%s  save_optim=%s\n"
-                "  worker_devices      : %s   WORKER policy → async=%s  save_optim=%s\n"
+                "  cache_device        : %d   CACHE policy -> async=%s  save_optim=%s\n"
+                "  worker_devices      : %s   WORKER policy -> async=%s  save_optim=%s\n"
                 "  worker_offload_optim: %s   hetero_async_save: %s\n"
                 "  shard_rebalance     : %s   ckpt_format: %s\n"
                 "  save_interval       : %s   non_persistent_interval: %s\n"
@@ -1004,7 +1004,7 @@ class DesLocEngine:
         _h100_idx = _h100_indices[0] if _h100_indices else 2
         # A6000 (48 GB): use "full" recompute granularity inside GDN layers so
         # the outer torch.utils.checkpoint block absorbs the entire layer forward.
-        # H100 (96 GB): keep "selective" — norm_out-only recompute costs less.
+        # H100 (96 GB): keep "selective" , norm_out-only recompute costs less.
         # This aligns with Megatron M4141 (ff5264c33): selective norm_out recompute
         # is only profitable when VRAM headroom exists to store other activations.
         _a6000_granularity = "full" if _a6000_indices else "selective"
@@ -1028,9 +1028,9 @@ class DesLocEngine:
         #   config.checkpoint_activations_granularity – "full" | "selective"
         #
         # Per-tier policy (overrides granularity config for each GPU class):
-        #   A6000 (48 GB VRAM, SM 8.6) → FULL checkpoint (every layer)
+        #   A6000 (48 GB VRAM, SM 8.6) -> FULL checkpoint (every layer)
         #       Memory budget is tighter; recompute all activations on backward.
-        #   H100  (96 GB VRAM, SM 9.x) → SELECTIVE checkpoint (every other layer)
+        #   H100  (96 GB VRAM, SM 9.x) -> SELECTIVE checkpoint (every other layer)
         #       Abundant VRAM; only half the layers are wrapped to reduce recompute
         #       overhead while still capping peak activation memory.
         #
@@ -1044,14 +1044,14 @@ class DesLocEngine:
             spec.device_index: spec.tier for spec in self.tiers
         }
 
-        # Build layer → device_index mapping from the partition plan.
+        # Build layer -> device_index mapping from the partition plan.
         #
         # ZeRO-3 vs Pipeline distinction matters here:
         #   ZeRO-3 (ZERO3_HETERO): every rank holds ALL parameters; tier_layer_map
-        #     maps every device_index → full layer list [0..N-1].  Naively iterating
+        #     maps every device_index -> full layer list [0..N-1].  Naively iterating
         #     dict.items() overwrites each layer key on every pass, leaving the LAST
         #     device_index (iteration order, typically A6000) as the owner of every
-        #     layer — this is the bug that produces "all layers tier=A6000".
+        #     layer , this is the bug that produces "all layers tier=A6000".
         #     Fix: in ZeRO-3 mode each process owns its OWN device, so map all
         #     layers to primary_idx (the local rank's CUDA device index).
         #
@@ -1067,7 +1067,7 @@ class DesLocEngine:
                 layer_device_map[li] = primary_idx
         else:
             # Pipeline 1F1B (and any future disjoint-partition strategies):
-            # tier_layer_map is a true partition — each entry is exclusive.
+            # tier_layer_map is a true partition , each entry is exclusive.
             for dev_idx, layer_indices in self.plan.tier_layer_map.items():
                 for li in layer_indices:
                     layer_device_map[li] = dev_idx
@@ -1082,7 +1082,7 @@ class DesLocEngine:
         # PipeDream runtime.py disables recompute on the last stage to save compute;
         # we do the inverse: force it ON for memory-constrained stages (A6000, 48 GB)
         # even when the caller has not set the flag.  Mirrors HetSeq controller.py
-        # line 282 OOM recovery — pre-emptive rather than crash-and-retry.
+        # line 282 OOM recovery , pre-emptive rather than crash-and-retry.
         _has_a6000_tier = any(spec.tier == TierClass.A6000 for spec in self.tiers)
         if _has_a6000_tier and not _ckpt_master_on:
             logger.warning(
@@ -1100,7 +1100,7 @@ class DesLocEngine:
 
         if block_list is not None:
             logger.info(
-                "[ActCkpt] GPU%d — master=%s  config_granularity=%s",
+                "[ActCkpt] GPU%d , master=%s  config_granularity=%s",
                 _local_rank, _ckpt_master_on, _ckpt_granularity,
             )
             print(
@@ -1115,41 +1115,41 @@ class DesLocEngine:
 
                 # ---- Per-tier policy decision --------------------------------
                 if not _ckpt_master_on:
-                    # Master switch OFF → no wrapping regardless of tier.
+                    # Master switch OFF -> no wrapping regardless of tier.
                     apply_ckpt = False
                     policy_label = "OFF (master disabled)"
                 elif tier == TierClass.A6000:
-                    # A6000: full checkpoint — wrap every layer.
+                    # A6000: full checkpoint , wrap every layer.
                     apply_ckpt = True
-                    policy_label = "FULL (A6000 — every layer)"
+                    policy_label = "FULL (A6000 , every layer)"
                 elif tier == TierClass.H100:
-                    # H100: selective checkpoint — wrap every other layer.
+                    # H100: selective checkpoint , wrap every other layer.
                     apply_ckpt = (layer_idx % 2 == 0)
                     policy_label = (
-                        "SELECTIVE (H100 — even layer)"
+                        "SELECTIVE (H100 , even layer)"
                         if apply_ckpt
-                        else "SELECTIVE (H100 — odd layer, skip)"
+                        else "SELECTIVE (H100 , odd layer, skip)"
                     )
                 elif tier == TierClass.RTX_PRO_6000_BW:
-                    # Blackwell 96 GB — treat same as H100 (selective).
+                    # Blackwell 96 GB , treat same as H100 (selective).
                     apply_ckpt = (layer_idx % 2 == 0)
                     policy_label = (
-                        "SELECTIVE (RTX_PRO_6000_BW — even layer)"
+                        "SELECTIVE (RTX_PRO_6000_BW , even layer)"
                         if apply_ckpt
-                        else "SELECTIVE (RTX_PRO_6000_BW — odd layer, skip)"
+                        else "SELECTIVE (RTX_PRO_6000_BW , odd layer, skip)"
                     )
                 else:
                     # UNKNOWN tier: fall back to config granularity.
                     if _ckpt_granularity == "selective":
                         apply_ckpt = (layer_idx % 2 == 0)
                         policy_label = (
-                            "SELECTIVE (UNKNOWN — even layer)"
+                            "SELECTIVE (UNKNOWN , even layer)"
                             if apply_ckpt
-                            else "SELECTIVE (UNKNOWN — odd layer, skip)"
+                            else "SELECTIVE (UNKNOWN , odd layer, skip)"
                         )
                     else:
                         apply_ckpt = True
-                        policy_label = "FULL (UNKNOWN — fallback to full)"
+                        policy_label = "FULL (UNKNOWN , fallback to full)"
                 # ---- End policy decision -------------------------------------
 
                 if apply_ckpt:
@@ -1265,7 +1265,7 @@ class DesLocEngine:
         if self._dist_optimizer is not None:
             self.fp32_grad_manager = None
             logger.info(
-                "HeteroFP32GradAccumManager SKIPPED — "
+                "HeteroFP32GradAccumManager SKIPPED , "
                 "core.optimizer.DistributedOptimizer owns FP32 shards (device=%s)",
                 _local_device,
             )
@@ -1305,7 +1305,7 @@ class DesLocEngine:
         if self._dist_optimizer is not None:
             # ZeRO-3 path: DistributedOptimizer handles reduce-scatter internally.
             # But finalize_model_grads still needs a valid DP group for the
-            # pg_collection threading (M4172) — otherwise it falls back to
+            # pg_collection threading (M4172) , otherwise it falls back to
             # parallel_state globals which may not be initialized (DES-LOC
             # skips Megatron parallel init).
             self._ddp_dp_group = (
@@ -1314,7 +1314,7 @@ class DesLocEngine:
                 else (dist.group.WORLD if dist.is_initialized() else None)
             )
             logger.info(
-                "[zero3] core.optimizer.DistributedOptimizer active — "
+                "[zero3] core.optimizer.DistributedOptimizer active , "
                 "reduce-scatter via prepare_grads() "
                 "(fp32_grad_manager=%s)",
                 self.fp32_grad_manager is not None,
@@ -1337,7 +1337,7 @@ class DesLocEngine:
                     from deepspeed.core.model_parallel_config import ModelParallelConfig  # noqa: PLC0415
                     _mp_cfg = ModelParallelConfig()
                     # M4041: when full-iteration CUDA graphs are active we must not
-                    # dereference param.grad in the backward hook — the graph was
+                    # dereference param.grad in the backward hook , the graph was
                     # recorded with live grad tensor addresses and zeroing the
                     # attribute on the first replay would corrupt subsequent iterations.
                     _cg_impl = getattr(self, 'config', None)
@@ -1463,7 +1463,7 @@ class DesLocEngine:
                     pipeline_model_parallel_size=config.pipeline_parallel_size,
                     tensor_model_parallel_size=getattr(config, "tensor_parallel_size", 1),
                     # variable_seq_lengths=True: activations may differ across NUMA stages
-                    # (different layer counts → different hidden shapes at stage boundary is
+                    # (different layer counts -> different hidden shapes at stage boundary is
                     # impossible by construction, but variable seq-len packing is safe here).
                     variable_seq_lengths=True,
                     # deallocate_pipeline_outputs: free output tensor after isend completes
@@ -1488,7 +1488,7 @@ class DesLocEngine:
                 self._pp_pg_collection.pos_embd = _ps_init.get_position_embedding_group(check_initialized=False)
 
                 # Register per-stage layer counts for heterogeneous topologies
-                # (e.g. NUMA0 [GPU0-2] → stages 0-2, NUMA1 [GPU3-4] → stages 3-4).
+                # (e.g. NUMA0 [GPU0-2] -> stages 0-2, NUMA1 [GPU3-4] -> stages 3-4).
                 _layer_split = getattr(config, "pipeline_layer_split", [])
                 if _layer_split:
                     set_pipeline_layer_split(_layer_split)
@@ -1603,7 +1603,7 @@ class DesLocEngine:
         computes the causal-LM cross-entropy loss.  The per-layer selective
         recompute (applied via ``torch.utils.checkpoint`` in ``__init__``) is
         transparently active for every block whose device class requires it
-        (A6000 → recompute norm_out; H100/Blackwell → no recompute).
+        (A6000 -> recompute norm_out; H100/Blackwell -> no recompute).
 
         Parameters
         ----------
@@ -1656,13 +1656,13 @@ class DesLocEngine:
                     _x = self.model.embedding(input_ids) + self.model.pos_embedding(_pos)
                     logger.info("[layer_log] rank=%d embedding done, shape=%s", _fw_rank, tuple(_x.shape))
                     for _li, _blk in enumerate(self.model.blocks):
-                        logger.info("[layer_log] rank=%d → layer %d START", _fw_rank, _li)
+                        logger.info("[layer_log] rank=%d -> layer %d START", _fw_rank, _li)
                         if dist.is_initialized():
                             dist.barrier()
                         _x = _blk(_x)
                         if dist.is_initialized():
                             dist.barrier()
-                        logger.info("[layer_log] rank=%d ← layer %d END", _fw_rank, _li)
+                        logger.info("[layer_log] rank=%d <-- layer %d END", _fw_rank, _li)
                     _x = self.model.norm(_x)
                     logits = self.model.lm_head(_x)
                     logger.info("[layer_log] rank=%d lm_head done, logits=%s", _fw_rank, tuple(logits.shape))
@@ -1686,7 +1686,7 @@ class DesLocEngine:
         return loss, scaled_loss
 
     def step(self) -> None:
-        """Optimizer step — used by hetero_grad_norm_skip monkey-patch.
+        """Optimizer step , used by hetero_grad_norm_skip monkey-patch.
 
         On CPU-offload ranks (A6000, VRAM<50GB), the param_shard lives
         on CPU during optimizer.step().  After the CPU Adam update, we
@@ -1790,7 +1790,7 @@ class DesLocEngine:
         # --- ZeRO-3 model GPU materialisation ---
         # DistributedOptimizer holds FP32 shards; the full BF16 model must
         # also live on GPU for forward/backward.  ZeRO3ForwardHook.register()
-        # moves it there once (no per-layer hooks — full BF16 fits on both tiers).
+        # moves it there once (no per-layer hooks , full BF16 fits on both tiers).
         self._zero3_forward_hook = None
         if self._dist_optimizer is not None:
             try:
@@ -1816,7 +1816,7 @@ class DesLocEngine:
                 if _is_main:
                     logger.info(
                         "[zero3-hook] full BF16 model loaded to GPU "
-                        "(rank=%d/%d) — DistributedOptimizer path",
+                        "(rank=%d/%d) , DistributedOptimizer path",
                         self._dist_optimizer.data_parallel_rank,
                         self._dist_optimizer.data_parallel_world_size,
                     )
@@ -1954,7 +1954,7 @@ class DesLocEngine:
                     out3 = _raw_a2a(out2, scatter_idx=1, gather_idx=2, group=group)
                     out3 = out3[:, :n_heads, :T, :]
 
-                    # Save A2A'd tensors for backward (not original q,k,v — saves memory)
+                    # Save A2A'd tensors for backward (not original q,k,v , saves memory)
                     ctx.save_for_backward(q2, k2, v2, out2)
                     ctx.group = group
                     ctx.n_heads = n_heads
@@ -1982,7 +1982,7 @@ class DesLocEngine:
                     T = ctx.T
                     full_shape = ctx.out3_shape_before_trim
 
-                    # 1. Un-trim grad_output → pad back to pre-trim shape
+                    # 1. Un-trim grad_output -> pad back to pre-trim shape
                     d_out3 = torch.zeros(full_shape, dtype=grad_output.dtype, device=grad_output.device)
                     d_out3[:, :n_heads, :T, :] = grad_output
 
@@ -2036,7 +2036,7 @@ class DesLocEngine:
             _sp_layers = self._get_model_layers()
             if _sp_layers is None:
                 logger.warning(
-                    "AutoSP: cannot find model layers — probed model.layers, "
+                    "AutoSP: cannot find model layers , probed model.layers, "
                     "model.blocks, model._gpt.decoder.layers, model.model.layers, "
                     "model.decoder.layers. SP injection skipped."
                 )
@@ -2056,7 +2056,7 @@ class DesLocEngine:
 
         # Wire HeteroGradNormSkipController into this engine via
         # integrate_with_deepspeed_engine(). That function monkey-patches
-        # engine.step(), but DesLocEngine has no .step() method — step logic
+        # engine.step(), but DesLocEngine has no .step() method , step logic
         # is inline in train(). We therefore call it for the standard
         # initialisation path (config wiring, logging, controller creation)
         # and retain the returned controller to drive should_skip() /
@@ -2067,7 +2067,7 @@ class DesLocEngine:
         # When _hetero_pg evaluates differently across ranks (some ranks
         # resolve a valid pg, others fall back to None), those 2 collectives
         # are only entered by a subset of ranks while the remainder skip
-        # straight to the _skip_tensor all_reduce below — permanent NCCL hang.
+        # straight to the _skip_tensor all_reduce below , permanent NCCL hang.
         #
         # All thresholds default to inf (feature disabled), so the partial-norm
         # all_reduces inside should_skip() carry no useful information.
@@ -2088,7 +2088,7 @@ class DesLocEngine:
 
         # --- Async ZeRO-3 shard-sync state ---
         # After optimizer.step() we launch sync_shard_to_model_async() on a
-        # dedicated CUDA stream so the FP32→BF16 PCIe copies overlap with the
+        # dedicated CUDA stream so the FP32->BF16 PCIe copies overlap with the
         # next step's data preprocessing on the CPU / default stream.
         # _shard_sync_stream  : persistent stream reused every step
         # _shard_sync_pending : True iff a sync was launched but not yet waited
@@ -2144,7 +2144,7 @@ class DesLocEngine:
         _trace_log = StepTraceLog(maxlen=_trace_maxlen)
         if _contract_enabled and _is_main:
             logger.info(
-                "[CollectiveContract] ENABLED — enforcing NCCL collective "
+                "[CollectiveContract] ENABLED , enforcing NCCL collective "
                 "symmetry across all ranks (set NEURON_SP_COLLECTIVE_CONTRACT=0 "
                 "to disable, NEURON_SP_CONTRACT_VERIFY=1 to enable preflight)."
             )
@@ -2190,7 +2190,7 @@ class DesLocEngine:
             step_loss = 0.0
 
             # Heterogeneous scheduling: each rank gets its own micro-batch count
-            # based on VRAM/compute tier. No FSDP collective constraints —
+            # based on VRAM/compute tier. No FSDP collective constraints ,
             # Neuron_SP ZeRO-3 uses per-layer gather_full_params which only
             # requires collectives at the granularity the hooks fire.
             allocation: MicrobatchAllocation = self.hetero_scheduler.schedule(
@@ -2203,8 +2203,37 @@ class DesLocEngine:
             # that require all ranks to call forward() the same number of times.
             # Heterogeneous throughput is achieved via per-rank micro_batch_size
             # differences (larger batches on faster GPUs), NOT via different
-            # iteration counts — which would cause NCCL collective mismatch.
-            num_microbatches = allocation.num_microbatches
+            # iteration counts , which would cause NCCL collective mismatch.
+            _local_num_microbatches = allocation.num_microbatches
+
+            # --- FIX #591 Blocker 2: enforce uniform num_microbatches ---
+            # Even though HeteroMicrobatchAllocator.allocate() is designed to
+            # return uniform counts, edge cases (scheduler bugs, checkpoint
+            # resume with different DP sizes, batch_schedule step boundaries)
+            # can cause per-rank divergence.  A single rank with fewer
+            # iterations means fewer all_gather_into_tensor calls in
+            # gather_full_params -> NCCL deadlock.
+            #
+            # Fix: all-reduce MAX across all ranks.  Ranks with fewer real
+            # microbatches run zero-loss dummy batches (forward+backward with
+            # loss *= 0) for the remaining iterations, keeping ZeRO-3
+            # all_gather participation symmetric.
+            from deepspeed.runtime.microbatch_guard import (
+                broadcast_uniform_microbatch_count,
+                log_microbatch_guard_stats,
+            )
+            _mb_guard_group = (
+                self._dist_optimizer.data_parallel_group
+                if self._dist_optimizer is not None
+                else None
+            )
+            num_microbatches = broadcast_uniform_microbatch_count(
+                _local_num_microbatches, group=_mb_guard_group,
+            )
+            if step < 5:
+                log_microbatch_guard_stats(
+                    step, _local_num_microbatches, num_microbatches, _my_rank,
+                )
 
             logger.warning("rank=%d: num_microbatches=%d, step=%d",
                           dist.get_rank() if dist.is_initialized() else 0,
@@ -2247,13 +2276,13 @@ class DesLocEngine:
             # replacing the serial `for micro` loop below.
             #
             # Correctness notes for our [4,8,8,4,8] NUMA topology:
-            #   • _shard_sync_stream wait is hoisted here (step-level) because
+            #   * _shard_sync_stream wait is hoisted here (step-level) because
             #     `micro == 0` no longer fires inside the schedule.
-            #   • forward_step_func drives self.data_iter directly; the `for micro`
+            #   * forward_step_func drives self.data_iter directly; the `for micro`
             #     loop's `next(self.data_iter)` calls are *not* executed on this path.
-            #   • fp32_grad_manager.accumulate() is called once after the schedule
+            #   * fp32_grad_manager.accumulate() is called once after the schedule
             #     returns (all micro-batch backwards are complete by then).
-            #   • num_microbatches must be identical across all PP ranks — enforced
+            #   * num_microbatches must be identical across all PP ranks , enforced
             #     by hetero_scheduler design (uniform count, per-rank batch size).
             # ---------------------------------------------------------------
             if _pipeline_fb_func is not None and self._pp_p2p_comm is not None:
@@ -2291,7 +2320,7 @@ class DesLocEngine:
                     _num_mb = _engine._cur_num_microbatches
                     loss, scaled_loss = _engine.forward(_ids, _lbl, num_microbatches=_num_mb)
 
-                    # MoE auxiliary loss — add before schedule drives backward so
+                    # MoE auxiliary loss , add before schedule drives backward so
                     # router gate gradients flow through the combined loss tensor.
                     if _engine.moe_adapter is not None:
                         _aux = _engine.moe_adapter.collect_aux_loss()
@@ -2316,7 +2345,7 @@ class DesLocEngine:
                     p2p_communicator=self._pp_p2p_comm,
                     pg_collection=self._pp_pg_collection,
                 )
-                # Promote BF16 grads → FP32 main_grad once, after all micro-batch
+                # Promote BF16 grads -> FP32 main_grad once, after all micro-batch
                 # backwards have completed inside the schedule.
                 if self.fp32_grad_manager is not None:
                     self.fp32_grad_manager.accumulate()
@@ -2350,7 +2379,7 @@ class DesLocEngine:
                     else:
                         input_ids, labels = raw
 
-                    # Apply capacity-weighted CP slice — ONLY if SP is not active.
+                    # Apply capacity-weighted CP slice , ONLY if SP is not active.
                     # When Ulysses SP is on, all ranks need the same seq_len for
                     # symmetric all-to-all. Load balancing is done via
                     # micro_batch_size_per_gpu instead (H100 gets more batches).
@@ -2376,7 +2405,7 @@ class DesLocEngine:
                             if parallel_state.is_initialized()
                             else (dist.get_rank() if dist.is_initialized() else 0)
                         )
-                        logger.info("[data] rank=%d seq=%d→%d sp=%s",
+                        logger.info("[data] rank=%d seq=%d->%d sp=%s",
                                     _log_rank,
                                     _orig_seq, input_ids.shape[-1],
                                     "ON" if self._sp_active else "OFF")
@@ -2413,8 +2442,8 @@ class DesLocEngine:
                     # Wait for async ZeRO-3 shard sync (launched after optimizer.step
                     # of the *previous* step).  Data loading above runs on the default
                     # stream / CPU, so it overlaps with the sync stream doing the
-                    # FP32→BF16 param copies.  We wait here — before the first forward
-                    # kernel — to guarantee model BF16 params are fully up-to-date.
+                    # FP32->BF16 param copies.  We wait here , before the first forward
+                    # kernel , to guarantee model BF16 params are fully up-to-date.
                     # On the very first step _shard_sync_pending is False, so this is
                     # a no-op.
                     # -----------------------------------------------------------------
@@ -2568,7 +2597,7 @@ class DesLocEngine:
             # _step_has_nan was rank-local; on a Kx step, if rank 0 saw NaN
             # and rank 1 did not, _fmg_skip_sync differed across ranks,
             # causing finalize_model_grads to issue an allreduce on some ranks
-            # but not others → NCCL ALLREDUCE hang at SeqNum=3 (NumelIn=1).
+            # but not others -> NCCL ALLREDUCE hang at SeqNum=3 (NumelIn=1).
             # Fix: allreduce the NaN flag here so every downstream conditional
             # that gates a collective uses an identical value on all ranks.
             if dist.is_initialized():
@@ -2625,7 +2654,7 @@ class DesLocEngine:
             # finalize_model_grads gets the same Kx decision that gated _skip_sync.
             #
             # FIX (NCCL hang): finalize_model_grads MUST be called on ALL ranks
-            # every step — even on NaN steps — because it contains NCCL collectives
+            # every step , even on NaN steps , because it contains NCCL collectives
             # (allreduce / bucket finish_grad_sync) that require symmetric
             # participation.  On NaN steps we pass skip_grad_sync=True so that no
             # gradient data is actually transferred; the call becomes a collective
@@ -2636,7 +2665,7 @@ class DesLocEngine:
             _is_Kx_sync = _is_Kx_sync_pre
             try:
                 import types as _types  # noqa: PLC0415
-                from deepspeed.core.model_parallel_config import ModelParallelConfig  # noqa: PLC0415
+                from deepspeed.core.distributed.embedding_guard import safe_model_parallel_config  # noqa: PLC0415
                 _dp_grp = getattr(self, '_ddp_dp_group', None)
                 _fmg_pg = _types.SimpleNamespace(
                     tp=None,
@@ -2649,15 +2678,22 @@ class DesLocEngine:
                 # On NaN steps force skip_grad_sync=True: avoids sending garbage
                 # gradients across ranks while still completing the collective.
                 # _step_has_nan is collective (fix #197) so _fmg_skip_sync is
-                # identical on all ranks — no more asymmetric collectives.
+                # identical on all ranks , no more asymmetric collectives.
                 _fmg_skip_sync = (not _is_Kx_sync) or _step_has_nan
                 logger.warning("rank=%d: ENTERING finalize_model_grads (Kx=%s, nan=%s, skip=%s, force_ar=%s)",
                     dist.get_rank() if dist.is_initialized() else 0,
                     _is_Kx_sync, _step_has_nan, _fmg_skip_sync,
                     self._dist_optimizer is not None and not _step_has_nan)
+                # FIX #591 Blocker 3: use safe_model_parallel_config() which
+                # explicitly disables share_embeddings_and_output_weights and
+                # other conditional-collective flags.  A bare ModelParallelConfig()
+                # left these at default (False) but did NOT set has_cond_embedder
+                # or sequence_parallel, which could be overridden by model
+                # inspection inside finalize_model_grads -> _allreduce_all_embedding_grads.
+                _fmg_config = safe_model_parallel_config()
                 finalize_model_grads(
                     model=_fmg_model,
-                    config=ModelParallelConfig(),
+                    config=_fmg_config,
                     num_tokens=None,
                     skip_grad_sync=_fmg_skip_sync,
                     force_all_reduce=False,  # dist_optimizer handles reduce_scatter internally
@@ -2676,10 +2712,10 @@ class DesLocEngine:
 
             _profiler.end("finalize_grads")
 
-            # Gradient clipping — unified via core clip_grad_norm on all paths.
+            # Gradient clipping , unified via core clip_grad_norm on all paths.
             # finalize_model_grads has already all-reduced grads; clip globally.
             # core clip_grad_norm avoids host/device sync and handles model-parallel
-            # norm reduction — replaces torch.nn.utils.clip_grad_norm_ (M2335).
+            # norm reduction , replaces torch.nn.utils.clip_grad_norm_ (M2335).
             _profiler.begin("clip_grad_norm")
             logger.warning("rank=%d: ENTERING clip_grad_norm", dist.get_rank() if dist.is_initialized() else 0)
             gnorm = clip_grad_norm(
@@ -2692,7 +2728,7 @@ class DesLocEngine:
             logger.warning("rank=%d: EXITED clip_grad_norm gnorm=%.6f", dist.get_rank() if dist.is_initialized() else 0, gnorm)
 
             # BYPASS: should_skip() / _skip_controller removed to unblock training.
-            # The should_skip() → _maybe_allreduce_partials() path issues asymmetric
+            # The should_skip() -> _maybe_allreduce_partials() path issues asymmetric
             # all_reduces that hang post-clip_grad_norm (issue #152).  Bypassed until
             # a hang-safe implementation is ready.  NaN guard is preserved below.
             _should_skip = False
@@ -2710,7 +2746,7 @@ class DesLocEngine:
             # reduce_scatter_tensor, a collective) but rank-1 skips, NCCL deadlocks.
             #
             # Fix: all-reduce the skip flag so ALL ranks agree.  If ANY rank wants
-            # to skip, every rank skips — but every rank still participates in the
+            # to skip, every rank skips , but every rank still participates in the
             # NCCL collectives (reduce_scatter + all-gather) with zero contribution
             # to avoid the collective mismatch that causes the hang.
             if dist.is_initialized():
@@ -2720,22 +2756,22 @@ class DesLocEngine:
                     device=torch.cuda.current_device(),
                 )
                 # FIX #155 (SP=3, DP=1 hang): use the same group as the optimizer
-                # collectives (prepare_grads → reduce_scatter_tensor and
-                # shard_to_model_broadcast → all_reduce).
+                # collectives (prepare_grads -> reduce_scatter_tensor and
+                # shard_to_model_broadcast -> all_reduce).
                 #
                 # Root cause: with SP=3, DP=1, parallel_state.get_data_parallel_group()
-                # returns a size-1 group per rank — a trivial NOOP.  The skip decision
+                # returns a size-1 group per rank , a trivial NOOP.  The skip decision
                 # is never propagated across SP ranks.  If rank-0 sees NaN loss and sets
                 # _should_skip=True, ranks 1 and 2 are unaware and enter
                 # prepare_grads() which calls reduce_scatter_tensor on the full optimizer
                 # group (size=3).  Rank-0 meanwhile skips to start_param_sync(), which
                 # calls all_reduce on the same group.  Different ops on the same NCCL
-                # communicator → collective mismatch → permanent deadlock.
+                # communicator -> collective mismatch -> permanent deadlock.
                 #
                 # Fix: all-reduce _skip_tensor over self._dist_optimizer.data_parallel_group
                 # (the exact group that the optimizer collectives use), so the skip
                 # decision is consistent across every rank that will enter those ops.
-                # Fall back to DP group (parallel_state) → WORLD for non-dist-optimizer paths.
+                # Fall back to DP group (parallel_state) -> WORLD for non-dist-optimizer paths.
                 if self._dist_optimizer is not None:
                     _skip_opt_group = self._dist_optimizer.data_parallel_group
                 elif parallel_state.is_initialized():
@@ -2768,12 +2804,12 @@ class DesLocEngine:
 
             # --- FIX #154 (cont.): collective-safe optimizer step ---
             # The distributed optimizer's step() calls two NCCL collectives:
-            #   1. prepare_grads() → _reduce_scatter_grads() — reduce_scatter_tensor
-            #   2. step_with_ready_grads() → start_param_sync() → shard_to_model_broadcast() — all_reduce
+            #   1. prepare_grads() -> _reduce_scatter_grads() , reduce_scatter_tensor
+            #   2. step_with_ready_grads() -> start_param_sync() -> shard_to_model_broadcast() , all_reduce
             # ALL ranks must enter both, even when skipping the Adam update.
             #
             # When skipping: call prepare_grads() (reduce_scatter with whatever
-            # grads are present — they'll be discarded) and start_param_sync()
+            # grads are present , they'll be discarded) and start_param_sync()
             # (all-gather with unchanged shard values), but skip Adam + scheduler.
             if self._dist_optimizer is not None:
                 # ZeRO-3 path: always enter reduce_scatter (collective #1)
@@ -2790,9 +2826,9 @@ class DesLocEngine:
                 # entry so the collective sequence is identical on all ranks.
                 with _contract.guard("param_sync"):
                     if not _should_skip:
-                        # ── DES-LOC async optimizer: non-Kx steps skip NCCL broadcast ──
+                        # -- DES-LOC async optimizer: non-Kx steps skip NCCL broadcast --
                         # On non-Kx steps, each rank does a LOCAL Adam update + local
-                        # FP32→BF16 write.  No cross-rank sync — this is the core of
+                        # FP32->BF16 write.  No cross-rank sync , this is the core of
                         # DES-LOC's decomposed synchronization.  H100 doesn't wait for
                         # A6000's slow CPUAdam to finish because there's no NCCL barrier.
                         # On Kx steps, the full shard_to_model_broadcast runs to reconcile
@@ -2839,7 +2875,7 @@ class DesLocEngine:
             _profiler.snap_memory("post_optim")
 
             if not _should_skip:
-                # --- DES-LOC: Algorithm 1 — Kx/Ku/Kv conditional sync ---
+                # --- DES-LOC: Algorithm 1 , Kx/Ku/Kv conditional sync ---
                 _profiler.begin("desloc_sync")
                 _is_Kx = (step + 1) % self.desloc_Kx == 0
                 _is_Ku = (step + 1) % self.desloc_Ku == 0
@@ -2847,14 +2883,14 @@ class DesLocEngine:
 
                 if self._dist_optimizer is not None:
                     # Ku/Kv: all-reduce first/second Adam moments across DP ranks.
-                    # This is the DES-LOC core innovation — decoupled moment sync
+                    # This is the DES-LOC core innovation , decoupled moment sync
                     # reduces communication by (1 − 1/Ku) + (1 − 1/Kv) vs DDP.
                     if _is_Ku or _is_Kv:
                         pass  # [DES-LOC HOTFIX] sync_moments disabled
 
-                    # Every step: broadcast updated FP32 shards → BF16 model on
+                    # Every step: broadcast updated FP32 shards -> BF16 model on
                     # all ranks.  Without this each rank's model contains only its
-                    # own 1/N shard updated — "Frankenstein model" divergence.
+                    # own 1/N shard updated , "Frankenstein model" divergence.
                     # DES-LOC communication savings come from skipping GRADIENT
                     # all-reduce on non-Kx steps, not from skipping this broadcast.
                     # (optimizer.step() already called shard_to_model_broadcast()
@@ -2862,8 +2898,8 @@ class DesLocEngine:
                     # the BF16 copies with the next step's data preprocessing.)
                     if _shard_sync_stream is not None:
                         # Fix from Megatron M3561: the secondary stream must wait
-                        # for the current (default) stream — where optimizer.step()
-                        # ran — before launching the BF16 broadcast.  Without this
+                        # for the current (default) stream , where optimizer.step()
+                        # ran , before launching the BF16 broadcast.  Without this
                         # fence the all-gather can start before Adam has written the
                         # updated FP32 values, causing stale-weight corruption.
                         _shard_sync_stream.wait_stream(torch.cuda.current_stream())
@@ -3056,7 +3092,7 @@ class DesLocEngine:
                 _eval_model_path = cfg.eval_model_path or ""
                 _eval_output_dir = cfg.eval_output_dir
                 logger.info(
-                    "[eval] step=%d — running periodic eval (model_path='%s', output='%s')",
+                    "[eval] step=%d , running periodic eval (model_path='%s', output='%s')",
                     self.global_step, _eval_model_path, _eval_output_dir,
                 )
                 try:
@@ -3106,7 +3142,7 @@ class DesLocEngine:
                             )
                             logger.info(
                                 "[eval] step=%d PipelineOffloadManager reset+reinit "
-                                "(M3490 parity — stale backward chunks cleared)",
+                                "(M3490 parity , stale backward chunks cleared)",
                                 self.global_step,
                             )
                         except Exception as _reset_exc:  # noqa: BLE001
@@ -3286,7 +3322,7 @@ class DesLocEngine:
                 if tensor.device.index == _cache_dev_id:
                     return _cache_dev
                 return _default_worker_dev
-            # Tensor is on CPU (map_location="cpu" path): heuristic — use the
+            # Tensor is on CPU (map_location="cpu" path): heuristic , use the
             # current primary device (training loop will re-shard as needed).
             return _primary_dev
 
@@ -3334,12 +3370,12 @@ class DesLocEngine:
 
         Waits for two async subsystems:
 
-        1. **CPU-staging futures** — background threads copying GPU tensors to
+        1. **CPU-staging futures** , background threads copying GPU tensors to
            the locality-cache ramdisk (``/dev/shm``).  These are submitted
            by :meth:`save_checkpoint` when the CACHE or WORKER tier staging
            path is active.
 
-        2. **HeteroAsyncCheckpointScheduler** — the async disk-IO pipeline
+        2. **HeteroAsyncCheckpointScheduler** , the async disk-IO pipeline
            that persists staged tensors from CPU DRAM to the checkpoint
            directory.
 
@@ -3448,7 +3484,7 @@ def _smoke_test() -> None:
     )
 
     logger.info("=" * 60)
-    logger.info("DES-LOC Engine — smoke test")
+    logger.info("DES-LOC Engine , smoke test")
     logger.info("PyTorch: %s  |  CUDA: %s  |  Devices: %d",
                 torch.__version__,
                 torch.version.cuda or "N/A",
@@ -3496,7 +3532,7 @@ def _smoke_test() -> None:
         dummy = torch.randint(0, cfg.vocab_size, (1, 16), device=engine.primary_device)
         out = engine.model(dummy)
         assert out.shape == (1, 16, cfg.vocab_size), f"Unexpected output shape: {out.shape}"
-    logger.info("Inference check: OK — output shape %s", tuple(out.shape))
+    logger.info("Inference check: OK , output shape %s", tuple(out.shape))
 
     logger.info("Smoke test PASSED.")
 
