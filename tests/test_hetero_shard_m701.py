@@ -158,9 +158,77 @@ def test_remainder_distribution():
     print("  PASS: all totals accounted for")
 
 
+# ── Issue #590 — free VRAM and resolve tests ──────────────────────────────
+
+def test_free_vram_weights():
+    """Verify free_vram_weights_from_tiers uses free_mem_gb not total."""
+    from dataclasses import dataclass
+
+    @dataclass
+    class FTier:
+        device_index: int
+        total_mem_gb: float
+        free_mem_gb: float = 0.0
+
+    from deepspeed.runtime.zero3_hetero_shard import free_vram_weights_from_tiers
+
+    tiers = [FTier(0, 48, 45), FTier(1, 48, 44.5), FTier(2, 96, 91)]
+    w = free_vram_weights_from_tiers(tiers)
+    assert w == [45.0, 44.5, 91.0], f"Expected [45, 44.5, 91], got {w}"
+    print("  PASS: free_vram_weights returns free_mem_gb values")
+
+    # Fallback when free=0
+    tiers_no_free = [FTier(0, 48, 0), FTier(1, 48, 0), FTier(2, 96, 0)]
+    w2 = free_vram_weights_from_tiers(tiers_no_free)
+    assert w2 == [46.0, 46.0, 94.0], f"Expected fallback, got {w2}"
+    print("  PASS: free_vram_weights falls back to total-2.0 when free=0")
+
+
+def test_resolve_priority_chain():
+    """Verify resolve_shard_weights priority: runtime_query > discovery > even."""
+    from dataclasses import dataclass
+
+    @dataclass
+    class FTier:
+        device_index: int
+        total_mem_gb: float
+        free_mem_gb: float = 0.0
+
+    from deepspeed.runtime.zero3_hetero_shard import resolve_shard_weights
+    from deepspeed.runtime.desloc_config import TrainingConfig
+
+    tiers = [FTier(0, 48, 45), FTier(1, 48, 44), FTier(2, 96, 91)]
+
+    # Priority 1: config.shard_weights takes precedence
+    cfg = TrainingConfig()
+    cfg.shard_weights = [40.0, 40.0, 80.0]
+    w, src = resolve_shard_weights(cfg, tiers, 3)
+    assert src == "runtime_query", f"Expected runtime_query, got {src}"
+    assert w == [40.0, 40.0, 80.0]
+    print("  PASS: priority 1 (runtime_query) wins over discovery")
+
+    # Priority 2: falls back to free VRAM discovery
+    cfg2 = TrainingConfig()
+    w2, src2 = resolve_shard_weights(cfg2, tiers, 3)
+    assert src2 == "vram_discovery", f"Expected vram_discovery, got {src2}"
+    assert w2 == [45.0, 44.0, 91.0]
+    print("  PASS: priority 2 (vram_discovery) used when no config.shard_weights")
+
+    # Priority 4: even split when no tiers
+    cfg3 = TrainingConfig()
+    w3, src3 = resolve_shard_weights(cfg3, None, 3)
+    assert src3 == "even_split", f"Expected even_split, got {src3}"
+    assert w3 is None
+    print("  PASS: priority 4 (even_split) used when no tiers")
+
+
 if __name__ == "__main__":
     test_hetero_partitioning()
     test_uniform_fallback()
     test_gradient_consistency()
     test_remainder_distribution()
+    print()
+    print("=== Issue #590 — free VRAM and resolve tests ===")
+    test_free_vram_weights()
+    test_resolve_priority_chain()
     print("\n✅ All M701 hetero_shard_ratio tests passed.")
