@@ -666,17 +666,67 @@ class TestSnapshotVerification:
 # ---------------------------------------------------------------------------
 
 class TestVerifyTruncationGuard:
-    """Ensure verify() raises when the planned sequence exceeds buffer size."""
+    """Ensure verify() raises when the planned sequence exceeds buffer size.
 
-    def test_huge_sequence_raises_on_verify(self):
-        """If someone plans 200+ long-named collectives, verify() must not silently truncate."""
+    After BUG 1 review feedback: verify() short-circuits in non-distributed
+    mode, so we test _encode_planned_sequence() directly which is the
+    extracted, independently testable encoding+validation path.
+    """
+
+    def test_encode_raises_on_oversized_sequence(self):
+        """_encode_planned_sequence() must raise when encoding >= 4096 bytes."""
         c = CollectiveContract(step=0, rank=0)
-        # Plan enough ops to exceed 4096 bytes when encoded
         for i in range(250):
             c.plan(f"very_long_collective_name_number_{i:05d}", CollectiveOp.ALL_REDUCE)
 
-        # verify() should raise RuntimeError about sequence being too long
-        # (in non-distributed mode it short-circuits, so test the encoding path directly)
-        local_seq_str = "|".join(c.planned_sequence)
-        encoded = local_seq_str.encode("utf-8")
-        assert len(encoded) >= 4096, f"Test setup: expected >= 4096 bytes, got {len(encoded)}"
+        with pytest.raises(RuntimeError, match="too long"):
+            c._encode_planned_sequence()
+
+    def test_encode_succeeds_for_normal_sequence(self):
+        """Normal 6-op sequence should encode fine."""
+        c = CollectiveContract(step=0, rank=0)
+        for name in ["nan_flag_allreduce", "finalize_model_grads",
+                      "clip_grad_norm_allreduce", "skip_flag_allreduce",
+                      "prepare_grads_rs", "param_sync"]:
+            c.plan(name, CollectiveOp.ALL_REDUCE)
+
+        encoded, max_len = c._encode_planned_sequence()
+        assert len(encoded) < max_len
+        assert b"nan_flag_allreduce" in encoded
+
+
+# ---------------------------------------------------------------------------
+# Test: reset() with clear_plan
+# ---------------------------------------------------------------------------
+
+class TestResetClearPlan:
+    """Ensure reset(clear_plan=True) allows a fresh plan() cycle."""
+
+    def test_clear_plan_resets_everything(self):
+        c = CollectiveContract(step=0, rank=0)
+        c.plan("op_a", CollectiveOp.ALL_REDUCE)
+        c.plan("op_b", CollectiveOp.ALL_REDUCE)
+        with c.guard("op_a"): pass
+        with c.guard("op_b"): pass
+
+        c.reset(clear_plan=True)
+        assert c.planned_count == 0
+        assert c._seq_counter == 0
+
+        # Now plan fresh ops
+        c.plan("op_new", CollectiveOp.ALL_REDUCE)
+        assert c.planned_count == 1
+        assert c.planned_sequence == ["op_new"]
+        with c.guard("op_new"): pass
+        c.assert_complete()
+
+    def test_default_reset_preserves_plan_for_replay(self):
+        c = CollectiveContract(step=0, rank=0)
+        c.plan("op_a", CollectiveOp.ALL_REDUCE)
+        with c.guard("op_a"): pass
+
+        c.reset()  # default: clear_plan=False
+        assert c.planned_count == 1  # plan preserved
+        assert c.planned_sequence == ["op_a"]
+        with c.guard("op_a"): pass
+        c.assert_complete()

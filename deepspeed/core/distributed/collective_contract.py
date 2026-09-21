@@ -224,16 +224,25 @@ class CollectiveContract:
             f"enabled={self.enabled})"
         )
 
-    def reset(self) -> None:
+    def reset(self, *, clear_plan: bool = False) -> None:
         """Reset execution state so the contract can be re-verified and re-run.
 
-        Keeps the planned sequence intact; clears only the execution log,
-        verified flag, and active guard.  Useful for test harnesses that
-        replay the same contract multiple times.
+        By default keeps the planned sequence intact and clears only the
+        execution log, verified flag, active guard, and sequence counter.
+        Pass ``clear_plan=True`` to also discard the planned sequence,
+        allowing a fresh ``plan()`` cycle.
+
+        Args:
+            clear_plan: If True, also clear the planned sequence and
+                        reset the sequence counter.  Default False
+                        (replay mode: plan stays, execution resets).
         """
         self._executed.clear()
         self._active_guard = None
         self._verified = False
+        if clear_plan:
+            self._planned.clear()
+            self._seq_counter = 0
 
     # ------------------------------------------------------------------
     # Planning API
@@ -312,6 +321,37 @@ class CollectiveContract:
     # Verification API
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    _VERIFY_MAX_LEN: int = 4096
+
+    def _encode_planned_sequence(self) -> Tuple[bytes, int]:
+        """Encode planned sequence for allgather and validate length.
+
+        Returns:
+            (encoded_bytes, max_len) tuple.
+
+        Raises:
+            RuntimeError: If the encoded sequence exceeds the buffer size.
+                This prevents silent truncation in verify().
+        """
+        local_seq_str = "|".join(self.planned_sequence)
+        max_len = self._VERIFY_MAX_LEN
+        encoded = local_seq_str.encode("utf-8")
+        if len(encoded) >= max_len:
+            raise RuntimeError(
+                f"CollectiveContract: planned sequence too long for verify() "
+                f"({len(encoded)} >= {max_len} bytes, {self.planned_count} ops). "
+                f"Increase _VERIFY_MAX_LEN or reduce collective name lengths."
+            )
+        return encoded, max_len
+
+    # ------------------------------------------------------------------
+    # Verification API
+    # ------------------------------------------------------------------
+
     def verify(
         self,
         process_group: Optional[dist.ProcessGroup] = None,
@@ -347,17 +387,8 @@ class CollectiveContract:
             self._verified = True
             return True
 
-        # Encode planned sequence as a single string
-        local_seq_str = "|".join(self.planned_sequence)
-        # Pad to fixed length for allgather
-        max_len = 4096  # generous upper bound
-        encoded = local_seq_str.encode("utf-8")
-        if len(encoded) >= max_len:
-            raise RuntimeError(
-                f"CollectiveContract: planned sequence too long for verify() "
-                f"({len(encoded)} >= {max_len} bytes, {self.planned_count} ops). "
-                f"Increase max_len or reduce collective name lengths."
-            )
+        # Encode planned sequence and validate length
+        encoded, max_len = self._encode_planned_sequence()
         padded = encoded + b"\x00" * (max_len - len(encoded))
 
         local_tensor = torch.frombuffer(bytearray(padded), dtype=torch.uint8).cuda()
