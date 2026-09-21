@@ -433,8 +433,12 @@ class DesLocEngine:
         else:
             self.model = model
 
-        _local_device = torch.device(f"cuda:{torch.cuda.current_device()}")
-        _local_mem_gb = torch.cuda.get_device_properties(_local_device).total_memory / (1 << 30)
+        if torch.cuda.is_available():
+            _local_device = torch.device(f"cuda:{torch.cuda.current_device()}")
+            _local_mem_gb = torch.cuda.get_device_properties(_local_device).total_memory / (1 << 30)
+        else:
+            _local_device = torch.device("cpu")
+            _local_mem_gb = 0.0
         self._use_fsdp = False  # Neuron_SP native ZeRO-3, no FSDP
 
         # Model stays in BF16 on CPU , ZeRO-3 ShardState holds FP32 master

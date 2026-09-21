@@ -854,9 +854,12 @@ def run_standalone(args: argparse.Namespace) -> None:
     # For single-GPU: model IS the raw module.
     raw_model = model.module if (is_dist and not use_fsdp) else model
 
-    # VRAM-adaptive optimizer: CPUAdam for A6000 (≤47GB), GPU AdamW for H100.
+    # VRAM-adaptive optimizer: CPUAdam for A6000 (<=47GB), GPU AdamW for H100.
     # Ref: DeepSpeed #4527, Megatron PR #2811, Issue #3.
-    _local_vram_gb = torch.cuda.get_device_properties(device).total_memory / (1 << 30)
+    if torch.cuda.is_available():
+        _local_vram_gb = torch.cuda.get_device_properties(device).total_memory / (1 << 30)
+    else:
+        _local_vram_gb = 0.0
     _optim_params = model.parameters() if use_fsdp else raw_model.parameters()
 
     if _local_vram_gb < 50.0 and not use_fsdp:
