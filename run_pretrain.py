@@ -862,8 +862,8 @@ def run_standalone(args: argparse.Namespace) -> None:
         _local_vram_gb = 0.0
     _optim_params = model.parameters() if use_fsdp else raw_model.parameters()
 
-    if _local_vram_gb < 50.0 and not use_fsdp:
-        # A6000 path: move params to CPU, use DeepSpeedCPUAdam
+    if _local_vram_gb < 50.0 and not use_fsdp and torch.cuda.is_available():
+        # A6000 path: GPU present but small VRAM, offload optimizer to CPU
         try:
             from deepspeed.ops.adam import DeepSpeedCPUAdam
             _cpu_params = []
@@ -876,8 +876,8 @@ def run_standalone(args: argparse.Namespace) -> None:
                 eps=1e-8, weight_decay=0.1, adamw_mode=True,
             )
             logger.info("Standalone optimizer: DeepSpeedCPUAdam (VRAM=%.1fGB < 50GB)", _local_vram_gb)
-        except ImportError:
-            # Fallback: gradient checkpointing should have freed enough memory
+        except (ImportError, RuntimeError):
+            # Fallback: CPUAdam unavailable or JIT compile failed
             optimizer = AdamW(
                 model.parameters() if use_fsdp else raw_model.parameters(),
                 lr=3e-4, betas=(0.9, 0.95), eps=1e-8, weight_decay=0.1,
