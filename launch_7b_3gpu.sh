@@ -105,6 +105,16 @@ if [[ " ${EXTRA_ARGS[*]:-} " == *" --dry-run "* ]]; then
     EXTRA_ARGS=("${EXTRA_ARGS[@]/--dry-run/}" --steps 3 --log-every 1 --save-every 0)
 fi
 
+# --- FIX #591: --gate mode ─────────────────────────────────────────────────
+# Shorthand for the gate criteria run: 100 steps, log every step, no save,
+# validate output with scripts/validate_gate.py afterwards.
+_GATE_MODE=0
+if [[ " ${EXTRA_ARGS[*]:-} " == *" --gate "* ]]; then
+    _GATE_MODE=1
+    EXTRA_ARGS=("${EXTRA_ARGS[@]/--gate/}" --steps 100 --log-every 1 --save-every 0)
+    echo "=== GATE MODE (issue #591): 100 steps, log-every 1, no save ==="
+fi
+
 echo "=== Neuron_SP 7B DES-LOC (3-GPU: H100+2×A6000) ==="
 echo "Log: $LOG"
 echo "GPUs: $CUDA_VISIBLE_DEVICES"
@@ -140,3 +150,18 @@ torchrun --nproc_per_node=3 --master_port=29500 \
     "${DATA_ARGS[@]}" \
     "${EXTRA_ARGS[@]}" \
     2>&1 | tee "$LOG"
+
+# --- FIX #591: post-run gate validation ────────────────────────────────────
+if [ "$_GATE_MODE" -eq 1 ]; then
+    echo ""
+    echo "=== Running gate validation (issue #591) ==="
+    python scripts/validate_gate.py --steps 100 "$LOG"
+    _GATE_EXIT=$?
+    if [ $_GATE_EXIT -eq 0 ]; then
+        echo "✅ Gate PASSED — all 5 criteria met."
+        echo "Log evidence: $LOG"
+    else
+        echo "❌ Gate FAILED — see report above."
+        exit 1
+    fi
+fi

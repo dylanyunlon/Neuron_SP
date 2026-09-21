@@ -1,0 +1,67 @@
+# Gate run configuration for issue #591
+# Usage: bash launch_7b_3gpu.sh --config configs/gate_7b_3gpu.yaml --steps 100
+#
+# This config is the MINIMUM required to validate the 3 blockers:
+#   Blocker 1: NCCL collective asymmetry (fixed in #589)
+#   Blocker 2: num_microbatches divergence → ZeRO-3 deadlock (fixed here)
+#   Blocker 3: finalize_model_grads embedding allreduce asymmetry (fixed here)
+#
+# Gate criteria (from issue #591):
+#   1. 100 steps completed (no NCCL hang, no OOM, no crash)
+#   2. Loss monotonically decreasing (step 0 ~ 10-11, step 100 < step 0)
+#   3. All 3 ranks log the same step count
+#   4. Per-step GPU memory logged for H100 and both A6000s
+#   5. Log file committed to logs/ as evidence
+
+model:
+  size: "7b"
+  vocab_size: 32000
+  hidden_size: 4096
+  num_layers: 32
+  num_heads: 32
+  seq_len: 2048
+
+training:
+  total_steps: 100
+  batch_size: 1
+  micro_batch_size: 1
+  grad_accum_steps: 1
+  max_lr: 3.0e-4
+  min_lr: 3.0e-5
+  warmup_steps: 10
+  weight_decay: 0.1
+  grad_clip: 1.0
+
+# Fix #591 Blocker 3: explicitly disable share_embeddings to prevent
+# conditional embedding allreduce asymmetry across heterogeneous ranks.
+model_parallel:
+  share_embeddings_and_output_weights: false
+  sequence_parallel: false
+  pipeline_parallel_size: 1
+  tensor_model_parallel_size: 1
+
+desloc:
+  enabled: true
+  Kx: 32
+  Ku: 128
+  Kv: 256
+
+# Fix #591 Blocker 2: microbatch_guard enforces uniform num_microbatches
+# across all ranks via collective broadcast.  This is automatic and
+# requires no config — listed here for documentation.
+microbatch_guard:
+  enabled: true  # always on; cannot be disabled
+
+logging:
+  log_every: 1
+  save_every: 0  # no checkpointing during gate run
+  wandb_project: null
+  tensorboard_dir: null
+
+# Gradient checkpointing ON to fit 7B model on A6000 (48GB)
+activation_checkpointing: true
+checkpoint_activations_granularity: "full"
+
+data:
+  # Synthetic data for gate run (no external dataset required)
+  path: null

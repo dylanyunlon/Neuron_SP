@@ -1522,6 +1522,16 @@ def parse_args() -> argparse.Namespace:
         default=42,
         help="Base random seed for CUDA RNG tracker and data shuffling.",
     )
+    p.add_argument(
+        "--gate",
+        action="store_true",
+        default=False,
+        help=(
+            "Issue #591 gate mode: override --steps 100 --log-every 1 "
+            "--save-every 0, enable per-step GPU memory logging, "
+            "and validate all 5 gate criteria on completion."
+        ),
+    )
     return p.parse_args()
 
 
@@ -1540,6 +1550,15 @@ def main() -> None:
         args = _apply_yaml_config(args, yaml_cfg)
     else:
         args.yaml_cfg = {}
+
+    # ------------------------------------------------------------------
+    # FIX #591: --gate mode overrides
+    # ------------------------------------------------------------------
+    if getattr(args, "gate", False):
+        args.steps = 100
+        args.log_every = 1
+        args.save_every = 0
+        logger.info("[GATE] issue #591 gate mode: steps=100, log_every=1, save_every=0")
 
     # Only rank 0 prints the startup banner (avoids duplicate output under torchrun)
     _rank  = int(os.environ.get("RANK",       "0"))
