@@ -250,17 +250,17 @@ class TestDesLocEngineImports:
         assert cfg.grad_clip == 1.0
         assert cfg.activation_checkpointing is False
 
-    def test_training_config_shard_weights_defaults(self, desloc_module):
+    def test_training_config_shard_weights_defaults(self):
         """Issue #590: new shard_weights fields must default to None."""
-        TrainingConfig = desloc_module.TrainingConfig
+        from deepspeed.runtime.desloc_config import TrainingConfig
         cfg = TrainingConfig()
         assert cfg.shard_weights is None
         assert cfg.cpu_offload_optimizer is None
         assert cfg.shard_weights_source is None
 
-    def test_training_config_shard_weights_settable(self, desloc_module):
+    def test_training_config_shard_weights_settable(self):
         """Issue #590: shard_weights must be settable."""
-        TrainingConfig = desloc_module.TrainingConfig
+        from deepspeed.runtime.desloc_config import TrainingConfig
         cfg = TrainingConfig()
         cfg.shard_weights = [45.0, 45.0, 91.0]
         cfg.cpu_offload_optimizer = [True, True, False]
