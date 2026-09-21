@@ -160,6 +160,27 @@ def test_remainder_distribution():
 
 # ── Issue #590 ,  free VRAM and resolve tests ──────────────────────────────
 
+import sys as _sys
+import types as _types
+from pathlib import Path as _Path
+
+def _stub_deepspeed_if_needed():
+    """Stub deepspeed top-level so __init__.py dependency chain is skipped."""
+    if "deepspeed" in _sys.modules and hasattr(_sys.modules["deepspeed"], "__path__"):
+        return
+    _repo = _Path(__file__).parent.parent
+    ds = _types.ModuleType("deepspeed")
+    ds.__path__ = [str(_repo / "deepspeed")]
+    ds.__package__ = "deepspeed"
+    _sys.modules["deepspeed"] = ds
+    ds_rt = _types.ModuleType("deepspeed.runtime")
+    ds_rt.__path__ = [str(_repo / "deepspeed" / "runtime")]
+    ds_rt.__package__ = "deepspeed.runtime"
+    _sys.modules["deepspeed.runtime"] = ds_rt
+    ds.runtime = ds_rt
+
+_stub_deepspeed_if_needed()
+
 def test_free_vram_weights():
     """Verify free_vram_weights_from_tiers uses free_mem_gb not total."""
     from dataclasses import dataclass

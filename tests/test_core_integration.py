@@ -446,14 +446,18 @@ def test_shard_weights_wiring_integration():
     assert "resolve_shard_weights" in engine_src, (
         "desloc_engine must import resolve_shard_weights (issue #590)"
     )
-    # Must NOT use the old vram_weights_from_tiers path inline
+    # Must NOT use the old vram_weights_from_tiers path inline.
+    # desloc_engine.py has multiple ImportFrom nodes referencing
+    # zero3_hetero_shard (ShardState+resolve in one, ZeRO3ForwardHook
+    # in another), so collect all names first and assert once.
     tree = ast.parse(engine_src)
+    all_hetero_names = []
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom) and node.module and "zero3_hetero_shard" in node.module:
-            names = [a.name for a in node.names]
-            assert "resolve_shard_weights" in names, (
-                "Engine must import resolve_shard_weights from zero3_hetero_shard"
-            )
+            all_hetero_names.extend(a.name for a in node.names)
+    assert "resolve_shard_weights" in all_hetero_names, (
+        "Engine must import resolve_shard_weights from zero3_hetero_shard"
+    )
 
     # 4. Engine logs the acceptance criteria line
     assert "[zero3] shard_weights source:" in engine_src, (

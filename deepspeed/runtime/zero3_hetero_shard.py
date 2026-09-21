@@ -971,13 +971,15 @@ def resolve_shard_weights(
         )
 
     # -- Priority 2 & 3: tier discovery --------------------------------------
-    if tiers is not None and len(list(tiers)) > 0:
-        free_w = free_vram_weights_from_tiers(tiers)
-        if free_w and len(free_w) == world_size:
-            return free_w, "vram_discovery"
-        total_w = vram_weights_from_tiers(tiers)
-        if total_w and len(total_w) == world_size:
-            return total_w, "vram_discovery"
+    if tiers is not None:
+        tiers_list = list(tiers)  # materialize once (safe for generators)
+        if tiers_list:
+            free_w = free_vram_weights_from_tiers(tiers_list)
+            if free_w and len(free_w) == world_size:
+                return free_w, "vram_discovery"
+            total_w = vram_weights_from_tiers(tiers_list)
+            if total_w and len(total_w) == world_size:
+                return total_w, "vram_discovery"
 
     # -- Priority 4: even split ----------------------------------------------
     return None, "even_split"
