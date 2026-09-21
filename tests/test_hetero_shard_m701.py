@@ -252,4 +252,4 @@ if __name__ == "__main__":
     print("=== Issue #590 ,  free VRAM and resolve tests ===")
     test_free_vram_weights()
     test_resolve_priority_chain()
-    print("\n✅ All M701 hetero_shard_ratio tests passed.")
+    print("\nAll M701 hetero_shard_ratio tests passed.")

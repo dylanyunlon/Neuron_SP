@@ -1128,7 +1128,7 @@ def run_standalone(args: argparse.Namespace) -> None:
             assert final_loss < initial_10 + 0.5, (
                 f"Loss did not decrease: initial={initial_10:.4f}, final={final_loss:.4f}"
             )
-            logger.info("[PASS]  Loss decreased , training loop verified.")
+            logger.info("Loss decreased, training loop verified.")
 
     # ------------------------------------------- cleanup loggers (rank 0 only)
     if is_main:
