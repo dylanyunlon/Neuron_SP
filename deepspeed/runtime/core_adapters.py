@@ -1008,3 +1008,46 @@ def build_mla_adapter(
             "build_mla_adapter: failed (%s); MLA disabled for this run.", exc
         )
         return None
+
+
+# ---------------------------------------------------------------------------
+# 8. Configuration diagnostics (issue #590)
+# ---------------------------------------------------------------------------
+
+def log_config_diagnostics(config: object) -> None:
+    """Emit a one-line summary of shard_weights wiring state.
+
+    Called from DesLocEngine.__init__ after all adapters are wired up,
+    so the operator can verify at a glance:
+      - Whether runtime_config_query populated shard_weights
+      - The chosen source (runtime_query / vram_discovery / even_split)
+      - Whether CPU offload flags were set
+
+    This is a diagnostic aid, not a functional requirement. It reads
+    but never mutates config.
+    """
+    sw = getattr(config, "shard_weights", None)
+    src = getattr(config, "shard_weights_source", None) or "not_set"
+    offload = getattr(config, "cpu_offload_optimizer", None)
+
+    if sw is not None:
+        logger.info(
+            "[diagnostics] shard_weights=%s (source=%s, %d GPUs)",
+            sw, src, len(sw),
+        )
+    else:
+        logger.info(
+            "[diagnostics] shard_weights=None (source=%s) — will use "
+            "even split or tier discovery at engine init", src,
+        )
+
+    if offload is not None:
+        n_offload = sum(1 for v in offload if v)
+        logger.info(
+            "[diagnostics] cpu_offload_optimizer: %d/%d GPUs offloading",
+            n_offload, len(offload),
+        )
+    else:
+        logger.info(
+            "[diagnostics] cpu_offload_optimizer=None — using defaults"
+        )
