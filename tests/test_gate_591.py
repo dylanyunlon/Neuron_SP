@@ -23,7 +23,7 @@ from pathlib import Path
 
 import pytest
 
-# Import from scripts/ — add to path
+# Import from scripts/ , add to path
 import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
 from validate_gate import (

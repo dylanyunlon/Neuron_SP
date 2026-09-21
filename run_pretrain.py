@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # DeepSpeed Team
 """
-run_pretrain.py — Neuron_SP pretraining entry point
+run_pretrain.py , Neuron_SP pretraining entry point
 
 Direct entry point for ags1: python run_pretrain.py
 
@@ -120,15 +120,15 @@ def _apply_yaml_config(args: argparse.Namespace, cfg: Dict[str, Any]) -> argpars
     but remain accessible via the returned ``args.yaml_cfg`` attribute for
     downstream consumers such as DesLocEngine.
 
-    Mapping (YAML path → argparse attribute):
-        model.size           → model_size
-        model.vocab_size     → (stored in yaml_cfg only; overrides _MODEL_CONFIGS at runtime)
-        training.steps       → steps
-        training.micro_batch_size → batch_size
-        training.seq_len     / model.seq_len → seq_len
-        logging.log_every    → log_every
-        data.path            → data_path   (CLI --data-path takes priority)
-        desloc.enabled       → use_desloc
+    Mapping (YAML path -> argparse attribute):
+        model.size           -> model_size
+        model.vocab_size     -> (stored in yaml_cfg only; overrides _MODEL_CONFIGS at runtime)
+        training.steps       -> steps
+        training.micro_batch_size -> batch_size
+        training.seq_len     / model.seq_len -> seq_len
+        logging.log_every    -> log_every
+        data.path            -> data_path   (CLI --data-path takes priority)
+        desloc.enabled       -> use_desloc
     """
     # Attach the raw cfg for optional downstream inspection
     args.yaml_cfg = cfg
@@ -177,7 +177,7 @@ def _apply_yaml_config(args: argparse.Namespace, cfg: Dict[str, Any]) -> argpars
 
 
 # ---------------------------------------------------------------------------
-# Targeted import — bypass deepspeed.__init__ entirely
+# Targeted import , bypass deepspeed.__init__ entirely
 # ---------------------------------------------------------------------------
 # We stub the deepspeed package so Python never executes
 # deepspeed/__init__.py (which pulls in apex, op_builder, triton, etc.).
@@ -212,13 +212,13 @@ except Exception as _desloc_import_err:
     import traceback as _tb
     _desloc_import_err_saved = _desloc_import_err
     logger.error(
-        "DesLocEngine import FAILED — will fall back to standalone (DDP). Fix this!\n%s",
+        "DesLocEngine import FAILED , will fall back to standalone (DDP). Fix this!\n%s",
         _tb.format_exc(),
     )
     _HAS_DESLOC = False
 
 # ---------------------------------------------------------------------------
-# core.models.GPTModel — replaces hand-written LlamaModel
+# core.models.GPTModel , replaces hand-written LlamaModel
 # ---------------------------------------------------------------------------
 try:
     from deepspeed.core.models import GPTModel
@@ -228,7 +228,7 @@ try:
 except Exception as _core_err:
     import traceback as _core_tb
     # NO SILENT FALLBACK. The fallback LlamaModel uses absolute position
-    # embeddings + hand-written blocks — a DIFFERENT architecture than the real
+    # embeddings + hand-written blocks , a DIFFERENT architecture than the real
     # GPTModel (RoPE, RMSNorm, TP components). Training on it silently produces
     # a model that does not match the intended design. Fail loudly so the real
     # import bug gets fixed. Set NEURON_SP_ALLOW_FALLBACK_MODEL=1 only for an
@@ -245,7 +245,7 @@ except Exception as _core_err:
         _HAS_CORE_MODELS = False
     else:
         logger.error(
-            "deepspeed.core.models import FAILED — refusing to fall back to the "
+            "deepspeed.core.models import FAILED , refusing to fall back to the "
             "hand-written LlamaModel (different architecture). Fix the import "
             "below. To force the fallback for a debug run only, set "
             "NEURON_SP_ALLOW_FALLBACK_MODEL=1.\n%s",
@@ -298,7 +298,7 @@ class _SwiGLUMLP(nn.Module):
         return self.down(F.silu(self.gate(x)) * self.up(x))
 
 
-# ── SDPA as custom op: dynamo NEVER decomposes custom ops ────────────
+# -- SDPA as custom op: dynamo NEVER decomposes custom ops ------------
 # torch.library.custom_op is the same mechanism used for autosp::all_to_all.
 # Registering SDPA as neuronsp::sdpa guarantees it appears as an opaque
 # node in the FX graph regardless of PyTorch version or cu118 quirks.
@@ -380,7 +380,7 @@ class LlamaModel(nn.Module):
 
     Interface:
         LlamaModel(vocab_size, hidden_size, num_layers, num_heads, seq_len)
-        model(input_ids)  →  logits [B, T, vocab_size]
+        model(input_ids)  ->  logits [B, T, vocab_size]
         model.num_parameters  (property)
         model.enable_gradient_checkpointing()
     """
@@ -396,7 +396,7 @@ class LlamaModel(nn.Module):
         super().__init__()
 
         if _HAS_CORE_MODELS:
-            # Map kwargs → TransformerConfig.  Fields not declared in the
+            # Map kwargs -> TransformerConfig.  Fields not declared in the
             # dataclass (vocab_size, max_position_embeddings, …) are attached
             # as plain attributes; GPTModel reads them via getattr(..., default).
             _cfg = TransformerConfig(
@@ -503,7 +503,7 @@ def real_data_iter(
         try:
             tokens = np.load(str(path), mmap_mode="r").astype(np.int64)
             logger.info(
-                "Loaded %s as memory-mapped .npy: %d tokens (int32→int64)", path.name, len(tokens)
+                "Loaded %s as memory-mapped .npy: %d tokens (int32->int64)", path.name, len(tokens)
             )
         except Exception as _npy_exc:
             logger.warning("Failed to mmap '%s' (%s); using synthetic data.", data_path, _npy_exc)
@@ -584,10 +584,10 @@ def _gpu_mem_str(device: torch.device) -> str:
 #     eval and risks OOM on A6000 if the training batch is sized for H100.
 #
 # GPU tiers are classified by compute capability (SM version):
-#   SM 9.0+ → "H100-class"  (H100, H200) — large eval batch
-#   SM 8.0–8.9 → "A-class"  (A100, A6000, etc.) — medium eval batch
-#   SM 12.0+   → "Blackwell" — large eval batch (like H100-class)
-#   Below SM 8.0 → conservative eval batch
+#   SM 9.0+ -> "H100-class"  (H100, H200) , large eval batch
+#   SM 8.0-8.9 -> "A-class"  (A100, A6000, etc.) , medium eval batch
+#   SM 12.0+   -> "Blackwell" , large eval batch (like H100-class)
+#   Below SM 8.0 -> conservative eval batch
 # ---------------------------------------------------------------------------
 
 def get_eval_micro_batch_size(
@@ -618,26 +618,26 @@ def get_eval_micro_batch_size(
     except Exception:
         return train_micro_batch_size
 
-    # Blackwell (SM 12+) or H100-class (SM 9.x) → can handle larger eval batches
+    # Blackwell (SM 12+) or H100-class (SM 9.x) -> can handle larger eval batches
     # because no activation memory is needed without a backward pass.
     if sm_major >= 9:
-        # H100 NVL / H200 / Blackwell — high-bandwidth, large VRAM
+        # H100 NVL / H200 / Blackwell , high-bandwidth, large VRAM
         scale = 2
     elif sm_major == 8:
-        # A100, A6000, A40 — PCIe or NVLink depending on config
+        # A100, A6000, A40 , PCIe or NVLink depending on config
         # A6000 is PCIe only (48 GB), keep eval batch == train batch
         if "a6000" in gpu_name or "a40" in gpu_name:
             scale = 1
         else:
-            # A100 (80 GB, typically NVLink in datacenter) — modest bump
+            # A100 (80 GB, typically NVLink in datacenter) , modest bump
             scale = 2
     else:
-        # Older Ampere / Volta / Turing — be conservative
+        # Older Ampere / Volta / Turing , be conservative
         scale = 1
 
     eval_bs = max(1, train_micro_batch_size * scale)
     logger.debug(
-        "I12 eval_micro_batch_size: gpu=%s sm=%d.%d  train_bs=%d → eval_bs=%d (scale=%d×)",
+        "I12 eval_micro_batch_size: gpu=%s sm=%d.%d  train_bs=%d -> eval_bs=%d (scale=%d×)",
         props.name, props.major, props.minor, train_micro_batch_size, eval_bs, scale,
     )
     return eval_bs
@@ -672,7 +672,7 @@ def build_eval_data_iter(
     eval_bs = get_eval_micro_batch_size(train_micro_batch_size, device)
 
     if eval_bs == train_micro_batch_size:
-        # No change needed — pass through directly.
+        # No change needed , pass through directly.
         yield from train_data_iter
         return
 
@@ -742,7 +742,7 @@ def _cleanup_distributed() -> None:
 # ---------------------------------------------------------------------------
 
 def run_standalone(args: argparse.Namespace) -> None:
-    """Standalone PyTorch training loop — supports torchrun multi-GPU via DDP or FSDP."""
+    """Standalone PyTorch training loop , supports torchrun multi-GPU via DDP or FSDP."""
     cfg = _MODEL_CONFIGS[args.model_size]
 
     # ------------------------------------------------------------------ setup
@@ -803,7 +803,7 @@ def run_standalone(args: argparse.Namespace) -> None:
 
     # Wrap with FSDP or DDP when running in a distributed context.
     # FSDP is required for heterogeneous GPU clusters (different VRAM per GPU)
-    # because DDP requires all ranks to hold a full model replica — impossible
+    # because DDP requires all ranks to hold a full model replica , impossible
     # when VRAM differs. FSDP shards parameters, gradients, and (with
     # cpu_offload) optimizer states across ranks, letting each GPU contribute
     # its own capacity to the collective pool.
@@ -848,7 +848,7 @@ def run_standalone(args: argparse.Namespace) -> None:
             logger.info("Model wrapped with DistributedDataParallel (DDP).")
 
     # ---------------------------------------------------------------- optim
-    # For FSDP: call model.parameters() directly — FSDP manages the sharded
+    # For FSDP: call model.parameters() directly , FSDP manages the sharded
     # view of params for the optimizer on this rank.
     # For DDP: use model.module to reach the underlying nn.Module.
     # For single-GPU: model IS the raw module.
@@ -1128,7 +1128,7 @@ def run_standalone(args: argparse.Namespace) -> None:
             assert final_loss < initial_10 + 0.5, (
                 f"Loss did not decrease: initial={initial_10:.4f}, final={final_loss:.4f}"
             )
-            logger.info("✅  Loss decreased — training loop verified.")
+            logger.info("[PASS]  Loss decreased , training loop verified.")
 
     # ------------------------------------------- cleanup loggers (rank 0 only)
     if is_main:
@@ -1179,7 +1179,7 @@ def run_desloc(args: argparse.Namespace) -> None:
     _eval_micro_batch_size = get_eval_micro_batch_size(args.batch_size, device)
     if _eval_micro_batch_size != args.batch_size:
         logger.info(
-            "I12 heterogeneous eval: train_bs=%d → eval_bs=%d on %s",
+            "I12 heterogeneous eval: train_bs=%d -> eval_bs=%d on %s",
             args.batch_size, _eval_micro_batch_size,
             torch.cuda.get_device_name(device) if torch.cuda.is_available() else "cpu",
         )
@@ -1203,8 +1203,8 @@ def run_desloc(args: argparse.Namespace) -> None:
         tensorboard_dir = getattr(args, "tensorboard_desloc_dir", None),
     )
 
-    # ── Merge YAML desloc config into TrainingConfig ──
-    # Keys from configs/7b_5gpu.yaml → desloc: section are set as attributes
+    # -- Merge YAML desloc config into TrainingConfig --
+    # Keys from configs/7b_5gpu.yaml -> desloc: section are set as attributes
     # on TrainingConfig so that DesLocEngine can read them via getattr().
     _yaml_cfg = getattr(args, "yaml_cfg", {})
     _desloc_yaml = _yaml_cfg.get("desloc", {})
@@ -1248,7 +1248,7 @@ def run_desloc(args: argparse.Namespace) -> None:
     if "stage_overrides" in _desloc_yaml:
         setattr(tc, "desloc_stage_overrides", _desloc_yaml["stage_overrides"])
     logger.info(
-        "YAML→TrainingConfig merged: Kx=%s Ku=%s Kv=%s PP=%s zero=%s mbs_per_gpu=%s",
+        "YAML->TrainingConfig merged: Kx=%s Ku=%s Kv=%s PP=%s zero=%s mbs_per_gpu=%s",
         getattr(tc, 'desloc_Kx', 'default'),
         getattr(tc, 'desloc_Ku', 'default'),
         getattr(tc, 'desloc_Kv', 'default'),
@@ -1257,7 +1257,7 @@ def run_desloc(args: argparse.Namespace) -> None:
         getattr(tc, 'micro_batch_size_per_gpu', 'default'),
     )
 
-    # ── Runtime config query: ask claude-hk-config for optimal parameters ──
+    # -- Runtime config query: ask claude-hk-config for optimal parameters --
     # Rank 0 collects the hardware environment, sends it to a sub-Claude,
     # and gets back concrete numbers. Other ranks receive via broadcast.
     # Disabled by NEURON_SP_NO_RUNTIME_QUERY=1. Falls back to defaults on failure.
@@ -1298,7 +1298,7 @@ def run_desloc(args: argparse.Namespace) -> None:
     try:
         from deepspeed.core.tensor_parallel.random import model_parallel_cuda_manual_seed
         model_parallel_cuda_manual_seed(_seed)
-        logger.info("model_parallel_cuda_manual_seed(%d) — RNG tracker initialized", _seed)
+        logger.info("model_parallel_cuda_manual_seed(%d) , RNG tracker initialized", _seed)
     except Exception as _rng_err:
         # Fallback: directly register with the activation checkpointing tracker
         # (DeepSpeed's own RNG tracker, used when core.tensor_parallel is unavailable)
@@ -1313,7 +1313,7 @@ def run_desloc(args: argparse.Namespace) -> None:
             logger.warning("RNG tracker init failed (both paths): %s / %s", _rng_err, _rng_err2)
 
     # Build the LlamaModel and pass it in (DesLocEngine wraps it)
-    # Model stays on CPU here — DesLocEngine/FSDP handles device placement.
+    # Model stays on CPU here , DesLocEngine/FSDP handles device placement.
     # Moving to GPU first then FSDP flatten causes OOM on A6000 (47GB).
     dtype = torch.bfloat16
     model = LlamaModel(
@@ -1566,7 +1566,7 @@ def main() -> None:
     if _rank == 0:
         logger.info("=" * 60)
         logger.info("Neuron_SP run_pretrain.py")
-        logger.info("  config     : %s", args.config or "(none — CLI only)")
+        logger.info("  config     : %s", args.config or "(none , CLI only)")
         logger.info("  model-size : %s  (%s)", args.model_size, _MODEL_CONFIGS[args.model_size])
         logger.info("  steps      : %d", args.steps)
         logger.info("  batch-size : %d", args.batch_size)
@@ -1588,21 +1588,21 @@ def main() -> None:
                     props.major, props.minor,
                 )
         else:
-            logger.info("  No CUDA GPUs found — running on CPU")
+            logger.info("  No CUDA GPUs found , running on CPU")
         logger.info("=" * 60)
 
     if args.use_desloc and _HAS_DESLOC:
         run_desloc(args)
     elif args.use_desloc and not _HAS_DESLOC:
-        # DO NOT fall back to standalone DDP — this silently loses ZeRO-3
+        # DO NOT fall back to standalone DDP , this silently loses ZeRO-3
         # heterogeneous sharding, causing A6000 OOM on full-model DDP.
-        # Ref: DeepSpeed #4807 (DDP loads whole model → OOM),
+        # Ref: DeepSpeed #4807 (DDP loads whole model -> OOM),
         #      DeepSpeed #5575 (ZeRO-3 init bypass loads full model),
         #      HexiScale/FlashFlex (heterogeneous GPU training),
         #      Cephalo (arxiv:2411.01075, decoupled state allocation)
         logger.error(
             "--use-desloc requested but DesLocEngine failed to import. "
-            "REFUSING to fall back to standalone DDP — full-model replication "
+            "REFUSING to fall back to standalone DDP , full-model replication "
             "will OOM on A6000 (47GB) with 7B model. Fix the import error above."
         )
         raise RuntimeError(

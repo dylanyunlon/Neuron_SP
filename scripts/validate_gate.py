@@ -1,22 +1,22 @@
 #!/usr/bin/env python3
 """
-validate_gate.py — Post-run validator for issue #591 gate criteria.
+validate_gate.py , Post-run validator for issue #591 gate criteria.
 
 Parses a training log file and checks ALL 5 gate criteria:
-  1. ✅ 100 steps completed (no NCCL hang, no OOM, no crash)
-  2. ✅ Loss monotonically decreasing (step 0 ~ 10-11, step 100 < step 0)
-  3. ✅ All 3 ranks log the same step count
-  4. ✅ Per-step GPU memory logged for H100 and both A6000s
-  5. ✅ Log file committed to logs/ as evidence
+  1. [PASS] 100 steps completed (no NCCL hang, no OOM, no crash)
+  2. [PASS] Loss monotonically decreasing (step 0 ~ 10-11, step 100 < step 0)
+  3. [PASS] All 3 ranks log the same step count
+  4. [PASS] Per-step GPU memory logged for H100 and both A6000s
+  5. [PASS] Log file committed to logs/ as evidence
 
 Usage:
     python scripts/validate_gate.py logs/7b_pretrain_3gpu_*.log
     python scripts/validate_gate.py --steps 100 logs/gate_run.log
 
 Exit codes:
-    0 — all criteria pass
-    1 — one or more criteria fail (details printed to stderr)
-    2 — log file not found or parse error
+    0 , all criteria pass
+    1 , one or more criteria fail (details printed to stderr)
+    2 , log file not found or parse error
 """
 
 from __future__ import annotations
@@ -72,7 +72,7 @@ class GateReport:
             "-" * 60,
         ]
         for r in self.results:
-            icon = "✅" if r.passed else "❌"
+            icon = "[PASS]" if r.passed else "[FAIL]"
             lines.append(f"  {icon} {r.name}: {r.detail}")
         lines.append("-" * 60)
         status = "ALL PASSED" if self.all_passed else "FAILED"
@@ -215,7 +215,7 @@ def check_loss_decreasing(
     passed = last_loss < first_loss
 
     detail = (
-        f"step {records[0].step} loss={first_loss:.4f} → "
+        f"step {records[0].step} loss={first_loss:.4f} -> "
         f"step {records[-1].step} loss={last_loss:.4f} "
         f"(delta={last_loss - first_loss:+.4f})"
     )

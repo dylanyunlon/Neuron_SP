@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # DeepSpeed Team
-"""finalize_model_grads — gradient finalization before optimizer step.
+"""finalize_model_grads , gradient finalization before optimizer step.
 
 Evolution summary (ported from Megatron-LM finalize_model_grads.py, 16 commits):
-  M2282 (76622edf3): pgs_collection — ProcessGroupCollection; pg_collection
+  M2282 (76622edf3): pgs_collection , ProcessGroupCollection; pg_collection
       param in finalize_model_grads; tp/pp/embd/pos_embd/dp_cp group routing.
   M2286 (ca9797e95): Revert pgs_collection.
   M2293 (72d23540d): Add global aux loss support (MoE router).
@@ -19,9 +19,9 @@ Evolution summary (ported from Megatron-LM finalize_model_grads.py, 16 commits):
       (_allreduce_router_grads + flextron_router_pp_sync attribute).
   M3981 (aa786b72c): Thread custom process groups through MoE grad finalization
       (tp_dp_cp group for _update_router_expert_bias).
-  M4041 (67b2f3878): FSDP full-iteration CUDA graphability — conditional
+  M4041 (67b2f3878): FSDP full-iteration CUDA graphability , conditional
       param.grad dereferencing in finalize (param.grad = None for FSDP path).
-  M4173 (277c4f804): Offline logits-based knowledge distillation — guard
+  M4173 (277c4f804): Offline logits-based knowledge distillation , guard
       _update_router_expert_bias with module.training so that teacher model
       expert_bias is not updated when teacher is in eval mode.  Also: the
       model list may contain non-DDP-wrapped teacher chunks; all ddp_config
@@ -35,7 +35,7 @@ DES-LOC extensions (Algorithm 1):
     * Non-Kx steps: skip DP all-reduce (skip_grad_sync=True) but still
       run embedding + SP + MoE collectives so PP and TP stay in sync.
     * Kx steps: full DP all-reduce + optional Ku/Kv moment sync.
-  - _desloc_should_sync_grads(step, config) → bool: Kx predicate.
+  - _desloc_should_sync_grads(step, config) -> bool: Kx predicate.
   - _desloc_sync_optimizer_moments(model, config, is_ku, is_kv): broadcast
     Adam exp_avg (Ku) and exp_avg_sq (Kv) from rank-0 across DP group.
 
@@ -372,8 +372,8 @@ def _allreduce_word_embedding_grads(
     Args:
         model: List of model chunks.
         config: Model config.
-        embd_group: Embedding process group (None → look up from parallel_state).
-        pp_group: PP process group (None → look up from parallel_state).
+        embd_group: Embedding process group (None -> look up from parallel_state).
+        pp_group: PP process group (None -> look up from parallel_state).
     """
     if embd_group is None:
         embd_group = _get_embedding_group()
@@ -441,7 +441,7 @@ def fuse_grad_reductions(
                       They may have different shapes but MUST be the same dtype
                       within each fusion group (enforced internally by dtype
                       bucketing).
-        process_group: The process group for the collective.  None → default
+        process_group: The process group for the collective.  None -> default
                        (WORLD) group.
         op: Reduction operator, defaults to SUM.
 
@@ -454,7 +454,7 @@ def fuse_grad_reductions(
           after the call returns.
         - Empty input is a no-op.
 
-    Implementation note — why not torch.distributed._coalescing_manager?
+    Implementation note , why not torch.distributed._coalescing_manager?
         The coalescing manager batches *kernel launches* but still issues N
         individual NCCL ops under the hood, which on PCIe still costs N
         NCCL enqueue round-trips.  Flattening to a single tensor achieves a
@@ -463,7 +463,7 @@ def fuse_grad_reductions(
     if not grad_tensors:
         return
 
-    # Bucket by dtype — same dtype required for torch.cat / flatten.
+    # Bucket by dtype , same dtype required for torch.cat / flatten.
     from collections import defaultdict
     dtype_groups: Dict[torch.dtype, List[torch.Tensor]] = defaultdict(list)
     for t in grad_tensors:
@@ -481,7 +481,7 @@ def fuse_grad_reductions(
             )
             continue
 
-        # Fuse: flatten → cat → all_reduce → scatter back in-place.
+        # Fuse: flatten -> cat -> all_reduce -> scatter back in-place.
         shapes = [g.shape for g in grads]
         sizes  = [g.numel() for g in grads]
         flat   = torch.cat([g.flatten() for g in grads])
@@ -521,7 +521,7 @@ def _allreduce_all_embedding_grads(
     and issue one AllReduce, halving overhead.
 
     When the groups differ (encoder-decoder models where pos_embd_group ≠
-    embd_group) we fall back to the original two-call sequence — correctness
+    embd_group) we fall back to the original two-call sequence , correctness
     is never sacrificed for throughput.
 
     From Megatron M4149: Fuse per-sequence AlltoAll into unified.
@@ -628,7 +628,7 @@ def _allreduce_all_embedding_grads(
     )
 
     if word_grad is not None and pos_grad is not None and same_group and word_embd_size > 1:
-        # Both embeddings live on the same group → fuse into one AllReduce.
+        # Both embeddings live on the same group -> fuse into one AllReduce.
         logger.debug(
             "[_allreduce_all_embedding_grads] fusing word_embd(%s) + pos_embd(%s) "
             "into single AllReduce on shared group (PCIe M4149)",
@@ -654,7 +654,7 @@ def _allreduce_all_embedding_grads(
                 _reshard_if_dtensor(pos_grad, pos_orig_grad),
             )
     else:
-        # Groups differ or one grad is absent — fall back to separate calls.
+        # Groups differ or one grad is absent , fall back to separate calls.
         # This preserves full correctness for encoder-decoder architectures.
         logger.debug(
             "[_allreduce_all_embedding_grads] groups differ or grad absent; "
@@ -806,7 +806,7 @@ def _allreduce_non_tensor_model_parallel_grads(
                 setattr(param, grad_attr, _reshard_if_dtensor(buf, orig_grad))
 
 
-# Legacy alias (maintained for unit tests — mcore 0.14 removal target).
+# Legacy alias (maintained for unit tests , mcore 0.14 removal target).
 _allreduce_layernorm_grads = _allreduce_non_tensor_model_parallel_grads
 
 
@@ -953,7 +953,7 @@ def _desloc_sync_optimizer_moments(
 
     Args:
         model: List of model chunks.
-        config: Model parallel config — may carry desloc_optimizer reference.
+        config: Model parallel config , may carry desloc_optimizer reference.
         is_ku: True on Ku synchronization steps.
         is_kv: True on Kv synchronization steps.
     """
@@ -1036,7 +1036,7 @@ def _try_hetero_allreduce(
         op.fused_gradient_allreduce(coalesced, dp_group, sm_version)
         return True
     except Exception:
-        # Kernel not compiled yet or unavailable — caller uses plain all_reduce.
+        # Kernel not compiled yet or unavailable , caller uses plain all_reduce.
         return False
 
 
@@ -1218,7 +1218,7 @@ def finalize_model_grads(
     #
     #    CollectiveContract integration (fix #589): the contract guard
     #    ensures this block is ALWAYS entered by all ranks, regardless of
-    #    skip_grad_sync — the skip flag only controls the NCCL payload,
+    #    skip_grad_sync , the skip flag only controls the NCCL payload,
     #    not whether we participate.  Without this, rank A entering
     #    finish_grad_sync while rank B skips causes an NCCL hang.
     # ------------------------------------------------------------------
@@ -1299,7 +1299,7 @@ def finalize_model_grads(
     #    via _get_shared_word_embedding_weight, which inspects model attrs.
     #    If model attrs differ across ranks (e.g. share_embeddings_and_output_weights
     #    only set on rank 0), some ranks fire the allreduce while others skip
-    #    it → NCCL deadlock.  We add an explicit guard: when config explicitly
+    #    it -> NCCL deadlock.  We add an explicit guard: when config explicitly
     #    sets share_embeddings_and_output_weights=False AND PP=1, skip the
     #    entire embedding allreduce path to guarantee symmetry.
     # ------------------------------------------------------------------
@@ -1320,7 +1320,7 @@ def finalize_model_grads(
         logger.debug(
             "[finalize_model_grads] skipping embedding allreduce: "
             "share_embeddings=False, PP=1, no cond_embedder, no MTP "
-            "(fix #591 Blocker 3 — prevents asymmetric NCCL collective)"
+            "(fix #591 Blocker 3 , prevents asymmetric NCCL collective)"
         )
     if config is not None and getattr(config, 'timers', None) is not None:
         config.timers('embedding-grads-all-reduce').stop()

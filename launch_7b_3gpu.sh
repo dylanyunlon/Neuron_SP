@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# launch_7b_3gpu.sh — ags1 3-GPU DES-LOC 7B pretrain (H100 + 2×A6000)
+# launch_7b_3gpu.sh , ags1 3-GPU DES-LOC 7B pretrain (H100 + 2×A6000)
 #
 # Blackwell RTX PRO 6000 (SM120) excluded: PyTorch 2.7.1+cu118 only supports up to SM90.
 # Upgrade to PyTorch cu126+ to enable Blackwell. Until then, train on 3 GPUs:
-#   GPU2: H100 NVL (93GB, SM9.0) — primary compute
-#   GPU3: A6000   (47GB, SM8.6) — secondary
-#   GPU4: A6000   (47GB, SM8.6) — secondary
+#   GPU2: H100 NVL (93GB, SM9.0) , primary compute
+#   GPU3: A6000   (47GB, SM8.6) , secondary
+#   GPU4: A6000   (47GB, SM8.6) , secondary
 #
 # To enable all 5 GPUs with Blackwell:
 #   pip install torch --index-url https://download.pytorch.org/whl/cu126
@@ -31,10 +31,10 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,max_split_size_mb:256
 
 # Pin CUDA arch list to SM8.6 (A6000) + SM9.0 (H100).
 # Without this, nvcc sees all GPUs (including Blackwell SM120) and tries to
-# compile for SM120 which PyTorch cu124 doesn't support → silent hang.
+# compile for SM120 which PyTorch cu124 doesn't support -> silent hang.
 export TORCH_CUDA_ARCH_LIST="8.6;9.0"
 
-# ── AutoSP kill-switch ────────────────────────────────────────────────────────
+# -- AutoSP kill-switch --------------------------------------------------------
 # PCIe-only topology (H100 + 2×A6000, no NVLink): Ulysses SP=3 all-to-all
 # collectives deadlock inside model.forward() at step 0.  Force DP-only mode
 # until the all-to-all / process-group wiring is fixed for heterogeneous PCIe.
@@ -44,21 +44,21 @@ export TORCH_CUDA_ARCH_LIST="8.6;9.0"
 #   remove / comment-out the line below.
 export NEURON_SP_DISABLE_AUTOSP=${NEURON_SP_DISABLE_AUTOSP:-0}
 
-# ── Optional per-layer forward logging ───────────────────────────────────────
+# -- Optional per-layer forward logging ---------------------------------------
 # Set NEURON_SP_LAYER_LOG=1 to emit a log line before/after every transformer
 # layer during forward.  Useful for pinpointing the exact layer that hangs
 # when SP is re-enabled.  Off by default (adds barrier overhead).
 export NEURON_SP_LAYER_LOG=${NEURON_SP_LAYER_LOG:-0}
 
-# ── Pre-build DeepSpeed CPU Adam C++ extension ──────────────────────────────
+# -- Pre-build DeepSpeed CPU Adam C++ extension ------------------------------
 # A6000 ranks use DeepSpeedCPUAdam which JIT-compiles csrc/adam/cpu_adam.cpp.
 # Problem: CPUAdamBuilder inherits from CUDAOpBuilder, so jit_load() passes
 # with_cuda=True and clears TORCH_CUDA_ARCH_LIST.  nvcc 13.0 (system) then
 # auto-detects ALL GPUs including Blackwell SM120, which PyTorch cu124 can't
-# compile for → silent hang.
+# compile for -> silent hang.
 #
 # Fix: compile directly via torch.utils.cpp_extension.load(with_cuda=False).
-# cpu_adam is pure C++ (no .cu files) — it never needed nvcc.
+# cpu_adam is pure C++ (no .cu files) , it never needed nvcc.
 echo "Pre-building DeepSpeed CPU Adam extension (CPU-only, no nvcc)..."
 python -c "
 import os, sys, torch
@@ -105,7 +105,7 @@ if [[ " ${EXTRA_ARGS[*]:-} " == *" --dry-run "* ]]; then
     EXTRA_ARGS=("${EXTRA_ARGS[@]/--dry-run/}" --steps 3 --log-every 1 --save-every 0)
 fi
 
-# --- FIX #591: --gate mode ─────────────────────────────────────────────────
+# --- FIX #591: --gate mode -------------------------------------------------
 # Shorthand for the gate criteria run: 100 steps, log every step, no save,
 # validate output with scripts/validate_gate.py afterwards.
 _GATE_MODE=0
@@ -123,7 +123,7 @@ echo "Note: Blackwell GPUs excluded (PyTorch cu118 < SM120). Upgrade to cu126+ f
 # Auto-detect real data
 DATA_PATH="data/commitpack_train.npy"
 if [ ! -f "$DATA_PATH" ]; then
-    echo "⚠ Real data not found at $DATA_PATH — using synthetic. Run: bash prepare_data.sh"
+    echo "WARNING: Real data not found at $DATA_PATH , using synthetic. Run: bash prepare_data.sh"
     DATA_PATH=""
 fi
 
@@ -151,17 +151,17 @@ torchrun --nproc_per_node=3 --master_port=29500 \
     "${EXTRA_ARGS[@]}" \
     2>&1 | tee "$LOG"
 
-# --- FIX #591: post-run gate validation ────────────────────────────────────
+# --- FIX #591: post-run gate validation ------------------------------------
 if [ "$_GATE_MODE" -eq 1 ]; then
     echo ""
     echo "=== Running gate validation (issue #591) ==="
     python scripts/validate_gate.py --steps 100 "$LOG"
     _GATE_EXIT=$?
     if [ $_GATE_EXIT -eq 0 ]; then
-        echo "✅ Gate PASSED — all 5 criteria met."
+        echo "[PASS] Gate PASSED , all 5 criteria met."
         echo "Log evidence: $LOG"
     else
-        echo "❌ Gate FAILED — see report above."
+        echo "[FAIL] Gate FAILED , see report above."
         exit 1
     fi
 fi

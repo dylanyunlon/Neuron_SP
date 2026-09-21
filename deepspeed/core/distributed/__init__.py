@@ -33,7 +33,7 @@ from deepspeed.core.distributed.contract_diagnostics import (
     StepTraceLog,
 )
 
-# Issue #591: embedding grad-sync guard — prevent asymmetric NCCL collectives.
+# Issue #591: embedding grad-sync guard , prevent asymmetric NCCL collectives.
 from deepspeed.core.distributed.embedding_guard import (
     EmbeddingGradSyncConfig,
     validate_embedding_sync_flags,

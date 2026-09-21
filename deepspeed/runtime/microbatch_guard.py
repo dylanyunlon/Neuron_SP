@@ -1,12 +1,12 @@
 """
-Microbatch Uniformity Guard — enforce identical num_microbatches across all ranks.
+Microbatch Uniformity Guard , enforce identical num_microbatches across all ranks.
 
 Fix for issue #591 Blocker 2:
-    desloc_engine.py:2156 — HeteroStepBatchScheduler.schedule() returns
+    desloc_engine.py:2156 , HeteroStepBatchScheduler.schedule() returns
     per-rank num_microbatches.  But gather_full_params() inside forward fires
     one all_gather_into_tensor per layer per microbatch.  If rank 0 does 2
     microbatches and rank 1 does 1, rank 0 fires 64 all_gathers and rank 1
-    fires 32 → NCCL deadlock.
+    fires 32 -> NCCL deadlock.
 
 Solution:
     broadcast_uniform_microbatch_count() all-reduces the MAX of all ranks'
@@ -16,15 +16,15 @@ Solution:
 
 AST call chain (6 nodes):
     launch_7b_3gpu.sh
-      → run_pretrain.py
-        → DesLocEngine.train()
-          → hetero_scheduler.schedule() → MicrobatchAllocation
-            → broadcast_uniform_microbatch_count()   ← THIS MODULE
-              → for micro in range(num_microbatches)
-                → gather_full_params() → all_gather_into_tensor()
+      -> run_pretrain.py
+        -> DesLocEngine.train()
+          -> hetero_scheduler.schedule() -> MicrobatchAllocation
+            -> broadcast_uniform_microbatch_count()   <-- THIS MODULE
+              -> for micro in range(num_microbatches)
+                -> gather_full_params() -> all_gather_into_tensor()
 
 Public API:
-    broadcast_uniform_microbatch_count(local_count, group) → int
+    broadcast_uniform_microbatch_count(local_count, group) -> int
     PaddedMicrobatchIterator(real_iter, real_count, padded_count, ...)
 """
 
@@ -75,7 +75,7 @@ def broadcast_uniform_microbatch_count(
     if uniform_count != local_count:
         rank = dist.get_rank()
         logger.warning(
-            "[MicrobatchGuard] rank=%d local_count=%d → uniform_count=%d "
+            "[MicrobatchGuard] rank=%d local_count=%d -> uniform_count=%d "
             "(padded %d dummy microbatches to prevent ZeRO-3 all_gather deadlock)",
             rank, local_count, uniform_count, uniform_count - local_count,
         )

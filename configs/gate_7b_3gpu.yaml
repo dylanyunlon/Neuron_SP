@@ -3,7 +3,7 @@
 #
 # This config is the MINIMUM required to validate the 3 blockers:
 #   Blocker 1: NCCL collective asymmetry (fixed in #589)
-#   Blocker 2: num_microbatches divergence → ZeRO-3 deadlock (fixed here)
+#   Blocker 2: num_microbatches divergence -> ZeRO-3 deadlock (fixed here)
 #   Blocker 3: finalize_model_grads embedding allreduce asymmetry (fixed here)
 #
 # Gate criteria (from issue #591):
@@ -48,7 +48,7 @@ desloc:
 
 # Fix #591 Blocker 2: microbatch_guard enforces uniform num_microbatches
 # across all ranks via collective broadcast.  This is automatic and
-# requires no config — listed here for documentation.
+# requires no config , listed here for documentation.
 microbatch_guard:
   enabled: true  # always on; cannot be disabled
 

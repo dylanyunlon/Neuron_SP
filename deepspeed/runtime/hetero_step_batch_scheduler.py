@@ -491,7 +491,7 @@ class HeteroMicrobatchAllocator:
         samples_per_round = sum(per_device_mbs.values())
 
         # num_microbatches: how many rounds to reach global_batch_size
-        # UNIFORM across all ranks — this is the key invariant.
+        # UNIFORM across all ranks , this is the key invariant.
         if samples_per_round > 0 and global_batch_size >= samples_per_round:
             num_microbatches = max(1, global_batch_size // samples_per_round)
         else:

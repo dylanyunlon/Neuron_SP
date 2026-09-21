@@ -1,12 +1,12 @@
 """
-Embedding Grad-Sync Guard — prevent asymmetric embedding allreduce hangs.
+Embedding Grad-Sync Guard , prevent asymmetric embedding allreduce hangs.
 
 Fix for issue #591 Blocker 3:
     finalize_model_grads.py has an embedding gradient allreduce that only
     fires when config.share_embeddings_and_output_weights = True.  If some
     ranks have this flag and others don't (or if the flag is derived from
     model attributes that differ across ranks), the embedding allreduce
-    fires on a subset of ranks → NCCL hang.
+    fires on a subset of ranks -> NCCL hang.
 
 Solution:
     1. validate_embedding_sync_flags() broadcasts the share_embeddings flag
@@ -16,16 +16,16 @@ Solution:
 
 AST call chain (6 nodes):
     DesLocEngine.train()
-      → finalize_model_grads()
-        → _allreduce_all_embedding_grads()
-          → _allreduce_word_embedding_grads()        ← conditional on share_embeddings
-            → _allreduce_embedding_grad()
-              → dist.all_reduce()                     ← deadlocks if asymmetric
+      -> finalize_model_grads()
+        -> _allreduce_all_embedding_grads()
+          -> _allreduce_word_embedding_grads()        <-- conditional on share_embeddings
+            -> _allreduce_embedding_grad()
+              -> dist.all_reduce()                     <-- deadlocks if asymmetric
 
 Public API:
     EmbeddingGradSyncConfig
-    validate_embedding_sync_flags(config, group) → EmbeddingGradSyncConfig
-    safe_model_parallel_config(**overrides) → ModelParallelConfig
+    validate_embedding_sync_flags(config, group) -> EmbeddingGradSyncConfig
+    safe_model_parallel_config(**overrides) -> ModelParallelConfig
 """
 
 from __future__ import annotations
@@ -75,7 +75,7 @@ def validate_embedding_sync_flags(
     """Broadcast embedding sync flags from rank 0 to ensure all-rank agreement.
 
     Must be called by ALL ranks in the group before finalize_model_grads().
-    Uses broadcast (not allreduce) so rank 0's flags are authoritative —
+    Uses broadcast (not allreduce) so rank 0's flags are authoritative ,
     this matches the Megatron convention where rank 0 owns the config.
 
     Args:
@@ -150,7 +150,7 @@ def safe_model_parallel_config(**overrides):
     Explicitly disables all conditional embedding allreduces that can cause
     asymmetric NCCL hangs in the heterogeneous 3-GPU setup.
 
-    The returned config is safe for finalize_model_grads() — every flag
+    The returned config is safe for finalize_model_grads() , every flag
     that gates a conditional collective is set to a value that either
     fires on ALL ranks or fires on NONE.
 

@@ -74,7 +74,7 @@ class TestSafeModelParallelConfig:
         cfg = safe_model_parallel_config()
         # Sequence parallel disabled (prevents conditional TP allreduce)
         assert cfg.sequence_parallel is False
-        # Pipeline parallel size 1 (no PP stages → no embedding cross-PP allreduce)
+        # Pipeline parallel size 1 (no PP stages -> no embedding cross-PP allreduce)
         assert cfg.pipeline_model_parallel_size == 1
         # TP size 1 (no tensor parallelism)
         assert cfg.tensor_model_parallel_size == 1
