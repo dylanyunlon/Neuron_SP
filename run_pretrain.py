@@ -1244,6 +1244,15 @@ def run_desloc(args: argparse.Namespace) -> None:
         tc.activation_checkpointing = _train_yaml["activation_checkpointing"]
     if "checkpoint_activations_granularity" in _train_yaml:
         tc.checkpoint_activations_granularity = _train_yaml["checkpoint_activations_granularity"]
+    # Issue #590: YAML can also pre-set shard_weights (e.g. from a previous
+    # runtime_config_query result baked into the config for reproducibility).
+    if "shard_weights" in _train_yaml:
+        tc.shard_weights = [float(w) for w in _train_yaml["shard_weights"]]
+        tc.shard_weights_source = "yaml"
+        logger.info("YAML shard_weights=%s (source=yaml)", tc.shard_weights)
+    if "cpu_offload_optimizer" in _train_yaml:
+        tc.cpu_offload_optimizer = [bool(v) for v in _train_yaml["cpu_offload_optimizer"]]
+        logger.info("YAML cpu_offload_optimizer=%s", tc.cpu_offload_optimizer)
     # Stage overrides (Blackwell Kx/Ku/Kv)
     if "stage_overrides" in _desloc_yaml:
         setattr(tc, "desloc_stage_overrides", _desloc_yaml["stage_overrides"])
