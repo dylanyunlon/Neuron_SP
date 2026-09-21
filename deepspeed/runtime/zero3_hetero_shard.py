@@ -903,6 +903,89 @@ def vram_weights_from_tiers(tiers: Sequence[object]) -> List[float]:
     return ordered
 
 
+def free_vram_weights_from_tiers(tiers: Sequence[object]) -> List[float]:
+    """Build per-rank weights using **free** VRAM instead of total VRAM.
+
+    This is more accurate than ``vram_weights_from_tiers`` because it
+    accounts for CUDA context overhead (~1.5 GB), NCCL buffers (~0.5 GB)
+    and any other pre-existing allocations at discovery time.
+
+    Falls back to ``total_mem_gb - 2.0`` when ``free_mem_gb`` is not
+    available or is <= 0.
+
+    Issue #590: used as intermediate priority when runtime_config_query
+    shard_weights are not available.
+    """
+    by_idx: Dict[int, float] = {}
+    for t in tiers:
+        idx = int(getattr(t, "device_index"))
+        free = float(getattr(t, "free_mem_gb", 0))
+        if free <= 0:
+            total = float(getattr(t, "total_mem_gb", 0))
+            free = max(total - 2.0, 1.0)
+        by_idx[idx] = free
+    if not by_idx:
+        return []
+    ordered = [by_idx[k] for k in sorted(by_idx)]
+    return ordered
+
+
+def resolve_shard_weights(
+    config: object,
+    tiers: Optional[Sequence[object]],
+    world_size: int,
+) -> Tuple[Optional[List[float]], str]:
+    """Resolve ZeRO-3 shard weights with clear priority.
+
+    Priority:
+      1. ``config.shard_weights``  — from runtime_config_query; based on
+         live available VRAM, most accurate.
+      2. ``free_vram_weights_from_tiers(tiers)`` — discovery-time free
+         VRAM; good approximation when runtime query unavailable.
+      3. ``vram_weights_from_tiers(tiers)`` — total VRAM; legacy fallback.
+      4. ``None`` — even split across all ranks.
+
+    Returns:
+        ``(weights, source)`` where *source* is one of
+        ``"runtime_query"``, ``"vram_discovery"``, ``"even_split"``.
+
+    AST call chain (issue #590):
+      desloc_engine.py : DesLocEngine.__init__
+        → zero3_hetero_shard.resolve_shard_weights(config, tiers, ws)
+          → reads config.shard_weights  (set by apply_overrides)
+          → OR free_vram_weights_from_tiers(tiers)
+          → OR vram_weights_from_tiers(tiers)
+          → OR None
+        → ShardState.build(model, rank, ws, device, vram_weights=weights)
+    """
+    # -- Priority 1: runtime query -------------------------------------------
+    rq = getattr(config, "shard_weights", None)
+    if rq is not None and isinstance(rq, list):
+        if (
+            len(rq) == world_size
+            and all(isinstance(w, (int, float)) and w > 0 for w in rq)
+        ):
+            return [float(w) for w in rq], "runtime_query"
+        logger.warning(
+            "[zero3] config.shard_weights invalid (len=%d, ws=%d); "
+            "falling through to discovery",
+            len(rq) if isinstance(rq, list) else -1,
+            world_size,
+        )
+
+    # -- Priority 2 & 3: tier discovery --------------------------------------
+    if tiers is not None and len(list(tiers)) > 0:
+        free_w = free_vram_weights_from_tiers(tiers)
+        if free_w and len(free_w) == world_size:
+            return free_w, "vram_discovery"
+        total_w = vram_weights_from_tiers(tiers)
+        if total_w and len(total_w) == world_size:
+            return total_w, "vram_discovery"
+
+    # -- Priority 4: even split ----------------------------------------------
+    return None, "even_split"
+
+
 
 # ---------------------------------------------------------------------------
 # GradBucketManager , Megatron-style bucketed grad sync for ZeRO-3
