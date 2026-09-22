@@ -201,6 +201,7 @@ def install(
         tier_map = TierMap.from_infos([
             TierInfo(rank=0, tier=GPUTier.UNKNOWN,
                      total_vram_bytes=_vram,
+                     free_vram_bytes=0,
                      numa_node=0, peak_bf16_tflops=100.0)
         ])
 

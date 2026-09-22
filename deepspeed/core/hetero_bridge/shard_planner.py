@@ -2,8 +2,12 @@
 """shard_planner.py — heterogeneous fp32 optimizer-shard assignment.
 
 Assigns fp32 optimizer shards proportionally to each rank's available VRAM
-budget, as returned by TierMap.mem_budget().  The proportional-split math
-mirrors zero3_hetero_shard.ShardState.build() (lines 154-163) so the two
+budget, as returned by TierMap.mem_budget().  Since issue #593,
+mem_budget() uses runtime-probed free VRAM (cudaMemGetInfo) instead of
+nameplate-capacity reserve fractions, making the budget accurate even when
+torch compile caches or other processes consume GPU memory before
+discover().  The proportional-split math mirrors
+zero3_hetero_shard.ShardState.build() (lines 154-163) so the two
 subsystems stay in lock-step without duplicating the ShardState object itself
 (the engine already builds one in Phase 4b; we don't need a second).
 
@@ -83,8 +87,9 @@ class HeteroShardPlanner:
             return plan
 
         # ── Step 1: VRAM weights from TierMap.mem_budget() ───────────
-        # mem_budget() already applies tier-specific reserve fractions
-        # (A6000: 35%, H100: 25%, Blackwell: 20%).
+        # mem_budget() uses runtime-probed free VRAM (issue #593) with a
+        # uniform 15% safety margin; falls back to legacy tier-specific
+        # reserve fractions only when free_vram_bytes is unavailable.
         vram_weights: List[int] = [
             self.tier_map.mem_budget(r) for r in range(world_size)
         ]
