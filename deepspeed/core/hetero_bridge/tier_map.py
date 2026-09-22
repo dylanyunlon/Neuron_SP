@@ -39,6 +39,7 @@ class TierInfo:
     rank: int
     tier: GPUTier
     total_vram_bytes: int
+    free_vram_bytes: int  # measured at discover() time via cudaMemGetInfo
     numa_node: int
     peak_bf16_tflops: float
 
@@ -65,14 +66,20 @@ _TIER_TFLOPS: Dict[GPUTier, float] = {
     GPUTier.UNKNOWN:  100.0,
 }
 
-# Fraction of VRAM reserved for model weights + activations; the rest is
-# available for optimizer state.  A6000 has a tighter budget.
+# DEPRECATED — kept only as fallback when free_vram_bytes is unavailable
+# (e.g. TierInfo constructed without a live CUDA probe).  New code should
+# never read this dict; mem_budget() uses free_vram_bytes when > 0.
 _VRAM_RESERVE_FRACTION: Dict[GPUTier, float] = {
-    GPUTier.A6000:    0.35,  # 35 % reserved → ~31 GB free on 48 GB card
-    GPUTier.H100:     0.25,  # 25 % reserved → ~72 GB free on 96 GB card
-    GPUTier.BLACKWELL: 0.20,  # 20 % reserved
+    GPUTier.A6000:    0.35,
+    GPUTier.H100:     0.25,
+    GPUTier.BLACKWELL: 0.20,
     GPUTier.UNKNOWN:  0.40,
 }
+
+# Uniform safety margin applied to the *measured* free VRAM.
+# Covers NCCL workspace, torch compile cache, and dynamic peak allocations
+# that are not yet visible at discover() time.
+_VRAM_SAFETY_MARGIN: float = 0.15
 
 _BYTES_PER_GB = 1 << 30
 
@@ -93,6 +100,16 @@ def _detect_local_tier() -> TierInfo:
         tier = _SM_TO_TIER.get(sm, GPUTier.UNKNOWN)
         total_vram = prop.total_memory  # bytes
 
+        # Runtime free-VRAM probe (issue #593): measures actual free bytes
+        # at discover() time rather than relying on per-tier reserve
+        # fractions derived from nameplate capacity.
+        try:
+            free_bytes, _ = torch.cuda.mem_get_info(local_rank)
+        except Exception:
+            free_bytes = 0
+            logger.debug("TierMap: mem_get_info failed for local_rank=%d; "
+                         "falling back to total_vram * (1 - reserve)", local_rank)
+
         # NUMA node: try to read from sysfs; default to 0
         try:
             device_idx = torch.cuda.current_device()
@@ -103,10 +120,18 @@ def _detect_local_tier() -> TierInfo:
             numa_node = 0
 
         global_rank = int(os.environ.get("RANK", "0"))
+        logger.info(
+            "TierMap: rank %d local_rank %d  tier=%s  total=%.1fGB  "
+            "free=%.1fGB (%.0f%% used)",
+            global_rank, local_rank, tier.value,
+            total_vram / _BYTES_PER_GB, free_bytes / _BYTES_PER_GB,
+            100.0 * (1 - free_bytes / total_vram) if total_vram > 0 else 0,
+        )
         return TierInfo(
             rank=global_rank,
             tier=tier,
             total_vram_bytes=total_vram,
+            free_vram_bytes=free_bytes,
             numa_node=max(0, numa_node),
             peak_bf16_tflops=_TIER_TFLOPS[tier],
         )
@@ -118,6 +143,7 @@ def _detect_local_tier() -> TierInfo:
             rank=global_rank,
             tier=GPUTier.UNKNOWN,
             total_vram_bytes=48 * _BYTES_PER_GB,  # conservative default
+            free_vram_bytes=0,  # no probe possible; mem_budget falls back
             numa_node=0,
             peak_bf16_tflops=_TIER_TFLOPS[GPUTier.UNKNOWN],
         )
@@ -192,6 +218,7 @@ class TierMap:
                     rank=r,
                     tier=GPUTier.UNKNOWN,
                     total_vram_bytes=48 * _BYTES_PER_GB,
+                    free_vram_bytes=0,
                     numa_node=0,
                     peak_bf16_tflops=_TIER_TFLOPS[GPUTier.UNKNOWN],
                 )
@@ -238,9 +265,15 @@ class TierMap:
     def mem_budget(self, rank: int) -> int:
         """Usable bytes for optimizer state after model + activations.
 
-        Computed as ``total_vram * (1 - reserve_fraction)`` where the
-        reserve fraction is tier-specific (A6000 reserves more because
-        activations take proportionally more of a smaller VRAM pool).
+        When ``free_vram_bytes > 0`` (runtime probe succeeded at discover
+        time), the budget is ``free_vram_bytes * (1 - _VRAM_SAFETY_MARGIN)``
+        — a uniform 15 % haircut that covers NCCL workspace and dynamic
+        peak allocations.
+
+        When ``free_vram_bytes == 0`` (no CUDA available at TierInfo
+        construction time, e.g. unit tests), falls back to the legacy
+        ``total_vram * (1 - tier_reserve)`` path so existing offline
+        planning and test code is unaffected.
 
         Args:
             rank: Global distributed rank.
@@ -249,6 +282,9 @@ class TierMap:
             Integer byte count available for optimizer state.
         """
         info = self._by_rank[rank]
+        if info.free_vram_bytes > 0:
+            return int(info.free_vram_bytes * (1.0 - _VRAM_SAFETY_MARGIN))
+        # Legacy fallback — no runtime probe available.
         reserve = _VRAM_RESERVE_FRACTION[info.tier]
         return int(info.total_vram_bytes * (1.0 - reserve))
 
@@ -281,7 +317,9 @@ class TierMap:
 
     def __repr__(self) -> str:  # pragma: no cover
         entries = ", ".join(
-            f"rank{r}={info.tier.value}({info.total_vram_bytes // _BYTES_PER_GB}GB)"
+            f"rank{r}={info.tier.value}"
+            f"({info.total_vram_bytes // _BYTES_PER_GB}GB"
+            f"/free={info.free_vram_bytes // _BYTES_PER_GB}GB)"
             for r, info in sorted(self._by_rank.items())
         )
         return f"TierMap({entries})"

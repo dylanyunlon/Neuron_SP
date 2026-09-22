@@ -128,11 +128,11 @@ def _make_tier_map_5gpu():
     from deepspeed.core.hetero_bridge.tier_map import GPUTier, TierInfo, TierMap, _BYTES_PER_GB
 
     infos = [
-        TierInfo(rank=0, tier=GPUTier.A6000,    total_vram_bytes=48 * _BYTES_PER_GB, numa_node=0, peak_bf16_tflops=309.7),
-        TierInfo(rank=1, tier=GPUTier.A6000,    total_vram_bytes=48 * _BYTES_PER_GB, numa_node=0, peak_bf16_tflops=309.7),
-        TierInfo(rank=2, tier=GPUTier.H100,     total_vram_bytes=94 * _BYTES_PER_GB, numa_node=1, peak_bf16_tflops=989.0),
-        TierInfo(rank=3, tier=GPUTier.BLACKWELL, total_vram_bytes=96 * _BYTES_PER_GB, numa_node=1, peak_bf16_tflops=2250.0),
-        TierInfo(rank=4, tier=GPUTier.BLACKWELL, total_vram_bytes=96 * _BYTES_PER_GB, numa_node=1, peak_bf16_tflops=2250.0),
+        TierInfo(rank=0, tier=GPUTier.A6000,    total_vram_bytes=48 * _BYTES_PER_GB, free_vram_bytes=30 * _BYTES_PER_GB, numa_node=0, peak_bf16_tflops=309.7),
+        TierInfo(rank=1, tier=GPUTier.A6000,    total_vram_bytes=48 * _BYTES_PER_GB, free_vram_bytes=29 * _BYTES_PER_GB, numa_node=0, peak_bf16_tflops=309.7),
+        TierInfo(rank=2, tier=GPUTier.H100,     total_vram_bytes=94 * _BYTES_PER_GB, free_vram_bytes=72 * _BYTES_PER_GB, numa_node=1, peak_bf16_tflops=989.0),
+        TierInfo(rank=3, tier=GPUTier.BLACKWELL, total_vram_bytes=96 * _BYTES_PER_GB, free_vram_bytes=78 * _BYTES_PER_GB, numa_node=1, peak_bf16_tflops=2250.0),
+        TierInfo(rank=4, tier=GPUTier.BLACKWELL, total_vram_bytes=96 * _BYTES_PER_GB, free_vram_bytes=77 * _BYTES_PER_GB, numa_node=1, peak_bf16_tflops=2250.0),
     ]
     return TierMap.from_infos(infos)
 

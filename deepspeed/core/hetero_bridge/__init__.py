@@ -11,6 +11,12 @@ from .desloc_sync_policy import DesLocSyncPolicy, SyncPeriods
 from .pp_schedule_adapter import PPScheduleAdapter
 from .autosp_hook import AutoSPHook
 from .engine_integration import install
+from .mem_probe import (
+    probe_free_vram,
+    budget_from_probe,
+    validate_tier_info_vram,
+    VRAM_SAFETY_MARGIN,
+)
 
 __all__ = [
     "TierMap", "TierInfo", "GPUTier",
@@ -20,4 +26,8 @@ __all__ = [
     "PPScheduleAdapter",
     "AutoSPHook",
     "install",
+    "probe_free_vram",
+    "budget_from_probe",
+    "validate_tier_info_vram",
+    "VRAM_SAFETY_MARGIN",
 ]

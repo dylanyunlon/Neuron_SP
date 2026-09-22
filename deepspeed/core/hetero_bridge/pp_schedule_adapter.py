@@ -22,6 +22,9 @@ Mirrors the VRAM-proportional calculation in configs/7b_5gpu.yaml:
   layers_r   = round(num_layers * mem_budget(r) / total_vram)
 Remainder is added to the H100/Blackwell stage with most VRAM.
 
+Since issue #593, mem_budget() uses runtime-probed free VRAM
+(cudaMemGetInfo) rather than nameplate-capacity reserve fractions.
+
 Bubble filler
 -------------
 ``HeterogeneousBubbleFiller`` (from schedules.py) is instantiated only when:
